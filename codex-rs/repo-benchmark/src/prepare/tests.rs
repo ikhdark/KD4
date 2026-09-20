@@ -693,14 +693,14 @@ fn project_configuration_comparison_records_explicit_differences_per_arm_without
     );
     std::fs::create_dir(temp.path().join(".codex")).unwrap();
     let path = temp.path().join(".codex/config.toml");
-    std::fs::write(&path, "approval_policy = 'never'\nmodel = 'private-model-name'\nallow_login_shell = false\n[features]\nkd4_runtime = true\n[reasoning_phase_efforts]\nverify = 'low'\n").unwrap();
+    std::fs::write(&path, "approval_policy = 'never'\nmodel = 'private-model-name'\nallow_login_shell = false\n[features]\nkd4_runtime = true\n[example_settings]\nverify = 'low'\n").unwrap();
     let comparison = ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides)
         .unwrap()
         .unwrap();
     let on = &comparison.by_variant[&Variant::ForkOn];
     assert_eq!(
         on.project_only,
-        ["allow_login_shell", "reasoning_phase_efforts.verify"]
+        ["allow_login_shell", "example_settings.verify"]
     );
     assert!(on.benchmark_only.contains(&"personality".into()));
     assert_eq!(comparison.by_variant[&Variant::ForkOn].changed, ["model"]);
@@ -710,7 +710,7 @@ fn project_configuration_comparison_records_explicit_differences_per_arm_without
         [
             "allow_login_shell",
             "features.kd4_runtime",
-            "reasoning_phase_efforts.verify"
+            "example_settings.verify"
         ]
     );
     let frozen = serde_json::to_string(&comparison).unwrap();
@@ -1349,9 +1349,13 @@ fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
 fn lockfile(entries: &[(&str, &str, Option<&str>)]) -> String {
     let mut text = String::from("version = 4\n");
     for (name, version, source) in entries {
-        text.push_str(&format!("\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"));
+        text.push_str(&format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"
+        ));
         if let Some(source) = source {
-            text.push_str(&format!("source = \"{source}\"\nchecksum = \"{name}-sum\"\n"));
+            text.push_str(&format!(
+                "source = \"{source}\"\nchecksum = \"{name}-sum\"\n"
+            ));
         }
         text.push_str("dependencies = [\n \"anyhow\",\n]\n");
     }
@@ -1446,15 +1450,21 @@ fn lockfile_repair_rejects_every_difference_beyond_a_member_version() {
 #[test]
 fn reconciled_checkout_accepts_the_lockfile_and_nothing_else() {
     assert!(super::only_workspace_lock_modified(""));
-    assert!(super::only_workspace_lock_modified(" M codex-rs/Cargo.lock"));
+    assert!(super::only_workspace_lock_modified(
+        " M codex-rs/Cargo.lock"
+    ));
+    // `git` trims its output, so a lone unstaged change arrives without the
+    // leading porcelain status space.
+    assert!(super::only_workspace_lock_modified("M codex-rs/Cargo.lock"));
     assert!(super::only_workspace_lock_modified(
         "M  codex-rs/Cargo.lock\n M codex-rs/Cargo.lock"
     ));
     for status in [
         " M codex-rs/core/src/lib.rs",
-        " M codex-rs/Cargo.lock\n M codex-rs/Cargo.toml",
+        "M codex-rs/Cargo.lock\n M codex-rs/Cargo.toml",
         " M codex-rs/Cargo.lock.bak",
         " M Cargo.lock",
+        "codex-rs/Cargo.lock",
     ] {
         assert!(
             !super::only_workspace_lock_modified(status),
@@ -1470,5 +1480,10 @@ fn resolved_sources_start_without_a_recorded_lockfile_repair() {
     let origin = repository(temp.path(), "origin", "pinned");
     let source = resolve_source(&origin, "HEAD", temp.path().join("checkout"), true).unwrap();
     assert!(source.lock_reconciliation.is_none());
-    assert!(serde_json::to_value(&source).unwrap().get("lockReconciliation").is_none());
+    assert!(
+        serde_json::to_value(&source)
+            .unwrap()
+            .get("lockReconciliation")
+            .is_none()
+    );
 }

@@ -1,21 +1,19 @@
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str =
     "Some deferred nested tools may be omitted from this description.";
-const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Nested tool schemas are discovered lazily at runtime. When `tool_search` is advertised, use it to activate tools that are not yet listed."#;
+const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in tool contracts may be included below. Use those declarations directly; external and omitted contracts remain lazy. When `tool_search` is advertised, use it to activate tools that are not yet listed."#;
 pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no Node/filesystem/network.
 - Nested tools live on the global `tools` object: `await tools.exec_command({cmd:"..."})`, `await tools.apply_patch(patchText)` if registered. Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`; `console.log(...)` aliases `text(...)`. Only `ALL_TOOL_NAMES` entries are callable.
 - Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
 - `text(...)` emits values; on failure/no output, the host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions. Emit needed results explicitly.
-- Reuse schemas, CLI usage, and results; resolve missing/stale schemas before calls. Use CLI `--help` only for uncertain arguments/subcommands.
+- Reuse current schemas and results; resolve missing/stale schemas before calls.
 - Nested tools: use a present schema; else `resolve_tool(name)` when the name is known, or inspect `ALL_TOOL_NAMES`. Never scan/filter/stringify/print `ALL_TOOLS`.
-- Read/list known paths directly; search unknown locations narrowly. Reuse applicable `AGENTS.md`; refresh missing/invalidated scopes.
-- Start useful work in the initial exec. Await `Promise.allSettled` for independent known reads/probes and inspect every result. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Finish discovery before dependent mutations. Separate status/file output; batch independent calls.
-- Prefer a purpose-built tool over shell; consolidate related read-only probes. Never spawn subprocesses to re-filter returned results.
-- Calls: hard 60s default deadline. After timeout, resume the returned live session/cell ID; never rerun live or uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
+- Await `Promise.allSettled` for independent known calls and inspect every result. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results.
+- Choose tools whose scope, evidence, and cost fit the task. Process returned results in JavaScript rather than spawning subprocesses to re-filter them.
+- Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
 - Cells yield on `yield_control()`, input, or their initial 10s budget. Keep long commands in the same awaited evaluation; yield explicitly only for a new model decision.
-- Run required validation after the final relevant edit. Parallelize only when tools permit and build locks, outputs, and services are independent. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`. Finish work/checks or report failures/blockers. Keep plans aligned with the request.
-- For unchanged deterministic failures, change route/state or report blockers; resume live operations via documented waits.
-- Read relevant ranges for large files; whole files when small or required. Read the complete enclosing unit before editing; refresh after intervening writes. Use retained-artifact selectors after truncation.
-- Output defaults to the 10000-token hard cap. Set the smallest useful budget with first-line `// @exec: {"max_output_tokens": 2000}`. Nested-call deadlines use the documented `{ timeout_ms }` option.
+- An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
+- Parallelize only when tools permit and build locks, outputs, and services are independent. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
+- Output defaults to the 10000-token hard cap. Set the smallest useful budget with first-line `// @exec: {"max_output_tokens": 2000}`. This limits model-visible output separately from nested tools' output budgets. Select relevant results before emitting them; use retained-artifact selectors after truncation. Nested-call deadlines use the documented `{ timeout_ms }` option.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
@@ -50,9 +48,8 @@ pub fn build_exec_tool_description(
         ));
     }
     if code_mode_only {
-        // Keep the public `exec` schema invariant across nested-tool inventory
-        // changes. Exact per-tool contracts remain available in the runtime's
-        // augmented `ALL_TOOLS` entries and through tool search.
+        // The grammar is stable; callers can append eager built-in contracts
+        // to this description. External inventory changes stay lazy.
         sections.push(LAZY_NESTED_TOOL_SCHEMA_GUIDANCE.to_string());
     } else if has_deferred_tools {
         sections.push(DEFERRED_NESTED_TOOLS_GUIDANCE.to_string());
@@ -117,25 +114,22 @@ mod tests {
     }
 
     #[test]
-    fn workflow_guidance_allows_blockers_waits_and_required_complete_reads() {
+    fn execution_contract_keeps_lifecycle_rules_without_general_workflow() {
         for code_mode_only in [false, true] {
             for has_deferred_tools in [false, true] {
                 let description =
                     build_exec_tool_description(code_mode_only, has_deferred_tools, &[]);
                 for required in [
-                    "Finish work/checks or report failures/blockers.",
-                    "Keep plans aligned with the request.",
-                    "For unchanged deterministic failures, change route/state or report blockers;",
-                    "resume live operations via documented waits.",
-                    "whole files when small or required.",
-                    "Read the complete enclosing unit before editing; refresh after intervening writes.",
-                    "Finish discovery before dependent mutations.",
+                    "Sequence dependent calls only after checking prerequisite results.",
                     "Await `Promise.allSettled`",
-                    "Reuse schemas, CLI usage, and results;",
-                    "Use CLI `--help` only for uncertain arguments/subcommands.",
-                    "Reuse applicable `AGENTS.md`; refresh missing/invalidated scopes.",
-                    "After timeout, resume the returned live session/cell ID;",
-                    "never rerun live or uncertain effects.",
+                    "Reuse current schemas and results;",
+                    "A resolved `exec_command` call may still return a running command session.",
+                    "continue that session within the current evaluation.",
+                    "separately from nested tools' output budgets.",
+                    "host-configured default deadline",
+                    "Expiry cancels the nested call and may return only an error, without a live handle.",
+                    "Resume only an actually returned live session/cell ID;",
+                    "check the outcome before retrying uncertain effects.",
                     "Retry only if unstarted, safely repeatable after stopping, or tool-approved.",
                 ] {
                     assert!(
@@ -144,6 +138,11 @@ mod tests {
                     );
                 }
                 for retired in [
+                    "Keep plans aligned",
+                    "Run required validation",
+                    "Read the complete enclosing unit",
+                    "AGENTS.md",
+                    "Prefer a purpose-built tool over shell",
                     "never whole files",
                     "never repeat the same call/poll",
                     "never duplicate a timed-out operation",

@@ -35,7 +35,48 @@ const RECEIPT_MAX_TOKENS: usize = 256;
 // Bound that complete representation separately and charge its actual cost to admission.
 const TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS: usize = 384;
 const RECEIPT_DIGEST_TARGET_TOKENS: usize = 96;
-const MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 10_000;
+// Aggregate raw tool-result tokens kept model-visible before consumed results
+// are compacted to receipts. A 10k budget compacted a 5k-token read after one
+// generation, so the model re-ran identical reads instead of reusing evidence;
+// keep roughly a quarter of the window so an investigation turn stays raw.
+const DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 60_000;
+
+#[cfg(test)]
+thread_local! {
+    static MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn model_visible_tool_result_token_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(std::cell::Cell::get)
+    {
+        return budget;
+    }
+    DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+}
+
+/// Restores the previous test budget when dropped.
+#[cfg(test)]
+pub(crate) struct ModelVisibleToolResultTokenBudgetOverride(Option<usize>);
+
+#[cfg(test)]
+impl Drop for ModelVisibleToolResultTokenBudgetOverride {
+    fn drop(&mut self) {
+        MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Pressure fixtures are sized against a small budget so admission, receipt,
+/// and drop paths stay exercised regardless of the production default.
+#[cfg(test)]
+pub(crate) fn override_model_visible_tool_result_token_budget_for_test(
+    budget: usize,
+) -> ModelVisibleToolResultTokenBudgetOverride {
+    ModelVisibleToolResultTokenBudgetOverride(
+        MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(|cell| cell.replace(Some(budget))),
+    )
+}
 const COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET: usize = 2_000;
 const COMPACTION_ARTIFACT_PIN_MAX_ITEMS: usize = 32;
 const MINIMUM_RAW_TOKENS: u64 = 256;
@@ -414,11 +455,26 @@ pub(crate) struct ToolHistorySubstitution {
     pub(crate) substituted_output_sha256: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolOutputBudgetDrops {
+    pub(crate) count: u32,
+    pub(crate) tokens: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolHistoryProjection {
     pub(crate) items: Arc<[ResponseItem]>,
     pub(crate) unreplaced_items: Arc<[ResponseItem]>,
     pub(crate) substitutions: Arc<[ToolHistorySubstitution]>,
+    /// Drops the aggregate output budget made in `items`.
+    ///
+    /// Recorded per representation because the budget runs over several
+    /// candidate projections and only one of them is sent. Summing the
+    /// invocations would overcount, and would implicate drops in a
+    /// representation the model never saw.
+    pub(crate) items_budget_drops: ToolOutputBudgetDrops,
+    /// The same accounting for `unreplaced_items`.
+    pub(crate) unreplaced_items_budget_drops: ToolOutputBudgetDrops,
 }
 
 #[derive(Clone, Debug)]
@@ -992,6 +1048,9 @@ impl ToolHistoryState {
             items: Arc::clone(&projected),
             unreplaced_items: projected,
             substitutions: Arc::from([]),
+            // This path applies no aggregate output budget.
+            items_budget_drops: ToolOutputBudgetDrops::default(),
+            unreplaced_items_budget_drops: ToolOutputBudgetDrops::default(),
         }
     }
 
@@ -1141,7 +1200,7 @@ impl ToolHistoryState {
                 })
             })
             .fold(0usize, usize::saturating_add)
-            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
+            <= model_visible_tool_result_token_budget();
         let newest_unconsumed_non_text_item = admission_candidates
             .iter()
             .filter(|admission| {
@@ -1203,7 +1262,7 @@ impl ToolHistoryState {
                             )
                         })
                         .map(|(_, receipt_tokens)| raw_tokens.min(receipt_tokens))
-                        .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET)
+                        .filter(|tokens| *tokens <= model_visible_tool_result_token_budget())
                         .unwrap_or(0);
                 }
 
@@ -1226,11 +1285,11 @@ impl ToolHistoryState {
                             .saturating_add(non_text_tokens);
                         raw_tokens.min(receipt_tokens)
                     })
-                    .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+                    .filter(|tokens| *tokens <= model_visible_tool_result_token_budget());
                 let pin_tokens = artifact_pins
                     .get(&admission_candidate.call_id)
                     .map(|(_, tokens)| *tokens)
-                    .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+                    .filter(|tokens| *tokens <= model_visible_tool_result_token_budget());
                 [Some(raw_tokens), receipt_tokens, pin_tokens]
                     .into_iter()
                     .flatten()
@@ -1275,8 +1334,8 @@ impl ToolHistoryState {
             .copied()
             .fold(0usize, usize::saturating_add);
         let mut decisions = BTreeMap::<String, AdmissionDecision>::new();
-        let mut remaining_tokens = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
-        let mut remaining_fallback_tokens = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
+        let mut remaining_tokens = model_visible_tool_result_token_budget();
+        let mut remaining_fallback_tokens = model_visible_tool_result_token_budget();
         for ((admission_candidate, reservation), fallback_reservation) in admission_candidates
             .into_iter()
             .zip(reservations)
@@ -1583,8 +1642,9 @@ impl ToolHistoryState {
                 replace_model_visible_output_text(body, text.clone());
             }
         }
-        self.enforce_tool_result_budget(&mut projected);
-        self.enforce_tool_result_budget(&mut unreplaced_projected);
+        let items_budget_drops = self.enforce_tool_result_budget(&mut projected);
+        let unreplaced_items_budget_drops =
+            self.enforce_tool_result_budget(&mut unreplaced_projected);
         let retained_indices = projected
             .iter()
             .enumerate()
@@ -1602,13 +1662,18 @@ impl ToolHistoryState {
             items: projected.into_shared(),
             unreplaced_items: unreplaced_projected.into_shared(),
             substitutions: Arc::from(substitutions),
+            items_budget_drops,
+            unreplaced_items_budget_drops,
         }
     }
 
     /// Apply the same ceiling to replayed receipts and to the transport's raw fallback.
     /// Admission alone cannot bound those forms: their hashes may differ from the original
     /// output, and many individually small recovery pins can exceed the aggregate budget.
-    fn enforce_tool_result_budget(&self, items: &mut ProjectedResponseItems) {
+    fn enforce_tool_result_budget(
+        &self,
+        items: &mut ProjectedResponseItems,
+    ) -> ToolOutputBudgetDrops {
         let mut candidates = Vec::new();
         let mut newest_unconsumed_image = None;
         for (index, item) in items.iter().enumerate() {
@@ -1650,22 +1715,28 @@ impl ToolHistoryState {
             .iter()
             .map(|(_, _, _, cost)| *cost)
             .fold(0usize, usize::saturating_add)
-            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+            <= model_visible_tool_result_token_budget()
         {
-            return;
+            return ToolOutputBudgetDrops::default();
         }
         candidates.sort();
-        let mut remaining = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
+        let mut remaining = model_visible_tool_result_token_budget();
         let mut dropped = BTreeSet::new();
+        let mut dropped_tokens = 0_u64;
         for (_, _, call_id, cost) in candidates {
             if cost <= remaining || newest_unconsumed_image.as_ref() == Some(&call_id) {
                 remaining = remaining.saturating_sub(cost);
             } else {
+                dropped_tokens = dropped_tokens.saturating_add(cost as u64);
                 dropped.insert(call_id);
             }
         }
         // Remove complete pairs so transport normalization cannot restore orphaned calls.
         items.retain(|item| item_call_id(item).is_none_or(|id| !dropped.contains(id)));
+        ToolOutputBudgetDrops {
+            count: u32::try_from(dropped.len()).unwrap_or(u32::MAX),
+            tokens: dropped_tokens,
+        }
     }
 
     fn invalidate_stale_workspace_evidence(
@@ -1767,6 +1838,15 @@ impl ToolHistoryState {
                 });
                 if !current_nested_results.is_empty() {
                     notice["current_nested_results"] = current_nested_results.into();
+                }
+                // Invalidating source evidence must not erase process controls
+                // or artifact recovery. These are historical command receipts,
+                // not claims that the old workspace evidence is still current.
+                if let Some((_, receipt)) = output
+                    .rsplit_once("Nested command states (independent of script completion):\n")
+                    && let Ok(states) = serde_json::from_str::<Vec<serde_json::Value>>(receipt)
+                {
+                    notice["nested_commands"] = states.into();
                 }
                 Some(notice)
             };

@@ -35,11 +35,8 @@ use crate::fragments::SkillInstructions;
 use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
-use crate::render::MAX_SKILL_NAME_BYTES;
-use crate::render::MAX_SKILL_PATH_BYTES;
 use crate::render::available_skills_fragment;
 use crate::render::truncate_main_prompt_contents;
-use crate::render::truncate_utf8_to_bytes;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::sources::SkillProviders;
 use crate::state::ExecutorSkillsStepState;
@@ -350,7 +347,7 @@ where
                 {
                     Ok(read_result) => {
                         let (contents, truncated) =
-                            truncate_main_prompt_contents(read_result.contents.as_str());
+                            truncate_main_prompt_contents(read_result.contents.as_str(), entry);
                         if truncated {
                             let warning = format!(
                                 "Skill `{}` exceeded the main prompt context limit and was truncated.",
@@ -360,12 +357,8 @@ where
                             warnings.push(warning);
                         }
                         let fragment = SkillInstructions {
-                            name: truncate_utf8_to_bytes(&entry.name, MAX_SKILL_NAME_BYTES).0,
-                            path: truncate_utf8_to_bytes(
-                                entry.rendered_path(),
-                                MAX_SKILL_PATH_BYTES,
-                            )
-                            .0,
+                            name: entry.name.clone(),
+                            path: entry.main_prompt.as_str().to_string(),
                             contents,
                             source_scope: entry.source_scope,
                         };

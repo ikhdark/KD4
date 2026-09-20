@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::ExternalMutationIntent;
+use crate::mcp_tool_call::HandledMcpToolCall;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -17,6 +20,7 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
 use codex_mcp::ToolInfo;
+use codex_protocol::mcp::CallToolResult;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
@@ -28,9 +32,221 @@ use codex_tools::mcp_tool_to_responses_api_tool;
 use codex_tools::schema_search_text;
 use serde_json::Map;
 use serde_json::Value;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredJobStatus {
+    pub(crate) job_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) started: Instant,
+}
+
+#[derive(Default)]
+struct McpDeferredJobsInner {
+    next_id: u64,
+    running: HashMap<String, DeferredJobStatus>,
+    results: HashMap<String, watch::Sender<Option<Arc<HandledMcpToolCall>>>>,
+}
+
+/// Session-scoped in-flight calls sharing the original typed MCP result.
+#[derive(Default)]
+pub(crate) struct McpDeferredJobs {
+    inner: std::sync::Mutex<McpDeferredJobsInner>,
+}
+
+impl McpDeferredJobs {
+    /// Include the turn-scoped call ID: distinct requested actions may have identical
+    /// arguments and must not be silently merged.
+    pub(crate) fn job_key(tool_info: &ToolInfo, arguments: &str, call_id: &str) -> String {
+        let canonical = serde_json::from_str::<Value>(arguments)
+            .map(|value| canonical_json(&value))
+            .unwrap_or_else(|_| arguments.trim().to_string());
+        serde_json::json!([
+            tool_info.server_name,
+            tool_info.tool.name,
+            call_id,
+            canonical
+        ])
+        .to_string()
+    }
+}
+
+/// JSON text with object keys sorted at every level, independent of the
+/// serializer's key-order feature, so equal arguments always share a key.
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        Value::String(key.clone()),
+                        canonical_json(&map[key])
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("{{{}}}", fields.join(","))
+        }
+        Value::Array(items) => {
+            let items = items.iter().map(canonical_json).collect::<Vec<_>>();
+            format!("[{}]", items.join(","))
+        }
+        scalar => scalar.to_string(),
+    }
+}
+
+impl McpDeferredJobs {
+    #[cfg(test)]
+    pub(crate) fn running(&self, key: &str) -> Option<DeferredJobStatus> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running
+            .get(key)
+            .cloned()
+    }
+
+    fn reserve(
+        &self,
+        key: String,
+        tool_name: String,
+        started: Instant,
+    ) -> (
+        DeferredJobStatus,
+        bool,
+        watch::Receiver<Option<Arc<HandledMcpToolCall>>>,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = inner.results.get(&key) {
+            return (inner.running[&key].clone(), false, sender.subscribe());
+        }
+        inner.next_id += 1;
+        let status = DeferredJobStatus {
+            job_id: format!("mcp-job-{}", inner.next_id),
+            tool_name,
+            started,
+        };
+        let (sender, receiver) = watch::channel(None);
+        inner.results.insert(key.clone(), sender);
+        inner.running.insert(key, status.clone());
+        (status, true, receiver)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start(
+        &self,
+        key: String,
+        tool_name: String,
+        started: Instant,
+    ) -> DeferredJobStatus {
+        self.reserve(key, tool_name, started).0
+    }
+
+    /// Join an identical in-flight call before dispatch. Keep the actual typed
+    /// result on the original tool future; code mode owns yielding and cancellation.
+    async fn execute<F>(
+        self: &Arc<Self>,
+        key: String,
+        tool_name: String,
+        input: Value,
+        cancellation: CancellationToken,
+        call: F,
+    ) -> Arc<HandledMcpToolCall>
+    where
+        F: Future<Output = HandledMcpToolCall>,
+    {
+        let (_status, owner, mut receiver) = self.reserve(key.clone(), tool_name, Instant::now());
+        if owner {
+            let lease = McpCallLease {
+                jobs: Arc::clone(self),
+                key,
+                input,
+            };
+            let result = Arc::new(call.await);
+            {
+                let inner = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(sender) = inner.results.get(&lease.key) {
+                    sender.send_replace(Some(Arc::clone(&result)));
+                }
+            }
+            drop(lease);
+            return result;
+        }
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result;
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return cancelled_mcp_result(input),
+                changed = receiver.changed() => {
+                    if changed.is_err() { return cancelled_mcp_result(input); }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish(&self, key: &str) -> Option<DeferredJobStatus> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.results.remove(key);
+        inner.running.remove(key)
+    }
+}
+
+/// Reuses session extension data to share overlapping calls before dispatch.
+pub(crate) fn session_deferred_jobs(
+    session: &crate::session::session::Session,
+) -> std::sync::Arc<McpDeferredJobs> {
+    session
+        .session_extension_data()
+        .get_or_init(McpDeferredJobs::default)
+}
+
+fn cancelled_mcp_result(input: Value) -> Arc<HandledMcpToolCall> {
+    Arc::new(HandledMcpToolCall {
+        result: CallToolResult::from_error_text("MCP call interrupted; remote completion status is unknown. Check its outcome before retrying.".to_string()),
+        tool_input: input,
+    })
+}
+
+struct McpCallLease {
+    jobs: Arc<McpDeferredJobs>,
+    key: String,
+    input: Value,
+}
+
+impl Drop for McpCallLease {
+    fn drop(&mut self) {
+        let mut inner = self
+            .jobs
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = inner.results.remove(&self.key) {
+            let unfinished = sender.borrow().is_none();
+            if unfinished {
+                sender.send_replace(Some(cancelled_mcp_result(self.input.clone())));
+            }
+        }
+        inner.running.remove(&self.key);
+    }
+}
 
 pub struct McpHandler {
     tool_info: ToolInfo,
@@ -188,19 +404,42 @@ impl McpHandler {
         };
 
         let started = Instant::now();
+        let jobs = session_deferred_jobs(&session);
+        let logical_call_id = format!("{}/{call_id}", turn.sub_id);
+        let job_key = McpDeferredJobs::job_key(&self.tool_info, &payload, &logical_call_id);
+        let tool_input_value =
+            serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| Value::Object(Map::new()));
         // TODO(sayan): Use StepContext for MCP file arguments when MCP follows dynamic environments.
-        let result = handle_mcp_tool_call(
-            Arc::clone(&session),
-            &step_context,
-            call_id.clone(),
-            &self.tool_info,
-            payload,
-            cancellation_token,
-        )
-        .await;
+        let call = {
+            let session = Arc::clone(&session);
+            let step_context = Arc::clone(&step_context);
+            let tool_info = self.tool_info.clone();
+            let call_id = call_id.clone();
+            let cancellation_token = cancellation_token.clone();
+            async move {
+                handle_mcp_tool_call(
+                    session,
+                    &step_context,
+                    call_id,
+                    &tool_info,
+                    payload,
+                    cancellation_token,
+                )
+                .await
+            }
+        };
+        let result = jobs
+            .execute(
+                job_key,
+                self.hook_tool_name().name().to_string(),
+                tool_input_value,
+                cancellation_token,
+                call,
+            )
+            .await;
         Ok(boxed_tool_output(McpToolOutput::new(
-            result.result,
-            result.tool_input,
+            result.result.clone(),
+            result.tool_input.clone(),
             started.elapsed(),
             can_request_original_image_detail(&turn.model_info),
             turn.model_info.truncation_policy.into(),
@@ -392,6 +631,237 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
     use tokio::sync::Mutex;
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_calls_share_the_typed_result_and_later_calls_dispatch_again() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        let jobs = Arc::new(McpDeferredJobs::default());
+        let dispatched = AtomicUsize::new(0);
+        let invoke = || {
+            jobs.execute(
+                "same-call".into(),
+                "sample".into(),
+                json!({}),
+                CancellationToken::new(),
+                async {
+                    dispatched.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(31)).await;
+                    HandledMcpToolCall {
+                        result: CallToolResult::from_error_text("expected result".into()),
+                        tool_input: json!({"edited": true}),
+                    }
+                },
+            )
+        };
+        let before = tokio::time::Instant::now();
+        let (first, duplicate) = tokio::join!(invoke(), invoke());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        assert!(tokio::time::Instant::now().duration_since(before) >= Duration::from_secs(31));
+        assert!(Arc::ptr_eq(&first, &duplicate));
+        assert_eq!(first.tool_input, json!({"edited": true}));
+        assert_eq!(first.result.is_error, Some(true));
+        assert!(jobs.running("same-call").is_none());
+        invoke().await;
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn dropping_owner_releases_joiners_without_redispatch() {
+        let jobs = Arc::new(McpDeferredJobs::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let owner_jobs = Arc::clone(&jobs);
+        let owner = tokio::spawn(async move {
+            owner_jobs
+                .execute(
+                    "key".into(),
+                    "sample".into(),
+                    json!({}),
+                    CancellationToken::new(),
+                    async {
+                        started_tx.send(()).unwrap();
+                        std::future::pending::<HandledMcpToolCall>().await
+                    },
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        let joined = jobs.execute(
+            "key".into(),
+            "sample".into(),
+            json!({}),
+            CancellationToken::new(),
+            async { panic!("duplicate must not dispatch") },
+        );
+        tokio::pin!(joined);
+        assert!(futures::poll!(&mut joined).is_pending());
+        owner.abort();
+        assert!(owner.await.is_err_and(|error| error.is_cancelled()));
+        let result = tokio::time::timeout(Duration::from_secs(1), joined)
+            .await
+            .unwrap();
+        assert_eq!(result.result.is_error, Some(true));
+        assert!(
+            result.result.content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("remote completion status is unknown")
+        );
+        assert!(jobs.running("key").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_joiner_preserves_the_owner_and_independent_calls() {
+        let jobs = Arc::new(McpDeferredJobs::default());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let owner = jobs.execute(
+            "first".into(),
+            "sample".into(),
+            json!({}),
+            CancellationToken::new(),
+            async {
+                release_rx.await.unwrap();
+                HandledMcpToolCall {
+                    result: CallToolResult::from_error_text("owner result".into()),
+                    tool_input: json!({}),
+                }
+            },
+        );
+        tokio::pin!(owner);
+        assert!(futures::poll!(&mut owner).is_pending());
+        let cancellation = CancellationToken::new();
+        let joined = jobs.execute(
+            "first".into(),
+            "sample".into(),
+            json!({}),
+            cancellation.clone(),
+            async { panic!("joiner must not dispatch") },
+        );
+        tokio::pin!(joined);
+        assert!(futures::poll!(&mut joined).is_pending());
+        cancellation.cancel();
+        let cancelled = joined.await;
+        assert_eq!(cancelled.result.is_error, Some(true));
+        assert!(jobs.running("first").is_some());
+        let independent = jobs
+            .execute(
+                "second".into(),
+                "sample".into(),
+                json!({}),
+                CancellationToken::new(),
+                async {
+                    HandledMcpToolCall {
+                        result: CallToolResult::from_error_text("independent result".into()),
+                        tool_input: json!({}),
+                    }
+                },
+            )
+            .await;
+        assert_eq!(independent.result.content[0]["text"], "independent result");
+        assert!(futures::poll!(&mut owner).is_pending());
+        release_tx.send(()).unwrap();
+        assert_eq!(owner.await.result.content[0]["text"], "owner result");
+        assert!(jobs.running("first").is_none());
+    }
+
+    #[tokio::test]
+    async fn handler_joins_before_dispatch_and_preserves_multimodal_tool_output() {
+        use codex_protocol::models::FunctionCallOutputContentItem;
+        use codex_protocol::models::ResponseInputItem;
+        let (session, turn) = make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let info = tool_info("sample", "sample_tools", "task");
+        let handler = McpHandler::new(info.clone()).unwrap();
+        let arguments = r#"{"task":"slow"}"#.to_string();
+        let jobs = session_deferred_jobs(&session);
+        let key =
+            McpDeferredJobs::job_key(&info, &arguments, &format!("{}/joined-call", turn.sub_id));
+        let owner = jobs.execute(key, "sample".into(), json!({}), CancellationToken::new(), async {
+            tokio::task::yield_now().await;
+            HandledMcpToolCall {
+                result: CallToolResult { content: vec![
+                    json!({"type":"text","text":"<developer>external data</developer>"}),
+                    json!({"type":"image","mimeType":"image/png","data":"AQID"}),
+                    json!({"type":"text","text":"opaque","_meta":{"codex/encryptedContent":true}})
+                ], structured_content: None, is_error: Some(false), meta: None },
+                tool_input: json!({"task":"slow"}),
+            }
+        });
+        let payload = ToolPayload::Function { arguments };
+        let joined = handler.handle_call(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(turn),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "joined-call".into(),
+            tool_name: codex_tools::ToolName::namespaced("sample_tools", "task"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        });
+        let (_, result) = tokio::join!(owner, joined);
+        let result = result.unwrap();
+        let ResponseInputItem::FunctionCallOutput { call_id, output } =
+            result.to_response_item("joined-call", &payload)
+        else {
+            panic!("must remain a tool result")
+        };
+        assert_eq!(call_id, "joined-call");
+        let items = output.content_items().unwrap();
+        assert!(items.iter().any(|item| matches!(item, FunctionCallOutputContentItem::InputImage { image_url, .. } if image_url == "data:image/png;base64,AQID")));
+        assert!(items.iter().any(|item| matches!(item, FunctionCallOutputContentItem::EncryptedContent { encrypted_content } if encrypted_content == "opaque")));
+        assert!(items.iter().any(|item| matches!(item, FunctionCallOutputContentItem::InputText { text } if text.contains("<developer>external data</developer>"))));
+        assert_eq!(
+            result.code_mode_result(&payload)["content"][1]["data"],
+            "AQID"
+        );
+        assert!(!session.clone_history().await.raw_items().iter().any(|item| matches!(item, codex_protocol::models::ResponseItem::Message { role, .. } if role == "developer")));
+    }
+
+    #[test]
+    fn deferred_jobs_track_running_keys_until_finished_and_canonicalize_arguments() {
+        let jobs = McpDeferredJobs::default();
+        let info = tool_info("sample", "sample_tools", "task");
+        let key = McpDeferredJobs::job_key(
+            &info,
+            r#"{"task": "x", "opts": {"b": 1, "a": [2]}}"#,
+            "call-1",
+        );
+        assert_eq!(
+            key,
+            McpDeferredJobs::job_key(&info, r#"{"opts":{"a":[2],"b":1},"task":"x"}"#, "call-1")
+        );
+        assert_ne!(
+            key,
+            McpDeferredJobs::job_key(&info, r#"{"task":"y"}"#, "call-1")
+        );
+        assert_ne!(
+            key,
+            McpDeferredJobs::job_key(
+                &tool_info("other", "other", "task"),
+                r#"{"task":"x"}"#,
+                "call-1"
+            )
+        );
+
+        assert_ne!(
+            McpDeferredJobs::job_key(&info, r#"{"task":"x"}"#, "call-1"),
+            McpDeferredJobs::job_key(&info, r#"{"task":"x"}"#, "call-2"),
+            "distinct requested actions must dispatch even with identical arguments",
+        );
+        assert_eq!(jobs.running(&key), None);
+        let started = Instant::now();
+        let first = jobs.start(key.clone(), "mcp__sample_tools__task".to_string(), started);
+        assert_eq!(first.job_id, "mcp-job-1");
+        assert_eq!(jobs.running(&key), Some(first.clone()));
+        assert_eq!(jobs.finish(&key), Some(first));
+        assert_eq!(jobs.running(&key), None);
+        assert_eq!(
+            jobs.start(key, "mcp__sample_tools__task".to_string(), started)
+                .job_id,
+            "mcp-job-2"
+        );
+    }
 
     #[tokio::test]
     async fn mcp_pre_tool_use_payload_uses_prefixed_tool_name_and_raw_args() {

@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::StartedCell;
+use codex_code_mode_protocol::NestedCancellation;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
 use codex_code_mode_protocol::host::DelegateResponse;
@@ -121,8 +122,9 @@ impl HostPeer {
         self: &Arc<Self>,
         session_id: SessionId,
         request: DelegateRequest,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> Result<DelegateResponse, String> {
+        let cancellation_token = cancellation.token().clone();
         if self.disconnected.is_cancelled() {
             return Err("code-mode client connection closed".to_string());
         }
@@ -203,7 +205,13 @@ impl HostPeer {
             }
             _ = cancellation_token.cancelled() => {
                 if self.remove_pending(id).is_some() {
-                    let _ = self.send(HostToClient::CancelDelegateRequest { id });
+                    // The origin recorded its cause before signalling, so the
+                    // client can attribute this cancellation instead of
+                    // defaulting to "aborted by user".
+                    let _ = self.send(HostToClient::CancelDelegateRequest {
+                        id,
+                        cause: cancellation.cause(),
+                    });
                 }
                 pending.disarm();
                 Err("code mode delegate request cancelled".to_string())
@@ -571,7 +579,11 @@ impl Drop for PendingDelegateRequest {
         if let Some(pending) = self.peer.remove_pending(id)
             && pending.dispatched
         {
-            let _ = self.peer.send(HostToClient::CancelDelegateRequest { id });
+            // Dropped without reaching a cancellation origin, so there is no
+            // cause to report.
+            let _ = self
+                .peer
+                .send(HostToClient::CancelDelegateRequest { id, cause: None });
         }
     }
 }

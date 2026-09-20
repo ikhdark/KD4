@@ -16,6 +16,8 @@ fn nested_code_mode_projection_is_not_provider_visible() {
         cell_id: "cell".to_string(),
         parent_call_id: Some("outer".to_string()),
         runtime_tool_call_id: "nested".to_string(),
+        nested_deadline: None,
+        cancellation_cause: None,
     }));
     assert!(admission_tracking_enabled(&ToolCallSource::Direct, true));
     assert!(!admission_tracking_enabled(&ToolCallSource::Direct, false));
@@ -87,6 +89,7 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         truncation_policy: codex_protocol::protocol::TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(64),
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -95,6 +98,7 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     crate::tools::context::ExecCommandToolOutput::reset_response_materialization_count();
     let mut result = AnyToolResult {
@@ -191,6 +195,8 @@ async fn small_admission_only_output_stays_inline_without_an_artifact() {
 
 #[tokio::test]
 async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
+    let _budget =
+        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let call_id = "registry-discovery";
     let registry_input = "text(ALL_TOOLS.find(tool => tool.name === 'exec_command').description);";
@@ -483,6 +489,8 @@ async fn code_mode_dispatch_without_hook_rewrite_preflights_once() -> anyhow::Re
         cell_id: "cell-1".to_string(),
         parent_call_id: Some("exec-1".to_string()),
         runtime_tool_call_id: "runtime-call-1".to_string(),
+        nested_deadline: None,
+        cancellation_cause: None,
     };
 
     registry
@@ -1613,7 +1621,11 @@ fn wire_only_receipt_cannot_satisfy_bounds_sensitive_owner_drain() {
 #[tokio::test]
 async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
-    let outer_text = "small native outer result".to_string();
+    let outer_text = "small native outer result\nunique recovered body".to_string();
+    let recovered = serde_json::json!({
+        "artifact_id": "nested-artifact",
+        "results": [{"text": "unique recovered body", "status": "ok", "complete": true}]
+    });
     let canonical = CanonicalToolResult::text(outer_text.clone());
     let mut projection = project_model_output(ModelProjectionInput {
         spillable_text: outer_text.clone(),
@@ -1679,7 +1691,7 @@ async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
             receipt: invalid_receipt,
         },
         PendingOwnerDrainedContinuation {
-            preserved_content: vec![serde_json::json!({"exact": "nested evidence"})],
+            preserved_content: vec![recovered.clone()],
             receipt: receipt.clone(),
         },
         PendingOwnerDrainedContinuation {
@@ -1695,10 +1707,35 @@ async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
     let envelope = projection.bounded.value();
     assert_eq!(envelope["artifact_id"], Value::Null);
     assert_eq!(envelope["result"]["artifact"], Value::Null);
-    assert_eq!(envelope["result"]["selected_text"], outer_text);
+    assert_eq!(
+        envelope["result"]["selected_text"],
+        "small native outer result\n"
+    );
+    assert_eq!(
+        projection
+            .bounded
+            .rendered()
+            .matches("unique recovered body")
+            .count(),
+        1
+    );
     assert_eq!(
         envelope["result"]["preserved_content"],
-        serde_json::json!([{"exact": "nested evidence"}])
+        serde_json::json!([recovered])
+    );
+}
+
+#[test]
+fn recovery_deduplication_preserves_independent_output_and_line_boundaries() {
+    let recovery = serde_json::json!({
+        "artifact_id": "artifact", "results": [{"text": "a\nb\n"}, {"text": "a"}]
+    });
+    assert_eq!(
+        without_preserved_recovery_text(
+            "before\na\nb\nafter\n{\"status\":\"a\"}\na\n",
+            &[recovery]
+        ),
+        "before\nafter\n{\"status\":\"a\"}\n\n"
     );
 }
 
@@ -1808,10 +1845,24 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         preserved_content: vec![serde_json::json!({ "exact": "x".repeat(8_000) })],
         receipt: oversized_receipt,
     };
+    // The projection bounds what the model reads; code running in a cell still
+    // receives the handler's own execution value, so it can branch on the real
+    // result instead of parsing a logical-artifact envelope.
+    // The projection still carries the envelope to the model.
+    let model_visible = format!("{:?}", nested.response());
+    assert!(
+        model_visible.contains(&inner_canonical.sha256),
+        "the model-facing path keeps the projection envelope: {model_visible}"
+    );
     let nested_code_mode = nested.code_mode_result();
-    assert_eq!(nested_code_mode["version"], 1);
-    assert!(nested_code_mode["artifact_id"].is_string());
-    assert_eq!(nested_code_mode["canonical_sha256"], inner_canonical.sha256);
+    assert!(
+        nested_code_mode.get("version").is_none(),
+        "the model-facing envelope must not be the nested return value: {nested_code_mode}"
+    );
+    assert!(
+        nested_code_mode.to_string().contains("native nested value"),
+        "the nested return value is the handler's own result: {nested_code_mode}"
+    );
 
     let outer_text = "outer code-mode output ".repeat(200);
     let outer_canonical = CanonicalToolResult::text(outer_text.clone());
@@ -2524,6 +2575,8 @@ async fn confirmed_performance_post_hook_response_is_deferred_until_success_and_
             cell_id: "cell-1".to_string(),
             parent_call_id: Some("exec-1".to_string()),
             runtime_tool_call_id: call_id.to_string(),
+            nested_deadline: None,
+            cancellation_cause: None,
         };
         registry
             .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())

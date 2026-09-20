@@ -216,6 +216,8 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
             "canonical_bytes": {"type": "integer", "minimum": 0},
             "retained_bytes": {"type": "integer", "minimum": 0},
             "complete": {"type": "boolean"},
+            "retained_artifact_complete": {"type": "boolean", "description": "All original bytes are retained. This does not imply the requested selection was delivered."},
+            "delivered_selection_complete": {"type": "boolean", "description": "All requested selectors were delivered completely; legacy complete has the same meaning."},
             "unavailable_ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}},
             "results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
             "continuation_stop": {
@@ -234,7 +236,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                 "additionalProperties": false
             }
         },
-        "required": ["artifact_id", "canonical_sha256", "canonical_bytes", "retained_bytes", "complete", "results"],
+        "required": ["artifact_id", "canonical_sha256", "canonical_bytes", "retained_bytes", "complete", "retained_artifact_complete", "delivered_selection_complete", "results"],
         "additionalProperties": false,
         "$defs": {
             "selector": selector_schema,

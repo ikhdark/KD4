@@ -68,6 +68,25 @@ def timing_profile() -> dict:
 
 
 class SharedTimingAnalysisTest(unittest.TestCase):
+    def test_provider_usage_replay_is_deduplicated_and_conflicts_are_visible(self):
+        profile = timing_profile()
+        request = profile["modelRequests"][0]
+        request["samplingRequestId"] = "sampling-1"
+        profile["modelRequests"] = [request, copy.deepcopy(request)]
+        profile["counters"]["logicalGenerationCount"] = 1
+        report = analysis.analyze_runner_evidence(self.evidence(profile))
+        self.assertEqual(report["tokens"]["observedTotals"]["inputTokens"], 100)
+        self.assertEqual(report["tokens"]["observedTotals"]["outputTokens"], 15)
+        self.assertEqual(report["tokens"]["deduplicatedRequestRecords"], 1)
+        self.assertEqual(report["tokens"]["conflictingUsageRequestIds"], [])
+        self.assertTrue(report["tokens"]["complete"])
+        profile["modelRequests"][1]["tokenUsage"]["inputTokens"] = 120
+        report = analysis.analyze_runner_evidence(self.evidence(profile))
+        self.assertEqual(report["tokens"]["observedTotals"]["inputTokens"], 120)
+        self.assertEqual(report["tokens"]["conflictingUsageRequestIds"], ["sampling-1"])
+        self.assertFalse(report["tokens"]["complete"])
+        self.assertIsNone(report["tokens"]["providerTotals"])
+
     def test_tool_dispatch_counters_flow_through_audit_and_require_complete_evidence(
         self,
     ):
@@ -1325,7 +1344,7 @@ class SharedTimingAnalysisTest(unittest.TestCase):
     def test_configuration_hash_uses_captured_values_not_layer_locations(self):
         evidence = self.evidence()
         evidence["effectiveConfig"] = {
-            "config": {"model": "test", "reasoning_phase_efforts": {"inspect": "low"}},
+            "config": {"model": "test", "example_settings": {"inspect": "low"}},
             "layers": ["first-home"],
         }
         first = audit.analyze_session_path(None, Path.cwd(), runner_evidence=evidence)
@@ -1336,12 +1355,12 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         )
         evidence["effectiveConfig"] = {
             "layers": ["second-home"],
-            "config": {"reasoning_phase_efforts": {"inspect": "low"}, "model": "test"},
+            "config": {"example_settings": {"inspect": "low"}, "model": "test"},
         }
         self.assertEqual(
             analysis.analyze_runner_evidence(evidence)["configuration"], config
         )
-        evidence["effectiveConfig"]["config"]["reasoning_phase_efforts"]["inspect"] = (
+        evidence["effectiveConfig"]["config"]["example_settings"]["inspect"] = (
             "high"
         )
         self.assertNotEqual(

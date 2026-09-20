@@ -124,7 +124,18 @@ fn custom_tool_output_items(req: &ResponsesRequest, call_id: &str) -> Vec<Value>
 
 fn normalize_script_output_items(items: Vec<Value>) -> Vec<Value> {
     let mut normalized = Vec::with_capacity(items.len());
-    for item in items {
+    for mut item in items {
+        // Payload tests inspect script output. Receipt tests below inspect the
+        // unmodified provider request separately, including tiny-budget cases.
+        if let Some(text) = item.get("text").and_then(Value::as_str)
+            && let Some((payload, _)) =
+                text.split_once("Nested command states (independent of script completion):\n")
+        {
+            if payload.trim().is_empty() {
+                continue;
+            }
+            item["text"] = Value::String(payload.trim_end_matches('\n').to_string());
+        }
         let wrapped_output = item
             .get("text")
             .and_then(Value::as_str)
@@ -167,6 +178,31 @@ fn normalize_script_output_items_splits_status_from_body() {
         "Script completed\nWall time 0.1 seconds\nOutput:\n"
     );
     assert_eq!(text_item(&items, 1), "first\nsecond");
+}
+
+fn nested_command_states(req: &ResponsesRequest, call_id: &str) -> Vec<Value> {
+    let raw = raw_custom_tool_output_text(req, call_id);
+    if let Ok(notice) = serde_json::from_str::<Value>(&raw)
+        && let Some(states) = notice["nested_commands"].as_array()
+    {
+        return states.clone();
+    }
+    let (_, states) = raw
+        .split_once("Nested command states (independent of script completion):\n")
+        .unwrap_or_else(|| panic!("missing complete command receipt: {raw}"));
+    serde_json::from_str(states).expect("command state must survive every output budget intact")
+}
+
+fn raw_custom_tool_output_text(req: &ResponsesRequest, call_id: &str) -> String {
+    match &req.custom_tool_call_output(call_id)["output"] {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        output => panic!("unexpected output: {output}"),
+    }
 }
 
 fn tool_names(body: &Value) -> Vec<String> {
@@ -260,7 +296,9 @@ fn custom_tool_output_last_non_empty_text(req: &ResponsesRequest, call_id: &str)
 
 fn assert_output_has_truncation_marker(output: &str) {
     assert!(
-        output.contains("tokens truncated") || output.contains("[omitted before retained middle]"),
+        output.contains("tokens truncated")
+            || output.contains("[omitted before retained middle]")
+            || output.contains("[command output reduced;"),
         "expected a truncation marker in output: {output}"
     );
 }
@@ -355,6 +393,164 @@ text("heartbeat-complete");"#,
         .filter(|request| request.url.path().contains("responses"))
         .count();
     assert_eq!(model_request_count, 2);
+    Ok(())
+}
+
+/// A model projection bounds what the *model* reads. Substituting it for the
+/// nested return value handed JavaScript a logical-artifact envelope with no
+/// `results[]`, so code inside a cell could not branch on what a read returned
+/// and spent generations rediscovering the shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_projected_nested_read_returns_its_execution_result_to_javascript() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::CodeMode);
+        // Projection is what replaced the return value; turn it on explicitly.
+        config.completed_tool_history_projection = true;
+    });
+    let test = builder.build(&server).await?;
+    // Large enough that the read is projected rather than passed through.
+    let large = "contract line that must be read in full\n".repeat(4_000);
+    fs::write(test.cwd_path().join("large.txt"), &large)?;
+
+    let script = r#"
+// Non-adjacent so nothing merges; together they exceed the projection's
+// token budget and force the canonical-artifact materialization.
+const result = await tools.read_file({
+  path: "large.txt",
+  selectors: [
+    { kind: "lines", start: 1, end: 200 },
+    { kind: "lines", start: 251, end: 450 },
+    { kind: "lines", start: 501, end: 700 },
+    { kind: "lines", start: 751, end: 950 },
+  ],
+});
+const shape = {
+  keys: Object.keys(result ?? {}).sort(),
+  hasResults: Array.isArray(result?.results),
+  resultCount: Array.isArray(result?.results) ? result.results.length : 0,
+  firstStatus: result?.results?.[0]?.status ?? null,
+  hasSections: Object.prototype.hasOwnProperty.call(result ?? {}, "sections"),
+};
+text(JSON.stringify(shape));
+"#;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call("call-1", "exec", script),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let completion = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    test.submit_turn("read the contract through a cell").await?;
+
+    let request = completion.single_request();
+    let items = custom_tool_output_items(&request, "call-1");
+    let reported = text_item(&items, 1);
+    let shape: Value = serde_json::from_str(reported)
+        .unwrap_or_else(|error| panic!("cell must report a JSON shape, got {reported:?}: {error}"));
+
+    assert_eq!(
+        shape["hasResults"],
+        Value::Bool(true),
+        "JavaScript must receive the handler's own result, got keys {:?}: {reported}",
+        shape["keys"]
+    );
+    assert!(
+        shape["resultCount"].as_u64().unwrap_or(0) > 0,
+        "the read must report at least one selector result: {reported}"
+    );
+    assert!(
+        shape["firstStatus"].is_string(),
+        "each selector result carries its own status: {reported}"
+    );
+    assert_eq!(
+        shape["hasSections"],
+        Value::Bool(false),
+        "the model-facing logical-artifact envelope must not be the return value: {reported}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_inventory_runs_through_code_mode_and_renders_exact_identifiers() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::CodeMode);
+        config.completed_tool_history_projection = true;
+    });
+    let test = builder.build(&server).await?;
+    fs::write(
+        test.cwd_path().join("inventory-component.txt"),
+        "component evidence\n",
+    )?;
+    let script = r#"
+const initial = await tools.inventory({operation:"create",scope:{roots:["."],purpose:"component inventory"},
+  profile:{categories:["components"],classifications:["included","excluded"],required_categories:["components"]}});
+const observed = await tools.inventory({operation:"observe",inventory_id:initial.inventory_id,
+  category:"components",paths:["inventory-component.txt","inventory-component.txt","inventory-missing.txt"],complete:true});
+const page = await tools.inventory({operation:"read",inventory_id:observed.inventory_id});
+const source = await tools.read_file({path:"inventory-component.txt",selectors:[{kind:"lines",start:1,end:1}]});
+const decisions = page.records.map(row => ({category:"components",candidate_id:row.candidate.id,
+  classification:row.candidate.exists ? "included" : "excluded",
+  evidence:row.candidate.exists ? [{artifact_id:source.artifact_id,lines:[1,1]}] : [row.record]}));
+const classified = await tools.inventory({operation:"classify",inventory_id:observed.inventory_id,decisions});
+const rendered = await tools.inventory({operation:"render",inventory_id:classified.inventory_id,classifications:["included"]});
+text(JSON.stringify({rendered,observed:observed.summary,ids:page.records.map(row => row.candidate.id)}));
+"#;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("inventory-1"),
+            ev_custom_tool_call("inventory-call", "exec", script),
+            ev_completed("inventory-1"),
+        ]),
+    )
+    .await;
+    let completion = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("inventory-done", "done"),
+            ev_completed("inventory-2"),
+        ]),
+    )
+    .await;
+    test.submit_turn("inventory the components using the retained records")
+        .await?;
+    let request = completion.single_request();
+    let items = custom_tool_output_items(&request, "inventory-call");
+    let reported = text_item(&items, 1);
+    let result: Value = serde_json::from_str(reported).unwrap_or_else(|error| {
+        panic!("inventory must return a result through Code Mode: {reported:?}: {error}")
+    });
+    assert_eq!(result["observed"]["unique_candidates"], 2);
+    assert_eq!(result["rendered"]["count"], 1);
+    assert_eq!(result["rendered"]["summary"]["complete"], true);
+    let rendered: Value = serde_json::from_slice(&fs::read(
+        result["rendered"]["rendered_path"]
+            .as_str()
+            .expect("exact rendered file"),
+    )?)?;
+    assert_eq!(
+        rendered["identifiers"],
+        serde_json::json!([test
+            .cwd_path()
+            .join("inventory-component.txt")
+            .to_string_lossy()])
+    );
+    assert_eq!(rendered["count"], 1);
     Ok(())
 }
 
@@ -1074,6 +1270,14 @@ async fn code_mode_terminal_prompt_requires_fresh_suites_and_completed_work(
     Ok(())
 }
 
+/// Aggregate ceiling this suite holds tool results to. Keep it in step with
+/// `DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET`; the fixture below has to
+/// clear it before the admission path has anything to decide.
+const MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 60_000;
+/// Enough ~9k-token cell outputs to carry the raw aggregate past that budget
+/// alongside the failed dispatches.
+const BUDGET_OUTPUT_CALLS: usize = 6;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1087,11 +1291,16 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         .build(&server)
         .await?;
     let mut events = vec![ev_response_created("many-results")];
-    events.push(ev_custom_tool_call(
-        "budget-output",
-        "exec",
-        "text('evidence '.repeat(3500));",
-    ));
+    // One result cannot exceed the aggregate budget on its own: a cell's output
+    // is capped per call. Emit several so the raw aggregate clears the budget
+    // and the admission path has to choose what to keep.
+    for index in 0..BUDGET_OUTPUT_CALLS {
+        events.push(ev_custom_tool_call(
+            &format!("budget-output-{index}"),
+            "exec",
+            "text('evidence '.repeat(4000));",
+        ));
+    }
     // Failed dispatches have no artifact candidate, but must share the same budget.
     for index in 0..800 {
         events.push(ev_custom_tool_call(
@@ -1122,8 +1331,9 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         .collect::<Vec<_>>();
     assert!(!outputs.is_empty());
     assert!(
-        outputs.len() < 801,
-        "dispatch failures must also be bounded under pressure"
+        outputs.len() < 800 + BUDGET_OUTPUT_CALLS,
+        "dispatch failures must also be bounded under pressure, kept {}",
+        outputs.len()
     );
     let total = outputs
         .iter()
@@ -1141,7 +1351,7 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         })
         .sum::<usize>();
     assert!(
-        total <= 10_000,
+        total <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET,
         "actual provider-visible results consumed {total} tokens"
     );
     for call in input
@@ -1158,6 +1368,10 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
     Ok(())
 }
 
+const PRESSURE_BATCHES: usize = 10;
+const PRESSURE_CALLS: usize = PRESSURE_BATCHES * 8;
+const PRESSURE_EVIDENCE_LINES: usize = 1_000;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1173,14 +1387,16 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
     let mut batches = Vec::new();
     // Each response stays within the eight-cell admission limit so every call
     // completes before the next batch adds pressure to the retained history.
-    for batch in 0..10 {
+    for batch in 0..PRESSURE_BATCHES {
         let response_id = format!("recovery-pressure-{batch}");
         let mut events = vec![ev_response_created(&response_id)];
         for index in batch * 8..(batch + 1) * 8 {
             events.push(ev_custom_tool_call(
                 &format!("recoverable-{index:03}"),
                 "exec",
-                &format!("text('recovery-{index:03}\\n' + 'evidence\\n'.repeat(1000));"),
+                &format!(
+                    "text('recovery-{index:03}\\n' + 'evidence\\n'.repeat({PRESSURE_EVIDENCE_LINES}));"
+                ),
             ));
         }
         events.push(ev_completed(&response_id));
@@ -1206,19 +1422,19 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
             .iter()
             .filter(|item| item["type"] == "custom_tool_call")
             .count(),
-        80
+        PRESSURE_CALLS
     );
     assert_eq!(
         input
             .iter()
             .filter(|item| item["type"] == "custom_tool_call_output")
             .count(),
-        80
+        PRESSURE_CALLS
     );
     let mut total_tokens = 0;
     let mut pinned = None;
     let mut artifact_ids = HashSet::new();
-    for index in 0..80 {
+    for index in 0..PRESSURE_CALLS {
         let call_id = format!("recoverable-{index:03}");
         let output = request.custom_tool_call_output(&call_id);
         let text = match &output["output"] {
@@ -1239,8 +1455,9 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
                 artifact_ids.insert(artifact_id.to_string()),
                 "each result has its own artifact"
             );
-            if recovery["kind"] == "tool_history_artifact_pin" {
-                assert_eq!(recovery["retrieval"]["tool"], "read_tool_output");
+            if pinned.is_none() {
+                // Both a regular receipt and a cheaper pin may fit the shared
+                // budget. Prove the reference is callable by reading it below.
                 pinned = Some((index, artifact_id.to_string()));
             }
         } else {
@@ -1251,10 +1468,11 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
         }
     }
     assert!(
-        total_tokens <= 10_000,
+        total_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET,
         "provider-visible results consumed {total_tokens} tokens"
     );
-    let (index, artifact_id) = pinned.expect("pressure must exercise cheaper artifact pins");
+    let (index, artifact_id) =
+        pinned.expect("pressure must retain a callable artifact recovery reference");
     let recovery_script = format!(
         "const recovered = await tools.read_tool_output({{artifact_id: {artifact_id:?}, selectors: [{{kind: 'bytes', start: 0, end: 256}}]}}); text(recovered.results.map(part => part.text ?? '').join(''));"
     );
@@ -1294,6 +1512,157 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
     ))?;
     assert!(!payload.is_empty(), "recovery must include payload bytes");
     assert_eq!(payload, &expected[1..1 + payload.len()]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_output_only_preserves_running_command_and_recovers_middle() -> Result<()> {
+    output_only_preserves_running_command_and_recovers_middle(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_output_only_zero_budget_preserves_running_command_and_recovers_middle()
+-> Result<()> {
+    output_only_preserves_running_command_and_recovers_middle(true).await
+}
+
+async fn output_only_preserves_running_command_and_recovers_middle(
+    zero_budget: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let fixture = tempfile::tempdir()?;
+    let release = fixture.path().join("release");
+    let source = fixture.path().join("source.txt");
+    let data = (0..4000)
+        .map(|i| {
+            if i == 2000 {
+                "DECISIVE_MIDDLE_MATCH".to_string()
+            } else {
+                format!("ordinary output line {i:04} {}", "x".repeat(80))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&source, data)?;
+    let command = format!(
+        "[Console]::Out.WriteLine('INITIAL_RESULT'); while (!(Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 25 }}; Get-Content -LiteralPath '{}'; [Console]::Out.WriteLine('DECISIVE_FINAL_RESULT')",
+        powershell_single_quoted_path(&release),
+        powershell_single_quoted_path(&source),
+    );
+    let code = format!(
+        "// @exec: {{\"max_output_tokens\": {budget}}}\nconst r = await tools.exec_command({{kind: 'script', cmd: {command:?}, yield_time_ms: 1000, max_output_tokens: {budget}}}); text(r.output);",
+        budget = if zero_budget { 0 } else { 256 },
+    );
+    let (test, observed) = run_code_mode_turn_with_config(
+        &server,
+        "Run the command and collect all its output.",
+        &code,
+        |config| config.completed_tool_history_projection = true,
+    )
+    .await?;
+    let raw = raw_custom_tool_output_text(&observed.single_request(), "call-1");
+    assert!(raw.contains("Script completed"), "{raw}");
+    assert_eq!(raw.contains("INITIAL_RESULT"), !zero_budget, "{raw}");
+    assert!(!raw.contains("DECISIVE_FINAL_RESULT"), "{raw}");
+    let states = nested_command_states(&observed.single_request(), "call-1");
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0]["process_exited"], false);
+    assert_eq!(states[0]["execution_state"], "running");
+    assert_eq!(states[0]["exit_code"], Value::Null);
+    assert_eq!(states[0]["output_complete"], false);
+    let session_id = states[0]["session_id"].as_u64().unwrap();
+    assert_eq!(
+        states[0]["continuation"]["arguments"]["session_id"],
+        session_id
+    );
+    fs::write(&release, "go")?;
+
+    let poll = format!(
+        "// @exec: {{\"max_output_tokens\": {budget}}}\nconst r = await tools.write_stdin({{session_id: {session_id}, chars: '', yield_time_ms: 30000, max_output_tokens: 256}}); text(r.output);",
+        budget = if zero_budget { 0 } else { 10000 },
+    );
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_custom_tool_call("poll", "exec", &poll),
+            ev_completed("poll-response"),
+        ]),
+    )
+    .await;
+    let observed = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("done-response"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Collect the remaining output using the returned handle.")
+        .await?;
+    assert_eq!(
+        nested_command_states(&observed.single_request(), "call-1")[0]["session_id"],
+        session_id,
+        "a completed wrapper must not retire the still-running child's receipt"
+    );
+    let raw = raw_custom_tool_output_text(&observed.single_request(), "poll");
+    assert_eq!(
+        raw.matches("DECISIVE_FINAL_RESULT").count(),
+        usize::from(!zero_budget),
+        "{raw}"
+    );
+    assert!(
+        !raw.contains("DECISIVE_MIDDLE_MATCH"),
+        "middle must be omitted: {raw}"
+    );
+    let states = nested_command_states(&observed.single_request(), "poll");
+    assert_eq!(states[0]["polled_session_id"], session_id);
+    assert_eq!(states[0]["process_exited"], true);
+    assert_eq!(states[0]["execution_state"], "exited");
+    assert_eq!(states[0]["exit_code"], 0);
+    assert_eq!(states[0]["output_complete"], false);
+    assert_eq!(states[0]["output_reduced"], true);
+    assert!(states[0].get("continuation").is_none());
+    let artifact_id = states[0]["raw_output_artifact_id"].as_str().unwrap();
+    assert_eq!(
+        states[0]["recovery"]["arguments"]["artifact_id"],
+        artifact_id
+    );
+    assert!(raw.contains(&format!("\"artifact_id\":\"{artifact_id}\"")));
+    // Removing the producer input proves recovery uses retained output.
+    fs::remove_file(&source)?;
+    let recover = format!(
+        "const r = await tools.read_tool_output({{artifact_id: {artifact_id:?}, selectors: [{{kind: 'lines', start: 2002, end: 2002}}]}}); text(r);"
+    );
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_custom_tool_call("recover", "exec", &recover),
+            ev_completed("recover-response"),
+        ]),
+    )
+    .await;
+    let observed = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("recovered", "done"),
+            ev_completed("recovered-response"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Recover the omitted decisive match from the artifact.")
+        .await?;
+    let raw =
+        custom_tool_output_last_non_empty_text(&observed.single_request(), "recover").unwrap();
+    let recovered: Value = serde_json::from_str(&raw)?;
+    assert_eq!(recovered["complete"], true, "{recovered}");
+    assert_eq!(recovered["results"][0]["status"], "ok");
+    assert_eq!(recovered["results"][0]["complete"], true);
+    assert_eq!(
+        recovered["results"][0]["text"].as_str().unwrap().trim_end(),
+        "DECISIVE_MIDDLE_MATCH"
+    );
+    assert!(!source.exists());
     Ok(())
 }
 
@@ -2204,6 +2573,7 @@ text(JSON.stringify({
   version: result.version,
   projected,
   output,
+  reduced: result.output_reduced,
   hasArtifact: result.result?.artifact != null
 }));
 "#,
@@ -2224,8 +2594,10 @@ text(JSON.stringify({
         let output = result["output"]
             .as_str()
             .expect("direct nested result should contain text output");
-        assert!(output.starts_with("Warning: truncated output"), "{output}");
-        assert_output_has_truncation_marker(output);
+        assert_eq!(result["reduced"], true);
+        assert!(output.contains('…'), "{output}");
+        assert!(codex_utils_output_truncation::approx_token_count(output) <= 5);
+        assert!(!output.contains("0123456789012345678901234567890123456789"));
     }
 
     Ok(())
@@ -2248,7 +2620,7 @@ const result = await tools.exec_command({
   yield_time_ms: 30_000
 });
 const output = result.result?.selected_text ?? result.output;
-const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+const resultVariableWasTruncated = result.output_reduced;
 text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
@@ -2281,7 +2653,7 @@ const result = await tools.exec_command({
   yield_time_ms: 30_000
 });
 const output = result.result?.selected_text ?? result.output;
-const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+const resultVariableWasTruncated = result.output_reduced;
 text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
@@ -2324,7 +2696,7 @@ const result = await tools.exec_command({
   yield_time_ms: 30_000
 });
 const output = result.result?.selected_text ?? result.output;
-const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+const resultVariableWasTruncated = result.output_reduced;
 text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "True" : "False"}.`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
@@ -2347,6 +2719,17 @@ text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "T
     assert!(output.contains("Variable truncated: True."), "{output}");
     assert_output_has_truncation_marker(&output);
 
+    let states = nested_command_states(&request, "call-1");
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0]["process_exited"], true);
+    assert_eq!(states[0]["output_complete"], false);
+    assert_eq!(states[0]["history_output_reduced"], true);
+    assert_eq!(states[0]["recovery"]["tool"], "read_tool_output");
+    assert_eq!(
+        states[0]["recovery"]["arguments"]["artifact_id"],
+        states[0]["raw_output_artifact_id"]
+    );
+    assert!(states[0]["raw_output_artifact_id"].is_string());
     Ok(())
 }
 
@@ -2366,7 +2749,7 @@ const result = await tools.exec_command({
   yield_time_ms: 30_000
 });
 const output = result.result?.selected_text ?? result.output;
-const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+const resultVariableWasTruncated = result.output_reduced;
 text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
@@ -2399,7 +2782,7 @@ const result = await tools.exec_command({
   yield_time_ms: 30_000
 });
 const output = result.result?.selected_text ?? result.output;
-const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+const resultVariableWasTruncated = result.output_reduced;
 text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "True" : "False"}.`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
@@ -2422,6 +2805,17 @@ text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "T
     assert!(output.contains("Variable truncated: True."), "{output}");
     assert_output_has_truncation_marker(&output);
 
+    let states = nested_command_states(&request, "call-1");
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0]["process_exited"], true);
+    assert_eq!(states[0]["output_complete"], false);
+    assert_eq!(states[0]["history_output_reduced"], true);
+    assert_eq!(states[0]["recovery"]["tool"], "read_tool_output");
+    assert_eq!(
+        states[0]["recovery"]["arguments"]["artifact_id"],
+        states[0]["raw_output_artifact_id"]
+    );
+    assert!(states[0]["raw_output_artifact_id"].is_string());
     Ok(())
 }
 
@@ -2455,6 +2849,12 @@ text(result.result?.selected_text ?? result.output);
     );
     assert!(!output.contains("0123456789012345678901234567890123456789"));
 
+    let states = nested_command_states(&request, "call-1");
+    assert_eq!(states[0]["process_exited"], true);
+    assert_eq!(states[0]["output_reduced"], false);
+    assert_eq!(states[0]["wrapper_output_reduced"], true);
+    assert_eq!(states[0]["output_complete"], false);
+    assert_eq!(states[0]["exit_code"], 0);
     Ok(())
 }
 

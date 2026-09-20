@@ -176,6 +176,36 @@ impl HostSkillsSnapshot {
         fs.read_file_text(&path, /*sandbox*/ None).await
     }
 
+    /// Reads a skill's `SKILL.md` through the provider that discovered it,
+    /// refusing anything past `max_bytes`, and reports the resolved path.
+    ///
+    /// The unbounded [`Self::read_skill_text`] is fine for rendering a catalog
+    /// the host already sized. A model-facing read needs a ceiling it can
+    /// report instead of loading whatever is on disk.
+    pub async fn read_skill_text_bounded(
+        &self,
+        skill: &SkillMetadata,
+        max_bytes: usize,
+    ) -> io::Result<(String, AbsolutePathBuf)> {
+        let fs = self
+            .outcome
+            .file_system_for_skill(skill)
+            .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
+        let path = PathUri::from_abs_path(&skill.path_to_skills_md);
+        let bytes = fs
+            .read_file_bounded(&path, max_bytes, /*sandbox*/ None)
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("skill exceeds the {max_bytes} byte read limit or changed while being read"),
+                )
+            })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "skill is not UTF-8 text"))?;
+        Ok((text, skill.path_to_skills_md.clone()))
+    }
+
     pub fn resolve_catalog_locator(&self, locator: &str) -> Option<&SkillMetadata> {
         let catalog_id = locator.strip_prefix(SKILL_CATALOG_LOCATOR_PREFIX)?;
         self.skills_by_catalog_id.get(catalog_id)

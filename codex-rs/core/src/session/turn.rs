@@ -76,18 +76,17 @@ use crate::session::EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
 use crate::session::PreparedContextUpdate;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
-use crate::session::reasoning_governor::AuthoritativeWaitResolution;
-use crate::session::reasoning_governor::ContinuationDisposition;
-use crate::session::reasoning_governor::GenerationRequestDisposition;
-use crate::session::reasoning_governor::SamplingConvergenceDecision;
-use crate::session::reasoning_governor::SamplingGenerationDisposition;
-use crate::session::reasoning_governor::SamplingReasoningGovernor;
-use crate::session::reasoning_governor::SamplingReasoningPhase;
-use crate::session::reasoning_governor::SamplingRequestSettledState;
-use crate::session::reasoning_governor::SamplingRequestSignalCollector;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_execution::AuthoritativeWaitResolution;
+use crate::session::turn_execution::ContinuationDisposition;
+use crate::session::turn_execution::GenerationRequestDisposition;
+use crate::session::turn_execution::SamplingConvergenceDecision;
+use crate::session::turn_execution::SamplingGenerationDisposition;
+use crate::session::turn_execution::SamplingRequestSettledState;
+use crate::session::turn_execution::SamplingRequestSignalCollector;
+use crate::session::turn_execution::TurnExecutionControl;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextTarget;
@@ -172,7 +171,6 @@ use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
-use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NextSampleBlockReason;
@@ -447,14 +445,8 @@ pub(crate) async fn run_turn(
         TurnDiffTracker::with_environment_display_roots(display_roots),
     ));
     let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);
-    let mut reasoning_governor = SamplingReasoningGovernor::new_with_timing(
-        turn_context
-            .config
-            .reasoning_phase_efforts
-            .as_ref()
-            .filter(|_| kd4_runtime),
-        Arc::clone(&turn_context.turn_timing_state),
-    );
+    let mut turn_execution =
+        TurnExecutionControl::new_with_timing(Arc::clone(&turn_context.turn_timing_state));
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -497,7 +489,7 @@ pub(crate) async fn run_turn(
         if recorded_input.accepted_context_input {
             prefetched_workspace_identity = None;
             mutating_finalizer_ran = false;
-            reasoning_governor.accepted_user_input();
+            turn_execution.accepted_user_input();
             logical_generation_budget.accepted_user_input();
         }
         if recorded_input.should_stop {
@@ -518,19 +510,19 @@ pub(crate) async fn run_turn(
         };
         let request_baselines = {
             let tracker = turn_diff_tracker.lock().await;
-            reasoning_governor.baselines_with_tool_exposure_revision(
+            turn_execution.baselines_with_tool_exposure_revision(
                 tracker.current_mutation_revision(),
                 turn_context.deferred_tool_activation_revision(),
             )
         };
         let request_signals = if kd4_runtime {
-            reasoning_governor.collector(&request_baselines)
+            turn_execution.collector(&request_baselines)
         } else {
             SamplingRequestSignalCollector::default()
         };
         let mut generation_request = pending_generation_request.take().unwrap_or_else(|| {
             if !has_started_generation {
-                reasoning_governor.initial_generation_request(&request_baselines)
+                turn_execution.initial_generation_request(&request_baselines)
             } else {
                 GenerationRequestDisposition {
                     purpose: match pending_continuation_cause {
@@ -683,8 +675,6 @@ pub(crate) async fn run_turn(
                 &mut first_router,
                 &base_instructions,
                 &mut preparation_timing_guard,
-                reasoning_governor.phase(),
-                reasoning_governor.trigger(),
                 generation_request.clone(),
                 generation_id.clone(),
                 request_signals.clone(),
@@ -733,7 +723,7 @@ pub(crate) async fn run_turn(
                         defer_pending_input: false,
                     });
                 }
-                reasoning_governor.settle(&request_baselines, &request_signals, &settled_state);
+                turn_execution.settle(&request_baselines, &request_signals, &settled_state);
                 can_drain_pending_input = true;
                 let (has_pending_input, token_status) = collect_post_sampling_state(
                     sess.input_queue.has_pending_input(&sess.active_turn),
@@ -763,7 +753,7 @@ pub(crate) async fn run_turn(
                     request_signals.progress_kinds(&request_baselines, &settled_state);
                 let mut convergence_decision =
                     if kd4_runtime && needs_follow_up && !has_pending_input {
-                        Some(reasoning_governor.evaluate_convergence(
+                        Some(turn_execution.evaluate_convergence(
                             &request_baselines,
                             &request_signals,
                             &settled_state,
@@ -784,7 +774,7 @@ pub(crate) async fn run_turn(
                 let server_resample_eligible =
                     server_end_turn_false && !tool_result_continuation && !has_pending_input;
                 let mut next_generation_request = needs_follow_up.then(|| {
-                    reasoning_governor.continuation_generation_request(
+                    turn_execution.continuation_generation_request(
                         &request_baselines,
                         &request_signals,
                         &settled_state,
@@ -799,7 +789,7 @@ pub(crate) async fn run_turn(
                 if next_generation_request
                     .as_ref()
                     .is_some_and(
-                        super::reasoning_governor::GenerationRequestDisposition::completes_protocol_turn_deterministically,
+                        super::turn_execution::GenerationRequestDisposition::completes_protocol_turn_deterministically,
                     )
                 {
                     // The only remaining action is host-owned protocol
@@ -904,7 +894,6 @@ pub(crate) async fn run_turn(
                         break 'sampling_loop;
                     }
                     can_drain_pending_input = !model_needs_follow_up;
-                    reasoning_governor.host_retain();
                     pending_continuation_cause = Some(ContinuationCause::Compaction);
                     continue;
                 }
@@ -958,7 +947,6 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                         stop_hook_active = true;
-                        reasoning_governor.host_diagnose();
                         pending_generation_request = None;
                         pending_continuation_cause = Some(ContinuationCause::StopHook);
                         continue 'sampling_loop;
@@ -1184,7 +1172,7 @@ fn authoritative_wait_terminal_surface(
 
 // Keep a finite emergency boundary for genuinely non-converging turns while
 // leaving room for legitimate multi-step tool work. Deterministic repeated
-// cycles are handled earlier by the reasoning governor.
+// cycles are handled earlier by the turn execution control.
 const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1491,7 +1479,7 @@ struct RecordedInputOutcome {
     accepted_context_input: bool,
 }
 
-fn resets_reasoning_governor(input: &TurnInput) -> bool {
+fn resets_turn_execution(input: &TurnInput) -> bool {
     match input {
         TurnInput::UserInput { content, .. } => !content.is_empty(),
         TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => true,
@@ -1519,7 +1507,7 @@ async fn run_hooks_and_record_inputs_detailed(
             .await;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if resets_reasoning_governor(input_item) {
+            if resets_turn_execution(input_item) {
                 accepted_context_input = true;
             }
             record_pending_input(
@@ -3020,6 +3008,9 @@ pub(crate) fn build_prompt(
         stable_context_fallback_input: Arc::clone(&input),
         tool_history_fallback_input: Arc::clone(&input),
         stable_context_tool_history_fallback_input: input,
+        // This path builds one representation directly and runs no aggregate
+        // output budget over it.
+        tool_output_budget_drops: Default::default(),
         tool_history_substitutions: Arc::from([]),
         stable_context_fallback_tool_history_substitutions: Arc::from([]),
         stable_context_manifest: Default::default(),
@@ -3449,6 +3440,7 @@ fn build_projected_prompt_from_scaffold(
         stable_context_fallback_input: fallback_input,
         tool_history_fallback_input,
         stable_context_tool_history_fallback_input,
+        tool_output_budget_drops: prepared.tool_output_budget_drops(),
         tool_history_substitutions: prepared.tool_history_substitutions(),
         stable_context_fallback_tool_history_substitutions: prepared
             .fallback_tool_history_substitutions(),
@@ -3490,8 +3482,6 @@ async fn run_sampling_request(
     prebuilt_router: &mut Option<Arc<ToolRouter>>,
     base_instructions: &BaseInstructions,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
-    reasoning_phase: Option<SamplingReasoningPhase>,
-    reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
     generation_request: GenerationRequestDisposition,
     generation_id: ModelGenerationId,
     request_signals: SamplingRequestSignalCollector,
@@ -3647,9 +3637,6 @@ async fn run_sampling_request(
             &prompt,
             &generation_id,
             preparation_timing_guard,
-            reasoning_phase,
-            reasoning_trigger,
-            generation_request.sampling.clone(),
             Arc::clone(&pending_tool_manifest),
             cancellation_token.child_token(),
             &mut attempt_progress,
@@ -5258,9 +5245,6 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     generation_id: &ModelGenerationId,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
-    reasoning_phase: Option<SamplingReasoningPhase>,
-    reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
-    sampling: SamplingGenerationDisposition,
     pending_tool_manifest: Arc<Mutex<Option<codex_protocol::protocol::ToolManifestItem>>>,
     cancellation_token: CancellationToken,
     attempt_progress: &mut SamplingAttemptProgress,
@@ -5327,19 +5311,15 @@ async fn try_run_sampling_request(
         }
         return Err(CodexErr::TurnAborted);
     }
-    let request_policy = crate::session::reasoning_governor::resolve_request_policy_for_runtime(
-        turn_context.config.features.enabled(Feature::Kd4Runtime),
-        reasoning_phase,
-        turn_context.config.reasoning_phase_efforts.as_ref(),
-        turn_context.configured_reasoning_effort.clone(),
+    let request_effort = crate::client::request_effort_for_model(
         &turn_context.model_info,
-        &sampling,
+        turn_context.configured_reasoning_effort.clone(),
     );
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
         sandbox_policy = &turn_context.sandbox_policy(),
-        effort = request_policy.request_effort,
+        effort = request_effort,
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
@@ -5347,7 +5327,17 @@ async fn try_run_sampling_request(
         turn_context.sub_id.as_str(),
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
-    );
+    ).with_request_metadata(|| serde_json::json!({
+        "enabled_features": sess.features.enabled_features().into_iter().map(Feature::key).collect::<Vec<_>>(),
+        "task_model_guidance_enabled": sess.features.enabled(Feature::TaskModelGuidance),
+        "base_instructions_own_task_model_guidance": crate::context::base_instructions_own_task_model_guidance(&prompt.base_instructions.text),
+        "configured_reasoning_effort": turn_context.configured_reasoning_effort,
+        "resolved_reasoning_effort": request_effort,
+        "reasoning_summary": turn_context.reasoning_summary,
+        "service_tier": turn_context.config.service_tier,
+        "collaboration_mode": turn_context.collaboration_mode,
+        "parallel_tool_calls": prompt.parallel_tool_calls,
+    }));
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config
@@ -5379,7 +5369,7 @@ async fn try_run_sampling_request(
                         *prewarmed_session,
                         prompt,
                         &turn_context.model_info,
-                        request_policy.request_effort.clone(),
+                        request_effort.clone(),
                         turn_context.reasoning_summary,
                         turn_context.config.service_tier.clone(),
                         responses_metadata,
@@ -5410,18 +5400,6 @@ async fn try_run_sampling_request(
     drop(preparation_timing_guard.take());
     let startup_snapshot = sess.startup_timing.complete_snapshot();
     startup_snapshot.trace_frozen_at_first_model_send();
-    if let Some(recorder) = sess.active_reasoning_policy_recorder().await
-        && let Some(snapshot) = recorder.append(
-            &request_policy,
-            turn_context.model_info.slug.clone(),
-            reasoning_trigger,
-        )
-    {
-        sess.try_send_live_event(Event {
-            id: turn_context.sub_id.clone(),
-            msg: EventMsg::ReasoningPolicyUpdated(snapshot),
-        });
-    }
     let boundary_session = Arc::clone(&sess);
     let boundary_turn_id = turn_context.sub_id.clone();
     let boundary_turn_timing = Arc::clone(&turn_context.turn_timing_state);
@@ -5535,7 +5513,7 @@ async fn try_run_sampling_request(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
-            request_policy.request_effort.clone(),
+            request_effort.clone(),
             turn_context.reasoning_summary,
             turn_context.config.service_tier.clone(),
             responses_metadata,
@@ -5569,26 +5547,10 @@ async fn try_run_sampling_request(
     let mut should_emit_turn_diff = false;
     let mut should_emit_token_count = false;
     let mut latest_models_etag = None;
-    let reasoning_effort = request_policy
-        .request_effort
+    let reasoning_effort = request_effort
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_else(|| "default".to_string());
-    let reasoning_phase = request_policy
-        .phase
-        .map(|phase| match phase {
-            SamplingReasoningPhase::Orient => "orient",
-            SamplingReasoningPhase::Inspect => "inspect",
-            SamplingReasoningPhase::Implement => "implement",
-            SamplingReasoningPhase::Verify => "verify",
-            SamplingReasoningPhase::Diagnose => "diagnose",
-            SamplingReasoningPhase::Finalize => "finalize",
-        })
-        .unwrap_or("disabled");
-    let reasoning_effort_source = match request_policy.source {
-        codex_protocol::protocol::ReasoningPolicySource::PhaseOverride => "phase_override",
-        codex_protocol::protocol::ReasoningPolicySource::TurnFallback => "turn_fallback",
-    };
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
@@ -5611,8 +5573,6 @@ async fn try_run_sampling_request(
             tool_name = field::Empty,
             from = field::Empty,
             codex.request.reasoning_effort = %reasoning_effort,
-            codex.request.reasoning_phase = reasoning_phase,
-            codex.request.reasoning_effort_source = reasoning_effort_source,
             gen_ai.usage.input_tokens = field::Empty,
             gen_ai.usage.cache_read.input_tokens = field::Empty,
             gen_ai.usage.output_tokens = field::Empty,

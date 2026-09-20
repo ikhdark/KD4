@@ -11017,6 +11017,101 @@
         }
       ]
     },
+    "Project": {
+      "properties": {
+        "createdAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "name": {
+          "type": "string"
+        },
+        "position": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "recencyAt": {
+          "description": "Newest non-archived member thread's recency, in Unix seconds; null when none exist.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "roots": {
+          "items": {
+            "$ref": "#/definitions/ProjectRoot"
+          },
+          "type": "array"
+        },
+        "updatedAt": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "createdAt",
+        "id",
+        "metadata",
+        "name",
+        "position",
+        "roots",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "ProjectChangeType": {
+      "enum": [
+        "created",
+        "updated",
+        "deleted"
+      ],
+      "type": "string"
+    },
+    "ProjectChangedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "changeType": {
+          "$ref": "#/definitions/ProjectChangeType"
+        },
+        "projectId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "changeType",
+        "projectId"
+      ],
+      "title": "ProjectChangedNotification",
+      "type": "object"
+    },
+    "ProjectRoot": {
+      "properties": {
+        "path": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ProjectSortKey": {
+      "enum": [
+        "position",
+        "recencyAt"
+      ],
+      "type": "string"
+    },
     "PtyTerminalSize": {
       "description": "Canonical PTY size payload shared by app-server process APIs.",
       "properties": {
@@ -11353,136 +11448,6 @@
           "type": "object"
         }
       ]
-    },
-    "ReasoningPolicyHistory": {
-      "description": "Bounded, durable per-turn reasoning-policy history.",
-      "properties": {
-        "entries": {
-          "items": {
-            "$ref": "#/definitions/ReasoningPolicySnapshot"
-          },
-          "type": "array"
-        },
-        "totalEntries": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "turnId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "entries",
-        "totalEntries",
-        "truncated",
-        "turnId"
-      ],
-      "type": "object"
-    },
-    "ReasoningPolicyPhase": {
-      "description": "Response event from the agent NOTE: Make sure none of these values have optional types, as it will mess up the extension code-gen. The exact request policy used for one model stream attempt. This is protocol state so rollout reconstruction and late-attaching clients observe the same decision as live consumers.",
-      "enum": [
-        "orient",
-        "inspect",
-        "implement",
-        "verify",
-        "diagnose",
-        "finalize"
-      ],
-      "type": "string"
-    },
-    "ReasoningPolicySnapshot": {
-      "properties": {
-        "configuredEffort": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "effectiveEffort": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "model": {
-          "type": "string"
-        },
-        "phase": {
-          "$ref": "#/definitions/ReasoningPolicyPhase"
-        },
-        "requestEffort": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "sequence": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "source": {
-          "$ref": "#/definitions/ReasoningPolicySource"
-        },
-        "timestamp": {
-          "description": "Unix timestamp in milliseconds.",
-          "format": "int64",
-          "type": "integer"
-        },
-        "trigger": {
-          "$ref": "#/definitions/ReasoningPolicyTrigger"
-        }
-      },
-      "required": [
-        "model",
-        "phase",
-        "sequence",
-        "source",
-        "timestamp",
-        "trigger"
-      ],
-      "type": "object"
-    },
-    "ReasoningPolicySource": {
-      "enum": [
-        "phase_override",
-        "turn_fallback"
-      ],
-      "type": "string"
-    },
-    "ReasoningPolicyTrigger": {
-      "enum": [
-        "user_input",
-        "read_only_tool_success",
-        "workspace_mutation",
-        "tool_failed",
-        "tool_blocked",
-        "tool_timed_out",
-        "tool_cancelled",
-        "validation_passed",
-        "validation_failed",
-        "validation_timed_out",
-        "plan_updated",
-        "host_override"
-      ],
-      "type": "string"
     },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
@@ -13013,6 +12978,46 @@
           "properties": {
             "method": {
               "enum": [
+                "project/changed"
+              ],
+              "title": "Project/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ProjectChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Project/changedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/project/updated"
+              ],
+              "title": "Thread/project/updatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadProjectUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/project/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/settings/updated"
               ],
               "title": "Thread/settings/updatedNotificationMethod",
@@ -13067,46 +13072,6 @@
             "params"
           ],
           "title": "Turn/startedNotification",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "enum": [
-                "turn/reasoningPolicy/updated"
-              ],
-              "title": "Turn/reasoningPolicy/updatedNotificationMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/TurnReasoningPolicyUpdatedNotification"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "title": "Turn/reasoningPolicy/updatedNotification",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "enum": [
-                "turn/reasoningPolicy/summary"
-              ],
-              "title": "Turn/reasoningPolicy/summaryNotificationMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/TurnReasoningPolicySummaryNotification"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "title": "Turn/reasoningPolicy/summaryNotification",
           "type": "object"
         },
         {
@@ -14752,6 +14717,13 @@
           "description": "Usually the first user message in the thread, if available.",
           "type": "string"
         },
+        "projectId": {
+          "description": "Canonical project assignment owned by app-server, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "recencyAt": {
           "description": "Unix timestamp (in seconds) used for thread recency ordering.",
           "format": "int64",
@@ -14812,6 +14784,7 @@
         "id",
         "modelProvider",
         "preview",
+        "projectId",
         "sessionId",
         "source",
         "status",
@@ -16395,6 +16368,26 @@
       "title": "ThreadNameUpdatedNotification",
       "type": "object"
     },
+    "ThreadProjectUpdatedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "projectId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projectId",
+        "threadId"
+      ],
+      "title": "ThreadProjectUpdatedNotification",
+      "type": "object"
+    },
     "ThreadReadParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -17785,48 +17778,6 @@
       "title": "TurnPlanUpdatedNotification",
       "type": "object"
     },
-    "TurnReasoningPolicySummaryNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "history": {
-          "$ref": "#/definitions/ReasoningPolicyHistory"
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "turnId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "history",
-        "threadId",
-        "turnId"
-      ],
-      "title": "TurnReasoningPolicySummaryNotification",
-      "type": "object"
-    },
-    "TurnReasoningPolicyUpdatedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "snapshot": {
-          "$ref": "#/definitions/ReasoningPolicySnapshot"
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "turnId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "snapshot",
-        "threadId",
-        "turnId"
-      ],
-      "title": "TurnReasoningPolicyUpdatedNotification",
-      "type": "object"
-    },
     "TurnStartParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -18498,7 +18449,7 @@
         },
         "residualDeterministicGenerationCount": {
           "default": 0,
-          "description": "Residual deterministic generation requests proved by the reasoning governor, including requests elided before provider dispatch.",
+          "description": "Residual deterministic generation requests proved by turn execution control, including requests elided before provider dispatch.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -18548,6 +18499,20 @@
         "toolOutputArtifactReuseCount": {
           "default": 0,
           "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDropCount": {
+          "default": 0,
+          "description": "Tool results the aggregate output budget dropped across every request this turn actually sent. Preparing an unchanged projection again adds nothing; only a dispatched request contributes.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDroppedTokenCount": {
+          "default": 0,
+          "description": "Tokens those dropped results would have occupied.",
+          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -19702,6 +19667,40 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "fixedPrefixChangedCategories": {
+          "description": "Fixed-prefix categories whose exact hash differed from the preceding request. Non-empty explains why fixed-prefix reuse was ineligible.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "historyFirstDivergentIndex": {
+          "description": "First input index whose digest differs from the preceding request's.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "historyItemsPrevious": {
+          "description": "Input items the preceding request sent, from this request's own comparison. Absent on the first request of a comparison chain, which has no predecessor to diverge from.\n\nA whole-history digest changes on every request by design, so it cannot distinguish appending from rewriting. These three fields can: with `history_prefix_items_reused == history_items_previous` the request only appended, and a smaller `history_first_divergent_index` locates where the prefix was rewritten or truncated instead.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "historyPrefixItemsReused": {
+          "description": "Leading input items identical to the preceding request's.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "localInputEstimate": {
           "default": 0,
           "description": "One-pass local estimate over the complete serialized logical prompt.",
@@ -19762,6 +19761,20 @@
         },
         "skills": {
           "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDropCount": {
+          "default": 0,
+          "description": "Tool results the aggregate output budget dropped from the representation this request actually sent.\n\nAttributed to one request and one representation: the budget runs over several candidate projections, and summing them would count drops that never reached the model.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDroppedTokenCount": {
+          "default": 0,
+          "description": "Tokens those dropped results would have occupied.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"

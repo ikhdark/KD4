@@ -3,6 +3,7 @@ use std::sync::Arc;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
+use codex_code_mode_protocol::NestedCancellation;
 use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::host::DelegateRequest;
@@ -27,7 +28,7 @@ impl CodeModeSessionDelegate for RemoteDelegate {
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             match self
@@ -37,7 +38,7 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                     DelegateRequest::InvokeTool {
                         invocation: invocation.into(),
                     },
-                    cancellation_token,
+                    cancellation,
                 )
                 .await?
             {
@@ -66,7 +67,7 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                         cell_id: cell_id.into(),
                         text,
                     },
-                    cancellation_token,
+                    NestedCancellation::new(cancellation_token),
                 )
                 .await?
             {

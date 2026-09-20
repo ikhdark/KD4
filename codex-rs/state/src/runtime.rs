@@ -71,6 +71,7 @@ mod logs;
 pub use logs::LogReader;
 pub(crate) use logs::LogRetentionScope;
 mod memories;
+mod projects;
 mod recovery;
 mod remote_control;
 #[cfg(test)]

@@ -805,6 +805,7 @@ mod tests {
         let id = ThreadId::from_string(&Uuid::from_u128(42).to_string()).expect("thread id");
         let created_at = DateTime::<Utc>::from_timestamp(1_735_689_600, 0).expect("timestamp");
         ThreadMetadata {
+            project_id: None,
             id,
             rollout_path: PathBuf::from("/tmp/a.jsonl"),
             created_at,

@@ -95,7 +95,6 @@ impl ChatWidget {
         }
         self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
-        self.active_reasoning_policy = None;
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
             /*body*/ None,
@@ -199,7 +198,6 @@ impl ChatWidget {
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
-        self.active_reasoning_policy = None;
         if !from_replay {
             let body = Notification::agent_turn_preview(&notification_response);
             self.set_ambient_pet_notification(crate::pets::PetNotificationKind::Review, body);

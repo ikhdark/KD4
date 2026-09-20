@@ -24,7 +24,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
     );
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
-        description: "Updates the task checklist for work with multiple substantive steps. Skip plans for straightforward work; do not create single-step plans. At most one step can be in_progress at a time."
+        description: "Updates the task checklist for work with multiple substantive dependent steps. Execute bounded read-only inventories directly. Skip plans for straightforward work; do not create single-step plans. At most one step can be in_progress at a time."
             .to_string(),
         strict: false,
         defer_loading: None,

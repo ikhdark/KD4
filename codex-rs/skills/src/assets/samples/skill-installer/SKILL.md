@@ -31,7 +31,7 @@ After installing a skill, tell the user it will be available on their next turn.
 
 ## Scripts
 
-All of these scripts use network, so when running in the sandbox, request escalation when running them.
+These scripts use the network. Use already-permitted network access; request additional permissions only when needed and allowed by the active policy. Never request escalation when the policy forbids it.
 
 - `scripts/list-skills.py` (prints skills list with installed annotations)
 - `scripts/list-skills.py --format json`

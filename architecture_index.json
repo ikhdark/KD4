@@ -1,7 +1,7 @@
 {
-  "index_sha256": "a224eb7413fcfdc086d8c3cd48e1c7a7e23ab505aa658bc12e91366b65fd0cfb",
+  "index_sha256": "86601837f3fff51ab01bcd0b65e96948a7d30ffce55a320e8f88366de6e86d6d",
   "index_version": 1,
-  "manifest_sha256": "949219c6c0f880357e1b9626a5cd2e45dd1d6b7d753848e86e6c7d8d09437caf",
+  "manifest_sha256": "c31d8275f8e60255bc52652747398580fa29f7a7ee7f84763bd02f4f881b28c9",
   "omitted": {
     "relationships": 0
   },
@@ -734,7 +734,7 @@
         "codex-rs/core/src/tools/handlers/plan.rs",
         "codex-rs/core/src/tools/handlers/plan_tests.rs",
         "codex-rs/core/src/tools/spec_plan.rs",
-        "codex-rs/core/src/session/reasoning_governor.rs"
+        "codex-rs/core/src/session/turn_execution.rs"
       ],
       "tests": [
         "codex-rs/core/src/tools/handlers/plan_tests.rs"
@@ -1585,17 +1585,25 @@
         {
           "path": "codex-rs/core/src/tools/handlers/read_tool_output.rs",
           "symbol": "ReadToolOutputHandler"
+        },
+        {
+          "path": "codex-rs/core/src/tools/handlers/retained_inventory.rs",
+          "symbol": "RetainedInventoryHandler"
         }
       ],
       "roots": [
         "codex-rs/core/src/tools/command_output_artifact.rs",
         "codex-rs/core/src/tools/handlers/read_tool_output.rs",
+        "codex-rs/core/src/tools/handlers/retained_inventory.rs",
+        "codex-rs/core/src/tools/handlers/retained_inventory_tests.rs",
         "codex-rs/core/src/tool_history.rs",
-        "codex-rs/core/src/tool_history_tests.rs"
+        "codex-rs/core/src/tool_history_tests.rs",
+        "docs/retained-inventory.md"
       ],
       "tests": [
         "codex-rs/core/src/tools/command_output_artifact_tests.rs",
-        "codex-rs/core/src/tool_history_tests.rs"
+        "codex-rs/core/src/tool_history_tests.rs",
+        "codex-rs/core/src/tools/handlers/retained_inventory_tests.rs"
       ],
       "validation": [
         {
@@ -2929,13 +2937,13 @@
       "confidence": "compiler_resolved",
       "evidence": [
         {
-          "path": "codex-rs/core/src/session/reasoning_governor.rs",
-          "symbol": "SamplingReasoningGovernor"
+          "path": "codex-rs/core/src/session/turn_execution.rs",
+          "symbol": "TurnExecutionControl"
         }
       ],
       "kind": "consumed_by",
       "source": "owner:planning-architecture-runtime",
-      "target": "path:codex-rs/core/src/session/reasoning_governor.rs"
+      "target": "path:codex-rs/core/src/session/turn_execution.rs"
     },
     {
       "category": "control_flow",
@@ -4348,7 +4356,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:949219c6c0f880357e1b9626a5cd2e45dd1d6b7d753848e86e6c7d8d09437caf:sources:09833954f949ec748aa17d1639e7e18a0ec8ec32f1880991119beb9dab334ef4",
+  "repository_revision": "manifest:c31d8275f8e60255bc52652747398580fa29f7a7ee7f84763bd02f4f881b28c9:sources:a503ce7f86d50a9da5604dc1f25dfd27b5b9b08f352e8297f87a85c2f1760a69",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

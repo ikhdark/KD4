@@ -35,7 +35,6 @@ async fn completed_file_changes_are_visible_in_replayed_turns() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             }],
             replay_kind,
         );
@@ -106,7 +105,6 @@ async fn dynamic_tool_results_render_through_live_notifications_and_resumed_turn
                     duration_ms: None,
                     timing: None,
                     surfaced_result: None,
-                    reasoning_policy_history: None,
                 }],
                 replay_kind,
             );
@@ -999,7 +997,6 @@ async fn replayed_retryable_app_server_error_keeps_turn_running() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         Some(ReplayKind::ThreadSnapshot),
@@ -1188,7 +1185,6 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1248,7 +1244,6 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1339,7 +1334,6 @@ async fn replayed_in_progress_turn_marks_task_running() {
             duration_ms: None,
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         }],
         ReplayKind::ResumeInitialMessages,
     );

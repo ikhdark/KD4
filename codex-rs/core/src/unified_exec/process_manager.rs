@@ -112,6 +112,28 @@ const NETWORK_ACCESS_DENIED_MESSAGE: &str =
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
 const INITIAL_OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(250);
 const INTERRUPT: &str = "\u{3}";
+/// Headroom reserved inside a nested call's budget for returning the result
+/// through dispatch and transport to the runtime wrapper.
+///
+/// Observation stops this early so the wrapper receives a yielded process
+/// handle instead of dropping the call at its own hard deadline.
+pub(crate) const NESTED_POLL_MARGIN: Duration = Duration::from_millis(2_000);
+
+/// Latest instant this call may still be observing output, given the runtime
+/// wrapper's hard deadline. `None` when no wrapper bounds the call.
+///
+/// Never earlier than `now`: an already-exhausted budget yields immediately
+/// rather than producing a deadline in the past that reads as an error.
+fn nested_poll_bound(nested_deadline: Option<std::time::Instant>) -> Option<Instant> {
+    let nested_deadline = Instant::from_std(nested_deadline?);
+    let now = Instant::now();
+    Some(
+        nested_deadline
+            .checked_sub(NESTED_POLL_MARGIN)
+            .unwrap_or(now)
+            .max(now),
+    )
+}
 
 struct CollectedOutput {
     bytes: Vec<u8>,
@@ -311,6 +333,7 @@ struct PreparedProcessHandles {
     process_id: u32,
     search_exit_one_is_no_match: bool,
     tty: bool,
+    validation_launch: bool,
 }
 
 struct InitialExecCommandGuard {
@@ -1162,6 +1185,7 @@ impl UnifiedExecProcessManager {
                     truncation_policy: context.turn.model_info.truncation_policy.into(),
                     max_output_tokens: request.max_output_tokens,
                     process_id: None,
+                    session_capabilities: None,
                     exit_code: Some(0),
                     process_exited: true,
                     search_no_match: false,
@@ -1170,6 +1194,7 @@ impl UnifiedExecProcessManager {
                     raw_output_artifact: Some(hit.raw_output_artifact().clone()),
                     raw_output_reduction_notice: None,
                     repair_notice: None,
+                    pending_deferred_completions: Vec::new(),
                 }
                 .with_prepared_reduction_notice()
                 .await);
@@ -1246,6 +1271,7 @@ impl UnifiedExecProcessManager {
                         .known_delta
                         .as_ref()
                         .map(|_| known_delta_executor_started_at),
+                    !request.tty && request.validation_launch.is_some(),
                 )
                 .await;
             store_result?;
@@ -1257,6 +1283,9 @@ impl UnifiedExecProcessManager {
 
         let yield_time_ms =
             clamp_yield_time_for_readiness(request.yield_time_ms, executor_was_ready);
+        // Registration above already completed, so an initial launch that runs
+        // out of nested budget here still returns a registered process id.
+        let poll_bound = nested_poll_bound(context.source.nested_deadline());
         // For the initial exec_command call, we both stream output to events
         // (via start_streaming_output above) and collect a snapshot here for
         // the tool response body.
@@ -1268,7 +1297,10 @@ impl UnifiedExecProcessManager {
             cancellation_token,
             ..
         } = process.output_handles();
-        let deadline = start + Duration::from_millis(yield_time_ms);
+        let deadline = match poll_bound {
+            Some(bound) => (start + Duration::from_millis(yield_time_ms)).min(bound),
+            None => start + Duration::from_millis(yield_time_ms),
+        };
         // Build/test progress is not a result. Keep noninteractive validation
         // attached until it exits or the caller's requested wait expires, so a
         // brief compilation pause does not cost another model round trip.
@@ -1491,6 +1523,8 @@ impl UnifiedExecProcessManager {
             truncation_policy: context.turn.model_info.truncation_policy.into(),
             max_output_tokens: request.max_output_tokens,
             process_id: response_process_id,
+            session_capabilities: response_process_id
+                .map(|_| process.session_capabilities(request.tty)),
             exit_code,
             process_exited,
             search_no_match: request.attempt_key.is_search_no_match(exit_code),
@@ -1499,6 +1533,7 @@ impl UnifiedExecProcessManager {
             raw_output_artifact: process.raw_output_artifact().await,
             raw_output_reduction_notice: None,
             repair_notice: None,
+            pending_deferred_completions: Vec::new(),
         };
 
         if process_started_alive
@@ -1578,18 +1613,41 @@ impl UnifiedExecProcessManager {
             notified
         });
         let queue_started_at = Instant::now();
+        // Queueing behind another interaction is charged against the nested
+        // budget like every other pre-observation stage, so a call that waits
+        // out its budget here still reports a live process instead of being
+        // cancelled at the wrapper's hard deadline.
+        let poll_bound = nested_poll_bound(request.nested_deadline);
         let lock = locked_process.interaction_lock().lock_owned();
         tokio::pin!(lock);
-        let _interaction_guard = if request.input.is_empty() {
-            lock.await
-        } else {
-            match futures::poll!(&mut lock) {
-                std::task::Poll::Ready(guard) => guard,
-                std::task::Poll::Pending => {
-                    interaction_requested.notify_waiters();
-                    lock.await
+        let guard = async {
+            if request.input.is_empty() {
+                lock.await
+            } else {
+                match futures::poll!(&mut lock) {
+                    std::task::Poll::Ready(guard) => guard,
+                    std::task::Poll::Pending => {
+                        interaction_requested.notify_waiters();
+                        lock.await
+                    }
                 }
             }
+        };
+        let _interaction_guard = match poll_bound {
+            Some(bound) => match tokio::time::timeout_at(bound, guard).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::debug!(
+                        process_id,
+                        interaction_queue_wait_ms = queue_started_at.elapsed().as_millis(),
+                        "unified exec interaction still queued at the nested budget"
+                    );
+                    return self
+                        .still_queued_result(process_id, locked_process, &request)
+                        .await;
+                }
+            },
+            None => guard.await,
         };
         tracing::debug!(
             process_id,
@@ -1612,6 +1670,7 @@ impl UnifiedExecProcessManager {
             process_id,
             search_exit_one_is_no_match,
             tty,
+            validation_launch,
             ..
         } = self
             .prepare_process_handles(process_id, locked_process)
@@ -1630,7 +1689,13 @@ impl UnifiedExecProcessManager {
         // The yield timeout bounds the write and process-reaction window.
         // Failure cleanup confirms termination under its separate deadline.
         let start = Instant::now();
-        let deadline = start + Duration::from_millis(yield_time_ms);
+        // Whatever the caller asked for, observation ends inside the nested
+        // budget that queueing has already drawn down. The minimum yield
+        // durations above bound the request, never the enclosing deadline.
+        let deadline = match poll_bound {
+            Some(bound) => (start + Duration::from_millis(yield_time_ms)).min(bound),
+            None => start + Duration::from_millis(yield_time_ms),
+        };
         let mut wait = WriteStdinWait(ToolLifecycleTimerWait {
             wait_kind: "write_stdin_yield".to_string(),
             requested_timeout_ms: Some(request.yield_time_ms),
@@ -1697,10 +1762,10 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             pause_state,
             deadline,
-            request
-                .input
-                .is_empty()
-                .then_some(INITIAL_OUTPUT_QUIET_PERIOD),
+            // A validation run is silent between bursts of build output. Ending
+            // its poll at the first gap is what bills the extra round trips, so
+            // it waits the full requested yield instead.
+            (request.input.is_empty() && !validation_launch).then_some(INITIAL_OUTPUT_QUIET_PERIOD),
             &mut handoff,
         )
         .await;
@@ -1789,6 +1854,7 @@ impl UnifiedExecProcessManager {
             truncation_policy: request.truncation_policy,
             max_output_tokens: request.max_output_tokens,
             process_id,
+            session_capabilities: process_id.map(|_| process.session_capabilities(tty)),
             exit_code,
             process_exited,
             search_no_match: search_exit_one_is_no_match && exit_code == Some(1),
@@ -1797,6 +1863,7 @@ impl UnifiedExecProcessManager {
             raw_output_artifact: process.raw_output_artifact().await,
             raw_output_reduction_notice: None,
             repair_notice: None,
+            pending_deferred_completions: Vec::new(),
         };
 
         Ok(response.with_prepared_reduction_notice().await)
@@ -1851,6 +1918,53 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    /// A yielded result for a call whose nested budget expired while it was
+    /// still queued behind another interaction.
+    ///
+    /// Nothing was written and no output was observed, so this is a resumable
+    /// handle, not a failure: the process is untouched and the caller can poll
+    /// again. Reporting it as an error would strand a live process behind a
+    /// cancelled call.
+    async fn still_queued_result(
+        &self,
+        process_id: u32,
+        locked_process: &Arc<UnifiedExecProcess>,
+        request: &WriteStdinRequest<'_>,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        let handles = self
+            .prepare_process_handles(process_id, locked_process)
+            .await?;
+        let notice = if request.input.is_empty() {
+            "The poll reached its deadline while another interaction held this session. \
+             The process is still running; poll again."
+                .to_string()
+        } else {
+            "The session was busy with another interaction until this call's deadline. \
+             The input was not delivered and was not retried; send it again."
+                .to_string()
+        };
+        Ok(ExecCommandToolOutput {
+            validation: handles.process.validation(),
+            event_call_id: handles.call_id,
+            chunk_id: generate_chunk_id(),
+            wall_time: Duration::ZERO,
+            raw_output: Vec::new(),
+            truncation_policy: request.truncation_policy,
+            max_output_tokens: request.max_output_tokens,
+            process_id: Some(handles.process_id),
+            session_capabilities: Some(handles.process.session_capabilities(handles.tty)),
+            exit_code: None,
+            process_exited: false,
+            search_no_match: false,
+            original_token_count: Some(0),
+            hook_command: Some(handles.hook_command),
+            raw_output_artifact: handles.process.raw_output_artifact().await,
+            raw_output_reduction_notice: None,
+            repair_notice: Some(notice),
+            pending_deferred_completions: Vec::new(),
+        })
+    }
+
     async fn prepare_process_handles(
         &self,
         process_id: u32,
@@ -1894,6 +2008,7 @@ impl UnifiedExecProcessManager {
             process_id: entry.process_id,
             search_exit_one_is_no_match: entry.search_exit_one_is_no_match,
             tty: entry.tty,
+            validation_launch: entry.validation_launch,
         })
     }
 
@@ -1918,6 +2033,7 @@ impl UnifiedExecProcessManager {
         registration: &mut PendingProcessRegistration,
         known_delta: Option<crate::tools::known_delta_store::PreparedKnownDelta>,
         known_delta_executor_started_at: Option<Instant>,
+        validation_launch: bool,
     ) -> Result<(), UnifiedExecError> {
         let command_execution_id = context
             .session
@@ -1940,6 +2056,7 @@ impl UnifiedExecProcessManager {
             hook_command,
             search_exit_one_is_no_match: attempt_key.is_search_no_match(Some(1)),
             tty,
+            validation_launch,
             network_approval: network_approval.clone(),
             session: Arc::downgrade(&context.session),
             last_used: started_at,

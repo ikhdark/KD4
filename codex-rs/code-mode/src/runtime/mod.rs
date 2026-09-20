@@ -205,6 +205,7 @@ pub(crate) async fn spawn_runtime(
                 tool_name: definition.tool_name,
                 description: definition.description,
                 kind: definition.kind,
+                default_timeout_ms: definition.default_timeout_ms,
             })
             .collect(),
     )?);
@@ -678,6 +679,7 @@ mod tests {
             source: source.to_string(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
+            default_tool_timeout_ms: None,
         }
     }
 
@@ -686,6 +688,7 @@ mod tests {
         let metadata = |global_name: &str, description: &str| EnabledToolMetadata {
             tool_name: ToolName::plain(global_name),
             global_name: global_name.to_string(),
+            default_timeout_ms: None,
             description: description.to_string(),
             kind: CodeModeToolKind::Function,
         };

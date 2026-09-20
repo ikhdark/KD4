@@ -24,6 +24,90 @@ def publish_source_text() -> str:
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
+    def test_desktop_executable_comes_from_package_manifest(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = Path(temp_dir)
+            app_dir = fixture / "app"
+            app_dir.mkdir()
+            (app_dir / "ChatGPT.exe").touch()
+            (fixture / "AppxManifest.xml").write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<Package>
+  <Applications>
+    <Application Id="App" Executable="app/ChatGPT.exe" />
+  </Applications>
+</Package>
+""",
+                encoding="utf-8",
+            )
+            command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+function Get-CodexDesktopPackage {{
+    return [pscustomobject]@{{ InstallLocation = {ps_single_quote(fixture)} }}
+}}
+Get-CodexDesktopExecutableProof
+"""
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                env=clean_env(),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
+                creationflags=CREATE_NO_WINDOW,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            Path(result.stdout.strip()),
+            fixture / "app" / "ChatGPT.exe",
+        )
+
+    def test_desktop_process_lookup_uses_executable_name(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+function Get-Process {{
+    [CmdletBinding()]
+    param([string]$Name)
+    if ($Name -ne 'ChatGPT') {{ throw "unexpected process name: $Name" }}
+    return @(
+        [pscustomobject]@{{ Id = 41; Path = 'C:\fixture\ChatGPT.exe' }},
+        [pscustomobject]@{{ Id = 42; Path = 'C:\other\ChatGPT.exe' }}
+    )
+}}
+@(Get-CodexDesktopProcessesForPath -DesktopPath 'C:\fixture\ChatGPT.exe') |
+    Select-Object Id, Path |
+    ConvertTo-Json -Compress
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env=clean_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"Id": 41, "Path": r"C:\fixture\ChatGPT.exe"},
+        )
+
     def test_restart_waits_for_the_original_process_identity(self) -> None:
         shell = powershell()
         if shell is None:

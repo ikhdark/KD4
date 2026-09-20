@@ -1285,6 +1285,7 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
         arguments: json!({ "command": "printf shell command" }).to_string(),
     };
     let output = FunctionToolOutput {
+        essential_inline: Default::default(),
         body: vec![],
         canonical_body: None,
         success: Some(true),

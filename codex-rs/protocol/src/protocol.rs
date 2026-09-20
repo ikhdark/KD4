@@ -1013,76 +1013,6 @@ pub struct Event {
     pub msg: EventMsg,
 }
 
-/// Response event from the agent
-/// NOTE: Make sure none of these values have optional types, as it will mess up the extension code-gen.
-/// The exact request policy used for one model stream attempt. This is protocol
-/// state so rollout reconstruction and late-attaching clients observe the same
-/// decision as live consumers.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case")]
-pub enum ReasoningPolicyPhase {
-    Orient,
-    Inspect,
-    Implement,
-    Verify,
-    Diagnose,
-    Finalize,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case")]
-pub enum ReasoningPolicySource {
-    PhaseOverride,
-    TurnFallback,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case")]
-pub enum ReasoningPolicyTrigger {
-    UserInput,
-    ReadOnlyToolSuccess,
-    WorkspaceMutation,
-    ToolFailed,
-    ToolBlocked,
-    ToolTimedOut,
-    ToolCancelled,
-    ValidationPassed,
-    ValidationFailed,
-    ValidationTimedOut,
-    PlanUpdated,
-    HostOverride,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[ts(rename_all = "camelCase")]
-pub struct ReasoningPolicySnapshot {
-    pub sequence: u64,
-    /// Unix timestamp in milliseconds.
-    pub timestamp: i64,
-    pub phase: ReasoningPolicyPhase,
-    pub configured_effort: Option<ReasoningEffortConfig>,
-    pub effective_effort: Option<ReasoningEffortConfig>,
-    pub request_effort: Option<ReasoningEffortConfig>,
-    pub source: ReasoningPolicySource,
-    pub model: String,
-    pub trigger: ReasoningPolicyTrigger,
-}
-
-/// Bounded, durable per-turn reasoning-policy history.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[ts(rename_all = "camelCase")]
-pub struct ReasoningPolicyHistory {
-    pub turn_id: String,
-    pub entries: Vec<ReasoningPolicySnapshot>,
-    pub total_entries: u64,
-    pub truncated: bool,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, Display, JsonSchema, TS)]
 // This public wire enum has hundreds of construction and match sites. Boxing
 // TurnComplete would be an API-wide migration for a layout-only optimization.
@@ -1129,12 +1059,6 @@ pub enum EventMsg {
     /// v1 wire format uses `task_complete`; accept `turn_complete` for v2 interop.
     #[serde(rename = "task_complete", alias = "turn_complete")]
     TurnComplete(TurnCompleteEvent),
-
-    /// Transient policy decision emitted immediately before a stream attempt.
-    ReasoningPolicyUpdated(ReasoningPolicySnapshot),
-
-    /// Durable, bounded policy history emitted before a terminal turn event.
-    ReasoningPolicySummary(ReasoningPolicyHistory),
 
     /// Usage update for the current session, including totals and last turn.
     /// Optional means unknown — UIs should not display when `None`.
@@ -2373,6 +2297,41 @@ pub struct TurnTimingRequestTokenCategories {
     /// matched the preceding request. This is not added to `logical_total`.
     #[serde(default)]
     pub repeated_unchanged_context: u64,
+    /// Fixed-prefix categories whose exact hash differed from the preceding
+    /// request. Non-empty explains why fixed-prefix reuse was ineligible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixed_prefix_changed_categories: Vec<String>,
+    /// Input items the preceding request sent, from this request's own
+    /// comparison. Absent on the first request of a comparison chain, which has
+    /// no predecessor to diverge from.
+    ///
+    /// A whole-history digest changes on every request by design, so it cannot
+    /// distinguish appending from rewriting. These three fields can: with
+    /// `history_prefix_items_reused == history_items_previous` the request only
+    /// appended, and a smaller `history_first_divergent_index` locates where the
+    /// prefix was rewritten or truncated instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub history_items_previous: Option<u32>,
+    /// Leading input items identical to the preceding request's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub history_prefix_items_reused: Option<u32>,
+    /// First input index whose digest differs from the preceding request's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub history_first_divergent_index: Option<u32>,
+    /// Tool results the aggregate output budget dropped from the representation
+    /// this request actually sent.
+    ///
+    /// Attributed to one request and one representation: the budget runs over
+    /// several candidate projections, and summing them would count drops that
+    /// never reached the model.
+    #[serde(default)]
+    pub tool_output_budget_drop_count: u32,
+    /// Tokens those dropped results would have occupied.
+    #[serde(default)]
+    pub tool_output_budget_dropped_token_count: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3080,8 +3039,8 @@ pub struct TurnTimingCounters {
     /// independent of `generations_by_disposition`.
     #[serde(default)]
     pub suppressed_deterministic_continuation_count: u32,
-    /// Residual deterministic generation requests proved by the reasoning
-    /// governor, including requests elided before provider dispatch.
+    /// Residual deterministic generation requests proved by turn execution
+    /// control, including requests elided before provider dispatch.
     #[serde(default)]
     pub residual_deterministic_generation_count: u32,
     /// Continuations drained and recorded by their code-mode owner.
@@ -3099,6 +3058,14 @@ pub struct TurnTimingCounters {
     /// Ready startup prewarms observed by the first model request.
     #[serde(default)]
     pub ready_startup_prewarm_count: u32,
+    /// Tool results the aggregate output budget dropped across every request
+    /// this turn actually sent. Preparing an unchanged projection again adds
+    /// nothing; only a dispatched request contributes.
+    #[serde(default)]
+    pub tool_output_budget_drop_count: u32,
+    /// Tokens those dropped results would have occupied.
+    #[serde(default)]
+    pub tool_output_budget_dropped_token_count: u64,
     /// Bounded to the stable purpose enum's cardinality.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub purpose_aggregates: Vec<TurnTimingGenerationPurposeAggregate>,
@@ -5685,7 +5652,7 @@ pub struct TurnAbortedEvent {
     pub timing: Option<TurnTiming>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnAbortReason {
     Interrupted,

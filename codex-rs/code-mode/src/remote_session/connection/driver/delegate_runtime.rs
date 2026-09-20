@@ -9,7 +9,9 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 
+use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
+use codex_code_mode_protocol::NestedCancellation;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
@@ -49,13 +51,22 @@ impl CellKey {
 
 struct DelegateCall {
     cell: CellKey,
-    cancellation: CancellationToken,
+    cancellation: NestedCancellation,
     completion_stop: CancellationToken,
 }
 
 impl DelegateCall {
+    /// Revokes a call whose cause is not known locally.
+    ///
+    /// The host reports the cause on its own cancel message; a revoke driven
+    /// by connection teardown here is the runtime stopping the call.
     fn revoke(&self) {
-        self.cancellation.cancel();
+        self.revoke_with(None);
+    }
+
+    fn revoke_with(&self, cause: Option<CancellationCause>) {
+        self.cancellation
+            .cancel_with(cause.unwrap_or(CancellationCause::RuntimeShutdown));
         self.completion_stop.cancel();
     }
 }
@@ -116,7 +127,7 @@ impl DelegateRuntime {
             return Err(format!("duplicate code-mode delegate request ID {id:?}"));
         }
         self.remember_request(id);
-        let cancellation = CancellationToken::new();
+        let cancellation = NestedCancellation::new(CancellationToken::new());
         let task_request = match request {
             DelegateRequest::InvokeTool { invocation } => {
                 let mut invocation: CodeModeNestedToolCall = invocation.into();
@@ -162,7 +173,7 @@ impl DelegateRuntime {
                         cell_id,
                         text,
                     } => delegate
-                        .notify(call_id, cell_id, text, task_cancellation)
+                        .notify(call_id, cell_id, text, task_cancellation.token().clone())
                         .await
                         .map(|()| DelegateResponse::NotificationDelivered {}),
                 }
@@ -204,9 +215,11 @@ impl DelegateRuntime {
         Ok(())
     }
 
-    pub(super) fn cancel(&mut self, id: DelegateRequestId) {
+    /// Cancels a call because the host said so, carrying the host's own reason
+    /// when it supplied one.
+    pub(super) fn cancel(&mut self, id: DelegateRequestId, cause: Option<CancellationCause>) {
         if let Some(call) = self.calls.remove(&id) {
-            call.revoke();
+            call.revoke_with(cause);
         }
     }
 

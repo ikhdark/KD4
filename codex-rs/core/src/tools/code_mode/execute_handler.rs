@@ -28,6 +28,20 @@ pub struct CodeModeExecuteHandler {
     enabled_tools: Vec<codex_code_mode::ToolDefinition>,
 }
 
+/// Headroom added to the longest wait a nested tool can be asked to perform, so
+/// dispatch, hooks, transport, and lock queueing cannot turn a full-length
+/// cooperative yield into a guaranteed hard-timeout failure.
+const NESTED_TOOL_TIMEOUT_GRACE_MS: u64 = 15_000;
+
+/// Hard deadline for a nested tool call that passes no explicit `{timeout_ms}`.
+/// Must exceed the empty-poll ceiling the same cell can request.
+fn default_nested_tool_timeout_ms(background_terminal_max_timeout_ms: u64) -> u64 {
+    background_terminal_max_timeout_ms
+        .saturating_add(NESTED_TOOL_TIMEOUT_GRACE_MS)
+        .max(codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS)
+        .min(codex_code_mode::MAX_TOOL_TIMEOUT_MS)
+}
+
 #[derive(Clone)]
 pub(super) struct CellDispatchLease {
     state: Arc<CellDispatchLeaseState>,
@@ -132,13 +146,40 @@ impl CodeModeExecuteHandler {
     async fn execute(
         &self,
         session: std::sync::Arc<crate::session::session::Session>,
-        turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
+        step_context: std::sync::Arc<crate::session::step_context::StepContext>,
         call_id: String,
         code: String,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
+        let turn = Arc::clone(&step_context.turn);
+        let mcp_timeouts = step_context
+            .mcp_tools()
+            .await
+            .iter()
+            .map(|tool| {
+                let timeout = step_context
+                    .mcp
+                    .config()
+                    .mcp_server_catalog
+                    .server(&tool.server_name)
+                    .and_then(|server| server.config().tool_timeout_sec)
+                    .unwrap_or(codex_mcp::DEFAULT_TOOL_TIMEOUT);
+                (
+                    tool.canonical_tool_name(),
+                    default_nested_tool_timeout_ms(
+                        u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut enabled_tools = self.enabled_tools.clone();
+        for tool in &mut enabled_tools {
+            // MCP owns its transport timeout. Give that call headroom without
+            // lengthening ordinary tools or overriding explicit per-call limits.
+            tool.default_timeout_ms = mcp_timeouts.get(&tool.tool_name).copied();
+        }
         let exec = ExecContext { session, turn };
         let started_at = std::time::Instant::now();
         let started_cell = exec
@@ -147,13 +188,22 @@ impl CodeModeExecuteHandler {
             .code_mode_service
             .execute(codex_code_mode::ExecuteRequest {
                 tool_call_id: call_id.clone(),
-                enabled_tools: self.enabled_tools.clone(),
+                enabled_tools,
                 source: args.code.to_owned(),
                 // Give ordinary awaited cells the runtime's completion budget.
                 // If that budget expires, the owner takes over and waits for a
                 // material state change without another model-mediated poll.
                 yield_time_ms: None,
                 max_output_tokens: args.max_output_tokens,
+                // A nested `write_stdin` may legitimately wait the whole
+                // background-terminal budget. Keep the runtime's hard deadline
+                // above that so a quiet full-length poll can yield instead.
+                default_tool_timeout_ms: Some(default_nested_tool_timeout_ms(
+                    exec.session
+                        .services
+                        .unified_exec_manager
+                        .max_write_stdin_yield_time_ms(),
+                )),
             })
             .await
             .map_err(FunctionCallError::RespondToModel)?;
@@ -194,7 +244,7 @@ impl CodeModeExecuteHandler {
         let (activity_rx, pending_activity) = exec
             .session
             .input_queue
-            .subscribe_activity(turn_state.as_deref())
+            .subscribe_activity(turn_state.as_deref(), false)
             .await;
         // Consume the immediate initial observation before making the held
         // wait steerable. This clears the runtime's initial observer, so
@@ -322,11 +372,9 @@ impl CodeModeExecuteHandler {
             cancellation_token,
             ..
         } = invocation;
-        let turn = Arc::clone(&step_context.turn);
-
         match payload {
             ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
-                .execute(session, turn, call_id, input, cancellation_token)
+                .execute(session, step_context, call_id, input, cancellation_token)
                 .await
                 .map(boxed_tool_output),
             _ => Err(FunctionCallError::RespondToModel(format!(

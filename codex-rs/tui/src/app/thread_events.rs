@@ -582,7 +582,6 @@ mod tests {
             duration_ms: None,
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         }
     }
 

@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CodeModeNestedToolCall;
 use crate::ExecuteRequest;
+use crate::NestedCancellation;
 use crate::RuntimeResponse;
 use crate::WaitOutcome;
 use crate::WaitRequest;
@@ -94,10 +95,15 @@ impl StartedCell {
 
 /// Host callbacks used by a code-mode session while cells are executing.
 pub trait CodeModeSessionDelegate: Send + Sync {
+    /// Invokes a nested tool.
+    ///
+    /// `cancellation` pairs the token with the write-once record of why it
+    /// fired, so a delegate that reports a cancelled call can say which origin
+    /// stopped it instead of attributing every cancellation to the user.
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> ToolInvocationFuture<'a>;
 
     fn notify<'a>(

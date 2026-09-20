@@ -54,7 +54,6 @@ use codex_feedback::CodexFeedback;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -205,102 +204,6 @@ async fn thread_read_can_include_turns() -> Result<()> {
         other => panic!("expected user message item, got {other:?}"),
     }
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_read_reasoning_policy_history_follows_initialize_capability() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-
-    for experimental_api in [false, true] {
-        let codex_home = TempDir::new()?;
-        create_config_toml(codex_home.path(), &server.uri())?;
-        let conversation_id = create_fake_rollout_with_text_elements(
-            codex_home.path(),
-            "2025-01-05T12-00-00",
-            "2025-01-05T12:00:00Z",
-            "Saved user message",
-            Vec::new(),
-            Some("mock_provider"),
-            /*git_info*/ None,
-        )?;
-        let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
-        let turn_id = "reasoning-policy-turn";
-        let history = ReasoningPolicyHistory {
-            turn_id: turn_id.to_string(),
-            entries: Vec::new(),
-            total_entries: 0,
-            truncated: false,
-        };
-        for item in [
-            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: turn_id.to_string(),
-                trace_id: None,
-                started_at: None,
-                model_context_window: None,
-                collaboration_mode_kind: Default::default(),
-            })),
-            RolloutItem::EventMsg(EventMsg::ReasoningPolicySummary(history.clone())),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: turn_id.to_string(),
-                last_agent_message: None,
-                surfaced_result: None,
-                error: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                timing: None,
-            })),
-        ] {
-            append_rollout_item_to_path(&path, &item).await?;
-        }
-
-        let mut mcp = TestAppServer::builder()
-            .with_codex_home(codex_home.path())
-            .without_auto_env()
-            .build()
-            .await?;
-        let initialize = mcp
-            .initialize_with_capabilities(
-                ClientInfo {
-                    name: "reasoning-policy-capability-test".to_string(),
-                    title: None,
-                    version: "0.1.0".to_string(),
-                },
-                Some(InitializeCapabilities {
-                    experimental_api,
-                    ..Default::default()
-                }),
-            )
-            .await?;
-        assert!(matches!(
-            initialize,
-            codex_app_server_protocol::JSONRPCMessage::Response(_)
-        ));
-
-        let read_id = mcp
-            .send_thread_read_request(ThreadReadParams {
-                thread_id: conversation_id,
-                include_turns: true,
-            })
-            .await?;
-        let read_response: JSONRPCResponse = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-        )
-        .await??;
-        let ThreadReadResponse { thread, .. } = to_response(read_response)?;
-        let turn = thread
-            .turns
-            .iter()
-            .find(|turn| turn.id == turn_id)
-            .expect("reasoning-policy turn should be returned");
-        assert_eq!(
-            turn.reasoning_policy_history.as_ref(),
-            experimental_api.then_some(&history)
-        );
-    }
 
     Ok(())
 }
@@ -546,6 +449,7 @@ async fn paginated_stored_thread_allows_metadata_discovery_and_rejects_legacy_hi
 
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            project_id: None,
             cursor: None,
             limit: Some(50),
             sort_key: None,
@@ -992,6 +896,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
         .request(ClientRequest::ThreadList {
             request_id: RequestId::Integer(1),
             params: ThreadListParams {
+                project_id: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -1411,6 +1316,7 @@ async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
     // List should also surface the name.
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            project_id: None,
             cursor: None,
             limit: Some(50),
             sort_key: None,

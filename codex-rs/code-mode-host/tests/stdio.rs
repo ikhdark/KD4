@@ -23,6 +23,7 @@ use codex_code_mode::ToolInvocationFuture;
 use codex_code_mode::WaitOutcome;
 use codex_code_mode::WaitRequest;
 use codex_code_mode::host::MAX_FRAME_BYTES;
+use codex_code_mode_protocol::NestedCancellation;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -58,7 +59,7 @@ impl CodeModeSessionDelegate for OversizedResultDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async { Ok(json!("x".repeat(MAX_FRAME_BYTES))) })
     }
@@ -96,7 +97,7 @@ impl CodeModeSessionDelegate for CancellationDelegate {
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let tool_name = invocation.tool_name.name.clone();
@@ -157,7 +158,7 @@ impl CodeModeSessionDelegate for RecordingDelegate {
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         self.invocations
             .lock()
@@ -199,6 +200,7 @@ fn execute_request(source: &str) -> ExecuteRequest {
         source: source.to_string(),
         yield_time_ms: None,
         max_output_tokens: None,
+        default_tool_timeout_ms: None,
     }
 }
 
@@ -273,6 +275,7 @@ async fn nested_tool_input_presence_reaches_local_and_remote_delegates() {
                     description: String::new(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
+                    default_timeout_ms: None,
                     output_schema: None,
                 }],
                 ..execute_request(
@@ -329,6 +332,7 @@ async fn remote_dropped_initial_response_keeps_the_cell_available_for_terminatio
                 description: String::new(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
+                default_timeout_ms: None,
                 output_schema: None,
             }],
             yield_time_ms: Some(60_000),
@@ -401,6 +405,7 @@ text(result.value);
         description: String::new(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        default_timeout_ms: None,
         output_schema: None,
     }];
     assert_eq!(
@@ -413,8 +418,32 @@ text(result.value);
             error_text: None,
         }
     );
+    let invocations = delegate
+        .invocations
+        .lock()
+        .expect("invocations lock")
+        .clone();
+    // The wrapper deadline is established in the host process and recovered
+    // here on this process's own clock, so compare it as a bound rather than a
+    // value. Nothing else about the invocation may change in transit.
+    let received_deadline = invocations
+        .first()
+        .expect("one nested invocation")
+        .nested_deadline
+        .expect("the wrapper deadline must survive the out-of-process crossing");
+    let remaining = received_deadline.saturating_duration_since(std::time::Instant::now());
+    assert!(
+        remaining > Duration::ZERO && remaining <= Duration::from_millis(60_000),
+        "recovered deadline must fall inside the host's own 60s wrapper budget, got {remaining:?}"
+    );
     assert_eq!(
-        *delegate.invocations.lock().expect("invocations lock"),
+        invocations
+            .into_iter()
+            .map(|invocation| CodeModeNestedToolCall {
+                nested_deadline: None,
+                ..invocation
+            })
+            .collect::<Vec<_>>(),
         vec![CodeModeNestedToolCall {
             cell_id: cell_id("2"),
             parent_tool_call_id: Some("call-2".to_string()),
@@ -422,6 +451,7 @@ text(result.value);
             tool_name: ToolName::plain("echo"),
             tool_kind: CodeModeToolKind::Function,
             input: Some(json!({ "value": "persisted" })),
+            nested_deadline: None,
         }]
     );
     assert_eq!(
@@ -624,6 +654,7 @@ return;
         description: String::new(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        default_timeout_ms: None,
         output_schema: None,
     })
     .collect();
@@ -744,6 +775,7 @@ async fn oversized_delegate_payloads_fail_only_the_tool_call() {
         description: String::new(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        default_timeout_ms: None,
         output_schema: None,
     };
 

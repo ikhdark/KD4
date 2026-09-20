@@ -40,7 +40,6 @@ fn add_ultra_reasoning(model_info: &mut ModelInfo) {
 fn configure_multi_agent_v2(config: &mut Config) {
     // These tests exercise explicit effort and multi-agent mode mapping. Keep the
     // independent phase governor from replacing those requested effort values.
-    config.reasoning_phase_efforts = None;
     config
         .features
         .enable(Feature::MultiAgentV2)
@@ -367,7 +366,6 @@ async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<
                 .features
                 .disable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
-            config.reasoning_phase_efforts = None;
             config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
         })
         .build(&server)

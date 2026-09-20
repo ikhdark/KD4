@@ -456,8 +456,6 @@ impl LocalThreadProjection {
             duration_ms: metadata.and_then(|metadata| metadata.duration_ms),
             timing: metadata.and_then(|metadata| metadata.timing.clone()),
             surfaced_result: metadata.and_then(|metadata| metadata.surfaced_result.clone()),
-            reasoning_policy_history: metadata
-                .and_then(|metadata| metadata.reasoning_policy_history.clone()),
         };
 
         Ok(StoredTurn {

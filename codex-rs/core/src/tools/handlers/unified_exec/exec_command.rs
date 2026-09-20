@@ -767,6 +767,7 @@ impl ExecCommandHandler {
                         truncation_policy: turn.model_info.truncation_policy.into(),
                         max_output_tokens,
                         process_id: None,
+                        session_capabilities: None,
                         exit_code: Some(0),
                         process_exited: true,
                         search_no_match: false,
@@ -775,6 +776,7 @@ impl ExecCommandHandler {
                         raw_output_artifact,
                         raw_output_reduction_notice: None,
                         repair_notice,
+                        pending_deferred_completions: Vec::new(),
                     }
                     .with_prepared_reduction_notice()
                     .await,
@@ -970,6 +972,7 @@ impl ExecCommandHandler {
                     // Sandbox denial is terminal, so there is no live
                     // process for write_stdin to resume.
                     process_id: None,
+                    session_capabilities: None,
                     exit_code: Some(output.exit_code),
                     process_exited: true,
                     search_no_match: false,
@@ -978,6 +981,7 @@ impl ExecCommandHandler {
                     raw_output_artifact: Some(finalized_artifact),
                     raw_output_reduction_notice: None,
                     repair_notice,
+                    pending_deferred_completions: Vec::new(),
                 };
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(

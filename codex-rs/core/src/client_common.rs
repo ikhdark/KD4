@@ -159,6 +159,11 @@ pub struct Prompt {
     /// receipts remain unreplaced.
     pub(crate) stable_context_tool_history_fallback_input: Arc<[ResponseItem]>,
 
+    /// Aggregate-output-budget drops per representation above, in the same
+    /// order. Only the representation a request actually sends is attributed
+    /// to that request; the others are prepared and discarded.
+    pub(crate) tool_output_budget_drops: [crate::tool_history::ToolOutputBudgetDrops; 4],
+
     /// Receipt substitutions applied to `input`. This metadata is never sent
     /// to a provider; it gates provider-prefix invalidation.
     pub(crate) tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
@@ -197,6 +202,23 @@ pub struct Prompt {
     pub output_schema_strict: bool,
 }
 
+impl Prompt {
+    /// Budget drops for the representation this request selected.
+    pub(crate) fn selected_tool_output_budget_drops(
+        &self,
+        use_stable_context_fallback: bool,
+        use_tool_history_fallback: bool,
+    ) -> crate::tool_history::ToolOutputBudgetDrops {
+        let index = match (use_tool_history_fallback, use_stable_context_fallback) {
+            (false, false) => 0,
+            (false, true) => 1,
+            (true, false) => 2,
+            (true, true) => 3,
+        };
+        self.tool_output_budget_drops[index]
+    }
+}
+
 impl Default for Prompt {
     fn default() -> Self {
         Self {
@@ -204,6 +226,7 @@ impl Default for Prompt {
             stable_context_fallback_input: Arc::from([]),
             tool_history_fallback_input: Arc::from([]),
             stable_context_tool_history_fallback_input: Arc::from([]),
+            tool_output_budget_drops: Default::default(),
             tool_history_substitutions: Arc::from([]),
             stable_context_fallback_tool_history_substitutions: Arc::from([]),
             stable_context_manifest: StableContextManifest::default(),

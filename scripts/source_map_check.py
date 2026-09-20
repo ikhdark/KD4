@@ -207,6 +207,14 @@ def declared_non_rust_manifests(markdown: str) -> list[tuple[int, str]]:
 def repository_source_inventory(
     repo_root: Path, *, include_untracked: bool = True
 ) -> tuple[set[str], set[str]]:
+    records = repository_source_records(repo_root, include_untracked=include_untracked)
+    sources = {path for path, state in records.items() if state != "deleted"}
+    return sources, {path for path in sources if records[path] == "tracked"}
+
+
+def repository_source_records(
+    repo_root: Path, *, include_untracked: bool = True, prune: tuple[str, ...] = ()
+) -> dict[str, str]:
     # One listing answers everything the inventory needs: `--deleted` tags
     # tracked paths missing from the working tree (R) and `--stage` exposes
     # the index mode, so gitlinks (160000) drop out without a stat per path.
@@ -222,6 +230,9 @@ def repository_source_inventory(
     ]
     if include_untracked:
         args.append("--others")
+    # Git prunes these untracked directories before descending. Filtering its
+    # output alone would still walk arbitrarily large build/dependency trees.
+    args.extend(f"--exclude={name}/" for name in prune)
     result = subprocess.run(
         args,
         cwd=repo_root,
@@ -257,15 +268,14 @@ def repository_source_inventory(
                 # A submodule gitlink is a directory in the working tree.
                 continue
         entries.append((tag, path))
-    source_paths: set[str] = set()
-    tracked_source_paths: set[str] = set()
+    records: dict[str, str] = {}
     for tag, path in entries:
-        if path in deleted_paths:
+        if any(part in prune for part in PurePosixPath(path).parts[:-1]):
             continue
-        source_paths.add(path)
-        if tag != "?":
-            tracked_source_paths.add(path)
-    return source_paths, tracked_source_paths
+        records[path] = "deleted" if path in deleted_paths else (
+            "untracked" if tag == "?" else "tracked"
+        )
+    return records
 
 
 def repository_source_paths(repo_root: Path) -> set[str]:

@@ -869,7 +869,10 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
         let result = super::measure_responses_request_after_dispatch(
             request,
             prompt,
-            true,
+            super::SelectedInputRepresentation {
+                stable_context_fallback: true,
+                tool_history_fallback: true,
+            },
             tokio_util::sync::CancellationToken::new(),
             Some(encoded.len() as u64),
             use_encoded_bytes.then(|| encoded.into()),
@@ -971,6 +974,77 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
             .find(|measurement| measurement.category == "tool_schemas")
             .expect("tool schema category")
             .unchanged_from_previous_request
+    );
+
+    // Telemetry names the fixed-prefix category that broke reuse, and stays
+    // silent for the baseline-less first request and the eligible second one.
+    assert!(
+        first
+            .request_token_categories()
+            .fixed_prefix_changed_categories
+            .is_empty()
+    );
+    assert!(
+        second
+            .request_token_categories()
+            .fixed_prefix_changed_categories
+            .is_empty()
+    );
+    assert_eq!(
+        third
+            .request_token_categories()
+            .fixed_prefix_changed_categories,
+        vec!["tool_schemas".to_string()]
+    );
+}
+
+#[test]
+fn history_growth_alone_keeps_fixed_prefix_reuse_eligible() {
+    let stable_digests = crate::client_common::PromptDigests {
+        instructions: Some([1; 32]),
+        tools: Some([2; 32]),
+        history: Some([3; 32]),
+    };
+    let first_request = history_test_request(vec![
+        history_test_tool_output("call-1", "first result"),
+        history_test_item("task", Some("turn-1")),
+    ]);
+    let mut first = ModelRequestMeasurements::for_responses_request(
+        &first_request,
+        &history_test_provenance(&first_request),
+        &first_request.instructions,
+    )
+    .expect("measure first request");
+    let mut baseline = None;
+    first.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
+
+    // Appending a tool result changes only history and the input array
+    // envelope; neither may alter a fixed-prefix category's identity hash.
+    let second_request = history_test_request(vec![
+        history_test_tool_output("call-1", "first result"),
+        history_test_item("task", Some("turn-1")),
+        history_test_tool_output("call-2", "second result"),
+    ]);
+    let mut second = ModelRequestMeasurements::for_responses_request(
+        &second_request,
+        &history_test_provenance(&second_request),
+        &second_request.instructions,
+    )
+    .expect("measure second request");
+    second.compare_and_remember_prompt_context(
+        &mut baseline,
+        Some("cache-key"),
+        crate::client_common::PromptDigests {
+            history: Some([5; 32]),
+            ..stable_digests
+        },
+    );
+    assert!(second.fixed_prefix_reuse_eligible);
+    assert!(
+        second
+            .request_token_categories()
+            .fixed_prefix_changed_categories
+            .is_empty()
     );
 }
 
@@ -1074,6 +1148,354 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
     }
     let serialized = serde_json::to_string(&protocol)?;
     assert!(!serialized.contains("018f31aa-1111-7111-8111-111111111111"));
+
+    Ok(())
+}
+
+#[test]
+fn history_prefix_divergence_separates_appending_from_rewriting() {
+    let stable_digests = crate::client_common::PromptDigests {
+        instructions: Some([1; 32]),
+        tools: Some([2; 32]),
+        history: Some([3; 32]),
+    };
+    let measure = |items: Vec<ResponseItem>| {
+        let request = history_test_request(items);
+        ModelRequestMeasurements::for_responses_request(
+            &request,
+            &history_test_provenance(&request),
+            &request.instructions,
+        )
+        .expect("measure request")
+    };
+    let divergence = |measured: &ModelRequestMeasurements| {
+        let categories = measured.request_token_categories();
+        (
+            categories.history_items_previous,
+            categories.history_prefix_items_reused,
+            categories.history_first_divergent_index,
+        )
+    };
+
+    let first_item = history_test_tool_output("call-1", "first result");
+    let second_item = history_test_tool_output("call-2", "second result");
+    let third_item = history_test_tool_output("call-3", "third result");
+
+    let mut baseline = None;
+    let mut first = measure(vec![first_item.clone(), second_item.clone()]);
+    first.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
+    assert_eq!(
+        divergence(&first),
+        (None, None, None),
+        "a first request has no predecessor to diverge from"
+    );
+
+    // Appending leaves the whole previous prefix reusable.
+    let mut appended = measure(vec![
+        first_item.clone(),
+        second_item.clone(),
+        third_item.clone(),
+    ]);
+    appended.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
+    assert_eq!(
+        divergence(&appended),
+        (Some(2), Some(2), Some(2)),
+        "appending must report the full previous prefix as reused"
+    );
+
+    // Re-sending the same items is still full reuse.
+    let mut unchanged = measure(vec![
+        first_item.clone(),
+        second_item.clone(),
+        third_item.clone(),
+    ]);
+    unchanged.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
+    assert_eq!(divergence(&unchanged), (Some(3), Some(3), Some(3)));
+
+    // Rewriting item 1 breaks the prefix there. The trailing item matches
+    // again, so counting equal items rather than the common prefix would
+    // wrongly report two reused items.
+    let mut rewritten = measure(vec![
+        first_item.clone(),
+        history_test_tool_output("call-2", "rewritten result"),
+        third_item.clone(),
+    ]);
+    rewritten.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
+    assert_eq!(
+        divergence(&rewritten),
+        (Some(3), Some(1), Some(1)),
+        "a rewrite must locate the first divergent index, not count matching items"
+    );
+
+    // Truncation diverges at the new length.
+    let mut truncated = measure(vec![first_item]);
+    truncated.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
+    assert_eq!(
+        divergence(&truncated),
+        (Some(3), Some(1), Some(1)),
+        "a truncation reports fewer reused items than the predecessor sent"
+    );
+}
+
+#[test]
+fn budget_drops_are_read_from_the_representation_a_request_selects() {
+    let drops = |count: u32| crate::tool_history::ToolOutputBudgetDrops {
+        count,
+        tokens: u64::from(count) * 100,
+    };
+    let prompt = Prompt {
+        tool_output_budget_drops: [drops(1), drops(2), drops(3), drops(4)],
+        ..Prompt::default()
+    };
+
+    // Ordered to match `Prompt`'s four inputs: logical, stable-context
+    // fallback, tool-history fallback, both fallbacks.
+    assert_eq!(
+        prompt.selected_tool_output_budget_drops(
+            /*use_stable_context_fallback*/ false, /*use_tool_history_fallback*/ false
+        ),
+        drops(1)
+    );
+    assert_eq!(
+        prompt.selected_tool_output_budget_drops(
+            /*use_stable_context_fallback*/ true, /*use_tool_history_fallback*/ false
+        ),
+        drops(2)
+    );
+    assert_eq!(
+        prompt.selected_tool_output_budget_drops(
+            /*use_stable_context_fallback*/ false, /*use_tool_history_fallback*/ true
+        ),
+        drops(3)
+    );
+    assert_eq!(
+        prompt.selected_tool_output_budget_drops(
+            /*use_stable_context_fallback*/ true, /*use_tool_history_fallback*/ true
+        ),
+        drops(4)
+    );
+}
+
+#[tokio::test]
+async fn turn_timing_carries_prefix_divergence_and_selected_budget_drops() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",",
+        "\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,",
+        "\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(/*status*/ 200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .expect(/*requests*/ 3)
+        .mount(&server)
+        .await;
+
+    let provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::from_string("018f31aa-2222-7222-8222-222222222222")?,
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let timing = Arc::new(TurnTimingState::default());
+    timing.mark_turn_started();
+    let mut session = client.new_session();
+    session.set_turn_timing(Arc::clone(&timing));
+
+    let first_item = history_test_tool_output("call-1", "first result");
+    let second_item = history_test_tool_output("call-2", "second result");
+    // Only the logical representation is dispatched over HTTP, so only its
+    // drops may be attributed; the fallbacks carry different numbers so
+    // reading the wrong one is visible.
+    let budget_drops = [
+        crate::tool_history::ToolOutputBudgetDrops {
+            count: 2,
+            tokens: 4_096,
+        },
+        crate::tool_history::ToolOutputBudgetDrops {
+            count: 7,
+            tokens: 70_000,
+        },
+        crate::tool_history::ToolOutputBudgetDrops {
+            count: 9,
+            tokens: 90_000,
+        },
+        crate::tool_history::ToolOutputBudgetDrops {
+            count: 11,
+            tokens: 110_000,
+        },
+    ];
+    let prompt_for = |input: Vec<ResponseItem>| Prompt {
+        input: input.into(),
+        tool_output_budget_drops: budget_drops,
+        base_instructions: BaseInstructions {
+            text: "stable base instructions".to_string(),
+        },
+        ..Prompt::default()
+    };
+    let model_info = test_model_info();
+    let session_telemetry = test_session_telemetry();
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ Some("turn-1"),
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let trace_dir = TempDir::new()?;
+    let writer = Arc::new(TraceWriter::create(
+        trace_dir.path(),
+        "trace-audit".to_string(),
+        "rollout-audit".to_string(),
+        "thread-audit".to_string(),
+    )?);
+    let inference_trace = InferenceTraceContext::enabled(
+        writer,
+        "thread-audit".to_string(),
+        "turn-1".to_string(),
+        "gpt-test".to_string(),
+        "test-provider".to_string(),
+    )
+    .with_request_metadata(|| json!({"task_model_guidance_enabled": false}));
+
+    let prompts = vec![
+        prompt_for(vec![first_item.clone(), second_item.clone()]),
+        // Appends one item.
+        prompt_for(vec![
+            first_item.clone(),
+            second_item.clone(),
+            history_test_tool_output("call-3", "third result"),
+        ]),
+        // Rewrites the second item and keeps the third.
+        prompt_for(vec![
+            first_item,
+            history_test_tool_output("call-2", "rewritten result"),
+            history_test_tool_output("call-3", "third result"),
+        ]),
+    ];
+    for prompt in &prompts {
+        let request_wait = timing.begin_model_request_wait();
+        let mut stream = session
+            .stream(
+                prompt,
+                &model_info,
+                &session_telemetry,
+                /*effort*/ None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                /*service_tier*/ None,
+                &responses_metadata,
+                &inference_trace,
+            )
+            .await?;
+        drop(request_wait);
+        while let Some(event) = stream.next().await {
+            event?;
+        }
+    }
+
+    let protocol = timing.complete_snapshot().protocol_timing();
+    let received = server.received_requests().await.expect("received requests");
+    let mut captures = Vec::new();
+    for entry in std::fs::read_dir(trace_dir.path().join("payloads"))? {
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+        if value.get("_codex").is_some() {
+            captures.push(value);
+        }
+    }
+    assert_eq!(captures.len(), 3);
+    for (wire, timed) in received.iter().zip(&protocol.model_requests) {
+        let capture = captures
+            .iter()
+            .find(|capture| {
+                capture["_codex"]["sampling_request_id"].as_str()
+                    == timed.sampling_request_id.as_deref()
+            })
+            .expect("sampling identity links capture to timing");
+        assert!(
+            timed
+                .physical_attempt_ids
+                .iter()
+                .any(|id| capture["_codex"]["physical_attempt_id"] == *id)
+        );
+        assert_eq!(
+            capture["_codex"]["settings"]["task_model_guidance_enabled"],
+            false
+        );
+        let mut provider_capture = capture.clone();
+        provider_capture.as_object_mut().unwrap().remove("_codex");
+        let wire: serde_json::Value = serde_json::from_slice(&wire.body)?;
+        assert_eq!(
+            provider_capture, wire,
+            "trace sidecar must never enter the provider request"
+        );
+        assert_eq!(wire["instructions"], "stable base instructions");
+        assert!(wire["input"].is_array());
+        assert!(wire["tools"].is_array());
+    }
+    assert_eq!(protocol.model_requests.len(), 3);
+    let categories = protocol
+        .model_requests
+        .iter()
+        .map(|request| {
+            request
+                .request_token_categories
+                .clone()
+                .expect("request token categories")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        categories
+            .iter()
+            .map(|category| (
+                category.history_items_previous,
+                category.history_prefix_items_reused,
+                category.history_first_divergent_index,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (None, None, None),
+            (Some(2), Some(2), Some(2)),
+            (Some(3), Some(1), Some(1)),
+        ],
+        "turn timing must distinguish the appending request from the rewriting one"
+    );
+    assert_eq!(
+        categories
+            .iter()
+            .map(|category| (
+                category.tool_output_budget_drop_count,
+                category.tool_output_budget_dropped_token_count,
+            ))
+            .collect::<Vec<_>>(),
+        vec![(2, 4_096), (2, 4_096), (2, 4_096)],
+        "each request reports the drops of the representation it sent"
+    );
+    assert_eq!(
+        protocol.counters.tool_output_budget_drop_count, 6,
+        "counters total the per-request deltas"
+    );
+    assert_eq!(
+        protocol.counters.tool_output_budget_dropped_token_count,
+        12_288
+    );
 
     Ok(())
 }
@@ -1550,6 +1972,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         category_hashes: BTreeMap::new(),
         ordered_fixed_hashes: Vec::new(),
         digests: Default::default(),
+        input_item_digests: Vec::new(),
     });
     let (sender, receiver) = tokio::sync::oneshot::channel();
     sender
@@ -2363,6 +2786,27 @@ fn ultra_reasoning_uses_max_for_requests() {
     ))
     .unwrap();
     assert_eq!(serialized["effort"], json!("max"),);
+}
+
+#[test]
+fn maximum_reasoning_respects_catalog_limits_and_preserves_lower_effort() {
+    let mut model = test_model_info();
+    model.supports_reasoning_summaries = true;
+    model.supported_reasoning_levels = serde_json::from_value(json!([
+        {"effort":"low","description":""},
+        {"effort":"xhigh","description":""}
+    ]))
+    .unwrap();
+    for requested in [ReasoningEffort::Ultra, ReasoningEffort::Max] {
+        assert_eq!(
+            crate::client::request_effort_for_model(&model, Some(requested)),
+            Some(ReasoningEffort::XHigh)
+        );
+    }
+    assert_eq!(
+        crate::client::request_effort_for_model(&model, Some(ReasoningEffort::Low)),
+        Some(ReasoningEffort::Low)
+    );
 }
 
 fn write_chatgpt_auth_json(codex_home: &std::path::Path) {

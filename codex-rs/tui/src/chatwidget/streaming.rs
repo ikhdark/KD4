@@ -12,19 +12,7 @@ impl ChatWidget {
             self.set_status_header(header);
         } else if self.bottom_pane.is_task_running() {
             self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
-            let header = self
-                .active_reasoning_policy
-                .as_ref()
-                .map(|snapshot| match snapshot.phase {
-                    codex_protocol::protocol::ReasoningPolicyPhase::Orient => "Orienting",
-                    codex_protocol::protocol::ReasoningPolicyPhase::Inspect => "Inspecting",
-                    codex_protocol::protocol::ReasoningPolicyPhase::Implement => "Implementing",
-                    codex_protocol::protocol::ReasoningPolicyPhase::Verify => "Verifying",
-                    codex_protocol::protocol::ReasoningPolicyPhase::Diagnose => "Diagnosing",
-                    codex_protocol::protocol::ReasoningPolicyPhase::Finalize => "Finalizing",
-                })
-                .unwrap_or("Working");
-            self.set_status_header(header.to_string());
+            self.set_status_header("Working".to_string());
         }
     }
 

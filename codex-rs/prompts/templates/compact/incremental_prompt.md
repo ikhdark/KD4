@@ -21,3 +21,7 @@ freshness attached to the claims they support.
 In `## Current state`, preserve changed repository facts needed to continue:
 owner and symbol paths, focused build/test commands, caller/consumer relationships,
 and their snapshot or freshness qualifications. Retire superseded locations.
+Carry changes to live command, cell, and job identifiers, their last observed
+status, supported continuation or cancellation calls, and indispensable artifact
+or recovery references. Retire completed handles and obsolete next actions.
+Preserve unknown status; do not infer completion or gather new evidence.

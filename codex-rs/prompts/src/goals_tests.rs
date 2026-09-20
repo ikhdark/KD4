@@ -78,7 +78,11 @@ fn objective_updated_prompt_supersedes_previous_goal_context() {
     assert!(prompt.contains("Token budget: 10000"));
     assert!(prompt.contains("Tokens remaining: 8766"));
     assert!(
-        prompt.contains("Do not call update_goal unless the updated goal is actually complete.")
+        prompt.contains("actually complete or the tool's strict blocked condition is satisfied")
+    );
+    assert!(prompt.contains("An incomplete goal, changed objective, or exhausted budget alone does not satisfy either condition."));
+    assert!(
+        !prompt.contains("Do not call update_goal unless the updated goal is actually complete.")
     );
 }
 

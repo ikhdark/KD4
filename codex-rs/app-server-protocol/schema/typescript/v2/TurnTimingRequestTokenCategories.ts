@@ -29,4 +29,42 @@ providerReconciliationResidual: number | null,
  * Overlapping diagnostic: logical tokens in categories whose exact hash
  * matched the preceding request. This is not added to `logical_total`.
  */
-repeatedUnchangedContext: bigint, };
+repeatedUnchangedContext: bigint,
+/**
+ * Fixed-prefix categories whose exact hash differed from the preceding
+ * request. Non-empty explains why fixed-prefix reuse was ineligible.
+ */
+fixedPrefixChangedCategories?: Array<string>,
+/**
+ * Input items the preceding request sent, from this request's own
+ * comparison. Absent on the first request of a comparison chain, which has
+ * no predecessor to diverge from.
+ *
+ * A whole-history digest changes on every request by design, so it cannot
+ * distinguish appending from rewriting. These three fields can: with
+ * `history_prefix_items_reused == history_items_previous` the request only
+ * appended, and a smaller `history_first_divergent_index` locates where the
+ * prefix was rewritten or truncated instead.
+ */
+historyItemsPrevious?: number,
+/**
+ * Leading input items identical to the preceding request's.
+ */
+historyPrefixItemsReused?: number,
+/**
+ * First input index whose digest differs from the preceding request's.
+ */
+historyFirstDivergentIndex?: number,
+/**
+ * Tool results the aggregate output budget dropped from the representation
+ * this request actually sent.
+ *
+ * Attributed to one request and one representation: the budget runs over
+ * several candidate projections, and summing them would count drops that
+ * never reached the model.
+ */
+toolOutputBudgetDropCount: number,
+/**
+ * Tokens those dropped results would have occupied.
+ */
+toolOutputBudgetDroppedTokenCount: bigint, };

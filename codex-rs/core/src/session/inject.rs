@@ -308,7 +308,10 @@ mod tests {
 
         let (_activity_rx, pending_activity) = session
             .input_queue
-            .subscribe_activity(Some(turn_state.as_ref()))
+            .subscribe_activity(
+                Some(turn_state.as_ref()),
+                /*has_internal_completion*/ false,
+            )
             .await;
         assert_eq!(pending_activity, Some(InputQueueActivity::Steer));
     }
@@ -332,7 +335,10 @@ mod tests {
 
         let (_activity_rx, pending_activity) = session
             .input_queue
-            .subscribe_activity(Some(turn_state.as_ref()))
+            .subscribe_activity(
+                Some(turn_state.as_ref()),
+                /*has_internal_completion*/ false,
+            )
             .await;
         assert_eq!(pending_activity, None);
         assert!(

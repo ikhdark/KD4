@@ -28,7 +28,6 @@ use codex_config::config_toml::ConfigLockfileToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
 use codex_config::config_toml::ProjectConfig;
-use codex_config::config_toml::ReasoningPhaseEfforts;
 use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::loader::load_config_layers_state;
@@ -180,23 +179,6 @@ pub(crate) use permissions::reject_unknown_builtin_permission_profile;
 pub(crate) use permissions::resolve_permission_profile;
 pub use resolved_permission_profile::PermissionProfileSnapshot;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
-
-fn effective_reasoning_phase_efforts(
-    configured: Option<ReasoningPhaseEfforts>,
-) -> ReasoningPhaseEfforts {
-    let configured = configured.unwrap_or_default();
-    ReasoningPhaseEfforts {
-        orient: configured.orient.or(Some(ReasoningEffort::High)),
-        inspect: configured.inspect.or(Some(ReasoningEffort::Low)),
-        implement: configured.implement.or(Some(ReasoningEffort::High)),
-        diagnose: configured.diagnose.or(Some(ReasoningEffort::High)),
-        verify: configured.verify.or(Some(ReasoningEffort::Low)),
-        finalize: configured.finalize.or(Some(ReasoningEffort::Low)),
-        deterministic_continuation: configured
-            .deterministic_continuation
-            .or(Some(ReasoningEffort::Low)),
-    }
-}
 
 /// Maximum number of source bytes retained across project documentation files.
 /// Model-visible separators, provenance labels, and notices receive a separate
@@ -1005,11 +987,6 @@ pub struct Config {
     /// Plan preset. The `none` value means "no reasoning" (not "inherit the
     /// global default").
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
-
-    /// Per-logical-request reasoning effort overrides. The sampling governor
-    /// remains enabled when the table is absent. Omitted fields use the
-    /// compatibility defaults documented by [`ReasoningPhaseEfforts`].
-    pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
 
     /// Optional value to use for `reasoning.summary` when making a request
     /// using the Responses API. When unset, the model catalog default is used.
@@ -3643,9 +3620,6 @@ impl Config {
                 .unwrap_or(false),
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
-            reasoning_phase_efforts: features
-                .enabled(Feature::Kd4Runtime)
-                .then(|| effective_reasoning_phase_efforts(cfg.reasoning_phase_efforts)),
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,
             model_verbosity: cfg.model_verbosity,

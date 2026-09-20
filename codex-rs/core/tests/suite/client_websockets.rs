@@ -595,6 +595,7 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
         vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
     ]])
     .await;
 
@@ -693,6 +694,64 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
         }],
     );
 
+    let payload = &rollout.raw_payloads[&inference.raw_request_payload_id];
+    let captured: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(trace_dir.path().join(&payload.path)).expect("read capture"),
+    )
+    .expect("capture JSON");
+    assert_eq!(captured["_codex"]["wire_request"], follow_up);
+    assert_eq!(captured["input"].as_array().unwrap().len(), 1);
+    assert!(captured["_codex"]["physical_attempt_id"].is_string());
+    assert!(follow_up.get("_codex").is_none());
+
+    let next_prompt = prompt_with_input(vec![message_item("hello"), message_item("continue")]);
+    let mut stream = client_session
+        .stream(
+            &next_prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            None,
+            &responses_metadata,
+            &inference_trace,
+        )
+        .await
+        .expect("continuation stream");
+    while let Some(event) = stream.next().await {
+        event.expect("continuation event");
+    }
+    let rollout = replay_bundle(trace_dir.path()).expect("replay continuation trace");
+    assert_eq!(rollout.inference_calls.len(), 2);
+    let next = rollout
+        .inference_calls
+        .values()
+        .find(|call| call.response_id.as_deref() == Some("resp-2"))
+        .expect("second inference");
+    let payload = &rollout.raw_payloads[&next.raw_request_payload_id];
+    let next_capture: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(trace_dir.path().join(&payload.path)).expect("read next capture"),
+    )
+    .expect("next capture JSON");
+    let next_wire = server.single_connection()[2].body_json();
+    let mut captured_wire = next_capture.clone();
+    captured_wire.as_object_mut().unwrap().remove("_codex");
+    assert_eq!(captured_wire, next_wire);
+    assert_eq!(
+        next_capture["_codex"]["logical_request"]["input"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_ne!(
+        next_capture["_codex"]["physical_attempt_id"],
+        captured["_codex"]["physical_attempt_id"]
+    );
+    assert_ne!(
+        next_capture["_codex"]["sampling_request_id"],
+        captured["_codex"]["sampling_request_id"]
+    );
     server.shutdown().await;
 }
 

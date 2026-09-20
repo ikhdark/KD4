@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::NestedCancellation;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
@@ -46,7 +47,7 @@ impl CodeModeSessionDelegate for RendezvousDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let started = self.started.fetch_add(1, Ordering::AcqRel) + 1;
@@ -94,7 +95,7 @@ impl CodeModeSessionDelegate for HeldNotificationDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let _ = self.events_tx.send(DelegateEvent::ToolStarted);
@@ -152,7 +153,7 @@ impl CodeModeSessionDelegate for BlockingDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let _ = self.events_tx.send(DelegateEvent::ToolStarted);
@@ -204,6 +205,7 @@ fn execute_request(source: &str) -> ExecuteRequest {
         source: source.to_string(),
         yield_time_ms: Some(1),
         max_output_tokens: None,
+        default_tool_timeout_ms: None,
     }
 }
 
@@ -214,6 +216,7 @@ fn blocking_tool() -> ToolDefinition {
         description: String::new(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        default_timeout_ms: None,
         output_schema: None,
     }
 }
@@ -230,6 +233,7 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
                     description: "plain tool".to_string(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
+                    default_timeout_ms: None,
                     output_schema: None,
                 },
                 ToolDefinition {
@@ -238,6 +242,7 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
                     description: "namespaced tool".to_string(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
+                    default_timeout_ms: None,
                     output_schema: None,
                 },
             ],
@@ -379,6 +384,107 @@ text(outcome);
             }],
             error_text: None,
         }
+    );
+}
+
+#[tokio::test]
+async fn explicit_nested_tool_timeout_still_wins_over_a_host_supplied_default() {
+    let (delegate, mut events_rx) = BlockingDelegate::new();
+    let service = InProcessCodeModeSession::with_delegate(delegate);
+    let mut tool = blocking_tool();
+    tool.default_timeout_ms = Some(300_000);
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![tool],
+            source: r#"
+const outcome = await tools.block({}, { timeout_ms: 10 }).then(
+  () => "unexpected success",
+  (error) => String(error),
+);
+text(outcome);
+"#
+            .to_string(),
+            yield_time_ms: Some(60_000),
+            // A generous per-cell default must not extend a short explicit
+            // per-call bound.
+            default_tool_timeout_ms: Some(600_000),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+    assert_eq!(
+        cell.initial_response().await.unwrap(),
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "nested tool `block` exceeded its 10ms timeout".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn per_tool_default_survives_runtime_conversion_without_extending_other_tools() {
+    let (delegate, mut events_rx) = BlockingDelegate::new();
+    let service = InProcessCodeModeSession::with_delegate(delegate);
+    let mut tool = blocking_tool();
+    tool.default_timeout_ms = Some(80);
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![tool],
+            source: "try { await tools.block({}); } catch (error) { text(String(error)); }".into(),
+            yield_time_ms: Some(60_000),
+            default_tool_timeout_ms: Some(5),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+    let response = cell.initial_response().await.unwrap();
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        ..
+    } = response
+    else {
+        panic!("the tool must reach its configured timeout");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(
+        content_items,
+        vec![FunctionCallOutputContentItem::InputText {
+            text: "nested tool `block` exceeded its 80ms timeout".into(),
+        }]
+    );
+
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()],
+            source: "try { await tools.block({}); } catch (error) { text(String(error)); }".into(),
+            yield_time_ms: Some(60_000),
+            default_tool_timeout_ms: Some(5),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+    let response = cell.initial_response().await.unwrap();
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        ..
+    } = response
+    else {
+        panic!("ordinary tool must retain its shorter timeout");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(
+        content_items,
+        vec![FunctionCallOutputContentItem::InputText {
+            text: "nested tool `block` exceeded its 5ms timeout".into(),
+        }]
     );
 }
 

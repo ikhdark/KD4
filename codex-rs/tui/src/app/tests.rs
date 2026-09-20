@@ -2663,6 +2663,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
         agent_thread_id,
         ServerNotification::ThreadStarted(ThreadStartedNotification {
             thread: Thread {
+                project_id: None,
                 id: agent_thread_id.to_string(),
                 extra: None,
                 session_id: agent_thread_id.to_string(),
@@ -2758,6 +2759,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
         agent_thread_id,
         ServerNotification::ThreadStarted(ThreadStartedNotification {
             thread: Thread {
+                project_id: None,
                 id: agent_thread_id.to_string(),
                 extra: None,
                 session_id: agent_thread_id.to_string(),
@@ -2820,6 +2822,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     app.primary_session_configured = Some(primary_session);
 
     let thread = Thread {
+        project_id: None,
         id: read_thread_id.to_string(),
         extra: None,
         session_id: read_thread_id.to_string(),
@@ -4597,7 +4600,6 @@ fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn 
         duration_ms: None,
         timing: None,
         surfaced_result: None,
-        reasoning_policy_history: None,
     }
 }
 
@@ -5483,7 +5485,6 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                     duration_ms: None,
                     timing: None,
                     surfaced_result: None,
-                    reasoning_policy_history: None,
                 },
                 Turn {
                     id: "turn-2".to_string(),
@@ -5511,7 +5512,6 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                     duration_ms: None,
                     timing: None,
                     surfaced_result: None,
-                    reasoning_policy_history: None,
                 },
             ],
             events: Vec::new(),
@@ -5871,6 +5871,7 @@ async fn thread_rollback_response_discards_queued_active_thread_events() {
         /*num_turns*/ 1,
         &ThreadRollbackResponse {
             thread: Thread {
+                project_id: None,
                 id: thread_id.to_string(),
                 extra: None,
                 session_id: thread_id.to_string(),

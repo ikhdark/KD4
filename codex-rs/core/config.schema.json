@@ -704,10 +704,37 @@
         }
       ]
     },
+    "HookRunScope": {
+      "description": "Codex extension: how often a matched hook handler may run.",
+      "oneOf": [
+        {
+          "description": "Run once per turn; later matched dispatches in that turn are skipped.",
+          "enum": [
+            "turn"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Run once per session; later matched dispatches in that session are skipped.",
+          "enum": [
+            "session"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "HookStateToml": {
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "once_per": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HookRunScope"
+            }
+          ],
+          "description": "Codex extension: run the handler at most once per scope. Later matched dispatches in that scope are skipped without spawning the command."
         },
         "trusted_hash": {
           "type": "string"
@@ -2044,39 +2071,6 @@
       "description": "A non-empty reasoning effort value advertised by the model.",
       "minLength": 1,
       "type": "string"
-    },
-    "ReasoningPhaseEfforts": {
-      "additionalProperties": false,
-      "description": "Per-logical-request reasoning effort overrides. Omitted fields retain the compatibility defaults: high for orient, implement, and diagnose; low for inspect, verify, finalize, and deterministic continuation.",
-      "properties": {
-        "deterministic_continuation": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            }
-          ],
-          "description": "Lowest-effort override for an unavoidable model request whose continuation has already been proven deterministic by its owner."
-        },
-        "diagnose": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "finalize": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "implement": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "inspect": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "orient": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "verify": {
-          "$ref": "#/definitions/ReasoningEffort"
-        }
-      },
-      "type": "object"
     },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
@@ -4524,9 +4518,6 @@
         "$ref": "#/definitions/ProjectConfig"
       },
       "type": "object"
-    },
-    "reasoning_phase_efforts": {
-      "$ref": "#/definitions/ReasoningPhaseEfforts"
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",

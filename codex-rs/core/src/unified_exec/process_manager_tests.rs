@@ -16,6 +16,80 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[tokio::test(start_paused = true)]
+async fn poll_advertises_noninteractive_session_capabilities() {
+    use codex_tools::ToolOutput;
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&1000)
+        .unwrap()
+        .tty = false;
+    let result = manager
+        .write_stdin(WriteStdinRequest {
+            process_id: 1000,
+            input: "",
+            yield_time_ms: 5_000,
+            max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            nested_deadline: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.process_id, Some(1000));
+    let payload = crate::tools::context::ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let value = result.code_mode_result(&payload);
+    let codex_tools::ToolSpec::Function(spec) =
+        crate::tools::handlers::shell_spec::create_write_stdin_tool()
+    else {
+        panic!("write_stdin must advertise a function schema");
+    };
+    let schema = spec.output_schema.expect("published output schema");
+    jsonschema::validator_for(&schema)
+        .expect("valid output schema")
+        .validate(&value)
+        .expect("session result must match the advertised contract");
+    assert_eq!(
+        value["session_capabilities"],
+        serde_json::json!({
+            "stdin": false, "interrupt": false, "cancellation": false, "polling": true
+        })
+    );
+    let response = result.to_response_item("capabilities", &payload);
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+    else {
+        panic!("expected function output");
+    };
+    assert!(
+        output
+            .body
+            .to_text()
+            .unwrap()
+            .contains("stdin=false, interrupt=false, cancellation=false, polling=true")
+    );
+    manager.process_store.lock().await.remove(1000);
+    process.terminate_confirmed().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn input_handoff_preserves_poll_bytes_and_reports_actual_wait() {
     use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
     use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
@@ -49,6 +123,7 @@ async fn input_handoff_preserves_poll_bytes_and_reports_actual_wait() {
             yield_time_ms: 120_000,
             max_output_tokens: None,
             truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            nested_deadline: None,
         }),
     );
     tokio::pin!(poll);
@@ -61,6 +136,7 @@ async fn input_handoff_preserves_poll_bytes_and_reports_actual_wait() {
         yield_time_ms: 250,
         max_output_tokens: None,
         truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        nested_deadline: None,
     });
     tokio::pin!(input);
     assert!(futures::poll!(&mut input).is_pending());
@@ -134,6 +210,7 @@ async fn poll_progress_is_completed_and_silence_is_timeout() {
                 yield_time_ms: 1000,
                 max_output_tokens: None,
                 truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+                nested_deadline: None,
             }),
         )
         .await
@@ -357,6 +434,7 @@ async fn collection_bounds_successive_drains_with_exact_omission_accounting() {
         yield_time_ms: 10_000,
         max_output_tokens: None,
         truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        nested_deadline: None,
     });
     tokio::pin!(collected);
     assert!(futures::poll!(&mut collected).is_pending());
@@ -435,6 +513,7 @@ async fn refresh_rejects_reused_identity_and_keeps_unread_closed_output() {
             yield_time_ms: 1000,
             max_output_tokens: None,
             truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            nested_deadline: None,
         })
         .await
         .expect("normal polling must recover the final bytes");
@@ -468,6 +547,7 @@ async fn polling_completion_cannot_adopt_or_drain_a_reused_process_id() {
         yield_time_ms: 1000,
         max_output_tokens: None,
         truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        nested_deadline: None,
     };
     let poll = manager.write_stdin(request());
     tokio::pin!(poll);
@@ -2668,6 +2748,7 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
         truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(100),
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -2676,6 +2757,7 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let result = tokio::time::timeout(
         Duration::from_secs(1),

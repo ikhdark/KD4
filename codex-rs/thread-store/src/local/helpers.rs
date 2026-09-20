@@ -237,6 +237,7 @@ pub(super) fn stored_thread_from_rollout_item(
     let rollout_path = codex_rollout::plain_rollout_path(item.path.as_path());
 
     Some(StoredThread {
+        project_id: None,
         thread_id,
         extra_config: None,
         rollout_path: Some(rollout_path),

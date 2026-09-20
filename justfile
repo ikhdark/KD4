@@ -265,11 +265,6 @@ test *args:
 test-fast *args:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo nextest run @forwarded_args
 
-# Keep the raw config, resolved defaults, and reachable sampling policy in one gate.
-# The filters and their exact test IDs live in codex-rs/.config/kd4-rust-tests.toml.
-adaptive-reasoning-contract-check:
-    just core-gate adaptive-reasoning-contract
-
 # Named `codex-core` test targets and gates. `codex-rs/.config/kd4-rust-tests.toml`
 # owns the package/target selection and the exact helper binaries each target
 # needs, so the selection cannot drift and a zero-test selection always fails.
@@ -669,9 +664,12 @@ app-server-schema-protocol-check:
     just core-gate app-server-schema-fixtures
 
 # Check app-server schema fixtures without modifying generated output.
+# Forwards checker flags, notably `--allow-stable-break <issue>` for a reviewed
+# stable API break and `--compatibility-baseline <rev>` to move the baseline off
+# the default `HEAD^`.
 [no-cd]
-app-server-schema-check:
-    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check
+app-server-schema-check *args:
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check {{ args }}
 
 # Explicitly regenerate app-server schemas under the repository generation lock.
 [no-cd]

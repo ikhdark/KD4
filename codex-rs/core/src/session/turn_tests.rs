@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::reasoning_governor::AuthoritativeWaitOwnerResult;
+use crate::session::turn_execution::AuthoritativeWaitOwnerResult;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
@@ -1746,8 +1746,8 @@ fn ordered_sampling_prefix_holds_ready_state_until_append_completes() {
 
 fn authoritative_wait_result(
     surfaceable_message: Option<&str>,
-) -> crate::session::reasoning_governor::AuthoritativeWaitOwnerResult {
-    crate::session::reasoning_governor::AuthoritativeWaitOwnerResult {
+) -> crate::session::turn_execution::AuthoritativeWaitOwnerResult {
+    crate::session::turn_execution::AuthoritativeWaitOwnerResult {
         adapter: "code_mode_cell".to_string(),
         value: serde_json::json!("arbitrary raw execution output"),
         surfaceable_message: surfaceable_message.map(ToOwned::to_owned),
@@ -2835,7 +2835,7 @@ fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {
 }
 
 #[test]
-fn reasoning_governor_resets_for_every_accepted_context_change() {
+fn turn_execution_resets_for_every_accepted_context_change() {
     let user_input = TurnInput::UserInput {
         content: vec![UserInput::Text {
             text: "new instruction".to_string(),
@@ -2858,11 +2858,11 @@ fn reasoning_governor_resets_for_every_accepted_context_change() {
         true,
     ));
 
-    assert!(resets_reasoning_governor(&user_input));
-    assert!(!resets_reasoning_governor(&empty_user_input));
-    assert!(resets_reasoning_governor(&response_item));
-    assert!(!resets_reasoning_governor(&internal_response_item));
-    assert!(resets_reasoning_governor(&mailbox_item));
+    assert!(resets_turn_execution(&user_input));
+    assert!(!resets_turn_execution(&empty_user_input));
+    assert!(resets_turn_execution(&response_item));
+    assert!(!resets_turn_execution(&internal_response_item));
+    assert!(resets_turn_execution(&mailbox_item));
 }
 
 #[test]

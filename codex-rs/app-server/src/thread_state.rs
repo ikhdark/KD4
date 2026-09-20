@@ -296,7 +296,6 @@ impl ThreadTurnIndex {
         turn.duration_ms = change.duration_ms;
         turn.timing = change.timing;
         turn.surfaced_result = change.surfaced_result;
-        turn.reasoning_policy_history = change.reasoning_policy_history;
     }
 
     fn overlay_turn(&mut self, mut turn: Turn) {
@@ -342,7 +341,6 @@ impl ThreadTurnIndex {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             })
     }
 

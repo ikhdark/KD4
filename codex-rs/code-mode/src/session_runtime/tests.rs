@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
+use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -21,7 +22,7 @@ impl SessionRuntimeDelegate for RecordingDelegate {
     async fn invoke_tool(
         &self,
         _invocation: NestedToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> Result<JsonValue, String> {
         Ok(JsonValue::Null)
     }
@@ -43,7 +44,7 @@ impl SessionRuntimeDelegate for PanickingClosedDelegate {
     async fn invoke_tool(
         &self,
         _invocation: NestedToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> Result<JsonValue, String> {
         Ok(JsonValue::Null)
     }

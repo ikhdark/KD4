@@ -52,6 +52,13 @@
     "turn_id": {
       "description": "Codex extension: expose the active turn id to internal turn-scoped hooks.",
       "type": "string"
+    },
+    "turn_tool_calls": {
+      "description": "Codex extension: flat names of tools already dispatched earlier in this turn, so a hook can skip advice the turn has already acted on.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [

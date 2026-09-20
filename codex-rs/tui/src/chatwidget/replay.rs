@@ -25,7 +25,6 @@ impl ChatWidget {
                 duration_ms,
                 timing,
                 surfaced_result,
-                reasoning_policy_history,
             } = turn;
             if matches!(status, TurnStatus::InProgress) {
                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
@@ -50,7 +49,6 @@ impl ChatWidget {
                     duration_ms,
                     timing,
                     surfaced_result,
-                    reasoning_policy_history,
                 };
                 self.handle_turn_completed_notification(
                     TurnCompletedNotification {

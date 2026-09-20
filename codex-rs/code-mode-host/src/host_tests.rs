@@ -78,6 +78,7 @@ fn execute_request(source: &str) -> WireExecuteRequest {
         source: source.to_string(),
         yield_time_ms: Some(60_000),
         max_output_tokens: Some(1_000),
+        default_tool_timeout_ms: None,
     }
 }
 

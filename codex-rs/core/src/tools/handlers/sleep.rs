@@ -104,7 +104,7 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
                 .await;
             let (mut activity_rx, pending_activity) = session
                 .input_queue
-                .subscribe_activity(turn_state.as_deref())
+                .subscribe_activity(turn_state.as_deref(), false)
                 .await;
             let sleep_result: Result<bool, FunctionCallError> = if pending_activity.is_some() {
                 Ok(true)

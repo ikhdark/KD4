@@ -1253,6 +1253,9 @@ mod tests {
         };
 
         assert_eq!(recovery_retruncation_count(&output), 0);
+        let delivered = serde_json::to_value(output).expect("recovery result");
+        assert_eq!(delivered["retained_artifact_complete"], true);
+        assert_eq!(delivered["delivered_selection_complete"], false);
     }
 
     #[test]

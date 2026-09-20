@@ -442,6 +442,8 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
                     cell_id: "cell-1".to_string(),
                     parent_call_id: Some("outer-call".to_string()),
                     runtime_tool_call_id: "tool-1".to_string(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
                 "{}",
             ),

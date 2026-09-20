@@ -2502,6 +2502,24 @@
       ],
       "type": "object"
     },
+    "ProjectRoot": {
+      "properties": {
+        "path": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ProjectSortKey": {
+      "enum": [
+        "position",
+        "recencyAt"
+      ],
+      "type": "string"
+    },
     "PtyTerminalSize": {
       "description": "Canonical PTY size payload shared by app-server process APIs.",
       "properties": {

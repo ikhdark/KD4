@@ -35,6 +35,10 @@ pub(crate) enum TurnInput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputQueueActivity {
+    /// Lowest priority: a deferred internal result is queued for the next
+    /// request. It is worth waking an owner-held wait, but it must never mask
+    /// user steering that is also pending.
+    InternalCompletion,
     Mailbox,
     Steer,
 }
@@ -99,14 +103,36 @@ impl InputQueue {
         queue
     }
 
+    /// Subscribes to activity wakes, then reports what is already pending.
+    ///
+    /// Subscribing first is what makes the pair safe: anything that lands
+    /// between the two is retained state the caller sees on the second half, or
+    /// a wake the receiver has already registered for.
     pub(crate) async fn subscribe_activity(
         &self,
         turn_state: Option<&Mutex<TurnState>>,
+        has_internal_completion: bool,
     ) -> (
         watch::Receiver<InputQueueActivity>,
         Option<InputQueueActivity>,
     ) {
         let activity_rx = self.activity_tx.subscribe();
+        let pending_activity = self
+            .pending_activity(turn_state, has_internal_completion)
+            .await;
+        (activity_rx, pending_activity)
+    }
+
+    /// Derives the highest-priority pending activity from queue state.
+    ///
+    /// The watch channel carries only its latest value, so a low-priority wake
+    /// published after steering would otherwise hide it. Every waiter
+    /// re-derives from state after each wake instead of trusting that value.
+    pub(crate) async fn pending_activity(
+        &self,
+        turn_state: Option<&Mutex<TurnState>>,
+        has_internal_completion: bool,
+    ) -> Option<InputQueueActivity> {
         let has_recovered_steer = self
             .startup_recovery_items
             .lock()
@@ -118,14 +144,25 @@ impl InputQueue {
         } else {
             false
         };
-        let pending_activity = if has_recovered_steer || has_pending_steer {
+        if has_recovered_steer || has_pending_steer {
             Some(InputQueueActivity::Steer)
         } else if self.has_pending_mailbox_items().await {
             Some(InputQueueActivity::Mailbox)
+        } else if has_internal_completion {
+            Some(InputQueueActivity::InternalCompletion)
         } else {
             None
-        };
-        (activity_rx, pending_activity)
+        }
+    }
+
+    /// Wakes owner-held waits after an internal completion was recorded.
+    ///
+    /// This is only a nudge: the record, not this signal, is the retained state
+    /// a waiter checks, and the waiter re-derives priority for itself.
+    #[cfg(test)]
+    pub(crate) fn publish_internal_completion(&self) {
+        self.activity_tx
+            .send_replace(InputQueueActivity::InternalCompletion);
     }
 
     pub(crate) async fn enqueue_mailbox_communication(
@@ -643,8 +680,11 @@ mod tests {
     #[tokio::test]
     async fn input_queue_notifies_mailbox_subscribers() {
         let input_queue = InputQueue::new();
-        let (mut activity_rx, pending_activity) =
-            input_queue.subscribe_activity(/*turn_state*/ None).await;
+        let (mut activity_rx, pending_activity) = input_queue
+            .subscribe_activity(
+                /*turn_state*/ None, /*has_internal_completion*/ false,
+            )
+            .await;
         assert_eq!(pending_activity, None);
 
         input_queue
@@ -677,8 +717,9 @@ mod tests {
     async fn input_queue_notifies_steer_subscribers() {
         let input_queue = InputQueue::new();
         let turn_state = Mutex::new(TurnState::default());
-        let (mut activity_rx, pending_activity) =
-            input_queue.subscribe_activity(Some(&turn_state)).await;
+        let (mut activity_rx, pending_activity) = input_queue
+            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false)
+            .await;
         assert_eq!(pending_activity, None);
 
         input_queue
@@ -719,10 +760,92 @@ mod tests {
             .await
             .expect("steer input should fit");
 
-        let (_activity_rx, pending_activity) =
-            input_queue.subscribe_activity(Some(&turn_state)).await;
+        let (_activity_rx, pending_activity) = input_queue
+            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false)
+            .await;
 
         assert_eq!(pending_activity, Some(InputQueueActivity::Steer));
+    }
+
+    /// A deferred result is worth ending a quiet wait for, but an agent must
+    /// never be told "a job finished" while the user is waiting to steer it.
+    #[tokio::test]
+    async fn steering_outranks_an_internal_completion_that_arrives_with_it() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+
+        // Nothing pending but a completion: it is reported.
+        let (_activity_rx, pending_activity) = input_queue
+            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ true)
+            .await;
+        assert_eq!(
+            pending_activity,
+            Some(InputQueueActivity::InternalCompletion)
+        );
+
+        input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                &turn_state,
+                &[TurnInput::UserInput {
+                    content: vec![UserInput::Text {
+                        text: "steer me".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                }],
+                || {},
+            )
+            .await
+            .expect("steer input should fit");
+
+        // Both pending: steering wins, however late the completion's wake was.
+        input_queue.publish_internal_completion();
+        let (_activity_rx, pending_activity) = input_queue
+            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ true)
+            .await;
+        assert_eq!(
+            pending_activity,
+            Some(InputQueueActivity::Steer),
+            "a low-priority completion must not mask pending user steering"
+        );
+    }
+
+    /// Re-deriving from state is what makes the previous guarantee hold for a
+    /// waiter that is already parked: the watch carries only its latest value,
+    /// so the completion's wake would otherwise overwrite the steer signal.
+    #[tokio::test]
+    async fn a_parked_waiter_re_derives_steering_after_a_completion_wake() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        let (_activity_rx, _) = input_queue
+            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false)
+            .await;
+
+        input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                &turn_state,
+                &[TurnInput::UserInput {
+                    content: vec![UserInput::Text {
+                        text: "steer me".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                }],
+                || {},
+            )
+            .await
+            .expect("steer input should fit");
+        // The completion publishes last, so the watch's latest value is the
+        // low-priority one.
+        input_queue.publish_internal_completion();
+
+        assert_eq!(
+            input_queue
+                .pending_activity(Some(&turn_state), /*has_internal_completion*/ true)
+                .await,
+            Some(InputQueueActivity::Steer),
+            "priority comes from queue state, not from the last value published"
+        );
     }
 
     #[tokio::test]
@@ -1247,20 +1370,26 @@ mod tests {
             ),
         ] {
             let queue = InputQueue::new();
-            let (mut receiver, pending) = queue.subscribe_activity(None).await;
+            let (mut receiver, pending) = queue
+                .subscribe_activity(None, /*has_internal_completion*/ false)
+                .await;
             assert_eq!(pending, None);
             queue.restore_transferred_startup_input(input.clone()).await;
             assert_eq!(receiver.has_changed().unwrap(), expected.is_some());
             if let Some(expected) = expected {
                 assert_eq!(*receiver.borrow_and_update(), expected);
             }
-            let (_, pending) = queue.subscribe_activity(None).await;
+            let (_, pending) = queue
+                .subscribe_activity(None, /*has_internal_completion*/ false)
+                .await;
             assert_eq!(
                 pending, expected,
                 "late subscribers must see recovered work"
             );
             assert_eq!(queue.get_pending_input(&Mutex::new(None)).await, input);
-            let (_, pending) = queue.subscribe_activity(None).await;
+            let (_, pending) = queue
+                .subscribe_activity(None, /*has_internal_completion*/ false)
+                .await;
             assert_eq!(pending, None);
         }
 
@@ -1268,7 +1397,9 @@ mod tests {
         queue
             .restore_transferred_startup_input(vec![user.clone()])
             .await;
-        let (mut receiver, _) = queue.subscribe_activity(None).await;
+        let (mut receiver, _) = queue
+            .subscribe_activity(None, /*has_internal_completion*/ false)
+            .await;
         let later_mail = mail(true);
         queue
             .restore_transferred_startup_input(vec![later_mail.clone()])

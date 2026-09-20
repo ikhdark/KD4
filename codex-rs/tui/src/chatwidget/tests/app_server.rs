@@ -87,7 +87,6 @@ fn start_safety_buffering_test_turn(
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -583,7 +582,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -631,7 +629,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
             timing: None,
         }),
@@ -640,63 +637,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
 
     assert!(!chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_widget().is_none());
-}
-
-#[tokio::test]
-async fn live_reasoning_policy_phase_updates_the_working_status() {
-    use codex_protocol::openai_models::ReasoningEffort;
-    use codex_protocol::protocol::ReasoningPolicyPhase;
-    use codex_protocol::protocol::ReasoningPolicySnapshot;
-    use codex_protocol::protocol::ReasoningPolicySource;
-    use codex_protocol::protocol::ReasoningPolicyTrigger;
-
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.handle_server_notification(
-        ServerNotification::TurnStarted(TurnStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn: AppServerTurn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
-                status: AppServerTurnStatus::InProgress,
-                error: None,
-                started_at: Some(0),
-                completed_at: None,
-                duration_ms: None,
-                timing: None,
-                surfaced_result: None,
-                reasoning_policy_history: None,
-            },
-        }),
-        /*replay_kind*/ None,
-    );
-
-    chat.handle_server_notification(
-        ServerNotification::TurnReasoningPolicyUpdated(
-            codex_app_server_protocol::TurnReasoningPolicyUpdatedNotification {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                snapshot: ReasoningPolicySnapshot {
-                    sequence: 1,
-                    timestamp: 1,
-                    phase: ReasoningPolicyPhase::Verify,
-                    configured_effort: Some(ReasoningEffort::High),
-                    effective_effort: Some(ReasoningEffort::High),
-                    request_effort: Some(ReasoningEffort::High),
-                    source: ReasoningPolicySource::TurnFallback,
-                    model: "test-model".to_string(),
-                    trigger: ReasoningPolicyTrigger::UserInput,
-                },
-            },
-        ),
-        /*replay_kind*/ None,
-    );
-
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Verifying");
 }
 
 #[tokio::test]
@@ -717,7 +657,6 @@ async fn live_app_server_turn_started_sets_feedback_turn_id() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1352,7 +1291,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1395,7 +1333,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
             timing: None,
         }),
@@ -1458,7 +1395,6 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1520,7 +1456,6 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1565,7 +1500,6 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,

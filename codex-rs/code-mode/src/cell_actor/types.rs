@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use codex_code_mode_protocol::NestedCancellation;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -31,6 +32,10 @@ pub(crate) struct CellToolCall {
     pub(crate) kind: ToolKind,
     pub(crate) input: Option<JsonValue>,
     pub(crate) timeout: std::time::Duration,
+    /// Absolute instant the wrapper timeout fires, set by `spawn_tool` at the
+    /// point its own `sleep(timeout)` begins. `None` until then, so a handler
+    /// downstream never sees a deadline the wrapper is not actually enforcing.
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 
 /// Connects a cell actor to session-owned callbacks and stored values.
@@ -42,7 +47,7 @@ pub(crate) trait CellHost: Send + Sync + 'static {
     fn invoke_tool(
         &self,
         invocation: CellToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> impl Future<Output = Result<JsonValue, String>> + Send;
 
     fn notify(

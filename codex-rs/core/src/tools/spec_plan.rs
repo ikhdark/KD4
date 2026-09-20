@@ -26,6 +26,7 @@ use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
+use crate::tools::handlers::RetainedInventoryHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
@@ -729,6 +730,14 @@ fn build_code_mode_executors(
                         .description
                         .replace_range(..duplicate_prefix_len, "");
                 }
+                tracing::debug!(
+                    target: "codex_core::tool_schema_audit",
+                    tool = %executor.tool_name(),
+                    declaration_bytes = definition.description.len(),
+                    declaration_approx_tokens = codex_utils_output_truncation::approx_token_count(&definition.description),
+                    declaration_sha256 = %crate::tool_history::sha256(definition.description.as_bytes()),
+                    "eager built-in declaration"
+                );
                 eager_nested_tool_descriptions.push(definition.description);
             }
             code_mode_nested_tool_specs.push(spec);
@@ -963,14 +972,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
-    if !context
-        .step_context
-        .environments
-        .turn_environments
-        .is_empty()
-    {
-        planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
-    }
+    planned_tools
+        .add_with_authorization_class(RetainedInventoryHandler, TypedToolClass::ReadSearch);
+    // Host skill locators remain readable even when no execution environment exists.
+    // The handler still requires an environment for ordinary filesystem paths.
+    planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);

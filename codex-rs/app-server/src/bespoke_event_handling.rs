@@ -174,7 +174,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                     duration_ms: None,
                     timing: None,
                     surfaced_result: None,
-                    reasoning_policy_history: None,
                 });
                 turn.items.clear();
                 turn.items_view = TurnItemsView::NotLoaded;
@@ -670,8 +669,6 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         msg @ (EventMsg::AgentMessageContentDelta(_)
         | EventMsg::PlanDelta(_)
-        | EventMsg::ReasoningPolicyUpdated(_)
-        | EventMsg::ReasoningPolicySummary(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)) => {
@@ -1078,7 +1075,6 @@ async fn emit_turn_completed_with_status(
         duration_ms: turn_completion_metadata.duration_ms,
         timing: turn_completion_metadata.timing,
         surfaced_result: turn_completion_metadata.surfaced_result,
-        reasoning_policy_history: None,
     };
     let notification = TurnCompletedNotification {
         thread_id: conversation_id.to_string(),
@@ -1974,7 +1970,6 @@ mod tests {
     use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::RateLimitSnapshot;
     use codex_protocol::protocol::RateLimitWindow;
-    use codex_protocol::protocol::ReasoningPolicyHistory;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TokenUsage;
@@ -2056,85 +2051,6 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
-    async fn reasoning_policy_summary_emits_live_notification() -> Result<()> {
-        let codex_home = TempDir::new()?;
-        let mut config = load_default_config_for_test(&codex_home).await;
-        config.model_catalog = Some(codex_models_manager::bundled_models_response()?);
-        // Build the thread models manager from this fixture catalog, not the
-        // shared OpenAI manager, which otherwise refreshes through ChatGPT.
-        config.model_provider_id = "event-test".to_string();
-        let fallback_model_provider = config.model_provider_id.clone();
-        let thread_manager = Arc::new(
-            codex_core::test_support::thread_manager_with_models_provider_and_home(
-                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-                config.model_provider.clone(),
-                config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-            ),
-        );
-        let codex_core::NewThread {
-            thread_id: conversation_id,
-            thread: conversation,
-            ..
-        } = thread_manager.start_thread(config).await?;
-        let thread_state = new_thread_state();
-        let thread_watch_manager = ThreadWatchManager::new();
-        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(
-            outgoing,
-            vec![ConnectionId(1)],
-            conversation_id,
-        );
-        let history = ReasoningPolicyHistory {
-            turn_id: "turn-1".to_string(),
-            entries: Vec::new(),
-            total_entries: 2,
-            truncated: false,
-        };
-
-        apply_bespoke_event_handling(
-            Event {
-                id: "turn-1".to_string(),
-                msg: EventMsg::ReasoningPolicySummary(history.clone()),
-            },
-            conversation_id,
-            conversation,
-            thread_manager,
-            outgoing,
-            thread_state,
-            thread_watch_manager,
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            fallback_model_provider,
-        )
-        .await;
-
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            recv_broadcast_message(&mut rx),
-        )
-        .await??;
-        let OutgoingMessage::AppServerNotification(ServerNotification::TurnReasoningPolicySummary(
-            notification,
-        )) = msg
-        else {
-            bail!("expected reasoning-policy summary notification");
-        };
-        assert_eq!(
-            notification,
-            codex_app_server_protocol::TurnReasoningPolicySummaryNotification {
-                thread_id: conversation_id.to_string(),
-                turn_id: "turn-1".to_string(),
-                history,
-            }
-        );
-        Ok(())
-    }
-
     #[test]
     fn rollback_response_rebuilds_pathless_thread_from_stored_history() -> Result<()> {
         let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000789")?;
@@ -2155,6 +2071,7 @@ mod tests {
             })),
         ];
         let stored_thread = StoredThread {
+            project_id: None,
             thread_id,
             extra_config: None,
             rollout_path: None,

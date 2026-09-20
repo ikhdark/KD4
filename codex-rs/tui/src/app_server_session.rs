@@ -769,6 +769,7 @@ impl AppServerSession {
             .request_typed(ClientRequest::ThreadMetadataUpdate {
                 request_id,
                 params: ThreadMetadataUpdateParams {
+                    project_id: None,
                     thread_id: thread_id.to_string(),
                     git_info: Some(ThreadMetadataGitInfoUpdateParams {
                         sha: None,
@@ -1754,6 +1755,7 @@ mod tests {
             .expect("bind rollback server");
         let endpoint = format!("ws://{}", listener.local_addr().expect("server address"));
         let response_thread = Thread {
+            project_id: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
@@ -2359,6 +2361,7 @@ mod tests {
         let read_only_profile = PermissionProfile::read_only();
         let response = ThreadResumeResponse {
             thread: codex_app_server_protocol::Thread {
+                project_id: None,
                 id: thread_id.to_string(),
                 extra: None,
                 session_id: ThreadId::new().to_string(),
@@ -2407,7 +2410,6 @@ mod tests {
                     duration_ms: None,
                     timing: None,
                     surfaced_result: None,
-                    reasoning_policy_history: None,
                 }],
             },
             model: "gpt-5.4".to_string(),
@@ -2731,10 +2733,10 @@ mod tests {
             duration_ms: None,
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         };
         let response = ThreadStartResponse {
             thread: Thread {
+                project_id: None,
                 id: thread_id.to_string(),
                 extra: None,
                 session_id: thread_id.to_string(),

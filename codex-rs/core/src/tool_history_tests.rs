@@ -1327,6 +1327,7 @@ async fn stored_candidate(
 
 #[test]
 fn completed_tool_history_receipt_lifecycle_keeps_canonical_history_unchanged() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-1";
     let bounded = bounded_output();
     let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
@@ -1369,6 +1370,7 @@ fn completed_tool_history_receipt_lifecycle_keeps_canonical_history_unchanged() 
 
 #[test]
 fn completed_tool_history_receipt_does_not_expose_source_dependency_paths() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-1";
     let bounded = bounded_output();
     let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
@@ -1451,6 +1453,7 @@ fn token_efficiency_compact_v2_receipt_retains_integrity_and_accepts_legacy_v1()
 
 #[test]
 fn tool_history_receipt_does_not_replace_output_when_only_an_empty_digest_fits() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     // This call ID leaves exactly enough envelope space for an empty digest.
     // Such a receipt would fail the consumer's nonempty-digest validation.
     let call_id = "c".repeat(576);
@@ -1521,6 +1524,7 @@ fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
 
 #[test]
 fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let first = "alpha ".repeat(6_000);
     let second = "beta ".repeat(6_000);
     let canonical: Arc<[ResponseItem]> = Arc::from([
@@ -1540,7 +1544,7 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
             .filter_map(textual_output_identity)
             .map(|(_, output)| approx_token_count(output))
             .sum::<usize>()
-            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+            <= model_visible_tool_result_token_budget()
     );
     assert_eq!(
         projection
@@ -1557,7 +1561,7 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
             .filter_map(textual_output_identity)
             .map(|(_, output)| approx_token_count(output))
             .sum::<usize>()
-            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+            <= model_visible_tool_result_token_budget()
     );
     assert_eq!(projection.substitutions.len(), 1);
     assert_eq!(
@@ -1581,6 +1585,7 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
 
 #[test]
 fn tool_history_recovery_handles_cannot_bypass_the_aggregate_budget() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let mut state = ToolHistoryState::default();
     let mut items = Vec::new();
     for index in 0..160 {
@@ -1613,7 +1618,7 @@ fn tool_history_recovery_handles_cannot_bypass_the_aggregate_budget() {
                 .iter()
                 .map(|(_, text)| approx_token_count(text))
                 .sum::<usize>()
-                <= 10_000
+                <= model_visible_tool_result_token_budget()
         );
         assert!(!outputs.is_empty());
         assert!(
@@ -1639,6 +1644,93 @@ fn tool_history_recovery_handles_cannot_bypass_the_aggregate_budget() {
             Some(substitution.call_id.as_str())
         );
     }
+}
+
+#[test]
+fn aggregate_budget_drops_are_recorded_per_representation() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    for index in 0..20 {
+        let call_id = format!("saved-{index:03}");
+        let output = format!("result-{index} {}", "evidence ".repeat(500));
+        let mut tracked = candidate(&call_id, output.clone());
+        tracked.artifact_id = format!("artifact-{index:03}");
+        tracked.refresh_derived();
+        state.register(tracked);
+        items.push(function_call(&call_id));
+        items.push(text_output(&call_id, output));
+    }
+    // Dispatch failures and running-process receipts have no saved artifact, so
+    // admission cannot shrink them. They still occupy the prompt, and the
+    // aggregate budget is the only stage that can evict them.
+    for index in 0..30 {
+        let call_id = format!("unsaved-{index:03}");
+        items.push(function_call(&call_id));
+        items.push(text_output(
+            &call_id,
+            format!("unsaved-{index} {}", "pending ".repeat(200)),
+        ));
+    }
+    let canonical: Arc<[ResponseItem]> = Arc::from(items);
+
+    // The budget is one of several stages that can remove an output, so its
+    // own drops are measured where it runs.
+    let outputs = |items: &ProjectedResponseItems| {
+        items
+            .iter()
+            .filter_map(textual_output_identity)
+            .map(|(call_id, text)| (call_id.to_string(), approx_token_count(&text)))
+            .collect::<Vec<_>>()
+    };
+    let mut budgeted = ProjectedResponseItems::Shared(Arc::clone(&canonical));
+    let before = outputs(&budgeted);
+    let drops = state.enforce_tool_result_budget(&mut budgeted);
+    let after = outputs(&budgeted);
+    assert!(
+        !after.is_empty() && after.len() < before.len(),
+        "fixture must exhaust the aggregate budget without emptying history"
+    );
+    assert_eq!(
+        drops.count as usize,
+        before.len() - after.len(),
+        "the recorded count must match the results the budget removed"
+    );
+    assert_eq!(
+        drops.tokens,
+        before
+            .iter()
+            .filter(|(call_id, _)| !after.iter().any(|(kept, _)| kept == call_id))
+            .map(|(_, tokens)| *tokens as u64)
+            .sum::<u64>(),
+        "the recorded tokens must be what the dropped results would have cost"
+    );
+
+    // Both representations carry their own numbers into the projection. They
+    // present different output sizes to the same budget, so one shared number
+    // could not describe both.
+    let projection = state.project(Arc::clone(&canonical));
+    assert!(projection.items_budget_drops.count > 0);
+    assert!(projection.items_budget_drops.tokens > 0);
+    assert_ne!(
+        projection.items_budget_drops, projection.unreplaced_items_budget_drops,
+        "each representation must be measured on what it actually sends"
+    );
+
+    // A history that fits records nothing, so a request that sends it reports
+    // no drop delta.
+    let small = state.project(Arc::from(vec![
+        function_call("call-000"),
+        text_output("call-000", "short".to_string()),
+    ]));
+    assert_eq!(
+        small.items_budget_drops,
+        crate::tool_history::ToolOutputBudgetDrops::default()
+    );
+    assert_eq!(
+        small.unreplaced_items_budget_drops,
+        crate::tool_history::ToolOutputBudgetDrops::default()
+    );
 }
 
 #[tokio::test]
@@ -1715,10 +1807,10 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
 #[test]
 fn tool_history_admission_reserves_competing_results_before_spending_the_shared_budget() {
     let older = "older ".repeat(1_000);
-    let newest = "x ".repeat(MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    let newest = "x ".repeat(model_visible_tool_result_token_budget());
     assert_eq!(
         approx_token_count(&newest),
-        MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+        model_visible_tool_result_token_budget()
     );
     let mut state = ToolHistoryState::default();
     state.register(candidate("older-call", older.clone()));
@@ -1750,7 +1842,7 @@ fn tool_history_admission_reserves_competing_results_before_spending_the_shared_
             .filter_map(textual_output_identity)
             .map(|(_, output)| approx_token_count(output))
             .sum::<usize>()
-            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+            <= model_visible_tool_result_token_budget()
     );
 }
 
@@ -1782,7 +1874,7 @@ fn token_backfire_tool_history_pressure_keeps_every_result_recoverable(repetitio
                 .iter()
                 .map(|(_, output)| approx_token_count(output))
                 .sum::<usize>()
-                <= 10_000,
+                <= model_visible_tool_result_token_budget(),
             "recoverability must not increase the aggregate token budget"
         );
         for index in 0..80 {
@@ -1807,6 +1899,7 @@ fn token_backfire_tool_history_pressure_keeps_every_result_recoverable(repetitio
 
 #[test]
 fn tool_history_admission_preserves_newest_unconsumed_non_text_content() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "image-call";
     let output = "small text".to_string();
     let images = vec![FunctionCallOutputContentItem::InputImage {
@@ -1817,7 +1910,7 @@ fn tool_history_admission_preserves_newest_unconsumed_non_text_content() {
     let non_text_tokens =
         approx_token_count(&serde_json::to_string(&images).expect("serialize image content"))
             as u64;
-    assert!(non_text_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET as u64);
+    assert!(non_text_tokens > model_visible_tool_result_token_budget() as u64);
     image_candidate.preserved_non_text_tokens = Some(non_text_tokens);
     let mut content = vec![FunctionCallOutputContentItem::InputText { text: output }];
     content.extend(images);
@@ -1906,7 +1999,7 @@ fn tool_history_admission_keeps_in_budget_consumed_output_below_savings_threshol
     let output = "x ".repeat(MINIMUM_RAW_TOKENS as usize);
     let raw_tokens = approx_token_count(&output);
     assert_eq!(raw_tokens, MINIMUM_RAW_TOKENS as usize);
-    assert!(raw_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    assert!(raw_tokens <= model_visible_tool_result_token_budget());
 
     let canonical: Arc<[ResponseItem]> =
         Arc::from([function_call(call_id), text_output(call_id, output.clone())]);
@@ -1937,6 +2030,7 @@ fn tool_history_admission_keeps_in_budget_consumed_output_below_savings_threshol
 
 #[test]
 fn tool_history_admission_prioritizes_plain_failure_outputs() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let failure = "failure evidence ".repeat(1_800);
     let success = "ordinary success ".repeat(1_800);
     let mut failure_candidate = candidate("failure-call", failure.clone());
@@ -1966,6 +2060,7 @@ fn tool_history_admission_prioritizes_plain_failure_outputs() {
 
 #[test]
 fn tool_history_admission_budgets_structured_tool_search_pairs() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let older = tool_search_pair("search-older", 48_000);
     let latest = tool_search_pair("search-latest", 48_000);
     let canonical: Arc<[ResponseItem]> = Arc::from([
@@ -1996,6 +2091,7 @@ fn tool_history_admission_budgets_structured_tool_search_pairs() {
 
 #[test]
 fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let mut pair = tool_search_pair("search", 48_000);
     let ResponseItem::ToolSearchCall { arguments, .. } = &mut pair[0] else {
         panic!("expected search call");
@@ -2057,7 +2153,7 @@ fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
             tokens
         })
         .sum::<usize>();
-    assert!(total_output_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    assert!(total_output_tokens <= model_visible_tool_result_token_budget());
 
     let mut changed = receipt.clone();
     changed.status = "failed".to_string();
@@ -2091,6 +2187,7 @@ fn structured_tool_search_negative_evidence_has_failure_priority() {
 
 #[test]
 fn structured_tool_search_negative_evidence_precedes_success_under_budget() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let mut failed = tool_search_pair("search-failed", 28_000);
     let ResponseItem::ToolSearchCall { status, .. } = &mut failed[0] else {
         panic!("expected search call");
@@ -2251,6 +2348,7 @@ fn legacy_result_only_supersession_identity_does_not_collapse_actions() {
 
 #[test]
 fn mcp_content_item_receipt_preserves_non_text_modalities() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "mcp-call";
     let bounded = bounded_output();
     let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCallOutput {
@@ -2306,11 +2404,12 @@ fn mcp_content_item_receipt_preserves_non_text_modalities() {
 
 #[test]
 fn mcp_multi_text_content_is_canonicalized_and_receipted_without_losing_modalities() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "mcp-multi-text";
     let first = "first section\n".repeat(2_000);
     let second = "second section\n".repeat(2_000);
     let bounded = format!("{first}\n{second}");
-    assert!(approx_token_count(&bounded) > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    assert!(approx_token_count(&bounded) > model_visible_tool_result_token_budget());
     let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCallOutput {
         id: None,
         call_id: call_id.to_string(),
@@ -2370,6 +2469,7 @@ fn mcp_multi_text_content_is_canonicalized_and_receipted_without_losing_modaliti
 
 #[test]
 fn structural_receipt_validation_rejects_receipt_like_text_and_tampering() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-1";
     let bounded = bounded_output();
     let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
@@ -2509,6 +2609,7 @@ fn compaction_tool_history_receipt_survives_history_replacement() {
 
 #[test]
 fn token_backfire_compaction_pins_artifact_without_model_copying_receipt() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-1";
     let output = bounded_output();
     let mut state = ToolHistoryState::default();
@@ -2749,6 +2850,7 @@ async fn mutation_journal_repairs_an_incomplete_tail_before_appending() {
 
 #[tokio::test]
 async fn fork_remints_receipt_artifact_into_child_namespace() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let temp = tempfile::tempdir().expect("tempdir");
     let source_thread_id = "source-thread";
     let target_thread_id = "target-thread";
@@ -3125,6 +3227,7 @@ fn borrowed_ledger_serialization_matches_owned_compatibility_shape() {
 
 #[test]
 fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reuse() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let temp = tempfile::tempdir().expect("workspace fixture");
     let workspace = temp.path().join("workspace");
     let app = workspace.join("app");
@@ -3305,13 +3408,14 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
 
 #[test]
 fn tool_history_admission_recovers_legacy_non_text_cost_from_response_content() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let image = FunctionCallOutputContentItem::InputImage {
         image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
         detail: None,
     };
     let images = vec![image; 300];
     let non_text_tokens = approx_token_count(&serde_json::to_string(&images).unwrap());
-    assert!(non_text_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    assert!(non_text_tokens > model_visible_tool_result_token_budget());
     for legacy_missing_cost in [false, true] {
         let mut state = ToolHistoryState::default();
         let mut canonical = Vec::new();

@@ -174,6 +174,7 @@ async fn lookup_session_by_exact_name(
         loop {
             let response = app_server
                 .thread_list(ThreadListParams {
+                    project_id: None,
                     cursor: cursor.clone(),
                     limit: Some(100),
                     sort_key: Some(ThreadSortKey::UpdatedAt),

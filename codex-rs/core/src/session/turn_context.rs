@@ -6,6 +6,7 @@ use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
+use codex_code_mode::CancellationCause;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -21,6 +22,7 @@ use codex_utils_path_uri::PathUri;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
@@ -217,6 +219,16 @@ pub struct TurnContext {
     /// Ensures external-context producers signal memory pollution at most once
     /// during this turn, even when the same result has multiple projections.
     pub(crate) memory_pollution_signal_claimed: AtomicBool,
+    /// Flat tool names dispatched earlier in this turn, in dispatch order.
+    /// PreToolUse hooks receive it so advice the turn already acted on is not
+    /// injected again.
+    pub(crate) dispatched_tool_names: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Write-once record of why this turn cancelled its in-flight tool calls.
+    ///
+    /// Recorded before the turn's cancellation token fires, so a tool aborted
+    /// by the turn reports the turn's reason. A call that recorded its own
+    /// cause — a runtime deadline, say — keeps that more specific attribution.
+    pub(crate) cancellation_cause: Arc<OnceLock<CancellationCause>>,
 }
 
 enum TurnMultiAgentRuntime {
@@ -267,6 +279,20 @@ impl TurnContext {
             .await
             .remove(call_id)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn record_dispatched_tool_name(&self, tool_name: &str) {
+        self.dispatched_tool_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(tool_name.to_string());
+    }
+
+    pub(crate) fn dispatched_tool_names(&self) -> Vec<String> {
+        self.dispatched_tool_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn claim_memory_pollution_signal(&self) -> bool {
@@ -591,6 +617,8 @@ impl TurnContext {
             memory_pollution_signal_claimed: AtomicBool::new(
                 self.memory_pollution_signal_claimed.load(Ordering::Relaxed),
             ),
+            dispatched_tool_names: Arc::clone(&self.dispatched_tool_names),
+            cancellation_cause: Arc::new(OnceLock::new()),
         }
     }
 
@@ -886,6 +914,8 @@ impl Session {
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
             memory_pollution_signal_claimed: AtomicBool::new(false),
+            dispatched_tool_names: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cancellation_cause: Arc::new(OnceLock::new()),
         }
     }
 

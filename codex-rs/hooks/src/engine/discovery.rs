@@ -10,6 +10,7 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::HookEventsToml;
 use codex_config::HookHandlerConfig;
+use codex_config::HookRunScope;
 use codex_config::HookStateToml;
 use codex_config::HooksFile;
 use codex_config::ManagedHooksRequirementsToml;
@@ -36,6 +37,8 @@ pub(crate) struct DiscoveryResult {
     pub handlers: Vec<ConfiguredHandler>,
     pub hook_entries: Vec<HookListEntry>,
     pub warnings: Vec<String>,
+    /// Handler run ids whose user hook state limits how often they run.
+    pub once_per: HashMap<String, HookRunScope>,
 }
 
 struct HookHandlerSource<'a> {
@@ -167,10 +170,21 @@ pub(crate) fn discover_handlers(
         policy,
     );
 
+    let once_per = hook_entries
+        .iter()
+        .filter_map(|entry| {
+            let scope = hook_states.get(&entry.key)?.once_per?;
+            Some((
+                super::hook_run_id(entry.event_name, entry.display_order, &entry.source_path),
+                scope,
+            ))
+        })
+        .collect();
     DiscoveryResult {
         handlers,
         hook_entries,
         warnings,
+        once_per,
     }
 }
 
@@ -550,6 +564,7 @@ fn append_matcher_groups(
                     let unresolved_legacy_state = HookStateToml {
                         enabled: Some(false),
                         trusted_hash: None,
+                        once_per: None,
                     };
                     let mut state = source.hook_states.get(&key).or(legacy_state);
                     if state.is_none() && ambiguous_legacy_disablement && !source.is_managed {
@@ -996,6 +1011,7 @@ mod tests {
             HookStateToml {
                 enabled: Some(false),
                 trusted_hash: None,
+                once_per: None,
             },
         )]);
 

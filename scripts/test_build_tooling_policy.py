@@ -2006,7 +2006,7 @@ function Get-Command($Name) {
         self.assertIn("\ncargo-lane-isolated-home lane *args:", justfile)
         self.assertIn("\nconfig-schema-check:", justfile)
         self.assertIn("\nconfig-schema-regenerate owner:", justfile)
-        self.assertIn("\napp-server-schema-check:", justfile)
+        self.assertIn("\napp-server-schema-check *args:", justfile)
         self.assertIn('\napp-server-schema-regenerate owner experimental="":', justfile)
         self.assertIn("\nwrite-hooks-schema:", justfile)
         self.assertNotIn("write-hooks-schema", package["scripts"])
@@ -2806,7 +2806,6 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         self.assertNotIn("nextest run -p codex-core", justfile)
         self.assertNotIn("-p codex-core", justfile)
         for gate in (
-            "adaptive-reasoning-contract",
             "config-schema-protocol",
             "windows-sandbox-core-exec",
         ):

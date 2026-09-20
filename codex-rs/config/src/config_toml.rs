@@ -108,23 +108,6 @@ pub fn canonicalize_chatgpt_base_url(value: &str) -> String {
     canonical
 }
 
-/// Per-logical-request reasoning effort overrides. Omitted fields retain the
-/// compatibility defaults: high for orient, implement, and diagnose; low for
-/// inspect, verify, finalize, and deterministic continuation.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ReasoningPhaseEfforts {
-    pub orient: Option<ReasoningEffort>,
-    pub inspect: Option<ReasoningEffort>,
-    pub implement: Option<ReasoningEffort>,
-    pub diagnose: Option<ReasoningEffort>,
-    pub verify: Option<ReasoningEffort>,
-    pub finalize: Option<ReasoningEffort>,
-    /// Lowest-effort override for an unavoidable model request whose
-    /// continuation has already been proven deterministic by its owner.
-    pub deterministic_continuation: Option<ReasoningEffort>,
-}
-
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 
 const fn default_allow_login_shell() -> Option<bool> {
@@ -423,7 +406,6 @@ pub struct ConfigToml {
 
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
-    pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
@@ -1072,73 +1054,6 @@ mod tests {
             assert!(!canonical.starts_with("https://chatgpt.com"));
             assert!(!canonical.starts_with("https://chat.openai.com"));
         }
-    }
-
-    #[test]
-    fn reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables() {
-        let absent: ConfigToml = toml::from_str("").expect("absent config should deserialize");
-        assert_eq!(absent.reasoning_phase_efforts, None);
-
-        let empty: ConfigToml =
-            toml::from_str("[reasoning_phase_efforts]").expect("empty table should deserialize");
-        assert_eq!(
-            empty.reasoning_phase_efforts,
-            Some(ReasoningPhaseEfforts {
-                orient: None,
-                inspect: None,
-                implement: None,
-                diagnose: None,
-                verify: None,
-                finalize: None,
-                deterministic_continuation: None,
-            })
-        );
-
-        let partial: ConfigToml = toml::from_str(
-            r#"
-[reasoning_phase_efforts]
-inspect = "low"
-"#,
-        )
-        .expect("partial table should deserialize");
-        assert_eq!(
-            partial.reasoning_phase_efforts,
-            Some(ReasoningPhaseEfforts {
-                orient: None,
-                inspect: Some(ReasoningEffort::Low),
-                implement: None,
-                diagnose: None,
-                verify: None,
-                finalize: None,
-                deterministic_continuation: None,
-            })
-        );
-
-        let full: ConfigToml = toml::from_str(
-            r#"
-[reasoning_phase_efforts]
-orient = "medium"
-inspect = "low"
-implement = "high"
-diagnose = "high"
-verify = "low"
-finalize = "low"
-deterministic_continuation = "low"
-"#,
-        )
-        .expect("full table should deserialize");
-        assert_eq!(
-            full.reasoning_phase_efforts,
-            Some(ReasoningPhaseEfforts {
-                orient: Some(ReasoningEffort::Medium),
-                inspect: Some(ReasoningEffort::Low),
-                implement: Some(ReasoningEffort::High),
-                diagnose: Some(ReasoningEffort::High),
-                verify: Some(ReasoningEffort::Low),
-                finalize: Some(ReasoningEffort::Low),
-                deterministic_continuation: Some(ReasoningEffort::Low),
-            })
-        );
     }
 
     #[test]

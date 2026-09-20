@@ -18,6 +18,7 @@ use super::WireNestedToolCall;
 use super::WireRuntimeResponse;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
+use crate::CancellationCause;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,7 +167,16 @@ pub enum HostToClient {
         request: DelegateRequest,
     },
     #[serde(rename = "delegate/cancel")]
-    CancelDelegateRequest { id: DelegateRequestId },
+    CancelDelegateRequest {
+        id: DelegateRequestId,
+        /// Why the host is cancelling, when it knows.
+        ///
+        /// Without it the receiving peer cannot tell a runtime deadline from a
+        /// user interrupt and would report every cancellation the same way.
+        /// Absent from peers that predate this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<CancellationCause>,
+    },
     #[serde(rename = "cell/closed")]
     CellClosed {
         session_id: SessionId,

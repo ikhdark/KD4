@@ -84,16 +84,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Reasoning effort to use while in plan mode.",
     ),
     doc(
-        "reasoning_phase_efforts",
-        "Reasoning and output",
-        "Optional per-sampling-request effort overrides. Omitted fields default to `high` for orient, implement, and diagnose, and `low` for inspect, verify, and finalize.",
-    ),
-    doc(
-        "reasoning_phase_efforts.deterministic_continuation",
-        "Reasoning and output",
-        "Reasoning effort for a proven non-decision-bearing residual request; it takes precedence over the broader phase effort and defaults to `low` or the model's lowest supported equivalent.",
-    ),
-    doc(
         "model_reasoning_summary",
         "Reasoning and output",
         "Reasoning summary style: `auto`, `concise`, `detailed`, or `none`.",

@@ -1,9 +1,13 @@
+mod cancellation;
 mod description;
 pub mod host;
 mod response;
 mod runtime;
 mod session;
+mod shared_clock;
 
+pub use cancellation::CancellationCause;
+pub use cancellation::NestedCancellation;
 pub use description::CODE_MODE_PRAGMA_PREFIX;
 pub use description::CodeModeToolKind;
 pub use description::EnabledToolMetadata;
@@ -27,9 +31,11 @@ pub use response::ImageDetail;
 pub use runtime::CodeModeNestedToolCall;
 pub use runtime::DEFAULT_EXEC_YIELD_TIME_MS;
 pub use runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+pub use runtime::DEFAULT_TOOL_TIMEOUT_MS;
 pub use runtime::DEFAULT_WAIT_YIELD_TIME_MS;
 pub use runtime::ExecuteRequest;
 pub use runtime::MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+pub use runtime::MAX_TOOL_TIMEOUT_MS;
 pub use runtime::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS;
 pub use runtime::RuntimeResponse;
 pub use runtime::WaitOutcome;
@@ -43,6 +49,8 @@ pub use session::CodeModeSessionResultFuture;
 pub use session::NotificationFuture;
 pub use session::StartedCell;
 pub use session::ToolInvocationFuture;
+pub use shared_clock::SharedMonotonicNanos;
+pub use shared_clock::shared_monotonic_now;
 
 pub const PUBLIC_TOOL_NAME: &str = "exec";
 pub const WAIT_TOOL_NAME: &str = "wait";

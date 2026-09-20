@@ -18,8 +18,6 @@ use crate::protocol::v2::ReasoningSummaryTextDeltaNotification;
 use crate::protocol::v2::ReasoningTextDeltaNotification;
 use crate::protocol::v2::TerminalInteractionNotification;
 use crate::protocol::v2::ThreadItem;
-use crate::protocol::v2::TurnReasoningPolicySummaryNotification;
-use crate::protocol::v2::TurnReasoningPolicyUpdatedNotification;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::protocol::EventMsg;
 use std::collections::HashMap;
@@ -37,20 +35,6 @@ pub fn item_event_to_server_notification(
     let thread_id = thread_id.to_string();
     let turn_id = turn_id.to_string();
     match msg {
-        EventMsg::ReasoningPolicyUpdated(snapshot) => {
-            ServerNotification::TurnReasoningPolicyUpdated(TurnReasoningPolicyUpdatedNotification {
-                thread_id,
-                turn_id,
-                snapshot,
-            })
-        }
-        EventMsg::ReasoningPolicySummary(history) => {
-            ServerNotification::TurnReasoningPolicySummary(TurnReasoningPolicySummaryNotification {
-                thread_id,
-                turn_id,
-                history,
-            })
-        }
         EventMsg::DynamicToolCallResponse(response) => {
             let status = if response.success {
                 DynamicToolCallStatus::Completed
@@ -496,7 +480,6 @@ mod tests {
     use codex_protocol::protocol::CollabResumeEndEvent;
     use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
     use codex_protocol::protocol::ExecOutputStream;
-    use codex_protocol::protocol::ReasoningPolicyHistory;
     use pretty_assertions::assert_eq;
 
     fn assert_item_started_server_notification(
@@ -565,34 +548,6 @@ mod tests {
                     agents_states: HashMap::new(),
                 },
             },
-        );
-    }
-
-    #[test]
-    fn reasoning_policy_summary_maps_to_live_notification() {
-        let history = ReasoningPolicyHistory {
-            turn_id: "turn-1".to_string(),
-            entries: Vec::new(),
-            total_entries: 3,
-            truncated: true,
-        };
-
-        let notification = item_event_to_server_notification(
-            EventMsg::ReasoningPolicySummary(history.clone()),
-            "thread-1",
-            "turn-1",
-        );
-
-        let ServerNotification::TurnReasoningPolicySummary(notification) = notification else {
-            panic!("expected reasoning-policy summary notification");
-        };
-        assert_eq!(
-            notification,
-            TurnReasoningPolicySummaryNotification {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                history,
-            }
         );
     }
 

@@ -2978,6 +2978,32 @@ class ProcessOutputStream(Enum):
     stderr = "stderr"
 
 
+class ProjectChangeType(Enum):
+    created = "created"
+    updated = "updated"
+    deleted = "deleted"
+
+
+class ProjectChangedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    change_type: Annotated[ProjectChangeType, Field(alias="changeType")]
+    project_id: Annotated[str, Field(alias="projectId")]
+
+
+class ProjectRoot(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    path: AbsolutePathBuf
+
+
+class ProjectSortKey(Enum):
+    position = "position"
+    recency_at = "recencyAt"
+
+
 class PtyTerminalSize(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -3073,35 +3099,6 @@ class ReasoningItemReasoningSummary(RootModel[SummaryTextReasoningItemReasoningS
         populate_by_name=True,
     )
     root: SummaryTextReasoningItemReasoningSummary
-
-
-class ReasoningPolicyPhase(Enum):
-    orient = "orient"
-    inspect = "inspect"
-    implement = "implement"
-    verify = "verify"
-    diagnose = "diagnose"
-    finalize = "finalize"
-
-
-class ReasoningPolicySource(Enum):
-    phase_override = "phase_override"
-    turn_fallback = "turn_fallback"
-
-
-class ReasoningPolicyTrigger(Enum):
-    user_input = "user_input"
-    read_only_tool_success = "read_only_tool_success"
-    workspace_mutation = "workspace_mutation"
-    tool_failed = "tool_failed"
-    tool_blocked = "tool_blocked"
-    tool_timed_out = "tool_timed_out"
-    tool_cancelled = "tool_cancelled"
-    validation_passed = "validation_passed"
-    validation_failed = "validation_failed"
-    validation_timed_out = "validation_timed_out"
-    plan_updated = "plan_updated"
-    host_override = "host_override"
 
 
 class ReasoningSummaryValue(Enum):
@@ -3544,6 +3541,14 @@ class SendAddCreditsNudgeEmailResponse(BaseModel):
         populate_by_name=True,
     )
     status: AddCreditsNudgeEmailStatus
+
+
+class ProjectChangedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[Literal["project/changed"], Field(title="Project/changedNotificationMethod")]
+    params: ProjectChangedNotification
 
 
 class ProcessExitedServerNotification(BaseModel):
@@ -4425,6 +4430,14 @@ class ThreadNameUpdatedNotification(BaseModel):
     )
     thread_id: Annotated[str, Field(alias="threadId")]
     thread_name: Annotated[str | None, Field(alias="threadName")] = None
+
+
+class ThreadProjectUpdatedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    project_id: Annotated[str | None, Field(alias="projectId")] = None
+    thread_id: Annotated[str, Field(alias="threadId")]
 
 
 class ThreadReadParams(BaseModel):
@@ -7142,6 +7155,26 @@ class ProcessOutputDeltaNotification(BaseModel):
     ]
 
 
+class Project(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    created_at: Annotated[int, Field(alias="createdAt")]
+    id: str
+    metadata: dict[str, str]
+    name: str
+    position: int
+    recency_at: Annotated[
+        int | None,
+        Field(
+            alias="recencyAt",
+            description="Newest non-archived member thread's recency, in Unix seconds; null when none exist.",
+        ),
+    ] = None
+    roots: list[ProjectRoot]
+    updated_at: Annotated[int, Field(alias="updatedAt")]
+
+
 class RateLimitResetCredit(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7212,21 +7245,6 @@ class RateLimitSnapshot(BaseModel):
             description="Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.",
         ),
     ] = None
-
-
-class ReasoningPolicySnapshot(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    configured_effort: Annotated[ReasoningEffort | None, Field(alias="configuredEffort")] = None
-    effective_effort: Annotated[ReasoningEffort | None, Field(alias="effectiveEffort")] = None
-    model: str
-    phase: ReasoningPolicyPhase
-    request_effort: Annotated[ReasoningEffort | None, Field(alias="requestEffort")] = None
-    sequence: Annotated[int, Field(ge=0)]
-    source: ReasoningPolicySource
-    timestamp: Annotated[int, Field(description="Unix timestamp in milliseconds.")]
-    trigger: ReasoningPolicyTrigger
 
 
 class MessageResponseItem(BaseModel):
@@ -7322,6 +7340,16 @@ class ThreadGoalClearedServerNotification(BaseModel):
         Literal["thread/goal/cleared"], Field(title="Thread/goal/clearedNotificationMethod")
     ]
     params: ThreadGoalClearedNotification
+
+
+class ThreadProjectUpdatedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["thread/project/updated"], Field(title="Thread/project/updatedNotificationMethod")
+    ]
+    params: ThreadProjectUpdatedNotification
 
 
 class HookStartedServerNotification(BaseModel):
@@ -7959,15 +7987,6 @@ class TurnPlanUpdatedNotification(BaseModel):
     turn_id: Annotated[str, Field(alias="turnId")]
 
 
-class TurnReasoningPolicyUpdatedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    snapshot: ReasoningPolicySnapshot
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
 class TurnStartParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8175,7 +8194,7 @@ class TurnTimingCounters(BaseModel):
         int | None,
         Field(
             alias="residualDeterministicGenerationCount",
-            description="Residual deterministic generation requests proved by the reasoning governor, including requests elided before provider dispatch.",
+            description="Residual deterministic generation requests proved by turn execution control, including requests elided before provider dispatch.",
             ge=0,
         ),
     ] = 0
@@ -8208,6 +8227,22 @@ class TurnTimingCounters(BaseModel):
     ] = 0
     tool_output_artifact_reuse_count: Annotated[
         int | None, Field(alias="toolOutputArtifactReuseCount", ge=0)
+    ] = 0
+    tool_output_budget_drop_count: Annotated[
+        int | None,
+        Field(
+            alias="toolOutputBudgetDropCount",
+            description="Tool results the aggregate output budget dropped across every request this turn actually sent. Preparing an unchanged projection again adds nothing; only a dispatched request contributes.",
+            ge=0,
+        ),
+    ] = 0
+    tool_output_budget_dropped_token_count: Annotated[
+        int | None,
+        Field(
+            alias="toolOutputBudgetDroppedTokenCount",
+            description="Tokens those dropped results would have occupied.",
+            ge=0,
+        ),
     ] = 0
     tool_output_canonical_byte_count: Annotated[
         int | None, Field(alias="toolOutputCanonicalByteCount", ge=0)
@@ -8270,6 +8305,37 @@ class TurnTimingRequestTokenCategories(BaseModel):
     base_instructions: Annotated[int | None, Field(alias="baseInstructions", ge=0)] = 0
     conversation_history: Annotated[int | None, Field(alias="conversationHistory", ge=0)] = 0
     current_input: Annotated[int | None, Field(alias="currentInput", ge=0)] = 0
+    fixed_prefix_changed_categories: Annotated[
+        list[str] | None,
+        Field(
+            alias="fixedPrefixChangedCategories",
+            description="Fixed-prefix categories whose exact hash differed from the preceding request. Non-empty explains why fixed-prefix reuse was ineligible.",
+        ),
+    ] = None
+    history_first_divergent_index: Annotated[
+        int | None,
+        Field(
+            alias="historyFirstDivergentIndex",
+            description="First input index whose digest differs from the preceding request's.",
+            ge=0,
+        ),
+    ] = None
+    history_items_previous: Annotated[
+        int | None,
+        Field(
+            alias="historyItemsPrevious",
+            description="Input items the preceding request sent, from this request's own comparison. Absent on the first request of a comparison chain, which has no predecessor to diverge from.\n\nA whole-history digest changes on every request by design, so it cannot distinguish appending from rewriting. These three fields can: with `history_prefix_items_reused == history_items_previous` the request only appended, and a smaller `history_first_divergent_index` locates where the prefix was rewritten or truncated instead.",
+            ge=0,
+        ),
+    ] = None
+    history_prefix_items_reused: Annotated[
+        int | None,
+        Field(
+            alias="historyPrefixItemsReused",
+            description="Leading input items identical to the preceding request's.",
+            ge=0,
+        ),
+    ] = None
     local_input_estimate: Annotated[
         int | None,
         Field(
@@ -8319,6 +8385,22 @@ class TurnTimingRequestTokenCategories(BaseModel):
     ] = 0
     repository_context: Annotated[int | None, Field(alias="repositoryContext", ge=0)] = 0
     skills: Annotated[int | None, Field(ge=0)] = 0
+    tool_output_budget_drop_count: Annotated[
+        int | None,
+        Field(
+            alias="toolOutputBudgetDropCount",
+            description="Tool results the aggregate output budget dropped from the representation this request actually sent.\n\nAttributed to one request and one representation: the budget runs over several candidate projections, and summing them would count drops that never reached the model.",
+            ge=0,
+        ),
+    ] = 0
+    tool_output_budget_dropped_token_count: Annotated[
+        int | None,
+        Field(
+            alias="toolOutputBudgetDroppedTokenCount",
+            description="Tokens those dropped results would have occupied.",
+            ge=0,
+        ),
+    ] = 0
     tool_schemas: Annotated[int | None, Field(alias="toolSchemas", ge=0)] = 0
 
 
@@ -9095,16 +9177,6 @@ class PluginSummary(BaseModel):
     ] = None
 
 
-class ReasoningPolicyHistory(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    entries: list[ReasoningPolicySnapshot]
-    total_entries: Annotated[int, Field(alias="totalEntries", ge=0)]
-    truncated: bool
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
 class FunctionCallOutputResponseItem(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9212,17 +9284,6 @@ class ThreadTokenUsageUpdatedServerNotification(BaseModel):
         Field(title="Thread/tokenUsage/updatedNotificationMethod"),
     ]
     params: ThreadTokenUsageUpdatedNotification
-
-
-class TurnReasoningPolicyUpdatedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["turn/reasoningPolicy/updated"],
-        Field(title="Turn/reasoningPolicy/updatedNotificationMethod"),
-    ]
-    params: TurnReasoningPolicyUpdatedNotification
 
 
 class HookCompletedServerNotification(BaseModel):
@@ -9347,15 +9408,6 @@ class SessionSource(RootModel[SessionSourceValue | CustomSessionSource | SubAgen
         populate_by_name=True,
     )
     root: SessionSourceValue | CustomSessionSource | SubAgentSessionSource
-
-
-class TurnReasoningPolicySummaryNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    history: ReasoningPolicyHistory
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
 
 
 class TurnTimingModelRequest(BaseModel):
@@ -9657,17 +9709,6 @@ class RawResponseItemCompletedNotification(BaseModel):
     item: ResponseItem
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str, Field(alias="turnId")]
-
-
-class TurnReasoningPolicySummaryServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["turn/reasoningPolicy/summary"],
-        Field(title="Turn/reasoningPolicy/summaryNotificationMethod"),
-    ]
-    params: TurnReasoningPolicySummaryNotification
 
 
 class TurnTiming(BaseModel):
@@ -10196,6 +10237,13 @@ class Thread(BaseModel):
     preview: Annotated[
         str, Field(description="Usually the first user message in the thread, if available.")
     ]
+    project_id: Annotated[
+        str | None,
+        Field(
+            alias="projectId",
+            description="Canonical project assignment owned by app-server, if any.",
+        ),
+    ] = None
     recency_at: Annotated[
         int | None,
         Field(
@@ -10409,11 +10457,11 @@ class ServerNotification(
         | ThreadNameUpdatedServerNotification
         | ThreadGoalUpdatedServerNotification
         | ThreadGoalClearedServerNotification
+        | ProjectChangedServerNotification
+        | ThreadProjectUpdatedServerNotification
         | ThreadSettingsUpdatedServerNotification
         | ThreadTokenUsageUpdatedServerNotification
         | TurnStartedServerNotification
-        | TurnReasoningPolicyUpdatedServerNotification
-        | TurnReasoningPolicySummaryServerNotification
         | HookStartedServerNotification
         | TurnCompletedServerNotification
         | HookCompletedServerNotification
@@ -10473,11 +10521,11 @@ class ServerNotification(
         | ThreadNameUpdatedServerNotification
         | ThreadGoalUpdatedServerNotification
         | ThreadGoalClearedServerNotification
+        | ProjectChangedServerNotification
+        | ThreadProjectUpdatedServerNotification
         | ThreadSettingsUpdatedServerNotification
         | ThreadTokenUsageUpdatedServerNotification
         | TurnStartedServerNotification
-        | TurnReasoningPolicyUpdatedServerNotification
-        | TurnReasoningPolicySummaryServerNotification
         | HookStartedServerNotification
         | TurnCompletedServerNotification
         | HookCompletedServerNotification

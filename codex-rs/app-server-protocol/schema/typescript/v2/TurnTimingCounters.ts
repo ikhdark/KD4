@@ -22,8 +22,8 @@ logicalGenerationCount: number, generationsByReason: TurnTimingGenerationReasonC
  */
 suppressedDeterministicContinuationCount: number,
 /**
- * Residual deterministic generation requests proved by the reasoning
- * governor, including requests elided before provider dispatch.
+ * Residual deterministic generation requests proved by turn execution
+ * control, including requests elided before provider dispatch.
  */
 residualDeterministicGenerationCount: number,
 /**
@@ -46,6 +46,16 @@ suppressedValidationOutputCount: number,
  * Ready startup prewarms observed by the first model request.
  */
 readyStartupPrewarmCount: number,
+/**
+ * Tool results the aggregate output budget dropped across every request
+ * this turn actually sent. Preparing an unchanged projection again adds
+ * nothing; only a dispatched request contributes.
+ */
+toolOutputBudgetDropCount: number,
+/**
+ * Tokens those dropped results would have occupied.
+ */
+toolOutputBudgetDroppedTokenCount: bigint,
 /**
  * Bounded to the stable purpose enum's cardinality.
  */

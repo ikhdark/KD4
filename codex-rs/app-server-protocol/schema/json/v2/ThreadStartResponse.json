@@ -1138,136 +1138,6 @@
       "minLength": 1,
       "type": "string"
     },
-    "ReasoningPolicyHistory": {
-      "description": "Bounded, durable per-turn reasoning-policy history.",
-      "properties": {
-        "entries": {
-          "items": {
-            "$ref": "#/definitions/ReasoningPolicySnapshot"
-          },
-          "type": "array"
-        },
-        "totalEntries": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "turnId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "entries",
-        "totalEntries",
-        "truncated",
-        "turnId"
-      ],
-      "type": "object"
-    },
-    "ReasoningPolicyPhase": {
-      "description": "Response event from the agent NOTE: Make sure none of these values have optional types, as it will mess up the extension code-gen. The exact request policy used for one model stream attempt. This is protocol state so rollout reconstruction and late-attaching clients observe the same decision as live consumers.",
-      "enum": [
-        "orient",
-        "inspect",
-        "implement",
-        "verify",
-        "diagnose",
-        "finalize"
-      ],
-      "type": "string"
-    },
-    "ReasoningPolicySnapshot": {
-      "properties": {
-        "configuredEffort": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "effectiveEffort": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "model": {
-          "type": "string"
-        },
-        "phase": {
-          "$ref": "#/definitions/ReasoningPolicyPhase"
-        },
-        "requestEffort": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "sequence": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "source": {
-          "$ref": "#/definitions/ReasoningPolicySource"
-        },
-        "timestamp": {
-          "description": "Unix timestamp in milliseconds.",
-          "format": "int64",
-          "type": "integer"
-        },
-        "trigger": {
-          "$ref": "#/definitions/ReasoningPolicyTrigger"
-        }
-      },
-      "required": [
-        "model",
-        "phase",
-        "sequence",
-        "source",
-        "timestamp",
-        "trigger"
-      ],
-      "type": "object"
-    },
-    "ReasoningPolicySource": {
-      "enum": [
-        "phase_override",
-        "turn_fallback"
-      ],
-      "type": "string"
-    },
-    "ReasoningPolicyTrigger": {
-      "enum": [
-        "user_input",
-        "read_only_tool_success",
-        "workspace_mutation",
-        "tool_failed",
-        "tool_blocked",
-        "tool_timed_out",
-        "tool_cancelled",
-        "validation_passed",
-        "validation_failed",
-        "validation_timed_out",
-        "plan_updated",
-        "host_override"
-      ],
-      "type": "string"
-    },
     "SandboxPolicy": {
       "oneOf": [
         {
@@ -1622,6 +1492,13 @@
           "description": "Usually the first user message in the thread, if available.",
           "type": "string"
         },
+        "projectId": {
+          "description": "Canonical project assignment owned by app-server, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "recencyAt": {
           "description": "Unix timestamp (in seconds) used for thread recency ordering.",
           "format": "int64",
@@ -1682,6 +1559,7 @@
         "id",
         "modelProvider",
         "preview",
+        "projectId",
         "sessionId",
         "source",
         "status",
@@ -3349,7 +3227,7 @@
         },
         "residualDeterministicGenerationCount": {
           "default": 0,
-          "description": "Residual deterministic generation requests proved by the reasoning governor, including requests elided before provider dispatch.",
+          "description": "Residual deterministic generation requests proved by turn execution control, including requests elided before provider dispatch.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -3399,6 +3277,20 @@
         "toolOutputArtifactReuseCount": {
           "default": 0,
           "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDropCount": {
+          "default": 0,
+          "description": "Tool results the aggregate output budget dropped across every request this turn actually sent. Preparing an unchanged projection again adds nothing; only a dispatched request contributes.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDroppedTokenCount": {
+          "default": 0,
+          "description": "Tokens those dropped results would have occupied.",
+          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -4553,6 +4445,40 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "fixedPrefixChangedCategories": {
+          "description": "Fixed-prefix categories whose exact hash differed from the preceding request. Non-empty explains why fixed-prefix reuse was ineligible.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "historyFirstDivergentIndex": {
+          "description": "First input index whose digest differs from the preceding request's.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "historyItemsPrevious": {
+          "description": "Input items the preceding request sent, from this request's own comparison. Absent on the first request of a comparison chain, which has no predecessor to diverge from.\n\nA whole-history digest changes on every request by design, so it cannot distinguish appending from rewriting. These three fields can: with `history_prefix_items_reused == history_items_previous` the request only appended, and a smaller `history_first_divergent_index` locates where the prefix was rewritten or truncated instead.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "historyPrefixItemsReused": {
+          "description": "Leading input items identical to the preceding request's.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "localInputEstimate": {
           "default": 0,
           "description": "One-pass local estimate over the complete serialized logical prompt.",
@@ -4613,6 +4539,20 @@
         },
         "skills": {
           "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDropCount": {
+          "default": 0,
+          "description": "Tool results the aggregate output budget dropped from the representation this request actually sent.\n\nAttributed to one request and one representation: the budget runs over several candidate projections, and summing them would count drops that never reached the model.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputBudgetDroppedTokenCount": {
+          "default": 0,
+          "description": "Tokens those dropped results would have occupied.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"

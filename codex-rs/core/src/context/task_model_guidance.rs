@@ -28,12 +28,13 @@ impl ContextualUserFragment for TaskModelGuidance {
             "unknowns, and the next necessary action. Form competing hypotheses only when ",
             "uncertainty between explanations affects the next action. Track repository ",
             "ownership and runtime relationships only as needed to establish the requested ",
-            "behavior. Attach one ",
-            "explicit provenance kind to each material claim: direct_file_read, search_hit, ",
+            "behavior. Preserve applicable provenance kinds for each material claim: direct_file_read, search_hit, ",
             "generated_summary, cached_observation, inferred_relationship, or test_result. Preserve ",
-            "that label through summaries and durable state; storage or repetition never upgrades ",
+            "those labels through summaries and durable state; cached search evidence retains both its source and freshness. Storage or repetition never upgrades ",
             "its evidence strength. Treat direct file reads as observations of the exact content ",
-            "read at that time, search hits as candidates rather than authority, generated summaries ",
+            "read at that time. Discovery-only hits identify candidates. Complete search results establish ",
+            "the exact matching facts they report for their recorded scope and snapshot, but not omitted ",
+            "context or broader behavior. Treat generated summaries ",
             "as derived and potentially lossy, cached observations as potentially stale, inferred ",
             "relationships as hypotheses, and test results as proof only for the exact exercised ",
             "contract. These are internal evidence labels, not a mandatory user-facing reporting ",
@@ -41,11 +42,11 @@ impl ContextualUserFragment for TaskModelGuidance {
             "instead of rediscovering them. Batch independent read-only checks in one tool ",
             "generation when their tool contracts allow it. For actionable coding tasks, begin ",
             "with the responsible owner, implementation, and direct test when available; expand ",
-            "the inspection as evidence requires, and pause only when genuinely blocked. After ",
-            "an observational or wait ",
-            "result leaves the relevant state unchanged, do not repeat that observation unless ",
-            "you can name a pending state transition; otherwise synthesize the evidence, take a ",
-            "state-changing action, or report the blocker. Before final synthesis, compare every ",
+            "the inspection as evidence requires, and pause only when genuinely blocked. Do not repeat ",
+            "an unchanged observation without a relevant input change or pending transition. Instead, ",
+            "resolve a named remaining question through different evidence, synthesize the answer, ",
+            "or report the blocker. Take state-changing actions only when authorized and necessary. ",
+            "Before final synthesis, compare every ",
             "version, ",
             "edition, name, count, path, subcommand, or other literal attributed to a direct file ",
             "read against the retained evidence. If that evidence is unavailable or stale, mark ",
@@ -83,12 +84,17 @@ mod tests {
         ] {
             assert!(rendered.contains(provenance));
         }
-        assert!(rendered.contains("storage or repetition never upgrades"));
+        assert!(rendered.contains("Storage or repetition never upgrades"));
         assert!(rendered.contains("generated summaries as derived and potentially lossy"));
         assert!(rendered.contains("Reuse current exact values and enumerations"));
         assert!(rendered.contains("Batch independent read-only checks"));
-        assert!(rendered.contains("do not repeat that observation unless"));
-        assert!(rendered.contains("name a pending state transition"));
+        assert!(rendered.contains("relevant input change or pending transition"));
+        assert!(rendered.contains("resolve a named remaining question through different evidence"));
+        assert!(
+            rendered.contains("Take state-changing actions only when authorized and necessary")
+        );
+        assert!(rendered.contains("cached search evidence retains both its source and freshness"));
+        assert!(rendered.contains("Complete search results establish the exact matching facts"));
         assert!(rendered.contains("edition, name, count, path, subcommand"));
         assert!(rendered.contains("never substitute a remembered value"));
         assert!(rendered.contains("Never fill an unknown"));

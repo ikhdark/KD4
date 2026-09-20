@@ -19,6 +19,13 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
 /// Maximum coherent evidence-packet budget accepted from an explicit request.
 /// The core also caps this at the active model's hard output limit.
 pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
+/// Hard deadline applied to a single nested tool call when the host supplies no
+/// per-cell default. A host-supplied default must still leave room for the
+/// longest wait its own tools can be asked to perform.
+pub const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
+/// Ceiling for both the per-cell default and an explicit per-call
+/// `{timeout_ms}` override.
+pub const MAX_TOOL_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ExecuteRequest {
@@ -27,6 +34,10 @@ pub struct ExecuteRequest {
     pub source: String,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
+    /// Per-cell hard deadline for a nested tool call that does not pass an
+    /// explicit `{timeout_ms}`. Absent falls back to `DEFAULT_TOOL_TIMEOUT_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tool_timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -87,6 +98,16 @@ pub struct CodeModeNestedToolCall {
         deserialize_with = "deserialize_present_input"
     )]
     pub input: Option<JsonValue>,
+    /// Instant at which the runtime's wrapper timeout fires for this call,
+    /// expressed on the receiving process's own clock.
+    ///
+    /// Every stage before observation is charged against it, so a handler that
+    /// can wait should complete cooperatively before it rather than be
+    /// cancelled at it. Not serialized: an `Instant` is process local, so the
+    /// out-of-process wire form carries a shared-monotonic reading instead and
+    /// the receiver converts once, at receipt, into this field.
+    #[serde(skip)]
+    pub nested_deadline: Option<std::time::Instant>,
 }
 
 pub(crate) fn deserialize_present_input<'de, D>(
@@ -101,7 +122,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::CodeModeNestedToolCall;
+    use super::ExecuteRequest;
     use serde_json::json;
+
+    fn execute_request() -> ExecuteRequest {
+        ExecuteRequest {
+            tool_call_id: "call-1".to_string(),
+            enabled_tools: Vec::new(),
+            source: "text('ok');".to_string(),
+            yield_time_ms: None,
+            max_output_tokens: None,
+            default_tool_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn execute_request_round_trips_with_and_without_a_default_tool_timeout() {
+        let absent = execute_request();
+        let encoded = serde_json::to_value(&absent).expect("encode");
+        assert!(
+            encoded.get("default_tool_timeout_ms").is_none(),
+            "an absent default must not be serialized: {encoded}"
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecuteRequest>(encoded).expect("decode"),
+            absent
+        );
+
+        let present = ExecuteRequest {
+            default_tool_timeout_ms: Some(75_000),
+            ..execute_request()
+        };
+        let encoded = serde_json::to_value(&present).expect("encode");
+        assert_eq!(encoded["default_tool_timeout_ms"], json!(75_000));
+        assert_eq!(
+            serde_json::from_value::<ExecuteRequest>(encoded).expect("decode"),
+            present
+        );
+    }
 
     #[test]
     fn nested_tool_input_decodes_field_presence_from_json() {

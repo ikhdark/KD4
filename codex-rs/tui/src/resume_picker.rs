@@ -1850,6 +1850,7 @@ fn thread_list_params(
     include_non_interactive: bool,
 ) -> ThreadListParams {
     ThreadListParams {
+        project_id: None,
         cursor,
         limit: Some(PAGE_SIZE as u32),
         sort_key: Some(sort_key),
@@ -3323,6 +3324,7 @@ mod tests {
                 let endpoint = format!("ws://{}", listener.local_addr().unwrap());
                 let selected_id = ThreadId::new();
                 let thread = Thread {
+                    project_id: None,
                     id: selected_id.to_string(), extra: None, session_id: selected_id.to_string(),
                     forked_from_id: None, parent_thread_id: None, preview: "latest remote preview".to_string(),
                     ephemeral: false, history_mode: Default::default(), model_provider: "openai".to_string(),
@@ -6129,6 +6131,7 @@ session_picker_view = "dense"
     fn app_server_row_keeps_pathless_threads() {
         let thread_id = ThreadId::new();
         let thread = Thread {
+            project_id: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
@@ -6167,6 +6170,7 @@ session_picker_view = "dense"
 
         let thread_id = ThreadId::new();
         let thread = Thread {
+            project_id: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
@@ -6219,7 +6223,6 @@ session_picker_view = "dense"
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             }],
         };
 
@@ -6246,6 +6249,7 @@ session_picker_view = "dense"
 
         let thread_id = ThreadId::new();
         let thread = Thread {
+            project_id: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
@@ -6283,7 +6287,6 @@ session_picker_view = "dense"
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             }],
         };
 
@@ -6318,6 +6321,7 @@ session_picker_view = "dense"
 
         let thread_id = ThreadId::new();
         let thread = Thread {
+            project_id: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
@@ -6355,7 +6359,6 @@ session_picker_view = "dense"
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             }],
         };
 

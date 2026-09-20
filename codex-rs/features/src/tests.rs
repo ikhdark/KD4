@@ -165,6 +165,63 @@ fn retired_feature_keys_are_unknown_and_ignored_by_feature_sources() {
 }
 
 #[test]
+fn unknown_structured_features_are_ignored_without_changing_known_features() {
+    let input = r#"
+unified_exec = false
+future_toggle = true
+[tool_registry]
+error_on_tool_collisions = true
+[token_budget]
+enabled = true
+limit_tokens = 1000
+[code_mode]
+enabled = false
+excluded_tool_namespaces = ["example"]
+"#;
+    let parsed: FeaturesToml = toml::from_str(input).expect("newer client feature settings");
+    let json = serde_json::to_value(toml::from_str::<toml::Value>(input).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_value::<FeaturesToml>(json).unwrap(),
+        parsed
+    );
+    assert_eq!(
+        parsed.entries(),
+        BTreeMap::from([
+            ("code_mode".to_string(), false),
+            ("future_toggle".to_string(), true),
+            ("unified_exec".to_string(), false),
+        ])
+    );
+    let resolved = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&parsed),
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+    let mut expected = Features::with_defaults();
+    expected.disable(Feature::UnifiedExec);
+    expected.disable(Feature::CodeMode);
+    assert_eq!(resolved, expected);
+    let serialized = toml::to_string(&parsed).unwrap();
+    assert!(!serialized.contains("tool_registry"));
+    assert!(!serialized.contains("token_budget"));
+    assert!(serialized.contains("excluded_tool_namespaces"));
+}
+
+#[test]
+fn boolean_features_still_reject_malformed_values() {
+    for input in [
+        "unified_exec = { enabled = true }",
+        "unified_exec = 1",
+        "unified_exec = \"true\"",
+        "future_toggle = 1",
+    ] {
+        assert!(toml::from_str::<FeaturesToml>(input).is_err(), "{input}");
+    }
+}
+
+#[test]
 fn removed_code_mode_waiting_policy_is_rejected() {
     toml::from_str::<FeaturesToml>(
         r#"

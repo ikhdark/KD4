@@ -485,6 +485,7 @@ async fn resume_lookup_model_providers_filters_only_last_lookup() {
 
 fn recovery_thread_fixture() -> AppServerThread {
     AppServerThread {
+        project_id: None,
         id: "thread-1".to_string(),
         extra: None,
         session_id: "thread-1".to_string(),
@@ -524,7 +525,6 @@ fn recovery_thread_fixture() -> AppServerThread {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
             codex_app_server_protocol::Turn {
                 id: "turn-2".to_string(),
@@ -540,7 +540,6 @@ fn recovery_thread_fixture() -> AppServerThread {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         ],
     }
@@ -580,7 +579,6 @@ fn should_backfill_turn_completed_items_requires_missing_persisted_items() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         });
 
@@ -787,6 +785,7 @@ async fn session_configured_from_thread_response_preserves_session_contract() {
 fn sample_thread_start_response() -> ThreadStartResponse {
     ThreadStartResponse {
         thread: codex_app_server_protocol::Thread {
+            project_id: None,
             id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
             extra: None,
             session_id: "67e55044-10b1-426f-9247-bb680e5fe0c7".to_string(),

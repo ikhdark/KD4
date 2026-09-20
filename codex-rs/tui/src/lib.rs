@@ -568,6 +568,7 @@ async fn lookup_session_target_by_name_with_app_server(
     loop {
         let response = app_server
             .thread_list(ThreadListParams {
+                project_id: None,
                 cursor: cursor.clone(),
                 limit: Some(100),
                 sort_key: Some(AppServerThreadSortKey::UpdatedAt),
@@ -697,6 +698,7 @@ fn latest_session_lookup_params(
     lookup_mode: LatestSessionLookupMode,
 ) -> ThreadListParams {
     ThreadListParams {
+        project_id: None,
         cursor: None,
         limit: Some(1),
         sort_key: Some(AppServerThreadSortKey::UpdatedAt),

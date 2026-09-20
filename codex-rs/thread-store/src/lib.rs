@@ -4,10 +4,24 @@
 //! Implementations are responsible for resolving that id to local rollout files, RPC requests, or
 //! any other backing store.
 
+pub use codex_state::ProjectSortKey;
+pub use projects::CreateProjectParams;
+pub use projects::CreatedProject;
+pub use projects::DeletedProject;
+pub use projects::ListProjectsParams;
+pub use projects::MoveProjectParams;
+pub use projects::ProjectMoveOutcome;
+pub use projects::StoredProject;
+pub use projects::StoredProjectRoot;
+pub use projects::StoredProjectsPage;
+pub use projects::UpdateProjectParams;
+pub use projects::UpdatedProject;
+
 mod error;
 mod in_memory;
 mod live_thread;
 mod local;
+mod projects;
 mod store;
 mod thread_metadata_sync;
 mod thread_name;

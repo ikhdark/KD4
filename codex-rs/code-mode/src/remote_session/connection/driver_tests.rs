@@ -26,6 +26,7 @@ use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::ConnectionDriver;
@@ -127,6 +128,7 @@ impl DriverHarness {
                     source: "await new Promise(() => {})".to_string(),
                     yield_time_ms: Some(1),
                     max_output_tokens: None,
+                    default_tool_timeout_ms: None,
                 },
                 caller_cancellation: CancellationToken::new(),
                 response_tx,
@@ -168,6 +170,8 @@ impl DriverHarness {
                         tool_name: ToolName::plain("slow").into(),
                         tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
                         input: None,
+                        deadline_shared_monotonic_nanos: None,
+                        remaining_ms_at_send: None,
                     },
                 },
             }))
@@ -227,7 +231,7 @@ impl CodeModeSessionDelegate for HeldDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         let events_tx = self.events_tx.clone();
         let release = self.release.clone();
@@ -262,7 +266,7 @@ impl CodeModeSessionDelegate for PanickingDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async { panic!("delegate panic probe") })
     }
@@ -284,7 +288,7 @@ impl CodeModeSessionDelegate for RecordingDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         self.invocations.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
@@ -388,6 +392,7 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
                 source: "text('ok')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
+                default_tool_timeout_ms: None,
             },
             caller_cancellation: CancellationToken::new(),
             response_tx: execute_tx,
@@ -427,6 +432,8 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
                     tool_name: ToolName::plain("slow").into(),
                     tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
                     input: None,
+                    deadline_shared_monotonic_nanos: None,
+                    remaining_ms_at_send: None,
                 },
             },
         }))
@@ -435,7 +442,7 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest { id: request_id },
+            HostToClient::CancelDelegateRequest { id: request_id, cause: None },
         ))
         .await
         .expect("delegate cancel");
@@ -494,7 +501,7 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest { id: delegate_id },
+            HostToClient::CancelDelegateRequest { id: delegate_id, cause: None },
         ))
         .await
         .expect("delegate cancel");
@@ -587,7 +594,7 @@ async fn shutdown_closes_cell_without_waiting_for_delegate_cleanup() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest { id: delegate_id },
+            HostToClient::CancelDelegateRequest { id: delegate_id, cause: None },
         ))
         .await
         .expect("delegate cancel");
@@ -707,6 +714,8 @@ async fn delegate_task_panic_becomes_tool_error_without_killing_connection() {
                     tool_name: ToolName::plain("panic").into(),
                     tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
                     input: None,
+                    deadline_shared_monotonic_nanos: None,
+                    remaining_ms_at_send: None,
                 },
             },
         }))
@@ -748,6 +757,8 @@ async fn delegate_for_unknown_cell_fails_connection_without_invocation() {
                     tool_name: ToolName::plain("slow").into(),
                     tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
                     input: None,
+                    deadline_shared_monotonic_nanos: None,
+                    remaining_ms_at_send: None,
                 },
             },
         }))
@@ -1080,6 +1091,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
                 source: "await new Promise(() => {})".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
+                default_tool_timeout_ms: None,
             },
             caller_cancellation: cancellation.clone(),
             response_tx: execute_tx,
@@ -1175,6 +1187,7 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
                 source: "await new Promise(() => {})".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
+                default_tool_timeout_ms: None,
             },
             caller_cancellation: cancellation.clone(),
             response_tx: execute_tx,
@@ -1329,6 +1342,7 @@ async fn connection_failure_closes_every_live_cell_once() {
                 source: "await new Promise(() => {})".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
+                default_tool_timeout_ms: None,
             },
             caller_cancellation: CancellationToken::new(),
             response_tx: execute_tx,
@@ -1497,6 +1511,7 @@ async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
                 source: "text('unreachable')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
+                default_tool_timeout_ms: None,
             },
             caller_cancellation: CancellationToken::new(),
             response_tx: execute_tx,

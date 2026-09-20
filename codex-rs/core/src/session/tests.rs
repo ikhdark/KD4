@@ -8144,7 +8144,7 @@ async fn mailbox_submission_reports_overflow_and_allows_retry() {
         .expect("mailbox admission timed out")
         .expect("accepted or duplicate message should succeed");
     }
-    let (activity, _) = session.input_queue.subscribe_activity(None).await;
+    let (activity, _) = session.input_queue.subscribe_activity(None, /*has_internal_completion*/ false).await;
     let error = tokio::time::timeout(
         StdDuration::from_secs(5),
         codex.submit(Op::InterAgentCommunication {
@@ -16408,7 +16408,7 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
                 .await
                 .expect("mailbox admission")
         );
-        let (mut activity, _) = sess.input_queue.subscribe_activity(Some(&turn_state)).await;
+        let (mut activity, _) = sess.input_queue.subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false).await;
         assert!(!activity.has_changed().unwrap());
         let candidate_context = IndexMap::from([(
             "candidate-source".to_string(),

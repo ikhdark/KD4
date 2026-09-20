@@ -1108,6 +1108,7 @@ async fn run_exec_like_with_exit_code_inner(
         Some(_) | None => ValidationExecutionOutcome::ExecutedFailure,
     };
     let output = FunctionToolOutput {
+        essential_inline: Default::default(),
         body: vec![
             codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
         ],

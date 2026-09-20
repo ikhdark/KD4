@@ -2609,6 +2609,7 @@ stream_max_retries = 0
 
     let update_id = mcp
         .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            project_id: None,
             thread_id: thread_id.clone(),
             git_info: Some(ThreadMetadataGitInfoUpdateParams {
                 sha: None,

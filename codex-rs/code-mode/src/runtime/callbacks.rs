@@ -1,4 +1,5 @@
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS;
 
 use super::EXIT_SENTINEL;
 use super::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
@@ -37,7 +38,7 @@ pub(super) fn tool_callback(
             return;
         }
     };
-    let timeout_ms = match tool_timeout_ms(scope, args) {
+    let timeout_ms = match tool_timeout_ms(scope, args, tool_index) {
         Ok(timeout_ms) => timeout_ms,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
@@ -374,12 +375,18 @@ fn reject_callback_limit(
 fn tool_timeout_ms(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
+    tool_index: usize,
 ) -> Result<u64, String> {
-    const MAX_TOOL_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
-
     let default_timeout_ms = scope
         .get_slot::<RuntimeState>()
-        .map(|state| state.default_tool_timeout_ms)
+        .map(|state| {
+            state
+                .enabled_tools
+                .get(tool_index)
+                .and_then(|tool| tool.default_timeout_ms)
+                .unwrap_or(state.default_tool_timeout_ms)
+                .clamp(1, MAX_TOOL_TIMEOUT_MS)
+        })
         .ok_or_else(|| "runtime state unavailable".to_string())?;
     if args.length() < 2 || args.get(1).is_undefined() {
         return Ok(default_timeout_ms);

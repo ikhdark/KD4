@@ -1484,7 +1484,6 @@ mod tests {
                 duration_ms: Some(1),
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         })
     }
@@ -2910,7 +2909,6 @@ mod tests {
                             duration_ms: None,
                             timing: None,
                             surfaced_result: None,
-                            reasoning_policy_history: None,
                         },
                     }
                 )

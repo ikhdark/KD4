@@ -62,6 +62,7 @@ impl WriteStdinHandler {
             session,
             step_context,
             payload,
+            source,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -88,6 +89,9 @@ impl WriteStdinHandler {
                 yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
                 truncation_policy: turn.model_info.truncation_policy.into(),
+                // A nested poll must finish inside the runtime's wrapper
+                // deadline; the wrapper cancels rather than waits.
+                nested_deadline: source.nested_deadline(),
             })
             .await;
         if let Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence {

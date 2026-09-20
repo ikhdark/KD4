@@ -8,6 +8,7 @@ use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_code_mode::CancellationCause;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -199,7 +200,44 @@ pub enum ToolCallSource {
         /// debugging the JS/runtime bridge, but it is not the Codex tool call id
         /// because the runtime id only needs to be unique within one cell.
         runtime_tool_call_id: String,
+        /// Instant the runtime's wrapper timeout fires for this nested call, on
+        /// this process's clock.
+        ///
+        /// A handler that waits should complete cooperatively before it and
+        /// return a resumable result, because the wrapper's own expiry drops
+        /// the handler's future and no recovery can reach the cell. Every stage
+        /// before observation — dispatch, hooks, lock acquisition, startup — is
+        /// already charged against it. `None` when the runtime supplied none.
+        nested_deadline: Option<std::time::Instant>,
+        /// Write-once record of why this call's cancellation token fired.
+        ///
+        /// Read only when reporting a cancelled call, so a runtime deadline, a
+        /// turn shutdown, and a user interrupt stay distinguishable instead of
+        /// all reading as "aborted by user".
+        cancellation_cause: Option<Arc<OnceLock<CancellationCause>>>,
     },
+}
+
+impl ToolCallSource {
+    /// Remaining nested budget, or `None` for a call with no wrapper deadline.
+    pub(crate) fn nested_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Direct => None,
+            Self::CodeMode {
+                nested_deadline, ..
+            } => *nested_deadline,
+        }
+    }
+
+    /// Why this call was cancelled, when an origin recorded it.
+    pub(crate) fn cancellation_cause(&self) -> Option<CancellationCause> {
+        match self {
+            Self::Direct => None,
+            Self::CodeMode {
+                cancellation_cause, ..
+            } => cancellation_cause.as_ref()?.get().cloned(),
+        }
+    }
 }
 
 /// Internal semantic reason a required model-issued tool fixes the turn's
@@ -426,6 +464,8 @@ impl ToolOutput for ToolSearchOutput {
 }
 
 pub struct FunctionToolOutput {
+    /// Control and recovery information that must survive output projection.
+    pub essential_inline: serde_json::Map<String, JsonValue>,
     pub body: Vec<FunctionCallOutputContentItem>,
     /// Complete provider result used only for canonical artifact admission when
     /// `body` is a bounded model-facing projection.
@@ -433,7 +473,7 @@ pub struct FunctionToolOutput {
     pub success: Option<bool>,
     pub outcome: Option<ToolOutputOutcome>,
     pub post_tool_use_response: Option<JsonValue>,
-    /// Private signal consumed by the request-local reasoning governor. This is
+    /// Private signal consumed by the request-local turn execution control. This is
     /// never included in the model-facing tool result or public protocol.
     pub sampling_request_signal: Option<JsonValue>,
     pub deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
@@ -455,6 +495,7 @@ impl FunctionToolOutput {
 impl FunctionToolOutput {
     pub fn from_text(text: String, success: Option<bool>) -> Self {
         Self {
+            essential_inline: Default::default(),
             body: vec![FunctionCallOutputContentItem::InputText { text }],
             canonical_body: None,
             success,
@@ -472,6 +513,7 @@ impl FunctionToolOutput {
         success: Option<bool>,
     ) -> Self {
         Self {
+            essential_inline: Default::default(),
             body: content,
             canonical_body: None,
             success,
@@ -604,7 +646,11 @@ impl ToolOutput for FunctionToolOutput {
                     | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
                 })
                 .collect(),
-            essential_inline: serde_json::json!({ "success": model_success }),
+            essential_inline: {
+                let mut essential = self.essential_inline.clone();
+                essential.insert("success".to_string(), serde_json::json!(model_success));
+                JsonValue::Object(essential)
+            },
             requested_limit: None,
             predetermined_ranges: Vec::new(),
             predetermined_json_pointers: Vec::new(),
@@ -619,6 +665,7 @@ impl ToolOutput for FunctionToolOutput {
             }
             _ => {
                 let canonical_output = Self {
+                    essential_inline: self.essential_inline.clone(),
                     body: canonical_body.clone(),
                     canonical_body: None,
                     success: self.success,
@@ -642,7 +689,19 @@ impl ToolOutput for FunctionToolOutput {
         } else {
             self.success
         };
-        function_tool_response(call_id, payload, self.body.clone(), success)
+        let body = if !self.essential_inline.is_empty()
+            && self
+                .body
+                .iter()
+                .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+        {
+            vec![FunctionCallOutputContentItem::InputText {
+                text: function_call_output_content_items_to_text(&self.body).unwrap_or_default(),
+            }]
+        } else {
+            self.body.clone()
+        };
+        function_tool_response(call_id, payload, body, success)
     }
 
     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
@@ -768,6 +827,14 @@ impl ToolOutput for AbortedToolOutput {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExecSessionCapabilities {
+    pub stdin: bool,
+    pub interrupt: bool,
+    pub cancellation: bool,
+    pub polling: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecCommandToolOutput {
     /// Model-declared attribution only; it does not establish successful coverage.
@@ -780,6 +847,7 @@ pub struct ExecCommandToolOutput {
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<u32>,
+    pub session_capabilities: Option<ExecSessionCapabilities>,
     pub exit_code: Option<i32>,
     /// Whether the process has exited, even if its output pipe is still draining
     /// or the platform did not provide an exit code.
@@ -792,6 +860,12 @@ pub struct ExecCommandToolOutput {
     /// Availability observed by the async output-preparation boundary.
     pub raw_output_reduction_notice: Option<String>,
     pub repair_notice: Option<String>,
+    /// Deferred results already in history that no request has carried yet.
+    ///
+    /// Carried on every poll while they are pending so an agent waiting on an
+    /// unrelated process learns that the answer it deferred has arrived,
+    /// instead of polling until its cell's hard deadline.
+    pub pending_deferred_completions: Vec<String>,
 }
 
 impl ToolOutput for ExecCommandToolOutput {
@@ -905,11 +979,15 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             chunk_id: Option<String>,
             wall_time_seconds: f64,
-            #[serde(skip_serializing_if = "Option::is_none")]
             exit_code: Option<i32>,
+            execution_state: &'static str,
             #[serde(skip_serializing_if = "Option::is_none")]
             session_id: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session_capabilities: Option<ExecSessionCapabilities>,
             process_exited: bool,
+            output_complete: bool,
+            output_reduced: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -930,6 +1008,8 @@ impl ToolOutput for ExecCommandToolOutput {
             output: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             validation: Option<JsonValue>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            pending_deferred_completions: Vec<String>,
         }
 
         let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) =
@@ -942,6 +1022,7 @@ impl ToolOutput for ExecCommandToolOutput {
             };
         let raw_output = String::from_utf8_lossy(&self.raw_output);
         let model_output = self.projected_model_output(raw_output.as_ref());
+        let output_reduced = model_output.reduced;
         let output = self.output_with_reduction_notice(model_output);
         let output = if output.is_empty() {
             match (self.exit_code, self.process_id, self.process_exited) {
@@ -964,8 +1045,12 @@ impl ToolOutput for ExecCommandToolOutput {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
             wall_time_seconds: self.wall_time.as_secs_f64(),
             exit_code: self.exit_code,
+            execution_state: self.execution_state(),
             session_id: self.process_id,
+            session_capabilities: self.session_capabilities,
             process_exited: self.process_exited,
+            output_complete: self.process_exited && self.process_id.is_none() && !output_reduced,
+            output_reduced,
             original_token_count: self.original_token_count,
             original_token_count_is_approximate: self.original_token_count.map(|_| true),
             raw_output_artifact_id,
@@ -983,6 +1068,7 @@ impl ToolOutput for ExecCommandToolOutput {
             output_decoding_notice: self.output_decoding_notice(),
             validation: self.declared_validation_metadata(),
             output,
+            pending_deferred_completions: self.pending_deferred_completions.clone(),
         };
 
         serde_json::to_value(result).unwrap_or_else(|err| {
@@ -1276,6 +1362,16 @@ pub(crate) fn declared_validation_metadata(
 }
 
 impl ExecCommandToolOutput {
+    fn execution_state(&self) -> &'static str {
+        if self.process_exited {
+            "exited"
+        } else if self.process_id.is_some() {
+            "running"
+        } else {
+            "unknown"
+        }
+    }
+
     fn output_decoding_notice(&self) -> Option<&'static str> {
         std::str::from_utf8(&self.raw_output).err().map(|_| {
             "Output contained invalid UTF-8 bytes, which were replaced with U+FFFD. The displayed text is not byte-exact."
@@ -1379,7 +1475,9 @@ impl ExecCommandToolOutput {
                 "chunk_id": &self.chunk_id,
                 "exit_code": self.exit_code,
                 "session_id": self.process_id,
+                "session_capabilities": self.session_capabilities,
                 "process_exited": self.process_exited,
+                "execution_state": self.execution_state(),
                 "wall_time_seconds": self.wall_time.as_secs_f64(),
                 "original_token_count": self.original_token_count,
                 "repair_notice": &self.repair_notice,
@@ -1528,6 +1626,15 @@ impl ExecCommandToolOutput {
             }
         };
         sections.push(process_status);
+        if let Some(capabilities) = self.session_capabilities {
+            sections.push(format!(
+                "Session capabilities: stdin={}, interrupt={}, cancellation={}, polling={}",
+                capabilities.stdin,
+                capabilities.interrupt,
+                capabilities.cancellation,
+                capabilities.polling
+            ));
+        }
         if let Some(notice) = self.output_decoding_notice() {
             sections.push(notice.to_string());
         }
@@ -1557,15 +1664,14 @@ impl ExecCommandToolOutput {
         let Some(Some(notice)) = reduction_notice else {
             return truncate_text_to_token_ceiling(&response, max_tokens);
         };
-        // Keep the recovery identifier with its instruction. Truncating the
-        // surrounding response may otherwise remove the artifact that "above"
-        // refers to while retaining the recovery instruction.
+        // The notice carries its own identifier and selector. Remove the
+        // redundant header so recovery still fits a small output budget.
         let artifact_header = if self.raw_output_artifact.is_some() {
             sections.remove(artifact_section_index)
         } else {
             String::new()
         };
-        let notice = format!("{artifact_header}\n{notice}");
+        let notice = notice.to_string();
         let notice_tokens = codex_utils_string::approx_token_count(&notice);
         if notice_tokens > max_tokens {
             // An exceptionally small caller budget cannot fit the complete

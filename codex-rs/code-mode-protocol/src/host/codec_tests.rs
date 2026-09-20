@@ -32,6 +32,7 @@ async fn nested_tool_input_presence_survives_the_host_transport() {
             tool_name: ToolName::plain("example"),
             tool_kind: CodeModeToolKind::Function,
             input,
+            nested_deadline: None,
         };
         let runtime_json = serde_json::to_value(&expected).expect("encode runtime invocation");
         assert_eq!(runtime_json.get("input"), expected.input.as_ref());
@@ -75,6 +76,117 @@ async fn nested_tool_input_presence_survives_the_host_transport() {
             panic!("expected nested tool invocation");
         };
         assert_eq!(CodeModeNestedToolCall::from(invocation), expected);
+    }
+}
+
+#[cfg(test)]
+mod nested_deadline_transport {
+    use super::super::WireNestedToolCall;
+    use crate::CellId;
+    use crate::CodeModeNestedToolCall;
+    use crate::CodeModeToolKind;
+    use codex_protocol::ToolName;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    fn invocation(nested_deadline: Option<Instant>) -> CodeModeNestedToolCall {
+        CodeModeNestedToolCall {
+            cell_id: CellId::new("cell-deadline".to_string()),
+            parent_tool_call_id: Some("parent-call".to_string()),
+            runtime_tool_call_id: "nested-call".to_string(),
+            tool_name: ToolName::plain("example"),
+            tool_kind: CodeModeToolKind::Function,
+            input: None,
+            nested_deadline,
+        }
+    }
+
+    /// The receiver must recover the sender's remaining budget, not restart it.
+    #[test]
+    fn a_delayed_delivery_is_charged_against_the_original_budget() {
+        let sent = invocation(Some(Instant::now() + Duration::from_millis(1_000)));
+        let wire = WireNestedToolCall::from(sent);
+        assert!(
+            wire.deadline_shared_monotonic_nanos.is_some(),
+            "a supported platform must send the shared monotonic form"
+        );
+
+        // Stand in for transit time between the two processes.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let received = CodeModeNestedToolCall::from(wire)
+            .nested_deadline
+            .expect("the deadline must survive the crossing");
+        let remaining = received.saturating_duration_since(Instant::now());
+        assert!(
+            remaining < Duration::from_millis(900),
+            "transit must be charged to the budget, not refunded: {remaining:?} left of 1000ms"
+        );
+        assert!(
+            remaining > Duration::from_millis(400),
+            "only the elapsed transit may be charged: {remaining:?} left of 1000ms"
+        );
+    }
+
+    /// The exchanged value is a monotonic reading, so re-reading the encoded
+    /// frame later cannot be moved by a wall-clock adjustment: the recovered
+    /// deadline depends only on the monotonic offset.
+    #[test]
+    fn a_wall_clock_adjustment_between_send_and_receipt_does_not_move_the_deadline() {
+        let wire = WireNestedToolCall::from(invocation(Some(
+            Instant::now() + Duration::from_millis(1_000),
+        )));
+        let monotonic_deadline = wire
+            .deadline_shared_monotonic_nanos
+            .expect("shared monotonic form");
+
+        // A wall-clock jump changes SystemTime but not the monotonic source the
+        // deadline is expressed on, so the same frame still decodes to the same
+        // remaining budget.
+        let first = CodeModeNestedToolCall::from(wire.clone())
+            .nested_deadline
+            .expect("deadline");
+        let second = CodeModeNestedToolCall::from(wire.clone())
+            .nested_deadline
+            .expect("deadline");
+        let drift = second.saturating_duration_since(first);
+        assert!(
+            drift < Duration::from_millis(50),
+            "two receipts of one frame must agree on the deadline, drifted {drift:?}"
+        );
+        assert_eq!(
+            wire.deadline_shared_monotonic_nanos,
+            Some(monotonic_deadline),
+            "encoding must not mutate the monotonic reading"
+        );
+    }
+
+    /// Without a shared source the fallback is charged from receipt. It does
+    /// not preserve the original budget, and that is the documented contract.
+    #[test]
+    fn the_fallback_charges_the_remaining_duration_from_receipt() {
+        let wire = WireNestedToolCall {
+            deadline_shared_monotonic_nanos: None,
+            remaining_ms_at_send: Some(1_000),
+            ..WireNestedToolCall::from(invocation(None))
+        };
+
+        let received = CodeModeNestedToolCall::from(wire)
+            .nested_deadline
+            .expect("the fallback still yields a deadline");
+        let remaining = received.saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::from_millis(900) && remaining <= Duration::from_millis(1_000),
+            "the fallback restarts the budget at receipt: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn an_invocation_without_a_deadline_sends_and_receives_none() {
+        let wire = WireNestedToolCall::from(invocation(None));
+        assert_eq!(wire.deadline_shared_monotonic_nanos, None);
+        assert_eq!(wire.remaining_ms_at_send, None);
+        assert_eq!(CodeModeNestedToolCall::from(wire).nested_deadline, None);
     }
 }
 

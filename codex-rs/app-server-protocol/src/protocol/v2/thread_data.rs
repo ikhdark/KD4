@@ -5,7 +5,6 @@ use super::ThreadStatus;
 use super::TurnStatus;
 use super::TurnTiming;
 use codex_experimental_api_macros::ExperimentalApi;
-pub use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource as CoreSubAgentSource;
 pub use codex_protocol::protocol::ThreadHistoryMode;
@@ -85,6 +84,12 @@ pub struct GitInfo {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct Thread {
+    /// Canonical project assignment owned by app-server, if any.
+    #[schemars(
+        required,
+        schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+    )]
+    pub project_id: Option<String>,
     /// Identifier for this thread. Codex-generated thread IDs are UUIDv7.
     pub id: String,
     /// Optional implementation-specific thread data.
@@ -173,11 +178,6 @@ pub struct Turn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub surfaced_result: Option<SurfacedToolResult>,
-    /// Bounded reasoning-policy snapshots recorded for this turn.
-    #[experimental("reasoningPolicyVisibility")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub reasoning_policy_history: Option<ReasoningPolicyHistory>,
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]

@@ -25,6 +25,7 @@ use crate::GitInfoPatch;
 use crate::ReadThreadParams;
 use crate::StoredThread;
 use crate::ThreadMetadataPatch;
+use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::UpdateThreadMetadataParams;
@@ -37,6 +38,11 @@ pub(super) async fn update_thread_metadata(
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let patch = params.patch;
+    if patch.project_id.is_some() && !store.supports_projects() {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "projects",
+        });
+    }
     if patch.is_empty() {
         return read_thread::read_thread(
             store,
@@ -352,12 +358,26 @@ async fn apply_metadata_update(
                 metadata.git_branch = branch;
                 metadata.git_origin_url = origin_url;
             }
-            state_db
-                .upsert_thread(&metadata)
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to update thread metadata for {thread_id}: {err}"),
+            if let Some(project_id) = patch.project_id {
+                metadata.project_id = project_id;
+                state_db
+                    .upsert_thread_with_project(&metadata, metadata.project_id.as_deref())
+                    .await
+                    .map_err(|err| {
+                        let message = err.to_string();
+                        if message.contains("project not found") {
+                            ThreadStoreError::InvalidRequest { message }
+                        } else {
+                            ThreadStoreError::Internal { message }
+                        }
+                    })?;
+            } else {
+                state_db.upsert_thread(&metadata).await.map_err(|err| {
+                    ThreadStoreError::Internal {
+                        message: format!("failed to update thread metadata for {thread_id}: {err}"),
+                    }
                 })?;
+            }
             if existing.is_some()
                 && let Some(recency_at) = advance_recency_at
             {
@@ -545,7 +565,7 @@ fn sqlite_write_failure_should_block(patch: &ThreadMetadataPatch) -> bool {
     // look broken. Explicit git-only updates still require SQLite because partial git patches need
     // the existing SQLite value to preserve unspecified fields. Name compatibility writes still
     // require their targeted SQLite update to succeed before writing the legacy name index.
-    patch.git_info.is_some() && !has_observed_metadata_facts(patch)
+    patch.project_id.is_some() || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
 }
 
 fn sqlite_write_error_is_best_effort(err: &ThreadStoreError) -> bool {
@@ -1904,6 +1924,7 @@ mod tests {
         assert_eq!(metadata.cwd, normalized_cwd);
         let page = store
             .list_threads(ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::UpdatedAt,

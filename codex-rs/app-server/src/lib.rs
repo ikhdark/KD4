@@ -928,7 +928,6 @@ pub async fn run_main(
                                     .connection_opened_with_runtime(
                                         connection_id,
                                         Arc::clone(&outbound_initialized),
-                                        Arc::clone(&outbound_experimental_api_enabled),
                                         disconnect_sender.clone().unwrap_or_else(|| transport_shutdown_token.clone()),
                                     )
                                     .await;

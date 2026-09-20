@@ -630,6 +630,24 @@ impl UnifiedExecProcess {
         }
     }
 
+    pub(super) fn session_capabilities(
+        &self,
+        tty: bool,
+    ) -> crate::tools::context::ExecSessionCapabilities {
+        let running = !self.has_exited();
+        // Non-PTY Windows and remote backends do not guarantee interrupt
+        // delivery. Never advertise a speculative Ctrl-C operation.
+        let interrupt =
+            tty || matches!(&self.process_handle, ProcessHandle::Local(_)) && !cfg!(windows);
+        crate::tools::context::ExecSessionCapabilities {
+            stdin: running && tty,
+            interrupt: running && interrupt,
+            // write_stdin exposes polling and input, not process termination.
+            cancellation: false,
+            polling: true,
+        }
+    }
+
     pub(super) fn termination_was_requested(&self) -> bool {
         self.termination_requested.load(Ordering::Acquire)
     }

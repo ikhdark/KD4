@@ -1,4 +1,6 @@
 use std::num::TryFromIntError;
+use std::time::Duration;
+use std::time::Instant;
 
 use codex_protocol::ToolName;
 use serde::Deserialize;
@@ -12,9 +14,11 @@ use crate::ExecuteRequest;
 use crate::FunctionCallOutputContentItem;
 use crate::ImageDetail;
 use crate::RuntimeResponse;
+use crate::SharedMonotonicNanos;
 use crate::ToolDefinition;
 use crate::WaitOutcome;
 use crate::WaitRequest;
+use crate::shared_monotonic_now;
 
 /// A cell identifier with a wire representation owned by protocol V1.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -108,6 +112,9 @@ pub struct WireToolDefinition {
     pub kind: WireToolKind,
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
+    /// Default for this tool only; an explicit per-call timeout takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_timeout_ms: Option<u64>,
 }
 
 impl From<ToolDefinition> for WireToolDefinition {
@@ -119,6 +126,7 @@ impl From<ToolDefinition> for WireToolDefinition {
             kind: value.kind.into(),
             input_schema: value.input_schema,
             output_schema: value.output_schema,
+            default_timeout_ms: value.default_timeout_ms,
         }
     }
 }
@@ -132,6 +140,7 @@ impl From<WireToolDefinition> for ToolDefinition {
             kind: value.kind.into(),
             input_schema: value.input_schema,
             output_schema: value.output_schema,
+            default_timeout_ms: value.default_timeout_ms,
         }
     }
 }
@@ -145,6 +154,10 @@ pub struct WireExecuteRequest {
     pub source: String,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<i32>,
+    /// Absent on peers that predate the per-cell nested-tool deadline; the
+    /// runtime then falls back to `DEFAULT_TOOL_TIMEOUT_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tool_timeout_ms: Option<u64>,
 }
 
 impl TryFrom<ExecuteRequest> for WireExecuteRequest {
@@ -158,6 +171,7 @@ impl TryFrom<ExecuteRequest> for WireExecuteRequest {
             source: value.source,
             yield_time_ms: value.yield_time_ms,
             max_output_tokens,
+            default_tool_timeout_ms: value.default_tool_timeout_ms,
         })
     }
 }
@@ -173,6 +187,7 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
             source: value.source,
             yield_time_ms: value.yield_time_ms,
             max_output_tokens,
+            default_tool_timeout_ms: value.default_tool_timeout_ms,
         })
     }
 }
@@ -415,10 +430,34 @@ pub struct WireNestedToolCall {
         deserialize_with = "crate::runtime::deserialize_present_input"
     )]
     pub input: Option<JsonValue>,
+    /// The wrapper deadline as a reading of the machine-wide monotonic clock.
+    ///
+    /// Both peers run on one machine and read one monotonic source, so the
+    /// receiver recovers the sender's own deadline by measuring the offset
+    /// against that source at receipt. A wall-clock adjustment in between
+    /// cannot move it, and transit time is charged to the budget rather than
+    /// refunded. Absent when the platform exposes no shared source, or when the
+    /// sending peer predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_shared_monotonic_nanos: Option<SharedMonotonicNanos>,
+    /// Budget left when the call was sent, used only when no shared monotonic
+    /// source is available.
+    ///
+    /// This deliberately does **not** preserve the original budget: it is
+    /// charged from receipt, so transit time goes uncharged and the receiver
+    /// may observe slightly longer than the sender's wrapper allows. The
+    /// wrapper's hard timeout remains the fallback there, and the reported
+    /// cause still comes from whichever origin recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_ms_at_send: Option<u64>,
 }
 
 impl From<CodeModeNestedToolCall> for WireNestedToolCall {
     fn from(value: CodeModeNestedToolCall) -> Self {
+        let (deadline_shared_monotonic_nanos, remaining_ms_at_send) = value
+            .nested_deadline
+            .map(encode_nested_deadline)
+            .unwrap_or((None, None));
         Self {
             cell_id: value.cell_id.into(),
             parent_tool_call_id: value.parent_tool_call_id,
@@ -426,6 +465,8 @@ impl From<CodeModeNestedToolCall> for WireNestedToolCall {
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),
             input: value.input,
+            deadline_shared_monotonic_nanos,
+            remaining_ms_at_send,
         }
     }
 }
@@ -439,6 +480,43 @@ impl From<WireNestedToolCall> for CodeModeNestedToolCall {
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),
             input: value.input,
+            nested_deadline: decode_nested_deadline(
+                value.deadline_shared_monotonic_nanos,
+                value.remaining_ms_at_send,
+            ),
         }
     }
+}
+
+/// Renders a local deadline for transport. Prefers the shared monotonic
+/// timeline; the remaining-duration form is only a fallback.
+fn encode_nested_deadline(deadline: Instant) -> (Option<SharedMonotonicNanos>, Option<u64>) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining_ms = u64::try_from(remaining.as_millis()).ok();
+    let Some(now_nanos) = shared_monotonic_now() else {
+        return (None, remaining_ms);
+    };
+    let deadline_nanos = u64::try_from(remaining.as_nanos())
+        .ok()
+        .and_then(|remaining_nanos| now_nanos.checked_add(remaining_nanos));
+    // Always send the fallback too: the receiving peer may be on a platform or
+    // build without a shared source even when this one has it.
+    (deadline_nanos, remaining_ms)
+}
+
+/// Recovers the sender's deadline on this process's own clock.
+///
+/// The monotonic path charges transit time to the budget. The fallback path
+/// does not, and is documented as not preserving the original budget.
+fn decode_nested_deadline(
+    deadline_shared_monotonic_nanos: Option<SharedMonotonicNanos>,
+    remaining_ms_at_send: Option<u64>,
+) -> Option<Instant> {
+    let now = Instant::now();
+    if let Some(deadline_nanos) = deadline_shared_monotonic_nanos
+        && let Some(now_nanos) = shared_monotonic_now()
+    {
+        return Some(now + Duration::from_nanos(deadline_nanos.saturating_sub(now_nanos)));
+    }
+    remaining_ms_at_send.map(|remaining_ms| now + Duration::from_millis(remaining_ms))
 }

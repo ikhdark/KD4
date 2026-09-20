@@ -23,10 +23,13 @@ async fn build_memory_tool_developer_instructions_renders_embedded_template() {
         .unwrap();
 
     assert!(instructions.contains(&format!(
-        "- {}/memory_summary.md (already provided below; do NOT open again)",
+        "- {}/memory_summary.md (provided below, possibly truncated; reuse",
         memories_dir.display()
     )));
     assert!(instructions.contains("Short memory summary for tests."));
+    assert!(instructions.contains("search/read a narrow omitted range only when needed"));
+    assert!(instructions.contains("current request and visible `MEMORY_SUMMARY`"));
+    assert!(!instructions.contains("do NOT open again"));
     assert_eq!(
         instructions
             .matches("========= MEMORY_SUMMARY BEGINS =========")

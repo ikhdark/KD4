@@ -2160,7 +2160,7 @@ async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kd4_runtime_off_preserves_effort_after_tool_and_followup() -> anyhow::Result<()> {
+async fn configured_effort_survives_tools_and_followup() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let response_mock = mount_sse_sequence(
         &server,
@@ -2190,21 +2190,9 @@ async fn kd4_runtime_off_preserves_effort_after_tool_and_followup() -> anyhow::R
         .with_config(|config| {
             config
                 .features
-                .disable(Feature::Kd4Runtime)
-                .expect("disable KD4 runtime");
-            config
-                .features
                 .disable(Feature::CodeMode)
                 .expect("expose direct tools");
             config.model_reasoning_effort = Some(ReasoningEffort::High);
-            // Deliberately retain conflicting overrides: request construction must
-            // respect the switch even for programmatically constructed configs.
-            config.reasoning_phase_efforts =
-                Some(codex_config::config_toml::ReasoningPhaseEfforts {
-                    orient: Some(ReasoningEffort::Low),
-                    finalize: Some(ReasoningEffort::Low),
-                    ..Default::default()
-                });
         })
         .build(&server)
         .await?;
@@ -2246,7 +2234,7 @@ async fn kd4_runtime_off_preserves_effort_after_tool_and_followup() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn initial_turn_reasoning_policy_uses_compatibility_phase_efforts() -> anyhow::Result<()> {
+async fn initial_turn_preserves_configured_reasoning_effort() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2287,14 +2275,14 @@ async fn initial_turn_reasoning_policy_uses_compatibility_phase_efforts() -> any
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("high")
+        Some("max")
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn governed_effort_overrides_model_default_reasoning_effort() -> anyhow::Result<()> {
+async fn initial_turn_uses_model_default_reasoning_effort() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2329,7 +2317,7 @@ async fn governed_effort_overrides_model_default_reasoning_effort() -> anyhow::R
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("high")
+        Some("medium")
     );
 
     Ok(())

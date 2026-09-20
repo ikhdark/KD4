@@ -429,6 +429,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(1),
         process_exited: true,
         search_no_match: false,
@@ -437,6 +438,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: Some(existing_repair_notice.to_string()),
+        pending_deferred_completions: Vec::new(),
     };
 
     attach_powershell_failure_advisory(
@@ -513,6 +515,7 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -521,6 +524,7 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     attach_powershell_failure_advisory(&mut output, ShellType::PowerShell, false);
     assert_eq!(output.exit_code, Some(0));
@@ -2016,7 +2020,7 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     assert!(model_output.len() < segment_bytes);
     assert!(!model_output.contains("MIDDLE_MARKER"));
     assert!(model_output.contains(
-        "[command output reduced; recover the full retained output with read_tool_output"
+        "[command output reduced; read a bounded selection from the retained output with read_tool_output"
     ));
     let response = output.to_response_item(
         "full-output-artifact",
@@ -2026,7 +2030,7 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     );
     let rendered = serde_json::to_string(&response).expect("model response");
     assert!(rendered.contains(
-        "[command output reduced; recover the full retained output with read_tool_output"
+        "[command output reduced; read a bounded selection from the retained output with read_tool_output"
     ));
 }
 
@@ -2309,6 +2313,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -2317,6 +2322,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
     let handler = ExecCommandHandler::default();
@@ -2345,6 +2351,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -2353,6 +2360,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
     let handler = ExecCommandHandler::default();
@@ -2382,6 +2390,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: Some(45),
+        session_capabilities: None,
         exit_code: None,
         process_exited: false,
         search_no_match: false,
@@ -2390,6 +2399,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
     let handler = ExecCommandHandler::default();
@@ -2414,6 +2424,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -2422,6 +2433,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
     let handler = WriteStdinHandler;
@@ -2481,6 +2493,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -2489,6 +2502,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let output_b = ExecCommandToolOutput {
         validation: None,
@@ -2499,6 +2513,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -2507,6 +2522,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;
@@ -2859,7 +2875,7 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
     let text = code_mode["output"].as_str().expect("code-mode output");
     assert!(
         text.contains(
-            "[command output reduced; recover the full retained output with read_tool_output"
+            "[command output reduced; read a bounded selection from the retained output with read_tool_output"
         ),
         "{text}"
     );
@@ -2867,9 +2883,10 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
     let response =
         serde_json::to_string(&completed.to_response_item("notice-write_stdin", &payload))
             .expect("model response");
-    assert!(response.contains(
-        "[command output reduced; recover the full retained output with read_tool_output"
-    ));
+    // The 100-token direct-output budget cannot fit the complete selector notice.
+    // Its documented fallback must retain the artifact ID without a partial instruction.
+    assert!(response.contains("Raw output artifact:"), "{response}");
+    assert!(!response.contains("[command output reduced;"), "{response}");
     let id = code_mode["raw_output_artifact_id"]
         .as_str()
         .expect("advertised artifact");

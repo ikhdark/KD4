@@ -10,6 +10,7 @@ use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -26,7 +27,7 @@ impl CellHost for TestHost {
     async fn invoke_tool(
         &self,
         _invocation: CellToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> Result<JsonValue, String> {
         Err("unexpected tool call".to_string())
     }
@@ -57,7 +58,7 @@ impl CellHost for RecordingHost {
     async fn invoke_tool(
         &self,
         _invocation: CellToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> Result<JsonValue, String> {
         Err("unexpected tool call".to_string())
     }
@@ -127,6 +128,7 @@ async fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             source: "await new Promise(() => {});".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            default_tool_timeout_ms: None,
         },
         60_000,
         runtime_event_tx,

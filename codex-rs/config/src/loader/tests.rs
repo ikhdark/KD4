@@ -657,6 +657,45 @@ async fn config_file_boundaries_migrate_before_strict_validation() {
 }
 
 #[tokio::test]
+async fn session_feature_tables_from_newer_clients_do_not_block_config_loading() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let config_path = home.path().join(CONFIG_TOML_FILE);
+    let saved_config = "[features]\nunified_exec = true\nmemories = false\n";
+    std::fs::write(&config_path, saved_config).unwrap();
+    let stack = load_config_layers_state(
+        &TestFileSystem::default(),
+        home.path(),
+        Some(AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap()),
+        &[
+            (
+                "features.tool_registry.error_on_tool_collisions".to_string(),
+                TomlValue::Boolean(true),
+            ),
+            (
+                "features.token_budget".to_string(),
+                toml::toml! { enabled = true }.into(),
+            ),
+            (
+                "features.unified_exec".to_string(),
+                TomlValue::Boolean(false),
+            ),
+        ],
+        LoaderOverrides::without_managed_config_for_tests(),
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .expect("session overrides from a newer client should load");
+    let config: ConfigToml = stack.effective_config().try_into().unwrap();
+    let features = config.features.unwrap().entries();
+    assert_eq!(features.get("unified_exec"), Some(&false));
+    assert_eq!(features.get("memories"), Some(&false));
+    assert!(!features.contains_key("tool_registry"));
+    assert!(!features.contains_key("token_budget"));
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), saved_config);
+}
+
+#[tokio::test]
 async fn overridden_invalid_field_does_not_change_relative_path_base() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();

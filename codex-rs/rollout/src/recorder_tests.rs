@@ -36,6 +36,16 @@ use tempfile::TempDir;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
+/// Stamp items the way `record_canonical_items` does: one capture instant for
+/// the whole enqueued batch.
+fn captured(items: Vec<RolloutItem>) -> Vec<CapturedRolloutItem> {
+    let captured_at = OffsetDateTime::now_utc();
+    items
+        .into_iter()
+        .map(|item| CapturedRolloutItem::new(item, captured_at))
+        .collect()
+}
+
 fn test_config(codex_home: &Path) -> RolloutConfig {
     RolloutConfig {
         codex_home: codex_home.to_path_buf(),
@@ -906,13 +916,13 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         rollout_path.clone(),
         Default::default(),
     );
-    state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+    state.add_items(captured(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
         AgentMessageEvent {
             message: "queued-after-writer-error".to_string(),
             phase: None,
             memory_citation: None,
         },
-    ))]);
+    ))]));
 
     state.flush().await?;
     let text_after_retry = std::fs::read_to_string(&rollout_path)?;
@@ -963,34 +973,34 @@ fn writer_state_defines_manifests_once_then_references_them() {
         collaboration_mode_kind: Default::default(),
     }));
 
-    state.add_items(vec![
+    state.add_items(captured(vec![
         manifest("already-persisted"),
         manifest("new"),
         manifest("new"),
         token_count(),
         token_count(),
         boundary,
-    ]);
+    ]));
 
     assert_eq!(state.pending_items.len(), 5);
     assert!(matches!(
-        &state.pending_items[0],
+        &state.pending_items[0].item,
         RolloutItem::ToolManifest(item) if item.hash == "already-persisted" && item.is_reference()
     ));
     assert!(matches!(
-        &state.pending_items[1],
+        &state.pending_items[1].item,
         RolloutItem::ToolManifest(item) if item.hash == "new" && item.manifest.is_some()
     ));
     assert!(matches!(
-        &state.pending_items[2],
+        &state.pending_items[2].item,
         RolloutItem::ToolManifest(item) if item.hash == "new" && item.is_reference()
     ));
     assert!(matches!(
-        &state.pending_items[3],
+        &state.pending_items[3].item,
         RolloutItem::EventMsg(EventMsg::TokenCount(_))
     ));
     assert!(matches!(
-        &state.pending_items[4],
+        &state.pending_items[4].item,
         RolloutItem::EventMsg(EventMsg::TurnStarted(_))
     ));
     assert!(state.pending_token_count.is_none());
@@ -1023,11 +1033,11 @@ async fn replay_reconstructs_full_tool_surface_from_compact_references() -> std:
     });
     let hash = "stable-surface";
 
-    state.add_items(vec![
+    state.add_items(captured(vec![
         RolloutItem::ToolManifest(ToolManifestItem::full(hash.to_string(), surface.clone())),
         RolloutItem::ToolManifest(ToolManifestItem::reference(hash.to_string())),
         RolloutItem::ToolManifest(ToolManifestItem::reference(hash.to_string())),
-    ]);
+    ]));
     state.flush().await?;
 
     let persisted = fs::read_to_string(&rollout_path)?
@@ -1092,7 +1102,7 @@ async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std
             serde_json::json!({"hash": hash}),
         ))
     };
-    state.add_items(vec![manifest("persisted"), manifest("changed")]);
+    state.add_items(captured(vec![manifest("persisted"), manifest("changed")]));
 
     state.flush().await?;
 
@@ -1115,6 +1125,208 @@ async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std
         })
         .collect::<Vec<_>>();
     assert_eq!(manifest_hashes, vec!["persisted", "persisted", "changed"]);
+    Ok(())
+}
+
+fn agent_message(message: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        message: message.to_string(),
+        phase: None,
+        memory_citation: None,
+    }))
+}
+
+fn recorded_lines(path: &Path) -> std::io::Result<Vec<RolloutLine>> {
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn parse_record_timestamp(timestamp: &str) -> OffsetDateTime {
+    let format: &[FormatItem] = format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    );
+    time::PrimitiveDateTime::parse(timestamp, &format)
+        .unwrap_or_else(|err| {
+            panic!("record timestamp {timestamp:?} is not in record format: {err}")
+        })
+        .assume_utc()
+}
+
+/// Records carry milliseconds, so an exact capture instant has to be compared
+/// at the resolution the record format keeps.
+fn at_record_resolution(instant: OffsetDateTime) -> OffsetDateTime {
+    instant
+        .replace_nanosecond(u32::from(instant.millisecond()) * 1_000_000)
+        .expect("millisecond boundary is a valid nanosecond")
+}
+
+#[tokio::test]
+async fn records_coalesced_into_one_flush_keep_their_own_capture_times() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+
+    // Ordered records buffer until an explicit barrier, so both of these land
+    // in the same flush even though they were produced far apart.
+    let capture_gap = Duration::from_millis(120);
+    recorder
+        .record_canonical_items_ordered(&[agent_message("captured-first")])
+        .await?;
+    tokio::time::sleep(capture_gap).await;
+    recorder
+        .record_canonical_items_ordered(&[agent_message("captured-second")])
+        .await?;
+    recorder.flush().await?;
+
+    let messages = recorded_lines(&rollout_path)?
+        .iter()
+        .filter_map(|line| match &line.item {
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => {
+                Some((event.message.clone(), parse_record_timestamp(&line.timestamp)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|(message, _)| message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["captured-first", "captured-second"],
+        "coalescing must not reorder records"
+    );
+    let observed_gap = messages[1].1 - messages[0].1;
+    assert!(
+        observed_gap >= capture_gap / 2,
+        "records flushed together must keep their own capture times, but they are \
+         {observed_gap:?} apart after a {capture_gap:?} gap between captures"
+    );
+
+    recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebased_records_keep_their_capture_time() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::now_v7();
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let rollout_path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+    let persisted_manifest = RolloutLine {
+        timestamp: "2025-01-03T12:00:01Z".to_string(),
+        item: RolloutItem::ToolManifest(ToolManifestItem::full(
+            "persisted".to_string(),
+            serde_json::json!({"hash": "persisted"}),
+        )),
+    };
+    let mut file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
+    writeln!(file, "{}", serde_json::to_string(&persisted_manifest)?)?;
+    drop(file);
+
+    let mut state = RolloutWriterState::new(
+        /*writer*/ None,
+        Some(LogFileInfo {
+            path: rollout_path.clone(),
+            conversation_id: thread_id,
+            timestamp: OffsetDateTime::now_utc(),
+        }),
+        Some(SessionMeta {
+            session_id: SessionId::from(thread_id),
+            id: thread_id,
+            ..SessionMeta::default()
+        }),
+        home.path().to_path_buf(),
+        /*known_repository_context*/ None,
+        rollout_path.clone(),
+        ToolManifestDictionary::default(),
+    );
+    // Rebasing rewrites this manifest against the persisted dictionary.
+    let captured_at = OffsetDateTime::now_utc() - Duration::from_secs(3600);
+    state.add_items(vec![CapturedRolloutItem::new(
+        RolloutItem::ToolManifest(ToolManifestItem::full(
+            "persisted".to_string(),
+            serde_json::json!({"hash": "persisted"}),
+        )),
+        captured_at,
+    )]);
+
+    state.flush().await?;
+
+    let rebased = recorded_lines(&rollout_path)?
+        .into_iter()
+        .filter(|line| matches!(&line.item, RolloutItem::ToolManifest(_)))
+        .last()
+        .expect("rebased manifest record");
+    let RolloutItem::ToolManifest(manifest) = &rebased.item else {
+        panic!("expected a tool manifest record");
+    };
+    assert!(
+        manifest.is_reference(),
+        "the record must actually have been rebased onto the persisted dictionary"
+    );
+    assert_eq!(
+        parse_record_timestamp(&rebased.timestamp),
+        at_record_resolution(captured_at),
+        "a rebased record keeps the time it was captured, not the time it was written"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retried_records_keep_their_capture_time() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    File::create(&rollout_path)?;
+    let read_only_file = std::fs::OpenOptions::new().read(true).open(&rollout_path)?;
+    let (_, append_lock) = compression::lock_rollout_for_append_blocking(&rollout_path)?;
+    let mut state = RolloutWriterState::new(
+        Some(JsonlWriter {
+            path: rollout_path.clone(),
+            file: tokio::fs::File::from_std(read_only_file),
+            _append_lock: append_lock,
+            write_fault: None,
+            append_transaction_count: 0,
+        }),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        /*known_repository_context*/ None,
+        rollout_path.clone(),
+        Default::default(),
+    );
+    let captured_at = OffsetDateTime::now_utc() - Duration::from_secs(3600);
+    state.add_items(vec![CapturedRolloutItem::new(
+        agent_message("survives-the-retry"),
+        captured_at,
+    )]);
+
+    // The first append fails against the read-only handle; the retry reopens
+    // and writes the same buffered record.
+    state.flush().await?;
+
+    let lines = recorded_lines(&rollout_path)?;
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        parse_record_timestamp(&lines[0].timestamp),
+        at_record_resolution(captured_at),
+        "a retried record keeps the time it was captured, not the time the retry succeeded"
+    );
     Ok(())
 }
 
@@ -1161,13 +1373,13 @@ async fn assert_failed_append_is_written_once(
         rollout_path.clone(),
         Default::default(),
     );
-    state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+    state.add_items(captured(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
         AgentMessageEvent {
             message: message.to_string(),
             phase: None,
             memory_citation: None,
         },
-    ))]);
+    ))]));
 
     state.flush().await?;
 
@@ -1216,13 +1428,13 @@ async fn unrecoverable_append_stops_writer_with_live_senders() -> std::io::Resul
         Arc::clone(&writer_task),
     ));
     tx.send(RolloutCmd::AddItems {
-        items: vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+        items: captured(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
             AgentMessageEvent {
                 message: "cannot safely retry".into(),
                 phase: None,
                 memory_citation: None,
             },
-        ))],
+        ))]),
         flush_if_materialized: true,
         accepted: None,
     })
@@ -1327,7 +1539,7 @@ async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::
         rollout_path.clone(),
         Default::default(),
     );
-    state.add_items(
+    state.add_items(captured(
         ["first", "second", "third"]
             .into_iter()
             .map(|message| {
@@ -1338,7 +1550,7 @@ async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::
                 }))
             })
             .collect(),
-    );
+    ));
 
     state.flush().await?;
 
@@ -2172,8 +2384,8 @@ async fn deferred_writers_install_one_canonical_header_after_both_open() -> std:
         "shared".into(),
         serde_json::json!({"tools": []}),
     ));
-    first.add_items(vec![manifest.clone()]);
-    second.add_items(vec![manifest]);
+    first.add_items(captured(vec![manifest.clone()]));
+    second.add_items(captured(vec![manifest]));
     let (first_result, second_result) = tokio::join!(first.persist(), second.persist());
     first_result?;
     second_result?;

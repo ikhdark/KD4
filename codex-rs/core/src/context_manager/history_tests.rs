@@ -2622,6 +2622,41 @@ fn prepared_prompt_cache_reuses_shared_items_across_non_history_changes() {
 }
 
 #[test]
+fn projection_budget_drops_are_ordered_to_match_the_prompt_representations() {
+    let prepared = create_history_with_items(vec![agent_message("hello")])
+        .prepare_for_prompt(&default_input_modalities());
+    let drops = |count: u32| crate::tool_history::ToolOutputBudgetDrops {
+        count,
+        tokens: u64::from(count) * 100,
+    };
+    // Distinct items force a real projection instead of the unchanged-input
+    // early return, so the recorded drops are the ones applied here.
+    let projection = ToolHistoryProjection {
+        items: Arc::from(vec![agent_message("projected")]),
+        unreplaced_items: Arc::from(vec![agent_message("unreplaced")]),
+        substitutions: Arc::from(Vec::new()),
+        items_budget_drops: drops(1),
+        unreplaced_items_budget_drops: drops(3),
+    };
+    let fallback_projection = ToolHistoryProjection {
+        items: Arc::from(vec![agent_message("fallback")]),
+        unreplaced_items: Arc::from(vec![agent_message("unreplaced fallback")]),
+        substitutions: Arc::from(Vec::new()),
+        items_budget_drops: drops(2),
+        unreplaced_items_budget_drops: drops(4),
+    };
+
+    let projected = apply_tool_history_projection(prepared, projection, fallback_projection);
+
+    assert_eq!(
+        projected.tool_output_budget_drops(),
+        [drops(1), drops(2), drops(3), drops(4)],
+        "order must match Prompt's [input, stable-context fallback, \
+         tool-history fallback, both fallbacks]"
+    );
+}
+
+#[test]
 fn unchanged_tool_projection_preserves_prepared_sidecars() {
     let prepared = create_history_with_items(vec![agent_message("hello")])
         .prepare_for_prompt(&default_input_modalities());
@@ -2632,11 +2667,13 @@ fn unchanged_tool_projection_preserves_prepared_sidecars() {
         items: prepared.shared_items(),
         unreplaced_items: prepared.shared_unreplaced_items(),
         substitutions: prepared.tool_history_substitutions(),
+        ..ToolHistoryProjection::default()
     };
     let fallback_projection = ToolHistoryProjection {
         items: prepared.shared_fallback_items(),
         unreplaced_items: prepared.shared_unreplaced_fallback_items(),
         substitutions: prepared.fallback_tool_history_substitutions(),
+        ..ToolHistoryProjection::default()
     };
 
     let projected = apply_tool_history_projection(prepared, projection, fallback_projection);
@@ -3120,6 +3157,8 @@ async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
 
 #[test]
 fn tool_history_budget_drops_complete_local_shell_pairs() {
+    let _budget =
+        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
     let mut canonical = Vec::new();
     for call_id in ["older-shell", "newer-shell"] {
         canonical.push(ResponseItem::LocalShellCall {
@@ -3173,6 +3212,8 @@ fn tool_history_budget_drops_complete_local_shell_pairs() {
 
 #[test]
 fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projection() {
+    let _budget =
+        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-cached-tool-history";
     let bounded_output =
         "bounded model-visible tool output with enough material for a smaller receipt\n"

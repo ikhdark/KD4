@@ -172,11 +172,15 @@ const WORKSPACE_LOCK: &str = "codex-rs/Cargo.lock";
 
 /// True when a reconciled checkout's `git status --porcelain` reports nothing
 /// but the workspace lockfile. Porcelain v1 prints two status characters, a
-/// space, then the path.
+/// space, then the path, but `git` trims its output and an unstaged change
+/// leads with a space, so take the path after the status field rather than at a
+/// fixed offset. A line without a status field is never accepted.
 fn only_workspace_lock_modified(status: &str) -> bool {
-    status
-        .lines()
-        .all(|line| line.get(3..) == Some(WORKSPACE_LOCK))
+    status.lines().all(|line| {
+        line.trim_start()
+            .split_once(' ')
+            .is_some_and(|(_, path)| path.trim() == WORKSPACE_LOCK)
+    })
 }
 
 /// Accept only the upstream release-tag difference: the locked package list must

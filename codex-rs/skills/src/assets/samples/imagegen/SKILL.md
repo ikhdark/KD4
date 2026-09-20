@@ -34,10 +34,10 @@ Rules:
 Built-in save-path policy:
 - In built-in tool mode, Codex saves generated images under `$CODEX_HOME/*` by default.
 - Do not describe or rely on OS temp as the default built-in destination.
-- Do not describe or rely on a destination-path argument (if any) on the built-in `image_gen` tool. If a specific location is needed, generate first and then move or copy the selected output from `$CODEX_HOME/generated_images/...`.
+- Do not describe or rely on a destination-path argument (if any) on the built-in `image_gen` tool. If a specific location is needed, generate first and then copy the selected output from `$CODEX_HOME/generated_images/...`. Preserve generated originals unless the user explicitly requests moving or removing them.
 - Save-path precedence in built-in mode:
-  1. If the user names a destination, move or copy the selected output there.
-  2. If the image is meant for the current project, move or copy the final selected image into the workspace before finishing.
+  1. If the user names a destination, copy the selected output there.
+  2. If the image is meant for the current project, copy the final selected image into the workspace before finishing.
   3. If the image is only for preview or brainstorming, render it inline; the underlying file can remain at the default `$CODEX_HOME/*` path.
 - Never leave a project-referenced asset only at the default `$CODEX_HOME/*` path.
 - Do not overwrite an existing asset unless the user explicitly asked for replacement; otherwise create a sibling versioned filename such as `hero-v2.png` or `item-icon-edited.png`.
@@ -75,7 +75,7 @@ Think about two separate questions:
 Intent:
 - If the user wants to modify an existing image while preserving parts of it, treat the request as **edit**.
 - If the user provides images only as references for style, composition, mood, or subject guidance, treat the request as **generate**.
-- If the user provides no images, treat the request as **generate**.
+- If the user asks to edit an existing image but the target is missing, locate the named local file or ask them to attach it. Do not turn the edit into new generation. With no edit intent or target, treat the request as **generate**.
 
 Built-in edit semantics:
 - Built-in edit mode is for images already visible in the conversation context, such as attached images or images generated earlier in the thread.
@@ -111,10 +111,10 @@ Assume the user wants a new image unless they clearly ask to change an existing 
 12. Inspect outputs and validate: subject, style, composition, text accuracy, and invariants/avoid items.
 13. Iterate with a single targeted change, then re-check.
 14. For preview-only work, render the image inline; the underlying file may remain at the default `$CODEX_HOME/generated_images/...` path.
-15. For project-bound work, move or copy the selected artifact into the workspace and update any consuming code or references. Never leave a project-referenced asset only at the default `$CODEX_HOME/generated_images/...` path.
+15. For project-bound work, copy the selected artifact into the workspace and update any consuming code or references. Never leave a project-referenced asset only at the default `$CODEX_HOME/generated_images/...` path.
 16. For batches or multi-asset requests, persist every requested deliverable final in the workspace unless the user explicitly asked to keep outputs preview-only. Discarded variants do not need to be kept unless requested.
 17. If the user explicitly chooses or confirms the CLI fallback, then use the fallback-only docs for model, quality, size, `input_fidelity`, masks, output format, output paths, and network setup.
-18. Always report the final saved path(s) for any workspace-bound asset(s), plus the final prompt or prompt set and whether the built-in tool or fallback CLI mode was used.
+18. For workspace-bound assets, report final saved paths and the relevant integration or validation outcome. Include prompts or mode details when requested or needed to explain a fallback. For a standalone image response, let the displayed image stand without redundant prose.
 
 ## Transparent image requests
 
@@ -123,7 +123,7 @@ Transparent-image requests still use built-in `image_gen` first. Because the bui
 Default sequence:
 1. Use built-in `image_gen` to generate the requested subject on a perfectly flat solid chroma-key background.
 2. Choose a key color that is unlikely to appear in the subject: default `#00ff00`, use `#ff00ff` for green subjects, and avoid `#0000ff` for blue subjects.
-3. After generation, move or copy the selected source image from `$CODEX_HOME/generated_images/...` into the workspace or `tmp/imagegen/`.
+3. After generation, copy the selected source image from `$CODEX_HOME/generated_images/...` into the workspace or `tmp/imagegen/`.
 4. Run the installed helper path, not a project-relative script path:
    ```bash
    python "${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/scripts/remove_chroma_key.py" \
@@ -264,7 +264,7 @@ Constraints: change only the background; keep the product and its edges unchange
 - Structure prompt as scene/backdrop -> subject -> details -> constraints.
 - Include intended use (ad, UI mock, infographic) to set the mode and polish level.
 - Use camera/composition language for photorealism.
-- Only use SVG/vector stand-ins when the user explicitly asked for vector output or a non-image placeholder.
+- For raster-image requests, do not substitute SVG/vector placeholders. For repo-native vector assets, follow the exclusions above and edit the native source directly.
 - Quote exact text and specify typography + placement.
 - For tricky words, spell them letter-by-letter and require verbatim rendering.
 - For multi-image inputs, reference images by index and describe how they should be used.

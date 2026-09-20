@@ -8,6 +8,7 @@ pub use resource_client::McpResourceClient;
 pub use resource_client::McpResourceClientCacheKey;
 pub use resource_client::McpResourcePage;
 pub use resource_client::McpResourceReadResult;
+pub use rmcp_client::DEFAULT_TOOL_TIMEOUT;
 pub use rmcp_client::MCP_SANDBOX_STATE_META_CAPABILITY;
 pub use runtime::McpRuntimeContext;
 pub use runtime::SandboxState;

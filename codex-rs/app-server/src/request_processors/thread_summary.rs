@@ -306,6 +306,7 @@ pub(crate) fn summary_to_thread(
 
     let thread_id = conversation_id.to_string();
     Thread {
+        project_id: None,
         id: thread_id.clone(),
         extra: None,
         session_id: thread_id,

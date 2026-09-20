@@ -22,6 +22,7 @@ use crate::events::stop::StopRequest;
 use crate::events::user_prompt_submit::UserPromptSubmitRequest;
 use crate::output_spill::HookOutputSpiller;
 use codex_config::ConfigLayerStack;
+use codex_config::HookRunScope;
 use codex_plugin::PluginHookSource;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookEventName;
@@ -31,6 +32,10 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookTrustStatus;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CommandShell {
@@ -53,27 +58,92 @@ pub(crate) struct ConfiguredHandler {
 
 impl ConfiguredHandler {
     pub fn run_id(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.event_name_label(),
-            self.display_order,
-            self.source_path.display()
-        )
+        hook_run_id(self.event_name, self.display_order, &self.source_path)
+    }
+}
+
+/// Stable handler identity shared by run summaries and per-scope run gating.
+pub(crate) fn hook_run_id(
+    event_name: HookEventName,
+    display_order: i64,
+    source_path: &AbsolutePathBuf,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        event_name_label(event_name),
+        display_order,
+        source_path.display()
+    )
+}
+
+fn event_name_label(event_name: HookEventName) -> &'static str {
+    match event_name {
+        HookEventName::PreToolUse => "pre-tool-use",
+        HookEventName::PermissionRequest => "permission-request",
+        HookEventName::PostToolUse => "post-tool-use",
+        HookEventName::PreCompact => "pre-compact",
+        HookEventName::PostCompact => "post-compact",
+        HookEventName::SessionStart => "session-start",
+        HookEventName::UserPromptSubmit => "user-prompt-submit",
+        HookEventName::SubagentStart => "subagent-start",
+        HookEventName::SubagentStop => "subagent-stop",
+        HookEventName::Stop => "stop",
+        HookEventName::Interrupt => "interrupt",
+    }
+}
+
+/// Admits `once_per` handlers only until they have run in the current scope.
+///
+/// A handler without a configured scope is always admitted. Recording is
+/// separate from admission so previews can report exactly the handlers that
+/// the following run will spawn.
+pub(crate) struct ScopedRunGate<'a> {
+    once_per: &'a HashMap<String, HookRunScope>,
+    scoped_runs: &'a Mutex<HashSet<String>>,
+    session_id: String,
+    turn_id: String,
+}
+
+impl<'a> ScopedRunGate<'a> {
+    pub(crate) fn new(
+        once_per: &'a HashMap<String, HookRunScope>,
+        scoped_runs: &'a Mutex<HashSet<String>>,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Self {
+        Self {
+            once_per,
+            scoped_runs,
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+        }
     }
 
-    fn event_name_label(&self) -> &'static str {
-        match self.event_name {
-            codex_protocol::protocol::HookEventName::PreToolUse => "pre-tool-use",
-            codex_protocol::protocol::HookEventName::PermissionRequest => "permission-request",
-            codex_protocol::protocol::HookEventName::PostToolUse => "post-tool-use",
-            codex_protocol::protocol::HookEventName::PreCompact => "pre-compact",
-            codex_protocol::protocol::HookEventName::PostCompact => "post-compact",
-            codex_protocol::protocol::HookEventName::SessionStart => "session-start",
-            codex_protocol::protocol::HookEventName::UserPromptSubmit => "user-prompt-submit",
-            codex_protocol::protocol::HookEventName::SubagentStart => "subagent-start",
-            codex_protocol::protocol::HookEventName::SubagentStop => "subagent-stop",
-            codex_protocol::protocol::HookEventName::Stop => "stop",
-            codex_protocol::protocol::HookEventName::Interrupt => "interrupt",
+    fn scope_key(&self, handler: &ConfiguredHandler) -> Option<String> {
+        let run_id = handler.run_id();
+        let scope_id = match *self.once_per.get(&run_id)? {
+            HookRunScope::Turn => self.turn_id.as_str(),
+            HookRunScope::Session => self.session_id.as_str(),
+        };
+        Some(format!("{run_id}|{scope_id}"))
+    }
+
+    pub(crate) fn admits(&self, handler: &ConfiguredHandler) -> bool {
+        self.scope_key(handler).is_none_or(|key| {
+            !self
+                .scoped_runs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&key)
+        })
+    }
+
+    pub(crate) fn record(&self, handler: &ConfiguredHandler) {
+        if let Some(key) = self.scope_key(handler) {
+            self.scoped_runs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key);
         }
     }
 }
@@ -103,6 +173,8 @@ pub(crate) struct ClaudeHooksEngine {
     warnings: Vec<String>,
     shell: CommandShell,
     output_spiller: HookOutputSpiller,
+    once_per: HashMap<String, HookRunScope>,
+    scoped_runs: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ClaudeHooksEngine {
@@ -120,6 +192,8 @@ impl ClaudeHooksEngine {
                 warnings: Vec::new(),
                 shell,
                 output_spiller: HookOutputSpiller::new(),
+                once_per: HashMap::new(),
+                scoped_runs: Arc::new(Mutex::new(HashSet::new())),
             };
         }
 
@@ -134,7 +208,18 @@ impl ClaudeHooksEngine {
             warnings: discovered.warnings,
             shell,
             output_spiller: HookOutputSpiller::new(),
+            once_per: discovered.once_per,
+            scoped_runs: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    fn scoped_run_gate(&self, session_id: ThreadId, turn_id: &str) -> ScopedRunGate<'_> {
+        ScopedRunGate::new(
+            &self.once_per,
+            &self.scoped_runs,
+            &session_id.to_string(),
+            turn_id,
+        )
     }
 
     pub(crate) fn warnings(&self) -> &[String] {
@@ -155,7 +240,8 @@ impl ClaudeHooksEngine {
     }
 
     pub(crate) fn preview_pre_tool_use(&self, request: &PreToolUseRequest) -> Vec<HookRunSummary> {
-        crate::events::pre_tool_use::preview(&self.handlers, request)
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::pre_tool_use::preview(&self.handlers, request, &gate)
     }
 
     pub(crate) fn preview_permission_request(
@@ -205,8 +291,9 @@ impl ClaudeHooksEngine {
 
     pub(crate) async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome {
         let session_id = request.session_id;
+        let gate = self.scoped_run_gate(session_id, &request.turn_id);
         let mut outcome =
-            crate::events::pre_tool_use::run(&self.handlers, &self.shell, request).await;
+            crate::events::pre_tool_use::run(&self.handlers, &self.shell, request, &gate).await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;

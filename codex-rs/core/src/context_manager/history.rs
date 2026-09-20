@@ -17,6 +17,7 @@ use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryProjection;
 use crate::tool_history::ToolHistoryState;
 use crate::tool_history::ToolHistorySubstitution;
+use crate::tool_history::ToolOutputBudgetDrops;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::BaseInstructions;
@@ -292,6 +293,10 @@ pub(crate) struct PreparedPromptInput {
     fingerprint: Option<PreparedHistoryFingerprint>,
     policy: PreparedHistoryPolicy,
     compacted_tool_search_outputs: Arc<OnceLock<CompactedPromptProjections>>,
+    /// Aggregate-output-budget drops for the four representations above, in
+    /// `[items, fallback_items, unreplaced_items, unreplaced_fallback_items]`
+    /// order. Preparing an unchanged projection again leaves these untouched.
+    tool_output_budget_drops: [ToolOutputBudgetDrops; 4],
 }
 
 impl PreparedPromptInput {
@@ -301,6 +306,16 @@ impl PreparedPromptInput {
 
     pub(crate) fn shared_items(&self) -> Arc<[ResponseItem]> {
         self.items.shared()
+    }
+
+    /// Budget drops per representation, ordered to match `Prompt`'s inputs.
+    pub(crate) fn tool_output_budget_drops(&self) -> [ToolOutputBudgetDrops; 4] {
+        [
+            self.tool_output_budget_drops[0],
+            self.tool_output_budget_drops[1],
+            self.tool_output_budget_drops[2],
+            self.tool_output_budget_drops[3],
+        ]
     }
 
     pub(crate) fn shared_fallback_items(&self) -> Arc<[ResponseItem]> {
@@ -811,6 +826,9 @@ impl ContextManager {
             fingerprint,
             policy,
             compacted_tool_search_outputs: Arc::new(OnceLock::new()),
+            // Filled by `apply_tool_history_projection`, which is where the
+            // aggregate budget actually runs.
+            tool_output_budget_drops: Default::default(),
         };
         if prepared.fingerprint.is_some() {
             *self
@@ -1804,6 +1822,9 @@ impl ContextManager {
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
                 compacted_tool_search_outputs,
+                // Appending items does not re-run the aggregate budget, so the
+                // cached attribution carries forward unchanged.
+                tool_output_budget_drops: entry.prepared.tool_output_budget_drops,
             },
             pending_source_items: None,
             pending_append: Vec::new(),
@@ -1899,6 +1920,14 @@ fn apply_tool_history_projection(
     prepared.fallback_items = fallback_items;
     prepared.unreplaced_fallback_items = unreplaced_fallback_items;
     prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
+    // Ordered to match `Prompt`'s four inputs, so a request attributes only the
+    // representation it actually sends.
+    prepared.tool_output_budget_drops = [
+        projection.items_budget_drops,
+        fallback_projection.items_budget_drops,
+        projection.unreplaced_items_budget_drops,
+        fallback_projection.unreplaced_items_budget_drops,
+    ];
     prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
         prepared.items(),
         &prepared.stable_context_manifest,
@@ -1947,6 +1976,59 @@ pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
 ) -> FunctionCallOutputPayload {
+    // Code Mode's command receipt is control state, independent of the script
+    // payload budget. Admission may have consolidated content items into text.
+    const RECEIPT: &str = "Nested command states (independent of script completion):\n";
+    let retain_receipt = |receipt: &str, reduced: bool| -> Option<String> {
+        let mut states = serde_json::from_str::<Vec<serde_json::Value>>(receipt).ok()?;
+        if !states.iter().all(serde_json::Value::is_object) {
+            return None;
+        }
+        if reduced {
+            for state in &mut states {
+                state["history_output_reduced"] = serde_json::Value::Bool(true);
+                state["output_complete"] = serde_json::Value::Bool(false);
+            }
+        }
+        Some(format!("{RECEIPT}{}", serde_json::json!(states)))
+    };
+    match &output.body {
+        FunctionCallOutputBody::Text(text) => {
+            if let Some((payload, receipt)) = text.rsplit_once(RECEIPT) {
+                let truncated = truncate_text(payload, policy);
+                if let Some(receipt) = retain_receipt(receipt, truncated != payload) {
+                    let separator = if truncated.ends_with('\n') { "" } else { "\n" };
+                    return FunctionCallOutputPayload {
+                        body: FunctionCallOutputBody::Text(format!(
+                            "{truncated}{separator}{receipt}"
+                        )),
+                        success: output.success,
+                    };
+                }
+            }
+        }
+        FunctionCallOutputBody::ContentItems(items) => {
+            if let Some((FunctionCallOutputContentItem::InputText { text }, payload)) =
+                items.split_last()
+                && let Some((inline_payload, receipt)) = text.rsplit_once(RECEIPT)
+            {
+                let mut payload = payload.to_vec();
+                if !inline_payload.is_empty() {
+                    payload.push(FunctionCallOutputContentItem::InputText {
+                        text: inline_payload.to_string(),
+                    });
+                }
+                let mut truncated = truncate_function_output_items_with_policy(&payload, policy);
+                if let Some(receipt) = retain_receipt(receipt, truncated != payload) {
+                    truncated.push(FunctionCallOutputContentItem::InputText { text: receipt });
+                    return FunctionCallOutputPayload {
+                        body: FunctionCallOutputBody::ContentItems(truncated),
+                        success: output.success,
+                    };
+                }
+            }
+        }
+    }
     let body = match &output.body {
         FunctionCallOutputBody::Text(content) => {
             FunctionCallOutputBody::Text(truncate_text(content, policy))

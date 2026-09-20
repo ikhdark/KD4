@@ -140,7 +140,6 @@ pub(crate) struct OutgoingMessageSender {
 
 struct ActiveConnection {
     initialized: Arc<AtomicBool>,
-    experimental_api_enabled: Arc<AtomicBool>,
     delivery_failure: CancellationToken,
 }
 
@@ -494,20 +493,14 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         initialized: Arc<AtomicBool>,
     ) {
-        self.connection_opened_with_runtime(
-            connection_id,
-            initialized,
-            Arc::new(AtomicBool::new(false)),
-            CancellationToken::new(),
-        )
-        .await;
+        self.connection_opened_with_runtime(connection_id, initialized, CancellationToken::new())
+            .await;
     }
 
     pub(crate) async fn connection_opened_with_runtime(
         &self,
         connection_id: ConnectionId,
         initialized: Arc<AtomicBool>,
-        experimental_api_enabled: Arc<AtomicBool>,
         delivery_failure: CancellationToken,
     ) {
         self.component_notification_cache
@@ -518,18 +511,9 @@ impl OutgoingMessageSender {
             connection_id,
             ActiveConnection {
                 initialized,
-                experimental_api_enabled,
                 delivery_failure,
             },
         );
-    }
-
-    async fn experimental_api_enabled(&self, connection_id: ConnectionId) -> bool {
-        self.active_connections
-            .lock()
-            .await
-            .get(&connection_id)
-            .is_some_and(|connection| connection.experimental_api_enabled.load(Ordering::Acquire))
     }
 
     pub(crate) async fn fail_connection_delivery(&self, connection_id: ConnectionId) {
@@ -1175,17 +1159,7 @@ impl OutgoingMessageSender {
         commit: impl std::future::Future<Output = std::result::Result<Option<G>, JSONRPCErrorError>>,
     ) -> bool {
         let response = ClientResponsePayload::from(response);
-        let experimental_api_enabled = self
-            .experimental_api_enabled(request_id.connection_id)
-            .await;
-        let serialized = response
-            .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
-            .map(|(id, mut result, payload)| {
-                if !experimental_api_enabled && let Some(payload) = &payload {
-                    project_response_history(payload, &mut result);
-                }
-                (id, result, payload)
-            });
+        let serialized = response.into_jsonrpc_parts_and_payload(request_id.request_id.clone());
         let (id, result, analytics_response) = match serialized {
             Ok(parts) => parts,
             Err(error) => {
@@ -1270,13 +1244,9 @@ impl OutgoingMessageSender {
     ) {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
-        let experimental_api_enabled = self.experimental_api_enabled(connection_id).await;
         let serialized_response = response
             .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
-            .map(|(id, mut result, response)| {
-                if !experimental_api_enabled && let Some(response) = &response {
-                    project_response_history(response, &mut result);
-                }
+            .map(|(id, result, response)| {
                 if let Some(response) = response {
                     match thread_originator {
                         Some(thread_originator) => {
@@ -1683,64 +1653,6 @@ impl OutgoingMessageSender {
     }
 }
 
-// Response identity is still available here. Only visit protocol-owned turn
-// locations; application-owned JSON inside items must remain untouched.
-fn project_response_history(payload: &ClientResponsePayload, result: &mut serde_json::Value) {
-    let paths: &[&str] = match payload {
-        ClientResponsePayload::ThreadResume(_) => &["/thread/turns", "/initialTurnsPage/data"],
-        ClientResponsePayload::ThreadStart(_)
-        | ClientResponsePayload::ThreadFork(_)
-        | ClientResponsePayload::ThreadRead(_)
-        | ClientResponsePayload::ThreadRollback(_)
-        | ClientResponsePayload::ThreadMetadataUpdate(_)
-        | ClientResponsePayload::ThreadUnarchive(_) => &["/thread/turns"],
-        ClientResponsePayload::ThreadTurnsList(_) => &["/data"],
-        ClientResponsePayload::TurnStart(_) => {
-            if let Some(turn) = result
-                .get_mut("turn")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                turn.remove("reasoningPolicyHistory");
-            }
-            return;
-        }
-        ClientResponsePayload::ThreadList(_) | ClientResponsePayload::ThreadSearch(_) => {
-            if let Some(threads) = result
-                .get_mut("data")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for thread in threads {
-                    let thread = if matches!(payload, ClientResponsePayload::ThreadSearch(_)) {
-                        thread.get_mut("thread")
-                    } else {
-                        Some(thread)
-                    };
-                    if let Some(turns) = thread.and_then(|thread| thread.get_mut("turns")) {
-                        strip_turn_histories(turns);
-                    }
-                }
-            }
-            return;
-        }
-        _ => return,
-    };
-    for path in paths {
-        if let Some(turns) = result.pointer_mut(path) {
-            strip_turn_histories(turns);
-        }
-    }
-}
-
-fn strip_turn_histories(turns: &mut serde_json::Value) {
-    if let Some(turns) = turns.as_array_mut() {
-        for turn in turns {
-            if let Some(turn) = turn.as_object_mut() {
-                turn.remove("reasoningPolicyHistory");
-            }
-        }
-    }
-}
-
 async fn collect_turn_delivery_outcomes(
     receipts: Vec<PendingTurnDeliveryReceipt>,
     dispatch_started: Instant,
@@ -2000,7 +1912,6 @@ mod tests {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
             timing: None,
         })
@@ -2628,7 +2539,6 @@ mod tests {
             .connection_opened_with_runtime(
                 ConnectionId(1),
                 Arc::new(AtomicBool::new(true)),
-                Arc::new(AtomicBool::new(false)),
                 failure.clone(),
             )
             .await;

@@ -10,9 +10,12 @@ use codex_code_mode_protocol::CodeModeSessionProviderFuture;
 use codex_code_mode_protocol::CodeModeSessionResultFuture;
 use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
+use codex_code_mode_protocol::DEFAULT_TOOL_TIMEOUT_MS;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
+use codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS;
+use codex_code_mode_protocol::NestedCancellation;
 use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
@@ -32,10 +35,10 @@ impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
     fn invoke_tool<'a>(
         &'a self,
         _invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
-            cancellation_token.cancelled().await;
+            cancellation.cancelled().await;
             Err("code mode nested tools are unavailable".to_string())
         })
     }
@@ -254,7 +257,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
     async fn invoke_tool(
         &self,
         invocation: runtime::NestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> Result<JsonValue, String> {
         self.delegate
             .invoke_tool(
@@ -271,8 +274,9 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
                         runtime::ToolKind::Freeform => CodeModeToolKind::Freeform,
                     },
                     input: invocation.input,
+                    nested_deadline: invocation.nested_deadline,
                 },
-                cancellation_token,
+                cancellation,
             )
             .await
     }
@@ -300,7 +304,10 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
 }
 
 fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
-    const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
+    let default_tool_timeout_ms = request
+        .default_tool_timeout_ms
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
+        .min(MAX_TOOL_TIMEOUT_MS);
     runtime::CreateCellRequest {
         tool_call_id: request.tool_call_id,
         enabled_tools: request
@@ -313,6 +320,9 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
                     namespace: definition.tool_name.namespace,
                 },
                 description: definition.description,
+                default_timeout_ms: definition
+                    .default_timeout_ms
+                    .map(|timeout| timeout.clamp(1, MAX_TOOL_TIMEOUT_MS)),
                 kind: match definition.kind {
                     CodeModeToolKind::Function => runtime::ToolKind::Function,
                     CodeModeToolKind::Freeform => runtime::ToolKind::Freeform,
@@ -320,7 +330,7 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
             })
             .collect(),
         source: request.source,
-        default_tool_timeout_ms: DEFAULT_TOOL_TIMEOUT_MS,
+        default_tool_timeout_ms,
     }
 }
 

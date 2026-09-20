@@ -84,7 +84,7 @@ struct PacketRuntime {
     step: Arc<crate::session::step_context::StepContext>,
     tracker: crate::tools::context::SharedTurnDiffTracker,
     execute: super::execute_handler::CodeModeExecuteHandler,
-    signals: crate::session::reasoning_governor::SamplingRequestSignalCollector,
+    signals: crate::session::turn_execution::SamplingRequestSignalCollector,
     _worker: super::delegate::CodeModeDispatchWorker,
 }
 
@@ -117,7 +117,7 @@ impl PacketRuntime {
         let tracker = Arc::new(tokio::sync::Mutex::new(
             crate::turn_diff_tracker::TurnDiffTracker::new(),
         ));
-        let signals: crate::session::reasoning_governor::SamplingRequestSignalCollector =
+        let signals: crate::session::turn_execution::SamplingRequestSignalCollector =
             Default::default();
         let worker = session
             .services
@@ -519,8 +519,8 @@ async fn exec_mixed_output_keeps_the_actual_exception_after_a_printed_error_log(
 
 #[tokio::test]
 async fn nested_status_codes_remain_distinct_in_the_continuation_consumer() {
-    use crate::session::reasoning_governor::SamplingReasoningGovernor;
-    use crate::session::reasoning_governor::SamplingRequestSettledState;
+    use crate::session::turn_execution::SamplingRequestSettledState;
+    use crate::session::turn_execution::TurnExecutionControl;
     let mut fingerprints = Vec::new();
     for status in [403, 404, 403] {
         let runtime = PacketRuntime::new().await;
@@ -545,9 +545,9 @@ async fn nested_status_codes_remain_distinct_in_the_continuation_consumer() {
             false,
         );
         assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
-        let governor = SamplingReasoningGovernor::new(None);
-        let request = governor.continuation_generation_request(
-            &governor.baselines(0),
+        let control = TurnExecutionControl::new();
+        let request = control.continuation_generation_request(
+            &control.baselines(0),
             &runtime.signals,
             &SamplingRequestSettledState {
                 mutation_revision: 0,
@@ -582,6 +582,7 @@ use super::response_needs_retained_nested_results;
 
 fn nested_result_evidence(output: &str) -> CodeModeNestedResultEvidence {
     CodeModeNestedResultEvidence {
+        command_state: None,
         ordinal: 0,
         call_id: "exec-cell-1-call-1".to_string(),
         parent_call_id: Some("outer-exec-call".to_string()),

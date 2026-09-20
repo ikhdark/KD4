@@ -182,7 +182,6 @@ impl ChatWidget {
             newly_installed_marketplace_tab_id: None,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
-            active_reasoning_policy: None,
             reasoning_summary_parts: Vec::new(),
             status_state: StatusState::default(),
             review: ReviewState::default(),

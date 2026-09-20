@@ -127,6 +127,7 @@ pub(super) async fn read_thread_by_rollout_path(
     }
     if let Some(metadata) = read_sqlite_metadata(store, thread.thread_id).await {
         thread.recency_at = metadata.recency_at;
+        thread.project_id = metadata.project_id;
         let existing_git_info = thread.git_info.take();
         let (fallback_sha, fallback_branch, fallback_origin_url) = match existing_git_info {
             Some(info) => (
@@ -329,6 +330,7 @@ pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
     let permission_profile =
         permission_profile_from_metadata_value(&metadata.sandbox_policy, metadata.cwd.as_path());
     Ok(StoredThread {
+        project_id: metadata.project_id,
         thread_id: metadata.id,
         extra_config: None,
         rollout_path: Some(rollout_path),
@@ -402,6 +404,7 @@ async fn stored_thread_from_meta_line(
         .unwrap_or(created_at);
     let rollout_path = codex_rollout::plain_rollout_path(path.as_path());
     StoredThread {
+        project_id: None,
         thread_id: meta_line.meta.id,
         extra_config: None,
         rollout_path: Some(rollout_path),

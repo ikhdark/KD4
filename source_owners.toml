@@ -623,13 +623,13 @@ id = "planning-architecture-runtime"
 concern_ids = ["planning", "plan-store"]
 aliases = ["update plan runtime", "session plan store"]
 phrases = ["session checklist state"]
-roots = ["codex-rs/core/src/plan_store.rs", "codex-rs/core/src/tools/handlers/plan.rs", "codex-rs/core/src/tools/handlers/plan_tests.rs", "codex-rs/core/src/tools/spec_plan.rs", "codex-rs/core/src/session/reasoning_governor.rs"]
+roots = ["codex-rs/core/src/plan_store.rs", "codex-rs/core/src/tools/handlers/plan.rs", "codex-rs/core/src/tools/handlers/plan_tests.rs", "codex-rs/core/src/tools/spec_plan.rs", "codex-rs/core/src/session/turn_execution.rs"]
 primary_entries = [
     { path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "PlanHandler" },
     { path = "codex-rs/core/src/plan_store.rs", symbol = "PlanStore" },
 ]
 instructions = ["AGENTS.md"]
-consumers = ["codex-rs/core/src/session/reasoning_governor.rs"]
+consumers = ["codex-rs/core/src/session/turn_execution.rs"]
 contracts = ["codex-rs/core/src/plan_store.rs", "codex-rs/core/src/tools/handlers/plan.rs"]
 generated_mirrors = []
 tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
@@ -641,9 +641,9 @@ generated_artifacts = "The update_plan schema is constructed at runtime and has 
 [[owners.relationships]]
 category = "callers_consumers"
 kind = "consumed_by"
-target = "path:codex-rs/core/src/session/reasoning_governor.rs"
+target = "path:codex-rs/core/src/session/turn_execution.rs"
 confidence = "compiler_resolved"
-evidence = [{ path = "codex-rs/core/src/session/reasoning_governor.rs", symbol = "SamplingReasoningGovernor" }]
+evidence = [{ path = "codex-rs/core/src/session/turn_execution.rs", symbol = "TurnExecutionControl" }]
 
 [[owners.relationships]]
 category = "runtime_registration"
@@ -933,15 +933,15 @@ role = "focused_tests"
 [[owners]]
 id = "tool-output-recovery"
 concern_ids = ["tool-output-artifact", "bounded-recovery", "exact-context"]
-aliases = ["read tool output", "output artifact recovery"]
-phrases = ["recover exact omitted tool output"]
-roots = ["codex-rs/core/src/tools/command_output_artifact.rs", "codex-rs/core/src/tools/handlers/read_tool_output.rs", "codex-rs/core/src/tool_history.rs", "codex-rs/core/src/tool_history_tests.rs"]
-primary_entries = [{ path = "codex-rs/core/src/tools/handlers/read_tool_output.rs", symbol = "ReadToolOutputHandler" }]
+aliases = ["read tool output", "output artifact recovery", "retained inventory"]
+phrases = ["recover exact omitted tool output", "retain scoped inventory records and exact identifiers"]
+roots = ["codex-rs/core/src/tools/command_output_artifact.rs", "codex-rs/core/src/tools/handlers/read_tool_output.rs", "codex-rs/core/src/tools/handlers/retained_inventory.rs", "codex-rs/core/src/tools/handlers/retained_inventory_tests.rs", "codex-rs/core/src/tool_history.rs", "codex-rs/core/src/tool_history_tests.rs", "docs/retained-inventory.md"]
+primary_entries = [{ path = "codex-rs/core/src/tools/handlers/read_tool_output.rs", symbol = "ReadToolOutputHandler" }, { path = "codex-rs/core/src/tools/handlers/retained_inventory.rs", symbol = "RetainedInventoryHandler" }]
 instructions = ["AGENTS.md"]
 consumers = []
 contracts = ["codex-rs/core/src/tools/handlers/read_tool_output_spec.rs"]
 generated_mirrors = []
-tests = ["codex-rs/core/src/tools/command_output_artifact_tests.rs", "codex-rs/core/src/tool_history_tests.rs"]
+tests = ["codex-rs/core/src/tools/command_output_artifact_tests.rs", "codex-rs/core/src/tool_history_tests.rs", "codex-rs/core/src/tools/handlers/retained_inventory_tests.rs"]
 
 [owners.facet_exclusions]
 configuration_and_gates = "Recovery limits are tool-schema and call arguments, not repository configuration or a feature gate."

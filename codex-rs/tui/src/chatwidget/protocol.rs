@@ -69,21 +69,6 @@ impl ChatWidget {
                     self.on_task_started();
                 }
             }
-            ServerNotification::TurnReasoningPolicyUpdated(notification) => {
-                if self.turn_lifecycle.last_turn_id.as_deref()
-                    == Some(notification.turn_id.as_str())
-                {
-                    self.active_reasoning_policy = Some(notification.snapshot);
-                    if self.bottom_pane.is_task_running()
-                        && self.unified_exec_wait_streak.is_none()
-                        && !self.safety_buffering_is_waiting()
-                        && !self.status_header_is_mcp_startup_owned()
-                    {
-                        self.restore_reasoning_status_header();
-                    }
-                }
-            }
-            ServerNotification::TurnReasoningPolicySummary(_) => {}
             ServerNotification::TurnCompleted(notification) => {
                 self.handle_turn_completed_notification(notification, replay_kind);
             }
@@ -225,7 +210,9 @@ impl ChatWidget {
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
-            | ServerNotification::AccountLoginCompleted(_) => {}
+            | ServerNotification::AccountLoginCompleted(_)
+            | ServerNotification::ProjectChanged(_)
+            | ServerNotification::ThreadProjectUpdated(_) => {}
         }
     }
 

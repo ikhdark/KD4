@@ -29,11 +29,13 @@ pub(super) fn runtime_request(request: CellRequest) -> ExecuteRequest {
                 },
                 input_schema: None,
                 output_schema: None,
+                default_timeout_ms: definition.default_timeout_ms,
             })
             .collect(),
         source: request.source,
         yield_time_ms: None,
         max_output_tokens: None,
+        default_tool_timeout_ms: Some(request.default_tool_timeout_ms),
     }
 }
 

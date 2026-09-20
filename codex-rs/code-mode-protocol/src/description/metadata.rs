@@ -20,6 +20,9 @@ pub struct ToolDefinition {
     pub kind: CodeModeToolKind,
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
+    /// Default for this tool only; an explicit per-call timeout takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_timeout_ms: Option<u64>,
 }
 
 pub fn is_code_mode_nested_tool(tool_name: &str) -> bool {
@@ -63,6 +66,7 @@ pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
         global_name: normalize_code_mode_identifier(&definition.name),
         description: definition.description.clone(),
         kind: definition.kind,
+        default_timeout_ms: definition.default_timeout_ms,
     }
 }
 
@@ -70,6 +74,8 @@ pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
 pub struct EnabledToolMetadata {
     pub tool_name: ToolName,
     pub global_name: String,
+    #[serde(skip)]
+    pub default_timeout_ms: Option<u64>,
     pub description: String,
     pub kind: CodeModeToolKind,
 }
@@ -226,6 +232,7 @@ mod tests {
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
                 output_schema: Some(schema.clone()),
+                default_timeout_ms: None,
             };
             // Exercise serialization and the metadata boundary used by discovery.
             let decoded =
@@ -237,6 +244,7 @@ mod tests {
                 EnabledToolMetadata {
                     tool_name: ToolName::plain("answer"),
                     global_name: "answer".to_string(),
+                    default_timeout_ms: None,
                     kind: CodeModeToolKind::Function,
                     description: format!(
                         "Answer.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ answer(args: unknown, options?: {{ timeout_ms?: number }}): Promise<{expected_output}>; }};\n```"

@@ -18,6 +18,18 @@ fn available_skills(skill_root_lines: Vec<String>) -> AvailableSkills {
     }
 }
 
+/// The catalog advertises `skill:` locators, so the guidance has to name the
+/// tool that resolves them. Saying "their stated provider" without naming one
+/// left the model with locators and no way to load them.
+#[test]
+fn skill_usage_guidance_names_the_tool_that_loads_skill_locators() {
+    let guidance = codex_core_skills::SKILLS_HOW_TO_USE;
+    assert!(
+        guidance.contains("`skill:` locators with `read_file`"),
+        "skill locators must name read_file as their provider: {guidance}"
+    );
+}
+
 #[test]
 fn rendered_skill_catalog_does_not_repeat_shared_usage_guidance() {
     for skill_root_lines in [Vec::new(), vec!["- r0: C:\\workspace\\skills".to_string()]] {

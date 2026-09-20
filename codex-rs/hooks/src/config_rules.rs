@@ -63,6 +63,9 @@ pub fn hook_states_from_stack(
             if let Some(trusted_hash) = state.trusted_hash {
                 effective_state.trusted_hash = Some(trusted_hash);
             }
+            if let Some(once_per) = state.once_per {
+                effective_state.once_per = Some(once_per);
+            }
         }
     }
 
@@ -108,6 +111,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(true),
                     trusted_hash: None,
+                    once_per: None,
                 },
             )])
         );
@@ -128,6 +132,7 @@ mod tests {
                         HookStateToml {
                             enabled: Some(/*enabled*/ false),
                             trusted_hash: None,
+                            once_per: None,
                         },
                     ),
                 ),
@@ -138,6 +143,7 @@ mod tests {
                         HookStateToml {
                             enabled: None,
                             trusted_hash: Some("sha256:trusted".to_string()),
+                            once_per: Some(codex_config::HookRunScope::Turn),
                         },
                     ),
                 ),
@@ -154,6 +160,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(false),
                     trusted_hash: Some("sha256:trusted".to_string()),
+                    once_per: Some(codex_config::HookRunScope::Turn),
                 },
             )])
         );
@@ -193,6 +200,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(false),
                     trusted_hash: None,
+                    once_per: None,
                 },
             )])
         );
@@ -234,6 +242,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(false),
                     trusted_hash: None,
+                    once_per: None,
                 },
             )])
         );
@@ -245,6 +254,7 @@ mod tests {
             HookStateToml {
                 enabled,
                 trusted_hash: None,
+                once_per: None,
             },
         )
     }

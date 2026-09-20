@@ -231,6 +231,8 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
                 cell_id: "plan-cell".to_string(),
                 parent_call_id: Some("plan-exec".to_string()),
                 runtime_tool_call_id: "1".to_string(),
+                nested_deadline: None,
+                cancellation_cause: None,
             },
             payload: payload.clone(),
         })
@@ -473,6 +475,7 @@ async fn durability_regression_resume_invalidates_unified_exec_session() {
         truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(1_000),
         max_output_tokens: Some(1_000),
         process_id: Some(1000),
+        session_capabilities: None,
         exit_code: None,
         process_exited: false,
         search_no_match: false,
@@ -481,6 +484,7 @@ async fn durability_regression_resume_invalidates_unified_exec_session() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     }
     .response_text();
     let rollout_items = vec![

@@ -5,7 +5,8 @@ current state. Use it only when it could materially improve this task.
 
 ### Sources
 
-- {{ base_path }}/memory_summary.md (already provided below; do NOT open again)
+- {{ base_path }}/memory_summary.md (provided below, possibly truncated; reuse
+  visible content and search/read a narrow omitted range only when needed)
 - `{{ base_path }}/MEMORY.md`: searchable durable guidance and evidence pointers.
 - `{{ base_path }}/rollout_summaries/`: detailed prior-run summaries; open one
   only when `MEMORY.md` points to it and exact provenance or wording matters.
@@ -19,7 +20,7 @@ Do not search raw session transcripts as a fallback.
 
 When memory is relevant:
 
-1. Extract distinctive task terms from `MEMORY_SUMMARY`.
+1. Extract distinctive terms from the current request and visible `MEMORY_SUMMARY`.
 2. Search `MEMORY.md` with a few focused project, path, API, command, error, or
    user-wording queries.
 3. Read only the matching block or line range.

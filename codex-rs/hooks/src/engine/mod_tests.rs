@@ -38,6 +38,110 @@ fn cwd() -> AbsolutePathBuf {
     AbsolutePathBuf::current_dir().expect("current dir")
 }
 
+fn scoped_engine(scope: codex_config::HookRunScope) -> ClaudeHooksEngine {
+    let handler = ConfiguredHandler {
+        event_name: HookEventName::PreToolUse,
+        matcher: Some(crate::events::common::HookMatcher::new("^Bash$").expect("valid matcher")),
+        command: "exit 0".to_string(),
+        timeout_sec: 10,
+        status_message: None,
+        source_path: cwd(),
+        source: HookSource::User,
+        display_order: 0,
+        env: HashMap::new(),
+    };
+    ClaudeHooksEngine {
+        once_per: HashMap::from([(handler.run_id(), scope)]),
+        scoped_runs: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        handlers: vec![handler],
+        warnings: Vec::new(),
+        shell: CommandShell {
+            program: String::new(),
+            args: Vec::new(),
+        },
+        output_spiller: crate::output_spill::HookOutputSpiller::new(),
+    }
+}
+
+fn scoped_request(session_id: ThreadId, turn_id: &str, tool_use_id: &str) -> PreToolUseRequest {
+    PreToolUseRequest {
+        session_id,
+        turn_id: turn_id.to_string(),
+        subagent: None,
+        cwd: cwd(),
+        transcript_path: None,
+        model: "gpt-test".to_string(),
+        permission_mode: "default".to_string(),
+        tool_name: "Bash".to_string(),
+        matcher_aliases: Vec::new(),
+        tool_use_id: tool_use_id.to_string(),
+        tool_input: serde_json::json!({ "command": "echo hello" }),
+        turn_tool_calls: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn once_per_turn_handler_runs_once_per_turn_and_previews_agree() {
+    let engine = scoped_engine(codex_config::HookRunScope::Turn);
+    let session_id = ThreadId::new();
+
+    assert_eq!(
+        engine
+            .preview_pre_tool_use(&scoped_request(session_id, "turn-1", "tool-1"))
+            .len(),
+        1
+    );
+    let first = engine
+        .run_pre_tool_use(scoped_request(session_id, "turn-1", "tool-1"))
+        .await;
+    assert_eq!(first.hook_events.len(), 1);
+    assert_eq!(first.hook_events[0].run.status, HookRunStatus::Completed);
+
+    // A second matched dispatch in the same turn is skipped without spawning.
+    assert!(
+        engine
+            .preview_pre_tool_use(&scoped_request(session_id, "turn-1", "tool-2"))
+            .is_empty()
+    );
+    let second = engine
+        .run_pre_tool_use(scoped_request(session_id, "turn-1", "tool-2"))
+        .await;
+    assert!(second.hook_events.is_empty());
+    assert!(!second.should_block);
+
+    // A new turn admits the handler again.
+    assert_eq!(
+        engine
+            .preview_pre_tool_use(&scoped_request(session_id, "turn-2", "tool-3"))
+            .len(),
+        1
+    );
+    let third = engine
+        .run_pre_tool_use(scoped_request(session_id, "turn-2", "tool-3"))
+        .await;
+    assert_eq!(third.hook_events.len(), 1);
+}
+
+#[tokio::test]
+async fn once_per_session_handler_skips_later_turns_in_the_same_session() {
+    let engine = scoped_engine(codex_config::HookRunScope::Session);
+    let session_id = ThreadId::new();
+
+    let first = engine
+        .run_pre_tool_use(scoped_request(session_id, "turn-1", "tool-1"))
+        .await;
+    assert_eq!(first.hook_events.len(), 1);
+    let second = engine
+        .run_pre_tool_use(scoped_request(session_id, "turn-2", "tool-2"))
+        .await;
+    assert!(second.hook_events.is_empty());
+
+    let other_session = engine
+        .run_pre_tool_use(scoped_request(ThreadId::new(), "turn-1", "tool-3"))
+        .await;
+    assert_eq!(other_session.hook_events.len(), 1);
+}
+
 fn managed_hooks_for_current_platform(
     managed_dir: impl AsRef<Path>,
     hooks: HookEventsToml,
@@ -261,6 +365,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        turn_tool_calls: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(preview[0].source_path, managed_dir);
@@ -278,6 +383,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
             matcher_aliases: Vec::new(),
             tool_use_id: "tool-1".to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            turn_tool_calls: Vec::new(),
         })
         .await;
 
@@ -350,6 +456,7 @@ async fn requirements_managed_hooks_execute_windows_command_override() {
             matcher_aliases: Vec::new(),
             tool_use_id: "tool-1".to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            turn_tool_calls: Vec::new(),
         })
         .await;
 
@@ -685,6 +792,7 @@ async fn cancelling_registered_hook_terminates_descendants() {
         matcher_aliases: Vec::new(),
         tool_use_id: "cancelled-tool".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        turn_tool_calls: Vec::new(),
     }));
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -875,6 +983,7 @@ async fn hook_state_follows_handlers_after_insertion_and_reordering() {
                     matcher_aliases: Vec::new(),
                     tool_use_id: "state-tool".to_string(),
                     tool_input: serde_json::json!({}),
+                    turn_tool_calls: Vec::new(),
                 })
                 .await;
             assert_eq!(
@@ -1017,6 +1126,7 @@ fn requirements_managed_hooks_load_when_managed_dir_is_missing() {
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        turn_tool_calls: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(engine.handlers[0].command, "echo hi");
@@ -1423,6 +1533,7 @@ fn discovers_hooks_from_json_and_toml_in_the_same_layer() {
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        turn_tool_calls: Vec::new(),
     });
     assert_eq!(preview.len(), 2);
     assert_eq!(
@@ -1513,6 +1624,7 @@ fn profile_user_layers_load_shared_hooks_json_once() {
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        turn_tool_calls: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(preview[0].source_path, hooks_json_path);
@@ -1656,6 +1768,7 @@ print(json.dumps({
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        turn_tool_calls: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(preview[0].source, HookSource::Plugin);
@@ -1689,6 +1802,7 @@ print(json.dumps({
             matcher_aliases: Vec::new(),
             tool_use_id: "tool-1".to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            turn_tool_calls: Vec::new(),
         })
         .await;
 
@@ -1862,6 +1976,7 @@ else:
             matcher_aliases: vec!["BashOutput".into()],
             tool_use_id: "tool-1".into(),
             tool_input: serde_json::json!({"command": "echo hello"}),
+            turn_tool_calls: Vec::new(),
         })
         .await;
     assert!(pre.should_block);

@@ -243,6 +243,7 @@ async fn list_threads_db_preserves_order_while_filtering_rollout_paths() -> anyh
         /*cwd_filters*/ None,
         /*relation_filter*/ None,
         /*archived*/ false,
+        /*project_id*/ None,
         /*search_term*/ None,
     )
     .await

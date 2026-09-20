@@ -18,6 +18,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use codex_code_mode_protocol::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::HostPeer;
@@ -136,6 +137,7 @@ fn outgoing_overflow_records_failure() {
     let peer = HostPeer::new(outgoing_tx);
     let message = || HostToClient::CancelDelegateRequest {
         id: codex_code_mode_protocol::host::DelegateRequestId::new(1),
+        cause: None,
     };
     assert!(peer.send(message()).is_ok());
     assert!(peer.send(message()).is_err());
@@ -211,7 +213,7 @@ async fn activation_preserves_buffered_delegate_order() {
                     cell_id: cell.clone().into(),
                     text: index.to_string(),
                 },
-                CancellationToken::new(),
+                NestedCancellation::new(CancellationToken::new()),
             ));
             assert!(
                 call.as_mut()
@@ -350,7 +352,7 @@ async fn pending_delegate_limit_rejects_call_without_disconnecting() {
                 cell_id: CellId::new("cell-1".to_string()).into(),
                 text: "hello".to_string(),
             },
-            CancellationToken::new(),
+            NestedCancellation::new(CancellationToken::new()),
         )
         .await;
 
@@ -373,7 +375,7 @@ fn dropped_delegate_call_releases_capacity_without_a_runtime() {
             cell_id: CellId::new("cell-1".to_string()).into(),
             text: "hello".to_string(),
         },
-        CancellationToken::new(),
+        NestedCancellation::new(CancellationToken::new()),
     ));
     assert!(matches!(
         call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -413,7 +415,7 @@ async fn exhausted_delegate_ids_reject_calls_without_side_effects() {
                     cell_id: CellId::new("cell-1".to_string()).into(),
                     text: "must not dispatch".to_string(),
                 },
-                CancellationToken::new(),
+                NestedCancellation::new(CancellationToken::new()),
             )
             .await;
 
@@ -570,7 +572,7 @@ async fn dropped_dispatched_delegate_call_sends_cancellation_immediately() {
             cell_id: cell_id.into(),
             text: "hello".to_string(),
         },
-        CancellationToken::new(),
+        NestedCancellation::new(CancellationToken::new()),
     ));
     assert!(matches!(
         call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -611,7 +613,7 @@ async fn dropped_dispatched_delegate_call_sends_cancellation_immediately() {
             .read::<HostToClient>()
             .await
             .expect("cancellation decoding"),
-        Some(HostToClient::CancelDelegateRequest { id })
+        Some(HostToClient::CancelDelegateRequest { id, cause: None })
     );
     assert!(matches!(
         outgoing_rx.try_recv(),

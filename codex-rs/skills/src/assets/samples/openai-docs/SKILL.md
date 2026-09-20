@@ -10,7 +10,7 @@ Provide authoritative, current guidance from OpenAI developer docs using the dev
 
 ## API Key Setup
 
-For requests to build, run, configure, debug, or implement an API-backed app, script, CLI, generator, or tool, use `openai-platform-api-key` first when available. After that credential gate is resolved, return here for current docs as needed.
+Use `openai-platform-api-key` when available before a step that actually needs API credentials, such as an authenticated API call or live API test. Offline implementation, configuration examples, code review, and conceptual work do not require credentials; continue those steps while credential-dependent work is unavailable.
 
 Use this skill directly for docs-only questions, citations, model/API guidance, conceptual explanations, and examples that do not require building or running an API-backed artifact.
 
@@ -113,11 +113,9 @@ Use this quick product map when needed: CLI is terminal-first local repo work; I
 
 If MCP tools fail or no OpenAI docs resources are available:
 
-1. Run the install command yourself: `codex mcp add openaiDeveloperDocs --url https://developers.openai.com/mcp`
-2. If it fails due to permissions/sandboxing, immediately retry the same command with escalated permissions and include a 1-sentence justification for approval.
-3. Ask the user to run the install command only if the escalated attempt fails.
-4. Ask the user to restart Codex.
-5. Re-run the doc search/fetch after restart.
+Use the official-domain web fallback described above. If that is also unavailable or unhelpful, state the bounded uncertainty and answer from the verified sources already available.
+
+A documentation lookup does not authorize installing an MCP server, changing configuration, escalating permissions, or restarting Codex. Only perform integration setup when the user requests it, and follow the active permission policy. Do not make setup or a restart a prerequisite for answering a documentation question.
 
 ## Workflow
 

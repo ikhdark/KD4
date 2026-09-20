@@ -31,3 +31,10 @@ where
 {
     serde_with::rust::double_option::serialize(value, serializer)
 }
+
+// Preserve a required nullable output field while accepting older peers that omit it.
+pub fn nullable_string_schema(
+    generator: &mut schemars::r#gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    generator.subschema_for::<Option<String>>()
+}

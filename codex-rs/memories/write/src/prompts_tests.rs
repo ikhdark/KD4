@@ -75,6 +75,8 @@ fn build_consolidation_prompt_points_to_workspace_diff_and_extension_tree() {
     let prompt = build_consolidation_prompt(&memory_root);
 
     assert!(prompt.contains("Memory workspace diff:"));
+    assert!(prompt.contains("remain editable outputs within the scope above"));
+    assert!(!prompt.contains("existing outputs, and extension resources as"));
     assert!(prompt.contains("phase2_workspace_diff.md"));
     assert!(prompt.contains(&format!(
         "Memory extensions (under {}/):",

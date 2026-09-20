@@ -21,6 +21,8 @@ pub(crate) use self::types::CellId;
 pub(crate) use self::types::CreateCellRequest;
 pub(crate) use self::types::Error;
 pub(crate) use self::types::ImageDetail;
+use codex_code_mode_protocol::NestedCancellation;
+
 pub(crate) use self::types::NestedToolCall;
 pub(crate) use self::types::ObserveMode;
 pub(crate) use self::types::OutputItem;
@@ -295,7 +297,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
     async fn invoke_tool(
         &self,
         invocation: CellToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> Result<JsonValue, String> {
         self.inner
             .delegate
@@ -307,8 +309,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     tool_name: invocation.name,
                     tool_kind: invocation.kind,
                     input: invocation.input,
+                    nested_deadline: invocation.deadline,
                 },
-                cancellation_token,
+                cancellation,
             )
             .await
     }

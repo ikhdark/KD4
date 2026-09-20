@@ -301,6 +301,19 @@ def _source_discovery_event(
     # Do not deduplicate on redacted display tokens: private queries collide.
     # Scope/options stay significant because a glob changes the search.
     signature = hashlib.sha256(source.strip().encode("utf-8")).hexdigest()
+    evidence_output = re.sub(
+        r"\AScript [^\n]*\nWall time [^\n]*\nOutput:\s*\n?", "",
+        output.replace("\r\n", "\n"),
+    )
+    # Execution receipts change on every invocation even when evidence does not.
+    evidence_output = evidence_output.split(
+        "\nNested command states (independent of script completion):\n", 1
+    )[0]
+    evidence_output = re.sub(
+        r"\AChunk ID: [^\n]*\nWall time: [^\n]*\n"
+        r"(?:Process exited with code [^\n]*|Process running with session ID [^\n]*)\n"
+        r"(?:Final output:\n|Output:\n)", "", evidence_output,
+    ).strip()
     return {
         "ordinal": ordinal,
         "turnId": pending.get("turnId"),
@@ -315,6 +328,11 @@ def _source_discovery_event(
         "scope": "repository" if is_broad else "path_scoped",
         "evidence": _ordered_unique(evidence),
         "signature": signature,
+        "evidenceIdentity": hashlib.sha256(evidence_output.encode("utf-8")).hexdigest(),
+        "outputReduced": bool(re.search(
+            r"Warning: (?:truncated output|output summarized)|\[omitted |\[command output reduced;",
+            evidence_output,
+        )),
     }
 
 
@@ -323,10 +341,26 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
     signatures: collections.Counter[tuple[Any, str]] = collections.Counter()
     signals: list[dict[str, Any]] = []
     by_turn: dict[Any, list[dict[str, Any]]] = collections.defaultdict(list)
+    seen_evidence: set[tuple[Any, str, str]] = set()
+    last_search: dict[tuple[Any, str], dict[str, Any]] = {}
     for event in events:
+        identity = event.get("evidenceIdentity")
+        evidence_key = (event.get("turnId"), event["signature"], identity)
+        event["newEvidence"] = evidence_key not in seen_evidence if identity else None
+        if identity:
+            seen_evidence.add(evidence_key)
         by_turn[event.get("turnId")].append(event)
         if "search" in event["operations"]:
-            signatures[(event.get("turnId"), event["signature"])] += 1
+            search_key = (event.get("turnId"), event["signature"])
+            signatures[search_key] += 1
+            if last_search.get(search_key, {}).get("outputReduced"):
+                signals.append({
+                    "code": "repeated_search_after_reduced_output",
+                    "turnId": event.get("turnId"), "ordinal": event["ordinal"],
+                    "previousOrdinal": last_search[search_key]["ordinal"],
+                    "causallyEstablished": False,
+                })
+            last_search[search_key] = event
             if event["scope"] == "repository":
                 signals.append(
                     {
@@ -418,6 +452,9 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
         "events": bounded_events,
         "omittedEvents": max(0, len(events) - len(bounded_events)),
         "eventCount": len(events),
+        "evidenceProgressCount": sum(event["newEvidence"] is True for event in events),
+        "unchangedEvidenceCount": sum(event["newEvidence"] is False for event in events),
+        "evidenceProgressScope": "new output for a recognized discovery action within a turn; independent of workspace mutation and not proof that a question was resolved",
         "searchCount": sum("search" in event["operations"] for event in events),
         "readCount": sum("read" in event["operations"] for event in events),
         "broadSearchCount": sum(
@@ -2194,6 +2231,12 @@ def render_report(report: dict[str, Any]) -> str:
 
 
 def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
+    token_definitions = {"accountingScope", "promptCategoryScope", "accountingNote",
+                         "billableDefinition", "blendedDefinition", "rankedPromptConsumers"}
+    def compact_token_field(key: str, value: Any) -> bool:
+        return key not in token_definitions and not (
+            key in {"deduplicatedRequestRecords", "conflictingUsageRequestIds"} and not value
+        )
     coverage = report["coverage"]
     coverage_keys = (
         "files",
@@ -2247,6 +2290,12 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "signals",
             )
         }
+        # Definitions repeat across populations and intervals. Keep them once
+        # in the full report; the compact view retains counts and discrepancies.
+        bounded_turn["tokens"] = {
+            key: value for key, value in bounded_turn["tokens"].items()
+            if compact_token_field(key, value)
+        }
         # Keep category totals once per turn; per-interval category detail and
         # explanatory definitions remain available in the full JSON report.
         bounded_turn["tokenIntervals"] = [
@@ -2255,7 +2304,10 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "tokens": {
                     key: value
                     for key, value in interval["tokens"].items()
-                    if key not in ("promptCategories", "promptCategoryAttempts")
+                    if compact_token_field(key, value) and key not in {
+                        "promptCategories", "promptCategoryAttempts", "promptCategoryEvidence",
+                        "promptCategoryBasis", "promptCategoryCoverage",
+                    }
                 },
             }
             for interval in turn["tokenIntervals"][:_MAX_SUMMARY_TOKEN_INTERVALS]
@@ -2282,6 +2334,11 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             bounded_populations[name] = {"turns": population["turns"], "sameAs": "all"}
             continue
         bounded_population = dict(population)
+        if isinstance(bounded_population.get("tokens"), dict):
+            bounded_population["tokens"] = {
+                key: value for key, value in bounded_population["tokens"].items()
+                if compact_token_field(key, value)
+            }
         for key in (
             "localActivityUnionsNs",
             "preFirstModelOutput",
@@ -2408,7 +2465,10 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             **{
                 key: value
                 for key, value in report["sourceDiscovery"].items()
-                if key not in ("events", "candidateSignals")
+                if key not in ("events", "candidateSignals", "evidenceProgressScope")
+                and not (not report["sourceDiscovery"]["eventCount"] and key in (
+                    "evidenceProgressCount", "unchangedEvidenceCount",
+                ))
             },
             "events": [
                 {

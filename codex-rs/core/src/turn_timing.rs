@@ -558,6 +558,26 @@ impl TurnTimingSnapshot {
             executed_validation_duration_ns: profile.counters.executed_validation_duration_ns,
             suppressed_validation_output_count: profile.counters.suppressed_validation_output_count,
             ready_startup_prewarm_count: profile.counters.ready_startup_prewarm_count,
+            // Summed over dispatched requests, each already attributed to the
+            // one representation it sent. A projection prepared and discarded
+            // never reaches this list, so it contributes nothing.
+            tool_output_budget_drop_count: profile.model_requests.iter().fold(0, |total, request| {
+                total.saturating_add(
+                    request
+                        .request_token_categories
+                        .as_ref()
+                        .map_or(0, |categories| categories.tool_output_budget_drop_count),
+                )
+            }),
+            tool_output_budget_dropped_token_count: profile.model_requests.iter().fold(
+                0,
+                |total, request| {
+                    total.saturating_add(request.request_token_categories.as_ref().map_or(
+                        0,
+                        |categories| categories.tool_output_budget_dropped_token_count,
+                    ))
+                },
+            ),
             purpose_aggregates,
             same_purpose_continuation_count: profile.counters.same_purpose_continuation_count,
             exact_repeated_wait_count,

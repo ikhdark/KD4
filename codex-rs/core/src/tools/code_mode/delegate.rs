@@ -6,6 +6,7 @@ use std::time::Instant;
 use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeSessionDelegate;
+use codex_code_mode::NestedCancellation;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ToolInvocationFuture;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -19,8 +20,8 @@ use tracing::info;
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
 use super::call_nested_tool;
-use crate::session::reasoning_governor::PendingOwnerDrainedContinuation;
 use crate::session::step_context::StepContext;
+use crate::session::turn_execution::PendingOwnerDrainedContinuation;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 
@@ -143,7 +144,7 @@ impl CodeModeDispatchBroker {
         exec: ExecContext,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
-        request_signals: crate::session::reasoning_governor::SamplingRequestSignalCollector,
+        request_signals: crate::session::turn_execution::SamplingRequestSignalCollector,
     ) -> CodeModeDispatchWorker {
         let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker)
             .with_sampling_request_signals(request_signals);
@@ -194,13 +195,14 @@ impl CodeModeDispatchBroker {
                     }
                     DispatchMessage::InvokeTool {
                         invocation,
-                        cancellation_token,
+                        cancellation,
                         enqueued_at,
                         response_tx,
                     } => {
                         let host = Arc::clone(&host);
                         let cells = Arc::clone(&cells);
                         tokio::spawn(async move {
+                            let cancellation_token = cancellation.token().clone();
                             let dequeued_at = Instant::now();
                             let cell_id = invocation.cell_id.clone();
                             let runtime_tool_call_id = invocation.runtime_tool_call_id.clone();
@@ -240,8 +242,7 @@ impl CodeModeDispatchBroker {
                                 ),
                                 "code mode nested tool child started"
                             );
-                            let invocation =
-                                host.invoke_tool(invocation, cancellation_token.clone());
+                            let invocation = host.invoke_tool(invocation, cancellation.clone());
                             tokio::pin!(invocation);
                             let response = tokio::select! {
                                 biased;
@@ -385,17 +386,18 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
-            if cancellation_token.is_cancelled() {
+            if cancellation.is_cancelled() {
                 return Err("code mode nested tool call cancelled".to_string());
             }
+            let cancellation_token = cancellation.token().clone();
             let (response_tx, response_rx) = oneshot::channel();
             self.dispatch_tx
                 .send(DispatchMessage::InvokeTool {
                     invocation,
-                    cancellation_token: cancellation_token.clone(),
+                    cancellation: cancellation.clone(),
                     enqueued_at: Instant::now(),
                     response_tx,
                 })
@@ -451,7 +453,7 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
 enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
         enqueued_at: Instant,
         response_tx: oneshot::Sender<Result<JsonValue, String>>,
     },
@@ -485,13 +487,13 @@ impl CoreTurnHost {
     async fn invoke_tool(
         &self,
         invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> Result<JsonValue, String> {
         call_nested_tool(
             self.exec.clone(),
             self.tool_runtime.clone(),
             invocation,
-            cancellation_token,
+            cancellation,
         )
         .await
         .map_err(|error| error.to_string())

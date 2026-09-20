@@ -238,7 +238,6 @@ mod input_queue;
 mod mcp;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
-pub(crate) mod reasoning_governor;
 mod review;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
@@ -247,6 +246,7 @@ pub(crate) mod step_context;
 pub(crate) mod time_reminder;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
+pub(crate) mod turn_execution;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 use self::config_lock::export_config_lock_if_configured;
@@ -2938,16 +2938,6 @@ impl Session {
             .and_then(|turn| turn.task.as_ref())
             .filter(|task| task.turn_context.sub_id == sub_id)
             .map(|task| Arc::clone(&task.turn_context))
-    }
-
-    pub(crate) async fn active_reasoning_policy_recorder(
-        &self,
-    ) -> Option<Arc<reasoning_governor::ReasoningPolicyRecorder>> {
-        self.active_turn
-            .lock()
-            .await
-            .as_ref()
-            .map(|turn| Arc::clone(&turn.reasoning_policy_recorder))
     }
 
     pub(crate) async fn record_execpolicy_amendment_message(
@@ -6122,6 +6112,11 @@ impl Session {
 
     pub(crate) fn hooks(&self) -> Arc<Hooks> {
         self.services.hooks.load_full()
+    }
+
+    /// Session-scoped attachments shared by tools and extensions.
+    pub(crate) fn session_extension_data(&self) -> &codex_extension_api::ExtensionData {
+        &self.services.session_extension_data
     }
 
     pub(crate) fn user_shell(&self) -> Arc<shell::Shell> {

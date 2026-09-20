@@ -264,6 +264,16 @@ async fn write_stdin(
     input: &str,
     yield_time_ms: u64,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+    write_stdin_within(session, process_id, input, yield_time_ms, None).await
+}
+
+async fn write_stdin_within(
+    session: &Arc<Session>,
+    process_id: u32,
+    input: &str,
+    yield_time_ms: u64,
+    nested_deadline: Option<std::time::Instant>,
+) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     session
         .services
         .unified_exec_manager
@@ -273,8 +283,361 @@ async fn write_stdin(
             yield_time_ms,
             max_output_tokens: None,
             truncation_policy: TruncationPolicy::Tokens(10_000),
+            nested_deadline,
         })
         .await
+}
+
+/// Where a poll bounded by `budget` must land.
+///
+/// The caller states the budget on the standard clock and the handler enforces
+/// it on tokio's, so the two differ by however long the fixture took to set up.
+/// The window is far tighter than any plausible wrong answer: ignoring the
+/// budget entirely yields the configured background maximum, and dropping the
+/// return margin yields the full budget.
+fn nested_budget_window(budget: Duration) -> std::ops::Range<Duration> {
+    const CLOCK_SKEW_TOLERANCE: Duration = Duration::from_millis(500);
+    let expected = budget - super::process_manager::NESTED_POLL_MARGIN;
+    expected..(expected + CLOCK_SKEW_TOLERANCE)
+}
+
+/// Registers a live interactive process the polling tests can observe.
+async fn register_pollable_process(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    call_id: &str,
+    validation_launch: bool,
+) -> anyhow::Result<(u32, Arc<UnifiedExecProcess>, Arc<Notify>)> {
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let (terminate_started_tx, _terminate_started_rx) = watch::channel(false);
+    let allow_terminate = Arc::new(Notify::new());
+    let process = blocking_terminate_unified_process(
+        process_id,
+        terminate_started_tx,
+        Arc::clone(&allow_terminate),
+    )
+    .await?;
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process: Arc::clone(&process),
+            command_execution_id: Default::default(),
+            search_exit_one_is_no_match: false,
+            parent_tool_execution_id: Default::default(),
+            call_id: call_id.to_string(),
+            process_id,
+            cwd: turn.cwd().clone().into(),
+            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hook_command: call_id.to_string(),
+            tty: !validation_launch,
+            validation_launch,
+            network_approval: None,
+            session: Arc::downgrade(session),
+            last_used: Instant::now(),
+        },
+    );
+    Ok((process_id, process, allow_terminate))
+}
+
+/// A quiet poll that is allowed to wait the whole background budget must return
+/// a live process handle *before* the runtime wrapper's hard deadline, not be
+/// cancelled at it. Equal values made a full-length wait a guaranteed failure.
+#[tokio::test(start_paused = true)]
+async fn a_full_length_quiet_poll_yields_inside_the_nested_budget() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let (process_id, process, allow_terminate) =
+        register_pollable_process(&session, &turn, "nested-budget", /*validation*/ false).await?;
+
+    let nested_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let started_at = Instant::now();
+    let output = write_stdin_within(
+        &session,
+        process_id,
+        "",
+        /*yield_time_ms*/ 60_000,
+        Some(nested_deadline),
+    )
+    .await?;
+
+    // The budget is measured on the caller's clock and enforced on the
+    // handler's, so compare against a tight window rather than one instant.
+    let elapsed = Instant::now().saturating_duration_since(started_at);
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the poll must finish before the wrapper's hard deadline, took {elapsed:?}"
+    );
+    assert!(
+        nested_budget_window(Duration::from_secs(60)).contains(&elapsed),
+        "observation should use the whole budget minus the return margin, took {elapsed:?}"
+    );
+    assert_eq!(
+        output.process_id,
+        Some(process_id),
+        "a yielded poll returns the live process so the model can poll again"
+    );
+    assert!(!output.process_exited);
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+    allow_terminate.notify_one();
+    process.terminate();
+    Ok(())
+}
+
+/// A short explicit caller timeout outranks the ordinary minimum poll
+/// durations, so the call yields cooperatively instead of running past the
+/// budget and being cancelled.
+#[tokio::test(start_paused = true)]
+async fn a_short_nested_budget_outranks_the_minimum_empty_yield() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let (process_id, process, allow_terminate) =
+        register_pollable_process(&session, &turn, "short-budget", /*validation*/ false).await?;
+
+    // Well below MIN_EMPTY_YIELD_TIME_MS, which would otherwise floor the wait.
+    let nested_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let started_at = Instant::now();
+    let output = write_stdin_within(
+        &session,
+        process_id,
+        "",
+        /*yield_time_ms*/ 60_000,
+        Some(nested_deadline),
+    )
+    .await?;
+
+    let elapsed = Instant::now().saturating_duration_since(started_at);
+    assert!(
+        nested_budget_window(Duration::from_secs(3)).contains(&elapsed),
+        "the enclosing deadline bounds the wait, not MIN_EMPTY_YIELD_TIME_MS, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS),
+        "a {MIN_EMPTY_YIELD_TIME_MS}ms floor would overrun the 3s budget, took {elapsed:?}"
+    );
+    assert_eq!(output.process_id, Some(process_id));
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+    allow_terminate.notify_one();
+    process.terminate();
+    Ok(())
+}
+
+/// An exhausted budget yields immediately with the registered process handle
+/// rather than producing a deadline in the past that reads as a failure.
+#[tokio::test(start_paused = true)]
+async fn an_already_exhausted_nested_budget_yields_immediately() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let (process_id, process, allow_terminate) =
+        register_pollable_process(&session, &turn, "spent-budget", /*validation*/ false).await?;
+
+    let started_at = Instant::now();
+    let output = write_stdin_within(
+        &session,
+        process_id,
+        "",
+        /*yield_time_ms*/ 60_000,
+        // Already past by the time the handler reads it.
+        Some(std::time::Instant::now()),
+    )
+    .await?;
+
+    assert_eq!(
+        Instant::now().saturating_duration_since(started_at),
+        Duration::ZERO
+    );
+    assert_eq!(output.process_id, Some(process_id));
+    assert!(!output.process_exited);
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+    allow_terminate.notify_one();
+    process.terminate();
+    Ok(())
+}
+
+/// Queueing behind another interaction is charged against the same budget. A
+/// call that waits out its budget there reports a live process to poll again,
+/// never a failure that would strand the process behind a cancelled call.
+#[tokio::test(start_paused = true)]
+async fn a_poll_queued_past_its_nested_budget_yields_instead_of_failing() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let (process_id, process, allow_terminate) =
+        register_pollable_process(&session, &turn, "queued-budget", /*validation*/ false).await?;
+
+    // Hold the interaction lock for longer than the caller's whole budget.
+    let held = Arc::clone(&process).interaction_lock().lock_owned().await;
+
+    let nested_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let started_at = Instant::now();
+    let output = write_stdin_within(
+        &session,
+        process_id,
+        "",
+        /*yield_time_ms*/ 60_000,
+        Some(nested_deadline),
+    )
+    .await?;
+
+    let elapsed = Instant::now().saturating_duration_since(started_at);
+    assert!(
+        nested_budget_window(Duration::from_secs(10)).contains(&elapsed),
+        "the lock wait is bounded by the nested budget, took {elapsed:?}"
+    );
+    assert_eq!(
+        output.process_id,
+        Some(process_id),
+        "a queued-out poll is resumable, not a failure"
+    );
+    assert!(!output.process_exited);
+    assert!(
+        output
+            .repair_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("another interaction")),
+        "the model needs to know the poll never reached the process: {:?}",
+        output.repair_notice
+    );
+
+    drop(held);
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+    allow_terminate.notify_one();
+    process.terminate();
+    Ok(())
+}
+
+/// Pushes one burst of output into a live process, then leaves it silent.
+fn emit_burst_then_go_silent(process: &Arc<UnifiedExecProcess>, after: Duration) {
+    let handles = process.output_handles();
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        handles
+            .output_buffer
+            .lock()
+            .await
+            .push_chunk(b"   Compiling codex-core\n");
+        handles.output_notify.notify_waiters();
+    });
+}
+
+/// A validation run is silent between bursts of build output. Ending its poll
+/// at the first gap is what billed the extra model round trips, so later polls
+/// wait for the requested yield instead of the quiet period.
+#[tokio::test(start_paused = true)]
+async fn an_empty_poll_on_a_validation_launch_waits_the_requested_yield() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let (process_id, process, allow_terminate) =
+        register_pollable_process(&session, &turn, "validation-poll", /*validation*/ true).await?;
+
+    emit_burst_then_go_silent(&process, Duration::from_secs(1));
+    let started_at = Instant::now();
+    let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 20_000).await?;
+
+    let elapsed = Instant::now().saturating_duration_since(started_at);
+    assert_eq!(
+        elapsed,
+        Duration::from_secs(20),
+        "silence after a burst is not a result; the poll keeps the requested yield"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.raw_output).contains("Compiling codex-core"),
+        "the burst is still reported: {:?}",
+        String::from_utf8_lossy(&output.raw_output)
+    );
+    assert_eq!(output.process_id, Some(process_id));
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+    allow_terminate.notify_one();
+    process.terminate();
+    Ok(())
+}
+
+/// Preservation: an interactive process still ends its poll shortly after
+/// output goes quiet, so a prompt returns without waiting out the yield.
+#[tokio::test(start_paused = true)]
+async fn an_empty_poll_on_an_interactive_process_keeps_the_quiet_period() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let (process_id, process, allow_terminate) =
+        register_pollable_process(&session, &turn, "interactive-poll", /*validation*/ false).await?;
+
+    emit_burst_then_go_silent(&process, Duration::from_secs(1));
+    let started_at = Instant::now();
+    let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 20_000).await?;
+
+    let elapsed = Instant::now().saturating_duration_since(started_at);
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "an interactive poll must not wait out the full yield, took {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the poll waits for the first output before the quiet period starts, took {elapsed:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.raw_output).contains("Compiling codex-core"),
+        "the burst is still reported"
+    );
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+    allow_terminate.notify_one();
+    process.terminate();
+    Ok(())
+}
+
+/// Preservation: a direct model call has no wrapper bounding it, so the
+/// configured background maximum still governs the wait.
+#[tokio::test(start_paused = true)]
+async fn a_direct_call_without_a_nested_budget_keeps_the_background_maximum() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let (process_id, process, allow_terminate) =
+        register_pollable_process(&session, &turn, "direct-poll", /*validation*/ false).await?;
+
+    let started_at = Instant::now();
+    let output = write_stdin_within(
+        &session,
+        process_id,
+        "",
+        /*yield_time_ms*/ 120_000,
+        /*nested_deadline*/ None,
+    )
+    .await?;
+
+    assert_eq!(
+        Instant::now().saturating_duration_since(started_at),
+        Duration::from_secs(60)
+    );
+    assert_eq!(output.process_id, Some(process_id));
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+    allow_terminate.notify_one();
+    process.terminate();
+    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
@@ -304,6 +667,7 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hook_command: "interactive".to_string(),
             tty: true,
+            validation_launch: false,
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
@@ -528,6 +892,8 @@ async fn command_dispatch_reuses_workspace_baseline_without_ledger_recapture() -
                         cell_id: "cell-1".to_string(),
                         parent_call_id: Some("outer".to_string()),
                         runtime_tool_call_id: "nested-read".to_string(),
+                        nested_deadline: None,
+                        cancellation_cause: None,
                     },
                     tokio_util::sync::CancellationToken::new(),
                 )
@@ -1169,6 +1535,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             hook_command: "Start-Sleep -Seconds 60".to_string(),
             tty: true,
+            validation_launch: false,
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
@@ -1244,6 +1611,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hook_command: "Start-Sleep -Seconds 60".to_string(),
             tty: true,
+            validation_launch: false,
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used,

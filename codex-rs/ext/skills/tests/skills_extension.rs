@@ -181,7 +181,7 @@ async fn assert_installed_host_skill_fragment(
         "{EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills\n{SKILLS_INTRO_WITH_ABSOLUTE_PATHS}\n### Available skills\n- demo: Demo skill. (file: {skill_prompt_path})\n{EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG}"
     );
     let expected_skill = format!(
-        "<skill>\n<name>demo</name>\n<path>{skill_prompt_path}</path>\n<scope>admin</scope>\n{rendered_contents}\n</skill>"
+        "<skill>\n<name>demo</name>\n<path>{skill_path_string}</path>\n<scope>admin</scope>\n{rendered_contents}\n</skill>"
     );
     assert_eq!(
         vec![
@@ -1410,20 +1410,22 @@ async fn executor_failure_retries_next_turn_and_real_input_populates_snapshot() 
 
 #[tokio::test]
 async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> TestResult {
+    let resource = format!("skill://orchestrator/{}/SKILL.md", "x".repeat(1_400));
     let mut entry = test_entry(
         SkillSourceKind::Orchestrator,
         "codex_apps",
         "orchestrator/bounded",
-        "skill://orchestrator/bounded/SKILL.md",
+        &resource,
     );
     entry.name = "bounded<&>".to_string();
     entry.display_path = Some("skill://orchestrator/<bounded>&/SKILL.md".to_string());
+    let original_contents = format!("<body>{}OMITTED_TAIL", "🚀".repeat(3_000));
     let provider = ReadContentsProvider {
         catalog: SkillCatalog {
             entries: vec![entry],
             warnings: Vec::new(),
         },
-        contents: format!("<body>{}OMITTED_TAIL", "🚀".repeat(3_000)),
+        contents: original_contents.clone(),
         returned_resource: None,
         read_calls: Default::default(),
     };
@@ -1438,7 +1440,7 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
                 turn_id: "turn".to_string(),
                 user_input: vec![UserInput::Mention {
                     name: "bounded<&>".to_string(),
-                    path: "skill://orchestrator/bounded/SKILL.md".to_string(),
+                    path: resource.clone(),
                 }],
                 environments: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
@@ -1451,7 +1453,8 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
     assert_eq!(fragments.len(), 1);
     let rendered = fragments[0].render();
     assert!(rendered.contains("<name>bounded&lt;&amp;&gt;</name>"));
-    assert!(rendered.contains("<path>skill://orchestrator/&lt;bounded&gt;&amp;/SKILL.md</path>"));
+    assert!(rendered.contains(&format!("<path>{resource}</path>")));
+    assert!(!rendered.contains("skill://orchestrator/&lt;bounded&gt;"));
     assert!(rendered.contains("&lt;body&gt;🚀"));
     assert!(rendered.contains("instructions are incomplete"));
     assert!(!rendered.contains("OMITTED_TAIL"));
@@ -1462,6 +1465,55 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
         .strip_suffix("\n</skill>")
         .ok_or("closing skill")?;
     assert!(contents.len() <= 8_006); // Escaping the body tag adds six bytes.
+    let recovery_args = rendered
+        .split("skills.read(")
+        .nth(1)
+        .ok_or("recovery call")?
+        .split(");")
+        .next()
+        .ok_or("recovery arguments")?;
+    let mut args: serde_json::Value = serde_json::from_str(recovery_args)?;
+    assert_eq!(args["resource"], resource);
+    assert_eq!(args["package"], "orchestrator/bounded");
+    let tools = registry.tool_contributors()[0].tools(&session, &thread);
+    let read_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "read")
+        .ok_or("read tool")?;
+    let mut recovered = String::new();
+    loop {
+        let payload = ToolPayload::Function {
+            arguments: args.to_string(),
+        };
+        let output = read_tool
+            .handle(ToolCall {
+                turn_id: "turn".to_string(),
+                call_id: "recover".to_string(),
+                tool_name: read_tool.tool_name(),
+                model: "gpt-test".to_string(),
+                truncation_policy: TruncationPolicy::Bytes(4_000),
+                source: ToolCallSource::Direct,
+                conversation_history: ConversationHistory::default(),
+                turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+                cancellation_token: Default::default(),
+                primary_environment_id: None,
+                environments: Vec::new(),
+                payload: payload.clone(),
+            })
+            .await?;
+        let response = output
+            .post_tool_use_response("recover", &payload)
+            .ok_or("read response")?;
+        let page = response["contents"].as_str().ok_or("contents")?;
+        assert!(!page.is_empty());
+        recovered.push_str(page);
+        assert!(original_contents.starts_with(&recovered));
+        if response["next_cursor"].is_null() {
+            break;
+        }
+        args["cursor"] = response["next_cursor"].clone();
+    }
+    assert_eq!(recovered, original_contents);
     Ok(())
 }
 
@@ -1596,6 +1648,94 @@ fn batch_catalog_merge_preserves_order_authority_and_first_entry() {
     });
     assert_eq!(catalog.entries, vec![first, other]);
     assert_eq!(catalog.warnings, vec!["warning"]);
+}
+
+#[tokio::test]
+async fn omitted_catalog_entries_are_recoverable_through_advertised_list_route() -> TestResult {
+    let entries = (0..12)
+        .map(|index| {
+            let mut entry = test_entry(
+                SkillSourceKind::Orchestrator,
+                "codex_apps",
+                &format!("orchestrator/skill-{index}"),
+                &format!("skill://orchestrator/skill-{index}/SKILL.md"),
+            );
+            entry.description = "description".repeat(100);
+            entry
+        })
+        .collect();
+    let provider = ReadContentsProvider {
+        catalog: SkillCatalog {
+            entries,
+            warnings: Vec::new(),
+        },
+        contents: "recovered instructions".to_string(),
+        returned_resource: None,
+        read_calls: Default::default(),
+    };
+    let (registry, session, thread) = start_test_extension(
+        SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+        default_config(),
+    )
+    .await;
+    let fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session, &thread)
+        .await;
+    let text = fragments[0].text();
+    assert!(!text.contains("skill://orchestrator/skill-11/SKILL.md"));
+    assert!(text.len() < 8_000);
+    let raw_args = text
+        .split("skills.list(")
+        .nth(1)
+        .ok_or("list route")?
+        .split(");")
+        .next()
+        .ok_or("list arguments")?;
+    let mut args: serde_json::Value = serde_json::from_str(raw_args)?;
+    let tools = registry.tool_contributors()[0].tools(&session, &thread);
+    let list = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("list")?;
+    let read = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "read")
+        .ok_or("read")?;
+    let mut recovered = Vec::new();
+    loop {
+        let call = skills_tool_call(list.tool_name(), args.clone(), 3_000);
+        let payload = call.payload.clone();
+        let call_id = call.call_id.clone();
+        let output = list.handle(call).await?;
+        let response = output
+            .post_tool_use_response(&call_id, &payload)
+            .ok_or("list response")?;
+        let page = response["skills"].as_array().ok_or("skills")?;
+        assert!(!page.is_empty());
+        recovered.extend(page.clone());
+        if response["next_cursor"].is_null() {
+            break;
+        }
+        args["cursor"] = response["next_cursor"].clone();
+    }
+    assert_eq!(recovered.len(), 12);
+    let last = recovered.last().ok_or("last skill")?;
+    assert_eq!(last["package"], "orchestrator/skill-11");
+    let call = skills_tool_call(
+        read.tool_name(),
+        serde_json::json!({
+            "authority": last["authority"], "package": last["package"], "resource": last["main_resource"],
+        }),
+        3_000,
+    );
+    let payload = call.payload.clone();
+    let call_id = call.call_id.clone();
+    let output = read.handle(call).await?;
+    let response = output
+        .post_tool_use_response(&call_id, &payload)
+        .ok_or("read response")?;
+    assert_eq!(response["contents"], "recovered instructions");
+    Ok(())
 }
 
 struct ChannelEventSink(std::sync::mpsc::Sender<Event>);

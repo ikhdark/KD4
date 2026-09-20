@@ -59,6 +59,7 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             description: tool.description.clone(),
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
+                            default_timeout_ms: None,
                             output_schema: tool.output_schema.clone(),
                         };
                         tool.description =
@@ -159,6 +160,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 description: tool.description.clone(),
                 kind: CodeModeToolKind::Function,
                 input_schema: serde_json::to_value(&tool.parameters).ok(),
+                default_timeout_ms: None,
                 output_schema: tool.output_schema.clone(),
             }]
         }
@@ -171,6 +173,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 description: tool.description.clone(),
                 kind: CodeModeToolKind::Freeform,
                 input_schema: None,
+                default_timeout_ms: None,
                 output_schema: None,
             }]
         }
@@ -185,6 +188,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                     description: tool.description.clone(),
                     kind: CodeModeToolKind::Function,
                     input_schema: serde_json::to_value(&tool.parameters).ok(),
+                    default_timeout_ms: None,
                     output_schema: tool.output_schema.clone(),
                 },
             })
@@ -202,6 +206,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             ),
             kind: CodeModeToolKind::Function,
             input_schema: serde_json::to_value(parameters).ok(),
+            default_timeout_ms: None,
             output_schema: Some(code_mode_tool_search_output_schema()),
         }],
         ToolSpec::WebSearch { .. } => Vec::new(),

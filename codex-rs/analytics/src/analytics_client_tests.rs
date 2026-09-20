@@ -183,6 +183,7 @@ fn sample_thread_with_metadata(
     parent_thread_id: Option<String>,
 ) -> Thread {
     Thread {
+        project_id: None,
         id: thread_id.to_string(),
         extra: None,
         session_id: format!("session-{thread_id}"),
@@ -337,7 +338,6 @@ fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload {
             duration_ms: None,
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         },
     })
 }
@@ -356,7 +356,6 @@ fn sample_turn_started_notification(thread_id: &str, turn_id: &str) -> ServerNot
             duration_ms: None,
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         },
     })
 }
@@ -399,7 +398,6 @@ pub(crate) fn sample_turn_completed_notification(
             duration_ms: Some(1234),
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         },
         timing: None,
     })

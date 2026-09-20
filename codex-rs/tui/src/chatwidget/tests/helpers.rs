@@ -981,7 +981,6 @@ pub(super) fn app_server_turn(
         duration_ms,
         timing: None,
         surfaced_result: None,
-        reasoning_policy_history: None,
     }
 }
 

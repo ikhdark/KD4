@@ -2,6 +2,7 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
+use codex_code_mode_protocol::NestedCancellation;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -92,6 +93,7 @@ pub(crate) struct ToolDefinition {
     pub(crate) tool_name: ToolName,
     pub(crate) description: String,
     pub(crate) kind: ToolKind,
+    pub(crate) default_timeout_ms: Option<u64>,
 }
 
 /// A tool name with an optional namespace.
@@ -116,6 +118,8 @@ pub(crate) struct NestedToolCall {
     pub(crate) tool_name: ToolName,
     pub(crate) tool_kind: ToolKind,
     pub(crate) input: Option<JsonValue>,
+    /// Instant the cell's wrapper timeout fires for this call.
+    pub(crate) nested_deadline: Option<std::time::Instant>,
 }
 
 /// Host callbacks used by cells owned by a [`super::SessionRuntime`].
@@ -126,7 +130,7 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
     fn invoke_tool(
         &self,
         invocation: NestedToolCall,
-        cancellation_token: CancellationToken,
+        cancellation: NestedCancellation,
     ) -> impl Future<Output = Result<JsonValue, String>> + Send;
 
     fn notify(

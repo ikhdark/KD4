@@ -259,6 +259,7 @@ async fn list_state_threads_for_storage(
         params.cwd_filters.as_deref(),
         params.relation_filter,
         params.archived,
+        params.project_id.as_ref().map(Option::as_deref),
         params.search_term.as_deref(),
     )
     .await
@@ -308,6 +309,7 @@ pub(super) async fn list_rollout_threads_for_storage(
             params.cwd_filters.as_deref(),
             Some(relation_filter),
             params.archived,
+            params.project_id.as_ref().map(Option::as_deref),
             params.search_term.as_deref(),
         )
         .await
@@ -387,6 +389,19 @@ fn storage_path_for_request(
     params: &ListThreadsParams,
     cursor: Option<&BoundThreadListCursor>,
 ) -> ThreadStoreResult<Option<ThreadListStoragePath>> {
+    if params.project_id.is_some() {
+        if params.storage_mode == ThreadListStorageMode::ScanAndRepair {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "project-filtered thread listing requires state DB storage".to_string(),
+            });
+        }
+        if cursor.is_some_and(|cursor| cursor.storage_path != ThreadListStoragePath::StateDb) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "project-filtered thread listing requires a state DB cursor".to_string(),
+            });
+        }
+    }
+
     if params.relation_filter.is_some()
         && params.storage_mode == ThreadListStorageMode::ScanAndRepair
     {
@@ -419,7 +434,7 @@ fn storage_path_for_request(
         return Ok(Some(cursor.storage_path));
     }
 
-    if params.relation_filter.is_some() {
+    if params.relation_filter.is_some() || params.project_id.is_some() {
         return Ok(Some(ThreadListStoragePath::StateDb));
     }
     Ok(match params.storage_mode {
@@ -519,6 +534,7 @@ mod tests {
         storage_mode: ThreadListStorageMode,
     ) -> ListThreadsParams {
         ListThreadsParams {
+            project_id: None,
             page_size,
             cursor,
             sort_key: ThreadSortKey::CreatedAt,
@@ -808,6 +824,7 @@ mod tests {
         let (page, _) = list_threads_with_state_db_read_count(
             &store,
             ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -873,6 +890,7 @@ mod tests {
         let (page, state_db_reads) = list_threads_with_state_db_read_count(
             &store,
             ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -949,6 +967,7 @@ mod tests {
 
         let page = store
             .list_threads(ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -982,6 +1001,7 @@ mod tests {
 
         let active = store
             .list_threads(ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -998,6 +1018,7 @@ mod tests {
             .expect("active listing");
         let archived = store
             .list_threads(ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -1050,6 +1071,7 @@ mod tests {
 
         let page = store
             .list_threads(ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -1087,6 +1109,7 @@ mod tests {
 
         let err = store
             .list_threads(ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: Some("not-a-cursor".to_string()),
                 sort_key: ThreadSortKey::CreatedAt,

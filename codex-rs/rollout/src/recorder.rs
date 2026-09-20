@@ -115,9 +115,36 @@ pub enum RolloutRecorderParams {
     },
 }
 
+/// A rollout item paired with the instant it was handed to the recorder.
+///
+/// Records are coalesced and flushed in batches, and a batch can be rebased or
+/// retried before it lands. Stamping at write time gave every record in a batch
+/// the flush time instead of its own, so a record's timestamp described when
+/// the writer got around to it rather than when it happened.
+#[derive(Clone, Debug)]
+struct CapturedRolloutItem {
+    captured_at: OffsetDateTime,
+    item: RolloutItem,
+}
+
+impl CapturedRolloutItem {
+    fn new(item: RolloutItem, captured_at: OffsetDateTime) -> Self {
+        Self { captured_at, item }
+    }
+
+    /// Keeps the original capture time while replacing the payload, for the
+    /// manifest encoding that rewrites an item in place.
+    fn with_item(&self, item: RolloutItem) -> Self {
+        Self {
+            captured_at: self.captured_at,
+            item,
+        }
+    }
+}
+
 enum RolloutCmd {
     AddItems {
-        items: Vec<RolloutItem>,
+        items: Vec<CapturedRolloutItem>,
         flush_if_materialized: bool,
         accepted: Option<oneshot::Sender<()>>,
     },
@@ -532,6 +559,7 @@ impl RolloutRecorder {
                 cwd_filters,
                 /*relation_filter*/ None,
                 archived,
+                /*project_id*/ None,
                 search_term,
             )
             .await
@@ -648,6 +676,7 @@ impl RolloutRecorder {
             cwd_filters,
             /*relation_filter*/ None,
             archived,
+            /*project_id*/ None,
             search_term,
         )
         .await;
@@ -788,6 +817,7 @@ impl RolloutRecorder {
                     /*cwd_filters*/ None,
                     /*relation_filter*/ None,
                     /*archived*/ false,
+                    /*project_id*/ None,
                     /*search_term*/ None,
                 )
                 .await
@@ -936,7 +966,7 @@ impl RolloutRecorder {
         let cwd = config.cwd().to_path_buf();
 
         // A reasonably-sized bounded channel. If the buffer fills up the send
-        // future will yield, which is fine – we only need to ensure we do not
+        // future will yield, which is fine â€“ we only need to ensure we do not
         // perform *blocking* I/O on the caller's thread.
         let (tx, rx) = mpsc::channel::<RolloutCmd>(256);
         // Spawn a Tokio task that owns the file handle and performs async
@@ -1023,7 +1053,15 @@ impl RolloutRecorder {
         let result = self
             .tx
             .send(RolloutCmd::AddItems {
-                items: items.to_vec(),
+                // Capture once, here: this is when the caller produced these
+                // records, and it is the only point that still knows.
+                items: {
+                    let captured_at = OffsetDateTime::now_utc();
+                    items
+                        .iter()
+                        .map(|item| CapturedRolloutItem::new(item.clone(), captured_at))
+                        .collect()
+                },
                 flush_if_materialized,
                 accepted,
             })
@@ -1762,7 +1800,7 @@ fn open_log_file_with_options(
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
     deferred_log_file_info: Option<LogFileInfo>,
-    pending_items: Vec<RolloutItem>,
+    pending_items: Vec<CapturedRolloutItem>,
     meta: Option<SessionMeta>,
     cwd: PathBuf,
     known_repository_context: Option<Option<RepositoryContext>>,
@@ -1770,7 +1808,7 @@ struct RolloutWriterState {
     last_logged_error: Option<String>,
     retry_blocked_error: Option<String>,
     tool_manifests: crate::ToolManifestDictionary,
-    pending_token_count: Option<RolloutItem>,
+    pending_token_count: Option<CapturedRolloutItem>,
 }
 
 impl RolloutWriterState {
@@ -1798,9 +1836,9 @@ impl RolloutWriterState {
         }
     }
 
-    fn add_items(&mut self, items: Vec<RolloutItem>) {
-        for item in items {
-            match item {
+    fn add_items(&mut self, items: Vec<CapturedRolloutItem>) {
+        for captured in items {
+            match &captured.item {
                 // The recorder owns the single canonical metadata slot. Inherited history must
                 // never append another session_meta record.
                 RolloutItem::SessionMeta(_) => {
@@ -1809,28 +1847,31 @@ impl RolloutWriterState {
                     );
                 }
                 RolloutItem::ToolManifest(manifest) => {
-                    match self.tool_manifests.encode_item(&manifest) {
-                        Ok(manifest) => {
-                            self.pending_items.push(RolloutItem::ToolManifest(manifest))
-                        }
+                    // Encoding rewrites the payload, never when it happened.
+                    let encoded = match self.tool_manifests.encode_item(manifest) {
+                        Ok(encoded) => encoded,
                         Err(err) => {
                             tracing::warn!(%err, "failed to encode tool manifest; preserving input record");
-                            self.pending_items.push(RolloutItem::ToolManifest(manifest));
+                            manifest.clone()
                         }
-                    }
+                    };
+                    self.pending_items
+                        .push(captured.with_item(RolloutItem::ToolManifest(encoded)));
                 }
                 RolloutItem::EventMsg(EventMsg::TokenCount(_)) => {
-                    self.pending_token_count = Some(item);
+                    self.pending_token_count = Some(captured);
                 }
                 RolloutItem::EventMsg(
                     EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::TurnStarted(_),
                 ) => {
+                    // A coalesced token count keeps its own capture time even
+                    // though a later record is what released it.
                     if let Some(token_count) = self.pending_token_count.take() {
                         self.pending_items.push(token_count);
                     }
-                    self.pending_items.push(item);
+                    self.pending_items.push(captured);
                 }
-                item => self.pending_items.push(item),
+                _ => self.pending_items.push(captured),
             }
         }
     }
@@ -1977,9 +2018,11 @@ impl RolloutWriterState {
         };
         if let Some((has_session_meta, mut persisted_tool_manifests)) = existing_rollout_state {
             let known_manifests = self.tool_manifests.clone();
+            // Rebasing rewrites manifest payloads against the persisted
+            // dictionary; each record keeps the capture time it arrived with.
             let mut rebased_items = self.pending_items.clone();
-            for item in &mut rebased_items {
-                let RolloutItem::ToolManifest(manifest) = item else {
+            for captured in &mut rebased_items {
+                let RolloutItem::ToolManifest(manifest) = &mut captured.item else {
                     continue;
                 };
                 let Some(full) = known_manifests.manifest(&manifest.hash).cloned() else {
@@ -1998,7 +2041,7 @@ impl RolloutWriterState {
         Ok(())
     }
 
-    async fn session_meta_item_if_needed(&self) -> std::io::Result<Option<RolloutItem>> {
+    async fn session_meta_item_if_needed(&self) -> std::io::Result<Option<CapturedRolloutItem>> {
         let Some(session_meta) = self.meta.as_ref().cloned() else {
             return Ok(None);
         };
@@ -2007,10 +2050,14 @@ impl RolloutWriterState {
             None if get_git_repo_root(&self.cwd).is_some() => collect_git_info(&self.cwd).await,
             None => None,
         };
-        Ok(Some(RolloutItem::SessionMeta(SessionMetaLine {
-            meta: session_meta,
-            git: git_info,
-        })))
+        // The metadata line is assembled here, so this write is its capture.
+        Ok(Some(CapturedRolloutItem::new(
+            RolloutItem::SessionMeta(SessionMetaLine {
+                meta: session_meta,
+                git: git_info,
+            }),
+            OffsetDateTime::now_utc(),
+        )))
     }
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
@@ -2196,10 +2243,15 @@ struct RolloutLineRef<'a> {
 
 impl JsonlWriter {
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
-        self.write_rollout_items(&[rollout_item]).await
+        // A direct append has no queue between capture and write.
+        let captured = CapturedRolloutItem::new(rollout_item.clone(), OffsetDateTime::now_utc());
+        self.write_rollout_items(&[&captured]).await
     }
 
-    async fn write_rollout_items(&mut self, rollout_items: &[&RolloutItem]) -> std::io::Result<()> {
+    async fn write_rollout_items(
+        &mut self,
+        rollout_items: &[&CapturedRolloutItem],
+    ) -> std::io::Result<()> {
         let path = self.path.clone();
         let write_lock = tokio::task::spawn_blocking(move || {
             compression::lock_rollout_for_write_blocking(&path)
@@ -2212,24 +2264,30 @@ impl JsonlWriter {
 
     async fn write_rollout_items_locked(
         &mut self,
-        rollout_items: &[&RolloutItem],
+        rollout_items: &[&CapturedRolloutItem],
         _write_lock: &compression::RolloutWriteLock,
     ) -> std::io::Result<()> {
         if rollout_items.is_empty() {
             return Ok(());
         }
         let mut bytes = Vec::new();
-        for rollout_item in rollout_items {
-            bytes.extend_from_slice(&Self::serialize_rollout_item(rollout_item)?);
+        for captured in rollout_items {
+            bytes.extend_from_slice(&Self::serialize_rollout_item(
+                &captured.item,
+                captured.captured_at,
+            )?);
         }
         self.write_transaction(&bytes).await
     }
 
-    fn serialize_rollout_item(rollout_item: &RolloutItem) -> std::io::Result<Vec<u8>> {
+    fn serialize_rollout_item(
+        rollout_item: &RolloutItem,
+        captured_at: OffsetDateTime,
+    ) -> std::io::Result<Vec<u8>> {
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         );
-        let timestamp = OffsetDateTime::now_utc()
+        let timestamp = captured_at
             .format(timestamp_format)
             .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
 

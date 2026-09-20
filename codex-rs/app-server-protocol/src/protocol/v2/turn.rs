@@ -10,7 +10,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
-pub use codex_protocol::protocol::ReasoningPolicySnapshot;
 pub use codex_protocol::protocol::SurfacedToolResult;
 pub use codex_protocol::protocol::TurnTiming;
 use codex_protocol::user_input::ByteRange as CoreByteRange;
@@ -387,24 +386,6 @@ impl UserInput {
 pub struct TurnStartedNotification {
     pub thread_id: String,
     pub turn: Turn,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct TurnReasoningPolicyUpdatedNotification {
-    pub thread_id: String,
-    pub turn_id: String,
-    pub snapshot: ReasoningPolicySnapshot,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct TurnReasoningPolicySummaryNotification {
-    pub thread_id: String,
-    pub turn_id: String,
-    pub history: super::ReasoningPolicyHistory,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

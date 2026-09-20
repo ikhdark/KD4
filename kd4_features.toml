@@ -10,25 +10,25 @@ status_semantics = "implementation_lifecycle"
 # No inventoried benchmark difference needs a separate compile configuration.
 
 [[features]]
-id = "kd4-phase-reasoning"
+id = "kd4-turn-execution"
 version = 1
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Phase effort selection, sampling governor interventions, and convergence completion; disabled preserves configured effort."
+summary = "Tool-loop controls and convergence completion; model requests preserve configured reasoning effort."
 upstream_equivalent = "none"
 config_keys = ["features.kd4_runtime"]
 runtime_feature_key = "features.kd4_runtime"
 runtime_status = "enabled"
 runtime_status_source = "codex-rs/features/src/lib.rs"
 benchmark_on = true
-benchmark_control = { kind = "runtime", reason = "Default-on shared switch controls config loading, startup prewarm, every generation, child inheritance, and resumed turns. Existing phase defaults apply only when enabled. The logical-generation budget and native timing instrumentation remain fixed fork differences." }
-runtime_verification = { kind = "integration_test", path = "codex-rs/core/tests/suite/client.rs", symbol = "kd4_runtime_off_preserves_effort_after_tool_and_followup", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-kd4-phase-reasoning", "--profile", "fast"] }
+benchmark_control = { kind = "runtime", reason = "Default-on shared switch controls tool-loop interventions and convergence completion. The logical-generation budget and native timing instrumentation remain fixed fork differences." }
+runtime_verification = { kind = "integration_test", path = "codex-rs/core/tests/suite/client.rs", symbol = "configured_effort_survives_tools_and_followup", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-kd4-turn-execution", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
-path = "codex-rs/core/src/session/reasoning_governor.rs"
-contains = "fn resolve_request_policy_for_runtime("
+path = "codex-rs/core/src/session/turn_execution.rs"
+contains = "pub(crate) struct TurnExecutionControl"
 
 [[features.evidence]]
 kind = "registration"
@@ -36,14 +36,9 @@ path = "codex-rs/core/src/session/turn.rs"
 contains = "let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);"
 
 [[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/session_startup_prewarm.rs"
-contains = ".enabled(Feature::Kd4Runtime)"
-
-[[features.evidence]]
 kind = "test"
 path = "codex-rs/core/tests/suite/client.rs"
-contains = "kd4_runtime_off_preserves_effort_after_tool_and_followup"
+contains = "configured_effort_survives_tools_and_followup"
 
 [[features.evidence]]
 kind = "test"

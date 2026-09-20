@@ -279,7 +279,6 @@ fn turn_completed_recovers_final_message_from_turn_items() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));
@@ -332,7 +331,6 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));
@@ -381,7 +379,6 @@ fn turn_completed_preserves_streamed_final_message_when_turn_items_are_empty() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));
@@ -430,7 +427,6 @@ fn turn_failed_clears_stale_final_message() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));
@@ -480,7 +476,6 @@ fn turn_interrupted_clears_stale_final_message() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));

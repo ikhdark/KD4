@@ -68,8 +68,8 @@ impl ConnectionDriver {
                 session_id,
                 request,
             } => self.start_delegate(id, session_id, request),
-            HostToClient::CancelDelegateRequest { id } => {
-                self.delegates.cancel(id);
+            HostToClient::CancelDelegateRequest { id, cause } => {
+                self.delegates.cancel(id, cause);
                 true
             }
             HostToClient::CellClosed {

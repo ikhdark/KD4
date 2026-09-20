@@ -82,7 +82,11 @@ impl Ord for TrackedPath {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommandMutation {
     ReadOnly,
-    KnownMutation { paths: Option<BTreeSet<PathBuf>> },
+    KnownMutation {
+        paths: Option<BTreeSet<PathBuf>>,
+    },
+    /// A workspace snapshot changed, without proof that this command caused it.
+    UnattributedWorkspaceChange,
     Uncertain,
 }
 
@@ -94,7 +98,7 @@ impl CommandMutation {
     pub(crate) fn paths(&self) -> Option<&BTreeSet<PathBuf>> {
         match self {
             Self::KnownMutation { paths } => paths.as_ref(),
-            Self::ReadOnly | Self::Uncertain => None,
+            Self::ReadOnly | Self::Uncertain | Self::UnattributedWorkspaceChange => None,
         }
     }
 }
@@ -102,7 +106,7 @@ impl CommandMutation {
 impl From<bool> for CommandMutation {
     fn from(possible_mutation: bool) -> Self {
         if possible_mutation {
-            Self::KnownMutation { paths: None }
+            Self::Uncertain
         } else {
             Self::ReadOnly
         }
@@ -339,8 +343,14 @@ impl TurnDiffTracker {
                 self.record_mutation();
                 self.invalidate();
             }
-            CommandMutation::KnownMutation { paths: None } | CommandMutation::Uncertain => {
+            CommandMutation::KnownMutation { paths: None } => {
                 self.record_unknown_mutation();
+            }
+            CommandMutation::Uncertain | CommandMutation::UnattributedWorkspaceChange => {
+                // This revision invalidates cached evidence; it is not proof
+                // that this command wrote files or that the task is an edit.
+                self.mutation_revision = self.mutation_revision.saturating_add(1);
+                self.invalidate();
             }
             CommandMutation::ReadOnly => {}
         }
@@ -382,7 +392,7 @@ impl TurnDiffTracker {
         }
         self.invalidation_reported = true;
         Some(
-            "The turn diff is unavailable after a workspace mutation that could not be tracked exactly. A cleared diff does not mean there are no changes.",
+            "The turn diff is unavailable because command effects or workspace changes could not be tracked exactly. Do not claim that no files changed without fresh workspace verification.",
         )
     }
 
@@ -1292,7 +1302,7 @@ pub(crate) fn resolve_uncertain_command_observation(
 ) -> CommandMutation {
     match workspace_changed {
         Some(false) => CommandMutation::ReadOnly,
-        Some(true) => CommandMutation::KnownMutation { paths: None },
+        Some(true) => CommandMutation::UnattributedWorkspaceChange,
         None => CommandMutation::Uncertain,
     }
 }
@@ -1367,25 +1377,13 @@ fn is_known_mutating_command(command: &[String]) -> bool {
                 | "touch"
                 | "truncate"
         )
-    }) || command.join(" ").contains(['>', '`'])
+    }) || command.join(" ").contains('>')
     {
         return true;
     }
-    matches!(
-        unwrapped.first().map(|token| command_basename(token)),
-        Some(
-            "bash"
-                | "cmd"
-                | "node"
-                | "perl"
-                | "powershell"
-                | "pwsh"
-                | "python"
-                | "python3"
-                | "ruby"
-                | "sh"
-        )
-    )
+    // Invoking an interpreter is not proof that its script writes anything.
+    // Unknown scripts still invalidate conservatively when observation fails.
+    false
 }
 
 pub(crate) fn command_reads_repository_history(command: &[String]) -> bool {

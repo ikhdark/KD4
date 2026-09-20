@@ -104,6 +104,7 @@ async fn shutdown_releases_final_host_lease() {
             source: "text('unreachable')".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            default_tool_timeout_ms: None,
         })
         .await
     {
@@ -180,6 +181,7 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
             source: "text('unreachable')".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            default_tool_timeout_ms: None,
         })
         .await
         .err()

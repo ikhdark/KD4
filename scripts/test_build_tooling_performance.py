@@ -793,7 +793,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("app-server-process-exec-check:", justfile)
         self.assertIn("app-server-thread-status-check:", justfile)
         self.assertIn("app-server-schema-protocol-check:", justfile)
-        self.assertIn("app-server-schema-check:", justfile)
+        self.assertIn("app-server-schema-check *args:", justfile)
         self.assertIn('app-server-schema-regenerate owner experimental="":', justfile)
         schema_recipe = justfile.split("\napp-server-schema-protocol-check:\n", 1)[
             1

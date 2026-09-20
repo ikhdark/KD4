@@ -661,7 +661,6 @@ mod thread_processor_behavior_tests {
             duration_ms: None,
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         };
 
         let turns = reconstruct_thread_turns_for_turns_list(
@@ -694,7 +693,6 @@ mod thread_processor_behavior_tests {
             duration_ms: None,
             timing: None,
             surfaced_result: None,
-            reasoning_policy_history: None,
         };
         let turns = vec![
             make_turn("turn-1"),
@@ -893,6 +891,7 @@ mod thread_processor_behavior_tests {
         let thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread");
         StoredThread {
+            project_id: None,
             thread_id,
             extra_config: None,
             rollout_path: Some(test_path_buf("/tmp/thread.jsonl")),

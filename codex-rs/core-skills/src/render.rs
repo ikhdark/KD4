@@ -26,7 +26,7 @@ pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "Each entry gives a skill nam
 const SKILLS_INTRO_WITH_ALIASES: &str = "Catalog entries give a skill name, concise purpose, and deterministic `SKILL.md` locator. Expand `rN/...` locators through the roots below.";
 pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by the user or clearly matched by the task; announce it, state ordering when needed, and do not carry it to later turns.
 - Before task actions, the main agent must read each selected `SKILL.md` completely. Do not delegate that reading or interpretation.
-- Load `skill:` locators and file, environment, orchestrator, or custom resources through their stated provider; resolve relative references from the skill source.
+- Load `skill:` locators with `read_file`, and file, environment, orchestrator, or custom resources through their stated provider; resolve relative references from the skill source.
 - Read task-required linked instructions with the same mechanism, load only relevant variants, and reuse supplied scripts, templates, and assets.
 - If a named skill or required read is unavailable, state it and use the safest fallback; retry a rejected shell read through a dedicated read-only route."###;
 

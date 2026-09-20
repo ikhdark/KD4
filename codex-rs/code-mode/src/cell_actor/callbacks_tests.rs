@@ -7,6 +7,7 @@ use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -25,7 +26,7 @@ impl CellHost for PanickingCallbackHost {
     async fn invoke_tool(
         &self,
         _invocation: CellToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> Result<JsonValue, String> {
         panic!("tool callback panic probe");
     }
@@ -56,7 +57,7 @@ impl CellHost for NonCooperativeCallbackHost {
     async fn invoke_tool(
         &self,
         _invocation: CellToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> Result<JsonValue, String> {
         std::future::pending().await
     }
@@ -100,9 +101,10 @@ async fn tool_callback_panic_rejects_the_js_promise_and_reports_failure() {
             kind: ToolKind::Function,
             input: None,
             timeout: Duration::from_secs(1),
+            deadline: None,
         },
         runtime_tx,
-        CancellationToken::new(),
+        NestedCancellation::new(CancellationToken::new()),
         Some(Arc::new(move |reason| {
             let _ = failure_tx.send(reason);
         })),
@@ -141,9 +143,10 @@ async fn tool_callback_timeout_rejects_the_js_promise_and_cancels_the_delegate()
             kind: ToolKind::Function,
             input: None,
             timeout: Duration::from_secs(1),
+            deadline: None,
         },
         runtime_tx,
-        cancellation_token.clone(),
+        NestedCancellation::new(cancellation_token.clone()),
         None,
     );
 
@@ -268,7 +271,7 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
     let mut notification_tasks = JoinSet::new();
     let mut tool_tasks = JoinSet::new();
     let notification_cancellation_token = CancellationToken::new();
-    let tool_cancellation_token = CancellationToken::new();
+    let tool_cancellation = NestedCancellation::new(CancellationToken::new());
     let (runtime_tx, _runtime_rx) = std_mpsc::channel();
     let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
     let task_failure_handler: TaskFailureHandler = Arc::new(move |reason| {
@@ -287,16 +290,17 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
             kind: ToolKind::Function,
             input: None,
             timeout: Duration::from_secs(60),
+            deadline: None,
         },
         runtime_tx,
-        tool_cancellation_token.child_token(),
+        tool_cancellation.child(tool_cancellation.token().child_token()),
         Some(task_failure_handler.clone()),
     );
 
     let cleanup = tokio::spawn(async move {
         finish_callbacks(
             &notification_cancellation_token,
-            &tool_cancellation_token,
+            &tool_cancellation,
             &mut notification_tasks,
             &mut tool_tasks,
             CallbackCompletion::Cancel,

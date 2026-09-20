@@ -126,7 +126,6 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
                     EventMsg::AgentMessage(_),
                     EventMsg::TokenCount(_),
                     EventMsg::TurnComplete(_),
-                    EventMsg::ReasoningPolicySummary(_),
                 ]
             )
         },
@@ -144,7 +143,6 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
             EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
-            EventMsg::ReasoningPolicySummary(_),
         ] => {
             assert_eq!(first_user.message, "Record some messages");
             assert_eq!(first_user.text_elements, text_elements);
@@ -226,7 +224,6 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
                     EventMsg::AgentMessage(_),
                     EventMsg::TokenCount(_),
                     EventMsg::TurnComplete(_),
-                    EventMsg::ReasoningPolicySummary(_),
                 ]
             )
         },
@@ -247,7 +244,6 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
             EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
-            EventMsg::ReasoningPolicySummary(_),
         ] => {
             assert_eq!(first_user.message, "Record reasoning messages");
             assert_eq!(reasoning.text, "Summarized step");

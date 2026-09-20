@@ -381,6 +381,7 @@ pub async fn list_threads_db(
     cwd_filters: Option<&[PathBuf]>,
     relation_filter: Option<codex_state::ThreadRelationFilter>,
     archived: bool,
+    project_id: Option<Option<&str>>,
     search_term: Option<&str>,
 ) -> Option<codex_state::ThreadsPage> {
     let ctx = context?;
@@ -409,6 +410,7 @@ pub async fn list_threads_db(
             .collect::<Vec<_>>()
     });
     let filters = codex_state::ThreadFilterOptions {
+        project_id,
         archived_only: archived,
         allowed_sources: allowed_sources.as_slice(),
         model_providers: model_providers.as_deref(),

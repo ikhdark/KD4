@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::common;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
+use crate::engine::ScopedRunGate;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
@@ -32,6 +33,8 @@ pub struct PreToolUseRequest {
     pub matcher_aliases: Vec<String>,
     pub tool_use_id: String,
     pub tool_input: Value,
+    /// Flat names of tools already dispatched earlier in this turn, in order.
+    pub turn_tool_calls: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -54,6 +57,7 @@ struct PreToolUseHandlerData {
 pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
     request: &PreToolUseRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> Vec<HookRunSummary> {
     let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
     dispatcher::select_handlers_for_matcher_inputs(
@@ -62,6 +66,7 @@ pub(crate) fn preview(
         &matcher_inputs,
     )
     .into_iter()
+    .filter(|handler| gate.admits(handler))
     .map(|handler| {
         common::hook_run_for_tool_use(dispatcher::running_summary(&handler), &request.tool_use_id)
     })
@@ -72,13 +77,18 @@ pub(crate) async fn run(
     handlers: &[ConfiguredHandler],
     shell: &CommandShell,
     request: PreToolUseRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> PreToolUseOutcome {
     let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
-    let matched = dispatcher::select_handlers_for_matcher_inputs(
+    let mut matched = dispatcher::select_handlers_for_matcher_inputs(
         handlers,
         HookEventName::PreToolUse,
         &matcher_inputs,
     );
+    matched.retain(|handler| gate.admits(handler));
+    for handler in &matched {
+        gate.record(handler);
+    }
     if matched.is_empty() {
         return PreToolUseOutcome {
             hook_events: Vec::new(),
@@ -177,6 +187,7 @@ fn command_input_json(request: PreToolUseRequest) -> Result<String, serde_json::
         tool_name: request.tool_name,
         tool_input: request.tool_input,
         tool_use_id: request.tool_use_id,
+        turn_tool_calls: request.turn_tool_calls,
     })
 }
 
@@ -334,6 +345,7 @@ mod tests {
     use super::parse_completed;
     use super::preview;
     use crate::engine::ConfiguredHandler;
+    use crate::engine::ScopedRunGate;
     use crate::engine::command_runner::CommandRunResult;
     use crate::events::common;
 
@@ -732,10 +744,23 @@ mod tests {
         );
     }
 
+    fn unscoped_gate<'a>(
+        once_per: &'a std::collections::HashMap<String, codex_config::HookRunScope>,
+        scoped_runs: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    ) -> ScopedRunGate<'a> {
+        ScopedRunGate::new(once_per, scoped_runs, "session-1", "turn-1")
+    }
+
     #[test]
     fn preview_and_completed_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-123");
-        let runs = preview(&[handler()], &request);
+        let once_per = std::collections::HashMap::new();
+        let scoped_runs = std::sync::Mutex::new(std::collections::HashSet::new());
+        let runs = preview(
+            &[handler()],
+            &request,
+            &unscoped_gate(&once_per, &scoped_runs),
+        );
 
         assert_eq!(runs.len(), 1);
         assert_eq!(
@@ -759,7 +784,13 @@ mod tests {
     #[test]
     fn serialization_failure_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-123");
-        let runs = preview(&[handler()], &request);
+        let once_per = std::collections::HashMap::new();
+        let scoped_runs = std::sync::Mutex::new(std::collections::HashSet::new());
+        let runs = preview(
+            &[handler()],
+            &request,
+            &unscoped_gate(&once_per, &scoped_runs),
+        );
 
         let completed = common::serialization_failure_hook_events_for_tool_use(
             vec![handler()],
@@ -811,6 +842,7 @@ mod tests {
             matcher_aliases: Vec::new(),
             tool_use_id: tool_use_id.to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            turn_tool_calls: Vec::new(),
         }
     }
 }

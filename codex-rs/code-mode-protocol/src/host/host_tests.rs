@@ -34,6 +34,7 @@ use super::WireToolKind;
 use super::WireToolName;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
+use crate::CancellationCause;
 use crate::ExecuteRequest;
 
 fn session_id() -> SessionId {
@@ -85,6 +86,7 @@ fn execute_request() -> WireExecuteRequest {
                 description: "function tool".to_string(),
                 kind: WireToolKind::Function,
                 input_schema: Some(json!({ "type": "object" })),
+                default_timeout_ms: None,
                 output_schema: None,
             },
             WireToolDefinition {
@@ -96,12 +98,14 @@ fn execute_request() -> WireExecuteRequest {
                 description: "freeform tool".to_string(),
                 kind: WireToolKind::Freeform,
                 input_schema: None,
+                default_timeout_ms: None,
                 output_schema: Some(json!({ "type": "string" })),
             },
         ],
         source: "text('hello');".to_string(),
         yield_time_ms: Some(25),
         max_output_tokens: Some(100),
+        default_tool_timeout_ms: Some(75_000),
     }
 }
 
@@ -277,6 +281,7 @@ fn client_to_host_v1_variants_are_pinned() {
                     "source": "text('hello');",
                     "yield_time_ms": 25,
                     "max_output_tokens": 100,
+                    "default_tool_timeout_ms": 75_000,
                 },
             }),
         ),
@@ -545,6 +550,8 @@ fn host_to_client_v1_variants_are_pinned() {
                     },
                     tool_kind: WireToolKind::Freeform,
                     input: Some(json!({ "value": 1 })),
+                    deadline_shared_monotonic_nanos: None,
+                    remaining_ms_at_send: None,
                 },
             },
         },
@@ -593,8 +600,33 @@ fn host_to_client_v1_variants_are_pinned() {
     assert_wire_round_trip(
         HostToClient::CancelDelegateRequest {
             id: delegate_request_id(/*value*/ 11),
+            cause: None,
         },
         json!({ "type": "delegate/cancel", "id": 11 }),
+    );
+    assert_wire_round_trip(
+        HostToClient::CancelDelegateRequest {
+            id: delegate_request_id(/*value*/ 12),
+            cause: Some(CancellationCause::NestedDeadline),
+        },
+        json!({
+            "type": "delegate/cancel",
+            "id": 12,
+            "cause": { "type": "nested_deadline" },
+        }),
+    );
+    assert_wire_round_trip(
+        HostToClient::CancelDelegateRequest {
+            id: delegate_request_id(/*value*/ 13),
+            cause: Some(CancellationCause::TurnAborted {
+                reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+            }),
+        },
+        json!({
+            "type": "delegate/cancel",
+            "id": 13,
+            "cause": { "type": "turn_aborted", "reason": "interrupted" },
+        }),
     );
     assert_wire_round_trip(
         HostToClient::CellClosed {
@@ -738,6 +770,44 @@ fn execute_request_integer_bounds_are_enforced() {
         ..wire_request
     };
     assert!(ExecuteRequest::try_from(negative).is_err());
+}
+
+#[test]
+fn per_tool_timeout_round_trips_without_changing_tools_that_omit_it() {
+    let mut wire = execute_request();
+    wire.enabled_tools[0].default_timeout_ms = Some(315_000);
+    let encoded = serde_json::to_value(&wire).unwrap();
+    assert_eq!(encoded["enabled_tools"][0]["default_timeout_ms"], 315_000);
+    assert!(
+        encoded["enabled_tools"][1]
+            .get("default_timeout_ms")
+            .is_none()
+    );
+    let decoded: WireExecuteRequest = serde_json::from_value(encoded).unwrap();
+    let domain = ExecuteRequest::try_from(decoded).unwrap();
+    assert_eq!(domain.enabled_tools[0].default_timeout_ms, Some(315_000));
+    assert_eq!(domain.enabled_tools[1].default_timeout_ms, None);
+    assert_eq!(WireExecuteRequest::try_from(domain).unwrap(), wire);
+}
+
+#[test]
+fn execute_request_from_a_peer_without_a_default_tool_timeout_decodes() {
+    let decoded = serde_json::from_value::<WireExecuteRequest>(json!({
+        "tool_call_id": "call-1",
+        "enabled_tools": [],
+        "source": "text('hello');",
+        "yield_time_ms": null,
+        "max_output_tokens": null,
+    }))
+    .expect("a peer that predates the per-cell deadline still decodes");
+
+    assert_eq!(decoded.default_tool_timeout_ms, None);
+    assert_eq!(
+        ExecuteRequest::try_from(decoded)
+            .expect("wire converts to the domain")
+            .default_tool_timeout_ms,
+        None
+    );
 }
 
 #[test]

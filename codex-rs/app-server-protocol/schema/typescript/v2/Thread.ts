@@ -9,6 +9,9 @@ import type { ThreadStatus } from "./ThreadStatus";
 import type { Turn } from "./Turn";
 
 export type Thread = {/**
+ * Canonical project assignment owned by app-server, if any.
+ */
+projectId: string | null, /**
  * Identifier for this thread. Codex-generated thread IDs are UUIDv7.
  */
 id: string, /**

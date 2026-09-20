@@ -35,10 +35,15 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
                 .as_str()
                 .expect("command tool description")
                 .to_string();
-        assert!(description.contains("Start repository `rg` searches in a likely owning path"));
-        assert!(description.contains(
-            "Expand after a miss or when the request requires a repository-wide inventory."
-        ));
+        assert!(description.contains("Read known files directly."));
+        assert!(description.contains("Use `rg -l` when only matching filenames are needed"));
+        assert!(description.contains("use scoped `rg -n` when matching content is needed"));
+        assert!(
+            description
+                .contains("search the requested scope and preserve the complete matching set")
+        );
+        assert!(description.contains("without treating truncated results as complete"));
+        assert!(!description.contains("then `rg -n"));
         assert!(!description.contains("is rejected"));
         assert!(description.contains(
             "Before editing, read the complete enclosing function, type, or configuration unit"
@@ -58,6 +63,53 @@ fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
     let tool = serde_json::to_value(tool).expect("tool spec should serialize");
     tool.pointer(&format!("/parameters/properties/{parameter_name}"))
         .is_some()
+}
+
+#[test]
+fn command_declarations_preserve_input_alternatives_and_return_contracts() {
+    for spec in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_shell_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+    ] {
+        let definition = codex_tools::tool_spec_to_code_mode_tool_definition(&spec).unwrap();
+        let (_, declaration) = definition
+            .description
+            .split_once("exec tool declaration:")
+            .unwrap();
+        eprintln!(
+            "{}: description_bytes={}, declaration_bytes={}, untyped_object_unions={}",
+            definition.name,
+            definition.description.len(),
+            declaration.len(),
+            declaration
+                .matches("string | number | boolean | null | unknown[]")
+                .count()
+        );
+        let script_field = if definition.name == "exec_command" {
+            "cmd"
+        } else {
+            "command"
+        };
+        for field in [script_field, "program", "script_body"] {
+            assert!(declaration.contains(&format!("{field}: unknown;")));
+        }
+        assert!(declaration.contains("Promise<"));
+        if definition.name == "exec_command" {
+            assert!(declaration.contains("session_id?: number"));
+            assert!(declaration.contains("execution_state?:"));
+            assert!(declaration.contains("session_capabilities?:"));
+        }
+        assert!(
+            !declaration.contains("string | number | boolean | null | unknown[]"),
+            "an enclosing object constraint makes non-object command alternatives redundant"
+        );
+    }
 }
 
 #[test]
@@ -211,7 +263,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; status metadata may still be returned.",
+                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
                 codex_utils_output_truncation::adaptive_output_budget_description()
             ), 0, usize::MAX as u64),
         ),
@@ -333,7 +385,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; status metadata may still be returned.",
+                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
                 codex_utils_output_truncation::adaptive_output_budget_description()
             ), 0, usize::MAX as u64),
         ),
@@ -344,7 +396,7 @@ fn write_stdin_tool_matches_expected_spec() {
         ToolSpec::Function(ResponsesApiTool {
             name: "write_stdin".to_string(),
             description:
-                "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
+                "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C only with interrupt=true, and empty input to poll with polling=true. cancellation describes explicit process cancellation through this tool; false means no such operation is exposed. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
                     .to_string(),
             strict: false,
             defer_loading: None,
@@ -676,6 +728,11 @@ fn command_output_schemas_require_integral_counters_but_allow_fractional_time() 
             "wall_time_seconds": 0.125,
             "output": "done",
             "exit_code": -1,
+            "execution_state": "exited",
+            "process_exited": true,
+            "output_complete": false,
+            "output_reduced": false,
+            "raw_output_artifact_retention_limit_hit": false,
             "session_id": 42,
             "original_token_count": 100,
             "raw_output_artifact_bytes": 400
@@ -694,6 +751,70 @@ fn command_output_schemas_require_integral_counters_but_allow_fractional_time() 
                 "{} must reject fractional {field}",
                 tool.name
             );
+        }
+    }
+}
+
+#[test]
+fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results() {
+    use crate::tools::context::ExecCommandToolOutput;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+    use codex_utils_output_truncation::TruncationPolicy;
+
+    let schema = unified_exec_output_schema();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(!validator.is_valid(&json!({"wall_time_seconds": 1.0, "output": "partial"})));
+    for (process_id, exit_code, process_exited, expected) in [
+        (Some(42), None, false, "running"),
+        (None, Some(0), true, "exited"),
+        (None, Some(1), true, "exited"),
+        (Some(42), Some(0), true, "exited"), // exited with output left to drain
+        (None, None, true, "exited"),        // terminal, exit code unavailable
+        (None, None, false, "unknown"),
+    ] {
+        let output = ExecCommandToolOutput {
+            validation: None,
+            event_call_id: "lifecycle".into(),
+            chunk_id: "chunk".into(),
+            wall_time: std::time::Duration::from_millis(125),
+            raw_output: b"evidence".to_vec(),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            max_output_tokens: Some(0),
+            process_id,
+            session_capabilities: None,
+            exit_code,
+            process_exited,
+            search_no_match: false,
+            original_token_count: Some(2),
+            hook_command: None,
+            raw_output_artifact: None,
+            raw_output_reduction_notice: None,
+            repair_notice: None,
+            pending_deferred_completions: Vec::new(),
+        };
+        let result = output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".into(),
+        });
+        assert_eq!(result["execution_state"], expected);
+        assert_eq!(result["exit_code"], json!(exit_code));
+        assert!(validator.is_valid(&result), "{result}");
+        assert_eq!(
+            output.projection_metadata().unwrap().essential_inline["execution_state"],
+            expected
+        );
+        for field in ["execution_state", "process_exited", "exit_code"] {
+            let mut invalid = result.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(!validator.is_valid(&invalid), "missing {field}: {invalid}");
+        }
+        if expected == "running" {
+            let mut invalid = result.clone();
+            invalid.as_object_mut().unwrap().remove("session_id");
+            assert!(!validator.is_valid(&invalid));
+            let mut invalid = result;
+            invalid["exit_code"] = json!(0);
+            assert!(!validator.is_valid(&invalid));
         }
     }
 }

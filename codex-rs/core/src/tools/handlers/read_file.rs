@@ -76,11 +76,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             .push(json!("path"));
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: "Read selected text from a file without shell quoting. Use lines, bytes, or fixed-string search with context, with the same selectors as read_tool_output. Reads UTF-8 files up to 8 MiB through the selected environment's filesystem permissions. Returns the resolved path, content hash, and an immutable artifact_id; use read_tool_output with that artifact_id and returned continuation or child_selectors for more of the same snapshot. A new read_file call reads current disk contents.".to_string(),
+            description: "Read selected text from a file without shell quoting. Use lines, bytes, or fixed-string search with context, with the same selectors as read_tool_output. Reads UTF-8 files up to 8 MiB through the selected environment's filesystem permissions. Returns the resolved path, content hash, and an immutable artifact_id; use read_tool_output with that artifact_id and returned continuation or child_selectors for more of the same snapshot. A new read_file call reads current disk contents. Every accepted call returns one entry in results[] per normalized selector: entries with status ok carry the text, and any other status carries message and child_selectors describing how to read that part. Only an invalid invocation returns an error instead of results[]. Pass a `skill:` locator from the skills catalog as the path to read that skill's SKILL.md; skills are host-owned, so omit environment_id for them.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, or a `skill:` locator from the skills catalog.".to_string()))),
                 ("environment_id".to_string(), JsonSchema::string(Some("Environment id; omit to use the primary environment.".to_string()))),
                 ("selectors".to_string(), selectors),
             ]), Some(vec!["path".to_string(), "selectors".to_string()]), Some(false.into())),
@@ -122,58 +122,18 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     "read_file cancelled".to_string(),
                 ));
             }
-            let environment = resolve_tool_environment(
-                &invocation.step_context.environments,
-                args.environment_id.as_deref(),
-            )?
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "read_file is unavailable without an environment".to_string(),
-                )
-            })?;
-            let path = environment
-                .cwd()
-                .join(&args.path)
-                .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
             let turn = &invocation.step_context.turn;
-            let sandbox = turn.file_system_sandbox_context(None, environment.cwd());
-            let fs = environment.environment.get_filesystem();
-            let metadata = fs
-                .get_metadata(&path, Some(&sandbox))
-                .await
-                .map_err(|err| {
-                    FunctionCallError::RespondToModel(format!(
-                        "unable to locate {}: {err}",
-                        path.inferred_native_path_string()
-                    ))
-                })?;
-            if !metadata.is_file {
-                return Err(FunctionCallError::RespondToModel(
-                    "read_file requires a regular file".to_string(),
-                ));
-            }
-            if metadata.size > MAX_FILE_BYTES as u64 {
-                return Err(FunctionCallError::RespondToModel(
-                    "file exceeds the 8 MiB read limit".to_string(),
-                ));
-            }
-            let contents = fs
-                .read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox))
-                .await
-                .map_err(|err| {
-                    FunctionCallError::RespondToModel(format!(
-                        "unable to read {}: {err}",
-                        path.inferred_native_path_string()
-                    ))
-                })?
-                .ok_or_else(|| {
-                    FunctionCallError::RespondToModel(
-                        "file exceeds the 8 MiB read limit or changed while being read".to_string(),
-                    )
-                })?;
-            let contents = String::from_utf8(contents).map_err(|_| {
-                FunctionCallError::RespondToModel("read_file requires UTF-8 text".to_string())
-            })?;
+            // The catalog advertises `skill:<id>` locators, so this tool has to
+            // resolve them. Without it the model can see every skill listed and
+            // load none of them.
+            let (contents, resolved_path) = if args
+                .path
+                .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
+            {
+                read_skill_locator(&invocation, &args).await?
+            } else {
+                read_environment_file(&invocation, &args).await?
+            };
             if invocation.cancellation_token.is_cancelled() {
                 return Err(FunctionCallError::RespondToModel(
                     "read_file cancelled".to_string(),
@@ -210,10 +170,114 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
             let mut output = serde_json::to_value(result)
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-            output["path"] = json!(path.inferred_native_path_string());
+            output["path"] = json!(resolved_path);
             Ok(boxed_tool_output(JsonToolOutput::new(output)))
         })
     }
+}
+
+/// Reads an ordinary path through the selected environment's filesystem.
+async fn read_environment_file(
+    invocation: &ToolInvocation,
+    args: &ReadFileArgs,
+) -> Result<(String, String), FunctionCallError> {
+    let environment = resolve_tool_environment(
+        &invocation.step_context.environments,
+        args.environment_id.as_deref(),
+    )?
+    .ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "read_file is unavailable without an environment".to_string(),
+        )
+    })?;
+    let path = environment
+        .cwd()
+        .join(&args.path)
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+    let turn = &invocation.step_context.turn;
+    let sandbox = turn.file_system_sandbox_context(None, environment.cwd());
+    let fs = environment.environment.get_filesystem();
+    let metadata = fs
+        .get_metadata(&path, Some(&sandbox))
+        .await
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "unable to locate {}: {err}",
+                path.inferred_native_path_string()
+            ))
+        })?;
+    if !metadata.is_file {
+        return Err(FunctionCallError::RespondToModel(
+            "read_file requires a regular file".to_string(),
+        ));
+    }
+    if metadata.size > MAX_FILE_BYTES as u64 {
+        return Err(FunctionCallError::RespondToModel(
+            "file exceeds the 8 MiB read limit".to_string(),
+        ));
+    }
+    let contents = fs
+        .read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox))
+        .await
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "unable to read {}: {err}",
+                path.inferred_native_path_string()
+            ))
+        })?
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "file exceeds the 8 MiB read limit or changed while being read".to_string(),
+            )
+        })?;
+    let contents = String::from_utf8(contents).map_err(|_| {
+        FunctionCallError::RespondToModel("read_file requires UTF-8 text".to_string())
+    })?;
+    Ok((contents, path.inferred_native_path_string()))
+}
+
+/// Reads a `skill:<catalog-id>` locator through the provider that discovered
+/// the skill.
+///
+/// Skills are host-owned and are not addressable inside a turn environment, so
+/// a caller that names one is told where the read actually happens rather than
+/// being handed an error about a missing path.
+async fn read_skill_locator(
+    invocation: &ToolInvocation,
+    args: &ReadFileArgs,
+) -> Result<(String, String), FunctionCallError> {
+    let turn = &invocation.step_context.turn;
+    if let Some(environment_id) = args.environment_id.as_deref()
+        && invocation
+            .step_context
+            .environments
+            .primary()
+            .is_none_or(|primary| primary.environment_id != environment_id)
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "skill locators are read through the skill's own provider, not environment `{environment_id}`; omit environment_id"
+        )));
+    }
+    let snapshot = &turn.turn_skills.snapshot;
+    let skill = snapshot
+        .resolve_catalog_locator(&args.path)
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "unknown skill locator `{}`; use a locator from the skills catalog",
+                args.path
+            ))
+        })?
+        .clone();
+    let (contents, path) = snapshot
+        .read_skill_text_bounded(&skill, MAX_FILE_BYTES)
+        .await
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "unable to read skill `{}`: {err}",
+                args.path
+            ))
+        })?;
+    Ok((contents, path.to_string_lossy().into_owned()))
 }
 
 impl CoreToolRuntime for ReadFileHandler {}
@@ -341,6 +405,172 @@ mod tests {
             .unwrap()
             .validate(&result)
             .unwrap();
+    }
+
+    /// Builds a turn whose skills snapshot holds one real skill loaded from
+    /// disk, plus the locator the catalog would advertise for it.
+    async fn skill_invocation(
+        root: &Path,
+        locator_path: Option<String>,
+        environment_id: Option<&str>,
+    ) -> (ToolInvocation, String, std::path::PathBuf) {
+        use codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX;
+        use codex_core_skills::loader::SkillRoot;
+        use codex_core_skills::loader::load_skills_from_roots;
+        use codex_utils_absolute_path::test_support::PathExt;
+
+        let skill_dir = root.join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &skill_md,
+            "---\nname: demo-skill\ndescription: demo skill for locator reads\n---\nfirst line\nsecond line\nthird line\n",
+        )
+        .unwrap();
+        let outcome = load_skills_from_roots(
+            vec![SkillRoot {
+                path: root.abs(),
+                scope: codex_protocol::protocol::SkillScope::Repo,
+                file_system: Arc::clone(&codex_exec_server::LOCAL_FS),
+                plugin_id: None,
+                plugin_namespace: None,
+                plugin_root: None,
+            }],
+            None,
+        )
+        .await;
+        assert!(
+            !outcome.skills.is_empty(),
+            "fixture must load one skill: {:?}",
+            outcome.errors
+        );
+        let locator = format!(
+            "{SKILL_CATALOG_LOCATOR_PREFIX}{}",
+            codex_core_skills::skill_catalog_id(&outcome.skills[0])
+        );
+        let snapshot = codex_core_skills::HostSkillsSnapshot::new(Arc::new(outcome));
+
+        let (session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = PermissionProfile::Disabled;
+        turn.turn_skills = crate::session::turn_context::TurnSkillsContext::new(snapshot);
+        let mut arguments = json!({
+            "path": locator_path.clone().unwrap_or_else(|| locator.clone()),
+            "selectors": [{"kind": "lines", "start": 1, "end": 10}],
+        });
+        if let Some(environment_id) = environment_id {
+            arguments["environment_id"] = json!(environment_id);
+        }
+        (
+            ToolInvocation {
+                session: Arc::new(session),
+                step_context: StepContext::for_test(Arc::new(turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "call-read-skill".to_string(),
+                tool_name: ToolName::plain("read_file"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: arguments.to_string(),
+                },
+            },
+            locator,
+            skill_md,
+        )
+    }
+
+    /// The catalog advertises `skill:` locators, so a tool has to resolve them.
+    /// Without this the model can see every skill listed and load none of them.
+    #[tokio::test]
+    async fn a_skill_locator_reads_its_skill_md_through_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (call, _locator, skill_md) = skill_invocation(dir.path(), None, None).await;
+        let payload = call.payload.clone();
+        let result = ReadFileHandler
+            .handle(call)
+            .await
+            .unwrap()
+            .code_mode_result(&payload);
+
+        assert_eq!(result["results"][0]["status"], "ok");
+        let text = result["results"][0]["text"].as_str().unwrap();
+        assert!(text.contains("first line"), "{text}");
+        assert!(text.contains("third line"), "{text}");
+        assert_eq!(
+            result["path"],
+            skill_md.to_string_lossy().as_ref(),
+            "the resolved skill path is reported, not the locator"
+        );
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
+            panic!("function tool expected")
+        };
+        jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+            .unwrap()
+            .validate(&result)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_skill_reads_work_without_an_environment_but_ordinary_paths_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut call, _, skill_md) = skill_invocation(dir.path(), None, None).await;
+        Arc::get_mut(&mut call.step_context)
+            .unwrap()
+            .environments
+            .turn_environments
+            .clear();
+        let payload = call.payload.clone();
+        let result = ReadFileHandler
+            .handle(call.clone())
+            .await
+            .unwrap()
+            .code_mode_result(&payload);
+        assert_eq!(result["results"][0]["status"], "ok");
+        assert!(
+            result["results"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("third line")
+        );
+
+        call.payload = ToolPayload::Function {
+            arguments:
+                json!({"path": skill_md, "selectors": [{"kind": "lines", "start": 1, "end": 10}]})
+                    .to_string(),
+        };
+        let Err(FunctionCallError::RespondToModel(message)) = ReadFileHandler.handle(call).await
+        else {
+            panic!("ordinary paths must require an execution environment")
+        };
+        assert!(
+            message.contains("read_file is unavailable without an environment"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_locator_failures_name_what_went_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let (call, _, _) =
+            skill_invocation(dir.path(), Some("skill:not-a-real-id".to_string()), None).await;
+        let Err(FunctionCallError::RespondToModel(message)) = ReadFileHandler.handle(call).await
+        else {
+            panic!("expected an unknown locator to be rejected")
+        };
+        assert!(
+            message.contains("skill:not-a-real-id") && message.contains("unknown skill locator"),
+            "{message}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (call, _, _) = skill_invocation(dir.path(), None, Some("some-other-environment")).await;
+        let Err(FunctionCallError::RespondToModel(message)) = ReadFileHandler.handle(call).await
+        else {
+            panic!("expected an incompatible environment to be rejected")
+        };
+        assert!(
+            message.contains("skill's own provider") && message.contains("some-other-environment"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

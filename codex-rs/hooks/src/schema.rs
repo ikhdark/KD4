@@ -302,6 +302,10 @@ pub(crate) struct PreToolUseCommandInput {
     pub tool_name: String,
     pub tool_input: Value,
     pub tool_use_id: String,
+    /// Codex extension: flat names of tools already dispatched earlier in this
+    /// turn, so a hook can skip advice the turn has already acted on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_tool_calls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1165,6 +1169,42 @@ mod tests {
     }
 
     #[test]
+    fn pre_tool_use_command_input_serializes_turn_tool_calls_only_when_present() {
+        let input = PreToolUseCommandInput {
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            agent_id: None,
+            agent_type: None,
+            transcript_path: NullableString::from_path(/*path*/ None),
+            cwd: "/tmp".to_string(),
+            hook_event_name: "PreToolUse".to_string(),
+            model: "gpt-test".to_string(),
+            permission_mode: "default".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: json!({ "command": "rg project/list" }),
+            tool_use_id: "tool-2".to_string(),
+            turn_tool_calls: vec!["task".to_string(), "exec_command".to_string()],
+        };
+
+        let value = serde_json::to_value(input).expect("serialize hook input");
+        assert_eq!(value["turn_tool_calls"], json!(["task", "exec_command"]));
+
+        let schema: Value =
+            serde_json::from_slice(&schema_json::<PreToolUseCommandInput>().expect("schema"))
+                .expect("schema value");
+        assert_eq!(
+            schema["properties"]["turn_tool_calls"]["items"]["type"],
+            "string"
+        );
+        assert!(
+            !schema["required"]
+                .as_array()
+                .expect("schema required fields")
+                .contains(&Value::String("turn_tool_calls".to_string()))
+        );
+    }
+
+    #[test]
     fn subagent_context_fields_serialize_flat_and_omit_when_absent() {
         let subagent = SubagentCommandInputFields::from(Some(&SubagentHookContext {
             agent_id: "agent-1".to_string(),
@@ -1183,6 +1223,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             tool_input: json!({ "command": "echo hello" }),
             tool_use_id: "tool-1".to_string(),
+            turn_tool_calls: Vec::new(),
         };
 
         assert_eq!(
@@ -1216,6 +1257,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             tool_input: json!({ "command": "echo hello" }),
             tool_use_id: "tool-1".to_string(),
+            turn_tool_calls: Vec::new(),
         };
         let root_input = serde_json::to_value(root_input).expect("serialize root hook input");
         assert_eq!(root_input.get("agent_id"), None);

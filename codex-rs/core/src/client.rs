@@ -225,6 +225,9 @@ struct ModelRequestMeasurements {
     tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
     full_prompt_estimated_tokens: u64,
     fixed_prefix_reuse_eligible: bool,
+    /// True once a previous request baseline existed for comparison, so an
+    /// ineligible first request is not reported as changed categories.
+    prompt_context_baseline_compared: bool,
     stable_context_manifest: StableContextManifest,
     logical_context_tokens: i64,
     active_component_bytes: u64,
@@ -235,6 +238,61 @@ struct ModelRequestMeasurements {
     provider_baseline: ModelAttemptProviderBaseline,
     previous_response_id_present: bool,
     local_projection_policy_active: bool,
+    /// Digest of each input item in the request that was actually sent, in
+    /// order, after projection and normalization.
+    ///
+    /// The whole-history digest changes on every request by design, so it
+    /// cannot tell an append from a rewrite. Per-item digests can.
+    input_item_digests: Vec<[u8; 32]>,
+    /// Filled by comparison against the preceding request; absent on the first.
+    history_divergence: Option<HistoryPrefixDivergence>,
+    /// Drops the aggregate output budget made in the representation this
+    /// request actually sent. Other representations are prepared and discarded,
+    /// so their drops must not be attributed here.
+    tool_output_budget_drop_count: u32,
+    tool_output_budget_dropped_token_count: u64,
+}
+
+/// How this request's input prefix relates to the preceding request's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistoryPrefixDivergence {
+    items_previous: u32,
+    prefix_items_reused: u32,
+    first_divergent_index: u32,
+}
+
+/// Compares two ordered input digests.
+///
+/// `prefix_items_reused == items_previous` means the request only appended, so
+/// the provider's prefix cache could still apply. A smaller value locates the
+/// index at which the prefix was rewritten or truncated.
+fn prefix_divergence(previous: &[[u8; 32]], current: &[[u8; 32]]) -> HistoryPrefixDivergence {
+    let reused = previous
+        .iter()
+        .zip(current)
+        .take_while(|(previous, current)| previous == current)
+        .count();
+    let reused = u32::try_from(reused).unwrap_or(u32::MAX);
+    HistoryPrefixDivergence {
+        items_previous: u32::try_from(previous.len()).unwrap_or(u32::MAX),
+        prefix_items_reused: reused,
+        // The first index that differs is exactly the length of the shared
+        // prefix; when nothing differs it is one past the shared items.
+        first_divergent_index: reused,
+    }
+}
+
+/// Digests each input item of the request that is actually sent.
+fn input_item_digests(input: &[ResponseItem]) -> Vec<[u8; 32]> {
+    input
+        .iter()
+        .map(|item| {
+            let encoded = serde_json::to_vec(item).unwrap_or_default();
+            let mut digest = [0_u8; 32];
+            digest.copy_from_slice(&Sha256::digest(&encoded));
+            digest
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +301,7 @@ struct PromptContextBaseline {
     category_hashes: BTreeMap<&'static str, [u8; 32]>,
     ordered_fixed_hashes: Vec<(&'static str, [u8; 32])>,
     digests: PromptDigests,
+    input_item_digests: Vec<[u8; 32]>,
 }
 
 impl ModelRequestMeasurements {
@@ -308,6 +367,21 @@ impl ModelRequestMeasurements {
             .fold(0_u64, |total, measurement| {
                 total.saturating_add(measurement.estimated_tokens)
             });
+        let fixed_prefix_changed_categories =
+            if self.prompt_context_baseline_compared && !self.fixed_prefix_reuse_eligible {
+                PromptContextCategory::FIXED_PREFIX
+                    .into_iter()
+                    .filter(|category| {
+                        self.prompt_context_categories.iter().any(|measurement| {
+                            measurement.category == category.as_str()
+                                && !measurement.unchanged_from_previous_request
+                        })
+                    })
+                    .map(|category| category.as_str().to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         TurnTimingRequestTokenCategories {
             accounting_basis: TurnTimingTokenCategoryBasis::FullLogicalPrompt,
             base_instructions: self.tokens(PromptContextCategory::BaseSystem),
@@ -328,6 +402,18 @@ impl ModelRequestMeasurements {
             provider_input_tokens: None,
             provider_reconciliation_residual: None,
             repeated_unchanged_context,
+            fixed_prefix_changed_categories,
+            history_items_previous: self
+                .history_divergence
+                .map(|divergence| divergence.items_previous),
+            history_prefix_items_reused: self
+                .history_divergence
+                .map(|divergence| divergence.prefix_items_reused),
+            history_first_divergent_index: self
+                .history_divergence
+                .map(|divergence| divergence.first_divergent_index),
+            tool_output_budget_drop_count: self.tool_output_budget_drop_count,
+            tool_output_budget_dropped_token_count: self.tool_output_budget_dropped_token_count,
         }
     }
 
@@ -402,7 +488,12 @@ impl ModelRequestMeasurements {
                 b"tool_schema_array_envelope",
             );
         }
-        Self::from_context(logical_request_bytes, context, tool_schema_breakdown)
+        Self::from_context(
+            logical_request_bytes,
+            context,
+            tool_schema_breakdown,
+            input_item_digests(&request.input),
+        )
     }
 
     fn for_responses_request_from_encoded_cancellable(
@@ -490,13 +581,19 @@ impl ModelRequestMeasurements {
                 b"tool_schema_array_envelope",
             );
         }
-        Self::from_context(logical_request_bytes, context, tool_schema_breakdown)
+        Self::from_context(
+            logical_request_bytes,
+            context,
+            tool_schema_breakdown,
+            input_item_digests(&request.input),
+        )
     }
 
     fn from_context(
         logical_request_bytes: u64,
         context: PromptContextBreakdown,
         tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
+        input_item_digests: Vec<[u8; 32]>,
     ) -> serde_json::Result<Self> {
         let full_prompt_estimated_tokens = context.total_estimated_tokens();
         let tool_token_count =
@@ -553,6 +650,7 @@ impl ModelRequestMeasurements {
             tool_schema_breakdown,
             full_prompt_estimated_tokens,
             fixed_prefix_reuse_eligible: false,
+            prompt_context_baseline_compared: false,
             stable_context_manifest: StableContextManifest::default(),
             logical_context_tokens: 0,
             active_component_bytes: 0,
@@ -563,6 +661,10 @@ impl ModelRequestMeasurements {
             provider_baseline: ModelAttemptProviderBaseline::StatelessFull,
             previous_response_id_present: false,
             local_projection_policy_active: false,
+            input_item_digests,
+            history_divergence: None,
+            tool_output_budget_drop_count: 0,
+            tool_output_budget_dropped_token_count: 0,
         })
     }
 
@@ -572,6 +674,12 @@ impl ModelRequestMeasurements {
         prompt_cache_key: Option<&str>,
         digests: PromptDigests,
     ) {
+        self.prompt_context_baseline_compared = baseline.is_some();
+        // A first request has no predecessor to diverge from, so it reports no
+        // divergence rather than a vacuous zero.
+        self.history_divergence = baseline.as_ref().map(|previous| {
+            prefix_divergence(&previous.input_item_digests, &self.input_item_digests)
+        });
         if let Some(previous) = baseline.as_ref() {
             for measurement in &mut self.prompt_context_categories {
                 let reused_digest = match measurement.category {
@@ -622,6 +730,7 @@ impl ModelRequestMeasurements {
             category_hashes,
             ordered_fixed_hashes,
             digests,
+            input_item_digests: self.input_item_digests.clone(),
         });
     }
 
@@ -939,14 +1048,37 @@ struct PostDispatchRequestMeasurements {
     stable_context_manifest: StableContextManifest,
 }
 
+/// Which of the four prepared input representations a request dispatched.
+///
+/// The other three are prepared and discarded, so only this one's aggregate
+/// budget drops may be attributed to the request.
+#[derive(Clone, Copy, Debug, Default)]
+struct SelectedInputRepresentation {
+    stable_context_fallback: bool,
+    tool_history_fallback: bool,
+}
+
+impl SelectedInputRepresentation {
+    /// A fallback build replaced the logical input, so provenance has to be
+    /// recomputed from the items that were actually sent.
+    fn is_reprojected(self) -> bool {
+        self.stable_context_fallback || self.tool_history_fallback
+    }
+}
+
 fn measure_responses_request_after_dispatch(
     request: ResponsesApiRequest,
     prompt: Prompt,
-    input_reprojected: bool,
+    selected_representation: SelectedInputRepresentation,
     cancellation: CancellationToken,
     logical_request_bytes: Option<u64>,
     encoded_request: Option<Bytes>,
 ) -> tokio::task::JoinHandle<PostDispatchRequestMeasurements> {
+    let selected_budget_drops = prompt.selected_tool_output_budget_drops(
+        selected_representation.stable_context_fallback,
+        selected_representation.tool_history_fallback,
+    );
+    let input_reprojected = selected_representation.is_reprojected();
     tokio::spawn(async move {
         let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
         let blocking_cancellation = cancellation.clone();
@@ -991,6 +1123,8 @@ fn measure_responses_request_after_dispatch(
                     )?,
                 };
                 measurements.wire_request_bytes = wire_request_bytes;
+                measurements.tool_output_budget_drop_count = selected_budget_drops.count;
+                measurements.tool_output_budget_dropped_token_count = selected_budget_drops.tokens;
                 Ok::<_, serde_json::Error>(measurements)
             })();
             let stable_context_manifest =
@@ -1532,8 +1666,45 @@ pub(crate) fn request_effort_for_model(
     model_info: &ModelInfo,
     effort: Option<ReasoningEffortConfig>,
 ) -> Option<ReasoningEffortConfig> {
-    crate::session::reasoning_governor::resolve_request_policy(None, None, effort, model_info)
-        .request_effort
+    effort
+        .or_else(|| {
+            model_info
+                .supports_reasoning_summaries
+                .then(|| model_info.default_reasoning_level.clone())
+                .flatten()
+        })
+        .and_then(|effort| {
+            if !matches!(
+                effort,
+                ReasoningEffortConfig::Ultra | ReasoningEffortConfig::Max
+            ) {
+                return Some(effort);
+            }
+            let supported = &model_info.supported_reasoning_levels;
+            // Ultra is a local alias for wire Max. Older catalogs stop at xhigh;
+            // do not send an unsupported Max merely because a preset requested it.
+            if supported.is_empty()
+                || supported.iter().any(|level| {
+                    matches!(
+                        level.effort,
+                        ReasoningEffortConfig::Ultra | ReasoningEffortConfig::Max
+                    )
+                })
+            {
+                return Some(ReasoningEffortConfig::Max);
+            }
+            [
+                ReasoningEffortConfig::XHigh,
+                ReasoningEffortConfig::High,
+                ReasoningEffortConfig::Medium,
+                ReasoningEffortConfig::Low,
+                ReasoningEffortConfig::Minimal,
+                ReasoningEffortConfig::None,
+            ]
+            .into_iter()
+            .find(|candidate| supported.iter().any(|level| &level.effort == candidate))
+            .or_else(|| model_info.default_reasoning_level.clone())
+        })
 }
 
 fn session_telemetry_for_request(
@@ -3668,7 +3839,6 @@ impl ModelClientSession {
             let inference_trace_attempt =
                 AsyncInferenceTraceAttempt::from(inference_trace.start_attempt());
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
-            inference_trace_attempt.record_started(&request).await;
             attempt_clock.mark_queue_started();
             let sampling_admission = match attempt_prepared.as_ref() {
                 Some(attempt_prepared) => attempt_prepared(attempt_identity.clone()).await,
@@ -3676,6 +3846,13 @@ impl ModelClientSession {
             };
             attempt_clock.mark_queue_finished();
             let _sampling_admission = sampling_admission?;
+            inference_trace_attempt
+                .record_audited_request(
+                    &request,
+                    &attempt_identity,
+                    None::<(&ResponsesApiRequest, &str)>,
+                )
+                .await;
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
@@ -3716,7 +3893,8 @@ impl ModelClientSession {
                 AbortOnDropHandle::new(measure_responses_request_after_dispatch(
                     request,
                     prompt.clone(),
-                    /*input_reprojected*/ false,
+                    // The HTTP path always dispatches the logical projection.
+                    SelectedInputRepresentation::default(),
                     measurement_cancellation.clone(),
                     logical_request_bytes,
                     dispatched_request,
@@ -4053,10 +4231,14 @@ impl ModelClientSession {
                 tool_history_substitutions,
                 build_tool_history_fail_open_request,
             )?;
-            let mut input_reprojected = false;
+            let mut selected_representation = SelectedInputRepresentation::default();
             if let Some(fallback_request) = tool_history_fail_open_override {
                 request = fallback_request;
-                input_reprojected = true;
+                // Built above with both fallbacks enabled.
+                selected_representation = SelectedInputRepresentation {
+                    stable_context_fallback: true,
+                    tool_history_fallback: true,
+                };
             }
             let inherited_stable_context_matches = self
                 .websocket_session
@@ -4086,7 +4268,10 @@ impl ModelClientSession {
                 final_payload.input = fallback_request.input.clone();
                 request = fallback_request;
                 verified_history = None;
-                input_reprojected = true;
+                selected_representation = SelectedInputRepresentation {
+                    stable_context_fallback: true,
+                    tool_history_fallback: false,
+                };
             }
             // `prepare_websocket_request` may invalidate a superseded stable
             // context baseline. Read the generation only after that decision
@@ -4129,14 +4314,6 @@ impl ModelClientSession {
                 Some(logical_request)
             };
             drop(request_transformation_guard);
-            if previous_response_id_from_untraced_warmup {
-                // The transport can reuse an untraced warmup response id and omit the
-                // already-sent input, but rollout replay needs the logical model-visible
-                // request rather than the compressed websocket delta.
-                inference_trace_attempt.record_started(&request).await;
-            } else {
-                inference_trace_attempt.record_started(&ws_request).await;
-            }
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
                     self.client.state.provider.map_api_error(ApiError::Stream(
@@ -4167,6 +4344,29 @@ impl ModelClientSession {
                 clock.mark_queue_finished();
             }
             let _sampling_admission = sampling_admission?;
+            if let Some(identity) = &attempt_identity {
+                if previous_response_id_from_untraced_warmup {
+                    // Replay needs the inherited warmup prefix, while the audit
+                    // also retains the actual transport delta.
+                    inference_trace_attempt
+                        .record_audited_request(
+                            logical_request_for_measurement.as_ref().unwrap_or(&request),
+                            identity,
+                            Some((&ws_request, "wire_request")),
+                        )
+                        .await;
+                } else {
+                    inference_trace_attempt
+                        .record_audited_request(
+                            &ws_request,
+                            identity,
+                            logical_request_for_measurement
+                                .as_ref()
+                                .map(|logical| (logical, "logical_request")),
+                        )
+                        .await;
+                }
+            }
             let turn_timing = self.turn_timing.clone();
             let serialization_timing_guard = self
                 .turn_timing
@@ -4219,7 +4419,7 @@ impl ModelClientSession {
                         AbortOnDropHandle::new(measure_responses_request_after_dispatch(
                             logical_request,
                             prompt.clone(),
-                            input_reprojected,
+                            selected_representation,
                             measurement_cancellation.clone(),
                             /*logical_request_bytes*/ None,
                             dispatched_request,
@@ -4629,21 +4829,39 @@ impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
 }
 
 impl AsyncInferenceTraceAttempt {
-    fn add_request_headers(&self, headers: &mut ApiHeaderMap) {
-        if let Some(attempt) = &self.attempt {
-            attempt.add_request_headers(headers);
-        }
-    }
-
-    async fn record_started<T: serde::Serialize + Clone + Send + 'static>(&self, request: &T) {
+    async fn record_audited_request<T, U>(
+        &self,
+        request: &T,
+        identity: &ResponseAttemptIdentity,
+        companion: Option<(&U, &'static str)>,
+    ) where
+        T: serde::Serialize + Clone + Send + 'static,
+        U: serde::Serialize + Clone + Send + 'static,
+    {
         let Some(attempt) = &self.attempt else {
             return;
         };
         let request = request.clone();
+        let identity = identity.clone();
+        let companion = companion.map(|(value, key)| (value.clone(), key));
         Self::record(Arc::clone(attempt), move |attempt| {
-            attempt.record_started(&request);
+            let mut metadata = serde_json::json!({
+                "schema_version": 1,
+                "sampling_request_id": identity.sampling_request_id,
+                "physical_attempt_id": identity.physical_attempt_id,
+            });
+            if let Some((value, key)) = companion {
+                metadata[key] = serde_json::to_value(value).unwrap_or_default();
+            }
+            attempt.record_started_with_metadata(&request, metadata);
         })
         .await;
+    }
+
+    fn add_request_headers(&self, headers: &mut ApiHeaderMap) {
+        if let Some(attempt) = &self.attempt {
+            attempt.add_request_headers(headers);
+        }
     }
 
     async fn record_completed(

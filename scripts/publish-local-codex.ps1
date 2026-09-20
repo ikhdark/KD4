@@ -1495,7 +1495,30 @@ function Get-CodexDesktopExecutableProof {
         return "<not installed>"
     }
 
-    $path = Join-Path $package.InstallLocation "app\Codex.exe"
+    $manifestPath = Join-Path $package.InstallLocation "AppxManifest.xml"
+    $relativeExecutable = $null
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
+            $applicationId = ($CodexDesktopAppId -split "!", 2)[1]
+            $application = @($manifest.Package.Applications.Application) |
+                Where-Object { [string]$_.Id -eq $applicationId } |
+                Select-Object -First 1
+            $relativeExecutable = [string]$application.Executable
+        }
+        catch {
+            return "<unavailable: could not read $manifestPath`: $($_.Exception.Message)>"
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($relativeExecutable)) {
+        $relativeExecutable = "app\Codex.exe"
+    }
+    $relativeExecutable = $relativeExecutable.Replace(
+        "/",
+        [System.IO.Path]::DirectorySeparatorChar
+    )
+    $path = Join-Path $package.InstallLocation $relativeExecutable
 
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         return "<missing: $path>"
@@ -2035,8 +2058,9 @@ function Ensure-LocalCodexSqliteHomeDirectory {
 function Get-CodexDesktopProcessesForPath {
     param([string]$DesktopPath)
 
+    $processName = [System.IO.Path]::GetFileNameWithoutExtension($DesktopPath)
     return @(
-        Get-Process Codex -ErrorAction SilentlyContinue |
+        Get-Process $processName -ErrorAction SilentlyContinue |
             Where-Object {
                 try {
                     [string]::Equals($_.Path, $DesktopPath, [System.StringComparison]::OrdinalIgnoreCase)

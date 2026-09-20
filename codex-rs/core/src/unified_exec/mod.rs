@@ -243,6 +243,12 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub truncation_policy: TruncationPolicy,
+    /// Instant a code-mode wrapper timeout fires for the enclosing nested call.
+    ///
+    /// Lock queueing and output observation are both charged against it, so the
+    /// poll can return a yielded process handle before the wrapper drops the
+    /// call. `None` for a direct model call, which the wrapper does not bound.
+    pub nested_deadline: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -313,6 +319,12 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    /// Effective ceiling for an empty `write_stdin` poll. A nested tool call
+    /// that can be asked to wait this long needs a hard deadline above it.
+    pub(crate) fn max_write_stdin_yield_time_ms(&self) -> u64 {
+        self.max_write_stdin_yield_time_ms
+    }
+
     fn mark_executor_ready(&self, environment_id: &str) -> bool {
         let mut ready = self
             .executor_ready_environments
@@ -339,6 +351,12 @@ struct ProcessEntry {
     hook_command: String,
     search_exit_one_is_no_match: bool,
     tty: bool,
+    /// This process was launched as a noninteractive validation run.
+    ///
+    /// Build and test output arrives in bursts with long silences between them.
+    /// A quiet period would end an empty poll at the first gap and bill another
+    /// model round trip, so later polls keep waiting for the requested yield.
+    validation_launch: bool,
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,

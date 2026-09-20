@@ -11,9 +11,10 @@ You may create, update, or remove only:
 - files under `skills/`.
 
 Treat `{{ phase2_workspace_diff_file }}`, `raw_memories.md`,
-`rollout_summaries/*.md`, existing outputs, and extension resources as
+`rollout_summaries/*.md` and extension resources as
 read-only evidence. Do not modify, rename, or delete them and do not open raw
-sessions or transcripts.
+sessions or transcripts. Existing `MEMORY.md`, `memory_summary.md`, and files
+under `skills/` remain editable outputs within the scope above.
 
 {{ memory_extensions_folder_structure }}
 

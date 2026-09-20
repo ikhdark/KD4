@@ -135,8 +135,7 @@ helpers = [
   "codex-command-runner",
 ]
 
-# `codex-config` owns the raw adaptive-reasoning tables; the adaptive reasoning
-# gate pairs it with the resolved `codex-core` defaults in one ordered run.
+# Configuration crate tests.
 [targets.config_lib]
 package = "codex-config"
 lib = true
@@ -150,31 +149,6 @@ helpers = []
 # report PASS exactly once. No discovery build is needed for normal execution;
 # `check-gates` explicitly verifies discovery without running tests or helpers.
 # ---------------------------------------------------------------------------
-
-[gates.adaptive-reasoning-contract]
-description = "Raw config tables, resolved defaults, and reachable sampling policy."
-
-[[gates.adaptive-reasoning-contract.steps]]
-target = "config_lib"
-tests = [
-  "config_toml::tests::reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables",
-  "merge::tests::empty_higher_reasoning_phase_table_preserves_lower_entries",
-  "merge::tests::partial_higher_reasoning_phase_table_merges_per_field",
-]
-
-[[gates.adaptive-reasoning-contract.steps]]
-target = "core_lib"
-helpers = []
-tests = [
-  "config::tests::load_config_defaults_phase_tracking_to_compatibility_efforts",
-  "config::tests::load_config_preserves_all_explicit_reasoning_phase_effort_overrides",
-  "config::tests::load_config_preserves_explicit_reasoning_phase_effort_overrides",
-  "session::reasoning_governor::tests::global_effort_survives_unoverridden_decision_bearing_phases",
-  "session::reasoning_governor::tests::protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged",
-  "session::reasoning_governor::tests::reachable_changed_continuation_defaults_to_low_even_when_turn_is_high",
-  "session::reasoning_governor::tests::reachable_changed_continuation_uses_the_lowest_supported_explicit_override",
-  "session::reasoning_governor::tests::request_policy_rejects_host_terminal_completion",
-]
 
 [gates.config-schema-protocol]
 description = "Config schema fixture parity without regenerating generated output."
@@ -273,31 +247,27 @@ target = "core_lib"
 tests = ["tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos"]
 helpers = []
 
-[gates.capability-kd4-phase-reasoning]
-description = "Reasoning phase transitions, failure classification, validation state, and disabled-runtime effort preservation."
-[[gates.capability-kd4-phase-reasoning.steps]]
+[gates.capability-kd4-turn-execution]
+description = "Turn convergence, deterministic continuation, and configured effort preservation."
+[[gates.capability-kd4-turn-execution.steps]]
 target = "core_lib"
 tests = [
-  "session::reasoning_governor::tests::scripted_phase_and_effort_flow_is_deterministic",
-  "session::reasoning_governor::tests::read_success_retains_sticky_phases_and_selects_their_explicit_effort",
-  "session::reasoning_governor::tests::tool_failures_dominate_a_competing_read",
-  "session::reasoning_governor::tests::non_failure_outcomes_do_not_enter_diagnose",
-  "session::reasoning_governor::tests::only_blocking_skips_reopen_failure_evidence",
-  "session::reasoning_governor::tests::current_validation_failure_dominates_a_competing_read",
-  "session::reasoning_governor::tests::fresh_validation_uses_final_revision_and_active_plan_state",
+    "session::turn_execution::tests::protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged",
 ]
 helpers = []
-[[gates.capability-kd4-phase-reasoning.steps]]
+[[gates.capability-kd4-turn-execution.steps]]
 target = "core_transport_telemetry"
-tests = ["suite::client::kd4_runtime_off_preserves_effort_after_tool_and_followup"]
+tests = [
+    "suite::client::configured_effort_survives_tools_and_followup",
+    "suite::client::initial_turn_preserves_configured_reasoning_effort",
+    "suite::client::initial_turn_uses_model_default_reasoning_effort",
+]
 
 [gates.kd4-runtime-controls]
-description = "KD4 runtime configuration, request policy, preflight, and child inheritance."
+description = "KD4 runtime preflight and child inheritance."
 [[gates.kd4-runtime-controls.steps]]
 target = "core_lib"
 tests = [
-  "config::tests::load_config_kd4_runtime_off_disables_phase_overrides",
-  "session::reasoning_governor::tests::kd4_runtime_off_preserves_high_even_for_residual_sampling",
   "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
   "tools::handlers::multi_agents::tests::kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents",
 ]

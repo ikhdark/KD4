@@ -69,7 +69,7 @@ Example combining operations:
 
 Important rules:
 
-- Reread the entire target region without truncation immediately before patching, reconcile changes, and keep each patch to one coherent contract.
+- Use a complete, still-current read of the target region before patching. Refresh only missing, changed, or uncertain context, reconcile changes, and keep each patch to one coherent contract.
 - Paths must be relative; never use absolute paths.
 - Use only this grammar. Do not include unified-diff headers such as `diff --git`, `---`, or `+++`.
 - Updates preserve whether a nonempty file ends with a newline. New lines use the file's first observed line ending; untouched lines retain their existing endings. Add operations use LF and terminate nonempty content with a newline.

@@ -103,7 +103,7 @@ fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
         assert_eq!(
             tracker.take_invalidation_warning(),
             Some(
-                "The turn diff is unavailable after a workspace mutation that could not be tracked exactly. A cleared diff does not mean there are no changes."
+                "The turn diff is unavailable because command effects or workspace changes could not be tracked exactly. Do not claim that no files changed without fresh workspace verification."
             )
         );
         assert_eq!(tracker.take_invalidation_warning(), None);
@@ -403,10 +403,11 @@ fn mutation_classification_separates_known_mutators_from_uncertain_commands() {
         ),
         CommandMutation::KnownMutation { .. }
     ));
-    assert!(matches!(
+    assert_eq!(
         command_mutation(&["python".into(), "edit.py".into()], None),
-        CommandMutation::KnownMutation { .. }
-    ));
+        CommandMutation::Uncertain
+    );
+    assert_eq!(CommandMutation::from(true), CommandMutation::Uncertain);
     assert_eq!(
         command_mutation(&["custom-codegen.exe".into()], None),
         CommandMutation::Uncertain
@@ -475,7 +476,7 @@ async fn uncertain_command_observation_detects_tracked_and_untracked_changes() {
         .expect("tracked result");
     assert!(matches!(
         resolve_uncertain_command_observation(Some(before_tracked != after_tracked)),
-        CommandMutation::KnownMutation { .. }
+        CommandMutation::UnattributedWorkspaceChange
     ));
 
     let before_untracked = after_tracked;
@@ -484,7 +485,10 @@ async fn uncertain_command_observation_detects_tracked_and_untracked_changes() {
         .await
         .expect("untracked result");
     let observed = resolve_uncertain_command_observation(Some(before_untracked != after_untracked));
-    assert!(matches!(observed, CommandMutation::KnownMutation { .. }));
+    assert!(matches!(
+        observed,
+        CommandMutation::UnattributedWorkspaceChange
+    ));
 
     let mut tracker = TurnDiffTracker::new();
     tracker.record_exec_command_end_with_mutation_at(

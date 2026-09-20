@@ -1,3 +1,9 @@
+use crate::CreateProjectParams;
+use crate::CreatedProject;
+use crate::DeletedProject;
+use crate::ListProjectsParams;
+use crate::MoveProjectParams;
+use crate::ProjectMoveOutcome;
 use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
@@ -19,6 +25,8 @@ use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::SearchThreadsParams;
+use crate::StoredProject;
+use crate::StoredProjectsPage;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadPage;
@@ -26,7 +34,9 @@ use crate::ThreadSearchPage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::TurnPage;
+use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
+use crate::UpdatedProject;
 
 /// Future returned by [`ThreadStore`] operations.
 pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResult<T>> + Send + 'a>>;
@@ -141,6 +151,71 @@ pub trait ThreadStore: Any + Send + Sync {
     ) -> ThreadStoreFuture<'_, StoredThread>;
 
     /// Lists stored threads matching the supplied filters.
+    /// Whether this store supports durable host-owned projects.
+    fn supports_projects(&self) -> bool {
+        false
+    }
+
+    fn list_projects(
+        &self,
+        _params: ListProjectsParams,
+    ) -> ThreadStoreFuture<'_, StoredProjectsPage> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "project/list",
+            })
+        })
+    }
+
+    fn read_project(&self, _project_id: String) -> ThreadStoreFuture<'_, Option<StoredProject>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "project/read",
+            })
+        })
+    }
+
+    fn create_project(
+        &self,
+        _params: CreateProjectParams,
+    ) -> ThreadStoreFuture<'_, CreatedProject> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "project/create",
+            })
+        })
+    }
+
+    fn update_project(
+        &self,
+        _params: UpdateProjectParams,
+    ) -> ThreadStoreFuture<'_, Option<UpdatedProject>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "project/update",
+            })
+        })
+    }
+
+    fn move_project(
+        &self,
+        _params: MoveProjectParams,
+    ) -> ThreadStoreFuture<'_, Option<ProjectMoveOutcome>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "project/move",
+            })
+        })
+    }
+
+    fn delete_project(&self, _project_id: String) -> ThreadStoreFuture<'_, Option<DeletedProject>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "project/delete",
+            })
+        })
+    }
+
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>;
 
     /// Searches stored threads and returns search-only preview metadata.

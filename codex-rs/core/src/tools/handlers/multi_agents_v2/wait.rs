@@ -100,7 +100,7 @@ impl Handler {
             .await;
         let (mut activity_rx, pending_activity) = session
             .input_queue
-            .subscribe_activity(turn_state.as_deref())
+            .subscribe_activity(turn_state.as_deref(), false)
             .await;
 
         session
@@ -636,6 +636,7 @@ impl Handler {
                     "outcome",
                     match outcome {
                         WaitOutcome::MailboxActivity => "mailbox",
+                        WaitOutcome::DeferredCompletion => "deferred_completion",
                         WaitOutcome::DurableActivity => "durable_progress",
                         WaitOutcome::MaintenanceActivity => "maintenance_activity",
                         WaitOutcome::Steered => "steered",
@@ -1013,6 +1014,9 @@ async fn read_next_wake_page(
                         let outcome = match *activity_rx.borrow_and_update() {
                             InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
                             InputQueueActivity::Steer => WaitOutcome::Steered,
+                            InputQueueActivity::InternalCompletion => {
+                                WaitOutcome::DeferredCompletion
+                            }
                         };
                         return BacklogPageRead::Activity(outcome);
                     }
@@ -1035,6 +1039,7 @@ fn take_pending_activity(
         Ok(true) => Some(match *activity_rx.borrow_and_update() {
             InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
             InputQueueActivity::Steer => WaitOutcome::Steered,
+            InputQueueActivity::InternalCompletion => WaitOutcome::DeferredCompletion,
         }),
         Ok(false) => None,
         Err(_) => {
@@ -1868,6 +1873,9 @@ impl WaitAgentResult {
     ) -> Self {
         let mut message = match outcome {
             WaitOutcome::MailboxActivity => "Wait completed.",
+            WaitOutcome::DeferredCompletion => {
+                "A deferred MCP result is waiting in your next response."
+            }
             WaitOutcome::DurableActivity => "Durable typed-task progress is available.",
             WaitOutcome::MaintenanceActivity => "Wait maintenance produced a state change.",
             WaitOutcome::Steered => "Wait interrupted by new input.",
@@ -2254,6 +2262,8 @@ impl ToolOutput for WaitAgentResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaitOutcome {
     MailboxActivity,
+    /// A deferred MCP result is queued for the next request.
+    DeferredCompletion,
     DurableActivity,
     MaintenanceActivity,
     Steered,
@@ -2324,6 +2334,7 @@ async fn wait_for_activity(
         let outcome = match activity {
             InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
             InputQueueActivity::Steer => WaitOutcome::Steered,
+            InputQueueActivity::InternalCompletion => WaitOutcome::DeferredCompletion,
         };
         return Ok((
             outcome,
@@ -2372,6 +2383,9 @@ async fn wait_for_activity(
             let outcome = match activity {
                 InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
                 InputQueueActivity::Steer => WaitOutcome::Steered,
+                            InputQueueActivity::InternalCompletion => {
+                                WaitOutcome::DeferredCompletion
+                            }
             };
             let wake_read = read_wake_events(store, root_session_id, cursor).await?;
             Ok((outcome, wake_read))

@@ -72,6 +72,7 @@ impl<'a> ToolEventCtx<'a> {
             cell_id,
             parent_call_id,
             runtime_tool_call_id,
+            ..
         } = source
         {
             self.parent_call_id = parent_call_id.as_deref();
@@ -1079,6 +1080,21 @@ async fn emit_exec_end(
         None => None,
     };
     if let Some(message) = invalidation_warning {
+        // A UI warning alone cannot constrain the model's clean-workspace claim.
+        ctx.session
+            .record_conversation_items(
+                ctx.turn,
+                &[codex_protocol::models::ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: message.to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+            )
+            .await;
         ctx.session
             .send_event(
                 ctx.turn,
@@ -1097,7 +1113,8 @@ fn observed_workspace_identity_changed(
     baseline: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
     current: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
 ) -> Option<bool> {
-    baseline.map(|baseline| baseline.as_ref() != current)
+    // Two unavailable snapshots do not prove a read-only execution.
+    Some(baseline?.as_ref()? != current?)
 }
 
 fn workspace_identity_capture_required(
@@ -1460,11 +1477,8 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_non_git_uncertain_command_identity_is_unchanged() {
-        assert_eq!(
-            observed_workspace_identity_changed(Some(&None), None),
-            Some(false)
-        );
+    fn unavailable_workspace_snapshots_do_not_prove_read_only_execution() {
+        assert_eq!(observed_workspace_identity_changed(Some(&None), None), None);
         assert_eq!(observed_workspace_identity_changed(None, None), None);
     }
 
@@ -1478,6 +1492,8 @@ mod tests {
             cell_id: "cell-7".to_string(),
             parent_call_id: Some("outer-exec-3".to_string()),
             runtime_tool_call_id: "runtime-call-11".to_string(),
+            nested_deadline: None,
+            cancellation_cause: None,
         };
         let timing = Arc::new(ToolDispatchTiming::new(Instant::now(), /*eager*/ true));
         let execution_id = timing.execution_id().0.clone();
@@ -2377,7 +2393,7 @@ mod tests {
         assert_eq!(
             warnings,
             vec![
-                "The turn diff is unavailable after a workspace mutation that could not be tracked exactly. A cleared diff does not mean there are no changes."
+                "The turn diff is unavailable because command effects or workspace changes could not be tracked exactly. Do not claim that no files changed without fresh workspace verification."
             ]
         );
         assert_eq!(
@@ -2548,10 +2564,16 @@ mod tests {
                 if unified_diff.contains("changed.txt") && unified_diff.contains("+after"))
             );
         } else {
+            let recorded = events.next().expect("model-visible uncertainty warning");
+            assert!(matches!(recorded.msg, EventMsg::RawResponseItem(event)
+                if matches!(&event.item, codex_protocol::models::ResponseItem::Message { role, content, .. }
+                    if role == "developer" && content.iter().any(|part| matches!(part,
+                        codex_protocol::models::ContentItem::InputText { text }
+                            if text.contains("without fresh workspace verification"))))));
             let warning = events.next().expect("unknown command diff warning");
             assert!(matches!(warning.msg, EventMsg::Warning(event)
                 if event.message.contains("The turn diff is unavailable")
-                    && event.message.contains("does not mean there are no changes")));
+                    && event.message.contains("without fresh workspace verification")));
             // Published exactly once: the turn-end emission must not repeat it.
             assert_eq!(tracker.lock().await.take_invalidation_warning(), None);
         }
@@ -2560,6 +2582,13 @@ mod tests {
             "completion must be emitted exactly once"
         );
         let history = session.clone_history().await;
+        if !apply_patch {
+            assert!(history.raw_items().iter().any(|item| matches!(item,
+                codex_protocol::models::ResponseItem::Message { role, content, .. }
+                    if role == "developer" && content.iter().any(|part| matches!(part,
+                        codex_protocol::models::ContentItem::InputText { text }
+                            if text.contains("without fresh workspace verification"))))));
+        }
         let live = serde_json::to_value(history.tool_history_state()).unwrap();
         assert_eq!(
             live["workspace_evidence"]["earlier-read"]["source_dependencies_current"],

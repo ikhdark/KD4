@@ -37,6 +37,7 @@ from .v2_all import ModelVerificationNotification
 from .v2_all import PlanDeltaNotification
 from .v2_all import ProcessExitedNotification
 from .v2_all import ProcessOutputDeltaNotification
+from .v2_all import ProjectChangedNotification
 from .v2_all import ReasoningSummaryPartAddedNotification
 from .v2_all import ReasoningSummaryTextDeltaNotification
 from .v2_all import ReasoningTextDeltaNotification
@@ -50,6 +51,7 @@ from .v2_all import ThreadDeletedNotification
 from .v2_all import ThreadGoalClearedNotification
 from .v2_all import ThreadGoalUpdatedNotification
 from .v2_all import ThreadNameUpdatedNotification
+from .v2_all import ThreadProjectUpdatedNotification
 from .v2_all import ThreadSettingsUpdatedNotification
 from .v2_all import ThreadStartedNotification
 from .v2_all import ThreadStatusChangedNotification
@@ -59,8 +61,6 @@ from .v2_all import TurnCompletedNotification
 from .v2_all import TurnDiffUpdatedNotification
 from .v2_all import TurnModerationMetadataNotification
 from .v2_all import TurnPlanUpdatedNotification
-from .v2_all import TurnReasoningPolicySummaryNotification
-from .v2_all import TurnReasoningPolicyUpdatedNotification
 from .v2_all import TurnStartedNotification
 from .v2_all import WarningNotification
 from .v2_all import WindowsSandboxSetupCompletedNotification
@@ -97,6 +97,7 @@ GeneratedNotificationPayload: TypeAlias = (
     | PlanDeltaNotification
     | ProcessExitedNotification
     | ProcessOutputDeltaNotification
+    | ProjectChangedNotification
     | ReasoningSummaryPartAddedNotification
     | ReasoningSummaryTextDeltaNotification
     | ReasoningTextDeltaNotification
@@ -110,6 +111,7 @@ GeneratedNotificationPayload: TypeAlias = (
     | ThreadGoalClearedNotification
     | ThreadGoalUpdatedNotification
     | ThreadNameUpdatedNotification
+    | ThreadProjectUpdatedNotification
     | ThreadSettingsUpdatedNotification
     | ThreadStartedNotification
     | ThreadStatusChangedNotification
@@ -119,8 +121,6 @@ GeneratedNotificationPayload: TypeAlias = (
     | TurnDiffUpdatedNotification
     | TurnModerationMetadataNotification
     | TurnPlanUpdatedNotification
-    | TurnReasoningPolicySummaryNotification
-    | TurnReasoningPolicyUpdatedNotification
     | TurnStartedNotification
     | WarningNotification
     | WindowsSandboxSetupCompletedNotification
@@ -162,6 +162,7 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "model/verification": ModelVerificationNotification,
     "process/exited": ProcessExitedNotification,
     "process/outputDelta": ProcessOutputDeltaNotification,
+    "project/changed": ProjectChangedNotification,
     "remoteControl/status/changed": RemoteControlStatusChangedNotification,
     "serverRequest/resolved": ServerRequestResolvedNotification,
     "skills/changed": SkillsChangedNotification,
@@ -171,6 +172,7 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "thread/goal/cleared": ThreadGoalClearedNotification,
     "thread/goal/updated": ThreadGoalUpdatedNotification,
     "thread/name/updated": ThreadNameUpdatedNotification,
+    "thread/project/updated": ThreadProjectUpdatedNotification,
     "thread/settings/updated": ThreadSettingsUpdatedNotification,
     "thread/started": ThreadStartedNotification,
     "thread/status/changed": ThreadStatusChangedNotification,
@@ -180,8 +182,6 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "turn/diff/updated": TurnDiffUpdatedNotification,
     "turn/moderationMetadata": TurnModerationMetadataNotification,
     "turn/plan/updated": TurnPlanUpdatedNotification,
-    "turn/reasoningPolicy/summary": TurnReasoningPolicySummaryNotification,
-    "turn/reasoningPolicy/updated": TurnReasoningPolicyUpdatedNotification,
     "turn/started": TurnStartedNotification,
     "warning": WarningNotification,
     "windows/worldWritableWarning": WindowsWorldWritableWarningNotification,
@@ -211,8 +211,6 @@ DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
     TurnDiffUpdatedNotification,
     TurnModerationMetadataNotification,
     TurnPlanUpdatedNotification,
-    TurnReasoningPolicySummaryNotification,
-    TurnReasoningPolicyUpdatedNotification,
 )
 
 NESTED_TURN_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (

@@ -5,7 +5,7 @@ calls in one packet when supported, in dependency order, only when
 prerequisite results meet expected conditions. Stop on unexpected results;
 split only for approvals, output bounds, or substantive judgment about the next action.
 Continue yielded commands through their existing wait or session path; avoid duplicates.
-Use known paths; query precise owners before broad inventory. Bound output.
-Resolve task uncertainties; fix affected callers without unrelated refactors or speculative tuning.
-Reuse passing validation if relevant inputs and environment are unchanged.
-Use owner-required checks; when required and coverage permits, scope clippy to changed packages.
+Use known paths; query ownership when it resolves a task uncertainty. Bound displayed output.
+For implementation tasks, fix affected callers without unrelated refactors or speculative tuning.
+For implementation tasks, reuse passing validation if relevant inputs and environment are unchanged.
+For implementation tasks, use owner-required checks; when required and coverage permits, scope clippy to changed packages.

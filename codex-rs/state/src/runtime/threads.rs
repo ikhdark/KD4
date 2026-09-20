@@ -70,6 +70,7 @@ SELECT
     threads.tokens_used,
     threads.first_user_message,
     threads.archived_at,
+    threads.project_id,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -421,6 +422,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         push_thread_filters(
             &mut builder,
             ThreadFilterOptions {
+                project_id: None,
                 archived_only,
                 allowed_sources,
                 model_providers,
@@ -543,6 +545,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         push_thread_filters(
             &mut builder,
             ThreadFilterOptions {
+                project_id: None,
                 archived_only,
                 allowed_sources,
                 model_providers,
@@ -579,6 +582,34 @@ ON CONFLICT(child_thread_id) DO NOTHING
             metadata, /*creation_memory_mode*/ None, /*allocate_timestamps*/ true,
         )
         .await
+    }
+
+    /// Commit an explicit project assignment with the other metadata fields.
+    /// Rollout reconciliation uses upsert_thread and must never overwrite this assignment.
+    pub async fn upsert_thread_with_project(
+        &self,
+        metadata: &crate::ThreadMetadata,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(id) = project_id {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+            anyhow::ensure!(exists != 0, "project not found: {id}");
+        }
+        self.upsert_thread_on_connection(&mut tx, metadata, None, true)
+            .await?;
+        sqlx::query("UPDATE threads SET project_id = ? WHERE id = ?")
+            .bind(project_id)
+            .bind(metadata.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
+            .await?;
+        Ok(())
     }
 
     /// Insert rollout metadata without changing its persisted file timestamps.
@@ -632,8 +663,9 @@ INSERT INTO threads (
     git_sha,
     git_branch,
     git_origin_url,
-    memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    memory_mode,
+    project_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -678,6 +710,7 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
         .bind("enabled")
+        .bind(metadata.project_id.as_deref())
         .execute(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
@@ -916,8 +949,9 @@ INSERT INTO threads (
     git_sha,
     git_branch,
     git_origin_url,
-    memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    memory_mode,
+    project_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -991,6 +1025,7 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
         .bind(creation_memory_mode.unwrap_or("enabled"))
+        .bind(metadata.project_id.as_deref())
         .execute(connection)
         .await?;
         Ok(())
@@ -1398,6 +1433,7 @@ SELECT
     threads.tokens_used,
     threads.first_user_message,
     threads.archived_at,
+    threads.project_id,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -1431,6 +1467,7 @@ fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadI
 
 #[derive(Clone, Copy)]
 pub struct ThreadFilterOptions<'a> {
+    pub project_id: Option<Option<&'a str>>,
     pub archived_only: bool,
     pub allowed_sources: &'a [String],
     pub model_providers: Option<&'a [String]>,
@@ -1448,6 +1485,7 @@ pub(super) fn push_thread_filters<'a>(
     include_thread_id_tiebreaker: bool,
 ) {
     let ThreadFilterOptions {
+        project_id,
         archived_only,
         allowed_sources,
         model_providers,
@@ -1458,6 +1496,15 @@ pub(super) fn push_thread_filters<'a>(
         search_term,
     } = options;
     builder.push(" WHERE 1 = 1");
+    match project_id {
+        Some(Some(id)) => {
+            builder.push(" AND threads.project_id = ").push_bind(id);
+        }
+        Some(None) => {
+            builder.push(" AND threads.project_id IS NULL");
+        }
+        None => {}
+    }
     if archived_only {
         builder.push(" AND threads.archived = 1");
     } else {
@@ -2054,6 +2101,7 @@ END
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: Some(&model_providers),
@@ -2082,6 +2130,7 @@ END
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: Some(&model_providers),
@@ -2135,6 +2184,7 @@ END
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -2167,6 +2217,7 @@ END
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -2192,6 +2243,7 @@ END
             .list_threads(
                 /*page_size*/ 10,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -2256,6 +2308,7 @@ END
                 push_list_threads_query(
                     &mut builder,
                     ThreadFilterOptions {
+                        project_id: None,
                         archived_only: false,
                         allowed_sources: &[],
                         model_providers: Some(&model_providers),
@@ -2353,6 +2406,7 @@ END
         push_list_threads_query(
             &mut builder,
             ThreadFilterOptions {
+                project_id: None,
                 archived_only: false,
                 allowed_sources: &[],
                 model_providers: None,
@@ -2381,6 +2435,7 @@ END
         );
 
         let filters = |anchor| ThreadFilterOptions {
+            project_id: None,
             archived_only: false,
             allowed_sources: &[],
             model_providers: None,
@@ -3069,6 +3124,7 @@ END
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -3101,6 +3157,7 @@ END
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -3133,6 +3190,7 @@ END
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    project_id: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,

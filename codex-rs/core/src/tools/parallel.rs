@@ -20,11 +20,11 @@ use tracing::warn;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::TypedToolClass;
-use crate::session::reasoning_governor::CodeModeToolResult;
-use crate::session::reasoning_governor::SamplingRequestSignalCollector;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_execution::CodeModeToolResult;
+use crate::session::turn_execution::SamplingRequestSignalCollector;
 use crate::tools::context::AbortedToolOutput;
 use crate::tools::context::RequiredToolTerminal;
 use crate::tools::context::RequiredToolTerminalCause;
@@ -2457,7 +2457,7 @@ impl ToolCallRuntime {
                         router_dispatch_state,
                     )
                     .instrument(dispatch_span.clone());
-                let result = scope_tool_dispatch_timing(
+                let mut result = scope_tool_dispatch_timing(
                     Arc::clone(&timing),
                     crate::tools::registry::with_precomputed_projection_source_dependencies(
                         projection_source_dependencies,
@@ -2488,14 +2488,30 @@ impl ToolCallRuntime {
                             workspace_evidence_classification_for_executed_payload(
                                 classification,
                                 dispatch_tool_name.as_str(),
-                                result
-                                    .as_ref()
-                                    .ok()
-                                    .map(|result| &result.payload)
-                                    .filter(|payload| *payload != &evidence_call.payload),
+                                result.as_ref().ok().map(|result| &result.payload).filter(
+                                    |payload| {
+                                        *payload != &evidence_call.payload
+                                            || (successful
+                                                && classification.source_dependencies.is_empty())
+                                    },
+                                ),
                                 turn.config.cwd.as_path(),
                             )
                         });
+                // Parser saturation can leave admission unscoped. After the
+                // command completes, reuse the executed-payload classifier to
+                // recover a proven literal scope. This changes evidence only,
+                // never the command's permissions or admission decision.
+                if successful
+                    && workspace_call_classification
+                        .as_ref()
+                        .is_some_and(|classification| classification.source_dependencies.is_empty())
+                    && let Some(classification) = evidence_classification.as_ref()
+                    && !classification.source_dependencies.is_empty()
+                    && let Ok(result) = result.as_mut()
+                {
+                    result.source_dependencies = Some(classification.source_dependencies.clone());
+                }
                 let source_dependencies_override = result
                     .as_ref()
                     .ok()
@@ -2624,10 +2640,13 @@ impl ToolCallRuntime {
                         // Required state/process cleanup has joined. Lifecycle observers
                         // do not extend the turn's durable-commit barrier.
                         drop(commit_guard.take());
-                        let mut response = Self::aborted_response(&call, secs);
+                        let mut response = Self::aborted_response(&call, secs, &abort_invocation);
                         if let Some(recovery) = cancellation_recovery {
                             response.result = Box::new(AbortedToolOutput {
-                                message: format!("{}\n{recovery}", Self::abort_message(&call, secs)),
+                                message: format!(
+                                    "{}\n{recovery}",
+                                    Self::abort_message_for(&abort_invocation, &call, secs)
+                                ),
                             });
                         }
                         scope_tool_dispatch_timing(
@@ -2829,12 +2848,12 @@ impl ToolCallRuntime {
         }
     }
 
-    fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult {
+    fn aborted_response(call: &ToolCall, secs: f32, invocation: &ToolInvocation) -> AnyToolResult {
         AnyToolResult {
             call_id: call.call_id.clone(),
             payload: call.payload.clone(),
             result: Box::new(AbortedToolOutput {
-                message: Self::abort_message(call, secs),
+                message: Self::abort_message_for(invocation, call, secs),
             }),
             model_projection: None,
             source_dependencies: None,
@@ -2842,11 +2861,35 @@ impl ToolCallRuntime {
         }
     }
 
+    /// Renders a cancelled call from whatever origin recorded itself.
+    ///
+    /// The call's own cause wins over the turn's: a nested runtime deadline is
+    /// more specific than the turn tearing down around it. Only a cancellation
+    /// no origin recorded falls back to the historical user wording.
+    fn abort_message_for(invocation: &ToolInvocation, call: &ToolCall, secs: f32) -> String {
+        let cause = invocation.source.cancellation_cause().or_else(|| {
+            invocation
+                .step_context
+                .turn
+                .cancellation_cause
+                .get()
+                .cloned()
+        });
+        match cause {
+            Some(cause) => Self::abort_message_with_reason(call, secs, &cause.describe()),
+            None => Self::abort_message(call, secs),
+        }
+    }
+
     fn abort_message(call: &ToolCall, secs: f32) -> String {
+        Self::abort_message_with_reason(call, secs, "aborted by user")
+    }
+
+    fn abort_message_with_reason(call: &ToolCall, secs: f32, reason: &str) -> String {
         if crate::tools::is_shell_family_tool_name(&call.tool_name) {
-            format!("Wall time: {secs:.1} seconds\naborted by user")
+            format!("Wall time: {secs:.1} seconds\n{reason}")
         } else {
-            format!("aborted by user after {secs:.1}s")
+            format!("{reason} after {secs:.1}s")
         }
     }
 }
@@ -2910,6 +2953,7 @@ impl ToolCallTimingGuard {
                 cell_id,
                 parent_call_id,
                 runtime_tool_call_id,
+                ..
             } => (
                 "code_mode",
                 cell_id.clone(),
@@ -3801,6 +3845,8 @@ mod tests {
                     cell_id: "cell-1".to_string(),
                     parent_call_id: Some("outer-call".to_string()),
                     runtime_tool_call_id: "runtime-call-1".to_string(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
             );
             let code_mode_guard = code_mode_guard
@@ -3950,6 +3996,8 @@ mod tests {
                 cell_id: "cell-1".to_string(),
                 parent_call_id: Some("outer-call".to_string()),
                 runtime_tool_call_id: "runtime-call-1".to_string(),
+                nested_deadline: None,
+                cancellation_cause: None,
             },
             cancellation_token.clone(),
         ));
@@ -4089,8 +4137,8 @@ mod tests {
 
     #[tokio::test]
     async fn sampled_failure_suppression_reports_skipped_without_dispatch() {
-        use crate::session::reasoning_governor::SamplingReasoningGovernor;
-        use crate::session::reasoning_governor::SamplingRequestSettledState;
+        use crate::session::turn_execution::SamplingRequestSettledState;
+        use crate::session::turn_execution::TurnExecutionControl;
 
         let (session, turn) = crate::session::tests::make_session_and_context().await;
         let turn = Arc::new(turn);
@@ -4100,16 +4148,16 @@ mod tests {
                 r#"{"artifact_id":"expired","selectors":[{"kind":"lines","start":1,"end":1}]}"#
                     .to_string(),
         };
-        let mut governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0);
-        let first = governor.collector(&baselines);
+        let mut control = TurnExecutionControl::new();
+        let baselines = control.baselines(0);
+        let first = control.collector(&baselines);
         let registration = first.register_deterministic_tool_call(&tool_name, &payload, "original");
         first.record_failure(
             registration.ordinal,
             "model:artifact `expired` has expired",
             true,
         );
-        governor.evaluate_convergence(
+        control.evaluate_convergence(
             &baselines,
             &first,
             &SamplingRequestSettledState {
@@ -4128,7 +4176,7 @@ mod tests {
             StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router),
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
         )
-        .with_sampling_request_signals(governor.collector(&baselines));
+        .with_sampling_request_signals(control.collector(&baselines));
         let response = runtime
             .handle_tool_call(
                 ToolCall {
@@ -4162,17 +4210,17 @@ mod tests {
 
     #[tokio::test]
     async fn sampled_replay_rechecks_workspace_revision_at_dispatch() {
-        use crate::session::reasoning_governor::SamplingReasoningGovernor;
-        use crate::session::reasoning_governor::SamplingRequestSettledState;
+        use crate::session::turn_execution::SamplingRequestSettledState;
+        use crate::session::turn_execution::TurnExecutionControl;
         for workspace_changed in [false, true] {
             let (session, turn) = crate::session::tests::make_session_and_context().await;
             let tool_name = codex_tools::ToolName::plain("exec_command");
             let payload = ToolPayload::Function {
                 arguments: serde_json::json!({"cmd": "cat README.md"}).to_string(),
             };
-            let mut governor = SamplingReasoningGovernor::new(None);
-            let baseline = governor.baselines(0);
-            let first = governor.collector(&baseline);
+            let mut control = TurnExecutionControl::new();
+            let baseline = control.baselines(0);
+            let first = control.collector(&baseline);
             let registration =
                 first.register_deterministic_tool_call(&tool_name, &payload, "old-read");
             first.record_response_result(
@@ -4187,7 +4235,7 @@ mod tests {
                 },
                 false,
             );
-            governor.settle(
+            control.settle(
                 &baseline,
                 &first,
                 &SamplingRequestSettledState {
@@ -4195,7 +4243,7 @@ mod tests {
                     tool_exposure_revision: 0,
                 },
             );
-            let collector = governor.collector(&governor.baselines(0));
+            let collector = control.collector(&control.baselines(0));
             assert!(
                 collector
                     .register_deterministic_tool_call(&tool_name, &payload, "probe")
@@ -4259,10 +4307,10 @@ mod tests {
         ));
         let step_context = step_context.with_tool_router_for_test(router);
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let governor = crate::session::reasoning_governor::SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0);
+        let control = crate::session::turn_execution::TurnExecutionControl::new();
+        let baselines = control.baselines(0);
         let runtime = ToolCallRuntime::new(session, step_context, Arc::clone(&tracker))
-            .with_sampling_request_signals(governor.collector(&baselines));
+            .with_sampling_request_signals(control.collector(&baselines));
         let held_tracker = Arc::clone(&tracker).lock_owned().await;
         let (release_tracker_tx, release_tracker_rx) = std::sync::mpsc::channel();
         let tracker_holder = std::thread::spawn(move || {
@@ -4497,6 +4545,8 @@ mod tests {
                     cell_id: "cell-1".to_string(),
                     parent_call_id: Some("outer-call".to_string()),
                     runtime_tool_call_id: "runtime-call-1".to_string(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
                 CancellationToken::new(),
             )
@@ -4542,9 +4592,9 @@ mod tests {
         ));
         let step_context =
             StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
-        let governor = crate::session::reasoning_governor::SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0);
-        let collector = governor.collector(&baselines);
+        let control = crate::session::turn_execution::TurnExecutionControl::new();
+        let baselines = control.baselines(0);
+        let collector = control.collector(&baselines);
         let runtime = ToolCallRuntime::new(
             Arc::clone(&session),
             step_context,
@@ -4574,6 +4624,8 @@ mod tests {
                     cell_id: "read-cell".to_string(),
                     parent_call_id: Some("outer-exec".to_string()),
                     runtime_tool_call_id: "runtime-read".to_string(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
                 CancellationToken::new(),
             )
@@ -4725,6 +4777,8 @@ mod tests {
                     cell_id: "blocked-persistence-cell".to_string(),
                     parent_call_id: Some("outer-blocked-persistence".to_string()),
                     runtime_tool_call_id: "blocked-persistence-runtime-call".to_string(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
                 CancellationToken::new(),
             ),
@@ -5304,6 +5358,8 @@ mod tests {
                     cell_id: "refresh-cell".to_string(),
                     parent_call_id: Some("outer-refresh".to_string()),
                     runtime_tool_call_id: "refresh-runtime-call".to_string(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
                 CancellationToken::new(),
             ),
@@ -5472,6 +5528,8 @@ mod tests {
                     cell_id: "cell-1".to_string(),
                     parent_call_id: Some("outer-call".to_string()),
                     runtime_tool_call_id: "runtime-call-1".to_string(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
                 CancellationToken::new(),
             )
@@ -6218,6 +6276,8 @@ mod tests {
                 cell_id: "cell-1".to_string(),
                 parent_call_id: Some("outer-call".to_string()),
                 runtime_tool_call_id: "runtime-call-1".to_string(),
+                nested_deadline: None,
+                cancellation_cause: None,
             },
             cancellation_token.clone(),
         ));

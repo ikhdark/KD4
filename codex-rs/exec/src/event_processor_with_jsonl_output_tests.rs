@@ -144,7 +144,6 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));
@@ -194,7 +193,6 @@ fn output_last_message_write_failure_is_returned() {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));
@@ -280,7 +278,6 @@ fn completed_turn_exposes_timing_in_jsonl_event() {
                 duration_ms: None,
                 timing: Some(timing.clone()),
                 surfaced_result: None,
-                reasoning_policy_history: None,
             },
         },
     ));

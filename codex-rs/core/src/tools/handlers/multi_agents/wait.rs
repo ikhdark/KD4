@@ -114,7 +114,7 @@ impl Handler {
             .await;
         let (mut activity_rx, mut pending_activity) = session
             .input_queue
-            .subscribe_activity(turn_state.as_deref())
+            .subscribe_activity(turn_state.as_deref(), false)
             .await;
 
         session
@@ -276,6 +276,9 @@ impl Handler {
                 let message = match activity {
                     InputQueueActivity::Mailbox => "wait_agent interrupted by mailbox activity",
                     InputQueueActivity::Steer => "wait_agent interrupted by new user input",
+                    InputQueueActivity::InternalCompletion => {
+                        "wait_agent interrupted by a deferred MCP result"
+                    }
                 };
                 (partial_statuses, false, Some(message.to_string()))
             }

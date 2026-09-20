@@ -283,29 +283,21 @@ impl ChatWidget {
             None => "the selected reasoning".to_string(),
         };
         let plan_only_description = format!("Always use {reasoning_phrase} in Plan mode.");
-        let plan_reasoning_source = if let Some(plan_override) =
-            self.config.plan_mode_reasoning_effort.as_ref()
-        {
-            format!(
-                "user-chosen Plan override ({})",
-                Self::reasoning_effort_sentence_label(plan_override)
-            )
-        } else if let Some(plan_mask) = collaboration_modes::plan_mask(self.model_catalog.as_ref())
-        {
-            let built_in_effort = plan_mask.reasoning_effort.flatten();
-            match self
-                .normalize_reasoning_effort_for_current_model(built_in_effort)
-                .as_ref()
-            {
-                Some(plan_effort) => format!(
-                    "built-in Plan default ({})",
-                    Self::reasoning_effort_sentence_label(plan_effort)
-                ),
-                None => "built-in Plan default (no reasoning)".to_string(),
-            }
-        } else {
-            "built-in Plan default".to_string()
-        };
+        let plan_reasoning_source =
+            if let Some(plan_override) = self.config.plan_mode_reasoning_effort.as_ref() {
+                format!(
+                    "user-chosen Plan override ({})",
+                    Self::reasoning_effort_sentence_label(plan_override)
+                )
+            } else {
+                match self.current_collaboration_mode.reasoning_effort().as_ref() {
+                    Some(effort) => format!(
+                        "global default ({})",
+                        Self::reasoning_effort_sentence_label(effort)
+                    ),
+                    None => "global default (model default)".to_string(),
+                }
+            };
         let all_modes_description = format!(
             "Set the global default reasoning level and the Plan mode override. This replaces the current {plan_reasoning_source}."
         );

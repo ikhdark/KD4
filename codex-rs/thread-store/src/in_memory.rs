@@ -260,6 +260,7 @@ mod tests {
         let page = ThreadStore::list_threads(
             &store,
             ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -287,6 +288,7 @@ mod tests {
         let page = ThreadStore::list_threads(
             &store,
             ListThreadsParams {
+                project_id: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -625,6 +627,7 @@ mod tests {
                 .expect("metadata");
         }
         let base = ListThreadsParams {
+            project_id: None,
             page_size: 10,
             cursor: None,
             sort_key: ThreadSortKey::UpdatedAt,
@@ -1062,6 +1065,11 @@ impl InMemoryThreadStore {
     }
 
     async fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreResult<ThreadPage> {
+        if params.project_id.is_some() {
+            return Err(ThreadStoreError::Unsupported {
+                operation: "projects",
+            });
+        }
         if params.cursor.is_some() {
             return Err(ThreadStoreError::Unsupported {
                 operation: "in_memory_thread_list_pagination",
@@ -1159,6 +1167,11 @@ impl InMemoryThreadStore {
         &self,
         params: UpdateThreadMetadataParams,
     ) -> ThreadStoreResult<StoredThread> {
+        if params.patch.project_id.is_some() {
+            return Err(ThreadStoreError::Unsupported {
+                operation: "projects",
+            });
+        }
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
         require_thread(&state, params.thread_id)?;
@@ -1355,6 +1368,7 @@ fn stored_thread_from_state(
         message: format!("thread {thread_id} is missing its creation timestamps"),
     };
     Ok(StoredThread {
+        project_id: None,
         thread_id,
         extra_config: created.extra_config.clone(),
         rollout_path: metadata.and_then(|metadata| metadata.rollout_path.clone()),

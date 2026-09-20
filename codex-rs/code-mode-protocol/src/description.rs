@@ -96,6 +96,7 @@ mod tests {
                 "required": ["city"],
                 "additionalProperties": false
             })),
+            default_timeout_ms: None,
             output_schema: Some(json!({
                 "type": "object",
                 "properties": { "ok": { "type": "boolean" } },
@@ -143,6 +144,7 @@ mod tests {
             description: "Look up an address.".to_string(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema.clone()),
+            default_timeout_ms: None,
             output_schema: Some(schema),
         };
 
@@ -181,6 +183,7 @@ mod tests {
                 },
                 "required": ["weather"]
             })),
+            default_timeout_ms: None,
             output_schema: Some(json!({
                 "type": "object",
                 "properties": {
@@ -206,13 +209,14 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_only_description_discovers_nested_tools_lazily() {
+    fn code_mode_only_description_distinguishes_eager_and_lazy_contracts() {
         let description = build_exec_tool_description(
             /*code_mode_only*/ true,
             /*has_deferred_tools*/ false,
             &[],
         );
-        assert!(description.contains("Nested tool schemas are discovered lazily at runtime"));
+        assert!(description.contains("Stable built-in tool contracts may be included below"));
+        assert!(description.contains("external and omitted contracts remain lazy"));
         assert!(description.contains("`resolve_tool(name)` when the name is known"));
         assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
         assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
@@ -238,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn rollout_workflow_guardrails_require_precise_bounded_discovery() {
+    fn executor_contract_preserves_discovery_lifecycle_and_output_mechanics() {
         let description = build_exec_tool_description(false, false, &[]);
 
         assert!(description.contains("raw JavaScript"));
@@ -258,56 +262,39 @@ mod tests {
         assert!(description.contains("type: \"image\""));
         assert!(description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
-        assert!(description.contains("Prefer a purpose-built tool over shell"));
-        assert!(description.contains("consolidate related read-only probes"));
-        assert!(description.contains("Never spawn subprocesses to re-filter returned results"));
-        assert!(description.contains("Start useful work in the initial exec"));
-        assert!(
-            description.contains("Await `Promise.allSettled` for independent known reads/probes")
-        );
-        assert!(description.contains("Reuse applicable `AGENTS.md`"));
-        assert!(description.contains("refresh missing/invalidated scopes"));
-        assert!(description.contains("Reuse schemas, CLI usage, and results"));
+        assert!(description.contains("Choose tools whose scope, evidence, and cost fit the task"));
+        assert!(description.contains("Process returned results in JavaScript"));
+        assert!(description.contains("Await `Promise.allSettled` for independent known calls"));
+        assert!(description.contains("Reuse current schemas and results"));
         assert!(description.contains("resolve missing/stale schemas before calls"));
-        assert!(description.contains("Use CLI `--help` only for uncertain arguments/subcommands"));
         assert!(description.contains("Nested tools: use a present schema"));
         assert!(description.contains("`resolve_tool(name)` when the name is known"));
         assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
         assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
-        assert!(description.contains("Read/list known paths directly"));
-        assert!(description.contains("Read/list known paths directly"));
-        assert!(description.contains("search unknown locations narrowly"));
         assert!(!description.contains("do not substitute a search or second shell"));
-        assert!(description.contains("hard 60s default deadline"));
-        assert!(description.contains("After timeout, resume the returned live session/cell ID"));
-        assert!(description.contains("never rerun live or uncertain effects"));
+        assert!(description.contains("host-configured default deadline"));
+        assert!(description.contains(
+            "Expiry cancels the nested call and may return only an error, without a live handle."
+        ));
+        assert!(description.contains("Resume only an actually returned live session/cell ID"));
+        assert!(description.contains("check the outcome before retrying uncertain effects"));
         assert!(description.contains(
             "Retry only if unstarted, safely repeatable after stopping, or tool-approved"
         ));
         assert!(description.contains("inspect every result"));
-        assert!(description.contains("Finish discovery before dependent mutations"));
-        assert!(description.contains("Separate status/file output"));
-        assert!(description.contains("batch independent calls"));
+        assert!(
+            description
+                .contains("Sequence dependent calls only after checking prerequisite results")
+        );
         assert!(description.contains("initial 10s budget"));
         assert!(description.contains("same awaited evaluation"));
         assert!(description.contains("only for a new model decision"));
-        assert!(description.contains("Run required validation after the final relevant edit"));
         assert!(description.contains(
             "Parallelize only when tools permit and build locks, outputs, and services are independent"
         ));
         assert!(description.contains("Propagate failures with `&&` or exit-code checks"));
         assert!(description.contains("never mask them with `|| true`"));
-        assert!(description.contains("Finish work/checks or report failures/blockers"));
-        assert!(description.contains("Keep plans aligned with the request"));
-        assert!(description.contains("For unchanged deterministic failures"));
-        assert!(description.contains("resume live operations via documented waits"));
         assert!(!description.contains("never repeat the same call/poll"));
-        assert!(description.contains("change route/state"));
-        assert!(description.contains(
-            "Read the complete enclosing unit before editing; refresh after intervening writes"
-        ));
-        assert!(description.contains("relevant ranges for large files"));
-        assert!(description.contains("whole files when small or required"));
         assert!(!description.contains("never whole files"));
         assert!(description.contains("retained-artifact selectors after truncation"));
         assert_eq!(
@@ -330,7 +317,7 @@ mod tests {
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
-        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 3_300;
+        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 3_600;
         assert!(
             description.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
             "the exec contract must stay within {COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET} bytes; got {}",
@@ -362,6 +349,7 @@ mod tests {
                 "required": ["description", "path"],
                 "additionalProperties": false
             })),
+            default_timeout_ms: None,
             output_schema: None,
         };
         let runtime_description = augment_tool_definition(tool).description;
@@ -444,6 +432,7 @@ mod tests {
             description: "Sample tool.".to_string(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema),
+            default_timeout_ms: None,
             output_schema: None,
         };
         assert_eq!(
@@ -583,6 +572,7 @@ mod tests {
             description: "Receipt.".to_string(),
             kind: CodeModeToolKind::Function,
             input_schema: None,
+            default_timeout_ms: None,
             output_schema: Some(json!({
                 "$defs": {"Payload": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}},
                 "type": "object",
@@ -757,6 +747,7 @@ mod tests {
                 description: "Direct tool.".to_string(),
                 kind: CodeModeToolKind::Function,
                 input_schema: Some(json!({"type": "string"})),
+                default_timeout_ms: None,
                 output_schema: None,
             };
             assert_eq!(augment_tool_definition(definition.clone()), definition);

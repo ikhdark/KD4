@@ -17,6 +17,7 @@ use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeSession;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
+use codex_code_mode::NestedCancellation;
 use codex_code_mode::RuntimeResponse;
 use codex_protocol::items::DynamicToolCallItem;
 use codex_protocol::items::DynamicToolCallStatus;
@@ -27,13 +28,12 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::sync::OnceCell;
-use tokio_util::sync::CancellationToken;
 
 use crate::FunctionCallError;
-use crate::session::reasoning_governor::CodeModeToolResult;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_execution::CodeModeToolResult;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::RequiredToolTerminalCause;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -97,6 +97,7 @@ struct CodeModePacketAdmission {
 
 #[derive(Default)]
 struct CodeModePacketMetrics {
+    command_states: Vec<JsonValue>,
     next_nested_ordinal: usize,
     nested_call_count: usize,
     batchable_observation_count: usize,
@@ -117,6 +118,8 @@ struct CodeModeNestedTerminal {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CodeModeNestedResultEvidence {
     #[serde(skip)]
+    command_state: Option<JsonValue>,
+    #[serde(skip)]
     ordinal: usize,
     call_id: String,
     parent_call_id: Option<String>,
@@ -128,6 +131,7 @@ struct CodeModeNestedResultEvidence {
 }
 
 struct CodeModePacketReceipt {
+    command_states: Vec<JsonValue>,
     nested_call_count: usize,
     batchable_observation_count: usize,
     result_bytes: usize,
@@ -361,6 +365,9 @@ impl CodeModeService {
             .post_tool_use_feedback
             .extend(post_tool_use_feedback);
         if let Some(nested_result) = nested_result {
+            if let Some(state) = &nested_result.command_state {
+                metrics.command_states.push(state.clone());
+            }
             if metrics.nested_results.len() == MAX_RETAINED_NESTED_RESULTS {
                 metrics.omitted_nested_result_count =
                     metrics.omitted_nested_result_count.saturating_add(1);
@@ -438,6 +445,7 @@ impl CodeModeService {
             .nested_results
             .sort_unstable_by_key(|result| result.ordinal);
         CodeModePacketReceipt {
+            command_states: metrics.command_states,
             nested_call_count: metrics.nested_call_count,
             batchable_observation_count: metrics.batchable_observation_count,
             result_bytes: metrics.result_bytes,
@@ -451,7 +459,7 @@ impl CodeModeService {
     pub(crate) fn record_owner_drained_continuation(
         &self,
         cell_id: &CellId,
-        continuation: crate::session::reasoning_governor::PendingOwnerDrainedContinuation,
+        continuation: crate::session::turn_execution::PendingOwnerDrainedContinuation,
     ) {
         self.dispatch_broker
             .record_continuation(cell_id, continuation);
@@ -460,7 +468,7 @@ impl CodeModeService {
     pub(crate) fn owner_drained_continuation_snapshot(
         &self,
         owner_key: &str,
-    ) -> Vec<crate::session::reasoning_governor::PendingOwnerDrainedContinuation> {
+    ) -> Vec<crate::session::turn_execution::PendingOwnerDrainedContinuation> {
         self.dispatch_broker
             .continuation_snapshot(&CellId::new(owner_key.to_string()))
     }
@@ -479,7 +487,7 @@ impl CodeModeService {
         session: &Arc<Session>,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
-        request_signals: crate::session::reasoning_governor::SamplingRequestSignalCollector,
+        request_signals: crate::session::turn_execution::SamplingRequestSignalCollector,
     ) -> Option<CodeModeDispatchWorker> {
         let turn = &step_context.turn;
         let tool_mode = effective_tool_mode(turn);
@@ -567,7 +575,7 @@ pub(super) fn handle_runtime_response(
     } else {
         Vec::new()
     };
-    let output = format_runtime_response(
+    let mut output = format_runtime_response(
         response,
         max_output_tokens,
         hard_limit,
@@ -577,6 +585,34 @@ pub(super) fn handle_runtime_response(
         nested_results,
         packet.first_required_terminal,
     );
+    if !packet.command_states.is_empty() {
+        // Script text is a presentation choice, not an acknowledgement that a
+        // child process finished. Keep these receipts outside the text budget
+        // and in the projection's essential fields, including when JS prints
+        // only result.output or the fallback-result retention cap is reached.
+        let mut command_states = packet.command_states;
+        if output
+            .canonical_body
+            .as_ref()
+            .is_some_and(|canonical| *canonical != output.body)
+        {
+            for state in &mut command_states {
+                state["wrapper_output_reduced"] = JsonValue::Bool(true);
+                state["output_complete"] = JsonValue::Bool(false);
+            }
+        }
+        let states = JsonValue::Array(command_states);
+        let item = FunctionCallOutputContentItem::InputText {
+            text: format!("Nested command states (independent of script completion):\n{states}"),
+        };
+        output.body.push(item.clone());
+        if let Some(canonical) = &mut output.canonical_body {
+            canonical.push(item);
+        }
+        output
+            .essential_inline
+            .insert("nested_commands".to_string(), states);
+    }
     Ok(output)
 }
 
@@ -971,8 +1007,9 @@ async fn call_nested_tool(
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
-    cancellation_token: CancellationToken,
+    cancellation: NestedCancellation,
 ) -> Result<JsonValue, FunctionCallError> {
+    let cancellation_token = cancellation.token().clone();
     let CodeModeNestedToolCall {
         cell_id,
         parent_tool_call_id,
@@ -980,6 +1017,7 @@ async fn call_nested_tool(
         tool_name,
         tool_kind,
         input,
+        nested_deadline,
     } = invocation;
     let packet_ordinal = exec
         .session
@@ -1071,6 +1109,11 @@ async fn call_nested_tool(
                 cell_id: cell_id.to_string(),
                 parent_call_id: parent_tool_call_id.clone(),
                 runtime_tool_call_id: runtime_tool_call_id.clone(),
+                nested_deadline,
+                // Whoever stops this call records why before signalling; the
+                // aborted-result formatter reads it rather than assuming the
+                // user interrupted.
+                cancellation_cause: Some(cancellation.cause_cell()),
             },
             cancellation_token,
         )
@@ -1129,6 +1172,7 @@ async fn call_nested_tool(
             .await;
     }
     let nested_result = CodeModeNestedResultEvidence {
+        command_state: nested_command_state(&tool_name, &nested_call_id, &payload, &result_value),
         ordinal: packet_ordinal,
         call_id: nested_call_id,
         parent_call_id: parent_tool_call_id,
@@ -1389,6 +1433,60 @@ fn result_has_live_exec_session(result: &JsonValue) -> bool {
             && !process_exited.and_then(JsonValue::as_bool).unwrap_or(false)
             && exit_code.is_none_or(JsonValue::is_null)
     })
+}
+
+fn nested_command_state(
+    tool_name: &ToolName,
+    call_id: &str,
+    payload: &ToolPayload,
+    result: &JsonValue,
+) -> Option<JsonValue> {
+    if tool_name.namespace.is_some()
+        || !matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
+        || result.get("process_exited").is_none()
+    {
+        return None;
+    }
+    let mut state = serde_json::json!({"call_id": call_id, "tool": tool_name.name});
+    for key in [
+        "chunk_id",
+        "session_id",
+        "exit_code",
+        "execution_state",
+        "session_capabilities",
+        "process_exited",
+        "output_complete",
+        "output_reduced",
+        "raw_output_artifact_id",
+        "raw_output_artifact_bytes",
+        "raw_output_artifact_error",
+        "raw_output_artifact_retention_limit_hit",
+        "raw_output_artifact_retention_limit_reason",
+    ] {
+        if let Some(value) = result.get(key) {
+            state[key] = value.clone();
+        }
+    }
+    if tool_name.name == "write_stdin"
+        && let ToolPayload::Function { arguments } = payload
+        && let Ok(arguments) = serde_json::from_str::<JsonValue>(arguments)
+    {
+        state["polled_session_id"] = arguments["session_id"].clone();
+    }
+    if let Some(session_id) = result.get("session_id") {
+        state["continuation"] = serde_json::json!({
+            "tool": "write_stdin", "arguments": {"session_id": session_id, "chars": ""}
+        });
+    }
+    if let Some(artifact_id) = result.get("raw_output_artifact_id") {
+        state["recovery"] = serde_json::json!({
+            "tool": "read_tool_output", "arguments": {
+                "artifact_id": artifact_id,
+                "selectors": [{"kind": "bytes", "start": 0, "end": 1024}]
+            }
+        });
+    }
+    Some(state)
 }
 
 fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
@@ -1822,6 +1920,7 @@ mod tests {
             tool_name: ToolName::plain("exec_command"),
             tool_kind: CodeModeToolKind::Function,
             input: Some(json!({ "cmd": format!("@'\n{envelope}\n'@ | apply_patch") })),
+            nested_deadline: None,
         }
     }
 
@@ -1845,7 +1944,7 @@ mod tests {
             exec,
             runtime,
             wrapped_patch_invocation(&cell_id),
-            tokio_util::sync::CancellationToken::new(),
+            codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
         )
         .await;
 
@@ -1896,8 +1995,9 @@ mod tests {
                 tool_name: ToolName::plain("shell_command"),
                 tool_kind: CodeModeToolKind::Function,
                 input: Some(json!({ "command": "echo '*** Begin Patch'" })),
+                nested_deadline: None,
             },
-            tokio_util::sync::CancellationToken::new(),
+            codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
         )
         .await
         .expect("printing patch-shaped data must reach ordinary shell dispatch");
@@ -1925,7 +2025,7 @@ mod tests {
             exec,
             runtime,
             wrapped_patch_invocation(&cell_id),
-            tokio_util::sync::CancellationToken::new(),
+            codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
         )
         .await;
 
@@ -2195,6 +2295,7 @@ mod tests {
                 tool_name: ToolName::plain("example"),
                 tool_kind: CodeModeToolKind::Function,
                 input,
+                nested_deadline: None,
             };
             let runtime_json = serde_json::to_vec(&invocation).expect("encode runtime input");
             let runtime: CodeModeNestedToolCall =
@@ -2540,6 +2641,7 @@ mod tests {
                 source: "text('unreachable')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
+                default_tool_timeout_ms: None,
             })
             .await
             .err()

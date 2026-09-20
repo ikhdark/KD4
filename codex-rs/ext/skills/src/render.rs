@@ -7,11 +7,8 @@ use crate::fragments::AvailableSkillsInstructions;
 
 const MAX_AVAILABLE_SKILLS_BYTES: usize = 8_000;
 const MAX_MAIN_PROMPT_BYTES: usize = 8_000;
-const INCOMPLETE_INSTRUCTIONS_NOTICE: &str = "\n\n[This skill's instructions are incomplete because the context limit was reached. The omitted portion has not been loaded. Read the remaining instructions through the owning provider.]";
 const MAX_CATALOG_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
-pub(crate) const MAX_SKILL_NAME_BYTES: usize = 256;
-pub(crate) const MAX_SKILL_PATH_BYTES: usize = 1_024;
 
 #[tracing::instrument(
     level = "trace",
@@ -21,7 +18,8 @@ pub(crate) const MAX_SKILL_PATH_BYTES: usize = 1_024;
 pub(crate) fn available_skills_fragment(
     catalog: &SkillCatalog,
 ) -> Option<AvailableSkillsInstructions> {
-    let mut total_bytes = 0usize;
+    // Reserve space for bounded omission and recovery guidance.
+    let mut total_bytes = 1_024usize;
     let mut omitted = 0usize;
     let mut skill_lines = Vec::new();
 
@@ -66,6 +64,29 @@ pub(crate) fn available_skills_fragment(
             "- {omitted} additional {skill_word} omitted from this bounded skills list."
         ));
     }
+    if catalog.entries.iter().any(|entry| {
+        entry.enabled
+            && entry.prompt_visible
+            && entry.authority.kind == SkillSourceKind::Orchestrator
+    }) {
+        skill_lines.push("- Recover orchestrator skills with skills.list({\"authority\":{\"kind\":\"orchestrator\"}}); follow next_cursor as cursor, then pass the returned authority, package, and main_resource as resource to skills.read.".to_string());
+    }
+    if omitted > 0
+        && catalog.entries.iter().any(|entry| {
+            entry.enabled && entry.prompt_visible && entry.authority.kind == SkillSourceKind::Host
+        })
+    {
+        skill_lines.push("- For host skills, use the host skills catalog's intact skill: locators with read_file, or discover SKILL.md files under the configured skill roots with filesystem tools.".to_string());
+    }
+    if omitted > 0
+        && catalog.entries.iter().any(|entry| {
+            entry.enabled
+                && entry.prompt_visible
+                && entry.authority.kind == SkillSourceKind::Executor
+        })
+    {
+        skill_lines.push("- For environment skills, discover SKILL.md files under the selected capability roots using that environment's filesystem tools; read them with read_file and its environment_id.".to_string());
+    }
 
     Some(AvailableSkillsInstructions::from_skill_lines(skill_lines))
 }
@@ -100,15 +121,45 @@ fn render_skill_line(entry: &SkillCatalogEntry, description: &str, locator_kind:
     }
 }
 
-pub(crate) fn truncate_main_prompt_contents(contents: &str) -> (String, bool) {
+pub(crate) fn truncate_main_prompt_contents(
+    contents: &str,
+    entry: &SkillCatalogEntry,
+) -> (String, bool) {
     if contents.len() <= MAX_MAIN_PROMPT_BYTES {
         return (contents.to_string(), false);
     }
-    let (mut prefix, _) = truncate_utf8_to_bytes(
-        contents,
-        MAX_MAIN_PROMPT_BYTES - INCOMPLETE_INSTRUCTIONS_NOTICE.len(),
+    let recovery = match &entry.authority.kind {
+        SkillSourceKind::Orchestrator => format!(
+            "Read the full instructions with skills.read({}); follow next_cursor as cursor until absent.",
+            serde_json::json!({
+                "authority": {"kind": "orchestrator"},
+                "package": entry.id.0,
+                "resource": entry.main_prompt.as_str(),
+            })
+        ),
+        SkillSourceKind::Host => format!(
+            "Read the full instructions from the host file {} using filesystem tools.",
+            serde_json::json!(entry.main_prompt.as_str())
+        ),
+        SkillSourceKind::Executor => match entry.main_prompt.environment_path() {
+            Some((environment_id, path)) => format!(
+                "Read the full instructions with read_file({}); follow the returned artifact continuation for remaining text.",
+                serde_json::json!({"environment_id": environment_id, "path": path.inferred_native_path_string()})
+            ),
+            None => "The resource has no environment binding; report that its full instructions are unavailable.".to_string(),
+        },
+        SkillSourceKind::Custom(_) => "No model-callable read route is exposed for this custom provider; report the missing instructions.".to_string(),
+    };
+    let notice = format!(
+        "\n\n[This skill's instructions are incomplete because the context limit was reached. The omitted portion has not been loaded. {recovery}]"
     );
-    prefix.push_str(INCOMPLETE_INSTRUCTIONS_NOTICE);
+    let notice = if notice.len() <= MAX_MAIN_PROMPT_BYTES {
+        notice
+    } else {
+        "\n\n[This skill's instructions are incomplete. Its recovery identity exceeds the context budget; do not use a shortened identity. Report the unavailable instructions.]".to_string()
+    };
+    let (mut prefix, _) = truncate_utf8_to_bytes(contents, MAX_MAIN_PROMPT_BYTES - notice.len());
+    prefix.push_str(&notice);
     (prefix, true)
 }
 

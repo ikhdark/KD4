@@ -65,7 +65,7 @@ fn command_parameters_schema(
                 .into_iter()
                 .map(|field| JsonSchema {
                     required: Some(vec![field.to_string()]),
-                    ..JsonSchema::default()
+                    ..JsonSchema::object(BTreeMap::new(), None, None)
                 })
                 .collect(),
         ),
@@ -156,7 +156,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "max_output_tokens".to_string(),
             bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; status metadata may still be returned.",
+                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
                 adaptive_output_budget_description()
             ), 0, usize::MAX as u64),
         ),
@@ -270,7 +270,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         (
             "max_output_tokens".to_string(),
             bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; status metadata may still be returned.",
+                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
                 adaptive_output_budget_description()
             ), 0, usize::MAX as u64),
         ),
@@ -279,7 +279,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "write_stdin".to_string(),
         description:
-            "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
+            "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C only with interrupt=true, and empty input to poll with polling=true. cancellation describes explicit process cancellation through this tool; false means no such operation is exposed. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -433,6 +433,17 @@ fn unified_exec_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "session_capabilities": {
+                "type": "object",
+                "properties": {
+                    "stdin": {"type": "boolean"},
+                    "interrupt": {"type": "boolean"},
+                    "cancellation": {"type": "boolean"},
+                    "polling": {"type": "boolean"}
+                },
+                "required": ["stdin", "interrupt", "cancellation", "polling"],
+                "additionalProperties": false
+            },
             "chunk_id": {
                 "type": "string",
                 "description": "Chunk identifier included when the response reports one."
@@ -442,20 +453,44 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Elapsed wall time spent waiting for output in seconds."
             },
             "exit_code": {
-                "type": "integer",
-                "description": "Process exit code when the command finished during this call."
+                "type": ["integer", "null"],
+                "description": "Terminal exit code; null when still running or when the exit code is unavailable. Consult execution_state."
+            },
+            "execution_state": {
+                "type": "string",
+                "enum": ["running", "exited", "unknown"],
+                "description": "Command process state, independent of the exec cell. Unknown explicitly means no live handle or terminal outcome is available."
+            },
+            "process_exited": { "type": "boolean" },
+            "output_complete": { "type": "boolean" },
+            "output_reduced": { "type": "boolean" },
+            "original_token_count_is_approximate": { "type": "boolean" },
+            "raw_output_artifact_retention_limit_hit": { "type": "boolean" },
+            "raw_output_artifact_retention_limit_reason": { "type": "string" },
+            "output_decoding_notice": { "type": "string" },
+            "validation": {
+                "type": "object",
+                "properties": {
+                    "covered_paths": { "type": "array", "items": { "type": "string" } },
+                    "coverage_status": { "const": "unverified" }
+                },
+                "required": ["covered_paths", "coverage_status"],
+                "additionalProperties": false
+            },
+            "pending_deferred_completions": {
+                "type": "array", "items": { "type": "string" }
             },
             "session_id": {
                 "type": "integer",
-                "description": "Session identifier to pass to write_stdin when the process is still running."
+                "description": "Continuation handle for write_stdin. If execution_state is exited, use it to drain pending output; it does not mean the process is still running."
             },
             "original_token_count": {
                 "type": "integer",
                 "description": "Approximate token count before output truncation."
             },
-            "raw_output_artifact": {
+            "raw_output_artifact_id": {
                 "type": "string",
-                "description": "Path to output retained before model summarization."
+                "description": "Opaque retained-output locator accepted verbatim as read_tool_output.artifact_id."
             },
             "raw_output_artifact_bytes": {
                 "type": "integer",
@@ -474,7 +509,36 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Command output text, possibly truncated."
             }
         },
-        "required": ["wall_time_seconds", "output"],
+        "required": ["wall_time_seconds", "output", "execution_state", "process_exited", "exit_code", "output_complete", "output_reduced", "raw_output_artifact_retention_limit_hit"],
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "execution_state": {"const": "running"},
+                    "process_exited": {"const": false},
+                    "exit_code": {"type": "null"},
+                    "output_complete": {"const": false}
+                },
+                "required": ["session_id"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "execution_state": {"const": "exited"},
+                    "process_exited": {"const": true}
+                }
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "execution_state": {"const": "unknown"},
+                    "process_exited": {"const": false},
+                    "exit_code": {"type": "null"},
+                    "output_complete": {"const": false}
+                },
+                "not": {"required": ["session_id"]}
+            }
+        ],
         "additionalProperties": false
     })
 }
@@ -617,7 +681,7 @@ fn filesystem_safety_guidance() -> &'static str {
 
 fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
-- Start repository `rg` searches in a likely owning path. Use `rg -l` to identify files, then `rg -n -C 2` on the shortlist. Exclude build output with `-g '!target'` and bound matches with `--max-count`. Expand after a miss or when the request requires a repository-wide inventory.
+- Read known files directly. Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. Start unknown-location searches in a likely owning path and expand after a miss. For repository-wide inventories, search the requested scope and preserve the complete matching set; bound displayed evidence without treating truncated results as complete. Exclude build output with `-g '!target'` when outside the requested scope.
 - Search windows locate code. Before editing, read the complete enclosing function, type, or configuration unit and refresh it after intervening writes.
 - Output above the token budget is truncated. For a known source file, request enough `max_output_tokens` to read the needed range in one call."#
 }

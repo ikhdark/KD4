@@ -25,6 +25,11 @@ mod tests {
             )
         );
         assert!(rendered.contains("Do not run shared-state mutations concurrently."));
+        assert!(rendered.contains("query ownership when it resolves a task uncertainty"));
+        assert!(rendered.contains("For implementation tasks, fix affected callers"));
+        assert!(rendered.contains("For implementation tasks, reuse passing validation"));
+        assert!(rendered.contains("For implementation tasks, use owner-required checks"));
+        assert!(!rendered.contains("before broad inventory"));
         assert!(
             rendered
                 .contains("Continue yielded commands through their existing wait or session path")

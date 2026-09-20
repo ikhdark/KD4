@@ -193,6 +193,7 @@ mod tests {
 
     fn test_thread(items: Vec<ThreadItem>) -> Thread {
         Thread {
+            project_id: None,
             id: "thread-1".to_string(),
             extra: None,
             session_id: "session-1".to_string(),
@@ -226,7 +227,6 @@ mod tests {
                 duration_ms: None,
                 timing: None,
                 surfaced_result: None,
-                reasoning_policy_history: None,
             }],
         }
     }

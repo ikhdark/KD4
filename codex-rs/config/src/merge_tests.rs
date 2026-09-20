@@ -1,75 +1,10 @@
 use super::*;
 use crate::config_toml::ConfigToml;
-use crate::config_toml::ReasoningPhaseEfforts;
 use crate::types::MemoriesToml;
-use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 
 fn parse_toml(value: &str) -> TomlValue {
     toml::from_str(value).expect("TOML should parse")
-}
-
-#[test]
-fn empty_higher_reasoning_phase_table_preserves_lower_entries() {
-    let mut base = parse_toml(
-        r#"
-[reasoning_phase_efforts]
-orient = "medium"
-inspect = "low"
-"#,
-    );
-    let overlay = parse_toml("[reasoning_phase_efforts]");
-
-    merge_toml_values(&mut base, &overlay);
-
-    let config: ConfigToml = base.try_into().expect("merged config should deserialize");
-    assert_eq!(
-        config.reasoning_phase_efforts,
-        Some(ReasoningPhaseEfforts {
-            orient: Some(ReasoningEffort::Medium),
-            inspect: Some(ReasoningEffort::Low),
-            implement: None,
-            diagnose: None,
-            verify: None,
-            finalize: None,
-            deterministic_continuation: None,
-        })
-    );
-}
-
-#[test]
-fn partial_higher_reasoning_phase_table_merges_per_field() {
-    let mut base = parse_toml(
-        r#"
-[reasoning_phase_efforts]
-orient = "medium"
-inspect = "low"
-deterministic_continuation = "medium"
-"#,
-    );
-    let overlay = parse_toml(
-        r#"
-[reasoning_phase_efforts]
-inspect = "high"
-verify = "medium"
-"#,
-    );
-
-    merge_toml_values(&mut base, &overlay);
-
-    let config: ConfigToml = base.try_into().expect("merged config should deserialize");
-    assert_eq!(
-        config.reasoning_phase_efforts,
-        Some(ReasoningPhaseEfforts {
-            orient: Some(ReasoningEffort::Medium),
-            inspect: Some(ReasoningEffort::High),
-            implement: None,
-            diagnose: None,
-            verify: Some(ReasoningEffort::Medium),
-            finalize: None,
-            deterministic_continuation: Some(ReasoningEffort::Medium),
-        })
-    );
 }
 
 #[test]
@@ -264,13 +199,13 @@ fn merge_owned_toml_values_matches_the_borrowed_entry_point() {
 [memories]
 no_memories_if_mcp_or_web_search = true
 
-[reasoning_phase_efforts]
-orient = "high"
+[example_settings]
+first = "high"
 "#,
     );
     let mut borrowed_base = parse_toml(
-        r#"[reasoning_phase_efforts]
-inspect = "low"
+        r#"[example_settings]
+second = "low"
 "#,
     );
     let mut owned_base = borrowed_base.clone();
@@ -286,9 +221,9 @@ inspect = "low"
 [memories]
 disable_on_external_context = true
 
-[reasoning_phase_efforts]
-inspect = "low"
-orient = "high"
+[example_settings]
+second = "low"
+first = "high"
 "#,
         )
     );

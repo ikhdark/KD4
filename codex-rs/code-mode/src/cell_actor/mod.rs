@@ -7,6 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_code_mode_protocol::NestedCancellation;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -128,7 +129,7 @@ async fn run_cell<H: CellHost>(
         output_admission,
     } = context;
     let cancellation_token = cell_state.cancellation_token();
-    let tool_cancellation_token = cancellation_token.child_token();
+    let tool_cancellation = NestedCancellation::new(cancellation_token.child_token());
     let notification_cancellation_token = CancellationToken::new();
     let mut content_items = Vec::new();
     let mut admitted_output_bytes = 0usize;
@@ -158,7 +159,7 @@ async fn run_cell<H: CellHost>(
                 if runtime_closed {
                     finish_callbacks(
                         &notification_cancellation_token,
-                        &tool_cancellation_token,
+                        &tool_cancellation,
                         &mut notification_tasks,
                         &mut tool_tasks,
                         CallbackCompletion::Cancel,
@@ -240,7 +241,7 @@ async fn run_cell<H: CellHost>(
                     if termination || cancellation_token.is_cancelled() {
                         finish_callbacks(
                             &notification_cancellation_token,
-                            &tool_cancellation_token,
+                            &tool_cancellation,
                             &mut notification_tasks,
                             &mut tool_tasks,
                             CallbackCompletion::Cancel,
@@ -265,7 +266,7 @@ async fn run_cell<H: CellHost>(
                     }
                     finish_callbacks(
                         &notification_cancellation_token,
-                        &tool_cancellation_token,
+                        &tool_cancellation,
                         &mut notification_tasks,
                         &mut tool_tasks,
                         CallbackCompletion::DrainNotifications,
@@ -373,9 +374,10 @@ async fn run_cell<H: CellHost>(
                                 kind: cell_tool_kind(kind),
                                 input,
                                 timeout: std::time::Duration::from_millis(timeout_ms),
+                                deadline: None,
                             },
                             runtime_tx.clone(),
-                            tool_cancellation_token.child_token(),
+                            tool_cancellation.child(tool_cancellation.token().child_token()),
                             task_failure_handler.clone(),
                         );
                     }
@@ -385,7 +387,7 @@ async fn run_cell<H: CellHost>(
                         if termination || cancellation_token.is_cancelled() {
                             finish_callbacks(
                                 &notification_cancellation_token,
-                                &tool_cancellation_token,
+                                &tool_cancellation,
                                 &mut notification_tasks,
                                 &mut tool_tasks,
                                 CallbackCompletion::Cancel,
@@ -402,7 +404,7 @@ async fn run_cell<H: CellHost>(
                         }
                         finish_callbacks(
                             &notification_cancellation_token,
-                            &tool_cancellation_token,
+                            &tool_cancellation,
                             &mut notification_tasks,
                             &mut tool_tasks,
                             CallbackCompletion::DrainNotifications,
@@ -465,7 +467,7 @@ async fn run_cell<H: CellHost>(
     begin_termination(&runtime_tx, &runtime_terminate_handle, &cancellation_token);
     finish_callbacks(
         &notification_cancellation_token,
-        &tool_cancellation_token,
+        &tool_cancellation,
         &mut notification_tasks,
         &mut tool_tasks,
         CallbackCompletion::Cancel,

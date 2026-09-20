@@ -151,6 +151,7 @@ command = "python3 /tmp/pre.py"
                 super::HookStateToml {
                     enabled: Some(false),
                     trusted_hash: Some("sha256:abc123".to_string()),
+                    once_per: None,
                 },
             )]),
         }

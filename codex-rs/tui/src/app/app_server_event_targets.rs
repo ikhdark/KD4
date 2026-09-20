@@ -65,6 +65,9 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadDeleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadUnarchived(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadClosed(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ThreadProjectUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadNameUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -81,12 +84,6 @@ pub(super) fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::TurnStarted(notification) => Some(notification.thread_id.as_str()),
-        ServerNotification::TurnReasoningPolicyUpdated(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::TurnReasoningPolicySummary(notification) => {
-            Some(notification.thread_id.as_str())
-        }
         ServerNotification::HookStarted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::TurnCompleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::HookCompleted(notification) => Some(notification.thread_id.as_str()),
@@ -148,7 +145,8 @@ pub(super) fn server_notification_thread_target(
                 None => return ServerNotificationThreadTarget::AppScoped,
             }
         }
-        ServerNotification::SkillsChanged(_)
+        ServerNotification::ProjectChanged(_)
+        | ServerNotification::SkillsChanged(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
@@ -189,14 +187,12 @@ mod tests {
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::ThreadSettings;
     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
-    use codex_app_server_protocol::TurnReasoningPolicySummaryNotification;
     use codex_app_server_protocol::WarningNotification;
     use codex_protocol::ThreadId;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
     use codex_protocol::openai_models::ReasoningEffort;
-    use codex_protocol::protocol::ReasoningPolicyHistory;
     use pretty_assertions::assert_eq;
 
     fn test_thread_settings() -> ThreadSettings {
@@ -339,27 +335,6 @@ mod tests {
                 thread_id: thread_id.to_string(),
                 thread_settings: test_thread_settings(),
             });
-
-        let target = server_notification_thread_target(&notification);
-
-        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
-    }
-
-    #[test]
-    fn reasoning_policy_summary_notifications_route_to_threads() {
-        let thread_id = ThreadId::new();
-        let notification = ServerNotification::TurnReasoningPolicySummary(
-            TurnReasoningPolicySummaryNotification {
-                thread_id: thread_id.to_string(),
-                turn_id: "turn".to_string(),
-                history: ReasoningPolicyHistory {
-                    turn_id: "turn".to_string(),
-                    entries: Vec::new(),
-                    total_entries: 0,
-                    truncated: false,
-                },
-            },
-        );
 
         let target = server_notification_thread_target(&notification);
 

@@ -964,6 +964,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(20),
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -972,6 +973,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     }
     .to_response_item("call-42", &payload);
 
@@ -1008,6 +1010,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: None,
         process_id: Some(4242),
+        session_capabilities: None,
         exit_code: None,
         process_exited: false,
         search_no_match: false,
@@ -1016,6 +1019,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
 
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Yielded);
@@ -1055,6 +1059,7 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(1_000),
         process_id: None,
+        session_capabilities: None,
         exit_code: None,
         process_exited: true,
         search_no_match: false,
@@ -1063,6 +1068,7 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
 
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
@@ -1093,6 +1099,7 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(1_000),
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(1),
         process_exited: true,
         search_no_match: false,
@@ -1101,6 +1108,7 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
     let expected_notice = "Output contained invalid UTF-8 bytes, which were replaced with U+FFFD. The displayed text is not byte-exact.";
     let ResponseInputItem::FunctionCallOutput {
@@ -1166,6 +1174,7 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(1_000),
         process_id: Some(4242),
+        session_capabilities: None,
         exit_code: Some(7),
         process_exited: true,
         search_no_match: false,
@@ -1174,6 +1183,7 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
 
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
@@ -1207,6 +1217,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(20),
         process_id: Some(42),
+        session_capabilities: None,
         exit_code: None,
         process_exited: false,
         search_no_match: false,
@@ -1215,6 +1226,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
 
     let metadata = output
@@ -1254,6 +1266,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
         truncation_policy: TruncationPolicy::Tokens(5),
         max_output_tokens: Some(20),
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -1262,6 +1275,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
 
     let raw_output = String::from_utf8_lossy(&output.raw_output);
@@ -1282,6 +1296,7 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(4),
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -1290,6 +1305,7 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
 
     let raw_output = String::from_utf8_lossy(&output.raw_output);
@@ -1314,6 +1330,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         truncation_policy: TruncationPolicy::Tokens(20_000),
         max_output_tokens: Some(20_000),
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -1322,6 +1339,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
 
     let projected = output.projected_model_output(&raw_output);
@@ -1401,6 +1419,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(256),
         process_id: Some(42),
+        session_capabilities: None,
         exit_code: None,
         process_exited: false,
         search_no_match: false,
@@ -1409,6 +1428,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         raw_output_artifact: None,
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     }
     .response_text();
 
@@ -1444,6 +1464,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: None,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(1),
         process_exited: true,
         search_no_match: false,
@@ -1458,6 +1479,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         }),
         raw_output_reduction_notice: None,
         repair_notice: Some("Command preflight applied one repair".to_string()),
+        pending_deferred_completions: Vec::new(),
     };
 
     let response = output.response_text();
@@ -1546,6 +1568,7 @@ async fn artifact_backed_exec_output(
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens,
         process_id: None,
+        session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
         search_no_match: false,
@@ -1554,6 +1577,7 @@ async fn artifact_backed_exec_output(
         raw_output_artifact: Some(artifact),
         raw_output_reduction_notice: None,
         repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     }
     .with_prepared_reduction_notice()
     .await;
@@ -1627,24 +1651,27 @@ async fn exec_code_mode_makes_empty_completion_explicit() {
 #[tokio::test]
 async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
     let raw_output = "word ".repeat(200);
+    // Leave room for the complete locator and selector while still reducing
+    // the producer text. Smaller budgets may retain only the artifact header.
     let (output, artifact_id, _, _retained_root) =
-        artifact_backed_exec_output(raw_output.as_bytes(), Some(100)).await;
+        artifact_backed_exec_output(raw_output.as_bytes(), Some(200)).await;
 
     let response = output.response_text();
 
-    assert!(response.contains("[command output reduced; recover the full retained output"));
-    assert!(response.contains("using the raw output artifact above"));
-    assert!(response.contains("do not rerun the producer.]"));
-    assert_eq!(response.matches(&artifact_id.to_string()).count(), 1);
-    assert!(codex_utils_string::approx_token_count(&response) <= 100);
     assert!(
         response
-            .find(&artifact_id.to_string())
-            .expect("artifact ID")
-            < response
-                .find("using the raw output artifact above")
-                .expect("recovery instruction")
+            .contains("[command output reduced; read a bounded selection from the retained output")
     );
+    assert!(response.contains(&format!("\"artifact_id\":\"{artifact_id}\"")));
+    assert!(response.contains(&format!(
+        "\"selectors\":[{{\"kind\":\"bytes\",\"start\":0,\"end\":{}}}]",
+        raw_output.len()
+    )));
+    assert!(response.contains("Selection completeness does not mean full artifact delivery."));
+    assert!(response.contains("do not rerun the producer.]"));
+    assert_eq!(response.matches(&artifact_id.to_string()).count(), 1);
+    assert!(codex_utils_string::approx_token_count(&response) <= 200);
+    assert!(!response.contains("artifact above"));
     let code_mode = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
     });
@@ -1652,9 +1679,15 @@ async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
         code_mode["output"]
             .as_str()
             .expect("code-mode output")
-            .contains("[command output reduced; recover the full retained output")
+            .contains("[command output reduced; read a bounded selection from the retained output")
     );
     assert_eq!(code_mode["raw_output_artifact_id"], artifact_id.to_string());
+    assert!(
+        code_mode["output"]
+            .as_str()
+            .unwrap()
+            .contains(&artifact_id.to_string())
+    );
 }
 
 #[tokio::test]

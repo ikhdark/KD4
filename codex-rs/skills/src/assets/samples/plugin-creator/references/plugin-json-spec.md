@@ -1,5 +1,10 @@
 # Plugin JSON sample spec
 
+This example targets the bundled `scripts/validate_plugin.py` contract. That
+validator is narrower than the native local plugin loader: the loader supports
+`hooks`, but the bundled validator rejects that manifest field. Keep it out of
+manifests produced by this scaffold.
+
 ```json
 {
   "name": "plugin-name",
@@ -15,7 +20,6 @@
   "license": "MIT",
   "keywords": ["keyword1", "keyword2"],
   "skills": "./skills/",
-  "hooks": "./hooks.json",
   "mcpServers": "./.mcp.json",
   "apps": "./.app.json",
   "interface": {
@@ -62,7 +66,6 @@
 - `license` (`string`): License identifier (for example `MIT`, `Apache-2.0`).
 - `keywords` (`array` of `string`): Search/discovery tags.
 - `skills` (`string`): Relative path to skill directories/files.
-- `hooks` (`string`): Hook config path.
 - `mcpServers` (`string` or `object`): MCP config path, or an object whose keys are MCP server names and whose values are MCP server config objects.
 - `apps` (`string`): App manifest path for plugin integrations.
 - `interface` (`object`): Interface/UX metadata block for plugin presentation.
@@ -114,7 +117,7 @@ Or as an object directly in `plugin.json`:
 ### Path conventions and defaults
 
 - Path values should be relative and begin with `./`.
-- `skills`, `hooks`, and string-valued `mcpServers` are supplemented on top of default component discovery; they do not replace defaults.
+- `skills` and string-valued `mcpServers` are supplemented on top of default component discovery; they do not replace defaults. The bundled validator rejects a `hooks` manifest field; omit it from `plugin.json`.
 - Custom path values must follow the plugin root convention and naming/namespacing rules.
 - This repo’s scaffold writes `.codex-plugin/plugin.json`; treat that as the manifest location this skill generates.
 
@@ -200,8 +203,8 @@ personal marketplace unless the caller explicitly requests a repo-local destinat
 
 ### Plugin validation notes
 
-- The validator mirrors the workspace plugin ingestion schema so generated plugins follow the same
-  manifest contract from the start.
+- The bundled validator defines the scaffold's accepted manifest fields. Do not
+  assume that every field accepted by the native local loader passes this validator.
 - Plugin manifests must include real values for `name`, `version`, `description`,
   `author.name`, and the required `interface` fields.
 - `version` must use strict semver.

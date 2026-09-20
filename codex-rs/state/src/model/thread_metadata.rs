@@ -54,6 +54,8 @@ pub struct ExtractionOutcome {
 /// Canonical thread metadata derived from rollout files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadMetadata {
+    /// Canonical host-owned project assignment.
+    pub project_id: Option<String>,
     /// The thread identifier.
     pub id: ThreadId,
     /// The absolute rollout path on disk.
@@ -203,6 +205,7 @@ impl ThreadMetadataBuilder {
             .map(canonicalize_datetime)
             .unwrap_or(updated_at);
         ThreadMetadata {
+            project_id: None,
             id: self.id,
             rollout_path: self.rollout_path.clone(),
             created_at,
@@ -343,6 +346,9 @@ impl ThreadMetadata {
         if self.archived_at != other.archived_at {
             diffs.push("archived_at");
         }
+        if self.project_id != other.project_id {
+            diffs.push("project_id");
+        }
         if self.git_sha != other.git_sha {
             diffs.push("git_sha");
         }
@@ -362,6 +368,7 @@ fn canonicalize_datetime(dt: DateTime<Utc>) -> DateTime<Utc> {
 
 #[derive(Debug)]
 pub(crate) struct ThreadRow {
+    project_id: Option<String>,
     id: String,
     rollout_path: String,
     created_at: i64,
@@ -416,6 +423,7 @@ impl ThreadRow {
             tokens_used: row.try_get("tokens_used")?,
             first_user_message: row.try_get("first_user_message")?,
             archived_at: row.try_get("archived_at")?,
+            project_id: row.try_get("project_id")?,
             git_sha: row.try_get("git_sha")?,
             git_branch: row.try_get("git_branch")?,
             git_origin_url: row.try_get("git_origin_url")?,
@@ -451,6 +459,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             tokens_used,
             first_user_message,
             archived_at,
+            project_id,
             git_sha,
             git_branch,
             git_origin_url,
@@ -485,6 +494,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             tokens_used,
             first_user_message: (!first_user_message.is_empty()).then_some(first_user_message),
             archived_at: archived_at.map(epoch_seconds_to_datetime).transpose()?,
+            project_id,
             git_sha,
             git_branch,
             git_origin_url,
@@ -547,6 +557,7 @@ mod tests {
 
     fn thread_row(reasoning_effort: Option<&str>) -> ThreadRow {
         ThreadRow {
+            project_id: None,
             id: "00000000-0000-0000-0000-000000000123".to_string(),
             rollout_path: "/tmp/rollout-123.jsonl".to_string(),
             created_at: 1_700_000_000_000,
@@ -578,6 +589,7 @@ mod tests {
 
     fn expected_thread_metadata(reasoning_effort: Option<ReasoningEffort>) -> ThreadMetadata {
         ThreadMetadata {
+            project_id: None,
             id: ThreadId::from_string("00000000-0000-0000-0000-000000000123")
                 .expect("valid thread id"),
             rollout_path: PathBuf::from("/tmp/rollout-123.jsonl"),

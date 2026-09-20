@@ -348,7 +348,33 @@ def _physical_attempt_count(request: dict[str, Any]) -> int:
 
 
 def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    request_list = list(requests)
+    request_list: list[dict[str, Any]] = []
+    identified: dict[tuple[str, str], int] = {}
+    duplicate_records = 0
+    conflicting_usage: set[str] = set()
+    for request in requests:
+        request_id = request.get("samplingRequestId")
+        scope = json.dumps(request.get("_turnKey", request.get("_turnId")), sort_keys=True)
+        if not isinstance(request_id, str) or not request_id:
+            # Missing identity is missing evidence, not permission to merge
+            # independent requests that happen to have identical token counts.
+            request_list.append(request)
+            continue
+        identity = (scope, request_id)
+        if identity not in identified:
+            identified[identity] = len(request_list)
+            request_list.append(request)
+            continue
+        duplicate_records += 1
+        index = identified[identity]
+        previous = request_list[index]
+        if (previous.get("tokenUsage") is not None
+                and request.get("tokenUsage") is not None
+                and previous["tokenUsage"] != request["tokenUsage"]):
+            conflicting_usage.add(request_id)
+        # A later snapshot may supply usage that an earlier one lacked.
+        if request.get("tokenUsage") is not None:
+            request_list[index] = request
     physical_attempts = sum(
         _physical_attempt_count(request) for request in request_list
     )
@@ -433,8 +459,14 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
     observed_blended_tokens = totals["nonCachedInputTokens"] + totals["outputTokens"]
     observed_billable_tokens = totals["inputTokens"] + totals["outputTokens"]
     input_tokens = totals["inputTokens"]
-    usage_complete = physical_attempts > 0 and covered_attempts == physical_attempts
+    usage_complete = (
+        physical_attempts > 0 and covered_attempts == physical_attempts
+        and not conflicting_usage
+    )
     return {
+        "accountingScope": "provider usage per identified sampling request within its turn",
+        "deduplicatedRequestRecords": duplicate_records,
+        "conflictingUsageRequestIds": sorted(conflicting_usage),
         "physicalAttempts": physical_attempts,
         "providerUsageAttempts": covered_attempts,
         "invalidUsageAttempts": invalid_usage_attempts,
@@ -452,6 +484,7 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "promptCategoryAttempts": categorized_attempts,
         "promptCategories": dict(prompt_categories) if categorized_attempts else None,
         "promptCategoryBasis": "native_estimate",
+        "promptCategoryScope": "sum of local logical-prompt estimates across requests; not provider usage or subscription cost",
         "promptCategoryCoverage": categorized_attempts / len(request_list)
         if request_list
         else None,
@@ -1055,7 +1088,7 @@ def _population_report(
         local = timing.get("local", {})
         counters = timing.get("counters", {})
         requests = _selected_requests(timing)
-        all_requests.extend(requests)
+        all_requests.extend({**request, "_turnId": record["turn_id"]} for request in requests)
         all_tool_calls.extend(
             {
                 **call,

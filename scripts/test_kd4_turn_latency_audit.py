@@ -1639,6 +1639,10 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
 
         discovery = report["sourceDiscovery"]
         self.assertEqual(discovery["eventCount"], 7)
+        self.assertEqual(discovery["evidenceProgressCount"], 6)
+        self.assertEqual(discovery["unchangedEvidenceCount"], 1)
+        self.assertTrue(discovery["events"][0]["newEvidence"])
+        self.assertFalse(discovery["events"][2]["newEvidence"])
         self.assertEqual(discovery["searchCount"], 3)
         self.assertEqual(discovery["readCount"], 3)
         self.assertEqual(discovery["broadSearchCount"], 2)
@@ -1674,6 +1678,44 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         rendered = kd4_turn_latency_audit.render_report(report)
         self.assertIn("source discovery: events=7", rendered)
         self.assertIn("discovery 1: turn=discovery", rendered)
+
+    def test_discovery_progress_ignores_wrapper_timing_and_records_recovery_sequence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = root / "rollout.jsonl"
+            records = [_meta(str(root)), _event(
+                {"type": "task_started", "turn_id": "t"}, "2026-08-17T00:00:00Z"
+            )]
+            operations = [
+                ("Get-Content scripts/widget.py", "class Widget: pass"),
+                ("Get-Content scripts/widget.py", "class Widget: pass"),
+                ("Get-Content scripts/widget.py", "class Widget: changed"),
+                ("rg -l Widget scripts", "Warning: truncated output\nscripts/widget.py"),
+                ("rg -l Widget scripts", "scripts/widget.py\nscripts/other.py"),
+            ]
+            for i, (command, body) in enumerate(operations, 1):
+                receipt = json.dumps([{"call_id": str(i), "process_exited": True}])
+                records += [
+                    _response({"type": "function_call", "call_id": str(i),
+                               "name": "exec_command", "arguments": json.dumps({"cmd": command})},
+                              f"2026-08-17T00:00:{2*i:02}Z"),
+                    _response({"type": "function_call_output", "call_id": str(i),
+                               "output": f"Script completed with cell ID {i}\nWall time {i}.0 seconds\nOutput:\n{body}\nNested command states (independent of script completion):\n{receipt}"},
+                              f"2026-08-17T00:00:{2*i+1:02}Z"),
+                ]
+            records.append(_event({"type": "task_complete", "turn_id": "t", "timing": _timing()},
+                                  "2026-08-17T00:00:12Z"))
+            session.write_text("\n".join(records), encoding="utf-8")
+            discovery = kd4_turn_latency_audit.analyze_session_path(session, root)["sourceDiscovery"]
+        self.assertEqual(discovery["evidenceProgressCount"], 4)
+        self.assertEqual(discovery["unchangedEvidenceCount"], 1)
+        self.assertEqual([event["newEvidence"] for event in discovery["events"]],
+                         [True, False, True, True, True])
+        repeats = [signal for signal in discovery["candidateSignals"]
+                   if signal["code"] == "repeated_search_after_reduced_output"]
+        self.assertEqual(len(repeats), 1)
+        self.assertEqual((repeats[0]["previousOrdinal"], repeats[0]["ordinal"]), (4, 5))
+        self.assertFalse(repeats[0]["causallyEstablished"])
 
     def test_waiting_input_tail_is_classified_without_blocking_completed_audit(
         self,

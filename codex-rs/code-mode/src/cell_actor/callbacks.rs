@@ -1,6 +1,8 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use codex_code_mode_protocol::CancellationCause;
+use codex_code_mode_protocol::NestedCancellation;
 use futures::FutureExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -89,20 +91,27 @@ pub(super) fn spawn_tool<H: CellHost>(
     host: Arc<H>,
     invocation: CellToolCall,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
-    cancellation_token: CancellationToken,
+    cancellation: NestedCancellation,
     task_failure_handler: Option<TaskFailureHandler>,
 ) {
     tasks.spawn(async move {
+        let mut invocation = invocation;
         let id = invocation.id.clone();
         let tool_name = invocation.name.name.clone();
         let timeout_tool_name = tool_name.clone();
         let timeout = invocation.timeout;
-        let timeout_token = cancellation_token.clone();
+        let timeout_cancellation = cancellation.clone();
+        // Publish the same instant the wrapper enforces, so every stage before
+        // observation is charged against one budget and a handler that can
+        // yield cooperatively knows exactly how long it has.
+        invocation.deadline = Some(std::time::Instant::now() + timeout);
         let callback = AssertUnwindSafe(async move {
             tokio::select! {
-                response = host.invoke_tool(invocation, cancellation_token) => response,
+                response = host.invoke_tool(invocation, cancellation) => response,
                 _ = tokio::time::sleep(timeout) => {
-                    timeout_token.cancel();
+                    // Record before signalling: an observer woken by the
+                    // cancellation must already be able to read why.
+                    timeout_cancellation.cancel_with(CancellationCause::NestedDeadline);
                     Err(format!(
                         "nested tool `{timeout_tool_name}` exceeded its {}ms timeout",
                         timeout.as_millis()
@@ -170,18 +179,21 @@ pub(super) fn spawn_tool<H: CellHost>(
 
 pub(super) async fn finish_callbacks(
     notification_cancellation_token: &CancellationToken,
-    tool_cancellation_token: &CancellationToken,
+    tool_cancellation: &NestedCancellation,
     notification_tasks: &mut JoinSet<()>,
     tool_tasks: &mut JoinSet<()>,
     completion: CallbackCompletion,
     task_failure_handler: Option<&TaskFailureHandler>,
 ) {
+    // The cell is going away, so every call still running under it is stopped
+    // by the runtime rather than by the user. A call that already recorded its
+    // own cause keeps it.
     if matches!(completion, CallbackCompletion::Cancel) {
-        tool_cancellation_token.cancel();
+        tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
     }
     drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
     notification_cancellation_token.cancel();
-    tool_cancellation_token.cancel();
+    tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
     drain_tasks_bounded(tool_tasks, "tool", task_failure_handler).await;
 }
 

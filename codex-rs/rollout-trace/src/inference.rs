@@ -51,6 +51,7 @@ struct EnabledInferenceTraceContext {
     codex_turn_id: CodexTurnId,
     model: String,
     provider_name: String,
+    request_metadata: Option<Arc<JsonValue>>,
 }
 
 /// One concrete upstream request attempt.
@@ -115,8 +116,18 @@ impl InferenceTraceContext {
                 codex_turn_id,
                 model,
                 provider_name,
+                request_metadata: None,
             }),
         }
+    }
+
+    /// Attach host settings to explicit full-content captures only. The closure
+    /// is not evaluated when tracing is disabled; metadata never enters a request.
+    pub fn with_request_metadata(mut self, metadata: impl FnOnce() -> JsonValue) -> Self {
+        if let InferenceTraceContextState::Enabled(context) = &mut self.state {
+            context.request_metadata = Some(Arc::new(metadata()));
+        }
+        self
     }
 
     /// Starts a new attempt after the concrete provider request has been built.
@@ -178,13 +189,34 @@ impl InferenceTraceAttempt {
     /// logical request when the transport omits already-sent input, such as
     /// websocket reuse after an untraced warmup response.
     pub fn record_started(&self, request: &impl Serialize) {
+        self.record_started_with_metadata(request, JsonValue::Null);
+    }
+
+    /// Preserve the provider payload at the top level for existing replay
+    /// consumers. `_codex` is an audit sidecar in the local capture only.
+    pub fn record_started_with_metadata(&self, request: &impl Serialize, mut metadata: JsonValue) {
         let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
             return;
         };
+        let Ok(mut request) = serde_json::to_value(request) else {
+            attempt.terminal_recorded.store(true, Ordering::Release);
+            return;
+        };
+        if let Some(settings) = &attempt.context.request_metadata {
+            if !metadata.is_object() {
+                metadata = serde_json::json!({});
+            }
+            metadata["settings"] = settings.as_ref().clone();
+        }
+        if !metadata.is_null()
+            && let Some(request) = request.as_object_mut()
+        {
+            request.insert("_codex".to_string(), metadata);
+        }
         let Some(request_payload) = write_json_payload_best_effort(
             &attempt.context.writer,
             RawPayloadKind::InferenceRequest,
-            request,
+            &request,
         ) else {
             attempt.terminal_recorded.store(true, Ordering::Release);
             return;
@@ -464,6 +496,13 @@ mod tests {
     }
 
     #[test]
+    fn disabled_context_does_not_build_request_metadata() {
+        let context = InferenceTraceContext::disabled()
+            .with_request_metadata(|| panic!("disabled captures must not prepare metadata"));
+        assert!(!context.start_attempt().is_enabled());
+    }
+
+    #[test]
     fn enabled_context_records_replayable_inference_attempt() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let writer = Arc::new(TraceWriter::create(
@@ -489,15 +528,20 @@ mod tests {
             "test-provider".to_string(),
         );
 
+        let context =
+            context.with_request_metadata(|| json!({"task_model_guidance_enabled": true}));
         let attempt = context.start_attempt();
-        attempt.record_started(&json!({
-            "model": "gpt-test",
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "hello"}]
-            }],
-        }));
+        attempt.record_started_with_metadata(
+            &json!({
+                "model": "gpt-test",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                }],
+            }),
+            json!({"sampling_request_id":"sample-1", "physical_attempt_id":"attempt-2"}),
+        );
         attempt.record_completed("resp-1", Some("req-1"), &None, &[]);
 
         let rollout = replay_bundle(temp.path())?;
@@ -513,6 +557,17 @@ mod tests {
         assert_eq!(inference.execution.status, ExecutionStatus::Completed);
         assert_eq!(inference.upstream_request_id, Some("req-1".to_string()));
         assert_eq!(rollout.raw_payloads.len(), 2);
+        let payload = &rollout.raw_payloads[&inference.raw_request_payload_id];
+        let captured: JsonValue =
+            serde_json::from_slice(&std::fs::read(temp.path().join(&payload.path))?)?;
+        assert_eq!(captured["model"], "gpt-test");
+        assert_eq!(captured["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(
+            captured["_codex"]["settings"]["task_model_guidance_enabled"],
+            true
+        );
+        assert_eq!(captured["_codex"]["sampling_request_id"], "sample-1");
+        assert_eq!(captured["_codex"]["physical_attempt_id"], "attempt-2");
 
         Ok(())
     }

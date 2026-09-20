@@ -190,6 +190,7 @@ FROM threads
         push_thread_filters(
             &mut builder,
             ThreadFilterOptions {
+                project_id: None,
                 archived_only: false,
                 allowed_sources,
                 model_providers: None,

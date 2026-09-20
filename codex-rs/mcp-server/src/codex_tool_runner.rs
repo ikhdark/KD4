@@ -530,8 +530,6 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::AgentMessageContentDelta(_)
                     | EventMsg::ReasoningContentDelta(_)
                     | EventMsg::ReasoningRawContentDelta(_)
-                    | EventMsg::ReasoningPolicyUpdated(_)
-                    | EventMsg::ReasoningPolicySummary(_)
                     | EventMsg::ExitedReviewMode(_)
                     | EventMsg::DynamicToolCallResponse(_)
                     | EventMsg::ContextCompacted(_)

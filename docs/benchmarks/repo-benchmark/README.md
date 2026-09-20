@@ -9,6 +9,34 @@ app-server. The Python session audit remains the sole diagnostic analyzer and ha
 
 ## Choose a measurement
 
+For an explicit full production-request capture, set `CODEX_ROLLOUT_TRACE_ROOT`
+to a task-owned directory before launching the binary being measured. Each
+bundle's `trace.jsonl` links inference events to JSON files in `payloads`.
+The request retains provider `instructions`, `input`, `tools`, and resolved
+wire settings. Its local-only `_codex` sidecar records `sampling_request_id`,
+`physical_attempt_id`, and effective `settings` from the production turn,
+including guidance gating and base-prompt ownership. Join those IDs to native
+model-request timing to distinguish physical retries from logical generations.
+The sidecar is never sent to the provider or inserted into model history.
+
+For WebSocket continuations, `_codex.logical_request` contains the full logical
+request while the top level retains the wire delta. When replay must restore an
+untraced prewarm prefix, the top level is the logical request and
+`_codex.wire_request` retains the delta instead. Count guidance fragments in the
+logical input, rather than treating an inherited prefix as absent. Inspect the
+captured base instructions and effective settings instead of inferring them
+from catalog defaults or the standalone `prompt_debug` input list.
+
+Full-content tracing is opt-in and includes conversation/tool content. Ordinary
+diagnosis can use existing timing and schema hashes/sizes. Debug events at
+`codex_core::tool_schema_audit` add the name, UTF-8 bytes, approximate tokens,
+and SHA-256 of each eager built-in declaration when its router is constructed.
+External contracts remain lazy. Compare these measurements with tool-search
+calls and failed-call repair rounds; smaller initial schemas alone do not
+establish a faster task. Reuse the startup, prewarm, response-tail, tool, hook,
+and retry timing boundaries below; local scaffold reuse does not prove a
+provider prompt-cache hit.
+
 Use the [session audit](../../../scripts/kd4_turn_latency_audit.py) for a recorded
 session and Repo Benchmark for comparisons between revisions. The audit shares
 definitions with [timing analysis](../../../scripts/kd4_timing_analysis.py) and
@@ -254,7 +282,7 @@ edits.
 `fork_on` against `reference` measures the overall result, including runtime controls,
 instrumentation, and other fixed fork differences.
 
-The feature inventory is the selected fork commit's `kd4_features.toml`, including phase reasoning
+The feature inventory is the selected fork commit's `kd4_features.toml`, including turn execution controls
 and `features.kd4_runtime`. Reports separate declared controls, enabled settings, evidence of
 exercise, and fixed differences. Enabling a feature alone does not prove that a workload exercised
 it. Preparation freezes declarations; it does not claim that feature test gates ran against the
@@ -500,7 +528,7 @@ Summed thread durations are not elapsed task time.
 | AJ | `nextest.toml` local/fast profiles disable fail-fast. `rust_test_runner.py::require_core_lib_filter` rejects unfiltered core library runs. Validation duration is command wall time, without compile/lane-wait decomposition; failure-fixing efficiency cannot be inferred from it. No optional runtime telemetry was added. |
 | AK | Projection/recovery counters now reach comparisons together, including omitted sections and recovery-associated generations. `read_tool_output.rs` supports line ranges and resumable continuation: its 2,000-line cap is per read, not proof that execution must be repeated. Token counts are estimates, not exact billed compression. Reserved recursive spill is excluded. |
 | AL | `command_shape.rs` supplies structured invocations and `command_search.rs` classifies rg narrowing; the latter is not a separate search tool. Audit discovery remains a labelled heuristic of call text. Adding a general dispatch taxonomy requires a separate contract; unmatched text cannot establish a zero unknown-operation rate. |
-| AM | `generationPurposeLatency`, per-request purpose/effort and token diagnostics already exist. Purpose is not interchangeable with configured reasoning phase. No phase tuning or causal conclusion follows from these observations. |
+| AM | `generationPurposeLatency`, per-request purpose/effort and token diagnostics already exist. Purpose does not select reasoning effort. No effort tuning or causal conclusion follows from these observations. |
 | AN | Captured configuration hashes and report warnings expose a confounder. Benchmark isolated configuration differs from `.codex/config.toml`; local historical configuration is not reconstructed from today's file. |
 | AO | The existing evidence envelope now accompanies the vector, including completeness, approximation, limitations and byte-snapshot identity. No parallel schema or analyzer was introduced. |
 | AP | Existing artifact creation/reuse counters are exported. Retention limits, search budgets and expiry behavior remain unchanged; there is no evidence here that tuning them improves outcomes. |

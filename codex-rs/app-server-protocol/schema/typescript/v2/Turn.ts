@@ -8,31 +8,40 @@ import type { TurnItemsView } from "./TurnItemsView";
 import type { TurnStatus } from "./TurnStatus";
 import type { TurnTiming } from "./TurnTiming";
 
-export type Turn = {/**
+export type Turn = {
+/**
  * Identifier for this turn. Codex-generated turn IDs are UUIDv7.
  */
-id: string, /**
+id: string,
+/**
  * Thread items currently included in this turn payload.
  */
-items: Array<ThreadItem>, /**
+items: Array<ThreadItem>,
+/**
  * Describes how much of `items` has been loaded for this turn.
  */
-itemsView: TurnItemsView, status: TurnStatus, /**
+itemsView: TurnItemsView, status: TurnStatus,
+/**
  * Only populated when the Turn's status is failed.
  */
-error: TurnError | null, /**
+error: TurnError | null,
+/**
  * Unix timestamp (in seconds) when the turn started.
  */
-startedAt: number | null, /**
+startedAt: number | null,
+/**
  * Unix timestamp (in seconds) when the turn completed.
  */
-completedAt: number | null, /**
+completedAt: number | null,
+/**
  * Duration between turn start and completion in milliseconds, if known.
  */
-durationMs: number | null, /**
+durationMs: number | null,
+/**
  * Immutable wall-clock profile persisted at the terminal turn boundary.
  */
-timing?: TurnTiming, /**
+timing?: TurnTiming,
+/**
  * Authoritative typed tool result surfaced when the turn terminalized.
  */
-surfacedResult?: SurfacedToolResult};
+surfacedResult?: SurfacedToolResult, };

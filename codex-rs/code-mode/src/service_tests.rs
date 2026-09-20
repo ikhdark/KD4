@@ -15,6 +15,7 @@ use crate::CodeModeSessionProvider;
 use crate::CodeModeToolKind;
 use crate::ExecuteRequest;
 use crate::FunctionCallOutputContentItem;
+use crate::NestedCancellation;
 use crate::NoopCodeModeSessionDelegate;
 use crate::NotificationFuture;
 use crate::ProcessOwnedCodeModeSessionProvider;
@@ -33,7 +34,7 @@ impl CodeModeSessionDelegate for EchoDelegate {
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
-        _cancellation_token: CancellationToken,
+        _cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             Ok(serde_json::json!({
@@ -63,6 +64,7 @@ fn exec_command_definition() -> ToolDefinition {
         description: "run a command".to_string(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        default_timeout_ms: None,
         output_schema: None,
     }
 }
@@ -93,6 +95,7 @@ fn execute_request(source: &str) -> ExecuteRequest {
         source: source.to_string(),
         yield_time_ms: Some(1),
         max_output_tokens: None,
+        default_tool_timeout_ms: None,
     }
 }
 
@@ -141,6 +144,29 @@ fn yield_time_does_not_extend_the_default_nested_tool_timeout() {
     });
 
     assert_eq!(request.default_tool_timeout_ms, 60_000);
+}
+
+#[test]
+fn host_supplied_default_nested_tool_timeout_reaches_the_runtime() {
+    let request = runtime_request(ExecuteRequest {
+        default_tool_timeout_ms: Some(75_000),
+        ..execute_request("text('done');")
+    });
+
+    assert_eq!(request.default_tool_timeout_ms, 75_000);
+}
+
+#[test]
+fn host_supplied_default_nested_tool_timeout_saturates_at_the_cap() {
+    let request = runtime_request(ExecuteRequest {
+        default_tool_timeout_ms: Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS + 1),
+        ..execute_request("text('done');")
+    });
+
+    assert_eq!(
+        request.default_tool_timeout_ms,
+        codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS
+    );
 }
 
 async fn execute(service: &InProcessCodeModeSession, request: ExecuteRequest) -> RuntimeResponse {
@@ -333,6 +359,7 @@ async fn compact_tool_discovery_resolves_one_exact_description() {
                 description: "exact schema description".to_string(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
+                default_timeout_ms: None,
                 output_schema: None,
             }],
             source: r#"text(JSON.stringify({ names: ALL_TOOL_NAMES, resolved: resolve_tool("sample_tool"), missing: resolve_tool("missing") === undefined }));"#.to_string(),

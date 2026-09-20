@@ -335,6 +335,41 @@ async fn read_file_is_visible_and_registered_for_text_models() {
 }
 
 #[tokio::test]
+async fn read_file_is_available_without_an_execution_environment() {
+    let plan = probe(|turn| turn.environments.turn_environments.clear()).await;
+    plan.assert_visible_contains(&["read_file"]);
+    plan.assert_registered_contains(&["read_file"]);
+}
+
+#[tokio::test]
+async fn retained_inventory_is_visible_and_registered_for_text_models() {
+    let plan = probe(|turn| {
+        turn.model_info.input_modalities = vec![InputModality::Text];
+        turn.model_info.supports_search_tool = false;
+    })
+    .await;
+    plan.assert_visible_contains(&["inventory"]);
+    plan.assert_registered_contains(&["inventory"]);
+}
+
+#[tokio::test]
+async fn retained_inventory_is_discoverable_without_loading_its_schema_upfront() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::CodeMode, true);
+        turn.model_info.supports_search_tool = true;
+    })
+    .await;
+    plan.assert_registered_contains(&["inventory"]);
+    plan.assert_visible_lacks(&["inventory"]);
+    assert_eq!(plan.exposure("inventory"), ToolExposure::Deferred);
+    assert!(
+        plan.tool_search_texts
+            .iter()
+            .any(|text| text.contains("inventory"))
+    );
+}
+
+#[tokio::test]
 async fn update_plan_is_not_exposed_or_registered_in_plan_mode() {
     let default_mode = probe(|_| {}).await;
     default_mode.assert_visible_contains(&["update_plan"]);
@@ -1393,15 +1428,27 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     )
     .await;
     missing_model_capability.assert_visible_lacks(&["tool_search"]);
+    assert_eq!(
+        missing_model_capability.exposure("inventory"),
+        ToolExposure::Direct
+    );
 
-    let missing_deferred_tools = probe(|turn| {
+    let builtin_deferred_tools = probe(|turn| {
         set_feature(turn, Feature::Collab, /*enabled*/ false);
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ false);
         turn.model_info.supports_search_tool = true;
     })
     .await;
-    missing_deferred_tools.assert_visible_lacks(&["tool_search"]);
-    missing_deferred_tools.assert_visible_lacks(&[
+    // The retained inventory remains deferred even with no external tools or
+    // agent tools. Search must still expose a route to that built-in contract.
+    builtin_deferred_tools.assert_visible_contains(&["tool_search"]);
+    builtin_deferred_tools.assert_visible_lacks(&["inventory"]);
+    builtin_deferred_tools.assert_registered_contains(&["inventory"]);
+    assert_eq!(
+        builtin_deferred_tools.exposure("inventory"),
+        ToolExposure::Deferred
+    );
+    builtin_deferred_tools.assert_visible_lacks(&[
         "list_mcp_resources",
         "list_mcp_resource_templates",
         "read_mcp_resource",

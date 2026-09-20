@@ -24,12 +24,26 @@ pub struct HooksToml {
     pub state: BTreeMap<String, HookStateToml>,
 }
 
+/// Codex extension: how often a matched hook handler may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRunScope {
+    /// Run once per turn; later matched dispatches in that turn are skipped.
+    Turn,
+    /// Run once per session; later matched dispatches in that session are skipped.
+    Session,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HookStateToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_hash: Option<String>,
+    /// Codex extension: run the handler at most once per scope. Later matched
+    /// dispatches in that scope are skipped without spawning the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub once_per: Option<HookRunScope>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

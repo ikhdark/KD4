@@ -478,10 +478,13 @@ impl PromptContextBreakdown {
                 .and_then(|index| sidecar.aligned_item(index));
             breakdown.record_response_item(item, &serialized_item, sidecar, aligned)?;
         }
-        breakdown.record_overhead(
+        // The array envelope grows with the item count. Keep its bytes in the
+        // injected category for reconciliation, but leave it out of the
+        // category hash: hashing it flipped fixed-prefix reuse eligibility on
+        // every request that merely appended history.
+        breakdown.record_overhead_unhashed(
             PromptContextCategory::OtherInjected,
             sequence_envelope_bytes(items.len()),
-            b"response_input_array_envelope",
         );
         Ok(breakdown)
     }
@@ -515,10 +518,9 @@ impl PromptContextBreakdown {
                 .and_then(|index| sidecar.aligned_item(index));
             breakdown.record_serialized_response_item(item, serialized_item, raw_item, aligned)?;
         }
-        breakdown.record_overhead(
+        breakdown.record_overhead_unhashed(
             PromptContextCategory::OtherInjected,
             sequence_envelope_bytes(items.len()),
-            b"response_input_array_envelope",
         );
         Ok(breakdown)
     }
@@ -729,6 +731,23 @@ impl PromptContextBreakdown {
             serialized_bytes.saturating_add(3) / 4,
             stable_source,
         );
+    }
+
+    /// Charges envelope bytes to a category without contributing to its
+    /// identity hash, so item-count-dependent overhead cannot make an
+    /// otherwise unchanged category look changed.
+    fn record_overhead_unhashed(&mut self, category: PromptContextCategory, serialized_bytes: u64) {
+        if serialized_bytes == 0 {
+            return;
+        }
+        let entry = self
+            .categories
+            .entry(category)
+            .or_insert_with(|| CategoryAccumulator::new(category));
+        entry.serialized_bytes = entry.serialized_bytes.saturating_add(serialized_bytes);
+        entry.estimated_tokens = entry
+            .estimated_tokens
+            .saturating_add(serialized_bytes.saturating_add(3) / 4);
     }
 
     fn record(

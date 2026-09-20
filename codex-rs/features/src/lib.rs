@@ -99,7 +99,7 @@ impl Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     // Stable.
-    /// Enable KD4 phase reasoning, governor intervention, and command preflight.
+    /// Enable KD4 turn execution controls and command preflight.
     /// Other independently controlled or fixed fork differences remain separate.
     Kd4Runtime,
     /// Enable the default shell tool.
@@ -548,8 +548,34 @@ pub struct FeaturesToml {
     removed_apps_mcp_path_override: Option<FeatureToml<RemovedAppsMcpPathOverrideConfigToml>>,
     pub network_proxy: Option<FeatureToml<NetworkProxyConfigToml>>,
     /// Boolean feature toggles keyed by canonical feature name.
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "deserialize_feature_entries")]
     entries: BTreeMap<String, bool>,
+}
+
+fn deserialize_feature_entries<'de, D>(deserializer: D) -> Result<BTreeMap<String, bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+    let mut entries = BTreeMap::new();
+    for (key, value) in values {
+        match value {
+            toml::Value::Boolean(enabled) => {
+                entries.insert(key, enabled);
+            }
+            toml::Value::Table(_) if canonical_feature_for_key(&key).is_none() => {
+                // Newer clients can send structured settings for features this
+                // runtime does not implement. Ignore them like unknown toggles.
+                tracing::warn!("unknown feature key in config: {key}");
+            }
+            _ => {
+                return Err(serde::de::Error::custom(format!(
+                    "feature `{key}` must be a boolean"
+                )));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 impl Features {

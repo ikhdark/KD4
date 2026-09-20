@@ -130,7 +130,7 @@ impl CodeModeWaitHandler {
                     let (activity_rx, pending_activity) = exec
                         .session
                         .input_queue
-                        .subscribe_activity(turn_state.as_deref())
+                        .subscribe_activity(turn_state.as_deref(), false)
                         .await;
                     // Periodic empty observations are host-owned and do not
                     // wake the model. The runtime wakes this owner on output,
@@ -446,6 +446,9 @@ pub(super) fn input_activity_response(
     let text = match activity {
         InputQueueActivity::Mailbox => "Wait interrupted by mailbox activity.",
         InputQueueActivity::Steer => "Wait interrupted by new user input.",
+        InputQueueActivity::InternalCompletion => {
+            "A deferred MCP result is waiting in your next response. Read it instead of polling."
+        }
     };
     codex_code_mode::RuntimeResponse::Yielded {
         cell_id: cell_id.clone(),
@@ -554,6 +557,7 @@ mod tests {
                     source: "await yield_control();".to_string(),
                     yield_time_ms: None,
                     max_output_tokens: None,
+                    default_tool_timeout_ms: None,
                 })
                 .await
                 .unwrap();
@@ -792,7 +796,10 @@ mod tests {
         };
         let (activity_rx, pending_activity) = session
             .input_queue
-            .subscribe_activity(Some(turn_state.as_ref()))
+            .subscribe_activity(
+                Some(turn_state.as_ref()),
+                /*has_internal_completion*/ false,
+            )
             .await;
         assert_eq!(pending_activity, None);
 
@@ -883,6 +890,7 @@ mod tests {
                 source: "await new Promise(() => {});".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
+                default_tool_timeout_ms: None,
             })
             .await
             .expect("real code-mode cell should start");

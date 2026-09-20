@@ -31,6 +31,9 @@ instead of only their artifact identifiers; do not invent missing topology.
 The latest implementation and worktree state needed to resume safely.
 Name files already edited, partial changes, and any active ownership or handoffs.
 Preserve the remaining predicted change surface: owners, files, and affected contracts.
+For live commands, cells, and jobs, preserve exact identifiers, last observed
+status, and supported continuation or cancellation calls. Keep unknown status
+explicit; elapsed time alone does not establish completion. Retire completed handles.
 
 ## Completed work
 
@@ -52,6 +55,8 @@ and any known later invalidation. Mark unknown freshness explicitly; do not
 invent identifiers or gather new evidence.
 Keep supplied provenance labels such as direct_file_read, cached_observation,
 and test_result attached to the claims they support.
+Keep indispensable artifact paths and recovery references needed to resume live
+work or retrieve retained output, including required selectors or cursors.
 
 ## Next action
 

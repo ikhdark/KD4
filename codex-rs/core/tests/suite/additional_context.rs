@@ -710,6 +710,43 @@ async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> R
     assert!(!guidance[0].contains("stay at module-level abstraction"));
     assert!(guidance[0].ends_with("</task_model_guidance>"));
 
+    // A second turn must reuse the stable fragment, not append another copy.
+    let second_request = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    submit_plain_user_text(&test, "continue using the retained evidence").await?;
+    assert_eq!(
+        task_model_guidance_texts(&second_request.single_request()),
+        guidance
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_model_guidance_owned_by_base_instructions_is_not_duplicated() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let request = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let instructions = "<task_model_guidance_policy version=\"1\" />\nRetain exact observed paths.";
+    let test = test_codex()
+        .with_config(move |config| {
+            config.base_instructions = Some(instructions.to_string());
+            config.features.enable(Feature::TaskModelGuidance).unwrap();
+        })
+        .build(&server)
+        .await?;
+    submit_plain_user_text(&test, "summarize the guidance policy").await?;
+    let request = request.single_request();
+    assert_eq!(request.body_json()["instructions"], instructions);
+    assert!(task_model_guidance_texts(&request).is_empty());
+
     Ok(())
 }
 

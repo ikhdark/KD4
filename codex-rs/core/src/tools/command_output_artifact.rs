@@ -169,7 +169,7 @@ impl ToolOutputSelectorResult {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub(crate) struct ReadToolOutputResult {
     pub artifact_id: String,
     pub canonical_sha256: String,
@@ -179,6 +179,32 @@ pub(crate) struct ReadToolOutputResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_ranges: Vec<CanonicalByteRange>,
     pub results: Vec<ToolOutputSelectorResult>,
+}
+
+impl Serialize for ReadToolOutputResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut result = serializer.serialize_struct("ReadToolOutputResult", 9)?;
+        result.serialize_field("artifact_id", &self.artifact_id)?;
+        result.serialize_field("canonical_sha256", &self.canonical_sha256)?;
+        result.serialize_field("canonical_bytes", &self.canonical_bytes)?;
+        result.serialize_field("retained_bytes", &self.retained_bytes)?;
+        // `complete` remains the legacy selection-completeness field.
+        result.serialize_field("complete", &self.complete)?;
+        result.serialize_field("delivered_selection_complete", &self.complete)?;
+        result.serialize_field(
+            "retained_artifact_complete",
+            &(self.retained_bytes == self.canonical_bytes && self.unavailable_ranges.is_empty()),
+        )?;
+        if !self.unavailable_ranges.is_empty() {
+            result.serialize_field("unavailable_ranges", &self.unavailable_ranges)?;
+        }
+        result.serialize_field("results", &self.results)?;
+        result.end()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1574,12 +1600,18 @@ impl RawOutputArtifact {
 
     pub(crate) async fn reduction_notice(&self) -> Option<String> {
         let Self::Stored {
-            path, truncated, ..
+            id,
+            path,
+            bytes,
+            truncated,
+            ..
         } = self
         else {
             return None;
         };
         let path = path.clone();
+        let id = *id;
+        let end = (*bytes).min(1024);
         let truncated = *truncated;
         run_blocking_artifact_io(move || {
             open_regular_artifact(&path)
@@ -1587,10 +1619,10 @@ impl RawOutputArtifact {
             let scope = if truncated {
                 "the retained prefix"
             } else {
-                "the full retained output"
+                "the retained output"
             };
             Ok(format!(
-                "[command output reduced; recover {scope} with read_tool_output using the raw output artifact above. Batch exact ranges when possible; do not rerun the producer.]"
+                "[command output reduced; read a bounded selection from {scope} with read_tool_output: {{\"artifact_id\":\"{id}\",\"selectors\":[{{\"kind\":\"bytes\",\"start\":0,\"end\":{end}}}]}}. Selection completeness does not mean full artifact delivery. Batch exact ranges when possible; do not rerun the producer.]"
             ))
         })
         .await
@@ -2257,15 +2289,34 @@ fn successful_byte_selector_result(
     }
 }
 
-fn largest_fitting_byte_chunk(
+/// Largest prefix of `range` whose own response fits, measured on the bytes
+/// that would actually be returned.
+///
+/// Sizing against a synthetic buffer cannot work: NUL renders as ` `, so a
+/// zero-filled probe overstates the cost about sixfold and advertises chunks a
+/// fraction of the size that fits, while representative letters would
+/// understate escape-heavy content and advertise chunks that do not. Only the
+/// real prefix answers the question being asked.
+///
+/// The returned length is char-boundary aligned so the advertised continuation
+/// is a readable fragment rather than a split code point.
+fn largest_fitting_byte_prefix(
     artifact_id: &str,
     canonical_bytes: u64,
     range: CanonicalByteRange,
+    snapshot: &[u8],
     token_ceiling: usize,
 ) -> u64 {
     if range.is_empty() {
         return 0;
     }
+    let prefix_bytes = |candidate_bytes: u64| -> &[u8] {
+        let start = range.start as usize;
+        let end = start
+            .saturating_add(candidate_bytes as usize)
+            .min(snapshot.len());
+        snapshot.get(start..end).unwrap_or_default()
+    };
     let fits = |candidate_bytes: u64| {
         let candidate_range = CanonicalByteRange::new(range.start, range.start + candidate_bytes);
         let result = ReadToolOutputResult {
@@ -2277,7 +2328,7 @@ fn largest_fitting_byte_chunk(
             unavailable_ranges: Vec::new(),
             results: vec![successful_byte_selector_result(
                 candidate_range,
-                &vec![0; candidate_bytes as usize],
+                prefix_bytes(candidate_bytes),
             )],
         };
         response_fits_recovery_token_ceiling(&result, token_ceiling)
@@ -2307,24 +2358,55 @@ fn largest_fitting_byte_chunk(
             high = middle.saturating_sub(1);
         }
     }
-    best
+    align_to_char_boundary(snapshot, range.start, best)
 }
 
-fn populate_recovery_subdivisions(metadata: &mut LogicalArtifactMetadata) {
+/// Shrinks `length` until the prefix ends on a UTF-8 char boundary.
+///
+/// A continuation that splits a code point is not readable, and the next read
+/// would have to discard the partial byte anyway. Non-UTF-8 content has no
+/// boundaries to respect, so it is returned unchanged.
+fn align_to_char_boundary(snapshot: &[u8], start: u64, length: u64) -> u64 {
+    let start = start as usize;
+    let Some(window) = snapshot.get(start..) else {
+        return length;
+    };
+    let mut length = (length as usize).min(window.len());
+    while length > 0 && !is_utf8_char_boundary(window, length) {
+        length -= 1;
+    }
+    // A boundary-aligned length of zero would advertise no progress at all;
+    // an unaligned original is better than a continuation that never advances.
+    if length == 0 { 0 } else { length as u64 }
+}
+
+fn is_utf8_char_boundary(bytes: &[u8], index: usize) -> bool {
+    match bytes.get(index) {
+        None => index == bytes.len(),
+        // Continuation bytes are 10xxxxxx; anything else starts a code point.
+        Some(byte) => (*byte as i8) >= -0x40,
+    }
+}
+
+/// Records how much of each addressable range fits one bounded response,
+/// measured on the retained bytes themselves.
+fn populate_recovery_subdivisions(metadata: &mut LogicalArtifactMetadata, retained: &[u8]) {
     for pointer in metadata.json_pointers.values_mut() {
-        pointer.recovery_chunk_bytes = Some(largest_fitting_byte_chunk(
+        pointer.recovery_chunk_bytes = Some(largest_fitting_byte_prefix(
             &metadata.artifact_id,
             metadata.canonical_bytes,
             pointer.range,
+            retained,
             RECOVERY_AGGREGATE_TOKEN_CEILING,
         ));
     }
     for section in &mut metadata.sections {
         if let Some(range) = section.canonical_range {
-            section.recovery_chunk_bytes = Some(largest_fitting_byte_chunk(
+            section.recovery_chunk_bytes = Some(largest_fitting_byte_prefix(
                 &metadata.artifact_id,
                 metadata.canonical_bytes,
                 range,
+                retained,
                 RECOVERY_AGGREGATE_TOKEN_CEILING,
             ));
         }
@@ -2551,7 +2633,7 @@ fn commit_create_canonical_output_artifact(
         line_starts: canonical_line_starts(retained),
         segments,
     };
-    populate_recovery_subdivisions(&mut metadata);
+    populate_recovery_subdivisions(&mut metadata, retained);
     let metadata_bytes = match serde_json::to_vec(&metadata) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -2882,7 +2964,7 @@ fn commit_attach_canonical_output_artifact(
         line_starts: canonical_line_starts(retained),
         segments,
     };
-    populate_recovery_subdivisions(&mut metadata);
+    populate_recovery_subdivisions(&mut metadata, retained);
     let write = serde_json::to_vec(&metadata)
         .map_err(std::io::Error::other)
         .and_then(|bytes| write_bytes_atomically(&logical_metadata_path(&path), &bytes));
@@ -4053,9 +4135,61 @@ fn normalized_selector_order_key(
     }
 }
 
+/// Whether one selector would still come back complete.
+///
+/// A merged range is acceptable when it fits the fragment ceiling outright, or
+/// when the auto-drain path can still return it whole in this same call. What
+/// normalization must never produce is a range that can only come back as
+/// `selector_too_large`, because the caller's own fragments would each have
+/// succeeded.
+///
+/// This runs the same selection the read itself performs, on the real bytes, so
+/// normalization and selection cannot disagree about what fits.
+fn merged_selector_still_completes(
+    metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
+    selector: &ToolOutputSelector,
+    fragment_token_ceiling: usize,
+    final_token_ceiling: usize,
+) -> bool {
+    let selected = select_logical_artifact(
+        metadata,
+        snapshot,
+        selector.clone(),
+        fragment_token_ceiling,
+        final_token_ceiling,
+    );
+    match selected.status {
+        ToolOutputSelectorStatus::Ok => true,
+        ToolOutputSelectorStatus::SelectorTooLarge => {
+            // Draining only counts when the read would actually accept the
+            // drained result, which is the same ceiling the read applies.
+            let Some(completed) =
+                internally_drain_exact_subdivisions(metadata, snapshot, &selected)
+            else {
+                return false;
+            };
+            let individual = ReadToolOutputResult {
+                artifact_id: metadata.artifact_id.clone(),
+                canonical_sha256: metadata.canonical_sha256.clone(),
+                canonical_bytes: metadata.canonical_bytes,
+                retained_bytes: metadata.retained_bytes,
+                complete: true,
+                unavailable_ranges: Vec::new(),
+                results: vec![completed],
+            };
+            response_fits_recovery_retry_avoidance_ceiling(&individual, final_token_ceiling)
+        }
+        _ => false,
+    }
+}
+
 fn normalize_tool_output_selectors(
     selectors: Vec<ToolOutputSelector>,
     metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
+    fragment_token_ceiling: usize,
+    final_token_ceiling: usize,
 ) -> Vec<ToolOutputSelector> {
     let mut byte_ranges = Vec::<(u64, u64)>::new();
     let mut line_ranges = Vec::<(usize, usize)>::new();
@@ -4081,17 +4215,45 @@ fn normalize_tool_output_selectors(
         }
     }
 
+    // Normalization exists to remove duplicate and adjacent work, not to build
+    // a range the caller never asked for and that cannot be returned. A merge
+    // that would no longer fit the fragment ceiling is skipped, so selectors
+    // that each fit keep working instead of collapsing into one that fails.
     byte_ranges.sort_unstable();
     let mut merged_bytes = Vec::<(u64, u64)>::new();
     for (start, end) in byte_ranges {
         match merged_bytes.last_mut() {
-            Some((_, previous_end)) if start <= *previous_end => {
-                *previous_end = (*previous_end).max(end);
+            // Already covered: dropping it removes work without growing a range.
+            Some((_, previous_end)) if end <= *previous_end => {}
+            Some((previous_start, previous_end)) if start <= *previous_end => {
+                let candidate = ToolOutputSelector::Bytes {
+                    start: *previous_start,
+                    end,
+                };
+                if merged_selector_still_completes(
+                    metadata,
+                    snapshot,
+                    &candidate,
+                    fragment_token_ceiling,
+                    final_token_ceiling,
+                ) {
+                    *previous_end = end;
+                } else {
+                    merged_bytes.push((start, end));
+                }
             }
             _ => merged_bytes.push((start, end)),
         }
     }
-    let merged_lines = normalize_line_ranges(line_ranges);
+    let merged_lines = normalize_line_ranges_within_ceiling(line_ranges, |start, end| {
+        merged_selector_still_completes(
+            metadata,
+            snapshot,
+            &ToolOutputSelector::Lines { start, end },
+            fragment_token_ceiling,
+            final_token_ceiling,
+        )
+    });
 
     let mut normalized = merged_bytes
         .into_iter()
@@ -4117,6 +4279,30 @@ pub(crate) fn normalize_line_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usi
         match normalized.last_mut() {
             Some((_, previous_end)) if start <= previous_end.saturating_add(1) => {
                 *previous_end = (*previous_end).max(end);
+            }
+            _ => normalized.push((start, end)),
+        }
+    }
+    normalized
+}
+
+/// Normalizes line ranges, declining any merge whose result would no longer
+/// fit. Ranges the caller supplied individually stay individually readable.
+fn normalize_line_ranges_within_ceiling(
+    mut ranges: Vec<(usize, usize)>,
+    fits: impl Fn(usize, usize) -> bool,
+) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut normalized: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match normalized.last_mut() {
+            Some((_, previous_end)) if end <= *previous_end => {}
+            Some((previous_start, previous_end)) if start <= previous_end.saturating_add(1) => {
+                if fits(*previous_start, end) {
+                    *previous_end = end;
+                } else {
+                    normalized.push((start, end));
+                }
             }
             _ => normalized.push((start, end)),
         }
@@ -4316,12 +4502,14 @@ fn too_large_result(
     range: CanonicalByteRange,
     child_selectors: Vec<ToolOutputSelector>,
     metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
     token_ceiling: usize,
 ) -> ToolOutputSelectorResult {
-    let chunk_bytes = largest_fitting_byte_chunk(
+    let chunk_bytes = largest_fitting_byte_prefix(
         &metadata.artifact_id,
         metadata.canonical_bytes,
         range,
+        snapshot,
         token_ceiling,
     );
     let mut children = Vec::new();
@@ -4341,12 +4529,10 @@ fn too_large_result(
         text: None,
         value: None,
         data_base64: None,
-        subdivision_plan: Some(ByteSubdivisionPlan {
-            range,
-            chunk_bytes,
-            chunk_count: range.len().div_ceil(chunk_bytes.max(1)),
-            selector_kind: "bytes".to_string(),
-        }),
+        // A uniform plan is a promise that every chunk it names can be read.
+        // Advertise one only where that is verified; otherwise the recomputed
+        // continuation is the honest answer, and the field already permits it.
+        subdivision_plan: verified_subdivision_plan(range, chunk_bytes),
         child_selectors: children,
         continuation: None,
         message: Some(
@@ -4371,6 +4557,31 @@ fn too_large_result(
         result.child_selectors.pop();
     }
     result
+}
+
+/// A uniform subdivision plan, but only where its guarantees hold.
+///
+/// The plan claims every chunk of `chunk_bytes` in `range` can be drained, and
+/// the auto-drain path only accepts a plan that stays inside its own limits.
+/// Advertising one outside them — 265 chunks of 278 bytes, in the case that
+/// motivated this — costs a round trip per chunk and never completes.
+fn verified_subdivision_plan(
+    range: CanonicalByteRange,
+    chunk_bytes: u64,
+) -> Option<ByteSubdivisionPlan> {
+    if range.is_empty() || chunk_bytes == 0 || range.len() > MAX_AUTOMATIC_SUBDIVISION_BYTES {
+        return None;
+    }
+    let chunk_count = range.len().div_ceil(chunk_bytes);
+    if chunk_count > MAX_AUTOMATIC_SUBDIVISIONS {
+        return None;
+    }
+    Some(ByteSubdivisionPlan {
+        range,
+        chunk_bytes,
+        chunk_count,
+        selector_kind: "bytes".to_string(),
+    })
 }
 
 fn successful_exact_selector_result(
@@ -4516,7 +4727,14 @@ fn select_logical_artifact(
         && !response_fits_recovery_token_ceiling(&individual, fragment_token_ceiling)
         && let Some(range) = range
     {
-        result = too_large_result(selector, range, children, metadata, fragment_token_ceiling);
+        result = too_large_result(
+            selector,
+            range,
+            children,
+            metadata,
+            snapshot,
+            fragment_token_ceiling,
+        );
     }
     result
 }
@@ -4531,6 +4749,44 @@ pub(crate) async fn read_tool_output_selectors(
     read_tool_output_selectors_with_reuse(codex_home, thread_id, artifact_id, selectors)
         .await
         .map(|(result, _)| result)
+}
+
+/// Host-side exact read for transformations of retained evidence. Reuses the
+/// selector reader's identity, confinement, integrity, and writer-lock checks;
+/// unlike a model projection it must reject any incomplete source.
+pub(crate) async fn read_complete_canonical_snapshot(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ReadToolOutputError> {
+    let id = artifact_id
+        .parse::<ToolOutputArtifactId>()
+        .map_err(|_| ReadToolOutputError::InvalidArtifactId)?;
+    if id.to_string() != artifact_id {
+        return Err(ReadToolOutputError::InvalidArtifactId);
+    }
+    let path = codex_home
+        .join("tool-output")
+        .join(thread_id)
+        .join(format!("{id}.log"));
+    tokio::task::spawn_blocking(move || {
+        let metadata = load_logical_metadata(&path, id)?;
+        if !metadata.complete
+            || metadata.canonical_bytes != metadata.retained_bytes
+            || !metadata.unavailable_ranges.is_empty()
+            || metadata.canonical_bytes > max_bytes as u64
+        {
+            return Err(ReadToolOutputError::InvalidRange(
+                "source artifact is incomplete or exceeds the host transformation limit"
+                    .to_string(),
+            ));
+        }
+        open_regular_artifact(&path)?;
+        load_validated_logical_snapshot(&path, &metadata)
+    })
+    .await
+    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
 pub(crate) async fn read_tool_output_selectors_with_reuse(
@@ -4589,7 +4845,6 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     let metadata = tokio::task::spawn_blocking(move || load_logical_metadata(&metadata_path, id))
         .await
         .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    let selectors = normalize_tool_output_selectors(selectors, &metadata);
     let validation_path = path.clone();
     let metadata_for_snapshot = metadata.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
@@ -4598,6 +4853,15 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
+    // Normalization decides merges against the same fragment ceiling selection
+    // enforces, so it needs the bytes those merges would have to return.
+    let selectors = normalize_tool_output_selectors(
+        selectors,
+        &metadata,
+        &snapshot,
+        token_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
+        token_ceiling,
+    );
     let result = tokio::task::spawn_blocking(move || {
         let mut response = ReadToolOutputResult {
             artifact_id: id.to_string(),
@@ -4658,6 +4922,7 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
                             range,
                             previous.child_selectors.clone(),
                             &metadata,
+                            &snapshot,
                             token_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
                         )
                     })

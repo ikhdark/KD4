@@ -9,8 +9,8 @@ use crate::hook_runtime::run_pre_tool_use_hooks;
 use crate::memory_usage::emit_metric_for_tool_read;
 use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
-use crate::session::reasoning_governor::PendingOwnerDrainedContinuation;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_execution::PendingOwnerDrainedContinuation;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::attach_canonical_output_artifact;
@@ -341,15 +341,6 @@ impl BoundedModelProjection {
             }
         }
     }
-
-    fn into_value(self) -> Value {
-        match self {
-            Self::Envelope { envelope, .. } => {
-                serde_json::to_value(envelope).unwrap_or(Value::Null)
-            }
-            Self::Fallback { value, .. } => value,
-        }
-    }
 }
 
 impl AnyToolResult {
@@ -493,17 +484,18 @@ impl AnyToolResult {
         result.to_response_item(&call_id, &payload)
     }
 
+    /// The value JavaScript receives from a nested tool call.
+    ///
+    /// This is the handler's own execution result, not the model projection.
+    /// The projection exists to bound what the *model* reads; substituting it
+    /// here handed JS a logical-artifact envelope with no `results[]`, so code
+    /// inside a cell could not branch on what a read actually returned. The
+    /// projection stays on the model-facing `into_response` path.
     pub(crate) fn code_mode_result(self) -> serde_json::Value {
         let Self {
-            payload,
-            result,
-            model_projection,
-            ..
+            payload, result, ..
         } = self;
-        match model_projection {
-            Some(projection) => projection.into_code_mode_result(),
-            None => result.code_mode_result(&payload),
-        }
+        result.code_mode_result(&payload)
     }
 }
 
@@ -576,10 +568,6 @@ impl ModelToolProjection {
         )
     }
 
-    fn into_code_mode_result(self) -> Value {
-        self.bounded.into_value()
-    }
-
     fn merge_owner_drained_continuations(
         &mut self,
         continuations: Vec<PendingOwnerDrainedContinuation>,
@@ -624,8 +612,15 @@ impl ModelToolProjection {
             let preserved_start = preserved.len();
             preserved.extend(continuation.preserved_content.iter().cloned());
             candidate.result["preserved_content"] = Value::Array(preserved);
+            let selected_text = without_preserved_recovery_text(
+                &projected_text,
+                candidate.result["preserved_content"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            );
             let accepted_candidate =
-                [projected_text.as_str(), ""]
+                [selected_text.as_str(), ""]
                     .into_iter()
                     .find_map(|selected_text| {
                         let candidate_bounded = serialize_projection_with_limit(
@@ -659,6 +654,65 @@ impl ModelToolProjection {
         }
         accepted
     }
+}
+
+// A code-mode cell often prints the recovered selection itself. The owner
+// envelope also preserves that selection, so remove only exact copies from
+// the presentation string before adding the authoritative structured value.
+fn without_preserved_recovery_text(selected: &str, preserved: &[Value]) -> String {
+    let mut selected = selected.to_string();
+    for value in preserved {
+        if value.get("artifact_id").is_none() || value.get("results").is_none() {
+            continue;
+        }
+        for serialized in [
+            serde_json::to_string(value),
+            serde_json::to_string_pretty(value),
+        ] {
+            if let Ok(serialized) = serialized {
+                selected = selected.replace(&serialized, "");
+            }
+        }
+        let Some(results) = value["results"].as_array() else {
+            continue;
+        };
+        for result in results {
+            let texts = result
+                .get("text")
+                .and_then(Value::as_str)
+                .into_iter()
+                .chain(
+                    result["value"]["hydrated_ranges"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|range| range["text"].as_str()),
+                );
+            for text in texts.filter(|text| !text.is_empty()).flat_map(|text| {
+                std::iter::once(text.to_string()).chain(serde_json::to_string(text).ok())
+            }) {
+                // Only remove a complete printed selection, never a substring
+                // of a cell's independent commentary or another result.
+                let mut ranges = selected
+                    .match_indices(text.as_str())
+                    .filter_map(|(start, value)| {
+                        let end = start + value.len();
+                        ((start == 0
+                            || text.starts_with('\n')
+                            || selected[..start].ends_with('\n'))
+                            && (end == selected.len()
+                                || text.ends_with('\n')
+                                || selected[end..].starts_with('\n')))
+                        .then_some(start..end)
+                    })
+                    .collect::<Vec<_>>();
+                for range in ranges.drain(..).rev() {
+                    selected.replace_range(range, "");
+                }
+            }
+        }
+    }
+    selected
 }
 
 fn valid_owner_drained_receipt(receipt: &TurnTimingDeterministicContinuationReceipt) -> bool {
@@ -814,8 +868,11 @@ impl ToolOutput for UnavailableModelProjectionOutput {
         self.model_visible.to_response_item(call_id, payload)
     }
 
+    /// Code running in a cell reads the handler's execution result even when a
+    /// model projection was unavailable. The substitute exists to bound the
+    /// model-facing text, not to replace what the call returned.
     fn code_mode_result(&self, payload: &ToolPayload) -> Value {
-        self.model_visible.code_mode_result(payload)
+        self.original.code_mode_result(payload)
     }
 }
 
@@ -1333,6 +1390,11 @@ impl ToolRegistry {
                 } => {}
             }
         }
+        // Recorded after PreToolUse hooks so a hook sees only earlier dispatches.
+        invocation
+            .step_context
+            .turn
+            .record_dispatched_tool_name(tool_name_flat.as_ref());
 
         // PreToolUse hooks may replace the arguments after the initial code-mode
         // admission check. Validate the final payload that will reach the
@@ -1896,7 +1958,19 @@ async fn prepare_model_projection(
     })?;
     // A yielded cell still owns a live handle that the model may need on the
     // next generation. Only terminal code-mode output is safe to retire.
-    if admit_code_mode_output && metadata.outcome == ToolOutputOutcome::Yielded {
+    let has_running_nested_command = metadata
+        .essential_inline
+        .get("nested_commands")
+        .and_then(Value::as_array)
+        .is_some_and(|states| {
+            states.iter().any(|state| {
+                state.get("session_id").is_some()
+                    && state.get("process_exited") == Some(&Value::Bool(false))
+            })
+        });
+    if admit_code_mode_output
+        && (metadata.outcome == ToolOutputOutcome::Yielded || has_running_nested_command)
+    {
         return None;
     }
     let spillable_text = metadata.spillable_text.join("\n");

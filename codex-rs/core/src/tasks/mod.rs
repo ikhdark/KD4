@@ -40,6 +40,7 @@ use crate::state::TurnTerminalPermit;
 use crate::tools::context::RequiredToolTerminal;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
+use codex_code_mode::CancellationCause;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_E2E_DURATION_METRIC;
 use codex_otel::TURN_MEMORY_METRIC;
@@ -281,7 +282,6 @@ impl TerminalSchedule {
 struct TerminalFinalization {
     task: RunningTask,
     turn_state: Arc<tokio::sync::Mutex<TurnState>>,
-    reasoning_policy_recorder: Arc<crate::session::reasoning_governor::ReasoningPolicyRecorder>,
     coordinator: Arc<TurnTerminalCoordinator>,
     outcome: TurnTerminalOutcome,
     permit: Option<TurnTerminalPermit>,
@@ -533,11 +533,6 @@ impl Session {
                 let Some(turn) = active.as_mut() else {
                     unreachable!("validated taskless turn reservation must remain present");
                 };
-                turn.reasoning_policy_recorder = Arc::new(
-                    crate::session::reasoning_governor::ReasoningPolicyRecorder::new(
-                        turn_context.config.reasoning_phase_efforts.is_some(),
-                    ),
-                );
                 let done_clone = Arc::clone(&done);
                 let worker_done_clone = Arc::clone(&worker_done);
                 let session = Arc::clone(self);
@@ -854,7 +849,6 @@ impl Session {
                         Ok((
                             task,
                             Arc::clone(&active_turn.turn_state),
-                            active_turn.reasoning_policy_recorder.clone(),
                             permit,
                             coordinator,
                         ))
@@ -874,7 +868,7 @@ impl Session {
                 }
             };
 
-            let (task, turn_state, reasoning_policy_recorder, permit, coordinator) = scheduling;
+            let (task, turn_state, permit, coordinator) = scheduling;
             let finalizer_span = task.task_span.clone();
             let terminal_turn_id = coordinator.turn_id().to_string();
             let finalizer_coordinator = Arc::clone(&coordinator);
@@ -884,7 +878,6 @@ impl Session {
                     let mut finalization = TerminalFinalization {
                         task,
                         turn_state,
-                        reasoning_policy_recorder,
                         coordinator: finalizer_coordinator,
                         outcome,
                         permit: Some(permit),
@@ -1150,6 +1143,14 @@ impl Session {
                 sub_id = %turn_context.sub_id,
                 "quiescing task before terminal finalization"
             );
+            // Record the reason before signalling, so a tool woken by this
+            // cancellation reports the turn's own abort rather than defaulting
+            // to a user interrupt.
+            if let Some(reason) = finalization.outcome.abort_reason() {
+                let _ = turn_context
+                    .cancellation_cause
+                    .set(CancellationCause::TurnAborted { reason });
+            }
             finalization.task.cancellation_token.cancel();
         }
 
@@ -1363,16 +1364,6 @@ impl Session {
             &token_usage_at_turn_start,
         )
         .await;
-        if let Some(summary) = finalization
-            .reasoning_policy_recorder
-            .take_summary(turn_context.sub_id.clone())
-        {
-            self.send_event(
-                turn_context.as_ref(),
-                EventMsg::ReasoningPolicySummary(summary),
-            )
-            .await;
-        }
 
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");

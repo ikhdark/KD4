@@ -656,6 +656,7 @@ client_request_definitions! {
     },
     ThreadMetadataUpdate => "thread/metadata/update" {
         params: v2::ThreadMetadataUpdateParams,
+        inspect_params: true,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadMetadataUpdateResponse,
     },
@@ -721,6 +722,48 @@ client_request_definitions! {
         inspect_params: true,
         serialization: None,
         response: v2::ThreadListResponse,
+    },
+    #[experimental("project/list")]
+    ProjectList => "project/list" {
+        params: v2::ProjectListParams,
+        serialization: global_shared_read("projects"),
+        response: v2::ProjectListResponse,
+    },
+    #[experimental("project/read")]
+    ProjectRead => "project/read" {
+        params: v2::ProjectReadParams,
+        serialization: global_shared_read("projects"),
+        response: v2::ProjectReadResponse,
+    },
+    #[experimental("project/create")]
+    ProjectCreate => "project/create" {
+        params: v2::ProjectCreateParams,
+        serialization: global("projects"),
+        response: v2::ProjectCreateResponse,
+    },
+    #[experimental("project/import")]
+    ProjectImport => "project/import" {
+        params: v2::ProjectImportParams,
+        serialization: global("projects"),
+        response: v2::ProjectImportResponse,
+    },
+    #[experimental("project/update")]
+    ProjectUpdate => "project/update" {
+        params: v2::ProjectUpdateParams,
+        serialization: global("projects"),
+        response: v2::ProjectUpdateResponse,
+    },
+    #[experimental("project/move")]
+    ProjectMove => "project/move" {
+        params: v2::ProjectMoveParams,
+        serialization: global("projects"),
+        response: v2::ProjectMoveResponse,
+    },
+    #[experimental("project/delete")]
+    ProjectDelete => "project/delete" {
+        params: v2::ProjectDeleteParams,
+        serialization: global("projects"),
+        response: v2::ProjectDeleteResponse,
     },
     #[experimental("thread/search")]
     ThreadSearch => "thread/search" {
@@ -1828,16 +1871,15 @@ server_notification_definitions! {
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
+    #[experimental("project/changed")]
+    ProjectChanged => "project/changed" (v2::ProjectChangedNotification),
+    #[experimental("thread/project/updated")]
+    ThreadProjectUpdated => "thread/project/updated" (v2::ThreadProjectUpdatedNotification),
     #[delivery(required)]
     #[experimental("thread/settings/updated")]
     ThreadSettingsUpdated => "thread/settings/updated" (v2::ThreadSettingsUpdatedNotification),
     ThreadTokenUsageUpdated => "thread/tokenUsage/updated" (v2::ThreadTokenUsageUpdatedNotification),
     TurnStarted => "turn/started" (v2::TurnStartedNotification),
-    #[experimental("reasoningPolicyVisibility")]
-    TurnReasoningPolicyUpdated => "turn/reasoningPolicy/updated" (v2::TurnReasoningPolicyUpdatedNotification),
-    #[delivery(required)]
-    #[experimental("reasoningPolicyVisibility")]
-    TurnReasoningPolicySummary => "turn/reasoningPolicy/summary" (v2::TurnReasoningPolicySummaryNotification),
     HookStarted => "hook/started" (v2::HookStartedNotification),
     #[delivery(required)]
     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
@@ -2060,18 +2102,6 @@ mod tests {
             ServerNotification::ThreadClosed(v2::ThreadClosedNotification {
                 thread_id: "thread".to_string(),
             }),
-            ServerNotification::TurnReasoningPolicySummary(
-                v2::TurnReasoningPolicySummaryNotification {
-                    thread_id: "thread".to_string(),
-                    turn_id: "turn".to_string(),
-                    history: codex_protocol::protocol::ReasoningPolicyHistory {
-                        turn_id: "turn".to_string(),
-                        entries: Vec::new(),
-                        total_entries: 0,
-                        truncated: false,
-                    },
-                },
-            ),
             ServerNotification::McpServerOauthLoginCompleted(
                 v2::McpServerOauthLoginCompletedNotification {
                     name: "server".to_string(),
@@ -3064,6 +3094,7 @@ mod tests {
                     parent_thread_id: None,
                     preview: "first prompt".to_string(),
                     ephemeral: true,
+                    project_id: None,
                     history_mode: Default::default(),
                     model_provider: "openai".to_string(),
                     created_at: 1,
@@ -3115,6 +3146,7 @@ mod tests {
                         "parentThreadId": null,
                         "preview": "first prompt",
                         "ephemeral": true,
+                        "projectId": null,
                         "historyMode": "legacy",
                         "modelProvider": "openai",
                         "createdAt": 1,

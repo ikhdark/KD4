@@ -176,6 +176,7 @@ fn thread_resume_params_accept_turns_page_bootstrap() {
 fn thread_resume_response_round_trips_initial_turns_page() {
     let response = ThreadResumeResponse {
         thread: Thread {
+            project_id: None,
             id: "thr_123".to_string(),
             extra: None,
             session_id: "thr_123".to_string(),
@@ -228,6 +229,20 @@ fn thread_resume_response_round_trips_initial_turns_page() {
             "backwardsCursor": "cursor_back",
         }))
     );
+    assert_eq!(value["thread"]["projectId"], serde_json::Value::Null);
+    let mut older_response = value.clone();
+    older_response["thread"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projectId");
+    let older = serde_json::from_value::<ThreadResumeResponse>(older_response)
+        .expect("older servers may omit projectId");
+    assert_eq!(older.thread.project_id, None);
+    let mut assigned_response = value.clone();
+    assigned_response["thread"]["projectId"] = json!("project-123");
+    let assigned = serde_json::from_value::<ThreadResumeResponse>(assigned_response)
+        .expect("assigned project");
+    assert_eq!(assigned.thread.project_id.as_deref(), Some("project-123"));
     let decoded = serde_json::from_value::<ThreadResumeResponse>(value)
         .expect("deserialize thread resume response");
     assert_eq!(decoded, response);
