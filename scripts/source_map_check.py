@@ -213,7 +213,8 @@ def repository_source_inventory(
 
 
 def repository_source_records(
-    repo_root: Path, *, include_untracked: bool = True, prune: tuple[str, ...] = ()
+    repo_root: Path, *, include_untracked: bool = True, prune: tuple[str, ...] = (),
+    paths: tuple[str, ...] = (),
 ) -> dict[str, str]:
     # One listing answers everything the inventory needs: `--deleted` tags
     # tracked paths missing from the working tree (R) and `--stage` exposes
@@ -233,6 +234,8 @@ def repository_source_records(
     # Git prunes these untracked directories before descending. Filtering its
     # output alone would still walk arbitrarily large build/dependency trees.
     args.extend(f"--exclude={name}/" for name in prune)
+    if paths:
+        args.extend(["--", *(f":(literal){path}" for path in paths)])
     result = subprocess.run(
         args,
         cwd=repo_root,

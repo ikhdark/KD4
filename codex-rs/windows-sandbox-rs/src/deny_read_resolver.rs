@@ -277,6 +277,46 @@ mod tests {
     }
 
     #[test]
+    fn configured_depth_limits_resolved_paths_without_dropping_exact_denials() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let root_env = tmp.path().join("root.env");
+        let nested_env = tmp.path().join("app").join("nested.env");
+        let deep_env = tmp.path().join("app").join("private").join("deep.env");
+        let missing = tmp.path().join("missing.env");
+        std::fs::create_dir_all(deep_env.parent().expect("parent")).expect("create dirs");
+        for path in [&root_env, &nested_env, &deep_env] {
+            std::fs::write(path, "secret").expect("write env");
+        }
+        let mut policy = FileSystemSandboxPolicy::restricted(vec![
+            unreadable_glob_entry(format!("{}/**/*.env", tmp.path().display())),
+            unreadable_path_entry(missing.clone()),
+        ]);
+
+        for (max_depth, expected) in [
+            (Some(0), vec![missing.clone()]),
+            (Some(1), vec![missing.clone(), root_env.clone()]),
+            (
+                Some(2),
+                vec![missing.clone(), root_env.clone(), nested_env.clone()],
+            ),
+            (None, vec![missing, root_env, nested_env, deep_env]),
+        ] {
+            policy.glob_scan_max_depth = max_depth;
+            let actual: HashSet<PathBuf> = resolve_windows_deny_read_paths(&policy, &cwd)
+                .expect("resolve")
+                .into_iter()
+                .map(AbsolutePathBuf::into_path_buf)
+                .collect();
+            assert_eq!(
+                actual,
+                expected.into_iter().collect(),
+                "depth {max_depth:?}"
+            );
+        }
+    }
+
+    #[test]
     fn exact_missing_paths_are_preserved() {
         let tmp = TempDir::new().expect("tempdir");
         let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");

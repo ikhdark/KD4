@@ -651,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_compaction_v2_retry_records_distinct_trace_attempts() -> anyhow::Result<()> {
-        core_test_support::skip_if_no_network!(Ok(()));
+        core_test_support::require_network!();
 
         let server = responses::start_mock_server().await;
         let request_log = responses::mount_sse_sequence(

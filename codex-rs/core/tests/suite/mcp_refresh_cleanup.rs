@@ -8,15 +8,15 @@ use codex_config::types::McpServerTransportConfig;
 use core_test_support::process::process_is_alive;
 use core_test_support::process::wait_for_pid_file;
 use core_test_support::process::wait_for_process_exit;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_mcp_server;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unchanged_generation_reuses_one_mcp_process_for_100_calls() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let temp_dir = tempfile::tempdir()?;

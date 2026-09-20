@@ -3,7 +3,10 @@
 use codex_protocol::models::FunctionCallOutputContentItem;
 pub use codex_utils_string::approx_bytes_for_tokens;
 pub use codex_utils_string::approx_token_count;
+pub use codex_utils_string::approx_token_count_exceeds;
 pub use codex_utils_string::approx_tokens_from_byte_count;
+use std::borrow::Cow;
+use std::fmt::Write;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
@@ -121,10 +124,10 @@ pub fn truncate_text_with_output_limit(
     content: &str,
     limits: OutputLimitResolution,
 ) -> TruncatedTextOutput {
-    let text = truncate_text_to_token_ceiling(content, limits.applied_limit);
-    let was_truncated = text != content;
+    let text = truncate_text_to_token_ceiling_cow(content, limits.applied_limit);
+    let was_truncated = matches!(text, Cow::Owned(_));
     TruncatedTextOutput {
-        text,
+        text: text.into_owned(),
         was_truncated,
     }
 }
@@ -132,13 +135,20 @@ pub fn truncate_text_with_output_limit(
 /// Truncates text while ensuring the returned value itself does not exceed the
 /// requested approximate-token ceiling, including any truncation marker.
 pub fn truncate_text_to_token_ceiling(content: &str, max_tokens: usize) -> String {
-    if max_tokens == 0 {
-        return String::new();
-    }
-    if approx_token_count(content) <= max_tokens {
-        return content.to_string();
-    }
+    truncate_text_to_token_ceiling_cow(content, max_tokens).into_owned()
+}
 
+fn truncate_text_to_token_ceiling_cow(content: &str, max_tokens: usize) -> Cow<'_, str> {
+    if !approx_token_count_exceeds(content, max_tokens) {
+        return Cow::Borrowed(content);
+    }
+    if max_tokens == 0 {
+        return Cow::Owned(String::new());
+    }
+    Cow::Owned(truncate_over_budget_text(content, max_tokens))
+}
+
+fn truncate_over_budget_text(content: &str, max_tokens: usize) -> String {
     const BEFORE_MIDDLE: &str = "\n[omitted before retained middle]\n";
     const AFTER_MIDDLE: &str = "\n[omitted after retained middle]\n";
     let marker_tokens = approx_token_count(BEFORE_MIDDLE) + approx_token_count(AFTER_MIDDLE);
@@ -149,17 +159,27 @@ pub fn truncate_text_to_token_ceiling(content: &str, max_tokens: usize) -> Strin
 
     let mut retained_bytes =
         approx_bytes_for_tokens(max_tokens - marker_tokens).min(content.len().saturating_sub(1));
+    let mut candidate = String::new();
     loop {
         let head = retained_bytes.saturating_mul(2) / 5;
         let middle = retained_bytes / 5;
         let tail = retained_bytes - head - middle;
         let middle_start = (content.len() - middle) / 2;
-        let candidate = format!(
+        candidate.clear();
+        let _ = write!(
+            candidate,
             "{}{BEFORE_MIDDLE}{}{AFTER_MIDDLE}{}",
-            &content[..content.floor_char_boundary(head)],
-            &content[content.ceil_char_boundary(middle_start)
-                ..content.ceil_char_boundary(middle_start + middle)],
-            &content[content.ceil_char_boundary(content.len() - tail)..]
+            retained_text(content, 0, content.floor_char_boundary(head)),
+            retained_text(
+                content,
+                content.ceil_char_boundary(middle_start),
+                content.floor_char_boundary(middle_start + middle)
+            ),
+            retained_text(
+                content,
+                content.ceil_char_boundary(content.len() - tail),
+                content.len()
+            )
         );
         let actual_tokens = approx_token_count(&candidate);
         if actual_tokens <= max_tokens {
@@ -179,6 +199,29 @@ pub fn truncate_text_to_token_ceiling(content: &str, max_tokens: usize) -> Strin
     }
 }
 
+// Prefer complete source lines at omission seams. If a sampled region cannot
+// fit even one line, retain its UTF-8-safe fragment so a long line remains useful.
+fn retained_text(content: &str, start: usize, end: usize) -> &str {
+    // A sub-character sample can round its start past its end.
+    let start = start.min(end);
+    let region = &content[start..end];
+    let line_start = if start == 0 || content.as_bytes()[start - 1] == b'\n' {
+        0
+    } else {
+        region.find('\n').map_or(region.len(), |index| index + 1)
+    };
+    let line_end = if end == content.len() || region.ends_with('\n') {
+        region.len()
+    } else {
+        region.rfind('\n').map_or(0, |index| index + 1)
+    };
+    if line_start < line_end {
+        &region[line_start..line_end]
+    } else {
+        region
+    }
+}
+
 fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String {
     const MARKER: &str = "\n[...]\n";
     let marker = if max_tokens >= approx_token_count(MARKER) + 4 {
@@ -190,6 +233,8 @@ fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String 
     };
     let mut bytes =
         approx_bytes_for_tokens(max_tokens - approx_token_count(marker)).min(content.len());
+    let marker_tokens = approx_token_count(marker);
+    let mut candidate = String::new();
     loop {
         let mut head = if marker.is_empty() {
             bytes
@@ -200,16 +245,21 @@ fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String 
             head = content.floor_char_boundary(bytes);
         }
         let tail = bytes - head;
-        let candidate = format!(
+        candidate.clear();
+        let _ = write!(
+            candidate,
             "{}{marker}{}",
-            &content[..content.floor_char_boundary(head)],
-            &content[content.ceil_char_boundary(content.len() - tail)..]
+            retained_text(content, 0, content.floor_char_boundary(head)),
+            retained_text(
+                content,
+                content.ceil_char_boundary(content.len() - tail),
+                content.len()
+            )
         );
         let tokens = approx_token_count(&candidate);
         if tokens <= max_tokens {
             return candidate;
         }
-        let marker_tokens = approx_token_count(marker);
         bytes = bytes
             .saturating_mul(max_tokens - marker_tokens)
             .checked_div(tokens - marker_tokens)
@@ -247,10 +297,10 @@ fn formatted_truncate_text_to_token_ceiling(
     let text = if max_tokens > warning_tokens.saturating_mul(2) {
         format!(
             "{warning}{}",
-            truncate_text_to_token_ceiling(content, max_tokens - warning_tokens)
+            truncate_over_budget_text(content, max_tokens - warning_tokens)
         )
     } else {
-        truncate_text_to_token_ceiling(content, max_tokens)
+        truncate_over_budget_text(content, max_tokens)
     };
     TruncatedTextOutput {
         text,
@@ -261,7 +311,11 @@ fn formatted_truncate_text_to_token_ceiling(
 /// Recognize validation output for diagnostic budgeting and summarization.
 /// This heuristic does not grant execution permission or classify side effects.
 pub fn looks_like_validation_command(command: &str) -> bool {
-    let command = command.to_ascii_lowercase();
+    let command = if command.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(command.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(command)
+    };
     let words = command.split_ascii_whitespace().collect::<Vec<_>>();
     validation_invocation(&words)
 }
@@ -277,7 +331,9 @@ fn validation_invocation(mut words: &[&str]) -> bool {
         // Only inspect executable positions and known launchers. Mentions in echo,
         // file reads, commit messages, or other arguments are not validation runs.
         match (program, args) {
-            ("&" | "npx", args) | ("uv", ["run", args @ ..]) => {
+            ("&" | "npx" | "bunx", args)
+            | ("uv" | "poetry" | "pipx", ["run", args @ ..])
+            | ("pnpm", ["exec", args @ ..]) => {
                 words = args;
                 continue;
             }
@@ -477,36 +533,39 @@ pub fn formatted_truncate_text_content_items_with_policy(
     items: &[FunctionCallOutputContentItem],
     policy: TruncationPolicy,
 ) -> (Vec<FunctionCallOutputContentItem>, Option<usize>) {
-    let text_segments = items
-        .iter()
-        .filter_map(|item| match item {
-            FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
-            FunctionCallOutputContentItem::InputImage { .. }
-            | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
-        })
-        .collect::<Vec<_>>();
+    let mut text_segments = items.iter().filter_map(|item| match item {
+        FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+        FunctionCallOutputContentItem::InputImage { .. }
+        | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+    });
 
-    if text_segments.is_empty() {
+    let Some(first) = text_segments.next() else {
         return (items.to_vec(), None);
-    }
+    };
 
-    let mut combined = String::new();
-    for text in &text_segments {
+    let mut combined = Cow::Borrowed(first);
+    for text in text_segments {
         if !combined.is_empty() {
-            combined.push('\n');
+            combined.to_mut().push('\n');
         }
-        combined.push_str(text);
+        combined.to_mut().push_str(text);
     }
 
+    let mut original_token_count = None;
     let within_budget = match policy {
         TruncationPolicy::Bytes(max_bytes) => combined.len() <= max_bytes,
-        TruncationPolicy::Tokens(max_tokens) => approx_token_count(&combined) <= max_tokens,
+        TruncationPolicy::Tokens(max_tokens) => {
+            let count = approx_token_count(&combined);
+            original_token_count = Some(count);
+            count <= max_tokens
+        }
     };
     if within_budget {
         return (items.to_vec(), None);
     }
 
-    let original_token_count = approx_token_count(&combined);
+    let original_token_count =
+        original_token_count.unwrap_or_else(|| approx_token_count(&combined));
     let runs = items
         .chunk_by(|left, right| {
             matches!(
@@ -518,13 +577,15 @@ pub fn formatted_truncate_text_content_items_with_policy(
             )
         })
         .map(|run| {
-            let mut text = String::new();
+            let mut text = Cow::Borrowed("");
             for item in run {
                 if let FunctionCallOutputContentItem::InputText { text: part } = item {
-                    if !text.is_empty() {
-                        text.push('\n');
+                    if text.is_empty() {
+                        text = Cow::Borrowed(part.as_str());
+                    } else {
+                        text.to_mut().push('\n');
+                        text.to_mut().push_str(part);
                     }
-                    text.push_str(part);
                 }
             }
             let cost = match policy {

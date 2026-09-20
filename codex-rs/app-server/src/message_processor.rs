@@ -409,7 +409,6 @@ impl MessageProcessor {
             Arc::clone(&workspace_settings_cache),
         );
         let command_exec_processor = CommandExecRequestProcessor::new(
-            arg0_paths.clone(),
             Arc::clone(&config),
             outgoing.clone(),
             config_manager.clone(),
@@ -491,7 +490,7 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             outgoing.clone(),
             analytics_events_client.clone(),
-            arg0_paths.clone(),
+            arg0_paths,
             Arc::clone(&config),
             config_manager.clone(),
             thread_state_manager,
@@ -525,7 +524,6 @@ impl MessageProcessor {
                 config_processor: config_processor.clone(),
                 state_db,
                 analytics_events_client,
-                arg0_paths,
                 codex_home: config.codex_home.to_path_buf(),
                 background_tasks: thread_processor.background_tasks.clone(),
             });
@@ -1397,18 +1395,14 @@ impl MessageProcessor {
             ClientRequest::McpServerOauthLogin { params, .. } => {
                 self.mcp_processor.mcp_server_oauth_login(params).await
             }
-            ClientRequest::McpServerRefresh { params, .. } => {
-                self.mcp_processor.mcp_server_refresh(params).await
-            }
+            ClientRequest::McpServerRefresh { .. } => self.mcp_processor.mcp_server_refresh().await,
             ClientRequest::McpServerStatusList { params, .. } => {
                 self.mcp_processor
                     .mcp_server_status_list(&request_id, params)
                     .await
             }
             ClientRequest::McpResourceRead { params, .. } => {
-                self.mcp_processor
-                    .mcp_resource_read(&request_id, params)
-                    .await
+                self.mcp_processor.mcp_resource_read(params).await
             }
             ClientRequest::McpServerToolCall { params, .. } => {
                 self.mcp_processor.mcp_server_tool_call(params).await

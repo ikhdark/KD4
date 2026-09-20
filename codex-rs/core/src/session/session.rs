@@ -157,14 +157,11 @@ impl ToolHistoryPersistenceQueue {
         let mirror = Arc::new(tokio::sync::Mutex::new(initial_state));
         let worker_mirror = Arc::clone(&mirror);
         let thread_id = thread_id.to_string();
-        let writer_id = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        // Replay deduplicates sequence numbers per writer, so queue restarts must
+        // not reuse an identity even when the clock repeats or moves backwards.
+        let writer_id = uuid::Uuid::new_v4().to_string();
+        // This channel only wakes the worker; state.pending owns every command.
+        // Multiple enqueues can share a wakeup because the worker drains the batch.
         let (wake_tx, mut wake_rx) = mpsc::channel(/*buffer*/ 1);
         let (progress_tx, progress) = watch::channel(ToolHistoryPersistenceProgress::default());
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -1790,10 +1787,8 @@ impl Session {
             }
             let executor_readiness_timing_guard =
                 startup_timing.begin_phase(crate::startup_timing::StartupPhase::ExecutorReadiness);
-            let unified_exec_manager = UnifiedExecProcessManager::new_with_deferred_executor(
-                config.background_terminal_max_timeout,
-                config.features.enabled(Feature::DeferredExecutor),
-            );
+            let unified_exec_manager =
+                UnifiedExecProcessManager::new(config.background_terminal_max_timeout);
             drop(executor_readiness_timing_guard);
             let command_execution =
                 crate::tools::command_execution::CommandExecutionLedger::load_or_new(

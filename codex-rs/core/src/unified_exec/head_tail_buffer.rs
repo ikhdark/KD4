@@ -169,24 +169,45 @@ impl HeadTailBuffer {
     ///
     /// The output is formed by concatenating head chunks, then tail chunks.
     /// Omitted bytes are not represented in the returned value.
+    #[cfg(test)]
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.retained_bytes());
-        out.extend_from_slice(&self.head);
-        out.extend(self.tail.iter().copied());
-        out
+        self.to_bytes_with_markers(&[], &[])
     }
 
     /// Return retained output with an explicit marker at the head/tail seam.
+    #[cfg(test)]
     pub(crate) fn to_bytes_with_omission_marker(&self, omission_marker: &[u8]) -> Vec<u8> {
-        if self.omitted_bytes == 0 {
-            return self.to_bytes();
-        }
+        self.to_bytes_with_markers(omission_marker, &[])
+    }
 
-        let mut out =
-            Vec::with_capacity(self.retained_bytes().saturating_add(omission_marker.len()));
+    /// Snapshot output, formatting a retention notice only when bytes were lost.
+    /// Reserve space for an optional trailing loss notice in the same allocation.
+    pub(crate) fn to_bytes_with_loss_notice(&self, suffix: &[u8]) -> Vec<u8> {
+        let marker = if self.omitted_bytes > 0 {
+            omitted_output_marker(self.omitted_bytes)
+        } else {
+            Vec::new()
+        };
+        self.to_bytes_with_markers(&marker, suffix)
+    }
+
+    fn to_bytes_with_markers(&self, omission_marker: &[u8], suffix: &[u8]) -> Vec<u8> {
+        let omission_marker = if self.omitted_bytes > 0 {
+            omission_marker
+        } else {
+            &[]
+        };
+        let mut out = Vec::with_capacity(
+            self.retained_bytes()
+                .saturating_add(omission_marker.len())
+                .saturating_add(suffix.len()),
+        );
         out.extend_from_slice(&self.head);
         out.extend_from_slice(omission_marker);
-        out.extend(self.tail.iter().copied());
+        let (front, back) = self.tail.as_slices();
+        out.extend_from_slice(front);
+        out.extend_from_slice(back);
+        out.extend_from_slice(suffix);
         out
     }
 

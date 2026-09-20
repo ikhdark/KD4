@@ -46,6 +46,26 @@ mod spawn;
 mod task;
 pub(crate) mod wait;
 
+fn task_store_error_detail(
+    tool_name: &'static str,
+    error: codex_agent_task_store::StoreError,
+) -> String {
+    use codex_agent_task_store::StoreError;
+
+    match error {
+        error @ (StoreError::Io(_)
+        | StoreError::Sql(_)
+        | StoreError::Migration(_)
+        | StoreError::Json(_)
+        | StoreError::CorruptData(_)) => {
+            // Keep storage details out of tool output, but retain the cause for diagnosis.
+            tracing::error!(tool_name, error = %error, "typed task store operation failed");
+            "the typed task store is unavailable or contains invalid persisted state".to_string()
+        }
+        error => error.to_string(),
+    }
+}
+
 pub(crate) async fn emit_sub_agent_activity(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
@@ -82,4 +102,64 @@ pub(super) fn communication_from_plaintext_message(
         message,
         /*trigger_turn*/ true,
     )
+}
+
+#[cfg(test)]
+mod store_error_tests {
+    use super::*;
+    use codex_agent_task_store::StoreError;
+    use pretty_assertions::assert_eq;
+    use std::sync::Mutex;
+    use tracing_test::internal::MockWriter;
+
+    pub(super) fn assert_error_reporting(
+        tool_name: &'static str,
+        convert: impl Fn(StoreError) -> FunctionCallError,
+    ) {
+        let buffer: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(MockWriter::new(buffer))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let errors = [
+            StoreError::Io(std::io::Error::other("task store disk failure")),
+            StoreError::Sql(sqlx::Error::PoolClosed),
+            StoreError::Migration(sqlx::migrate::MigrateError::VersionMissing(7)),
+            StoreError::Json(serde_json::from_str::<JsonValue>("{").unwrap_err()),
+            StoreError::CorruptData("invalid stored assignment".to_string()),
+        ];
+        for error in errors {
+            buffer.lock().unwrap().clear();
+            let cause = error.to_string();
+            let FunctionCallError::RespondToModel(detail) = convert(error) else {
+                panic!("store failure must remain a tool response");
+            };
+            assert_eq!(
+                detail,
+                format!(
+                    "{tool_name}: the typed task store is unavailable or contains invalid persisted state"
+                )
+            );
+            let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+            assert_eq!(logs.matches("typed task store operation failed").count(), 1);
+            assert!(logs.contains("ERROR"), "{logs}");
+            assert!(
+                logs.contains(&format!("tool_name=\"{tool_name}\"")),
+                "{logs}"
+            );
+            assert!(logs.contains(&cause), "{logs}");
+        }
+
+        buffer.lock().unwrap().clear();
+        let error = StoreError::InvalidScope("outside assigned scope".to_string());
+        let expected = format!("{tool_name}: {error}");
+        let FunctionCallError::RespondToModel(detail) = convert(error) else {
+            panic!("validation rejection must remain a tool response");
+        };
+        assert_eq!(detail, expected);
+        assert!(buffer.lock().unwrap().is_empty());
+    }
 }

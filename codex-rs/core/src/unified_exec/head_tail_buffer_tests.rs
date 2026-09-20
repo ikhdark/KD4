@@ -3,6 +3,35 @@ use super::HeadTailBuffer;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn loss_notice_snapshot_preserves_wrapped_tail_and_trailing_notice() {
+    let mut buf = HeadTailBuffer::new(8);
+    buf.push_chunk(b"abcd");
+    // Force two tail slices so neither half can be lost during materialization.
+    buf.tail = std::collections::VecDeque::with_capacity(4);
+    buf.tail.extend(b"efgh");
+    drop(buf.tail.drain(..2));
+    buf.tail.extend(b"ij");
+    buf.record_omitted_bytes(2);
+    assert!(!buf.tail.as_slices().1.is_empty());
+
+    assert_eq!(buf.to_bytes(), b"abcdghij");
+    assert_eq!(
+        buf.to_bytes_with_omission_marker(b"<gap>"),
+        b"abcd<gap>ghij"
+    );
+    assert_eq!(
+        buf.to_bytes_with_loss_notice(b"<lag>"),
+        b"abcd\n[output truncated: 2 byte(s) omitted from the middle by the output retention limit]\nghij<lag>"
+    );
+
+    let mut complete = HeadTailBuffer::new(8);
+    complete.push_chunk(b"complete");
+    assert_eq!(complete.to_bytes_with_loss_notice(&[]), b"complete");
+    assert_eq!(complete.to_bytes_with_loss_notice(b"<lag>"), b"complete<lag>");
+    assert_eq!(HeadTailBuffer::new(0).to_bytes_with_loss_notice(&[]), b"");
+}
+
+#[test]
 fn keeps_prefix_and_suffix_when_over_budget() {
     let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
 

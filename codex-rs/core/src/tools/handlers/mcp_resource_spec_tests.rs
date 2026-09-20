@@ -9,7 +9,7 @@ fn list_mcp_resources_tool_matches_expected_spec() {
         create_list_mcp_resources_tool(),
         ToolSpec::Function(ResponsesApiTool {
             name: "list_mcp_resources".to_string(),
-            description: "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible. If an aggregate response includes `remainingServers`, list each named server separately without a cursor.".to_string(),
+            description: "Lists resources provided by MCP servers, such as files, database schemas, or application-specific information. Use a known relevant resource for the requested source and scope; resource listing is not a prerequisite for public web research or tool discovery. If an aggregate response includes `remainingServers`, list each named server separately without a cursor.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -39,7 +39,7 @@ fn list_mcp_resource_templates_tool_matches_expected_spec() {
         create_list_mcp_resource_templates_tool(),
         ToolSpec::Function(ResponsesApiTool {
             name: "list_mcp_resource_templates".to_string(),
-            description: "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible. If an aggregate response includes `remainingServers`, list each named server separately without a cursor.".to_string(),
+            description: "Lists resource templates provided by MCP servers, such as parameterized files, database schemas, or application-specific information. Use a known relevant template for the requested source and scope; template listing is not a prerequisite for public web research or tool discovery. If an aggregate response includes `remainingServers`, list each named server separately without a cursor.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([

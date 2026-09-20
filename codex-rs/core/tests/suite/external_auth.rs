@@ -1,11 +1,11 @@
 use codex_login::AuthHeaders;
 use codex_login::CodexAuth;
+use core_test_support::require_network;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -13,7 +13,7 @@ use http::header::AUTHORIZATION;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn header_auth_is_attached_to_responses_requests() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let response_mock = mount_sse_once(

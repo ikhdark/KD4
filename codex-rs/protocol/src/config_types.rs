@@ -15,6 +15,9 @@ use wildmatch::WildMatchPattern;
 
 use crate::openai_models::ReasoningEffort;
 
+/// Terminal-title items used when no custom selection is configured.
+pub const DEFAULT_TERMINAL_TITLE_ITEMS: &[&str] = &["activity", "project-name"];
+
 /// HTTP payload encoding used by OTLP/HTTP exporters.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]

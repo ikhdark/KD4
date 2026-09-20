@@ -45,9 +45,8 @@ impl McpRequestProcessor {
 
     pub(crate) async fn mcp_server_refresh(
         &self,
-        params: Option<()>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.mcp_server_refresh_response(params)
+        self.mcp_server_refresh_response()
             .await
             .map(|response| Some(response.into()))
     }
@@ -62,7 +61,6 @@ impl McpRequestProcessor {
 
     pub(crate) async fn mcp_resource_read(
         &self,
-        _request_id: &ConnectionRequestId,
         params: McpResourceReadParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         await_mcp_response(self.read_mcp_resource(params)).await
@@ -79,7 +77,6 @@ impl McpRequestProcessor {
 
     async fn mcp_server_refresh_response(
         &self,
-        _params: Option<()>,
     ) -> Result<McpServerRefreshResponse, JSONRPCErrorError> {
         crate::mcp_refresh::queue_strict_refresh(&self.thread_manager, &self.config_manager)
             .await

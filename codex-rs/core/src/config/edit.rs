@@ -615,7 +615,7 @@ fn write_skill_config_selector(table: &mut TomlTable, selector: &SkillConfigSele
         }
         SkillConfigSelector::Path(path) => {
             table.remove("name");
-            table["path"] = value(path.to_string_lossy().to_string());
+            table["path"] = value(path.to_string_lossy().into_owned());
         }
     }
 }

@@ -21,8 +21,8 @@ impl ContextualUserFragment for TaskModelGuidance {
         Self::type_markers()
     }
 
-    fn body(&self) -> String {
-        concat!(
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(concat!(
             "Maintain the task state needed for the current request and higher-priority ",
             "instructions: desired outcome, active requirements and constraints, material ",
             "unknowns, and the next necessary action. Form competing hypotheses only when ",
@@ -57,8 +57,7 @@ impl ContextualUserFragment for TaskModelGuidance {
             "establish the requested behavior; expand beyond the relevant runtime path only for ",
             "a material reason. Never fill an unknown with an ",
             "unstated assumption."
-        )
-        .to_string()
+        ))
     }
 
     fn type_markers() -> (&'static str, &'static str) {

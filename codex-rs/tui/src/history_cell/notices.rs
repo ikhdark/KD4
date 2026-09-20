@@ -124,7 +124,7 @@ impl HistoryCell for SafetyAccessBlockCell {
             RtOptions::new(wrap_width).subsequent_indent("  ".into()),
         );
         let mut wrapped_body = Vec::new();
-        push_owned_lines(&wrapped, &mut wrapped_body);
+        push_owned_lines(wrapped, &mut wrapped_body);
         lines.extend(plain_hyperlink_lines(wrapped_body));
 
         for (label, url) in [
@@ -139,7 +139,7 @@ impl HistoryCell for SafetyAccessBlockCell {
                 RtOptions::new(wrap_width).subsequent_indent("  ".into()),
             );
             let mut wrapped_links = Vec::new();
-            push_owned_lines(&wrapped, &mut wrapped_links);
+            push_owned_lines(wrapped, &mut wrapped_links);
             lines.extend(crate::terminal_hyperlinks::remap_wrapped_line(
                 &source,
                 wrapped_links,
@@ -186,7 +186,7 @@ impl HistoryCell for DeprecationNoticeCell {
         if let Some(details) = &self.details {
             let detail_line = Line::from(details.clone().dim());
             let wrapped = adaptive_wrap_line(&detail_line, RtOptions::new(wrap_width));
-            push_owned_lines(&wrapped, &mut lines);
+            push_owned_lines(wrapped, &mut lines);
         }
 
         lines

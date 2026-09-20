@@ -94,7 +94,16 @@ struct UserPromptSummary {
 
 fn summarize_user_prompt(items: &[UserInput], include_prompt: bool) -> UserPromptSummary {
     let mut summary = UserPromptSummary {
-        prompt: include_prompt.then(String::new),
+        prompt: include_prompt.then(|| {
+            let bytes = items
+                .iter()
+                .filter_map(|item| match item {
+                    UserInput::Text { text, .. } => Some(text.len()),
+                    _ => None,
+                })
+                .sum();
+            String::with_capacity(bytes)
+        }),
         prompt_length: 0,
         text_input_count: 0,
         image_input_count: 0,

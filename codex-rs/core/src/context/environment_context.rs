@@ -6,6 +6,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +127,7 @@ impl ManagedFileSystemContext {
 
                 rendered.push_str("<file_system type=\"restricted\"");
                 if let Some(glob_scan_max_depth) = glob_scan_max_depth {
-                    rendered.push_str(&format!(" glob_scan_max_depth=\"{glob_scan_max_depth}\""));
+                    let _ = write!(rendered, " glob_scan_max_depth=\"{glob_scan_max_depth}\"");
                 }
                 rendered.push('>');
                 for entry in entries {

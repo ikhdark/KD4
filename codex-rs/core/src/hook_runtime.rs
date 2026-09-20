@@ -140,6 +140,12 @@ pub(crate) async fn run_pre_tool_use_hooks(
     tool_name: &HookToolName,
     tool_input: &Value,
 ) -> PreToolUseHookResult {
+    let hooks = sess.hooks();
+    if !hooks.has_handler_for(HookEventName::PreToolUse) {
+        return PreToolUseHookResult::Continue {
+            updated_input: None,
+        };
+    }
     let request = PreToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -154,7 +160,6 @@ pub(crate) async fn run_pre_tool_use_hooks(
         tool_input: tool_input.clone(),
         turn_tool_calls: turn_context.dispatched_tool_names(),
     };
-    let hooks = sess.hooks();
     let preview_runs = hooks.preview_pre_tool_use(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
@@ -201,6 +206,10 @@ pub(crate) async fn run_permission_request_hooks(
     run_id_suffix: &str,
     payload: PermissionRequestPayload,
 ) -> Option<PermissionRequestDecision> {
+    let hooks = sess.hooks();
+    if !hooks.has_handler_for(HookEventName::PermissionRequest) {
+        return None;
+    }
     let request = PermissionRequestRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -214,7 +223,6 @@ pub(crate) async fn run_permission_request_hooks(
         run_id_suffix: run_id_suffix.to_string(),
         tool_input: payload.tool_input,
     };
-    let hooks = sess.hooks();
     let preview_runs = hooks.preview_permission_request(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
@@ -262,8 +270,8 @@ pub(crate) async fn run_post_tool_use_hooks(
     let preview_runs = hooks.preview_planned_post_tool_use(&plan, &request.tool_use_id);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = hooks.run_planned_post_tool_use(plan, request).await;
-    emit_hook_completed_events(sess, turn_context, outcome.hook_events.clone()).await;
+    let mut outcome = hooks.run_planned_post_tool_use(plan, request).await;
+    emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
     outcome
 }
 
@@ -772,6 +780,9 @@ pub(crate) async fn prepare_additional_context_items(
     turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
 ) -> Vec<ResponseItem> {
+    if additional_contexts.is_empty() {
+        return Vec::new();
+    }
     let total = additional_contexts.len();
     let messages = additional_context_messages(additional_contexts);
     let omitted = total - messages.len();
@@ -796,7 +807,10 @@ fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<Response
         .map(HookAdditionalContext::new)
         .filter_map(|fragment| {
             budget.take(&fragment.render()).map(|text| {
-                ContextualUserFragment::into(RenderedContextFragment::new("developer", text))
+                ContextualUserFragment::into(RenderedContextFragment::new(
+                    "developer",
+                    text.into_owned(),
+                ))
             })
         })
         .collect()

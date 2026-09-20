@@ -33,6 +33,7 @@ use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::apps_test_server::search_capable_apps_builder;
 use core_test_support::assert_regex_match;
 use core_test_support::fs_wait;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
@@ -41,7 +42,6 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
@@ -368,7 +368,7 @@ async fn run_code_mode_turn_with_builder(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_exec_heartbeats_do_not_add_model_generations() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, completion) = run_code_mode_turn(
@@ -396,13 +396,77 @@ text("heartbeat-complete");"#,
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn predetermined_command_drains_complete_in_one_cell_without_lost_chunks() -> Result<()> {
+    require_network!();
+    let server = responses::start_mock_server().await;
+    // Cross the initial Windows observation floor without mutating any source
+    // dependency. The runtime's command receipts below count actual launches.
+    let command = if cfg!(windows) {
+        "[Console]::Out.Write('first'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('middle'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('last')"
+    } else {
+        "printf first; sleep 1.8; printf middle; sleep 1.8; printf last"
+    };
+    let script = format!(
+        r#"// @exec: {{"yield_time_ms": 5}}
+const deadline = Date.now() + 10000;
+const chunks = [];
+let result = await tools.exec_command({{kind:"script",cmd:{command:?},yield_time_ms:250,max_output_tokens:1000}});
+chunks.push(result.output ?? "");
+let polls = 0;
+while (result.session_id && result.execution_state === "running" && Date.now() < deadline && polls < 4) {{
+  result = await tools.write_stdin({{session_id:result.session_id,chars:"",yield_time_ms:1000,max_output_tokens:1000}});
+  chunks.push(result.output ?? "");
+  polls++;
+}}
+text(JSON.stringify({{chunks,polls,exit_code:result.exit_code,session_id:result.session_id ?? null,output_complete:result.output_complete}}));"#
+    );
+    let (_test, completion) =
+        run_code_mode_turn(&server, "Run the command and await its output", &script).await?;
+    let request = completion.single_request();
+    let items = custom_tool_output_items(&request, "call-1");
+    let result = (0..items.len())
+        .filter_map(|index| serde_json::from_str::<Value>(text_item(&items, index)).ok())
+        .find(|value| value.get("chunks").is_some())
+        .unwrap_or_else(|| panic!("cell must report its complete chunks: {items:?}"));
+    assert!(result["polls"].as_u64().unwrap() >= 1, "{result}");
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["session_id"], Value::Null);
+    assert_eq!(result["output_complete"], true);
+    let chunks = result["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(chunks, "firstmiddlelast");
+    let receipts = nested_command_states(&request, "call-1");
+    let launches = receipts
+        .iter()
+        .filter(|command| command["tool"] == "exec_command")
+        .count();
+    assert_eq!(launches, 1);
+    let requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().contains("responses"))
+        .count();
+    assert_eq!(
+        requests, 2,
+        "one execution request and one final generation"
+    );
+    Ok(())
+}
+
 /// A model projection bounds what the *model* reads. Substituting it for the
 /// nested return value handed JavaScript a logical-artifact envelope with no
 /// `results[]`, so code inside a cell could not branch on what a read returned
 /// and spent generations rediscovering the shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_projected_nested_read_returns_its_execution_result_to_javascript() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
@@ -485,7 +549,7 @@ text(JSON.stringify(shape));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_inventory_runs_through_code_mode_and_renders_exact_identifiers() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         let _ = config.features.enable(Feature::CodeMode);
@@ -556,7 +620,7 @@ text(JSON.stringify({rendered,observed:observed.summary,ids:page.records.map(row
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let builder = test_codex()
@@ -598,7 +662,7 @@ async fn assert_code_mode_standalone_web_search(
     web_search_mode: WebSearchMode,
     expected_external_web_access: Value,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     Mock::given(method("POST"))
@@ -818,8 +882,8 @@ async fn run_code_mode_turn_with_rmcp_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_persistence_failure_blocks_next_provider_request() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+async fn code_mode_known_persistence_failure_blocks_next_turn_provider_request() -> Result<()> {
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let test = test_codex()
@@ -858,44 +922,61 @@ async fn code_mode_persistence_failure_blocks_next_provider_request() -> Result<
         ]),
     )
     .await;
-    let forbidden_follow_up = responses::mount_sse_once(
+    let possible_follow_up = responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_assistant_message("forbidden-follow-up", "must not dispatch this generation"),
-            ev_completed("forbidden-follow-up-response"),
+            ev_assistant_message("first-turn-follow-up", "finish the first generation"),
+            ev_completed("first-turn-follow-up-response"),
         ]),
     )
     .await;
 
-    let completion = tokio::time::timeout(
+    // The asynchronous writer can fail before or after this turn's continuation.
+    // Its terminal checkpoint makes that failure known before the next turn.
+    tokio::time::timeout(
         Duration::from_secs(30),
         test.submit_turn_and_capture_completion("Produce the requested text using exec."),
     )
     .await
-    .expect("a failed persistence barrier must terminate the turn")?;
+    .expect("first turn must finish")?;
+    assert_eq!(first_request.requests().len(), 1);
+    let follow_up_count = possible_follow_up.requests().len();
+    assert!(follow_up_count <= 1);
+    let model_request_count = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .iter()
+        .filter(|request| request.url.path().contains("responses"))
+        .count();
+    assert_eq!(model_request_count, 1 + follow_up_count);
+    let completion = tokio::time::timeout(
+        Duration::from_secs(30),
+        test.submit_turn_and_capture_completion("Continue after the failed checkpoint."),
+    )
+    .await
+    .expect("known persistence failure must terminate the turn")?;
     let error = completion
         .error
-        .expect("the failed queued write must be reported in the terminal turn result");
+        .expect("known writer failure must be reported");
     assert!(
         error
             .message
             .contains("failed to create tool-history ledger directory"),
-        "the terminal error must preserve the actual persistence cause: {}",
-        error.message,
+        "{}",
+        error.message
     );
-    assert_eq!(first_request.requests().len(), 1);
-    assert!(
-        forbidden_follow_up.requests().is_empty(),
-        "the model must receive no follow-up request after its tool-history barrier fails",
-    );
-    let model_request_count = server
+    let after_failure_count = server
         .received_requests()
         .await
-        .expect("recorded HTTP requests")
+        .expect("recorded requests")
         .iter()
         .filter(|request| request.url.path().contains("responses"))
         .count();
-    assert_eq!(model_request_count, 1);
+    assert_eq!(
+        after_failure_count, model_request_count,
+        "known persistence failure must prevent provider dispatch"
+    );
     assert_eq!(fs::read(&history_path)?, b"filesystem obstruction");
 
     // Repair and use the real shutdown checkpoint to prove the failed queue
@@ -927,13 +1008,13 @@ async fn code_mode_persistence_failure_blocks_next_provider_request() -> Result<
         serde_json::json!(["queued-non-workspace-call"]),
         "the real code-mode registration must survive its failed persistence cycle",
     );
-    assert!(forbidden_follow_up.requests().is_empty());
+    assert_eq!(possible_follow_up.requests().len(), follow_up_count);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_preserves_read_history_until_its_source_changes() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let test = test_codex()
         .with_config(|config| {
@@ -1068,7 +1149,7 @@ text(reads.map(read => read.value).join(""));"#
 async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads(
     project_completed_history: bool,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let test = test_codex()
         .with_config(move |config| {
@@ -1152,7 +1233,9 @@ async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads
             stale.contains(r#""stale_workspace_evidence":true"#),
             "{call_id}: {stale}"
         );
-        assert!(!stale.contains("validated after"));
+        let notice: Value = serde_json::from_str(&stale).expect("stale evidence notice");
+        assert_eq!(notice["valid_for_current_workspace"], false);
+        assert!(notice["historical_digest"].as_str().is_some());
     }
     assert_eq!(
         fs::read_to_string(test.cwd_path().join("source.txt"))?,
@@ -1179,7 +1262,7 @@ async fn code_mode_terminal_prompt_requires_fresh_suites_and_completed_work(
     later_edit: bool,
     terminal: bool,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let test = test_codex()
         .with_config(|config| {
@@ -1280,7 +1363,7 @@ const BUDGET_OUTPUT_CALLS: usize = 6;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let test = test_codex()
         .with_config(|config| {
@@ -1374,7 +1457,7 @@ const PRESSURE_EVIDENCE_LINES: usize = 1_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let test = test_codex()
         .with_config(|config| {
@@ -1529,7 +1612,7 @@ async fn code_mode_output_only_zero_budget_preserves_running_command_and_recover
 async fn output_only_preserves_running_command_and_recovers_middle(
     zero_budget: bool,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let fixture = tempfile::tempdir()?;
     let release = fixture.path().join("release");
@@ -1668,7 +1751,7 @@ async fn output_only_preserves_running_command_and_recovers_middle(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_return_exec_command_output() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -1720,7 +1803,7 @@ text(JSON.stringify(result));
 
 #[tokio::test]
 async fn code_mode_preserves_nested_result_evidence_without_injecting_advice() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let test = test_codex()
         .with_config(|config| {
@@ -2037,7 +2120,7 @@ await new Promise(() => {});
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let resp_mock = responses::mount_sse_once(
@@ -2077,7 +2160,7 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let apps_server = AppsTestServer::mount_searchable(&server).await?;
@@ -2195,7 +2278,7 @@ if (!tool) {
             })
         })
         .expect("exec description should be present");
-    assert!(exec_description.contains("Nested tool schemas are discovered lazily at runtime"));
+    assert!(exec_description.contains("Nested tools: use a present schema"));
     assert!(exec_description.contains("`resolve_tool(name)` when the name is known"));
     assert!(exec_description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
     assert!(!exec_description.contains("### `tool_search`"));
@@ -2233,7 +2316,7 @@ if (!tool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_only_tools_are_not_visible_or_runnable_by_code_mode_model() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let apps_server =
@@ -2319,7 +2402,7 @@ text(JSON.stringify({{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_nested_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     responses::mount_sse_once(
@@ -2368,7 +2451,7 @@ text(output.output);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_update_plan_nested_tool_returns_authoritative_result() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -2405,7 +2488,7 @@ text(JSON.stringify(result));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_current_time_returns_structured_result() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn_with_config(
@@ -2449,7 +2532,7 @@ text(JSON.stringify(result));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_nested_tool_calls_can_run_in_parallel() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex()
@@ -2547,7 +2630,7 @@ const TOKEN_POLICY_TEST_MODEL: &str = "gpt-5.4";
 // script calls `text`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -2606,7 +2689,7 @@ text(JSON.stringify({
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_preserves_result_variable_before_default_history_truncation()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn_with_model_and_config(
@@ -2639,7 +2722,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_truncates_result_variable_when_exceeded() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn_with_model_and_config(
@@ -2682,7 +2765,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_preserves_result_variable_before_configured_history_truncation()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn_with_model_and_config(
@@ -2736,7 +2819,7 @@ text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "T
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_default_history_truncation()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn_with_model_and_config(
@@ -2769,7 +2852,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_configured_history_truncation()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn_with_model_and_config(
@@ -2823,7 +2906,7 @@ text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "T
 // further change the nested tool's model-visible result text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -2860,7 +2943,7 @@ text(result.result?.selected_text ?? result.output);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_yielded_output_keeps_an_omission_marker_within_a_tiny_budget() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let (_test, response) = run_code_mode_turn(
         &server,
@@ -2887,7 +2970,7 @@ await new Promise(() => {});
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_returns_accumulated_output_when_script_fails() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -2929,7 +3012,7 @@ Error:\ boom\n
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_surfaces_handler_errors_as_exceptions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -2967,7 +3050,7 @@ try {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -3112,7 +3195,7 @@ text("phase 3");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_yield_and_termination_are_not_starved_by_runtime_output() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -3209,7 +3292,7 @@ while (true) {}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_run_multiple_yielded_sessions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -3376,7 +3459,7 @@ text("session b done");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_concurrent_cells_merge_only_the_stored_values_they_write() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex()
@@ -3540,7 +3623,7 @@ async fn code_mode_termination_retains_completed_nested_results_after_printed_pr
     use core_test_support::streaming_sse::StreamingSseChunk;
     use core_test_support::streaming_sse::start_streaming_sse_server;
 
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let (terminate, termination_ready) = tokio::sync::oneshot::channel();
     let (server, _) = start_streaming_sse_server(vec![
         vec![StreamingSseChunk {
@@ -3749,7 +3832,7 @@ text("must not run after cancellation");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -3871,7 +3954,7 @@ text("after terminate");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_returns_error_for_unknown_session() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -3945,7 +4028,7 @@ await new Promise(() => {});"#,
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_terminate_returns_completed_session_if_it_finished_after_yield_control()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex()
@@ -4001,7 +4084,7 @@ text("session a done");
                 "call-release",
                 "test_sync_tool",
                 &serde_json::to_string(&serde_json::json!({
-                    "sleep_after_ms": 250,
+                    "sleep_after_ms": 5_000,
                 }))?,
             ),
             ev_completed("resp-3"),
@@ -4055,7 +4138,7 @@ text("session a done");
 
     let fourth_request = fourth_completion.single_request();
     let fourth_items = function_tool_output_items(&fourth_request, "call-3");
-    assert_eq!(fourth_items.len(), 2);
+    assert_eq!(fourth_items.len(), 2, "{fourth_items:?}");
     assert_regex_match(
         concat!(
             r"(?s)\A",
@@ -4070,7 +4153,7 @@ text("session a done");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_background_keeps_running_on_later_turn_without_wait() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -4152,7 +4235,7 @@ text("after yield");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_uses_its_own_max_tokens_budget() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -4247,7 +4330,7 @@ text("token one token two token three token four token five token six token seve
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_output_serialized_text_via_global_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4277,7 +4360,7 @@ text({ json: true });
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_resume_after_set_timeout() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4304,7 +4387,7 @@ text("timer done");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_notify_injects_additional_exec_tool_output_into_active_context() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4336,7 +4419,7 @@ text("done");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exit_stops_script_immediately() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4374,7 +4457,7 @@ text("after");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_surfaces_text_stringify_errors() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4414,7 +4497,7 @@ text(circular);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_output_images_via_global_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4456,7 +4539,7 @@ image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUl
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_replaces_malformed_image() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4488,7 +4571,7 @@ async fn code_mode_replaces_malformed_image() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_resizes_explicit_original_image() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let original_dimensions = (6401, 100);
     let image = ImageBuffer::from_pixel(
@@ -4538,7 +4621,7 @@ async fn code_mode_resizes_explicit_original_image() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
@@ -4576,9 +4659,12 @@ async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case("original"; "original")]
+#[test_case::test_case("low"; "low")]
+#[test_case::test_case("high"; "high")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_use_view_image_result_with_image_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+async fn code_mode_view_image_helper_applies_detail_policy(detail: &str) -> Result<()> {
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex()
@@ -4597,7 +4683,7 @@ async fn code_mode_can_use_view_image_result_with_image_helper() -> Result<()> {
     let image_path_json = serde_json::to_string(&image_path.to_string_lossy().to_string())?;
     let code = format!(
         r#"
-const out = await tools.view_image({{ path: {image_path_json}, detail: "original" }});
+const out = await tools.view_image({{ path: {image_path_json}, detail: "{detail}" }});
 image(out);
 "#
     );
@@ -4643,7 +4729,8 @@ image(out);
 
     assert_eq!(
         items[1].get("type").and_then(Value::as_str),
-        Some("input_image")
+        Some("input_image"),
+        "{items:?}"
     );
 
     let emitted_image_url = items[1]
@@ -4651,17 +4738,14 @@ image(out);
         .and_then(Value::as_str)
         .expect("image helper should emit an input_image item with image_url");
     assert!(emitted_image_url.starts_with("data:image/png;base64,"));
-    assert_eq!(
-        items[1].get("detail").and_then(Value::as_str),
-        Some("original")
-    );
+    assert_eq!(items[1].get("detail").and_then(Value::as_str), Some(detail));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_use_mcp_image_result_with_image_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -4717,7 +4801,7 @@ image(imageItem);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let file_name = "code_mode_apply_patch.txt";
     let patch = format!(
@@ -4766,7 +4850,13 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
         } else {
             assert!(exec_description.contains(runtime_description));
         }
-        let result = output["result"].as_str().expect("patch result");
+        assert_eq!(output["result"]["success"], true);
+        assert_eq!(output["result"]["changes_exact"], true);
+        assert_eq!(output["result"]["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(output["result"]["changes"][0]["kind"], "add");
+        let result = output["result"]["text"]
+            .as_str()
+            .expect("patch result text");
         assert!(
             result.contains("Success. Updated the following files:") && result.contains(file_name)
         );
@@ -4781,7 +4871,7 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_print_structured_mcp_tool_result_fields() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -4819,7 +4909,7 @@ contentLength=0"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_mcp_tool() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -4849,7 +4939,7 @@ text(`echo=${result.structuredContent?.echo ?? "missing"}`);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exposes_mcp_tools_on_global_tools_object() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -4890,7 +4980,7 @@ contentLength=0"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_uses_non_prefixed_mcp_tool_names_when_feature_enabled() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -4934,7 +5024,7 @@ text(JSON.stringify({
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exposes_namespaced_mcp_tools_on_global_tools_object() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -4970,7 +5060,7 @@ text(JSON.stringify({
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exposes_normalized_illegal_mcp_tool_names() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -4999,7 +5089,7 @@ text(`echo=${result.structuredContent.echo}`);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_lists_global_scope_items() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -5117,7 +5207,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exports_all_tools_metadata_for_builtin_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -5144,7 +5234,7 @@ text(JSON.stringify(tool));
         parsed,
         serde_json::json!({
             "name": "view_image",
-            "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file.\n  path: string;\n}, options?: { timeout_ms?: number }): Promise<{\n  // Image detail hint returned by view_image. Returns `high` for default resized behavior or `original` when original resolution is preserved.\n  detail: \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```",
+            "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Image detail level. Defaults to `high`; use `low` for lower-cost overview inspection. When available, `original` preserves exact resolution.\n  detail?: \"low\" | \"high\";\n  // Local filesystem path to an image file.\n  path: string;\n}, options?: { timeout_ms?: number }): Promise<{\n  // Image detail hint returned by view_image: `low` for overview inspection, `high` for default resized behavior, or `original` when original resolution is preserved.\n  detail: \"low\" | \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```",
         })
     );
 
@@ -5153,7 +5243,7 @@ text(JSON.stringify(tool));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exports_all_tools_metadata_for_namespaced_mcp_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -5199,7 +5289,7 @@ text(JSON.stringify(tool));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -5368,7 +5458,7 @@ text(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
@@ -5461,7 +5551,7 @@ text(JSON.stringify({
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_print_content_only_mcp_tool_result_fields() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -5504,7 +5594,7 @@ isError=false"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_print_error_mcp_tool_result_fields() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let code = r#"
@@ -5537,7 +5627,7 @@ try {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_store_and_load_values_across_turns() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
@@ -5630,7 +5720,7 @@ text(JSON.stringify(load("nb")));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_compare_elapsed_time_around_set_timeout() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(

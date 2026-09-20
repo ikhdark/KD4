@@ -21,12 +21,12 @@ use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
+use core_test_support::require_network;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use tempfile::TempDir;
 
 fn resume_history(
@@ -114,7 +114,7 @@ fn resume_history(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_model_difference_uses_model_switch_context_without_legacy_warning() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let response_mock = mount_sse_once(

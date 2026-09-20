@@ -1,8 +1,8 @@
-use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::validation_admission::ValidationClassification;
-use crate::validation_admission::classify_validation;
+use crate::validation_admission::classify_validation_script;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 
 const DEFAULT_SUMMARY_AFTER_BYTES: usize = 48 * 1024;
 const DEFAULT_SUMMARY_AFTER_LINES: usize = 600;
@@ -42,6 +42,16 @@ pub(crate) fn summarize_shell_output_for_model(
     if !options.enabled {
         return None;
     }
+    let exceeds_token_budget = options
+        .applied_token_limit
+        .is_some_and(|limit| codex_utils_string::approx_token_count_exceeds(output, limit));
+    if !exceeds_token_budget
+        && output.len() <= DEFAULT_SUMMARY_AFTER_BYTES
+        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES + 1).count()
+            <= DEFAULT_SUMMARY_AFTER_LINES
+    {
+        return None;
+    }
     if options.command_text.is_some_and(|command| {
         let commands = codex_shell_command::parse_command::parse_shell_script(command);
         !commands.is_empty()
@@ -59,21 +69,11 @@ pub(crate) fn summarize_shell_output_for_model(
         return None;
     }
 
-    let exceeds_token_budget = options
-        .applied_token_limit
-        .is_some_and(|limit| codex_utils_string::approx_token_count(output) > limit);
-    if !exceeds_token_budget
-        && output.len() <= DEFAULT_SUMMARY_AFTER_BYTES
-        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES + 1).count()
-            <= DEFAULT_SUMMARY_AFTER_LINES
-    {
-        return None;
-    }
     let line_count = output.lines().count();
     let failed = timed_out || exit_code != 0;
     let validation = options.command_text.is_some_and(|command| {
         matches!(
-            classify_validation(&CommandInvocation::Script(command.to_string())),
+            classify_validation_script(command),
             ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
         )
     });
@@ -110,10 +110,16 @@ pub(crate) fn summarize_shell_output_for_model(
     // rendering. Emit the selected lines in source order so a diagnostic stays
     // attached to the context that explains it.
     // Borrow only the bounded selection; never copy oversized source lines.
-    let selected = output
-        .lines()
-        .enumerate()
-        .filter(|(index, _)| selection.indexes.contains(index))
+    let mut lines = output.lines();
+    let mut next_index = 0;
+    let selected = selection
+        .indexes
+        .iter()
+        .filter_map(|&index| {
+            let line = lines.nth(index - next_index)?;
+            next_index = index + 1;
+            Some((index, line))
+        })
         .collect::<Vec<_>>();
     let gap_bytes: usize = selected
         .windows(2)
@@ -193,6 +199,7 @@ fn classify_line(line: &str) -> LineClassification {
             || starts_with_diagnostic_label_ascii_case(trimmed, "panic")
             || starts_with_diagnostic_label_ascii_case(trimmed, "fatal")
             || starts_with_ascii_case(trimmed, "fail [")
+            || starts_with_ascii_case(trimmed, "--- fail:")
             || strip_prefix_ascii_case(trimmed, "try ").is_some_and(|retry| {
                 find_ascii_case(retry, " fail [").is_some_and(|separator| {
                     let attempt = &retry[..separator];
@@ -267,9 +274,17 @@ fn contains_ascii_case(line: &str, needle: &str) -> bool {
 }
 
 fn find_ascii_case(line: &str, needle: &str) -> Option<usize> {
-    line.as_bytes()
-        .windows(needle.len())
-        .position(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
+    let (&first, _) = needle.as_bytes().split_first()?;
+    memchr::memchr2_iter(
+        first.to_ascii_lowercase(),
+        first.to_ascii_uppercase(),
+        line.as_bytes(),
+    )
+    .find(|&index| {
+        line.as_bytes()
+            .get(index..index + needle.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
+    })
 }
 
 // The selector retains at most 64 diagnostic groups and a fixed number of
@@ -397,7 +412,7 @@ impl SummaryBuilder {
             self.capped = true;
             summarize_oversized_line(line, remaining)
         } else {
-            line.to_string()
+            std::borrow::Cow::Borrowed(line)
         };
 
         if !self.text.is_empty() {
@@ -417,10 +432,11 @@ impl SummaryBuilder {
         if self.text.trim().is_empty() {
             return None;
         }
-        self.text.push_str(&format!(
+        let _ = write!(
+            self.text,
             "\n- emitted_source_lines: {emitted_source_lines}\n- omitted_source_lines: {}",
             original_lines.saturating_sub(emitted_source_lines),
-        ));
+        );
         if self.capped && !self.text.ends_with("[summary capped]") {
             if !self.text.is_empty() {
                 self.text.push('\n');
@@ -431,13 +447,13 @@ impl SummaryBuilder {
     }
 }
 
-fn summarize_oversized_line(line: &str, max_bytes: usize) -> String {
+fn summarize_oversized_line(line: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
     const MARKER: &str = " ... [line truncated] ... ";
     if line.len() <= max_bytes {
-        return line.to_string();
+        return std::borrow::Cow::Borrowed(line);
     }
     if max_bytes <= MARKER.len() {
-        return line[..line.floor_char_boundary(max_bytes)].to_string();
+        return std::borrow::Cow::Borrowed(&line[..line.floor_char_boundary(max_bytes)]);
     }
 
     let payload_bytes = max_bytes - MARKER.len();
@@ -446,12 +462,24 @@ fn summarize_oversized_line(line: &str, max_bytes: usize) -> String {
     let head = &line[..line.floor_char_boundary(head_bytes)];
     let tail_start = line.ceil_char_boundary(line.len().saturating_sub(tail_bytes));
     let tail = &line[tail_start..];
-    format!("{head}{MARKER}{tail}")
+    std::borrow::Cow::Owned(format!("{head}{MARKER}{tail}"))
 }
 
 #[cfg(test)]
 mod optimization_tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_search_preserves_ascii_case_and_utf8_offsets() {
+        for (line, needle, expected) in [
+            ("界 ERROR: failed", "error:", Some(4)),
+            ("error er", "error:", None),
+            ("x eRrOr: y ERROR:", "error:", Some(2)),
+            ("ordinary output", "npm err!", None),
+        ] {
+            assert_eq!(find_ascii_case(line, needle), expected);
+        }
+    }
 
     #[test]
     fn selection_storage_is_bounded_for_large_logs() {

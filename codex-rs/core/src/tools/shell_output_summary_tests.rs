@@ -12,6 +12,28 @@ fn options(
 }
 
 #[test]
+fn go_and_pytest_failures_survive_passing_output_afterward() {
+    for (command, failure) in [
+        ("go test ./...", "--- FAIL: TestExpectedResult (0.00s)"),
+        (
+            "pytest",
+            "FAILED tests/test_example.py::test_expected - AssertionError",
+        ),
+    ] {
+        let output = format!(
+            "{}\n{failure}\nexpected 2, got 1\n{}",
+            "build progress\n".repeat(100),
+            "unrelated passing test\n".repeat(700)
+        );
+        let summary =
+            summarize_shell_output_for_model(&output, 1, false, options(Some(command), None))
+                .unwrap();
+        assert!(summary.contains(failure), "{summary}");
+        assert!(summary.contains("expected 2, got 1"), "{summary}");
+    }
+}
+
+#[test]
 fn small_output_is_unchanged() {
     let output = "ok\n";
 
@@ -117,10 +139,13 @@ fn oversized_diagnostic_and_distinct_middle_failure_preserve_final_status() {
         duration: std::time::Duration::ZERO,
         timed_out: false,
     };
-    let summary = crate::tools::format_exec_output_for_model(
+    let summary = crate::tools::project_exec_output_for_model_with_budget(
         &exec_output,
         codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
-    );
+        Some(10_000),
+        None,
+    )
+    .text;
     for expected in [
         "EARLY_DIAGNOSTIC",
         "UNIQUE_MIDDLE_FAILURE",
@@ -294,10 +319,13 @@ fn selected_errors_do_not_spend_the_final_status_quota() {
         duration: std::time::Duration::ZERO,
         timed_out: false,
     };
-    let summary = crate::tools::format_exec_output_for_model(
+    let summary = crate::tools::project_exec_output_for_model_with_budget(
         &output,
-        codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
-    );
+        codex_utils_output_truncation::TruncationPolicy::Tokens(3_000),
+        Some(3_000),
+        None,
+    )
+    .text;
     assert!(summary.contains("Shell output summary:"), "{summary}");
     assert!(!summary.contains("let summary:"), "{summary}");
 

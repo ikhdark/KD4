@@ -28,7 +28,7 @@ pub(crate) fn create_request_plugin_install_tool(
                     "action_type".to_string(),
                     JsonSchema::string_enum(
                         vec![json!("install")],
-                        Some("Suggested action for the tool. Use \"install\".".to_string()),
+                        Some("Omit to install. The only supported action is \"install\".".to_string()),
                     ),
                 ),
                 (
@@ -45,7 +45,6 @@ pub(crate) fn create_request_plugin_install_tool(
             ]),
             vec![
                 "tool_type".to_string(),
-                "action_type".to_string(),
                 "tool_id".to_string(),
                 "suggest_reason".to_string(),
             ],
@@ -93,6 +92,51 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn install_action_can_be_omitted_without_changing_the_request() {
+        let ToolSpec::Function(tool) =
+            create_request_plugin_install_tool(ToolSuggestPresentation::ListTool)
+        else {
+            panic!("expected install function tool");
+        };
+        let schema = serde_json::to_value(tool.parameters).expect("serialize install schema");
+        let validator = jsonschema::validator_for(&schema).expect("compile install schema");
+        let mut arguments = json!({
+            "tool_type": "plugin",
+            "tool_id": "example@marketplace",
+            "suggest_reason": "Use the requested plugin"
+        });
+        for explicit in [false, true] {
+            if explicit {
+                arguments["action_type"] = json!("install");
+            }
+            assert!(validator.is_valid(&arguments));
+            let parsed: codex_tools::RequestPluginInstallArgs =
+                crate::tools::handlers::parse_arguments(&arguments.to_string())
+                    .expect("advertised arguments must be accepted by the handler parser");
+            assert_eq!(
+                parsed.action_type,
+                codex_tools::DiscoverableToolAction::Install
+            );
+            assert_eq!(parsed.tool_id, "example@marketplace");
+        }
+        arguments["action_type"] = json!("enable");
+        assert!(!validator.is_valid(&arguments));
+        let parsed: codex_tools::RequestPluginInstallArgs =
+            crate::tools::handlers::parse_arguments(&arguments.to_string()).unwrap();
+        assert_eq!(
+            parsed.action_type,
+            codex_tools::DiscoverableToolAction::Enable
+        );
+        arguments["action_type"] = json!("unknown");
+        assert!(
+            crate::tools::handlers::parse_arguments::<codex_tools::RequestPluginInstallArgs>(
+                &arguments.to_string()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn create_request_plugin_install_tool_uses_expected_legacy_wire_shape() {
         let expected_description = concat!(
             "# Request plugin/connector install\n\n",
@@ -114,7 +158,7 @@ mod tests {
                             JsonSchema::string_enum(
                                 vec![json!("install")],
                                 Some(
-                                    "Suggested action for the tool. Use \"install\"."
+                                    "Omit to install. The only supported action is \"install\"."
                                         .to_string(),
                                 ),
                             ),
@@ -145,7 +189,6 @@ mod tests {
                         ),
                     ]), Some(vec![
                         "tool_type".to_string(),
-                        "action_type".to_string(),
                         "tool_id".to_string(),
                         "suggest_reason".to_string(),
                     ]), Some(false.into())),

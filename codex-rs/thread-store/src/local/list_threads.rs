@@ -772,6 +772,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deserialized_unassigned_project_filter_rejects_scan_storage() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let mut value =
+            serde_json::to_value(list_params(10, None, ThreadListStorageMode::ScanAndRepair))
+                .expect("serialize listing request");
+        value["project_id"] = serde_json::Value::Null;
+        let params = serde_json::from_value(value).expect("deserialize unassigned filter");
+        let error = store
+            .list_threads(params)
+            .await
+            .expect_err("unassigned filter must not silently become an unfiltered scan");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
     async fn relationship_filters_reject_scan_storage_and_require_db() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);

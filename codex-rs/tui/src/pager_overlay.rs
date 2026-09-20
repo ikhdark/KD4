@@ -31,7 +31,6 @@ use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
-use crate::terminal_hyperlinks::visible_lines;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crossterm::event::KeyCode;
@@ -400,6 +399,25 @@ impl Renderable for CachedRenderable {
     }
 }
 
+fn borrow_visible_lines(lines: &[HyperlinkLine]) -> Vec<ratatui::text::Line<'_>> {
+    lines
+        .iter()
+        .map(|line| ratatui::text::Line {
+            style: line.line.style,
+            alignment: line.line.alignment,
+            spans: line
+                .line
+                .spans
+                .iter()
+                .map(|span| ratatui::text::Span {
+                    style: span.style,
+                    content: std::borrow::Cow::Borrowed(span.content.as_ref()),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 struct CellRenderable {
     cell: Arc<dyn HistoryCell>,
     style: Style,
@@ -412,7 +430,7 @@ impl Renderable for CellRenderable {
 
     fn render_scrolled(&self, area: Rect, buf: &mut Buffer, rows: u16) -> bool {
         let hyperlink_lines = self.cell.transcript_hyperlink_lines(area.width);
-        let p = Paragraph::new(Text::from(visible_lines(hyperlink_lines.clone())))
+        let p = Paragraph::new(Text::from(borrow_visible_lines(&hyperlink_lines)))
             .style(self.style)
             .wrap(Wrap { trim: false })
             .scroll((rows, 0));
@@ -436,7 +454,7 @@ impl Renderable for HyperlinkLinesRenderable {
     }
 
     fn render_scrolled(&self, area: Rect, buf: &mut Buffer, rows: u16) -> bool {
-        Paragraph::new(Text::from(visible_lines(self.lines.clone())))
+        Paragraph::new(Text::from(borrow_visible_lines(&self.lines)))
             .wrap(Wrap { trim: false })
             .scroll((rows, 0))
             .render(area, buf);
@@ -445,7 +463,7 @@ impl Renderable for HyperlinkLinesRenderable {
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        Paragraph::new(Text::from(visible_lines(self.lines.clone())))
+        Paragraph::new(Text::from(borrow_visible_lines(&self.lines)))
             .wrap(Wrap { trim: false })
             .line_count(width)
             .try_into()

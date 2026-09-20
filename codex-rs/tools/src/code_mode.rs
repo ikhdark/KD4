@@ -121,10 +121,13 @@ pub fn collect_code_mode_tool_definitions<'a>(
             "plain"
         };
         let base = format!("{}__{kind}", definition.name);
+        let normalized_base = codex_code_mode::normalize_code_mode_identifier(&base);
         let mut candidate = base.clone();
+        let mut normalized_candidate = normalized_base.clone();
         let mut sequence = 2usize;
-        while !used_names.insert(codex_code_mode::normalize_code_mode_identifier(&candidate)) {
+        while !used_names.insert(normalized_candidate) {
             candidate = format!("{base}_{sequence}");
+            normalized_candidate = format!("{normalized_base}_{sequence}");
             sequence = sequence.saturating_add(1);
         }
         definition.name = candidate;

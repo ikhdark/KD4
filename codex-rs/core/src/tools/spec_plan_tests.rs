@@ -330,8 +330,8 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
 #[tokio::test]
 async fn read_file_is_visible_and_registered_for_text_models() {
     let plan = probe(|turn| turn.model_info.input_modalities = vec![InputModality::Text]).await;
-    plan.assert_visible_contains(&["read_file"]);
-    plan.assert_registered_contains(&["read_file"]);
+    plan.assert_visible_contains(&["read_file", "list_files"]);
+    plan.assert_registered_contains(&["read_file", "list_files"]);
 }
 
 #[tokio::test]
@@ -673,6 +673,27 @@ fn set_foreign_primary_environment(turn: &mut TurnContext) {
         foreign_cwd,
         shell,
     );
+}
+
+#[tokio::test]
+async fn shell_safety_guidance_follows_all_selectable_environment_paths() {
+    for mixed in [false, true] {
+        let plan = probe(|turn| {
+            if mixed {
+                duplicate_primary_environment(turn);
+            }
+            set_foreign_primary_environment(turn);
+            turn.permission_profile = PermissionProfile::Disabled;
+            turn.model_info.shell_type = ConfigShellToolType::UnifiedExec;
+        })
+        .await;
+        let ToolSpec::Function(tool) = plan.visible_spec("exec_command") else {
+            panic!("expected exec command");
+        };
+        assert_eq!(tool.description.contains("Windows safety rules"), mixed);
+        assert!(tool.description.contains("Filesystem safety:"));
+        assert!(tool.description.contains("Search guidance:"));
+    }
 }
 
 fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
@@ -1077,6 +1098,34 @@ async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell() {
 }
 
 #[tokio::test]
+async fn shell_family_advertises_configured_background_wait_limit() {
+    for (configured, expected_max, expected_default) in
+        [(300_000, 300_000, 300_000), (10_000, 30_000, 10_000)]
+    {
+        let plan = probe(|turn| {
+            set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+            let mut config = (*turn.config).clone();
+            config.background_terminal_max_timeout = configured;
+            turn.config = Arc::new(config);
+        })
+        .await;
+        let ToolSpec::Function(tool) = plan.visible_spec("write_stdin") else {
+            panic!("expected write_stdin");
+        };
+        let schema = serde_json::to_value(&tool.parameters).unwrap();
+        let yield_schema = &schema["properties"]["yield_time_ms"];
+        assert_eq!(yield_schema["maximum"], expected_max);
+        let description = yield_schema["description"].as_str().unwrap();
+        assert!(description.contains(&format!(
+            "Empty polls default to {expected_default} ms and cap at {configured} ms"
+        )));
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"session_id": 1, "yield_time_ms": expected_max})));
+        assert!(!validator.is_valid(&json!({"session_id": 1, "yield_time_ms": expected_max + 1})));
+    }
+}
+
+#[tokio::test]
 async fn shell_family_follows_default_unified_exec_policy() {
     let plan = probe(|turn| {
         turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
@@ -1145,8 +1194,42 @@ async fn foreign_primary_hides_exec_command_only_when_platform_sandboxing_is_req
 }
 
 #[tokio::test]
+async fn request_permissions_registration_respects_approval_policy() {
+    let granular = |request_permissions| {
+        AskForApproval::Granular(codex_protocol::protocol::GranularApprovalConfig {
+            sandbox_approval: true,
+            rules: true,
+            skill_approval: true,
+            request_permissions,
+            mcp_elicitations: true,
+        })
+    };
+    for (policy, allowed) in [
+        (AskForApproval::Never, false),
+        (granular(false), false),
+        (granular(true), true),
+        (AskForApproval::OnRequest, true),
+        (AskForApproval::UnlessTrusted, true),
+    ] {
+        let plan = probe(|turn| {
+            set_feature(turn, Feature::RequestPermissionsTool, true);
+            turn.approval_policy = codex_config::Constrained::allow_any(policy);
+        })
+        .await;
+        if allowed {
+            plan.assert_visible_contains(&["request_permissions"]);
+            plan.assert_registered_contains(&["request_permissions"]);
+        } else {
+            plan.assert_visible_lacks(&["request_permissions"]);
+            plan.assert_registered_lacks(&["request_permissions"]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn environment_count_controls_environment_backed_tools() {
     let no_environment = probe(|turn| {
+        turn.approval_policy = codex_config::Constrained::allow_any(AskForApproval::OnRequest);
         turn.environments.turn_environments.clear();
         set_feature(turn, Feature::ShellTool, /*enabled*/ true);
         set_feature(turn, Feature::RequestPermissionsTool, /*enabled*/ true);
@@ -1169,6 +1252,7 @@ async fn environment_count_controls_environment_backed_tools() {
     ]);
 
     let multiple_environments = probe(|turn| {
+        turn.approval_policy = codex_config::Constrained::allow_any(AskForApproval::OnRequest);
         duplicate_primary_environment(turn);
         set_feature(turn, Feature::ShellTool, /*enabled*/ true);
         set_feature(turn, Feature::UnifiedExec, /*enabled*/ true);

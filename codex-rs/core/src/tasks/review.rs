@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use codex_prompts::render_review_exit_interrupted;
@@ -212,7 +213,18 @@ async fn process_review_events(
                 let out = task_complete
                     .last_agent_message
                     .as_deref()
-                    .map(parse_review_output_event);
+                    .and_then(parse_review_output_event);
+                if out.is_none() {
+                    session
+                        .send_event(
+                            ctx.as_ref(),
+                            EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                                message: "Review did not return a valid structured result. Re-run /review; this is not a clean review verdict.".to_string(),
+                                codex_error_info: None,
+                            }),
+                        )
+                        .await;
+                }
                 return out;
             }
             EventMsg::TurnAborted(_) => {
@@ -229,25 +241,34 @@ async fn process_review_events(
 }
 
 /// Parse a ReviewOutputEvent from a text blob returned by the reviewer model.
-/// If the text is valid JSON matching ReviewOutputEvent, deserialize it.
-/// Otherwise, attempt to extract the first JSON object substring and parse it.
-/// If parsing still fails, return a structured fallback carrying the plain text
-/// in `overall_explanation`.
-fn parse_review_output_event(text: &str) -> ReviewOutputEvent {
-    if let Ok(ev) = serde_json::from_str::<ReviewOutputEvent>(text) {
-        return ev;
+/// Accept only results satisfying the review contract. Keep the wire types
+/// compatible with saved reviews; validate new model output at this boundary.
+/// A streaming deserializer finds an object's actual end even when surrounding
+/// prose or code contains braces. Invalid output must not become empty findings.
+fn parse_review_output_event(text: &str) -> Option<ReviewOutputEvent> {
+    for (start, _) in text.match_indices('{') {
+        let Some(Ok(output)) = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<ReviewOutputEvent>()
+            .next()
+        else {
+            continue;
+        };
+        if matches!(
+            output.overall_correctness.as_str(),
+            "patch is correct" | "patch is incorrect"
+        ) && (0.0..=1.0).contains(&output.overall_confidence_score)
+            && output.findings.iter().all(|finding| {
+                (0.0..=1.0).contains(&finding.confidence_score)
+                    && (0..=3).contains(&finding.priority)
+                    && finding.code_location.line_range.start > 0
+                    && finding.code_location.line_range.end
+                        >= finding.code_location.line_range.start
+            })
+        {
+            return Some(output);
+        }
     }
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
-        && start < end
-        && let Some(slice) = text.get(start..=end)
-        && let Ok(ev) = serde_json::from_str::<ReviewOutputEvent>(slice)
-    {
-        return ev;
-    }
-    ReviewOutputEvent {
-        overall_explanation: text.to_string(),
-        ..Default::default()
-    }
+    None
 }
 
 /// Emits ExitedReviewMode item lifecycle with optional ReviewOutput,
@@ -265,7 +286,7 @@ pub(crate) async fn exit_review_mode(
         }
         if !out.findings.is_empty() {
             let block = format_review_findings_block(&out.findings, /*selection*/ None);
-            findings_str.push_str(&format!("\n{block}"));
+            let _ = write!(findings_str, "\n{block}");
         }
         let rendered = render_review_exit_success(&findings_str);
         let assistant_message = render_review_output_text(&out);
@@ -324,6 +345,89 @@ mod tests {
     use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::TurnCompleteEvent;
+
+    fn valid_review() -> serde_json::Value {
+        serde_json::json!({
+            "findings": [{
+                "title": "[P2] Preserve the result",
+                "body": "This change discards the result.",
+                "confidence_score": 0.8,
+                "priority": 2,
+                "code_location": {
+                    "absolute_file_path": "/repo/file.rs",
+                    "line_range": {"start": 1, "end": 2}
+                }
+            }],
+            "overall_correctness": "patch is incorrect",
+            "overall_explanation": "The result is discarded.",
+            "overall_confidence_score": 0.9
+        })
+    }
+
+    #[test]
+    fn review_parser_recovers_json_among_unrelated_braces() {
+        let value = valid_review();
+        let expected = serde_json::from_value::<ReviewOutputEvent>(value.clone()).unwrap();
+        for text in [
+            value.to_string(),
+            format!("Example: fn main() {{}}\n```json\n{value}\n```\nTrailing {{ prose }}"),
+        ] {
+            assert_eq!(parse_review_output_event(&text), Some(expected.clone()));
+        }
+    }
+
+    #[test]
+    fn review_parser_rejects_invalid_contract_fields() {
+        for (pointer, replacement) in [
+            ("/overall_correctness", serde_json::json!("good")),
+            ("/overall_confidence_score", serde_json::json!(1.1)),
+            ("/overall_confidence_score", serde_json::json!(-0.1)),
+            ("/findings/0/confidence_score", serde_json::json!(1.1)),
+            ("/findings/0/confidence_score", serde_json::json!(-0.1)),
+            ("/findings/0/priority", serde_json::json!(4)),
+            ("/findings/0/priority", serde_json::json!(-1)),
+            ("/findings/0/priority", serde_json::Value::Null),
+            (
+                "/findings/0/code_location/line_range/start",
+                serde_json::json!(0),
+            ),
+            (
+                "/findings/0/code_location/line_range/end",
+                serde_json::json!(0),
+            ),
+        ] {
+            let mut value = valid_review();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            assert_eq!(
+                parse_review_output_event(&value.to_string()),
+                None,
+                "{pointer}"
+            );
+        }
+        assert_eq!(parse_review_output_event("plain text"), None);
+        let mut value = valid_review();
+        value["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("priority");
+        assert_eq!(parse_review_output_event(&value.to_string()), None);
+    }
+
+    #[test]
+    fn review_parser_accepts_clean_verdict_and_numeric_boundaries() {
+        let mut value = valid_review();
+        for priority in 0..=3 {
+            for confidence in [0.0, 1.0] {
+                value["findings"][0]["priority"] = serde_json::json!(priority);
+                value["findings"][0]["confidence_score"] = serde_json::json!(confidence);
+                value["overall_confidence_score"] = serde_json::json!(confidence);
+                assert!(parse_review_output_event(&value.to_string()).is_some());
+            }
+        }
+        value["findings"] = serde_json::json!([]);
+        value["overall_correctness"] = serde_json::json!("patch is correct");
+        assert!(parse_review_output_event(&value.to_string()).is_some());
+    }
 
     #[tokio::test]
     async fn failed_delegate_completion_preserves_error_and_closes_review_mode() {

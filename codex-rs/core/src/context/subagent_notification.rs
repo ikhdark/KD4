@@ -30,13 +30,13 @@ impl ContextualUserFragment for SubagentNotification {
         ("<subagent_notification>", "</subagent_notification>")
     }
 
-    fn body(&self) -> String {
-        format!(
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!(
             "\n{}\n",
             serde_json::json!({
                 "agent_path": &self.agent_reference,
                 "status": &self.status,
             })
-        )
+        ))
     }
 }

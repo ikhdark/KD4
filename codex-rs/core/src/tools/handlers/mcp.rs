@@ -19,6 +19,8 @@ use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
+use codex_mcp::LEGACY_MCP_TOOL_NAME_PREFIX;
+use codex_mcp::MCP_TOOL_NAME_DELIMITER;
 use codex_mcp::ToolInfo;
 use codex_protocol::mcp::CallToolResult;
 use codex_tools::ResponsesApiNamespace;
@@ -34,9 +36,6 @@ use serde_json::Map;
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
-const MCP_TOOL_NAME_DELIMITER: &str = "__";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeferredJobStatus {
@@ -78,28 +77,7 @@ impl McpDeferredJobs {
 /// JSON text with object keys sorted at every level, independent of the
 /// serializer's key-order feature, so equal arguments always share a key.
 fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Object(map) => {
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort();
-            let fields = keys
-                .into_iter()
-                .map(|key| {
-                    format!(
-                        "{}:{}",
-                        Value::String(key.clone()),
-                        canonical_json(&map[key])
-                    )
-                })
-                .collect::<Vec<_>>();
-            format!("{{{}}}", fields.join(","))
-        }
-        Value::Array(items) => {
-            let items = items.iter().map(canonical_json).collect::<Vec<_>>();
-            format!("[{}]", items.join(","))
-        }
-        scalar => scalar.to_string(),
-    }
+    codex_config::schema::canonicalize(value).to_string()
 }
 
 impl McpDeferredJobs {
@@ -369,7 +347,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
 
         ToolSearchInfo::from_spec(
             build_mcp_search_text(&self.tool_info, registered_spec),
-            registered_spec.clone(),
+            registered_spec,
             source_info,
         )
     }

@@ -48,7 +48,7 @@ pub trait ContextualUserFragment {
 
     fn markers(&self) -> (&'static str, &'static str);
 
-    fn body(&self) -> String;
+    fn body(&self) -> std::borrow::Cow<'_, str>;
 
     fn type_markers() -> (&'static str, &'static str)
     where
@@ -66,7 +66,7 @@ pub trait ContextualUserFragment {
         let (start_marker, end_marker) = self.markers();
         let body = self.body();
         if start_marker.is_empty() && end_marker.is_empty() {
-            return body;
+            return body.into_owned();
         }
 
         format!("{start_marker}{body}{end_marker}")

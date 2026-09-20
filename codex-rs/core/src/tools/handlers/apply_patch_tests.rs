@@ -29,6 +29,131 @@ fn sample_patch() -> &'static str {
 *** End Patch"#
 }
 
+#[tokio::test]
+async fn registered_large_patch_recovers_middle_changes_from_canonical_output() {
+    use crate::tools::command_output_artifact::ToolOutputSelector;
+    use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
+    use crate::tools::parallel::ToolCallRuntime;
+    use crate::tools::registry::ToolRegistry;
+    use crate::tools::router::ToolCall;
+    use crate::tools::router::ToolRouter;
+    use codex_protocol::models::ResponseInputItem;
+
+    let workspace = TempDir::new().unwrap();
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    let cwd = PathUri::from_host_native_path(workspace.path()).unwrap();
+    turn.environments.turn_environments = vec![TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        cwd.clone(),
+        None,
+    )];
+    let codex_home = turn.config.codex_home.clone();
+    let thread_id = session.thread_id.to_string();
+    let router = Arc::new(ToolRouter::from_parts(
+        ToolRegistry::from_tools([
+            Arc::new(ApplyPatchHandler::default()) as Arc<dyn CoreToolRuntime>
+        ]),
+        Vec::new(),
+    ));
+    let runtime = ToolCallRuntime::new(
+        Arc::new(session),
+        StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router),
+        Arc::new(Mutex::new(TurnDiffTracker::new())),
+    );
+    let names = (0..1024)
+        .map(|i| format!("file_{i:03}_with_a_long_name_for_output_recovery.txt"))
+        .collect::<Vec<_>>();
+    let mut patch = String::from("*** Begin Patch\n");
+    for name in &names {
+        patch.push_str(&format!("*** Add File: {name}\n+content\n"));
+    }
+    patch.push_str("*** End Patch");
+    let response = runtime
+        .handle_tool_call(
+            ToolCall {
+                tool_name: ToolName::plain("apply_patch"),
+                call_id: "large-patch".into(),
+                payload: ToolPayload::Custom { input: patch },
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let ResponseInputItem::CustomToolCallOutput { output, .. } = response else {
+        panic!("custom output")
+    };
+    assert_eq!(output.success, Some(true));
+    let text = output.body.to_text().unwrap();
+    assert!(
+        !text.contains("Exit code:"),
+        "patch results must not use shell framing"
+    );
+    let projection: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let artifact_id = projection["artifact_id"]
+        .as_str()
+        .expect("large patch recovery artifact");
+    let (recovered, _) = read_tool_output_selectors_with_reuse(
+        &codex_home,
+        &thread_id,
+        artifact_id,
+        vec![
+            ToolOutputSelector::JsonPointer {
+                pointer: "/changes/128".into(),
+            },
+            ToolOutputSelector::JsonPointer {
+                pointer: "/success".into(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(recovered.complete);
+    assert_eq!(
+        recovered.results[0].value,
+        Some(json!({
+            "path": cwd.join(&names[128]).unwrap().to_path_buf(), "kind": "add", "move_path": null,
+        }))
+    );
+    assert_eq!(recovered.results[1].value, Some(json!(true)));
+    for name in names {
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(name)).unwrap(),
+            "content\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_patch_returns_structured_failure_without_claiming_changes() {
+    for patch in [
+        "not a patch",
+        "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch",
+    ] {
+        let payload = ToolPayload::Custom {
+            input: patch.into(),
+        };
+        let call = invocation_for_payload(payload.clone()).await;
+        let output = ApplyPatchHandler::default().handle(call).await.unwrap();
+        assert!(!output.success_for_logging());
+        let result = output.code_mode_result(&payload);
+        assert_eq!(result["success"], false);
+        assert_eq!(result["changes"], json!([]));
+        assert_eq!(result["changes_exact"], true);
+        assert!(
+            result["text"]
+                .as_str()
+                .unwrap()
+                .contains("verification failed")
+        );
+        assert_eq!(
+            output.post_tool_use_response("call", &payload),
+            Some(result)
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registered_remote_apply_patch_preserves_requested_sandbox() {
     use base64::Engine as _;
@@ -48,11 +173,12 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
 
-    for (sandbox_enabled, deny_write, cancel_after_prefix) in [
-        (true, false, false),
-        (true, true, false),
-        (false, false, false),
-        (true, true, true),
+    for (sandbox_enabled, deny_write, partial, cancel_after_prefix) in [
+        (true, false, false, false),
+        (true, true, false, false),
+        (false, false, false, false),
+        (true, true, true, true),
+        (true, true, true, false),
     ] {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
@@ -63,7 +189,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         std::fs::write(&blocked_file, b"blocked original\n").unwrap();
         let cancellation = tokio_util::sync::CancellationToken::new();
         let server_cancellation = cancellation.clone();
-        let sandbox_level = if cancel_after_prefix {
+        let sandbox_level = if deny_write {
             WindowsSandboxLevel::RestrictedToken
         } else {
             WindowsSandboxLevel::Disabled
@@ -144,6 +270,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                     "fs/getMetadata" => json!({
                         "isDirectory": false, "isFile": true, "isSymlink": false,
                         "size": std::fs::metadata(backing_file).unwrap().len(),
+                        "createdAtMs": 0, "modifiedAtMs": 0,
                     }),
                     "fs/readFile" => json!({
                         "dataBase64": STANDARD.encode(std::fs::read(backing_file).unwrap()),
@@ -159,7 +286,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                             })
                         );
                         writes.push(params.clone());
-                        if deny_write && (!cancel_after_prefix || blocked) {
+                        if deny_write && (!partial || blocked) {
                             // Cancel while the runtime owns a committed prefix and
                             // an uncertain denied write. It must finish bookkeeping
                             // and return recovery information through normal dispatch.
@@ -190,7 +317,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             }
             writes
         });
-        let (session, mut turn, events) =
+        let (mut session, mut turn, events) =
             crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
                 codex_login::CodexAuth::from_api_key("Test API Key"),
                 Vec::new(),
@@ -208,6 +335,22 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                 },
             )
             .await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-core",
+                "test",
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .unwrap();
+        let session_mut = Arc::get_mut(&mut session).expect("unique test session");
+        session_mut.services.session_telemetry = session_mut
+            .services
+            .session_telemetry
+            .clone()
+            .with_metrics_without_metadata_tags(metrics.clone());
         let turn_mut = Arc::get_mut(&mut turn).unwrap();
         // Disabled exercises portable sandbox intent without a host sandbox.
         // RestrictedToken makes the cancelled denial enter sandbox error handling.
@@ -240,7 +383,9 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             step,
             Arc::new(Mutex::new(TurnDiffTracker::new())),
         );
-        let patch = if cancel_after_prefix {
+        let patch = if partial && !cancel_after_prefix {
+            "*** Begin Patch\n*** Update File: remote.txt\n@@\n-original\n+replacement\n*** Add File: blocked.txt\n+blocked replacement\n*** End Patch"
+        } else if partial {
             "*** Begin Patch\n*** Add File: remote.txt\n+replacement\n*** Add File: blocked.txt\n+blocked replacement\n*** End Patch"
         } else {
             "*** Begin Patch\n*** Add File: remote.txt\n+replacement\n*** End Patch"
@@ -280,12 +425,12 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             .unwrap();
         assert_eq!(
             writes.len(),
-            if cancel_after_prefix { 2 } else { 1 },
+            if partial { 2 } else { 1 },
             "each hunk has one remote write attempt, no unapproved retry"
         );
-        assert!(
-            approvals >= 1,
-            "registered patch must enter approval orchestration"
+        assert_eq!(
+            approvals, 1,
+            "a failed write must not request approval to replay the patch"
         );
         assert_eq!(writes[0]["path"], json!(target_uri));
         assert_eq!(
@@ -311,13 +456,98 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             panic!("registered patch must return a custom tool output");
         };
         let text = output.body.to_text().unwrap();
-        if cancel_after_prefix {
-            assert!(text.contains("aborted by user"), "{text}");
+        let metric_snapshot = metrics.snapshot().unwrap();
+        let attempt_metric = metric_snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == "codex.apply_patch.attempt")
+            .expect("registered patch emits an attempt counter");
+        let opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(
+            opentelemetry_sdk::metrics::data::MetricData::Sum(sum),
+        ) = attempt_metric.data()
+        else {
+            panic!("attempt counter");
+        };
+        let points = sum.data_points().collect::<Vec<_>>();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value(), 1);
+        let labels = points[0]
+            .attributes()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.as_str().to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            labels["outcome"],
+            if deny_write { "failed" } else { "success" }
+        );
+        assert_eq!(
+            labels["failure_kind"],
+            if deny_write { "io" } else { "none" }
+        );
+        assert_eq!(
+            labels["mutation"],
+            if deny_write { "uncertain" } else { "exact" }
+        );
+        for name in [
+            "codex.apply_patch.files_requested",
+            "codex.apply_patch.chunks_requested",
+        ] {
+            let metric = metric_snapshot
+                .scope_metrics()
+                .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+                .find(|metric| metric.name() == name)
+                .expect("registered patch emits size histogram");
+            let opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
+                opentelemetry_sdk::metrics::data::MetricData::Histogram(histogram),
+            ) = metric.data()
+            else {
+                panic!("size histogram");
+            };
+            let points = histogram.data_points().collect::<Vec<_>>();
+            assert_eq!(points.len(), 1);
+            assert_eq!(points[0].count(), 1);
+            assert_eq!(points[0].sum(), if partial { 2.0 } else { 1.0 });
+            assert!(
+                points[0]
+                    .attributes()
+                    .any(|attribute| attribute.key.as_str() == "outcome"
+                        && attribute.value.as_str()
+                            == if cancel_after_prefix {
+                                "cancelled"
+                            } else if deny_write {
+                                "failed"
+                            } else {
+                                "success"
+                            })
+            );
+        }
+        if partial {
+            if cancel_after_prefix {
+                assert!(text.contains("aborted by user"), "{text}");
+            } else {
+                assert!(text.contains("Automatic patch retry withheld"), "{text}");
+                assert!(!text.contains("PatchContextMismatch"), "{text}");
+            }
             assert!(!text.contains("cancelled before mutation"), "{text}");
-            assert!(text.contains("Exit code: 1"), "{text}");
             assert_eq!(
-                text.matches(&format!("A {}", target_uri.to_path_buf().display()))
-                    .count(),
+                output.success,
+                if cancel_after_prefix {
+                    None
+                } else {
+                    Some(false)
+                }
+            );
+            assert_eq!(
+                text.matches(&format!(
+                    "{} {}",
+                    if cancel_after_prefix { "A" } else { "M" },
+                    target_uri.to_path_buf().display()
+                ))
+                .count(),
                 1,
                 "{text}"
             );
@@ -334,9 +564,14 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             assert_eq!(std::fs::read(&blocked_file).unwrap(), b"blocked original\n");
         } else if deny_write {
             assert!(!text.contains("Success. Updated"), "{text}");
-            assert!(
-                text.contains("Exit code: 1") && text.contains("Failed to write file"),
-                "{text}"
+            assert!(text.contains("Failed to write file"), "{text}");
+            assert_eq!(
+                output.success,
+                if cancel_after_prefix {
+                    None
+                } else {
+                    Some(false)
+                }
             );
             assert_eq!(
                 std::fs::read(&remote_file).unwrap(),
@@ -729,7 +964,10 @@ async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
             tool_name: HookToolName::apply_patch(),
             tool_use_id: "call-apply-patch".to_string(),
             tool_input: json!({ "command": patch }),
-            tool_response: json!("Success. Updated files."),
+            tool_response: json!({
+                "text": "Success. Updated files.", "success": true,
+                "changes": [], "changes_exact": true, "environment_id": null,
+            }),
         })
     );
 }
@@ -987,7 +1225,7 @@ async fn input_state_determined_environment_mismatch_blocks_exact_retry_without_
     assert_eq!(
         message,
         format!(
-            "apply_patch verification failed: patch environment id `{patch_environment_id}` does not match selected shell environment `{selected_environment_id}`"
+            "apply_patch verification failed: patch environment id `{patch_environment_id}` does not match selected shell environment `{selected_environment_id}`; use the intended environment id from <environment_context> for both"
         )
     );
     assert!(

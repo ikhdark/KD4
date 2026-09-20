@@ -87,8 +87,8 @@ use codex_rollout::read_session_meta_line;
 use codex_state::StateRuntime;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::fs::FileTimes;
@@ -115,7 +115,7 @@ use super::analytics::wait_for_matching_analytics_event;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
-const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
+const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, autonomous within the requested scope. Protect user work; explain results plainly.";
 
 fn normalized_existing_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(AbsolutePathBuf::from_absolute_path(path.as_ref().canonicalize()?)?.into_path_buf())
@@ -4265,7 +4265,7 @@ async fn start_materialized_thread_and_restart(
 
 #[tokio::test]
 async fn thread_resume_accepts_personality_override() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let first_body = responses::sse(vec![

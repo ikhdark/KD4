@@ -1,3 +1,6 @@
+use crate::context::CollaborationModeInstructions;
+use crate::context::UserInstructions;
+use crate::context::world_state::AgentsMdState;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -33,11 +36,10 @@ const STABLE_CONTEXT_HASH_DOMAIN: &[u8] = b"codex.stable-context.component.v1";
 const STABLE_CONTEXT_MANIFEST_HASH_DOMAIN: &[u8] = b"codex.stable-context.manifest.v1";
 const SKILLS_USAGE_OPEN_TAG: &str = "<skills_usage_instructions>";
 const SKILL_OPEN_TAG: &str = "<skill>";
-const REPOSITORY_OPEN_TAG: &str = "# AGENTS.md instructions";
-const REPOSITORY_CLOSE_TAG: &str = "</INSTRUCTIONS>";
-const REPOSITORY_REMOVAL_NOTICE: &str =
-    "The previously provided AGENTS.md instructions no longer apply.";
-const COLLABORATION_RESET_NOTICE: &str = "No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.";
+const REPOSITORY_OPEN_TAG: &str = UserInstructions::OPEN_MARKER;
+const REPOSITORY_CLOSE_TAG: &str = UserInstructions::CLOSE_MARKER;
+const REPOSITORY_REMOVAL_NOTICE: &str = AgentsMdState::REMOVAL_NOTICE;
+const COLLABORATION_RESET_NOTICE: &str = CollaborationModeInstructions::RESET_INSTRUCTIONS;
 const ROOT_COORDINATOR_PREFIX: &str =
     "You are `/root`, the primary agent in a team of agents collaborating";
 const ROOT_ORCHESTRATION_OPEN_TAG: &str = "<root_orchestration_instructions>";
@@ -575,13 +577,13 @@ impl Occurrence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct StableItemSignatureEntry {
+struct StableItemSignatureEntry<'a> {
     slot: StableContextSlot,
-    role: String,
-    payload: String,
+    role: &'a str,
+    payload: &'a str,
 }
 
-fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSignatureEntry>> {
+fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSignatureEntry<'_>>> {
     let ResponseItem::Message { role, content, .. } = item else {
         return None;
     };
@@ -596,17 +598,17 @@ fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSignatureE
         };
         let classification = classify_stable_text(role, text)?;
         let (payload, consumed) = match classification.payload {
-            StablePayload::Inline | StablePayload::Removed => (text.clone(), 1),
+            StablePayload::Inline | StablePayload::Removed => (text.as_str(), 1),
             StablePayload::FollowingText => {
                 let Some(ContentItem::InputText { text }) = content.get(content_index + 1) else {
                     return None;
                 };
-                (text.clone(), 2)
+                (text.as_str(), 2)
             }
         };
         signature.push(StableItemSignatureEntry {
             slot: classification.slot,
-            role: role.clone(),
+            role,
             payload,
         });
         content_index += consumed;
@@ -629,24 +631,29 @@ pub(crate) fn filter_unchanged_stable_context_items(
         }
     }
 
-    let mut retained = Vec::with_capacity(candidates.len());
-    for item in candidates {
-        let Some(signature) = stable_item_signature(&item) else {
-            retained.push(item);
-            continue;
-        };
-        let unchanged = signature
-            .iter()
-            .all(|entry| !entry.slot.is_volatile() && latest.get(&entry.slot) == Some(entry));
-        if unchanged {
-            continue;
-        }
-        for entry in signature {
-            latest.insert(entry.slot, entry);
-        }
-        retained.push(item);
-    }
-    retained
+    let retained = candidates
+        .iter()
+        .map(|item| {
+            let Some(signature) = stable_item_signature(item) else {
+                return true;
+            };
+            let unchanged = signature
+                .iter()
+                .all(|entry| !entry.slot.is_volatile() && latest.get(&entry.slot) == Some(entry));
+            if unchanged {
+                return false;
+            }
+            for entry in signature {
+                latest.insert(entry.slot, entry);
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .into_iter()
+        .zip(retained)
+        .filter_map(|(item, keep)| keep.then_some(item))
+        .collect()
 }
 
 pub(crate) fn project_stable_context(

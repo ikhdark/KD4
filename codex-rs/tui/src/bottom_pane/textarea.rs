@@ -1941,6 +1941,10 @@ impl TextArea {
         base_style: Style,
         highlights: &[(Range<usize>, Style)],
     ) {
+        let mut element_index = range.clone().next().map_or(0, |index| {
+            self.elements
+                .partition_point(|element| element.range.end <= lines[index].start)
+        });
         for (row, idx) in range.enumerate() {
             let r = &lines[idx];
             let y = area.y + row as u16;
@@ -1956,7 +1960,15 @@ impl TextArea {
             );
 
             // Overlay styled segments for elements that intersect this line.
-            for elem in &self.elements {
+            while element_index < self.elements.len()
+                && self.elements[element_index].range.end <= line_range.start
+            {
+                element_index += 1;
+            }
+            for elem in self.elements[element_index..]
+                .iter()
+                .take_while(|element| element.range.start < line_range.end)
+            {
                 // Compute overlap with displayed slice.
                 let overlap_start = elem.range.start.max(line_range.start);
                 let overlap_end = elem.range.end.min(line_range.end);
@@ -2010,24 +2022,20 @@ impl TextArea {
         range: std::ops::Range<usize>,
         mask_char: char,
     ) {
+        // Reuse one row of masks, including for multibyte single-cell characters.
+        let mask = if unicode_width::UnicodeWidthChar::width(mask_char) == Some(1) {
+            mask_char
+        } else {
+            '*'
+        };
+        let masked: String = std::iter::repeat_n(mask, usize::from(area.width)).collect();
         for (row, idx) in range.enumerate() {
             let r = &lines[idx];
             let y = area.y + row as u16;
             let line_range = r.start..r.end - 1;
-            // Keep masking on the same display-cell geometry as wrapping and cursor placement.
-            let mask = if unicode_width::UnicodeWidthChar::width(mask_char) == Some(1) {
-                mask_char
-            } else {
-                '*'
-            };
-            let masked = mask.to_string().repeat(self.text[line_range].width());
-            buf.set_stringn(
-                area.x,
-                y,
-                &masked,
-                usize::from(area.width),
-                Style::default(),
-            );
+            let width = self.text[line_range].width().min(usize::from(area.width));
+            let masked = &masked[..width * mask.len_utf8()];
+            buf.set_stringn(area.x, y, masked, usize::from(area.width), Style::default());
         }
     }
 }
@@ -3797,12 +3805,19 @@ mod tests {
         let mut t = ta_with("界e\u{301}x");
         t.set_cursor("界e\u{301}".len());
         let area = Rect::new(0, 0, 8, 1);
-        for mask in ['*', '界', '\u{301}'] {
+        for mask in ['*', '界', '\u{301}', '•'] {
             let mut state = TextAreaState::default();
             let mut buf = Buffer::empty(area);
             t.render_ref_masked(area, &mut buf, &mut state, mask);
             let row: String = (0..8).map(|x| buf[(x, 0)].symbol()).collect();
-            assert_eq!(row, "****    ");
+            assert_eq!(
+                row,
+                if mask == '•' {
+                    "••••    "
+                } else {
+                    "****    "
+                }
+            );
             assert_eq!(t.cursor_pos_with_state(area, state), Some((3, 0)));
         }
     }

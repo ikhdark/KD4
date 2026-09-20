@@ -101,8 +101,12 @@ pub enum ToolCallSource {
     CodeMode {
         /// Runtime cell that issued the nested tool request.
         cell_id: String,
+        /// Model-visible `functions.exec` call that owns the runtime cell.
+        parent_call_id: Option<String>,
         /// Code-mode's per-cell tool invocation id.
         runtime_tool_call_id: String,
+        /// Runtime wrapper deadline on this process's monotonic clock.
+        nested_deadline: Option<std::time::Instant>,
     },
 }
 
@@ -155,10 +159,7 @@ impl ToolCall {
             ToolCallSource::Direct => {
                 max_response_bytes.min((self.truncation_policy * 1.2).byte_budget())
             }
-            ToolCallSource::CodeMode {
-                cell_id: _,
-                runtime_tool_call_id: _,
-            } => max_response_bytes,
+            ToolCallSource::CodeMode { .. } => max_response_bytes,
         }
     }
 

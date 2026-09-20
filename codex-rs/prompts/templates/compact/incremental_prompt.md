@@ -18,6 +18,10 @@ Record newly edited files and partial changes, changed ownership or handoffs,
 pending consumer updates, regeneration and validation obligations, and newly
 ruled-out causes with observed evidence. Keep supplied provenance labels and
 freshness attached to the claims they support.
+Update the observed diff summary when edits change; preserve unfinished hunks
+and pre-existing user edits. Retain exact artifact_id values and read_tool_output
+selectors or continuations for output still needed, with expiry, truncation,
+and stale-workspace qualifications. Do not invent a diff that was not inspected.
 In `## Current state`, preserve changed repository facts needed to continue:
 owner and symbol paths, focused build/test commands, caller/consumer relationships,
 and their snapshot or freshness qualifications. Retire superseded locations.

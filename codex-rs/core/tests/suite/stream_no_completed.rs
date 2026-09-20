@@ -24,8 +24,8 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
@@ -40,7 +40,7 @@ fn sse_incomplete() -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retries_on_early_close() {
-    skip_if_no_network!();
+    require_network!();
 
     let incomplete_sse = sse_incomplete();
     let completed_sse = responses::sse_completed("resp_ok");
@@ -146,7 +146,7 @@ async fn retries_on_early_close() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_close_completes_partial_assistant_before_terminal_error() {
-    skip_if_no_network!();
+    require_network!();
 
     let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
         gate: None,
@@ -282,7 +282,7 @@ async fn early_close_completes_partial_assistant_before_terminal_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_completes_partial_assistant_and_plan_before_turn_aborted() {
-    skip_if_no_network!();
+    require_network!();
 
     let (release_stream, hold_stream) = oneshot::channel();
     let (server, _) = start_streaming_sse_server(vec![vec![
@@ -485,7 +485,7 @@ async fn interrupt_completes_partial_assistant_and_plan_before_turn_aborted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_mode_empty_final_item_preserves_streamed_prose() {
-    skip_if_no_network!();
+    require_network!();
 
     let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
         gate: None,
@@ -603,7 +603,7 @@ async fn plan_mode_empty_final_item_preserves_streamed_prose() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reasoning_closure_preserves_partial_text_and_final_authority() {
-    skip_if_no_network!();
+    require_network!();
 
     for sequential_cutoff in [false, true] {
         for normal_done in [false, true] {

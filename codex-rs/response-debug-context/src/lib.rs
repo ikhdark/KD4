@@ -1,12 +1,12 @@
 use base64::Engine;
 use codex_api::ApiError;
 use codex_api::TransportError;
+use codex_api::X_ERROR_JSON_HEADER;
+use codex_api::X_OPENAI_AUTHORIZATION_ERROR_HEADER;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
-const AUTH_ERROR_HEADER: &str = "x-openai-authorization-error";
-const X_ERROR_JSON_HEADER: &str = "x-error-json";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResponseDebugContext {
@@ -37,7 +37,7 @@ pub fn extract_response_debug_context(transport: &TransportError) -> ResponseDeb
     context.request_id =
         extract_header(REQUEST_ID_HEADER).or_else(|| extract_header(OAI_REQUEST_ID_HEADER));
     context.cf_ray = extract_header(CF_RAY_HEADER);
-    context.auth_error = extract_header(AUTH_ERROR_HEADER);
+    context.auth_error = extract_header(X_OPENAI_AUTHORIZATION_ERROR_HEADER);
     context.auth_error_code = extract_header(X_ERROR_JSON_HEADER).and_then(|encoded| {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)

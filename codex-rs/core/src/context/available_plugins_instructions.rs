@@ -25,8 +25,10 @@ impl ContextualUserFragment for AvailablePluginsInstructions {
         )
     }
 
-    fn body(&self) -> String {
-        "\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; use the contributed capability, not the bundle. Prefer a named plugin's relevant capability, loading or discovering it through its existing route when needed. If unavailable, explain the limitation; use a fallback only if it preserves the requested source and scope.\n".to_string()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(
+            "\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; use the contributed capability, not the bundle. Prefer a named plugin's relevant capability, loading or discovering it through its existing route when needed. If unavailable, explain the limitation; use a fallback only if it preserves the requested source and scope.\n",
+        )
     }
 }
 
@@ -46,9 +48,10 @@ impl ContextualUserFragment for PluginsInstructionsUnavailable {
         )
     }
 
-    fn body(&self) -> String {
-        "\n## Plugins\nPlugins are currently unavailable. Previously provided plugin guidance no longer applies.\n"
-            .to_string()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(
+            "\n## Plugins\nPlugins are currently unavailable. Previously provided plugin guidance no longer applies.\n",
+        )
     }
 }
 

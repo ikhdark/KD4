@@ -131,6 +131,60 @@ model = "gpt-5.4-mini"
 }
 
 #[tokio::test]
+async fn thread_start_surfaces_configured_plugin_load_failure() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"
+[features]
+plugins = true
+[plugins."missing@test"]
+enabled = true
+"#,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response: ThreadStartResponse = to_response(response)?;
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification("plugin load warning", |notification| {
+            notification.method == "warning"
+                && notification
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("message"))
+                    .and_then(Value::as_str)
+                    == Some("Failed to load plugin `missing@test`: plugin is not installed")
+        }),
+    )
+    .await??;
+    let notification: ServerNotification = notification.try_into()?;
+    let ServerNotification::Warning(warning) = notification else {
+        anyhow::bail!("expected warning")
+    };
+    assert_eq!(
+        warning.thread_id.as_deref(),
+        Some(response.thread.id.as_str())
+    );
+    assert_eq!(
+        warning.message,
+        "Failed to load plugin `missing@test`: plugin is not installed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_warns_for_exec_policy_parse_failure_after_initialize() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut mcp = TestAppServer::builder()

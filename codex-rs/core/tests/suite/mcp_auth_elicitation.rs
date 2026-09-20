@@ -14,6 +14,7 @@ use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::SEARCH_CALENDAR_CREATE_TOOL;
 use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
 use core_test_support::apps_test_server::search_capable_apps_builder;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
@@ -21,7 +22,6 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -72,7 +72,7 @@ impl Respond for AuthFailureResponder {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_apps_auth_failure_requests_elicitation_by_default() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let apps_server = AppsTestServer::mount_searchable(&server).await?;

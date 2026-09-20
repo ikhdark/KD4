@@ -136,7 +136,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
 
     assert_eq!(
         properties.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["explanation", "plan"]
+        vec!["explanation", "plan", "set"]
     );
     assert_eq!(
         item_properties
@@ -153,10 +153,18 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
             serde_json::json!("completed"),
         ]
     );
-    assert_eq!(
-        tool.pointer("/parameters/required"),
-        Some(&serde_json::json!(["plan"]))
-    );
+    let validator = jsonschema::validator_for(&tool["parameters"]).unwrap();
+    assert!(validator.is_valid(&serde_json::json!({"plan": []})));
+    assert!(validator.is_valid(&serde_json::json!({"set": [{"index": 0, "status": "completed"}]})));
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({"plan": [], "set": [{"index": 0, "status": "completed"}]}),
+        serde_json::json!({"set": []}),
+        serde_json::json!({"set": [{"index": -1, "status": "completed"}]}),
+        serde_json::json!({"set": [{"index": 0, "status": "done"}]}),
+    ] {
+        assert!(!validator.is_valid(&invalid), "accepted {invalid}");
+    }
     assert_eq!(
         tool.pointer("/parameters/properties/plan/items/required"),
         Some(&serde_json::json!(["step", "status"]))
@@ -309,6 +317,140 @@ async fn update_plan_rejects_unknown_arguments_at_runtime() {
 }
 
 #[tokio::test]
+async fn status_deltas_preserve_steps_and_reject_invalid_updates_atomically() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    let initial = UpdatePlanArgs {
+        explanation: Some("retained explanation".to_string()),
+        plan: vec![
+            PlanItemArg {
+                step: "Implement".to_string(),
+                status: StepStatus::InProgress,
+            },
+            PlanItemArg {
+                step: "Verify".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+    };
+    for (arguments, has_plan, cancelled, error) in [
+        (
+            serde_json::json!({"set": [{"index": 0, "status": "completed"}]}),
+            false,
+            false,
+            "create a plan",
+        ),
+        (serde_json::json!({"set": []}), true, false, "at least one"),
+        (
+            serde_json::json!({"set": [{"index": 0, "status": "completed"}, {"index": 2, "status": "pending"}]}),
+            true,
+            false,
+            "out of range",
+        ),
+        (
+            serde_json::json!({"set": [{"index": 0, "status": "completed"}, {"index": 0, "status": "pending"}]}),
+            true,
+            false,
+            "duplicate",
+        ),
+        (
+            serde_json::json!({"set": [{"index": 1, "status": "in_progress"}]}),
+            true,
+            false,
+            "at most one",
+        ),
+        (
+            serde_json::json!({"plan": [], "set": []}),
+            true,
+            false,
+            "exactly one",
+        ),
+        (serde_json::json!({}), true, false, "exactly one"),
+        (
+            serde_json::json!({"set": [{"index": 0, "status": "completed", "unexpected": true}]}),
+            true,
+            false,
+            "unknown field",
+        ),
+        (
+            serde_json::json!({"set": [{"index": 0, "status": "completed"}]}),
+            true,
+            true,
+            "cancelled",
+        ),
+    ] {
+        let expected = has_plan.then(|| initial.clone());
+        session.services.plan_store.restore(expected.clone()).await;
+        let token = CancellationToken::new();
+        if cancelled {
+            token.cancel();
+        }
+        let result = PlanHandler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: token,
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "invalid-delta".to_string(),
+                tool_name: ToolName::plain("update_plan"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: arguments.to_string(),
+                },
+            })
+            .await;
+        assert!(
+            matches!(result, Err(FunctionCallError::RespondToModel(ref message)) if message.contains(error)),
+            "expected {error}"
+        );
+        assert_eq!(
+            session.services.plan_store.current_for_test().await,
+            expected
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event.msg, EventMsg::PlanUpdate(_)));
+        }
+    }
+    session
+        .services
+        .plan_store
+        .restore(Some(initial.clone()))
+        .await;
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({"set": [{"index": 0, "status": "completed"}, {"index": 1, "status": "in_progress"}]}).to_string(),
+    };
+    let mut expected = initial;
+    expected.plan[0].status = StepStatus::Completed;
+    expected.plan[1].status = StepStatus::InProgress;
+    for effect in ["status_only", "no_op"] {
+        let result = PlanHandler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("delta-{effect}"),
+                tool_name: ToolName::plain("update_plan"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap();
+        let output = result.code_mode_result(&payload);
+        assert_plan_output_schema(&output);
+        assert_eq!(output["effect"], effect);
+        assert_eq!(output["current_plan"], serde_json::json!(expected));
+        assert!(result.sampling_request_signal().unwrap()["plan"].is_null());
+        assert_eq!(
+            session.services.plan_store.current_for_test().await,
+            Some(expected.clone())
+        );
+        assert!(
+            matches!(events.recv().await.unwrap().msg, EventMsg::PlanUpdate(ref plan) if plan == &expected)
+        );
+    }
+}
+
+#[tokio::test]
 async fn cancellation_before_plan_commit_does_not_emit_plan_update() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     let cancellation_token = CancellationToken::new();
@@ -371,7 +513,24 @@ async fn registered_plan_output_restores_after_history_serialization() {
         step_context,
         Arc::new(Mutex::new(TurnDiffTracker::new())),
     );
-    let arguments = plan_arguments("Restore the accepted checklist", StepStatus::Completed);
+    runtime
+        .clone()
+        .handle_tool_call(
+            ToolCall {
+                tool_name: ToolName::plain("update_plan"),
+                call_id: "plan-before-delta".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: plan_arguments(
+                        "Restore the accepted checklist",
+                        StepStatus::InProgress,
+                    ),
+                },
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("initial plan");
+    let arguments = serde_json::json!({"set": [{"index": 0, "status": "completed"}]}).to_string();
     let response = runtime
         .handle_tool_call(
             ToolCall {
@@ -391,6 +550,7 @@ async fn registered_plan_output_restores_after_history_serialization() {
     let value = serde_json::from_str(&output.body.to_text().expect("plan output text"))
         .expect("plan output JSON");
     assert_plan_output_schema(&value);
+    assert_eq!(value["effect"], "status_only");
     let history = vec![
         codex_protocol::models::ResponseItem::FunctionCall {
             id: None,

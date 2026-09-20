@@ -24,7 +24,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "resume_agent resume reopen closed agent subagent thread id target",
-            registered_spec.clone(),
+            registered_spec,
         )
     }
 

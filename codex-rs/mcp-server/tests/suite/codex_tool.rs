@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use wiremock::MockServer;
 
-use core_test_support::skip_if_no_network;
+use core_test_support::require_network;
 use mcp_test_support::McpProcess;
 use mcp_test_support::create_final_assistant_message_sse_response;
 use mcp_test_support::create_mock_responses_server;
@@ -33,7 +33,7 @@ async fn unsupported_interactive_tools_abort_instead_of_hanging() -> anyhow::Res
     use core_test_support::responses::ev_function_call;
     use core_test_support::responses::ev_response_created;
     use core_test_support::responses::sse;
-    skip_if_no_network!();
+    require_network!();
     for (tool, arguments) in [
         (
             "request_user_input",
@@ -75,6 +75,12 @@ async fn unsupported_interactive_tools_abort_instead_of_hanging() -> anyhow::Res
                 .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?
                 .len(),
             1
+        );
+        process.close_stdin();
+        assert!(
+            timeout(std::time::Duration::from_secs(5), process.wait_for_exit())
+                .await??
+                .success()
         );
     }
     Ok(())
@@ -187,7 +193,7 @@ async fn initialize_negotiates_unknown_protocol_versions() -> anyhow::Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approval_without_form_support_denies_command_and_completes() -> anyhow::Result<()> {
-    skip_if_no_network!();
+    require_network!();
     let workdir = TempDir::new()?;
     let server = create_mock_responses_server(vec![create_shell_command_sse_response(
         vec![
@@ -300,14 +306,14 @@ async fn test_shell_command_approval_triggers_elicitation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shell_command_approval_client_error_denies_command_and_completes() -> anyhow::Result<()> {
-    skip_if_no_network!();
+    require_network!();
     shell_command_approval_triggers_elicitation(false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shell_command_approval_cancellation_completes_and_ignores_late_approval()
 -> anyhow::Result<()> {
-    skip_if_no_network!();
+    require_network!();
     let workdir = TempDir::new()?;
     let created_file = workdir.path().join("must_not_be_created.txt");
     let command = vec![
@@ -585,7 +591,7 @@ fn create_expected_elicitation_request_params(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_codex_tool_passes_base_instructions() {
-    skip_if_no_network!();
+    require_network!();
 
     // Apparently `#[tokio::test]` must return `()`, so we create a helper
     // function that returns `Result` so we can use `?` in favor of `unwrap`.

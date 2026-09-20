@@ -8,7 +8,6 @@ use codex_tools::ConversationHistory;
 use codex_tools::ConversationHistoryRequirement;
 use codex_tools::ExtensionTurnItem;
 use codex_tools::ToolCall as ExtensionToolCall;
-use codex_tools::ToolCallSource as ExtensionToolCallSource;
 use codex_tools::ToolEnvironment;
 use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
@@ -57,7 +56,7 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
         let search_info = self.0.search_info()?;
         ToolSearchInfo::from_spec(
             search_info.entry.search_text,
-            registered_spec.clone(),
+            registered_spec,
             search_info.source_info,
         )
     }
@@ -194,17 +193,7 @@ async fn to_extension_call(
             .model_info
             .truncation_policy
             .into(),
-        source: match &invocation.source {
-            crate::tools::context::ToolCallSource::Direct => ExtensionToolCallSource::Direct,
-            crate::tools::context::ToolCallSource::CodeMode {
-                cell_id,
-                runtime_tool_call_id,
-                ..
-            } => ExtensionToolCallSource::CodeMode {
-                cell_id: cell_id.clone(),
-                runtime_tool_call_id: runtime_tool_call_id.clone(),
-            },
-        },
+        source: crate::tools::lifecycle::extension_tool_call_source(invocation.source.clone()),
         conversation_history,
         turn_item_emitter: Arc::new(CoreTurnItemEmitter {
             session: Arc::downgrade(&invocation.session),
@@ -562,6 +551,7 @@ mod tests {
         let step_context = StepContext::for_test(Arc::clone(&turn));
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let forwarded_cancellation_token = cancellation_token.clone();
+        let nested_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         let invocation = ToolInvocation {
             session,
             step_context,
@@ -569,7 +559,13 @@ mod tests {
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-extension".to_string(),
             tool_name: codex_tools::ToolName::plain("extension_echo"),
-            source: ToolCallSource::Direct,
+            source: ToolCallSource::CodeMode {
+                cell_id: "cell-extension".to_string(),
+                parent_call_id: Some("exec-parent".to_string()),
+                runtime_tool_call_id: "runtime-extension".to_string(),
+                nested_deadline,
+                cancellation_cause: None,
+            },
             payload: ToolPayload::Function {
                 arguments: json!({ "message": "hello" }).to_string(),
             },
@@ -590,6 +586,15 @@ mod tests {
             codex_tools::ToolName::plain("extension_echo")
         );
         assert_eq!(captured_call.model, model);
+        assert_eq!(
+            captured_call.source,
+            codex_tools::ToolCallSource::CodeMode {
+                cell_id: "cell-extension".to_string(),
+                parent_call_id: Some("exec-parent".to_string()),
+                runtime_tool_call_id: "runtime-extension".to_string(),
+                nested_deadline,
+            }
+        );
         assert_eq!(captured_call.truncation_policy, truncation_policy);
         forwarded_cancellation_token.cancel();
         assert!(captured_call.cancellation_token.is_cancelled());

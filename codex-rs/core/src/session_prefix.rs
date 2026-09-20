@@ -59,7 +59,10 @@ pub(crate) fn format_inter_agent_completion_message(
     let payload = match status {
         AgentStatus::Completed(Some(message)) => {
             return Some(format_bounded_inter_agent_completion_message(
-                task_name, sender, message,
+                task_name,
+                sender,
+                message,
+                TYPED_COMPLETION_NEXT_ACTION,
             ));
         }
         AgentStatus::Completed(None) => String::new(),
@@ -68,7 +71,10 @@ pub(crate) fn format_inter_agent_completion_message(
             ..
         } => {
             return Some(format_bounded_inter_agent_completion_message(
-                task_name, sender, message,
+                task_name,
+                sender,
+                message,
+                TYPED_COMPLETION_NEXT_ACTION,
             ));
         }
         AgentStatus::CompletedWithSurface {
@@ -76,8 +82,12 @@ pub(crate) fn format_inter_agent_completion_message(
             ..
         } => String::new(),
         AgentStatus::Errored(error) => {
-            let error = truncate_text(error, TruncationPolicy::Tokens(ERROR_MAX_TOKENS));
-            format!("Agent errored: {error}\n\n{ERROR_NEXT_ACTION}")
+            return Some(format_bounded_inter_agent_completion_message(
+                task_name,
+                sender,
+                &format!("Agent errored: {error}"),
+                ERROR_NEXT_ACTION,
+            ));
         }
         AgentStatus::Shutdown => "Agent shut down.".to_string(),
         AgentStatus::NotFound => "Agent was not found.".to_string(),
@@ -90,6 +100,7 @@ fn format_bounded_inter_agent_completion_message(
     task_name: AgentPath,
     sender: AgentPath,
     payload: &str,
+    retrieval_guidance: &str,
 ) -> String {
     let unabridged =
         InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload.to_string())
@@ -101,7 +112,7 @@ fn format_bounded_inter_agent_completion_message(
     let mut payload_budget = ERROR_MAX_TOKENS;
     loop {
         let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
-        let payload = format!("{payload}\n\n{TYPED_COMPLETION_NEXT_ACTION}");
+        let payload = format!("{payload}\n\n{retrieval_guidance}");
         let message =
             InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload).render();
         let message_tokens = approx_token_count(&message);

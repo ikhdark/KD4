@@ -513,10 +513,12 @@ async fn audit_capsule_cancelled_publication_serializes_competing_attach_and_rec
         while_paused.is_err(),
         "recovery must wait for capsule publication"
     );
+    // Recovery may own the database lock, so keep polling it alongside the competitor.
+    let (competing_result, recovered) = tokio::join!(competitor, recovery);
     assert!(
-        matches!(competitor.await.expect("competitor joins"), Err(StoreError::TaskCapsuleAlreadyAttached(id)) if id == assignment.assignment_id)
+        matches!(competing_result.expect("competitor joins"), Err(StoreError::TaskCapsuleAlreadyAttached(id)) if id == assignment.assignment_id)
     );
-    let recovered = recovery.await.expect("recovery succeeds");
+    let recovered = recovered.expect("recovery succeeds");
     let task = recovered
         .get_agent_task(assignment.assignment_id, Some(0))
         .await

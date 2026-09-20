@@ -29,7 +29,7 @@ futures = { workspace = true, default-features = false, features = ["std"] }
 http = { workspace = true }
 keyring = { workspace = true, features = ["crypto-rust", "windows-native"] }
 memchr = { workspace = true }
-oauth2 = "5"
+oauth2 = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
     "auth",
     "base64",
@@ -45,7 +45,7 @@ rmcp = { workspace = true, default-features = false, features = [
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sse-stream = "0.2.1"
+sse-stream = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
 tiny_http = { workspace = true }

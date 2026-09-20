@@ -17,11 +17,25 @@ pub fn line_to_static(line: &Line<'_>) -> Line<'static> {
     }
 }
 
-/// Append owned copies of borrowed lines to `out`.
-pub fn push_owned_lines<'a>(src: &[Line<'a>], out: &mut Vec<Line<'static>>) {
-    for l in src {
-        out.push(line_to_static(l));
+/// Consume a line, retaining owned span strings and copying only borrowed content.
+pub fn line_into_static(line: Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span {
+                style: span.style,
+                content: std::borrow::Cow::Owned(span.content.into_owned()),
+            })
+            .collect(),
     }
+}
+
+/// Append lines by moving their owned content into `out`.
+pub fn push_owned_lines(src: Vec<Line<'_>>, out: &mut Vec<Line<'static>>) {
+    out.extend(src.into_iter().map(line_into_static));
 }
 
 /// Consider a line blank if it has no spans or only spans whose contents are
@@ -63,6 +77,19 @@ pub fn prefix_lines(
 mod tests {
     use super::*;
     use ratatui::style::Stylize;
+
+    #[test]
+    fn consuming_line_retains_owned_strings_and_style() {
+        let content = String::from("owned body");
+        let allocation = content.as_ptr();
+        let line = Line::from(vec![Span::from(content).bold(), Span::from(" borrowed")])
+            .cyan()
+            .right_aligned();
+        let expected = line.clone();
+        let owned = line_into_static(line);
+        assert_eq!(owned, expected);
+        assert_eq!(owned.spans[0].content.as_ptr(), allocation);
+    }
 
     #[test]
     fn prefixes_preserve_line_metadata() {

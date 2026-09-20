@@ -11,39 +11,49 @@ use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_RESULTS;
 pub(crate) const READ_TOOL_OUTPUT_TOOL_NAME: &str = "read_tool_output";
 pub(crate) const READ_TOOL_OUTPUT_MAX_BYTES: usize = 16_384;
 pub(crate) const READ_TOOL_OUTPUT_MAX_SELECTORS: usize = 64;
-pub(crate) const READ_TOOL_OUTPUT_MAX_LEGACY_RANGES: usize = 16;
+pub(crate) const READ_TOOL_OUTPUT_MAX_LEGACY_RANGES: usize = READ_TOOL_OUTPUT_MAX_SELECTORS;
 
 pub(crate) fn tool_output_selector_schema() -> JsonSchema {
-    JsonSchema::one_of(
-        vec![
-            selector_variant(
-                "bytes",
-                BTreeMap::from([
-                    (
-                        "start".to_string(),
-                        bounded_integer(0, u64::MAX, "Zero-based start byte.".to_string()),
-                    ),
-                    (
-                        "end".to_string(),
-                        bounded_integer(0, u64::MAX, "Exclusive end byte.".to_string()),
-                    ),
-                ]),
-                vec!["start", "end"],
-            ),
-            selector_variant(
-                "lines",
-                BTreeMap::from([
-                    (
-                        "start".to_string(),
-                        bounded_integer(1, u64::MAX, "One-based first line.".to_string()),
-                    ),
-                    (
-                        "end".to_string(),
-                        bounded_integer(1, u64::MAX, "Inclusive last line.".to_string()),
-                    ),
-                ]),
-                vec!["start", "end"],
-            ),
+    selector_schema(true)
+}
+
+pub(crate) fn file_selector_schema() -> JsonSchema {
+    selector_schema(false)
+}
+
+fn selector_schema(include_structured: bool) -> JsonSchema {
+    let mut variants = vec![
+        selector_variant(
+            "bytes",
+            BTreeMap::from([
+                (
+                    "start".to_string(),
+                    bounded_integer(0, u64::MAX, "Zero-based start byte.".to_string()),
+                ),
+                (
+                    "end".to_string(),
+                    bounded_integer(0, u64::MAX, "Exclusive end byte.".to_string()),
+                ),
+            ]),
+            vec!["start", "end"],
+        ),
+        selector_variant(
+            "lines",
+            BTreeMap::from([
+                (
+                    "start".to_string(),
+                    bounded_integer(1, u64::MAX, "One-based first line.".to_string()),
+                ),
+                (
+                    "end".to_string(),
+                    bounded_integer(1, u64::MAX, "Inclusive last line.".to_string()),
+                ),
+            ]),
+            vec!["start", "end"],
+        ),
+    ];
+    if include_structured {
+        variants.extend([
             selector_variant(
                 "section",
                 BTreeMap::from([(
@@ -64,6 +74,9 @@ pub(crate) fn tool_output_selector_schema() -> JsonSchema {
                 )]),
                 vec!["pointer"],
             ),
+        ]);
+    }
+    variants.push(
             selector_variant(
                 "search",
                 BTreeMap::from([
@@ -103,8 +116,10 @@ pub(crate) fn tool_output_selector_schema() -> JsonSchema {
                     ),
                 ]),
                 vec!["query"],
-            ),
-        ],
+            )
+    );
+    JsonSchema::one_of(
+        variants,
         Some("Ordered search or exact-select operations over the original artifact.".to_string()),
     )
 }

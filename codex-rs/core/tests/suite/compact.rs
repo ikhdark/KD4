@@ -32,10 +32,10 @@ use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
 use core_test_support::hooks::trust_discovered_hooks;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
@@ -491,7 +491,7 @@ fn format_labeled_requests_snapshot(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summarize_context_three_requests_and_instructions() {
-    skip_if_no_network!();
+    require_network!();
 
     // Set up a mock server that we can inspect after the run.
     let server = start_mock_server().await;
@@ -711,7 +711,7 @@ async fn summarize_context_three_requests_and_instructions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_pre_compact_block_decision_does_not_block_compaction() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let first_turn = sse(vec![
@@ -784,7 +784,7 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let first_turn = sse(vec![
@@ -867,7 +867,7 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_openai_provider_uses_custom_prompt_locally() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let first_turn = sse(vec![
@@ -959,7 +959,7 @@ async fn manual_compact_openai_provider_uses_custom_prompt_locally() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_emits_api_and_local_token_usage_events() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1017,7 +1017,7 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_emits_context_compaction_items() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1094,7 +1094,7 @@ async fn manual_compact_emits_context_compaction_items() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1649,7 +1649,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
 async fn auto_compact_openai_provider_with_custom_prompt_uses_local_route() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1853,7 +1853,7 @@ async fn auto_compact_openai_provider_with_custom_prompt_uses_local_route() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
 async fn auto_compact_emits_context_compaction_items() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1939,7 +1939,7 @@ async fn auto_compact_emits_context_compaction_items() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
 async fn auto_compact_starts_after_turn_started() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -2041,7 +2041,7 @@ async fn auto_compact_starts_after_turn_started() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let previous_model = "gpt-5.4";
@@ -2143,7 +2143,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_runs_when_comp_hash_changes() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let previous_model = "gpt-5.4";
@@ -2230,7 +2230,7 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_rename() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let retired_model = "gpt-5.5";
@@ -2365,7 +2365,7 @@ async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_renam
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let retired_model = "gpt-5.6";
@@ -2460,7 +2460,7 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let previous_model = "custom/gpt-5.5";
@@ -2544,7 +2544,7 @@ async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let model_without_hash = "gpt-5.4";
@@ -2654,7 +2654,7 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn body_after_prefix_model_switch_budget_compacts_with_previous_model() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let previous_model = "gpt-5.4";
@@ -2752,7 +2752,7 @@ async fn body_after_prefix_model_switch_budget_compacts_with_previous_model() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let previous_model = "gpt-5.4";
@@ -2873,7 +2873,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let previous_model = "gpt-5.4";
@@ -3004,7 +3004,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let previous_model = "gpt-5.4";
@@ -3133,7 +3133,7 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_persists_rollout_entries() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -3273,7 +3273,7 @@ async fn auto_compact_persists_rollout_entries() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_context_window_error_does_not_retry_with_trimmed_history() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -3332,7 +3332,7 @@ async fn manual_compact_context_window_error_does_not_retry_with_trimmed_history
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_context_window_error_does_not_batch_delete_history() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -3401,7 +3401,7 @@ async fn manual_compact_context_window_error_does_not_batch_delete_history() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_non_retryable_failure_is_not_retried() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -3468,7 +3468,7 @@ async fn manual_compact_corrects_invalid_summary_before_committing_output() {
 }
 
 async fn assert_manual_compact_corrective_retry(retry_succeeds: bool) {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let rejected_summary = "## Goal\npreserve the active task\n\n## Next action\nretry compaction";
@@ -3609,7 +3609,7 @@ async fn assert_manual_compact_corrective_retry(retry_succeeds: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_retryable_failure_retries_then_succeeds() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -3682,7 +3682,7 @@ async fn manual_compact_retryable_failure_retries_then_succeeds() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_twice_preserves_latest_user_messages() {
-    skip_if_no_network!();
+    require_network!();
 
     let first_user_message = "first manual turn";
     let second_user_message = "second manual turn";
@@ -3908,7 +3908,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_events() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4037,7 +4037,7 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_request_shape_mid_turn_continuation_compaction() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4144,7 +4144,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_clamps_config_limit_to_context_window() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4204,7 +4204,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4275,7 +4275,7 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4387,7 +4387,7 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4453,7 +4453,7 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // TODO(ccunningham): Update once pre-turn compaction includes incoming user input.
 async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_message() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4575,7 +4575,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
 // TODO(ccunningham): Update once pre-turn compaction context-overflow handling includes incoming
 // user input and emits richer oversized-input messaging.
 async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let previous_model = "gpt-5.4";
@@ -4677,7 +4677,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4768,7 +4768,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_request_shape_manual_compact_without_previous_user_messages() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -4991,7 +4991,7 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     // Set up an ordinary turn, a remote-v2 compact response, and a post-compaction turn.
     let server = responses::start_mock_server().await;

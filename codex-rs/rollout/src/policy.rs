@@ -89,9 +89,10 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
     match ev {
         EventMsg::ItemCompleted(event) => {
             // Paginated rollouts store TurnItems.
-            // Legacy rollouts keep only items with no raw ResponseItem or legacy equivalent.
+            // Legacy assistant events lack IDs; keep their canonical item for output recovery.
+            // Other legacy items are retained only when they lack a raw/legacy equivalent.
             matches!(history_mode, ThreadHistoryMode::Paginated)
-                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_))
+                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_))
         }
         EventMsg::TokenCount(_)
         | EventMsg::PlanUpdate(_)

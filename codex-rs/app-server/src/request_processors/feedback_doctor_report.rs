@@ -213,13 +213,16 @@ fn check_values(checks: &Value) -> Box<dyn Iterator<Item = &Value> + '_> {
 }
 
 fn truncate_tag_value(value: &str) -> String {
-    if value.chars().count() <= MAX_DOCTOR_TAG_VALUE_LEN {
+    if value.len() <= MAX_DOCTOR_TAG_VALUE_LEN
+        || value.chars().nth(MAX_DOCTOR_TAG_VALUE_LEN).is_none()
+    {
         return value.to_string();
     }
-    let prefix = value
-        .chars()
-        .take(MAX_DOCTOR_TAG_VALUE_LEN.saturating_sub(3))
-        .collect::<String>();
+    let end = value
+        .char_indices()
+        .nth(MAX_DOCTOR_TAG_VALUE_LEN.saturating_sub(3))
+        .map_or(value.len(), |(index, _)| index);
+    let prefix = &value[..end];
     format!("{prefix}...")
 }
 

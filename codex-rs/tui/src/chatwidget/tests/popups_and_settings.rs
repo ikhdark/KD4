@@ -3094,6 +3094,14 @@ async fn astra_reasoning_picker_uses_its_supported_efforts() {
 #[tokio::test]
 async fn personality_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let mut models = crate::test_support::TEST_MODEL_PRESETS.clone();
+    models
+        .iter_mut()
+        .find(|model| model.model == "gpt-5.4")
+        .expect("fixture model")
+        .supports_personality = true;
+    chat.model_catalog = std::sync::Arc::new(crate::model_catalog::ModelCatalog::new(models));
+    chat.set_feature_enabled(Feature::Personality, true);
     chat.thread_id = Some(ThreadId::new());
     chat.open_personality_popup();
 

@@ -140,6 +140,26 @@ kd4-sync-audit *args:
 kd4-perf-snapshot *args:
     @{{ python }} "{{ justfile_directory() }}/scripts/kd4_perf_snapshot.py" {args}
 
+# Compare rejected Desktop methods with this checkout's generated request schema.
+[working-directory("..")]
+[script("python")]
+desktop-protocol-drift *args:
+    import runpy
+    import sys
+    script = r"{{ justfile_directory() }}/scripts/desktop_protocol_drift.py"
+    sys.argv = [script, *sys.argv[1:]]
+    runpy.run_path(script, run_name="__main__")
+
+# Inspect committed blobs; pass --base, --head, and an explicit --allowlist.
+[working-directory("..")]
+[script("python")]
+check-blob-size *args:
+    import runpy
+    import sys
+    script = r"{{ justfile_directory() }}/scripts/check_blob_size.py"
+    sys.argv = [script, *sys.argv[1:]]
+    runpy.run_path(script, run_name="__main__")
+
 [no-cd]
 audit-scripts *args:
     @{{ python }} "{{ justfile_directory() }}/scripts/root_maintenance.py" audit-scripts {args}
@@ -254,8 +274,8 @@ rust-perf-env *args:
 # Run nextest with --no-fail-fast so all tests are run.
 #
 # Run `cargo install --locked cargo-nextest` if you don't have it installed.
-# Workspace crate features are banned, so there should be no need to add
-# `--all-features`.
+# The process-ID test feature is selected by core_test_support. Other workspace
+# crate features remain disallowed; there is no need to add `--all-features`.
 [windows]
 test *args:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast @forwarded_args

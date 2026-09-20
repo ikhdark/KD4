@@ -166,6 +166,82 @@ fn validation_commands_do_not_clear_generic_mutation_revision() {
     assert_eq!(tracker.current_mutation_revision(), 2);
 }
 
+#[tokio::test]
+async fn formatter_checks_preserve_diff_but_writes_and_compound_scripts_invalidate() {
+    let root = tempdir().unwrap();
+    let delta = apply_verified_patch(
+        root.path(),
+        "*** Begin Patch\n*** Add File: a.rs\n+fn main() {}\n*** End Patch",
+    )
+    .await;
+    for command in [
+        vec!["C:/bin/rustfmt.exe", "--check", "a.rs"],
+        vec!["/usr/bin/cargo", "fmt", "--check"],
+        vec!["prettier", "--list-different", "a.js"],
+        vec!["prettier", "-l", "a.js"],
+        vec!["pwsh", "-Command", "prettier --check a.js"],
+        vec!["bash", "-lc", "rustfmt --check a.rs"],
+    ] {
+        let command = command.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let mut tracker = tracker_with_root(root.path());
+        tracker.track_delta("", &delta);
+        let before = tracker.get_unified_diff().expect("patch diff");
+        assert_eq!(
+            command_mutation(&command, Some(root.path())),
+            CommandMutation::ReadOnly,
+            "{command:?}"
+        );
+        tracker.record_exec_command_end(&command, 0, false);
+        assert_eq!(tracker.get_unified_diff(), Some(before), "{command:?}");
+    }
+    for command in [
+        vec!["C:/bin/rustfmt.exe", "a.rs"],
+        vec!["prettier", "--write", "--check", "a.js"],
+        vec![
+            "pwsh",
+            "-Command",
+            "prettier --check a.js; Set-Content a.js changed",
+        ],
+        vec!["pwsh", "-Command", "cargo test\nSet-Content a.rs changed"],
+        vec!["bash", "-lc", "rustfmt --check a.rs && touch marker"],
+    ] {
+        let command = command.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let mut tracker = tracker_with_root(root.path());
+        tracker.track_delta("", &delta);
+        tracker.record_exec_command_end(&command, 0, false);
+        assert_eq!(tracker.get_unified_diff(), None, "{command:?}");
+    }
+}
+
+#[test]
+fn repository_validation_recipes_remain_observed_instead_of_assumed_read_only() {
+    for command in [
+        vec!["just", "core-test-fast", "core_lib", "selected_case"],
+        vec!["just", "core-gate", "config-schema-protocol"],
+        vec!["cargo", "clippy"],
+        vec![
+            "pwsh",
+            "-Command",
+            "just core-test-fast core_lib selected_case",
+        ],
+    ] {
+        let command = command.into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            command_mutation(&command, None),
+            CommandMutation::Uncertain,
+            "{command:?}"
+        );
+        assert_eq!(
+            resolve_uncertain_command_observation(Some(false)),
+            CommandMutation::ReadOnly
+        );
+        assert_eq!(
+            resolve_uncertain_command_observation(Some(true)),
+            CommandMutation::UnattributedWorkspaceChange
+        );
+    }
+}
+
 #[test]
 fn failed_or_timed_out_mutators_still_create_unknown_mutation_state() {
     for timed_out in [false, true] {

@@ -14,6 +14,44 @@ use super::EnvironmentSkillMetadata;
 use super::load_environment_skills_from_root;
 
 #[tokio::test]
+async fn reports_optional_metadata_failures_without_dropping_environment_skill() {
+    let root = tempdir().unwrap();
+    let skill_dir = root.path().join("demo");
+    fs::create_dir_all(skill_dir.join("agents")).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: valid skill\n---\n",
+    )
+    .unwrap();
+    let metadata_path = skill_dir.join("agents/openai.yaml");
+    let root_uri = PathUri::from_host_native_path(root.path()).unwrap();
+    for (content, expected) in [
+        ("dependencies: [", "invalid metadata"),
+        (
+            "dependencies:\n  tools:\n    - type: mcp\n",
+            "dependencies.tools.value: value is missing",
+        ),
+    ] {
+        fs::write(&metadata_path, content).unwrap();
+        let outcome = load_environment_skills_from_root(LOCAL_FS.as_ref(), &root_uri, None).await;
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(outcome.skills[0].name, "demo");
+        assert_eq!(outcome.skills[0].dependencies, None);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains(expected),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.warnings[0].contains("openai.yaml"));
+    }
+    fs::remove_file(metadata_path).unwrap();
+    let outcome = load_environment_skills_from_root(LOCAL_FS.as_ref(), &root_uri, None).await;
+    assert_eq!(outcome.skills.len(), 1);
+    assert_eq!(outcome.warnings, Vec::<String>::new());
+}
+
+#[tokio::test]
 async fn loads_plugin_namespace_dependencies_and_policy() {
     let root = tempdir().expect("tempdir");
     let skill_dir = root.path().join("skills/deploy");

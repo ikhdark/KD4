@@ -2272,18 +2272,16 @@ impl JsonlWriter {
         }
         let mut bytes = Vec::new();
         for captured in rollout_items {
-            bytes.extend_from_slice(&Self::serialize_rollout_item(
-                &captured.item,
-                captured.captured_at,
-            )?);
+            Self::serialize_rollout_item(&mut bytes, &captured.item, captured.captured_at)?;
         }
         self.write_transaction(&bytes).await
     }
 
     fn serialize_rollout_item(
+        bytes: &mut Vec<u8>,
         rollout_item: &RolloutItem,
         captured_at: OffsetDateTime,
-    ) -> std::io::Result<Vec<u8>> {
+    ) -> std::io::Result<()> {
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         );
@@ -2296,9 +2294,9 @@ impl JsonlWriter {
             format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
             item: rollout_item,
         };
-        let mut json = serde_json::to_string(&line)?;
-        json.push('\n');
-        Ok(json.into_bytes())
+        serde_json::to_writer(&mut *bytes, &line)?;
+        bytes.push(b'\n');
+        Ok(())
     }
 
     async fn write_transaction(&mut self, bytes: &[u8]) -> std::io::Result<()> {

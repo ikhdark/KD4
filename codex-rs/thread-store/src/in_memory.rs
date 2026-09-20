@@ -426,6 +426,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_rejects_foreign_history_without_replacing_thread_data() {
+        let store = InMemoryThreadStore::default();
+        let thread_id = ThreadId::new();
+        let other_id = ThreadId::new();
+        for id in [thread_id, other_id] {
+            store
+                .create_thread(create_thread_params(id, ThreadHistoryMode::Legacy))
+                .await
+                .expect("create thread");
+        }
+        let load = |thread_id| LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        };
+        let original = store
+            .load_history(load(thread_id))
+            .await
+            .expect("original history");
+        let foreign = store
+            .load_history(load(other_id))
+            .await
+            .expect("foreign history");
+        let error = ThreadStore::resume_thread(
+            &store,
+            ResumeThreadParams {
+                thread_id,
+                rollout_path: Some(PathBuf::from("foreign.jsonl")),
+                history: Some(Arc::new(foreign.items)),
+                include_archived: false,
+                metadata: thread_metadata(),
+            },
+        )
+        .await
+        .expect_err("foreign history must be rejected");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        let retained = store
+            .load_history(load(thread_id))
+            .await
+            .expect("retained history");
+        assert_eq!(
+            serde_json::to_value(&retained.items).expect("serialize retained history"),
+            serde_json::to_value(&original.items).expect("serialize original history")
+        );
+        let state = store.state.lock().await;
+        assert!(
+            !state
+                .rollout_paths
+                .contains_key(&PathBuf::from("foreign.jsonl"))
+        );
+        assert!(
+            state
+                .metadata_updates
+                .get(&thread_id)
+                .is_none_or(|patch| patch.rollout_path.is_none())
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_lifecycle_operations_leave_no_thread_data() {
         let store = InMemoryThreadStore::default();
         let missing = ThreadId::new();
@@ -922,6 +980,15 @@ impl InMemoryThreadStore {
             .unwrap_or_else(|| history_mode_from_state(&state, params.thread_id));
         reject_paginated_history_mode(history_mode)?;
         if let Some(history) = params.history {
+            if let Some(RolloutItem::SessionMeta(meta)) = history
+                .iter()
+                .find(|item| matches!(item, RolloutItem::SessionMeta(_)))
+                && meta.meta.id != params.thread_id
+            {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: "resume history belongs to a different thread".to_string(),
+                });
+            }
             state
                 .histories
                 .insert(params.thread_id, Arc::unwrap_or_clone(history));

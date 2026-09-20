@@ -2,7 +2,7 @@
 //!
 //! Wraps [syntect] with the [two_face] grammar and theme bundles to provide
 //! ~250-language syntax highlighting and 32 bundled color themes.  The module
-//! owns four process-global singletons:
+//! owns the following process-global state:
 //!
 //! | Singleton | Type | Purpose |
 //! |---|---|---|
@@ -10,6 +10,8 @@
 //! | `THEME` | `OnceLock<RwLock<Theme>>` | Active color theme, swappable at runtime |
 //! | `THEME_OVERRIDE` | `OnceLock<Option<String>>` | Persisted user preference (write-once) |
 //! | `CODEX_HOME` | `OnceLock<Option<PathBuf>>` | Root for custom `.tmTheme` discovery |
+//! | `HIGHLIGHT_CACHE` | `OnceLock<Mutex<HighlightCache>>` | Bounded reuse of rendered code blocks |
+//! | `THEME_GENERATION` | `AtomicU64` | Invalidates cached colors after theme changes |
 //!
 //! **Lifecycle:** call [`set_theme_override`] once at startup (after the final
 //! config is resolved) to persist the user preference and seed the `THEME`
@@ -27,10 +29,14 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Color as SyntectColor;
 use syntect::highlighting::FontStyle;
@@ -50,6 +56,8 @@ static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
 static THEME_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 static CODEX_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+static THEME_GENERATION: AtomicU64 = AtomicU64::new(0);
+static HIGHLIGHT_CACHE: OnceLock<Mutex<HighlightCache>> = OnceLock::new();
 
 // Syntect/bat encode ANSI palette semantics in alpha:
 // `a=0` => indexed ANSI palette via RGB payload, `a=1` => terminal default.
@@ -245,6 +253,7 @@ pub(crate) fn set_syntax_theme(theme: Theme) {
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = theme;
+    THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Clone the current syntax theme (e.g. to save for cancel-restore).
@@ -550,11 +559,10 @@ fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
         return Some(s);
     }
     // Try case-insensitive name match (e.g. "rust" -> "Rust").
-    let lower = patched.to_ascii_lowercase();
     if let Some(s) = ss
         .syntaxes()
         .iter()
-        .find(|s| s.name.to_ascii_lowercase() == lower)
+        .find(|s| s.name.eq_ignore_ascii_case(patched))
     {
         return Some(s);
     }
@@ -576,6 +584,88 @@ const MAX_HIGHLIGHT_LINES: usize = 10_000;
 
 /// Skip highlighting when an individual line is longer than 4 KiB.
 const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
+
+const MAX_CACHED_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CACHED_HIGHLIGHT_BLOCKS: usize = 64;
+
+struct CachedHighlight {
+    code: String,
+    lang: String,
+    lines: Vec<Line<'static>>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct HighlightCache {
+    generation: u64,
+    entries: VecDeque<CachedHighlight>,
+    bytes: usize,
+}
+
+impl HighlightCache {
+    fn render(
+        &mut self,
+        code: &str,
+        lang: &str,
+        generation: u64,
+        render: impl FnOnce() -> Vec<Line<'static>>,
+    ) -> Vec<Line<'static>> {
+        if self.generation != generation {
+            self.entries.clear();
+            self.bytes = 0;
+            self.generation = generation;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.lang == lang && entry.code == code)
+            && let Some(entry) = self.entries.remove(index)
+        {
+            // Exact keys avoid hash collisions changing displayed code or styles.
+            let lines = entry.lines.clone();
+            self.entries.push_back(entry);
+            return lines;
+        }
+
+        let lines = render();
+        if code.len() > MAX_HIGHLIGHT_BYTES {
+            return lines;
+        }
+        // Account for both text and span/line storage, including token-heavy blocks.
+        let bytes = code.len()
+            + lang.len()
+            + std::mem::size_of::<CachedHighlight>()
+            + lines.len() * std::mem::size_of::<Line<'static>>()
+            + lines
+                .iter()
+                .map(|line| {
+                    line.spans.len() * std::mem::size_of::<Span<'static>>()
+                        + line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        if bytes <= MAX_CACHED_HIGHLIGHT_BYTES {
+            while self.bytes + bytes > MAX_CACHED_HIGHLIGHT_BYTES
+                || self.entries.len() >= MAX_CACHED_HIGHLIGHT_BLOCKS
+            {
+                if let Some(entry) = self.entries.pop_front() {
+                    self.bytes -= entry.bytes;
+                }
+            }
+            self.entries.push_back(CachedHighlight {
+                code: code.to_owned(),
+                lang: lang.to_owned(),
+                lines: lines.clone(),
+                bytes,
+            });
+            self.bytes += bytes;
+        }
+        lines
+    }
+}
 
 /// Check whether an input exceeds the safe highlighting limits.
 ///
@@ -608,10 +698,9 @@ fn highlight_to_line_spans_with_theme(
     // Count actual lines (not newline bytes) to avoid an off-by-one when
     // the input does not end with a newline.
     if code.len() > MAX_HIGHLIGHT_BYTES
-        || code.lines().count() > MAX_HIGHLIGHT_LINES
-        || code
-            .lines()
-            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+        || code.lines().enumerate().any(|(index, line)| {
+            index >= MAX_HIGHLIGHT_LINES || line.len() > MAX_HIGHLIGHT_LINE_BYTES
+        })
     {
         return None;
     }
@@ -663,7 +752,23 @@ fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'stati
 /// Used by `markdown_render` for fenced code blocks and by `exec_cell` for bash
 /// command highlighting.
 pub(crate) fn highlight_code_to_lines(code: &str, lang: &str) -> Vec<Line<'static>> {
-    if let Some(line_spans) = highlight_to_line_spans(code, lang) {
+    let theme = theme_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Read the generation under the theme lock so a live preview cannot pair
+    // cached colors with a different theme. Diff highlighting keeps its existing API.
+    let generation = THEME_GENERATION.load(Ordering::Relaxed);
+    HIGHLIGHT_CACHE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .render(code, lang, generation, || {
+            highlight_code_to_lines_with_theme(code, lang, &theme)
+        })
+}
+
+fn highlight_code_to_lines_with_theme(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
+    if let Some(line_spans) = highlight_to_line_spans_with_theme(code, lang, theme) {
         line_spans.into_iter().map(Line::from).collect()
     } else {
         // Fallback: plain text, one Line per source line.
@@ -710,6 +815,70 @@ mod tests {
     use syntect::highlighting::StyleModifier;
     use syntect::highlighting::ThemeItem;
     use syntect::highlighting::ThemeSettings;
+
+    #[test]
+    fn highlight_cache_reuses_exact_blocks_and_invalidates_theme() {
+        let mut cache = HighlightCache::default();
+        let dark = resolve_theme_with_override(Some("base16-ocean-dark"), None);
+        let light = resolve_theme_with_override(Some("base16-ocean-light"), None);
+        let code = "fn main() { println!(\"hello\"); }\n";
+        let first = cache.render(code, "rust", 0, || {
+            highlight_code_to_lines_with_theme(code, "rust", &dark)
+        });
+        assert_eq!(
+            cache.render(code, "rust", 0, || panic!("cache miss")),
+            first
+        );
+        let changed = cache.render(code, "rust", 1, || {
+            highlight_code_to_lines_with_theme(code, "rust", &light)
+        });
+        assert_ne!(first, changed);
+        assert_eq!(
+            changed,
+            highlight_code_to_lines_with_theme(code, "rust", &light)
+        );
+        let plain = cache.render(code, "unknown-language", 1, || {
+            highlight_code_to_lines_with_theme(code, "unknown-language", &light)
+        });
+        assert_ne!(plain, changed);
+        assert_eq!(
+            cache.render(code, "unknown-language", 1, || panic!("fallback miss")),
+            plain
+        );
+        let grown = format!("{code}// next line\n");
+        assert_eq!(
+            cache.render(&grown, "rust", 1, || highlight_code_to_lines_with_theme(
+                &grown, "rust", &light
+            )),
+            highlight_code_to_lines_with_theme(&grown, "rust", &light),
+        );
+    }
+
+    #[test]
+    fn highlight_cache_bounds_storage_and_preserves_recent_entries() {
+        let mut cache = HighlightCache::default();
+        for index in 0..MAX_CACHED_HIGHLIGHT_BLOCKS {
+            let code = index.to_string();
+            cache.render(&code, "text", 0, || vec![Line::from(code.clone())]);
+        }
+        cache.render("0", "text", 0, || panic!("recent hit"));
+        cache.render("new", "text", 0, || vec![Line::from("new")]);
+        assert_eq!(cache.entries.len(), MAX_CACHED_HIGHLIGHT_BLOCKS);
+        assert!(cache.entries.iter().any(|entry| entry.code == "0"));
+        assert!(!cache.entries.iter().any(|entry| entry.code == "1"));
+        for index in 0..8 {
+            let code = format!("{index}{}", "x".repeat(MAX_HIGHLIGHT_BYTES - 1));
+            cache.render(&code, "text", 0, || vec![Line::from(code.clone())]);
+            assert!(cache.bytes <= MAX_CACHED_HIGHLIGHT_BYTES);
+        }
+        assert!(cache.entries.len() < 8);
+        let oversized = "x".repeat(MAX_HIGHLIGHT_BYTES + 1);
+        let lines = cache.render(&oversized, "text", 0, || {
+            vec![Line::from(oversized.clone())]
+        });
+        assert_eq!(lines, vec![Line::from(oversized.clone())]);
+        assert!(!cache.entries.iter().any(|entry| entry.code == oversized));
+    }
 
     fn write_minimal_tmtheme(path: &Path) {
         // Minimal valid .tmTheme plist (enough for syntect to parse).

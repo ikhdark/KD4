@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::CheckStatus;
 use super::DoctorCheck;
 
-const DEFAULT_TERMINAL_TITLE_ITEMS: &[&str] = &["activity", "project-name"];
+use codex_protocol::config_types::DEFAULT_TERMINAL_TITLE_ITEMS;
 const PROJECT_TITLE_MAX_CHARS: usize = 24;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

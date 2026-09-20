@@ -121,16 +121,10 @@ pub(crate) fn matcher_pattern_for_event(
     event_name: HookEventName,
     matcher: Option<&str>,
 ) -> Option<&str> {
-    match event_name {
-        HookEventName::PreToolUse
-        | HookEventName::PermissionRequest
-        | HookEventName::PostToolUse
-        | HookEventName::SessionStart
-        | HookEventName::SubagentStart
-        | HookEventName::SubagentStop
-        | HookEventName::PreCompact
-        | HookEventName::PostCompact => matcher,
-        HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => None,
+    if crate::hook_event_supports_matcher(event_name) {
+        matcher
+    } else {
+        None
     }
 }
 
@@ -139,6 +133,7 @@ pub(crate) fn matcher_pattern_for_event(
 pub(crate) struct HookMatcher {
     pattern: String,
     regex: Option<regex::Regex>,
+    match_all: bool,
 }
 
 impl HookMatcher {
@@ -151,6 +146,7 @@ impl HookMatcher {
         Ok(Self {
             pattern: pattern.to_owned(),
             regex,
+            match_all: is_match_all_matcher(pattern),
         })
     }
 
@@ -160,7 +156,7 @@ impl HookMatcher {
     }
 
     pub(crate) fn matches(&self, input: Option<&str>) -> bool {
-        if is_match_all_matcher(&self.pattern) {
+        if self.match_all {
             return true;
         }
         input.is_some_and(|input| match &self.regex {

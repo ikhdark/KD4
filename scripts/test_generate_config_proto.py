@@ -160,11 +160,17 @@ class GenerateConfigProtoTest(unittest.TestCase):
         self.assertTrue(lane_args[-1].endswith("proto"), lane_args[-1])
 
     def test_checked_binding_is_pinned_to_lf_in_worktrees(self) -> None:
-        attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
-        self.assertIn(
-            "codex-rs/config/src/thread_config/proto/"
-            "codex.thread_config.v1.rs text eol=lf",
-            attributes.splitlines(),
+        path = "codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs"
+        result = subprocess.run(
+            ["git", "check-attr", "text", "eol", "--", path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [f"{path}: text: set", f"{path}: eol: lf"],
         )
 
     def test_check_uses_default_cargo_home_and_locked_generation(self) -> None:

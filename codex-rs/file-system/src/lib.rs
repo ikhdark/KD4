@@ -581,11 +581,8 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             } else {
                 continue;
             };
-            if !reserve_walk_response_bytes(
-                &mut outcome,
-                &mut response_bytes,
-                path.to_string().len(),
-            ) {
+            if !reserve_walk_response_bytes(&mut outcome, &mut response_bytes, path.as_str().len())
+            {
                 return Ok(outcome);
             }
             outcome.entries.push(WalkEntry {
@@ -637,7 +634,7 @@ fn push_walk_error(
     path: PathUri,
     message: String,
 ) -> bool {
-    let item_bytes = path.to_string().len().saturating_add(message.len());
+    let item_bytes = path.as_str().len().saturating_add(message.len());
     if !reserve_walk_response_bytes(outcome, response_bytes, item_bytes) {
         return false;
     }

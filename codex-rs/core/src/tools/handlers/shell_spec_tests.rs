@@ -82,15 +82,6 @@ fn command_declarations_preserve_input_alternatives_and_return_contracts() {
             .description
             .split_once("exec tool declaration:")
             .unwrap();
-        eprintln!(
-            "{}: description_bytes={}, declaration_bytes={}, untyped_object_unions={}",
-            definition.name,
-            definition.description.len(),
-            declaration.len(),
-            declaration
-                .matches("string | number | boolean | null | unknown[]")
-                .count()
-        );
         let script_field = if definition.name == "exec_command" {
             "cmd"
         } else {
@@ -255,9 +246,9 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-30000 ms. Windows initial waits are floored to 2000 ms.".to_string(),
+                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
-                crate::unified_exec::MAX_YIELD_TIME_MS,
+                crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
         ),
         (
@@ -377,7 +368,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 60000 ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 300000 ms and cap at 300000 ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ),
@@ -396,7 +387,7 @@ fn write_stdin_tool_matches_expected_spec() {
         ToolSpec::Function(ResponsesApiTool {
             name: "write_stdin".to_string(),
             description:
-                "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C only with interrupt=true, and empty input to poll with polling=true. cancellation describes explicit process cancellation through this tool; false means no such operation is exposed. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
+                "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C by sending `chars: \"\\u0003\"` only when session_capabilities.interrupt=true, and empty input to poll with polling=true. `interrupt` is a returned capability, not an input parameter. cancellation describes explicit process cancellation through this tool; false means no such operation is exposed. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
                     .to_string(),
             strict: false,
             defer_loading: None,
@@ -510,7 +501,7 @@ fn shell_command_tool_matches_expected_spec() {
         (
             "timeout_ms".to_string(),
             bounded_integer(
-                "Maximum command runtime. Defaults to 10000 ms. Zero sets an immediate deadline; it does not disable the timeout.".to_string(),
+                "Maximum command runtime. Defaults to 300000 ms for recognized validation commands and 10000 ms otherwise. This is a hard deadline; use exec_command for resumable long-running work. Zero sets an immediate deadline; it does not disable the timeout.".to_string(),
                 0,
                 u64::MAX,
             ),
@@ -674,7 +665,7 @@ fn integer_arguments_expose_destination_types_and_runtime_bounds() {
     );
     assert_eq!(
         exec_yield["maximum"],
-        crate::unified_exec::MAX_YIELD_TIME_MS
+        crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS
     );
 
     let write = serde_json::to_value(create_write_stdin_tool()).expect("serialize write tool");

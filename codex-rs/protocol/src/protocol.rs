@@ -1220,6 +1220,11 @@ pub enum HookEventName {
 }
 
 impl HookEventName {
+    /// Every supported event, in declaration order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+
     /// Stable display and telemetry label for this hook event.
     pub const fn as_pascal_case_label(self) -> &'static str {
         match self {
@@ -5522,7 +5527,9 @@ pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("goal objective must not be empty".to_string());
     }
-    if value.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+    if value.len() > MAX_THREAD_GOAL_OBJECTIVE_CHARS
+        && value.chars().nth(MAX_THREAD_GOAL_OBJECTIVE_CHARS).is_some()
+    {
         return Err(format!(
             "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
         ));

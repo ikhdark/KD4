@@ -1,8 +1,59 @@
 use super::approx_token_count;
+use super::approx_token_count_exceeds;
 use super::split_string;
 use super::truncate_middle_chars;
 use super::truncate_middle_with_token_budget;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn token_estimates_preserve_unicode_and_ascii_boundaries() {
+    for (text, expected) in [
+        ("", 0),
+        ("abcd", 1),
+        ("abcde", 2),
+        ("a b c", 3),
+        ("!!!", 3),
+        ("_abcd", 2),
+        ("a\u{b}b", 2),
+        ("é雪_1", 2),
+        ("a\u{a0}b", 2),
+        ("a💥b", 3),
+        ("e\u{301}", 2),
+        ("  \t\r\n  ", 2),
+    ] {
+        assert_eq!(approx_token_count(text), expected, "{text:?}");
+        for limit in 0..=expected + 1 {
+            assert_eq!(
+                approx_token_count_exceeds(text, limit),
+                expected > limit,
+                "{text:?}, {limit}"
+            );
+        }
+        assert!(!approx_token_count_exceeds(text, usize::MAX));
+    }
+}
+
+#[test]
+fn token_estimates_match_character_reference_for_all_scalar_values() {
+    // Include ASCII/Unicode seams, word endings, whitespace and punctuation.
+    for ch in (0..=0x10ffff).filter_map(char::from_u32) {
+        let text = format!("abcd{ch}ef!");
+        let mut lexical = 0usize;
+        let mut word_bytes = 0usize;
+        for ch in text.chars() {
+            if ch.is_alphanumeric() || ch == '_' {
+                word_bytes += ch.len_utf8();
+            } else {
+                lexical += word_bytes.div_ceil(4) + usize::from(!ch.is_whitespace());
+                word_bytes = 0;
+            }
+        }
+        let expected = text.len().div_ceil(4).max(lexical + word_bytes.div_ceil(4));
+        assert_eq!(approx_token_count(&text), expected, "{ch:?}");
+        assert!(approx_token_count_exceeds(&text, expected - 1), "{ch:?}");
+        assert!(!approx_token_count_exceeds(&text, expected), "{ch:?}");
+    }
+}
 
 #[test]
 fn token_budget_includes_marker_for_small_positive_budgets() {

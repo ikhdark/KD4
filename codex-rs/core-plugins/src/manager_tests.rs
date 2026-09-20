@@ -569,6 +569,48 @@ async fn plugin_auth_projection_keeps_non_conflicting_mcp_with_chatgpt_apps_rout
 }
 
 #[tokio::test]
+async fn plugin_load_failures_reach_cached_and_hook_warnings() {
+    let codex_home = TempDir::new().unwrap();
+    write_auth_projection_plugin(codex_home.path(), "valid", false);
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        r#"
+[features]
+plugins = true
+[plugins."missing@test"]
+enabled = true
+[plugins."disabled@test"]
+enabled = false
+[plugins."valid@test"]
+enabled = true
+"#,
+    );
+    let config = load_config(codex_home.path(), codex_home.path()).await;
+    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let expected =
+        vec!["Failed to load plugin `missing@test`: plugin is not installed".to_string()];
+    for _ in 0..2 {
+        let outcome = manager.plugins_for_config(&config).await;
+        assert_eq!(outcome.load_warnings(), expected);
+        assert_eq!(
+            sorted_effective_mcp_server_names(&outcome),
+            vec!["valid".to_string()]
+        );
+        assert!(
+            outcome
+                .plugins()
+                .iter()
+                .any(|plugin| plugin.config_name == "missing@test" && !plugin.is_active())
+        );
+    }
+    let hooks = manager
+        .plugin_hooks_for_layer_stack(&config.config_layer_stack, &config)
+        .await;
+    assert_eq!(hooks.hook_load_warnings, expected);
+    assert!(hooks.hook_sources.is_empty());
+}
+
+#[tokio::test]
 async fn duplicate_mcp_servers_resolve_after_auth_dependent_app_routing() {
     let codex_home = TempDir::new().unwrap();
     write_auth_projection_plugin_with_server(codex_home.path(), "alpha", "shared", Some("shared"));
@@ -6444,7 +6486,8 @@ async fn load_plugins_ignores_project_config_files() {
         Some(Product::Codex),
         /*remote_global_catalog_active*/ false,
     )
-    .await;
+    .await
+    .expect("configured plugins resolve");
 
     assert_eq!(plugins, Vec::new());
 }

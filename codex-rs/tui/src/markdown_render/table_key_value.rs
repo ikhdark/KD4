@@ -4,7 +4,7 @@ use super::TABLE_BODY_SEPARATOR_CHAR;
 use super::TableCell;
 use super::TableColumnKind;
 use super::TableColumnMetrics;
-use crate::render::line_utils::line_to_static;
+use crate::render::line_utils::line_into_static;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::wrapping::RtOptions;
@@ -218,7 +218,7 @@ fn render_stacked_field(
         &label,
         word_wrap_line(&label.line, RtOptions::new(label_width))
             .into_iter()
-            .map(|line| line_to_static(&line))
+            .map(line_into_static)
             .collect(),
     );
     for label_line in wrapped_labels {
@@ -271,7 +271,7 @@ fn wrap_cell(cell: &TableCell, width: usize) -> Vec<HyperlinkLine> {
     for source_line in &cell.lines {
         let rendered = word_wrap_line(&source_line.line, RtOptions::new(width.max(1)))
             .into_iter()
-            .map(|line| line_to_static(&line))
+            .map(line_into_static)
             .collect::<Vec<_>>();
         if rendered.is_empty() {
             wrapped.push(HyperlinkLine::new(Line::default()));

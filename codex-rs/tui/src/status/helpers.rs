@@ -189,8 +189,10 @@ fn title_case(s: &str) -> String {
     let Some(first) = chars.next() else {
         return String::new();
     };
-    let rest = chars.as_str().to_ascii_lowercase();
-    first.to_uppercase().collect::<String>() + &rest
+    let mut title = String::with_capacity(s.len());
+    title.extend(first.to_uppercase());
+    title.extend(chars.map(|ch| ch.to_ascii_lowercase()));
+    title
 }
 
 #[cfg(test)]

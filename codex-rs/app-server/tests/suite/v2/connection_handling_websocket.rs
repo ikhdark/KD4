@@ -668,13 +668,48 @@ async fn websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_tim
     Ok(())
 }
 
-pub(super) async fn spawn_websocket_server(codex_home: &Path) -> Result<(Child, SocketAddr)> {
+pub(super) struct WebSocketServerProcess {
+    child: Child,
+    #[cfg(windows)]
+    process_root: codex_utils_pty::ManagedRootProcess,
+}
+
+impl std::ops::Deref for WebSocketServerProcess {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for WebSocketServerProcess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl WebSocketServerProcess {
+    pub(super) async fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            // Killing only the parent can strand suspended children holding inherited pipes.
+            self.process_root.terminate()?;
+            self.child.wait().await.map(|_| ())
+        }
+        #[cfg(not(windows))]
+        self.child.kill().await
+    }
+}
+
+pub(super) async fn spawn_websocket_server(
+    codex_home: &Path,
+) -> Result<(WebSocketServerProcess, SocketAddr)> {
     spawn_websocket_server_with_args(codex_home, "ws://127.0.0.1:0", &[]).await
 }
 
 async fn spawn_websocket_server_without_originator_override(
     codex_home: &Path,
-) -> Result<(Child, SocketAddr)> {
+) -> Result<(WebSocketServerProcess, SocketAddr)> {
     spawn_websocket_server_with_options(
         codex_home,
         "ws://127.0.0.1:0",
@@ -687,7 +722,7 @@ async fn spawn_websocket_server_without_originator_override(
 async fn spawn_websocket_server_with_originator_override(
     codex_home: &Path,
     originator_override: &str,
-) -> Result<(Child, SocketAddr)> {
+) -> Result<(WebSocketServerProcess, SocketAddr)> {
     spawn_websocket_server_with_options(
         codex_home,
         "ws://127.0.0.1:0",
@@ -701,7 +736,7 @@ pub(super) async fn spawn_websocket_server_with_args(
     codex_home: &Path,
     listen_url: &str,
     extra_args: &[String],
-) -> Result<(Child, SocketAddr)> {
+) -> Result<(WebSocketServerProcess, SocketAddr)> {
     spawn_websocket_server_with_options(
         codex_home,
         listen_url,
@@ -722,7 +757,7 @@ async fn spawn_websocket_server_with_options(
     listen_url: &str,
     extra_args: &[String],
     originator_override: OriginatorOverride<'_>,
-) -> Result<(Child, SocketAddr)> {
+) -> Result<(WebSocketServerProcess, SocketAddr)> {
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
     let mut cmd = Command::new(program);
@@ -744,10 +779,24 @@ async fn spawn_websocket_server_with_options(
             cmd.env("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", value);
         }
     }
-    let mut process = cmd
+    #[cfg(windows)]
+    let process_root = {
+        let root = codex_utils_pty::ManagedRootProcess::reserve()?;
+        root.require_descendant_containment()?;
+        cmd.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+        root
+    };
+    let child = cmd
         .kill_on_drop(true)
         .spawn()
         .context("failed to spawn websocket app-server process")?;
+    #[cfg(windows)]
+    process_root.attach_and_resume(child.id().expect("app-server process id"))?;
+    let mut process = WebSocketServerProcess {
+        child,
+        #[cfg(windows)]
+        process_root,
+    };
 
     let stderr = process
         .stderr

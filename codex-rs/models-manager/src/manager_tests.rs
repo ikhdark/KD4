@@ -1103,6 +1103,7 @@ async fn get_model_info_tracks_fallback_usage() {
         .get_model_info("model-that-does-not-exist", &config)
         .await;
     assert!(unknown.used_fallback_model_metadata);
+    assert!(unknown.include_skills_usage_instructions);
     assert_eq!(unknown.slug, "model-that-does-not-exist");
 }
 
@@ -2283,6 +2284,20 @@ async fn static_manager_reads_latest_auth_mode() {
 }
 
 #[test]
+fn bundled_gpt_5_2_uses_the_catalog_token_output_budget() {
+    let response = crate::bundled_models_response().expect("bundled catalog");
+    let model = response
+        .models
+        .iter()
+        .find(|model| model.slug == "gpt-5.2")
+        .expect("GPT-5.2 catalog entry");
+    assert_eq!(
+        model.truncation_policy,
+        codex_protocol::openai_models::TruncationPolicyConfig::tokens(10_000)
+    );
+}
+
+#[test]
 fn bundled_models_json_roundtrips() {
     let response = crate::bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
@@ -2303,28 +2318,77 @@ fn bundled_models_json_roundtrips() {
 }
 
 #[tokio::test]
-async fn astra_remote_refresh_keeps_fork_prompt_and_server_capabilities() {
+async fn local_policy_remote_refresh_keeps_fork_prompt_and_server_capabilities() {
     let codex_home = tempdir().expect("temp dir");
-    let mut astra = remote_model("gpt-6-astra", "Remote Astra", 0);
-    astra.context_window = Some(400_000);
-    astra.max_context_window = Some(872_000);
+    let remote_models = crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS
+        .iter()
+        .map(|slug| {
+            let mut model = remote_model(slug, "Remote model", 0);
+            model.context_window = Some(400_000);
+            model.max_context_window = Some(872_000);
+            model.model_messages = Some(codex_protocol::openai_models::ModelMessages {
+                instructions_template: Some(
+                    "remote verbosity policy {{ personality }}".to_string(),
+                ),
+                instructions_variables: None,
+                approvals: Some(codex_protocol::openai_models::ApprovalMessages {
+                    on_request: Some("remote approval policy".to_string()),
+                }),
+            });
+            model
+        })
+        .collect();
     let manager = openai_manager_for_tests(
         codex_home.path().to_path_buf(),
-        TestModelsEndpoint::new(vec![vec![astra]]),
+        TestModelsEndpoint::new(vec![remote_models]),
     );
     manager
         .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
         .await
         .expect("refresh models");
-    let info = manager
-        .get_model_info("gpt-6-astra", &ModelsManagerConfig::default())
-        .await;
-    assert_eq!(info.context_window, Some(400_000));
-    assert_eq!(
-        info.base_instructions,
-        codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
-    );
-    assert!(!info.used_fallback_model_metadata);
+    for slug in crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS {
+        let info = manager
+            .get_model_info(
+                slug,
+                &ModelsManagerConfig {
+                    personality_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(info.context_window, Some(400_000));
+        assert_eq!(
+            info.base_instructions,
+            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+        );
+        assert!(!info.used_fallback_model_metadata);
+        assert_eq!(
+            info.get_model_instructions(None),
+            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+        );
+        assert_eq!(
+            info.model_messages
+                .as_ref()
+                .unwrap()
+                .approvals
+                .as_ref()
+                .unwrap()
+                .on_request
+                .as_deref(),
+            Some("remote approval policy")
+        );
+        let custom = manager
+            .get_model_info(
+                slug,
+                &ModelsManagerConfig {
+                    base_instructions: Some("user override".to_string()),
+                    personality_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(custom.get_model_instructions(None), "user override");
+    }
 }
 
 #[tokio::test]

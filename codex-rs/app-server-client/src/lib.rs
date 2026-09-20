@@ -82,10 +82,35 @@ pub use crate::thread_lifecycle::thread_start_params_from_config;
 /// while legacy startup/config paths are migrated to RPCs.
 pub mod legacy_core {
     pub mod config {
-        pub use codex_core::config::*;
+        // Keep the remaining client dependencies explicit so new core APIs do
+        // not automatically become part of this migration bridge.
+        pub use codex_core::config::Config;
+        pub use codex_core::config::ConfigBuilder;
+        pub use codex_core::config::ConfigOverrides;
+        pub use codex_core::config::ConfigTomlLoadResult;
+        pub use codex_core::config::NetworkProxySpec;
+        pub use codex_core::config::PermissionProfileCatalogEntry;
+        pub use codex_core::config::PermissionProfileSnapshot;
+        pub use codex_core::config::Permissions;
+        pub use codex_core::config::TerminalResizeReflowConfig;
+        pub use codex_core::config::TerminalResizeReflowMaxRows;
+        pub use codex_core::config::find_codex_home_async;
+        pub use codex_core::config::load_config_toml_with_layer_stack;
+        pub use codex_core::config::resolve_bootstrap_auth_keyring_backend_kind;
+        pub use codex_core::config::resolve_bootstrap_auth_route_config;
+        pub use codex_core::config::resolve_oss_provider;
+        pub use codex_core::config::resolve_profile_v2_config_path;
 
         pub mod edit {
-            pub use codex_core::config::edit::*;
+            pub use codex_core::config::edit::ConfigEdit;
+            pub use codex_core::config::edit::ConfigEditsBuilder;
+            pub use codex_core::config::edit::keymap_binding_clear_edit;
+            pub use codex_core::config::edit::keymap_bindings_edit;
+            pub use codex_core::config::edit::status_line_items_edit;
+            pub use codex_core::config::edit::status_line_use_colors_edit;
+            pub use codex_core::config::edit::syntax_theme_edit;
+            pub use codex_core::config::edit::terminal_title_items_edit;
+            pub use codex_core::config::edit::tui_pet_edit;
         }
     }
 }

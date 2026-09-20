@@ -8,6 +8,7 @@
 //! - a remote HTTP client that forwards requests to the remote runtime
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io;
 use std::sync::Arc;
 
@@ -219,9 +220,10 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 &body[..body.len().min(NON_JSON_RESPONSE_BODY_PREVIEW_BYTES)],
             ));
             if truncated {
-                preview.push_str(&format!(
+                let _ = write!(
+                    preview,
                     "... (HTTP error body exceeds {limit}-byte collection limit)"
-                ));
+                );
             }
             return Err(unexpected_http_status_error(response.status, preview));
         }
@@ -414,10 +416,11 @@ fn body_preview(body: impl Into<String>) -> String {
             boundary = boundary.saturating_sub(1);
         }
         body_preview.truncate(boundary);
-        body_preview.push_str(&format!(
+        let _ = write!(
+            body_preview,
             "... (truncated {} bytes)",
             body_len.saturating_sub(boundary)
-        ));
+        );
     }
     body_preview
 }

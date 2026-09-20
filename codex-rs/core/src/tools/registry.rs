@@ -49,6 +49,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_rollout::state_integration;
 use codex_tools::CanonicalByteRange;
@@ -668,10 +669,11 @@ fn without_preserved_recovery_text(selected: &str, preserved: &[Value]) -> Strin
         for serialized in [
             serde_json::to_string(value),
             serde_json::to_string_pretty(value),
-        ] {
-            if let Ok(serialized) = serialized {
-                selected = selected.replace(&serialized, "");
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            selected = selected.replace(&serialized, "");
         }
         let Some(results) = value["results"].as_array() else {
             continue;
@@ -921,27 +923,8 @@ impl RegisteredTool {
         runtime: Arc<dyn CoreToolRuntime>,
         authorization_class: TypedToolClass,
     ) -> Self {
-        assert_ne!(
-            authorization_class,
-            TypedToolClass::Unknown,
-            "registered tools must declare an authorization class"
-        );
         let exposure = runtime.exposure();
-        let spec = runtime.spec();
-        let tool_name = spec.sole_callable_tool_name().unwrap_or_else(|| {
-            panic!("registered runtime specs must declare exactly one callable tool")
-        });
-        Self {
-            tool_name,
-            runtime,
-            exposure,
-            authorization_class,
-            external_mutation_intent:
-                crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
-            spec,
-            canonical_spec_sha256: OnceLock::new(),
-            code_mode_argument_preflight: Arc::new(CodeModeArgumentPreflight::default()),
-        }
+        Self::with_exposure(runtime, exposure, authorization_class)
     }
 
     pub(crate) fn with_exposure(
@@ -1092,6 +1075,10 @@ impl ToolRegistry {
         names
     }
 
+    pub(crate) fn registered_tool(&self, name: &ToolName) -> Option<&RegisteredTool> {
+        self.tools.get(name)
+    }
+
     pub(crate) fn tool_exposure(&self, name: &ToolName) -> Option<ToolExposure> {
         self.tools.get(name).map(RegisteredTool::exposure)
     }
@@ -1102,6 +1089,7 @@ impl ToolRegistry {
             .map(RegisteredTool::authorization_class)
     }
 
+    #[cfg(test)]
     pub(crate) fn tool_external_mutation_intent(
         &self,
         name: &ToolName,
@@ -1217,7 +1205,7 @@ impl ToolRegistry {
         let (tool, tool_spec, code_mode_argument_preflight) = match self.tools.get(&tool_name) {
             Some(registered) => (
                 Arc::clone(registered.runtime()),
-                registered.spec().clone(),
+                registered.spec(),
                 Arc::clone(&registered.code_mode_argument_preflight),
             ),
             None => {
@@ -1252,7 +1240,18 @@ impl ToolRegistry {
             }
         }
         if !tool.matches_kind(&invocation.payload) {
-            let message = format!("tool {tool_name} invoked with incompatible payload");
+            let expected = match tool_spec {
+                ToolSpec::Freeform(_) => {
+                    "raw text in a custom/freeform tool call, not JSON function arguments"
+                }
+                ToolSpec::Function(_) | ToolSpec::ToolSearch { .. } => {
+                    "JSON arguments in a function tool call, not raw custom/freeform text"
+                }
+                _ => "the call format declared in its advertised tool schema",
+            };
+            let message = format!(
+                "tool {tool_name} invoked with incompatible payload; expected {expected}. The tool was not run; retry with the declared format."
+            );
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(
                 tool_name_flat.as_ref(),
@@ -1264,7 +1263,7 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::Fatal(message);
+            let err = FunctionCallError::RespondToModel(message);
             dispatch_trace.record_failed(&err).await;
             return Err(err);
         }
@@ -1272,7 +1271,7 @@ impl ToolRegistry {
         if matches!(invocation.source, ToolCallSource::CodeMode { .. })
             && let Err(message) = code_mode_argument_preflight.validate(
                 &tool_name,
-                &tool_spec,
+                tool_spec,
                 &invocation.payload,
                 parsed_function_arguments.as_ref(),
             )
@@ -1311,11 +1310,18 @@ impl ToolRegistry {
 
         let mut hook_rewrote_input = false;
         let mut hook_input_notice = None;
-        let pre_tool_use_payload =
+        let pre_tool_use_payload = if invocation
+            .session
+            .hooks()
+            .has_handler_for(HookEventName::PreToolUse)
+        {
             with_parsed_function_arguments(parsed_function_arguments.clone(), async {
                 tool.pre_tool_use_payload(&invocation)
             })
-            .await;
+            .await
+        } else {
+            None
+        };
         if let Some(pre_tool_use_payload) = pre_tool_use_payload {
             let phase_started = Instant::now();
             let pre_tool_use_result = run_pre_tool_use_hooks(
@@ -1403,7 +1409,7 @@ impl ToolRegistry {
             && matches!(invocation.source, ToolCallSource::CodeMode { .. })
             && let Err(message) = code_mode_argument_preflight.validate(
                 &tool_name,
-                &tool_spec,
+                tool_spec,
                 &invocation.payload,
                 parsed_function_arguments.as_ref(),
             )
@@ -1662,10 +1668,7 @@ impl ToolRegistry {
                         let phase_started = Instant::now();
                         invocation
                             .session
-                            .register_tool_history_candidate(
-                                invocation.step_context.turn.config.codex_home.as_path(),
-                                candidate.clone(),
-                            )
+                            .register_tool_history_candidate(candidate.clone())
                             .await;
                         record_history_persistence(phase_started.elapsed());
                     }
@@ -3406,17 +3409,23 @@ fn recovery_matches_section_identity(
         return false;
     }
     expected.iter().all(|expected| {
-        let covering = actual
+        let mut covering = actual
             .iter()
-            .filter(|actual| actual.start >= expected.start && actual.end <= expected.end)
-            .collect::<Vec<_>>();
-        covering
-            .first()
-            .is_some_and(|range| range.start == expected.start)
-            && covering
-                .last()
-                .is_some_and(|range| range.end == expected.end)
-            && covering.windows(2).all(|pair| pair[0].end == pair[1].start)
+            .filter(|actual| actual.start >= expected.start && actual.end <= expected.end);
+        let Some(first) = covering.next() else {
+            return false;
+        };
+        if first.start != expected.start {
+            return false;
+        }
+        let mut end = first.end;
+        for range in covering {
+            if range.start != end {
+                return false;
+            }
+            end = range.end;
+        }
+        end == expected.end
     })
 }
 
@@ -3475,7 +3484,10 @@ fn serialize_projection_with_limit(
         }
         output_limit = output_limit
             .saturating_sub((rendered_tokens - effective_limit).max(1))
-            .min(output_limit - 1);
+            // Token estimates need not be monotonic across truncation markers
+            // or UTF-8 boundaries. Bound retries geometrically, checking every
+            // rendered candidate instead of assuming binary-search ordering.
+            .min(output_limit - output_limit.div_ceil(4));
     }
 
     let essential = envelope
@@ -3731,10 +3743,13 @@ fn function_hook_tool_input(arguments: &str) -> Value {
 }
 
 fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) -> String {
-    match payload {
+    let message = match payload {
         ToolPayload::Custom { .. } => format!("unsupported custom tool call: {tool_name}"),
         _ => format!("unsupported call: {tool_name}"),
-    }
+    };
+    format!(
+        "{message}. No tool was run. Use an exact name from the current tool declarations; if tool_search is available, use it to discover and activate a missing tool. In code mode, inspect ALL_TOOL_NAMES and resolve_tool(name) before retrying."
+    )
 }
 #[cfg(test)]
 #[path = "registry_tests.rs"]

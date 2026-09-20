@@ -51,7 +51,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let mut prepared = prepare_sampling_prompt_for_client(
         history.clone(),
         turn_context,
-        client_session,
         sess.services.git_workspace.as_ref(),
     )
     .await;
@@ -71,7 +70,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         prepared = prepare_sampling_prompt_for_client(
             history.clone(),
             turn_context,
-            client_session,
             sess.services.git_workspace.as_ref(),
         )
         .await;

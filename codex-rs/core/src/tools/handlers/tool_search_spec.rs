@@ -59,7 +59,13 @@ pub(crate) fn create_tool_search_tool(
         if has_unnamed_tools {
             source_descriptions.push("- Deferred built-in or extension tools".to_string());
         }
-        source_descriptions.join("\n")
+        // Charge separators as well as prose so a large connector catalog
+        // cannot grow this model-visible contribution beyond the shared cap.
+        for description in &mut source_descriptions {
+            description.push('\n');
+        }
+        crate::tools::spec_plan::apply_fair_description_budget(&mut source_descriptions);
+        source_descriptions.concat().trim_end().to_string()
     };
 
     let description = format!(
@@ -133,6 +139,34 @@ mod tests {
                     ]), Some(vec!["query".to_string()]), Some(false.into())),
             }
         );
+    }
+
+    #[test]
+    fn source_catalog_budget_preserves_small_sources_after_large_descriptions() {
+        let sources = [
+            ToolSearchSourceInfo {
+                name: "large".to_string(),
+                description: Some("界".repeat(40_000)),
+            },
+            ToolSearchSourceInfo {
+                name: "small".to_string(),
+                description: Some("Find small records.".to_string()),
+            },
+        ];
+        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool(&sources, false, 8)
+        else {
+            panic!("expected search tool");
+        };
+        let catalog = description
+            .split_once("sources:\n")
+            .unwrap()
+            .1
+            .split_once("\nSome of the tools")
+            .unwrap()
+            .0;
+        assert!(catalog.len() <= 40_000);
+        assert!(catalog.contains("- small: Find small records."));
+        assert!(catalog.contains("context truncated"));
     }
 
     #[test]

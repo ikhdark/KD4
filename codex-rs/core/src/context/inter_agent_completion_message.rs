@@ -32,10 +32,10 @@ impl ContextualUserFragment for InterAgentCompletionMessage {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        format!(
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!(
             "Message Type: FINAL_ANSWER\nTask name: {}\nSender: {}\nPayload:\n{}",
             self.task_name, self.sender, self.payload,
-        )
+        ))
     }
 }

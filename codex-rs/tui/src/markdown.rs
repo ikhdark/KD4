@@ -43,7 +43,7 @@ pub(crate) fn append_markdown(
         width,
         cwd,
     );
-    crate::render::line_utils::push_owned_lines(&rendered.lines, lines);
+    lines.extend(rendered.lines);
 }
 
 /// Render an agent message to styled ratatui lines.
@@ -64,7 +64,7 @@ pub(crate) fn append_markdown_agent(
         width,
         /*cwd*/ None,
     );
-    crate::render::line_utils::push_owned_lines(&rendered.lines, lines);
+    lines.extend(rendered.lines);
 }
 
 pub(crate) fn render_markdown_agent_with_links_and_cwd(

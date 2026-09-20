@@ -5,11 +5,95 @@ use sha1::Digest;
 use sha1::Sha1;
 
 pub use json::to_ascii_json_string;
+pub use truncate::TokenCountEstimate;
 pub use truncate::approx_bytes_for_tokens;
 pub use truncate::approx_token_count;
+pub use truncate::approx_token_count_exceeds;
 pub use truncate::approx_tokens_from_byte_count;
 pub use truncate::truncate_middle_chars;
 pub use truncate::truncate_middle_with_token_budget;
+
+/// Normalize CRLF and bare CR, retaining the input allocation when unchanged.
+pub fn normalize_newlines<'a>(
+    text: impl Into<std::borrow::Cow<'a, str>>,
+) -> std::borrow::Cow<'a, str> {
+    let text = text.into();
+    let Some(first) = text.find('\r') else {
+        return text;
+    };
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(&text[..first]);
+    let mut chars = text[first..].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            normalized.push('\n');
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(normalized)
+}
+
+/// Format XML text directly into its enclosing output without an escaped copy.
+pub fn xml_text(text: &str) -> impl std::fmt::Display + '_ {
+    EscapedText {
+        text,
+        kind: EscapeKind::XmlText,
+    }
+}
+
+/// Format a double-quoted XML attribute, including whitespace character references.
+pub fn xml_attribute(text: &str) -> impl std::fmt::Display + '_ {
+    EscapedText {
+        text,
+        kind: EscapeKind::XmlAttribute,
+    }
+}
+
+/// Format one RFC 6901 JSON pointer segment without an intermediate string.
+pub fn json_pointer_segment(text: &str) -> impl std::fmt::Display + '_ {
+    EscapedText {
+        text,
+        kind: EscapeKind::JsonPointer,
+    }
+}
+
+enum EscapeKind {
+    XmlText,
+    XmlAttribute,
+    JsonPointer,
+}
+struct EscapedText<'a> {
+    text: &'a str,
+    kind: EscapeKind,
+}
+
+impl std::fmt::Display for EscapedText<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut start = 0;
+        for (index, byte) in self.text.bytes().enumerate() {
+            let replacement = match (&self.kind, byte) {
+                (EscapeKind::XmlText | EscapeKind::XmlAttribute, b'&') => "&amp;",
+                (EscapeKind::XmlText | EscapeKind::XmlAttribute, b'<') => "&lt;",
+                (EscapeKind::XmlText | EscapeKind::XmlAttribute, b'>') => "&gt;",
+                (EscapeKind::XmlAttribute, b'"') => "&quot;",
+                (EscapeKind::XmlAttribute, b'\r') => "&#13;",
+                (EscapeKind::XmlAttribute, b'\n') => "&#10;",
+                (EscapeKind::XmlAttribute, b'\t') => "&#9;",
+                (EscapeKind::JsonPointer, b'~') => "~0",
+                (EscapeKind::JsonPointer, b'/') => "~1",
+                _ => continue,
+            };
+            output.write_str(&self.text[start..index])?;
+            output.write_str(replacement)?;
+            start = index + 1;
+        }
+        output.write_str(&self.text[start..])
+    }
+}
 
 /// Return the lowercase SHA-1 digest for `bytes`.
 pub fn sha1_hex(bytes: impl AsRef<[u8]>) -> String {
@@ -80,6 +164,62 @@ fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn newline_normalization_preserves_plain_storage_and_mixed_endings() {
+        use std::borrow::Cow;
+        assert!(matches!(
+            super::normalize_newlines("plain\ntext"),
+            Cow::Borrowed(_)
+        ));
+        let owned = "plain text".to_string();
+        let ptr = owned.as_ptr();
+        assert_eq!(super::normalize_newlines(owned).as_ptr(), ptr);
+        assert_eq!(
+            super::normalize_newlines("é\r\n\r中\n\r\r\n"),
+            "é\n\n中\n\n\n"
+        );
+    }
+
+    #[test]
+    fn escaping_preserves_unicode_and_literal_entities() {
+        assert_eq!(
+            super::xml_text("é&<>&amp;\"\n").to_string(),
+            "é&amp;&lt;&gt;&amp;amp;\"\n"
+        );
+        assert_eq!(
+            super::xml_attribute("a\"\r\n\t&<中>").to_string(),
+            "a&quot;&#13;&#10;&#9;&amp;&lt;中&gt;"
+        );
+        assert_eq!(
+            super::json_pointer_segment("中~/~0").to_string(),
+            "中~0~1~00"
+        );
+    }
+
+    #[test]
+    fn cached_estimates_match_whitespace_joined_text_without_rounding_parts() {
+        use super::TokenCountEstimate;
+        let parts = ["a", "bc", "!?", "中😀", "  ", "long_word123", ""];
+        for left in parts {
+            for right in parts {
+                for separator in ["\n", "\n\n", " \t"] {
+                    assert_eq!(
+                        TokenCountEstimate::new(left)
+                            .then(TokenCountEstimate::new(right), separator.len())
+                            .tokens(),
+                        super::approx_token_count(&format!("{left}{separator}{right}")),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            TokenCountEstimate::new("a")
+                .then(TokenCountEstimate::new("b"), 1)
+                .tokens(),
+            2
+        );
+    }
+
     use super::normalize_markdown_hash_location_suffix;
     use super::sanitize_metric_tag_value;
     use super::sha1_hex;

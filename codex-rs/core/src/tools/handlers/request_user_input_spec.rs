@@ -127,7 +127,7 @@ pub fn request_user_input_unavailable_message(
     } else {
         let mode_name = mode.display_name();
         Some(format!(
-            "request_user_input is unavailable in {mode_name} mode"
+            "request_user_input is unavailable in {mode_name} mode. If the question is optional, state a reasonable assumption and continue. If explicit input or approval is required, ask the user in a message and wait; tool unavailability is not approval."
         ))
     }
 }

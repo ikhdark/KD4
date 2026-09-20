@@ -4,6 +4,7 @@ use codex_features::Feature;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_output_truncation::looks_like_validation_command;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 
@@ -190,7 +191,12 @@ impl ShellCommandHandler {
             command,
             codex_home: turn_context.config.codex_home.clone(),
             cwd,
-            expiration: params.timeout_ms.into(),
+            expiration: params
+                .timeout_ms
+                .or_else(|| {
+                    looks_like_validation_command(&invocation.display_command()).then_some(300_000)
+                })
+                .into(),
             capture_policy: ExecCapturePolicy::ShellTool,
             env,
             network: turn_context.network.clone(),
@@ -440,8 +446,8 @@ impl ShellCommandHandler {
             turn.windows_sandbox_level,
             exec_params.windows_sandbox_private_desktop,
         );
-        let stall_timeout_ms =
-            effective_stall_timeout_ms(params.timeout_ms, params.stall_timeout_ms);
+        let timeout_ms = exec_params.expiration.timeout_ms();
+        let stall_timeout_ms = effective_stall_timeout_ms(timeout_ms, params.stall_timeout_ms);
         let runtime_context = format!(
             "shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?};stall_timeout_ms={:?}",
             exec_params.capture_policy,
@@ -473,7 +479,7 @@ impl ShellCommandHandler {
                 &exec_params.command,
             )
             .with_environment_fingerprint(&environment_hash)
-            .with_timeout_ms(exec_params.expiration.timeout_ms())
+            .with_timeout_ms(timeout_ms)
             .with_sandbox_context(&sandbox_context)
             .with_input_context(&prefix_rule)
             .with_runtime_context(&runtime_context)
@@ -521,7 +527,7 @@ impl ShellCommandHandler {
             None
         };
         let run_args = RunExecLikeArgs {
-            validation: params.validation.clone(),
+            validation: params.validation,
             tool_name,
             exec_params,
             stall_timeout_ms,
@@ -531,7 +537,7 @@ impl ShellCommandHandler {
             shell_type,
             shell_wrapper_is_owned,
             is_powershell_script,
-            additional_permissions: params.additional_permissions.clone(),
+            additional_permissions: params.additional_permissions,
             prefix_rule,
             session,
             turn,
@@ -555,6 +561,13 @@ async fn resolve_command_shell_async(
     turn_environment: &TurnEnvironment,
     session_shell: &Shell,
 ) -> Result<Shell, FunctionCallError> {
+    let environment_shell = turn_environment.shell.as_ref().unwrap_or(session_shell);
+    if !invocation.is_powershell_script()
+        || environment_shell.shell_type == ShellType::PowerShell
+        || turn_environment.environment.is_remote()
+    {
+        return resolve_command_shell(invocation, turn_environment, session_shell);
+    }
     let invocation = invocation.clone();
     let turn_environment = turn_environment.clone();
     let session_shell = session_shell.clone();

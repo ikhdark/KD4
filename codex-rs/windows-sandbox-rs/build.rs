@@ -32,7 +32,11 @@ fn main() -> Result<(), String> {
                 "cargo:rustc-link-arg-bin={SETUP_BIN}=-Wl,-Xlink=/manifestinput:{manifest_path}"
             );
         }
-        _ => {}
+        (target_env, target_abi) => {
+            println!(
+                "cargo:warning=setup manifest embedding is unsupported for Windows target env {target_env:?}, ABI {target_abi:?}; {SETUP_BIN} will not contain {SETUP_MANIFEST}"
+            );
+        }
     }
 
     Ok(())

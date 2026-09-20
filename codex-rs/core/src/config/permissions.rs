@@ -715,7 +715,7 @@ fn compile_scoped_filesystem_pattern(
         )),
         None => {
             let base = parse_absolute_path(path)?;
-            Ok(base.join(&subpath).to_string_lossy().to_string())
+            Ok(base.join(&subpath).to_string_lossy().into_owned())
         }
     }
 }

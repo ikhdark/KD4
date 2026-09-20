@@ -47,20 +47,24 @@ impl ModelContextBudget {
     }
 
     /// Admit text, truncating the final admitted item within the remaining budget.
-    pub fn take(&mut self, text: &str) -> Option<String> {
+    pub fn take<'a>(&mut self, text: &'a str) -> Option<std::borrow::Cow<'a, str>> {
         self.take_up_to(text, self.remaining_bytes)
     }
 
     /// Admit text up to an item-specific byte cap while preserving the unused
     /// aggregate budget for later fragments.
-    pub fn take_up_to(&mut self, text: &str, max_bytes: usize) -> Option<String> {
+    pub fn take_up_to<'a>(
+        &mut self,
+        text: &'a str,
+        max_bytes: usize,
+    ) -> Option<std::borrow::Cow<'a, str>> {
         let budget = self.remaining_bytes.min(max_bytes);
         if budget == 0 {
             return None;
         }
         if text.len() <= budget {
             self.remaining_bytes -= text.len();
-            return Some(text.to_string());
+            return Some(std::borrow::Cow::Borrowed(text));
         }
 
         let admitted = if budget <= TRUNCATION_MARKER.len() {
@@ -76,7 +80,7 @@ impl ModelContextBudget {
             return None;
         }
         self.remaining_bytes = self.remaining_bytes.saturating_sub(admitted.len());
-        Some(admitted)
+        Some(std::borrow::Cow::Owned(admitted))
     }
 }
 
@@ -102,8 +106,8 @@ impl ContextualUserFragment for RenderedContextFragment {
         Self::type_markers()
     }
 
-    fn body(&self) -> String {
-        self.text.clone()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.text)
     }
 
     fn type_markers() -> (&'static str, &'static str) {

@@ -14,7 +14,7 @@ use codex_login::save_auth;
 use codex_login::token_data::IdTokenInfo;
 use codex_login::token_data::TokenData;
 use codex_protocol::auth::AuthMode;
-use core_test_support::skip_if_no_network;
+use core_test_support::require_network;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -32,7 +32,7 @@ const REFRESH_TOKEN: &str = "refresh-token";
 #[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn logout_with_revoke_revokes_refresh_token_then_removes_auth() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let _client_id_guard = EnvGuard::set(CLIENT_ID_OVERRIDE_ENV_VAR, "staging-client".to_string());
     let server = MockServer::start().await;
@@ -90,7 +90,7 @@ async fn logout_with_revoke_revokes_refresh_token_then_removes_auth() -> Result<
 #[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn logout_with_revoke_uses_stored_auth_when_access_token_env_is_set() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -133,7 +133,7 @@ async fn logout_with_revoke_uses_stored_auth_when_access_token_env_is_set() -> R
 #[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn logout_with_revoke_removes_auth_when_revoke_fails() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -177,7 +177,7 @@ async fn logout_with_revoke_removes_auth_when_revoke_fails() -> Result<()> {
 #[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))

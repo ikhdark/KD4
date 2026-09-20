@@ -47,7 +47,6 @@ use codex_apply_patch::ParseError;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
@@ -445,7 +444,20 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation))
+        Box::pin(async move {
+            let cancellation = invocation.cancellation_token.clone();
+            match self.handle_call(invocation).await {
+                Err(FunctionCallError::RespondToModel(text)) if !cancellation.is_cancelled() => {
+                    Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
+                        text,
+                        false,
+                        &Default::default(),
+                        None,
+                    )))
+                }
+                result => result,
+            }
+        })
     }
 }
 
@@ -474,117 +486,177 @@ impl ApplyPatchHandler {
         let args = match codex_apply_patch::parse_patch(&patch_input) {
             Ok(args) => args,
             Err(parse_error) => {
+                session.services.session_telemetry.counter(
+                    "codex.apply_patch.verification_failed",
+                    1,
+                    &[("failure_kind", "parse")],
+                );
                 return Err(FunctionCallError::RespondToModel(format!(
                     "apply_patch verification failed: {parse_error}"
                 )));
             }
         };
-        let selected_environment_id =
-            require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
+        let files_requested = args
+            .hunks
+            .iter()
+            .map(|hunk| match hunk {
+                Hunk::AddFile { path, .. }
+                | Hunk::DeleteFile { path }
+                | Hunk::UpdateFile { path, .. } => path,
+            })
+            .collect::<BTreeSet<_>>()
+            .len() as i64;
+        let chunks_requested = args
+            .hunks
+            .iter()
+            .map(|hunk| match hunk {
+                // A whole-file add/delete or a move without a text chunk is one operation.
+                Hunk::UpdateFile { chunks, .. } => chunks.len().max(1) as i64,
+                _ => 1,
+            })
+            .sum();
+        let cancellation = cancellation_token.clone();
+        let result = async {
+            let selected_environment_id =
+                require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
 
-        // Verify the parsed patch against the selected environment filesystem.
-        let Some(turn_environment) = resolve_tool_environment(
-            &step_context.environments,
-            selected_environment_id.as_deref(),
-        )?
-        else {
-            return Err(FunctionCallError::RespondToModel(
-                "apply_patch is unavailable in this session".to_string(),
-            ));
-        };
-        let fs = turn_environment.environment.get_filesystem();
-        let sandbox = turn.file_system_sandbox_context(
-            /*additional_permissions*/ None,
-            turn_environment.cwd(),
-        );
-        let workspace_operation_permit =
-            acquire_patch_workspace(turn_environment.cwd(), &cancellation_token).await?;
-        match codex_apply_patch::verify_apply_patch_args(
-            args,
-            turn_environment.cwd(),
-            fs.as_ref(),
-            Some(&sandbox),
-        )
-        .await
-        {
-            codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
-                let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
-                    effective_patch_permissions(
-                        session.as_ref(),
-                        turn.as_ref(),
-                        turn_environment.environment.approval_scope_id(),
-                        &changes,
-                        turn_environment.cwd(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "apply_patch cannot enforce filesystem permissions for the selected environment: {error}"
-                        ))
-                    })?;
-                let invocation =
-                    apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
-                        .await;
-                match invocation {
-                    InternalApplyPatchInvocation::Output(item) => {
-                        let content = item?;
-                        Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
-                    }
-                    InternalApplyPatchInvocation::DelegateToRuntime(apply) => {
-                        let changes = convert_apply_patch_to_protocol(&apply.action);
-                        let emitter = ToolEmitter::apply_patch_for_environment(
-                            changes.clone(),
-                            apply.auto_approved,
-                            turn_environment.environment_id.clone(),
-                        );
-                        let req = ApplyPatchRequest {
-                            cancellation_token,
-                            turn_environment: turn_environment.clone(),
-                            action: apply.action,
-                            file_paths,
-                            changes,
-                            exec_approval_requirement: apply.exec_approval_requirement,
-                            additional_permissions: effective_additional_permissions
-                                .additional_permissions,
-                            permissions_preapproved: effective_additional_permissions
-                                .permissions_preapproved,
-                        };
-
-                        let tool_ctx = ToolCtx {
-                            session: session.clone(),
-                            turn: turn.clone(),
-                            call_id: call_id.clone(),
-                            tool_name: tool_name.clone(),
-                        };
-                        let content = run_owned_patch(
-                            req,
-                            tool_ctx,
-                            Some(tracker),
-                            emitter,
-                            workspace_operation_permit,
+            // Verify the parsed patch against the selected environment filesystem.
+            let Some(turn_environment) = resolve_tool_environment(
+                &step_context.environments,
+                selected_environment_id.as_deref(),
+            )?
+            else {
+                return Err(FunctionCallError::RespondToModel(
+                    "apply_patch requires a ready execution environment. If an environment is starting, call wait_for_environment with its id first.".to_string(),
+                ));
+            };
+            let fs = turn_environment.environment.get_filesystem();
+            let sandbox = turn.file_system_sandbox_context(
+                /*additional_permissions*/ None,
+                turn_environment.cwd(),
+            );
+            let workspace_operation_permit = acquire_patch_workspace(
+                turn_environment,
+                turn_environment.cwd(),
+                &cancellation_token,
+            )
+            .await?;
+            match codex_apply_patch::verify_apply_patch_args(
+                args,
+                turn_environment.cwd(),
+                fs.as_ref(),
+                Some(&sandbox),
+            )
+            .await
+            {
+                codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+                    let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
+                        effective_patch_permissions(
+                            session.as_ref(),
+                            turn.as_ref(),
+                            turn_environment.environment.approval_scope_id(),
+                            &changes,
+                            turn_environment.cwd(),
                         )
-                        .await?;
-                        Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
+                        .await
+                        .map_err(|error| {
+                            FunctionCallError::RespondToModel(format!(
+                                "apply_patch cannot enforce filesystem permissions for the selected environment: {error}"
+                            ))
+                        })?;
+                    let invocation =
+                        apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
+                            .await;
+                    match invocation {
+                        InternalApplyPatchInvocation::Output(item) => {
+                            let content = item?;
+                            Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
+                        }
+                        InternalApplyPatchInvocation::DelegateToRuntime(apply) => {
+                            let changes = convert_apply_patch_to_protocol(&apply.action);
+                            let emitter = ToolEmitter::apply_patch_for_environment(
+                                changes.clone(),
+                                apply.auto_approved,
+                                turn_environment.environment_id.clone(),
+                            );
+                            let req = ApplyPatchRequest {
+                                cancellation_token,
+                                turn_environment: turn_environment.clone(),
+                                action: apply.action,
+                                file_paths,
+                                changes,
+                                exec_approval_requirement: apply.exec_approval_requirement,
+                                additional_permissions: effective_additional_permissions
+                                    .additional_permissions,
+                                permissions_preapproved: effective_additional_permissions
+                                    .permissions_preapproved,
+                            };
+
+                            let tool_ctx = ToolCtx {
+                                session: session.clone(),
+                                turn: turn.clone(),
+                                call_id: call_id.clone(),
+                                tool_name: tool_name.clone(),
+                            };
+                            let output = run_owned_patch(
+                                req,
+                                tool_ctx,
+                                Some(tracker),
+                                emitter,
+                                workspace_operation_permit,
+                            )
+                            .await?;
+                            Ok(boxed_tool_output(output))
+                        }
                     }
                 }
-            }
-            codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
-                Err(FunctionCallError::RespondToModel(format!(
-                    "apply_patch verification failed: {parse_error}"
-                )))
-            }
-            codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
-                tracing::trace!("Failed to parse apply_patch input, {error:?}");
-                Err(FunctionCallError::RespondToModel(
-                    "apply_patch handler received invalid patch input".to_string(),
-                ))
-            }
-            codex_apply_patch::MaybeApplyPatchVerified::NotApplyPatch => {
-                Err(FunctionCallError::RespondToModel(
-                    "apply_patch handler received non-apply_patch input".to_string(),
-                ))
+                codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
+                    session.services.session_telemetry.counter(
+                        "codex.apply_patch.verification_failed",
+                        1,
+                        &[(
+                            "failure_kind",
+                            crate::tools::runtimes::apply_patch::patch_failure_kind(&parse_error),
+                        )],
+                    );
+                    Err(FunctionCallError::RespondToModel(format!(
+                        "apply_patch verification failed: {parse_error}"
+                    )))
+                }
+                codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
+                    tracing::trace!("Failed to parse apply_patch input, {error:?}");
+                    Err(FunctionCallError::RespondToModel(format!(
+                        "apply_patch received invalid patch input: {error:?}"
+                    )))
+                }
+                codex_apply_patch::MaybeApplyPatchVerified::NotApplyPatch => {
+                    Err(FunctionCallError::RespondToModel(
+                        "apply_patch expects a patch beginning with *** Begin Patch and ending with *** End Patch".to_string(),
+                    ))
+                }
             }
         }
+        .await;
+        let outcome = if cancellation.is_cancelled() {
+            "cancelled"
+        } else if result
+            .as_ref()
+            .is_ok_and(|output| output.success_for_logging())
+        {
+            "success"
+        } else {
+            "failed"
+        };
+        for (name, value) in [
+            ("codex.apply_patch.files_requested", files_requested),
+            ("codex.apply_patch.chunks_requested", chunks_requested),
+        ] {
+            session
+                .services
+                .session_telemetry
+                .histogram(name, value, &[("outcome", outcome)]);
+        }
+        result
     }
 }
 
@@ -654,19 +726,16 @@ impl CoreToolRuntime for ApplyPatchHandler {
 }
 
 async fn acquire_patch_workspace(
+    environment: &TurnEnvironment,
     cwd: &PathUri,
     cancellation_token: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, FunctionCallError> {
-    let Ok(native_cwd) = cwd.to_abs_path() else {
-        return Ok(None);
-    };
-    let workspace_root = get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
     tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
             "apply_patch cancelled while waiting for the workspace".to_string(),
         )),
-        permit = crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root) => {
+        permit = crate::workspace_operation_gate::acquire_patch_operation(&environment.environment, cwd) => {
             Ok(Some(permit))
         }
     }
@@ -680,7 +749,7 @@ async fn run_owned_patch(
     tracker: Option<SharedTurnDiffTracker>,
     emitter: ToolEmitter,
     workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
-) -> Result<String, FunctionCallError> {
+) -> Result<ApplyPatchToolOutput, FunctionCallError> {
     let terminal_tasks = tool_ctx.session.terminal_tasks.clone();
     let timing = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing();
     let operation = async move {
@@ -741,9 +810,9 @@ async fn run_owned_patch(
             .await
             .map(|result| result.output)
         };
-        if req.cancellation_token.is_cancelled() {
-            runtime.finish_cancelled_mutation_evidence(&tool_ctx).await;
-        }
+        // A retry can also end through denial or a hook error. Every terminal
+        // path must finalize evidence retained by the preceding attempt.
+        runtime.finish_pending_mutation_evidence(&tool_ctx).await;
         let (out, delta) = match out {
             Ok(output) => (Ok(output.exec_output), Some(output.delta)),
             Err(_)
@@ -777,6 +846,32 @@ async fn run_owned_patch(
             tracker.as_ref(),
         );
         let result = emitter.finish(event_ctx, out, delta.as_ref()).await;
+        let result = match (result, runtime.mutation_evidence_warning()) {
+            (Ok(output), Some(warning)) => Ok(format!("{output}\n{warning}")),
+            (Err(FunctionCallError::RespondToModel(error)), Some(warning)) => Err(
+                FunctionCallError::RespondToModel(format!("{error}\n{warning}")),
+            ),
+            (result, _) => result,
+        };
+        let result = match result {
+            Ok(text) => Ok(ApplyPatchToolOutput::from_delta(
+                text,
+                true,
+                runtime.committed_delta(),
+                Some(req.turn_environment.environment_id.clone()),
+            )),
+            Err(FunctionCallError::RespondToModel(text))
+                if !req.cancellation_token.is_cancelled() =>
+            {
+                Ok(ApplyPatchToolOutput::from_delta(
+                    text,
+                    false,
+                    runtime.committed_delta(),
+                    Some(req.turn_environment.environment_id.clone()),
+                ))
+            }
+            Err(error) => Err(error),
+        };
         // Release the workspace gate after the committed delta reaches consumers.
         drop(runtime);
         result
@@ -818,7 +913,7 @@ pub(crate) async fn intercept_apply_patch(
     // wait for the patch gate. Verification below must run while holding the permit.
     let workspace_operation_permit =
         if let Some(patch_cwd) = codex_apply_patch::apply_patch_command_cwd(command, cwd) {
-            acquire_patch_workspace(&patch_cwd, &cancellation_token).await?
+            acquire_patch_workspace(&turn_environment, &patch_cwd, &cancellation_token).await?
         } else {
             None
         };
@@ -880,7 +975,7 @@ pub(crate) async fn intercept_apply_patch(
                         call_id: call_id.to_string(),
                         tool_name: ToolName::plain(tool_name),
                     };
-                    let content = run_owned_patch(
+                    let output = run_owned_patch(
                         req,
                         tool_ctx,
                         tracker.cloned(),
@@ -888,7 +983,10 @@ pub(crate) async fn intercept_apply_patch(
                         workspace_operation_permit,
                     )
                     .await?;
-                    Ok(Some(FunctionToolOutput::from_text(content, Some(true))))
+                    if !output.success {
+                        return Err(FunctionCallError::RespondToModel(output.text).into());
+                    }
+                    Ok(Some(FunctionToolOutput::from_text(output.text, Some(true))))
                 }
             }
         }

@@ -64,7 +64,7 @@ fn renders_agents_instructions_without_directory_header() {
 }
 
 #[test]
-fn renders_agents_instructions_with_escaped_directory_and_body() {
+fn renders_agents_instructions_escaping_only_fragment_delimiters() {
     let rendered = UserInstructions {
         directory: Some("/tmp/<project>&docs".to_string()),
         text: "Literal </INSTRUCTIONS><INSTRUCTIONS> and &lt;tag&gt;".to_string(),
@@ -73,7 +73,7 @@ fn renders_agents_instructions_with_escaped_directory_and_body() {
 
     assert_eq!(
         rendered,
-        "# AGENTS.md instructions for /tmp/&lt;project&gt;&amp;docs\n\n<INSTRUCTIONS>\nLiteral &lt;/INSTRUCTIONS&gt;&lt;INSTRUCTIONS&gt; and &amp;lt;tag&amp;gt;\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions for /tmp/<project>&docs\n\n<INSTRUCTIONS>\nLiteral &lt;/INSTRUCTIONS&gt;&lt;INSTRUCTIONS&gt; and &lt;tag&gt;\n</INSTRUCTIONS>"
     );
     assert!(is_contextual_user_fragment(&ContentItem::InputText {
         text: rendered,

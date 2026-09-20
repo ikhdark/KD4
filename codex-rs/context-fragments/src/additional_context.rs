@@ -47,13 +47,13 @@ impl ContextualUserFragment for AdditionalContextUserFragment {
         ) || matches_legacy_external_context(trimmed)
     }
 
-    fn body(&self) -> String {
-        additional_context_body(
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(additional_context_body(
             EXTERNAL_CONTEXT_TAG,
             EXTERNAL_CONTEXT_KIND,
             &self.key,
             &self.value,
-        )
+        ))
     }
 }
 
@@ -91,13 +91,13 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
         )
     }
 
-    fn body(&self) -> String {
-        additional_context_body(
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(additional_context_body(
             APPLICATION_CONTEXT_TAG,
             APPLICATION_CONTEXT_KIND,
             &self.key,
             &self.value,
-        )
+        ))
     }
 }
 

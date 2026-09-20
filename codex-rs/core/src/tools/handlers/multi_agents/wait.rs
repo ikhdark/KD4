@@ -44,7 +44,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "wait_agent wait agent subagent status final result complete timeout targets",
-            registered_spec.clone(),
+            registered_spec,
         )
     }
 

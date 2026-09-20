@@ -14,6 +14,7 @@ use core_test_support::PathBufExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::require_network;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -22,7 +23,6 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -72,7 +72,7 @@ fn format_environment_context_subagents_snapshot(subagents: &[&str]) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -196,7 +196,7 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_model_visible_layout_refreshes_agents_between_turns() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -389,7 +389,7 @@ async fn snapshot_model_visible_layout_refreshes_agents_between_turns() -> Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_model_visible_layout_resume_with_personality_change() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let mut initial_builder = test_codex().with_config(|config| {
@@ -513,7 +513,7 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let mut initial_builder = test_codex().with_config(|config| {

@@ -1251,7 +1251,7 @@ See the Codex keymap documentation for supported actions and examples."
                     // Windows terminals can convert pasted newlines to \r, but
                     // tui-textarea expects \n. Normalize CR to LF.
                     // [tui-textarea]: https://github.com/rhysd/tui-textarea/blob/4d18622eeac13b309e0ff6a55a46ac6706da68cf/src/textarea.rs#L782-L783
-                    let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+                    let pasted = codex_utils_string::normalize_newlines(pasted).into_owned();
                     self.chat_widget.handle_paste(pasted);
                 }
                 TuiEvent::Draw | TuiEvent::Resize => {
@@ -1314,14 +1314,15 @@ See the Codex keymap documentation for supported actions and examples."
     }
 
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui) -> Result<Rect> {
-        let desired_height = self.chat_widget.desired_height(tui.terminal.size()?.width);
+        let renderable = self.chat_widget.frame_renderable();
+        let desired_height = renderable.desired_height(tui.terminal.size()?.width);
         let mut rendered_area = Rect::default();
         tui.draw_with_resize_reflow(desired_height, |frame| {
             let area = frame.area();
             rendered_area = area;
-            self.chat_widget.render(area, frame.buffer);
-            if let Some((x, y)) = self.chat_widget.cursor_pos(area) {
-                frame.set_cursor_style(self.chat_widget.cursor_style(area));
+            renderable.render(area, frame.buffer);
+            if let Some((x, y)) = renderable.cursor_pos(area) {
+                frame.set_cursor_style(renderable.cursor_style(area));
                 frame.set_cursor_position((x, y));
             }
         })?;

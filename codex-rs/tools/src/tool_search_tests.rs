@@ -35,8 +35,10 @@ fn search_results_defer_functions_and_namespace_children_without_output_schemas(
             LoadableToolSpec::Namespace(expected_namespace),
         ),
     ] {
-        let info = ToolSearchInfo::from_tool_spec(spec, None).expect("searchable tool");
+        let original = spec.clone();
+        let info = ToolSearchInfo::from_tool_spec(&spec, None).expect("searchable tool");
         assert_eq!(info.entry.output, expected);
+        assert_eq!(spec, original);
     }
 }
 
@@ -76,7 +78,7 @@ fn default_search_text_uses_model_visible_namespace_metadata_once() {
         })],
     });
 
-    let search_info = ToolSearchInfo::from_tool_spec(spec, /*source_info*/ None)
+    let search_info = ToolSearchInfo::from_tool_spec(&spec, /*source_info*/ None)
         .expect("namespace should be searchable");
 
     assert_eq!(

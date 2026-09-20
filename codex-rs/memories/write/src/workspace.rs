@@ -3,6 +3,7 @@ use codex_git_utils::GitBaselineDiff;
 use codex_git_utils::diff_since_latest_init;
 use codex_git_utils::ensure_git_baseline_repository;
 use codex_git_utils::reset_git_repository;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::generated_files::write_generated_file;
@@ -86,13 +87,16 @@ fn render_workspace_diff_file(diff: &GitBaselineDiff) -> String {
             rendered.push_str(PARTIAL);
             return rendered;
         }
-        rendered.push_str(&format!("- {} {}\n", change.status.label(), change.path));
+        let _ = writeln!(rendered, "- {} {}", change.status.label(), change.path);
     }
     rendered.push_str("\n## Diff\n\n```diff\n");
     let remaining =
         crate::workspace_diff::MAX_BYTES - rendered.len() - SUFFIX.len() - PARTIAL.len();
     if diff.unified_diff.len() > remaining {
-        let boundary = diff.unified_diff.floor_char_boundary(remaining);
+        // Keep only complete lines: a cut hunk header or source line looks like
+        // real diff evidence even with the artifact-level truncation notice.
+        let prefix = &diff.unified_diff[..diff.unified_diff.floor_char_boundary(remaining)];
+        let boundary = prefix.rfind('\n').map_or(0, |index| index + 1);
         rendered.push_str(&diff.unified_diff[..boundary]);
         rendered.push_str(SUFFIX);
         rendered.push_str(PARTIAL);

@@ -15,7 +15,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_features::Feature;
-use core_test_support::skip_if_no_network;
+use core_test_support::require_network;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -50,7 +50,7 @@ fn standalone_app_server_emits_json_info_events() -> Result<()> {
 
 #[tokio::test]
 async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = create_mock_responses_server_sequence(vec![
         create_exec_command_sse_response("exec-call-1")?,

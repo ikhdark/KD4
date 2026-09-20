@@ -2694,7 +2694,8 @@ fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> std::io::R
             format!("{LABEL} must match ^[a-zA-Z0-9_-]+$"),
         ));
     }
-    if namespace.chars().count() > MAX_LEN {
+    // The identifier check above already guarantees ASCII.
+    if namespace.len() > MAX_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{LABEL} must be at most {MAX_LEN} characters"),

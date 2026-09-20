@@ -22,13 +22,13 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::assert_regex_match;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_shell_command_call_with_args;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
@@ -173,7 +173,7 @@ fn apply_patch_responses(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_multiple_operations_integration() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
 
@@ -190,13 +190,10 @@ async fn apply_patch_cli_multiple_operations_integration() -> Result<()> {
 
     let out = harness.apply_patch_output(call_id).await;
 
-    let expected = r"(?s)^Exit code: 0
-Wall time: [0-9]+(?:\.[0-9]+)? seconds
-Output:
-Success. Updated the following files:
+    let expected = r"(?s)^Success. Updated the following files:
 A nested/new.txt
-M modify.txt
 D delete.txt
+M modify.txt
 ?$";
     assert_regex_match(expected, &out);
 
@@ -212,7 +209,7 @@ D delete.txt
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_multiple_chunks() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -235,7 +232,7 @@ async fn apply_patch_cli_multiple_chunks() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_moves_file_to_new_directory() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -257,7 +254,7 @@ async fn apply_patch_cli_moves_file_to_new_directory() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_updates_file_preserves_missing_trailing_newline() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -278,7 +275,7 @@ async fn apply_patch_cli_updates_file_preserves_missing_trailing_newline() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_insert_only_hunk_modifies_file() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -301,7 +298,7 @@ async fn apply_patch_cli_insert_only_hunk_modifies_file() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_move_overwrites_existing_destination() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -326,7 +323,7 @@ async fn apply_patch_cli_move_overwrites_existing_destination() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_move_without_content_change_has_no_turn_diff() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -359,7 +356,7 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff() -> Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_add_overwrites_existing_file() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -380,7 +377,7 @@ async fn apply_patch_cli_add_overwrites_existing_file() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_rejects_invalid_hunk_header() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -429,7 +426,7 @@ async fn apply_patch_cli_rejects_invalid_hunk_header() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_reports_missing_context() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -458,7 +455,7 @@ async fn apply_patch_cli_reports_missing_context() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_reports_missing_target_file() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -487,7 +484,7 @@ async fn apply_patch_cli_reports_missing_target_file() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_delete_missing_file_reports_error() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -517,7 +514,7 @@ async fn apply_patch_cli_delete_missing_file_reports_error() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_rejects_empty_patch() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -537,7 +534,7 @@ async fn apply_patch_cli_rejects_empty_patch() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_delete_directory_reports_verification_error() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -558,7 +555,7 @@ async fn apply_patch_cli_delete_directory_reports_verification_error() -> Result
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(codex_home)]
 async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness_with(|builder| {
         builder.with_config(|config| config.set_windows_elevated_sandbox_enabled(true))
@@ -602,7 +599,7 @@ async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(codex_home)]
 async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test_root = tempfile::tempdir_in(std::env::current_dir()?)?;
     let work_dir = AbsolutePathBuf::try_from(test_root.path().join("work"))?;
@@ -664,7 +661,7 @@ async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(codex_home)]
 async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test_root = tempfile::tempdir_in(std::env::current_dir()?)?;
     let work_dir = AbsolutePathBuf::try_from(test_root.path().join("work"))?;
@@ -733,7 +730,7 @@ async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_verification_failure_has_no_side_effects() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -754,7 +751,7 @@ async fn apply_patch_cli_verification_failure_has_no_side_effects() -> Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_can_use_shell_command_output_as_patch_input() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness =
         apply_patch_harness_with(|builder| builder.with_model("gpt-5.4").with_windows_cmd_shell())
@@ -891,7 +888,7 @@ async fn apply_patch_cli_can_use_shell_command_output_as_patch_input() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness_with(|builder| {
         builder.with_config(|config| {
@@ -995,7 +992,7 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_end_of_file_anchor() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -1012,7 +1009,7 @@ async fn apply_patch_cli_end_of_file_anchor() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_missing_second_chunk_context_rejected() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 
@@ -1042,7 +1039,7 @@ async fn apply_patch_cli_missing_second_chunk_context_rejected() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_emits_turn_diff_event_with_unified_diff() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -1081,7 +1078,7 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -1144,7 +1141,7 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_aggregates_diff_preserves_success_after_failure() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -1217,7 +1214,7 @@ async fn apply_patch_aggregates_diff_preserves_success_after_failure() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_clears_aggregated_diff_after_inexact_delta() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness_with(|builder| {
         builder.with_workspace_setup(|cwd, fs| async move {
@@ -1287,7 +1284,7 @@ async fn apply_patch_clears_aggregated_diff_after_inexact_delta() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_change_context_disambiguates_target() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = apply_patch_harness().await?;
 

@@ -286,9 +286,7 @@ fn annotate_schema_constraints(
     let mut annotations = Vec::new();
     for keyword in ["pattern", "minLength", "maxLength", "format"] {
         if let Some(value) = map.get(keyword) {
-            let value = render_bounded_literal(value, budget)?
-                .replace("*/", "* /")
-                .replace(['\n', '\r'], " ");
+            let value = sanitize_comment(&render_bounded_literal(value, budget)?);
             annotations.push(format!("{keyword}: {value}"));
         }
     }
@@ -512,9 +510,7 @@ fn render_json_schema_object(
         } else {
             // TS index signatures also govern named fields. An unknown signature
             // is deliberately wider; the annotation preserves the extra-key rule.
-            let annotation = additional_type
-                .replace("*/", "* /")
-                .replace(['\n', '\r'], " ");
+            let annotation = sanitize_comment(&additional_type);
             lines.push(format!(
                 "[key: string]: unknown; /* additional keys: {annotation} */"
             ));
@@ -587,6 +583,20 @@ impl std::io::Write for BoundedLiteralWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+// Keep schema-controlled text within one generated block comment.
+fn sanitize_comment(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut previous = None;
+    for ch in value.chars() {
+        if previous == Some('*') && ch == '/' {
+            output.push(' ');
+        }
+        output.push(if matches!(ch, '\n' | '\r') { ' ' } else { ch });
+        previous = Some(ch);
+    }
+    output
 }
 
 #[cfg(test)]

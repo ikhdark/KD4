@@ -18,13 +18,14 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS;
+use crate::tools::handlers::read_tool_output_spec::file_selector_schema;
 use crate::tools::handlers::read_tool_output_spec::read_tool_output_output_schema;
-use crate::tools::handlers::read_tool_output_spec::tool_output_selector_schema;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 
-const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FILE_MIB: usize = 8;
+const MAX_FILE_BYTES: usize = MAX_FILE_MIB * 1024 * 1024;
 
 pub(crate) struct ReadFileHandler;
 
@@ -33,26 +34,7 @@ pub(crate) struct ReadFileHandler;
 struct ReadFileArgs {
     path: String,
     environment_id: Option<String>,
-    selectors: Vec<ToolOutputSelector>,
-}
-
-fn file_selector_schema() -> JsonSchema {
-    let mut schema = tool_output_selector_schema();
-    if let Some(variants) = &mut schema.one_of {
-        variants.retain(|variant| {
-            variant
-                .properties
-                .as_ref()
-                .and_then(|properties| properties.get("kind"))
-                .and_then(|kind| kind.enum_values.as_ref())
-                .is_some_and(|values| {
-                    values
-                        .iter()
-                        .any(|value| matches!(value.as_str(), Some("bytes" | "lines" | "search")))
-                })
-        });
-    }
-    schema
+    selectors: Option<Vec<ToolOutputSelector>>,
 }
 
 impl ToolExecutor<ToolInvocation> for ReadFileHandler {
@@ -61,11 +43,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), None);
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to select the whole file within the output budget. Oversized selections return child_selectors for the retained snapshot.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
         output["properties"]["path"] = json!({"type": "string"});
+        output["properties"]["total_lines"] = json!({"type": "integer", "minimum": 0});
         #[expect(
             clippy::expect_used,
             reason = "read_tool_output_output_schema constructs an object with a required array"
@@ -73,17 +56,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         output["required"]
             .as_array_mut()
             .expect("object schema")
-            .push(json!("path"));
+            .extend([json!("path"), json!("total_lines")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: "Read selected text from a file without shell quoting. Use lines, bytes, or fixed-string search with context, with the same selectors as read_tool_output. Reads UTF-8 files up to 8 MiB through the selected environment's filesystem permissions. Returns the resolved path, content hash, and an immutable artifact_id; use read_tool_output with that artifact_id and returned continuation or child_selectors for more of the same snapshot. A new read_file call reads current disk contents. Every accepted call returns one entry in results[] per normalized selector: entries with status ok carry the text, and any other status carries message and child_selectors describing how to read that part. Only an invalid invocation returns an error instead of results[]. Pass a `skill:` locator from the skills catalog as the path to read that skill's SKILL.md; skills are host-owned, so omit environment_id for them.".to_string(),
+            description: format!("Read a UTF-8 file without shell quoting. Pass path alone to select the whole file, or use lines selectors (for example start 40, end 90), bytes, or fixed-string search with context. Before editing, read the complete enclosing function, type, or configuration unit. Files may be up to {MAX_FILE_MIB} MiB, subject to filesystem permissions. Returns path, total_lines, content hash, and an immutable artifact_id. Large selections return child_selectors or continuation instead of full text; check complete and each results[] status, then use read_tool_output with the artifact_id to finish the snapshot. Workspace file results are freshness-tracked; artifact recovery returns the original snapshot. A new read_file call reads current disk contents. Pass a skill: locator from the catalog to read its SKILL.md; omit environment_id for host-owned skills."),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
                 ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, or a `skill:` locator from the skills catalog.".to_string()))),
                 ("environment_id".to_string(), JsonSchema::string(Some("Environment id; omit to use the primary environment.".to_string()))),
                 ("selectors".to_string(), selectors),
-            ]), Some(vec!["path".to_string(), "selectors".to_string()]), Some(false.into())),
+            ]), Some(vec!["path".to_string()]), Some(false.into())),
             output_schema: Some(output),
         })
     }
@@ -100,12 +83,14 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ));
             };
             let args: ReadFileArgs = parse_arguments(arguments)?;
-            if args.selectors.is_empty() || args.selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS {
+            if args.selectors.as_ref().is_some_and(|selectors| {
+                selectors.is_empty() || selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS
+            }) {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "read_file requires 1-{READ_TOOL_OUTPUT_MAX_SELECTORS} selectors"
                 )));
             }
-            if args.selectors.iter().any(|selector| {
+            if args.selectors.iter().flatten().any(|selector| {
                 !matches!(
                     selector,
                     ToolOutputSelector::Bytes { .. }
@@ -140,6 +125,13 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ));
             }
             let thread_id = invocation.session.thread_id.to_string();
+            let total_lines = contents.lines().count();
+            let selectors = args.selectors.unwrap_or_else(|| {
+                vec![ToolOutputSelector::Bytes {
+                    start: 0,
+                    end: contents.len() as u64,
+                }]
+            });
             let artifact = create_canonical_output_artifact(
                 &turn.config.codex_home,
                 &thread_id,
@@ -164,13 +156,14 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 &turn.config.codex_home,
                 &thread_id,
                 &artifact_id,
-                args.selectors,
+                selectors,
             )
             .await
             .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
             let mut output = serde_json::to_value(result)
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
             output["path"] = json!(resolved_path);
+            output["total_lines"] = json!(total_lines);
             Ok(boxed_tool_output(JsonToolOutput::new(output)))
         })
     }
@@ -187,7 +180,7 @@ async fn read_environment_file(
     )?
     .ok_or_else(|| {
         FunctionCallError::RespondToModel(
-            "read_file is unavailable without an environment".to_string(),
+            "read_file requires a ready execution environment for filesystem paths. If an environment is starting, call wait_for_environment with its id first.".to_string(),
         )
     })?;
     let path = environment
@@ -212,9 +205,9 @@ async fn read_environment_file(
         ));
     }
     if metadata.size > MAX_FILE_BYTES as u64 {
-        return Err(FunctionCallError::RespondToModel(
-            "file exceeds the 8 MiB read limit".to_string(),
-        ));
+        return Err(FunctionCallError::RespondToModel(format!(
+            "file exceeds the {MAX_FILE_MIB} MiB read limit"
+        )));
     }
     let contents = fs
         .read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox))
@@ -226,9 +219,9 @@ async fn read_environment_file(
             ))
         })?
         .ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "file exceeds the 8 MiB read limit or changed while being read".to_string(),
-            )
+            FunctionCallError::RespondToModel(format!(
+                "file exceeds the {MAX_FILE_MIB} MiB read limit or changed while being read"
+            ))
         })?;
     let contents = String::from_utf8(contents).map_err(|_| {
         FunctionCallError::RespondToModel("read_file requires UTF-8 text".to_string())
@@ -322,6 +315,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_read_file_records_evidence_and_invalidates_after_changes() {
+        use crate::session::turn_context::TurnEnvironment;
+        use crate::tool_history::SourceDependencyV1;
+        use crate::tools::parallel::ToolCallRuntime;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolRouter;
+        use codex_protocol::models::ResponseItem;
+        use codex_utils_absolute_path::AbsolutePathBuf;
+        use codex_utils_path_uri::PathUri;
+        use std::collections::BTreeSet;
+
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = workspace.path().join("file.txt");
+        std::fs::write(&path, "current text\n").unwrap();
+        let (session, mut turn) = make_session_and_context().await;
+        Arc::make_mut(&mut turn.config).cwd =
+            AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+        turn.permission_profile = PermissionProfile::Disabled;
+        turn.environments.turn_environments = vec![TurnEnvironment::new(
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            PathUri::from_host_native_path(workspace.path()).unwrap(),
+            None,
+        )];
+        let session = Arc::new(session);
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([Arc::new(ReadFileHandler) as Arc<dyn CoreToolRuntime>]),
+            Vec::new(),
+        ));
+        let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            session.clone(),
+            step,
+            Arc::new(Mutex::new(TurnDiffTracker::new())),
+        );
+        let arguments =
+            json!({"path": "file.txt", "selectors": [{"kind": "lines", "start": 1, "end": 1}]})
+                .to_string();
+        let result = runtime
+            .handle_tool_call_with_source(
+                ToolCall {
+                    tool_name: ToolName::plain("read_file"),
+                    call_id: "registered-file-read".into(),
+                    payload: ToolPayload::Function {
+                        arguments: arguments.clone(),
+                    },
+                },
+                ToolCallSource::CodeMode {
+                    cell_id: "read-cell".into(),
+                    parent_call_id: Some("outer-exec".into()),
+                    runtime_tool_call_id: "runtime-read".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.projected_source_dependencies(),
+            Some(&BTreeSet::from([SourceDependencyV1::new(&path, false)]))
+        );
+        let canonical: Arc<[ResponseItem]> = Arc::from([
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "read_file".into(),
+                namespace: None,
+                arguments,
+                call_id: "registered-file-read".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::from(result.response()),
+        ]);
+        assert_eq!(
+            result.code_mode_result()["results"][0]["text"],
+            "current text\n"
+        );
+        let mut history = session.clone_history().await.tool_history_state();
+        let revision = history
+            .workspace_evidence_revision_for_test("registered-file-read")
+            .unwrap();
+        assert_eq!(
+            history
+                .project_with_workspace_identity(canonical.clone(), revision.as_ref())
+                .items,
+            canonical
+        );
+        std::fs::write(&path, "changed text\n").unwrap();
+        assert!(
+            history
+                .invalidate_source_dependencies(Some(&BTreeSet::from([path])), revision.as_ref())
+        );
+        let projected = history.project_with_workspace_identity(canonical, revision.as_ref());
+        let output = serde_json::to_string(&projected.items[1]).unwrap();
+        assert!(output.contains("source_dependency_changed"), "{output}");
+        assert!(output.contains("read_file"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn omitted_selectors_read_whole_files_and_report_oversized_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whole.txt");
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
+            panic!("function tool expected");
+        };
+        let parameters = serde_json::to_value(&spec.parameters).unwrap();
+        let validator = jsonschema::validator_for(&parameters).unwrap();
+        for text in [
+            String::new(),
+            "one\nλ two\n".to_string(),
+            "large line\n".repeat(10_000),
+        ] {
+            std::fs::write(&path, &text).unwrap();
+            let mut call = invocation(&path, json!([]), false).await;
+            let arguments = json!({"path": path});
+            assert!(validator.is_valid(&arguments));
+            call.payload = ToolPayload::Function {
+                arguments: arguments.to_string(),
+            };
+            let payload = call.payload.clone();
+            let result = ReadFileHandler
+                .handle(call)
+                .await
+                .unwrap()
+                .code_mode_result(&payload);
+            assert_eq!(result["canonical_bytes"], text.len());
+            assert_eq!(result["total_lines"], text.lines().count());
+            assert_eq!(
+                result["results"][0]["selector"],
+                json!({"kind": "bytes", "start": 0, "end": text.len()})
+            );
+            if text.len() < 100 {
+                assert_eq!(result["complete"], true);
+                assert_eq!(result["results"][0]["text"], text);
+            } else {
+                assert_eq!(result["complete"], false);
+                assert_eq!(result["results"][0]["status"], "selector_too_large");
+                assert!(
+                    !result["results"][0]["child_selectors"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(result["artifact_id"].as_str().is_some());
+            }
+            jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+                .unwrap()
+                .validate(&result)
+                .unwrap();
+        }
+        assert!(!validator.is_valid(&json!({"path": path, "selectors": []})));
+    }
+
+    #[tokio::test]
     async fn selected_lines_recover_the_original_snapshot_after_a_file_change() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a file's contents.txt");
@@ -344,6 +500,7 @@ mod tests {
         assert_eq!(result["complete"], true);
         assert_eq!(result["path"], path.to_string_lossy().as_ref());
         assert_eq!(result["canonical_bytes"], 19);
+        assert_eq!(result["total_lines"], 3);
         assert_eq!(result["canonical_sha256"].as_str().unwrap().len(), 64);
         let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
             panic!("function tool expected")
@@ -542,7 +699,8 @@ mod tests {
             panic!("ordinary paths must require an execution environment")
         };
         assert!(
-            message.contains("read_file is unavailable without an environment"),
+            message.contains("read_file requires a ready execution environment")
+                && message.contains("wait_for_environment"),
             "{message}"
         );
     }

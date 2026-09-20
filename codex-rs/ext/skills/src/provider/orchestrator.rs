@@ -227,8 +227,12 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
         let plugin_name =
             normalized_label(meta.get("plugin_name")?.as_str()?, MAX_SKILL_NAME_CHARS)?;
         let qualified_name = format!("{plugin_name}:{skill_name}");
-        (qualified_name.chars().count() <= MAX_QUALIFIED_SKILL_NAME_CHARS)
-            .then_some(qualified_name)?
+        (qualified_name.len() <= MAX_QUALIFIED_SKILL_NAME_CHARS
+            || qualified_name
+                .chars()
+                .nth(MAX_QUALIFIED_SKILL_NAME_CHARS)
+                .is_none())
+        .then_some(qualified_name)?
     };
     let description = normalized_description(resource.description.as_deref().unwrap_or_default())?;
     let main_prompt = main_prompt_uri(uri);

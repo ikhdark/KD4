@@ -6,6 +6,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -13,7 +14,6 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -23,7 +23,7 @@ use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
@@ -109,10 +109,11 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_test_codex_shell_chain() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let call_id = "shell-command-call";
     let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
         vec![
             ev_response_created("resp-1"),
             ev_shell_command_call(call_id, "echo websocket"),
@@ -129,18 +130,28 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
     let mut builder = test_codex().with_windows_cmd_shell();
 
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy("run the echo command", test.config.legacy_sandbox_policy())
+    // Reserve a response for speculative warmup before submitting the actual shell turn.
+    let warmup = server.wait_for_request(0, 0).await.body_json();
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
+    let completion = test
+        .submit_turn_and_capture_completion("run the echo command")
         .await?;
+    assert!(
+        completion.error.is_none(),
+        "shell turn failed: {:?}",
+        completion.error
+    );
+    assert_eq!(completion.last_agent_message.as_deref(), Some("done"));
 
     let connection = server.single_connection();
-    assert_eq!(connection.len(), 2);
+    assert_eq!(connection.len(), 3);
 
     let first_turn = connection
-        .first()
+        .get(1)
         .expect("missing first turn request")
         .body_json();
     let second_turn = connection
-        .get(1)
+        .get(2)
         .expect("missing second turn request")
         .body_json();
 
@@ -151,7 +162,15 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
         .get("input")
         .and_then(Value::as_array)
         .expect("second response.create input array");
-    assert!(!input_items.is_empty());
+    let output = input_items
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        .expect("shell output must reach the continuation");
+    let body: codex_protocol::models::FunctionCallOutputBody =
+        serde_json::from_value(output["output"].clone())?;
+    let text = body.to_text().expect("text shell output");
+    assert!(text.contains("websocket"), "{text}");
+    assert!(text.contains("Exit code: 0"), "{text}");
 
     server.shutdown().await;
     Ok(())
@@ -159,7 +178,7 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
@@ -218,7 +237,7 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![
@@ -276,7 +295,7 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_cold_resume_and_fork_each_start_with_prewarm() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server(vec![
         vec![
@@ -393,7 +412,7 @@ async fn websocket_cold_resume_and_fork_each_start_with_prewarm() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let call_id = "shell-command-call";
     let mut shell_command_call = ev_shell_command_call(call_id, "echo websocket");
@@ -484,7 +503,7 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_v2_first_turn_uses_updated_fast_tier_after_startup_prewarm() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
@@ -534,7 +553,7 @@ async fn websocket_v2_first_turn_uses_updated_fast_tier_after_startup_prewarm() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
@@ -590,7 +609,7 @@ async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_v2_next_turn_uses_updated_service_tier() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],

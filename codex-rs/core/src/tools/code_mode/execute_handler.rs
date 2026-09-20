@@ -38,8 +38,10 @@ const NESTED_TOOL_TIMEOUT_GRACE_MS: u64 = 15_000;
 fn default_nested_tool_timeout_ms(background_terminal_max_timeout_ms: u64) -> u64 {
     background_terminal_max_timeout_ms
         .saturating_add(NESTED_TOOL_TIMEOUT_GRACE_MS)
-        .max(codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS)
-        .min(codex_code_mode::MAX_TOOL_TIMEOUT_MS)
+        .clamp(
+            codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS,
+            codex_code_mode::MAX_TOOL_TIMEOUT_MS,
+        )
 }
 
 #[derive(Clone)]
@@ -119,17 +121,8 @@ impl CodeModeExecuteHandler {
         // every cell does not rebuild it from cloned tool specs.
         nested_tool_specs.extend(deferred_nested_tool_specs);
         let mut enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
-        let mut by_global_name = HashMap::<String, ToolName>::with_capacity(enabled_tools.len());
-        for definition in &enabled_tools {
-            let global_name = codex_code_mode::normalize_code_mode_identifier(&definition.name);
-            if let Some(existing) = by_global_name.get(&global_name) {
-                return Err(format!(
-                    "code mode tool identifier collision: `{existing}` and `{}` both normalize to `{global_name}`",
-                    definition.tool_name
-                ));
-            }
-            by_global_name.insert(global_name, definition.tool_name.clone());
-        }
+        // The collector assigns unique normalized names. The runtime also
+        // validates catalogs at its host boundary; no second pass is needed here.
         // The rendered descriptions already contain the schema-derived TypeScript
         // declarations. The isolate consumes only callable metadata, so do not
         // clone and transport the original JSON schema trees for every cell.

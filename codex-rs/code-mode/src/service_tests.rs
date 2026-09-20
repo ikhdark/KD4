@@ -492,6 +492,46 @@ async fn oversized_store_rejects_all_writes_from_the_cell() {
 }
 
 #[tokio::test]
+async fn store_replacement_releases_bytes_in_current_and_later_cells() {
+    let session = InProcessCodeModeSession::new();
+    let first = execute(&session, ExecuteRequest {
+        source: r#"store("a", "x".repeat(4 * 1024 * 1024)); store("a", "small"); store("b", "y".repeat(6 * 1024 * 1024)); text(load("a"));"#.to_string(),
+        yield_time_ms: None,
+        ..execute_request("")
+    }).await;
+    assert_eq!(
+        first,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "small".to_string()
+            }],
+            error_text: None,
+        }
+    );
+    let second = execute(&session, ExecuteRequest {
+        source: r#"text(load("b").length); store("b", "tiny"); store("c", "z".repeat(6 * 1024 * 1024)); text(load("b"));"#.to_string(),
+        yield_time_ms: None,
+        ..execute_request("")
+    }).await;
+    assert_eq!(
+        second,
+        RuntimeResponse::Result {
+            cell_id: cell_id("2"),
+            content_items: vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "6291456".to_string()
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "tiny".to_string()
+                },
+            ],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
 async fn shutdown_interrupts_cpu_bound_cells() {
     let service = InProcessCodeModeSession::new();
 

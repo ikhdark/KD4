@@ -19,7 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
-use crate::render::line_utils::line_to_static;
+use crate::render::line_utils::line_into_static;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
 
@@ -137,7 +137,7 @@ pub(crate) fn adaptive_wrap_hyperlink_lines(
             line,
             adaptive_wrap_line(&line.line, options)
                 .into_iter()
-                .map(|wrapped| line_to_static(&wrapped))
+                .map(line_into_static)
                 .collect(),
         ));
     }
@@ -149,14 +149,8 @@ pub(crate) fn annotate_web_urls(lines: Vec<Line<'static>>) -> Vec<HyperlinkLine>
 }
 
 pub(crate) fn annotate_web_urls_in_line(line: Line<'static>) -> HyperlinkLine {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let mut out = HyperlinkLine::new(line);
-    out.hyperlinks = web_links_in_text(&text);
-    out
+    let hyperlinks = web_links_in_text(&line_text(&line));
+    HyperlinkLine { line, hyperlinks }
 }
 
 /// Re-attach source hyperlink ranges after visible-text wrapping has split a line.
@@ -188,7 +182,9 @@ pub(crate) fn remap_wrapped_line(
         let Some(rendered_start) = longest_suffix_matching_prefix(&rendered, remaining) else {
             continue;
         };
-        let mapped = &rendered[rendered_start..];
+        // The matched suffix is also a prefix of the source text. Borrow it
+        // there so updating this line's link ranges does not borrow its text.
+        let mapped = &remaining[..rendered.len() - rendered_start];
         let mut output_column = rendered[..rendered_start].width();
         for grapheme in mapped.graphemes(true) {
             let width = grapheme.width();
@@ -211,19 +207,57 @@ pub(crate) fn remap_wrapped_line(
     out
 }
 
-fn line_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
+fn line_text<'a>(line: &'a Line<'_>) -> std::borrow::Cow<'a, str> {
+    match line.spans.as_slice() {
+        [] => std::borrow::Cow::Borrowed(""),
+        [span] => std::borrow::Cow::Borrowed(span.content.as_ref()),
+        spans => std::borrow::Cow::Owned(spans.iter().map(|span| span.content.as_ref()).collect()),
+    }
 }
 
 fn longest_suffix_matching_prefix(rendered: &str, source: &str) -> Option<usize> {
-    rendered
-        .grapheme_indices(true)
-        .map(|(index, _)| index)
-        .chain(std::iter::once(rendered.len()))
-        .find(|index| source.starts_with(&rendered[*index..]) && *index < rendered.len())
+    if rendered.is_empty() || source.is_empty() {
+        return None;
+    }
+    if source.starts_with(rendered) {
+        return Some(0);
+    }
+    // KMP finds the longest source prefix matching the rendered suffix. Match
+    // bytes so a prefix may end inside a source grapheme; its start in rendered
+    // must still be a grapheme boundary, as required by hyperlink remapping.
+    let pattern = &source.as_bytes()[..source.len().min(rendered.len())];
+    let mut failure = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        let mut matched = failure[index - 1];
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = failure[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        failure[index] = matched;
+    }
+    let mut matched = 0;
+    for &byte in rendered.as_bytes() {
+        while matched > 0 && (matched == pattern.len() || byte != pattern[matched]) {
+            matched = failure[matched - 1];
+        }
+        if byte == pattern[matched] {
+            matched += 1;
+        }
+    }
+    let mut boundaries = vec![false; rendered.len()];
+    for (index, _) in rendered.grapheme_indices(true) {
+        boundaries[index] = true;
+    }
+    while matched > 0 {
+        let start = rendered.len() - matched;
+        if boundaries[start] {
+            return Some(start);
+        }
+        matched = failure[matched - 1];
+    }
+    None
 }
 
 fn push_link_range(line: &mut HyperlinkLine, range: Range<usize>, destination: &str) {
@@ -245,13 +279,11 @@ fn push_link_range(line: &mut HyperlinkLine, range: Range<usize>, destination: &
 
 pub(crate) fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink> {
     let mut links = Vec::new();
-    let mut search_from = 0usize;
+    let mut measured_byte = 0;
+    let mut measured_columns = 0;
     for raw_token in text.split_ascii_whitespace() {
-        let Some(relative_start) = text[search_from..].find(raw_token) else {
-            continue;
-        };
-        let raw_start = search_from + relative_start;
-        search_from = raw_start + raw_token.len();
+        // split_ascii_whitespace returns slices of this allocation.
+        let raw_start = raw_token.as_ptr() as usize - text.as_ptr() as usize;
         let trimmed_start = raw_token
             .find(|ch: char| !is_leading_punctuation(ch))
             .unwrap_or(raw_token.len());
@@ -263,7 +295,10 @@ pub(crate) fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink> {
         let Some(destination) = web_destination(candidate) else {
             continue;
         };
-        let start = text[..raw_start + trimmed_start].width();
+        let candidate_start = raw_start + trimmed_start;
+        measured_columns += text[measured_byte..candidate_start].width();
+        measured_byte = candidate_start;
+        let start = measured_columns;
         let end = start + candidate.width();
         links.push(TerminalHyperlink {
             columns: start..end,
@@ -557,6 +592,28 @@ fn mark_matching_cells(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn suffix_matching_preserves_grapheme_starts_and_partial_source_graphemes() {
+        assert_eq!(
+            longest_suffix_matching_prefix("prefix abc", "abcdef"),
+            Some(7)
+        );
+        assert_eq!(longest_suffix_matching_prefix("aaaaab", "aaaaac"), None);
+        assert_eq!(
+            longest_suffix_matching_prefix("prefix e", "e\u{301}x"),
+            Some(7)
+        );
+        assert_eq!(longest_suffix_matching_prefix("e\u{301}", "\u{301}x"), None);
+        assert_eq!(longest_suffix_matching_prefix("😀中", "中x"), Some(4));
+        assert_eq!(longest_suffix_matching_prefix("", "abc"), None);
+        assert_eq!(longest_suffix_matching_prefix("abc", ""), None);
+        let repeated = "a".repeat(20_000) + "b";
+        assert_eq!(
+            longest_suffix_matching_prefix(&repeated, &("a".repeat(20_000) + "c")),
+            None
+        );
+    }
 
     #[test]
     fn joined_emoji_preserve_link_columns_and_complete_graphemes() {

@@ -20,7 +20,7 @@
 //! functions. Callers that definitely will not (code blocks, pure
 //! numeric output) can use the standard path for speed.
 //!
-//! URL detection is heuristic — see [`text_contains_url_like`] for the
+//! URL detection is heuristic — see [`is_url_like_token`] for the
 //! rules. False positives suppress hyphenation for that line; false
 //! negatives let a URL get split. The heuristic is intentionally
 //! conservative: file paths like `src/main.rs` are not matched.
@@ -205,6 +205,7 @@ fn map_owned_wrapped_line_to_range(
 /// Returns `true` if any whitespace-delimited token in `line` looks like a URL.
 ///
 /// Concatenates all span contents and delegates to [`text_contains_url_like`].
+#[cfg(test)]
 pub(crate) fn line_contains_url_like(line: &Line<'_>) -> bool {
     let text: String = line
         .spans
@@ -219,6 +220,7 @@ pub(crate) fn line_contains_url_like(line: &Line<'_>) -> bool {
 ///
 /// Decorative marker tokens (for example list prefixes like `-`, `1.`, `|`,
 /// `│`) are ignored for the non-URL side of this check.
+#[cfg(test)]
 pub(crate) fn line_has_mixed_url_and_non_url_tokens(line: &Line<'_>) -> bool {
     let text: String = line
         .spans
@@ -239,12 +241,14 @@ pub(crate) fn line_has_mixed_url_and_non_url_tokens(line: &Line<'_>) -> bool {
 /// checking. Tokens that look like file paths (`src/main.rs`, `foo/bar`)
 /// are intentionally rejected — the host portion must be a valid domain
 /// name (with a recognized TLD), an IPv4 address, or `localhost`.
+#[cfg(test)]
 pub(crate) fn text_contains_url_like(text: &str) -> bool {
     text.split_ascii_whitespace().any(is_url_like_token)
 }
 
 /// Returns `true` if `text` contains at least one URL-like token and at least
 /// one substantive non-URL token.
+#[cfg(test)]
 fn text_has_mixed_url_and_non_url_tokens(text: &str) -> bool {
     let (saw_url, saw_non_url) = classify_url_tokens(text);
     saw_url && saw_non_url
@@ -514,15 +518,44 @@ pub(crate) fn url_preserving_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<
 #[must_use]
 pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) -> Vec<Line<'a>> {
     let (flat, span_bounds) = flatten_line(line);
-    let (saw_url, saw_non_url) = classify_url_tokens(&flat);
-    if !saw_url {
-        return word_wrap_flat_line(line, base, &flat, &span_bounds);
-    }
+    let classification = classify_url_tokens(&flat);
+    adaptive_wrap_flat_line(line, base, &flat, &span_bounds, classification)
+}
 
-    if saw_non_url {
-        mixed_url_wrap_line(line, base, &flat, &span_bounds)
+/// Classify once, returning `None` when the terminal should wrap the original
+/// URL-only line (including its existing hyperlink metadata).
+pub(crate) fn adaptive_wrap_scrollback_line<'a>(
+    line: &'a Line<'a>,
+    base: RtOptions<'a>,
+) -> Option<Vec<Line<'a>>> {
+    let (flat, span_bounds) = flatten_line(line);
+    let classification = classify_url_tokens(&flat);
+    if classification == (true, false) {
+        None
     } else {
-        word_wrap_flat_line(line, url_preserving_wrap_options(base), &flat, &span_bounds)
+        Some(adaptive_wrap_flat_line(
+            line,
+            base,
+            &flat,
+            &span_bounds,
+            classification,
+        ))
+    }
+}
+
+fn adaptive_wrap_flat_line<'a>(
+    line: &'a Line<'a>,
+    base: RtOptions<'a>,
+    flat: &str,
+    span_bounds: &[(Range<usize>, ratatui::style::Style)],
+    (saw_url, saw_non_url): (bool, bool),
+) -> Vec<Line<'a>> {
+    if !saw_url {
+        word_wrap_flat_line(line, base, flat, span_bounds)
+    } else if saw_non_url {
+        mixed_url_wrap_line(line, base, flat, span_bounds)
+    } else {
+        word_wrap_flat_line(line, url_preserving_wrap_options(base), flat, span_bounds)
     }
 }
 
@@ -543,6 +576,9 @@ where
     L: IntoLineInput<'a>,
 {
     let base_opts = width_or_options;
+    let subsequent_opts = base_opts
+        .clone()
+        .initial_indent(base_opts.subsequent_indent.clone());
     let mut out: Vec<Line<'static>> = Vec::new();
 
     for (idx, line) in lines.into_iter().enumerate() {
@@ -550,13 +586,11 @@ where
         let opts = if idx == 0 {
             base_opts.clone()
         } else {
-            base_opts
-                .clone()
-                .initial_indent(base_opts.subsequent_indent.clone())
+            subsequent_opts.clone()
         };
 
         let wrapped = adaptive_wrap_line(line_input.as_ref(), opts);
-        push_owned_lines(&wrapped, &mut out);
+        push_owned_lines(wrapped, &mut out);
     }
 
     out
@@ -890,8 +924,8 @@ fn split_mixed_url_word(text: &str, word: MixedUrlWord, line_limit: usize) -> Ve
 }
 
 fn flatten_line(line: &Line<'_>) -> (String, Vec<(Range<usize>, ratatui::style::Style)>) {
-    let mut flat = String::new();
-    let mut span_bounds = Vec::new();
+    let mut flat = String::with_capacity(line.spans.iter().map(|span| span.content.len()).sum());
+    let mut span_bounds = Vec::with_capacity(line.spans.len());
     let mut acc = 0usize;
     for span in &line.spans {
         let text = span.content.as_ref();
@@ -995,7 +1029,7 @@ where
             o
         };
         let wrapped = word_wrap_line(line_input.as_ref(), opts);
-        push_owned_lines(&wrapped, &mut out);
+        push_owned_lines(wrapped, &mut out);
     }
 
     out

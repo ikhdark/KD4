@@ -366,10 +366,24 @@ async fn immutable_git_show_identity_with_authorization_scope(
     #[cfg(test)]
     test_observation::record_immutable_git_show_identity();
     let started = Instant::now();
-    if !is_immutable_git_show_candidate(program, args) {
+    if !is_git_program(program) {
         return None;
     }
-    let requested = &args[1];
+    let (directories, requested) = immutable_git_show_arguments(args)?;
+    let mut effective_cwd = cwd.to_path_buf();
+    for directory in directories.chunks_exact(2).map(|pair| &pair[1]) {
+        // Git applies successive -C options relative to the preceding one;
+        // an empty argument leaves the current directory unchanged.
+        if !directory.is_empty() {
+            effective_cwd = tokio::fs::canonicalize(effective_cwd.join(directory))
+                .await
+                .ok()?;
+            if !effective_cwd.is_dir() {
+                return None;
+            }
+        }
+    }
+    let cwd = effective_cwd.as_path();
     let (object, suffix) = requested
         .split_once(':')
         .unwrap_or((requested.as_str(), ""));
@@ -385,6 +399,13 @@ async fn immutable_git_show_identity_with_authorization_scope(
         object.to_string()
     } else {
         format!("{object}:{normalized_suffix}")
+    };
+    // A caller's cached namespace describes its original cwd, which -C may
+    // leave entirely. Discover the actual repository before looking up evidence.
+    let project_namespace_hint = if directories.is_empty() {
+        project_namespace_hint
+    } else {
+        ProjectNamespaceHint::Discover
     };
     let project_namespace = match project_namespace_hint {
         ProjectNamespaceHint::Resolved(Some(namespace)) => namespace.to_owned(),
@@ -417,7 +438,19 @@ async fn immutable_git_show_identity_with_authorization_scope(
 /// Known Delta. Callers use this before computing repository identity so an
 /// ordinary `rg`, status, or shell command never spawns fingerprinting Git.
 pub(crate) fn is_immutable_git_show_candidate(program: &str, args: &[String]) -> bool {
-    is_git_program(program) && args.len() == 2 && args[0] == "show"
+    is_git_program(program) && immutable_git_show_arguments(args).is_some()
+}
+
+fn immutable_git_show_arguments(args: &[String]) -> Option<(&[String], &String)> {
+    let mut offset = 0;
+    while args.get(offset).is_some_and(|arg| arg == "-C") {
+        args.get(offset + 1)?;
+        offset += 2;
+    }
+    match &args[offset..] {
+        [command, object] if command == "show" => Some((&args[..offset], object)),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -692,27 +725,37 @@ pub(crate) fn render_hit(candidate: &EvidenceCandidate, artifact: &RawOutputArti
 }
 
 fn store_root(codex_home: &Path) -> PathBuf {
-    codex_home.join("tool-output").join(STORE_DIRECTORY)
+    let mut path = codex_home.to_path_buf();
+    path.push("tool-output");
+    path.push(STORE_DIRECTORY);
+    path
 }
 
 fn evidence_path(codex_home: &Path, identity: &EvidenceIdentity) -> PathBuf {
-    store_root(codex_home)
-        .join("evidence")
-        .join(&identity.project_namespace)
-        .join(format!("{}.json", identity.fingerprint))
+    let mut path = store_root(codex_home);
+    path.push("evidence");
+    path.push(&identity.project_namespace);
+    path.push(&identity.fingerprint);
+    path.as_mut_os_string().push(".json");
+    path
 }
 
 fn blob_path(codex_home: &Path, blob_digest: &str) -> PathBuf {
     // Keep cache blobs in the shape consumed by the existing global
     // tool-output retention sweep instead of introducing another budget.
-    store_root(codex_home).join(format!("{blob_digest}.log"))
+    let mut path = store_root(codex_home);
+    path.push(blob_digest);
+    path.as_mut_os_string().push(".log");
+    path
 }
 
 fn unsafe_path(codex_home: &Path, identity: &EvidenceIdentity) -> PathBuf {
-    store_root(codex_home)
-        .join("unsafe")
-        .join(&identity.project_namespace)
-        .join(format!("{}.unsafe", identity.lineage_key))
+    let mut path = store_root(codex_home);
+    path.push("unsafe");
+    path.push(&identity.project_namespace);
+    path.push(&identity.lineage_key);
+    path.as_mut_os_string().push(".unsafe");
+    path
 }
 
 fn runtime_quarantine_state() -> &'static Mutex<RuntimeQuarantineState> {
@@ -1603,6 +1646,70 @@ fn main() {
         .expect("prepared lookup");
         assert!(same_scope.has_candidate());
         assert!(same_scope.is_hit());
+    }
+
+    #[tokio::test]
+    async fn immutable_git_show_c_options_resolve_the_actual_repository() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo, "immutable\n");
+        let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
+        let direct = immutable_git_show_identity(&repo, "git", &["show".to_string(), blob.clone()])
+            .await
+            .unwrap();
+        let redirected = immutable_git_show_identity_with_project_namespace(
+            root.path(),
+            "git",
+            &[
+                "-C".to_string(),
+                "repo".to_string(),
+                "-C".to_string(),
+                String::new(),
+                "-C".to_string(),
+                ".".to_string(),
+                "show".to_string(),
+                blob.clone(),
+            ],
+            ProjectNamespaceHint::Resolved(Some("wrong-parent-project")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(redirected.project_namespace, direct.project_namespace);
+        assert_eq!(redirected.fingerprint, direct.fingerprint);
+        for args in [
+            vec!["-C".to_string()],
+            vec![
+                "-C".to_string(),
+                "missing".to_string(),
+                "show".to_string(),
+                blob.clone(),
+            ],
+            vec![
+                "-C".to_string(),
+                "repo/read.txt".to_string(),
+                "show".to_string(),
+                blob.clone(),
+            ],
+            vec![
+                "-C".to_string(),
+                "repo".to_string(),
+                "show".to_string(),
+                "HEAD:read.txt".to_string(),
+            ],
+            vec![
+                "-c".to_string(),
+                "core.pager=cat".to_string(),
+                "show".to_string(),
+                blob,
+            ],
+        ] {
+            assert!(
+                immutable_git_show_identity(root.path(), "git", &args)
+                    .await
+                    .is_none(),
+                "{args:?}"
+            );
+        }
     }
 
     #[tokio::test]

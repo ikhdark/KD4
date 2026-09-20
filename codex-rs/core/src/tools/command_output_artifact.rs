@@ -34,7 +34,7 @@ use codex_tools::CanonicalToolResultKind;
 #[cfg(test)]
 use codex_tools::ToolProjectionInclusion;
 use codex_tools::ToolProjectionSection;
-use codex_utils_string::approx_token_count;
+use codex_utils_string::approx_token_count_exceeds;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -881,8 +881,7 @@ fn scan_retention_root_blocking(
         }
         directories_visited = directories_visited.saturating_add(1);
         let mut entries = std::fs::read_dir(thread_entry.path())?;
-        let mut log_paths = Vec::new();
-        let mut bytes_by_stem = BTreeMap::<String, u64>::new();
+        let mut artifacts_by_stem = BTreeMap::<String, (u64, Option<PathBuf>)>::new();
         while let Some(entry) = entries.next().transpose()? {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -894,10 +893,7 @@ fn scan_retention_root_blocking(
                 if candidates_visited as usize > capacity {
                     oversized = true;
                     index = None;
-                    log_paths.clear();
-                    bytes_by_stem.clear();
-                } else if !oversized {
-                    log_paths.push(path.clone());
+                    artifacts_by_stem.clear();
                 }
             }
             if oversized {
@@ -907,23 +903,28 @@ fn scan_retention_root_blocking(
                 continue;
             };
             let bytes = entry.metadata()?.len();
-            let entry_bytes = bytes_by_stem.entry(stem.to_string()).or_default();
+            let (entry_bytes, log_path) = if let Some(entry) = artifacts_by_stem.get_mut(stem) {
+                entry
+            } else {
+                artifacts_by_stem.entry(stem.to_string()).or_default()
+            };
             *entry_bytes = entry_bytes.checked_add(bytes).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "logical artifact byte total overflowed",
                 )
             })?;
+            if is_log {
+                *log_path = Some(path);
+            }
         }
         if oversized {
             continue;
         }
-        for path in log_paths {
-            let stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or_default();
-            let bytes = bytes_by_stem.get(stem).copied().unwrap_or_default();
+        for (bytes, path) in artifacts_by_stem.into_values() {
+            let Some(path) = path else {
+                continue;
+            };
             let Some(record) = artifact_retention_record_with_bytes_blocking(&path, bytes)? else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -1250,7 +1251,7 @@ impl RawOutputArtifactWriter {
         state: Option<&Arc<Mutex<RawOutputArtifact>>>,
         output: &[u8],
     ) {
-        if let Some((codex_home, thread_id)) = self.pending_target.clone() {
+        if let Some((codex_home, thread_id)) = self.pending_target.as_ref() {
             // Keep small output inline and defer all artifact I/O until this buffer grows.
             self.pending_output.extend_from_slice(output);
             if self.pending_output.len() <= LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
@@ -1258,7 +1259,7 @@ impl RawOutputArtifactWriter {
             }
             let artifact = create_raw_output_artifact_inner(
                 codex_home.as_path(),
-                &thread_id,
+                thread_id,
                 &self.pending_output,
                 false,
             )
@@ -1271,7 +1272,7 @@ impl RawOutputArtifactWriter {
             }
             return;
         }
-        let (Some(state), Some(id), Some(path)) = (state, self.id, self.path.clone()) else {
+        let (Some(state), Some(id), Some(path)) = (state, self.id, self.path.as_ref()) else {
             return;
         };
         let Some(file) = self.file.as_mut() else {
@@ -1307,7 +1308,7 @@ impl RawOutputArtifactWriter {
         }) {
             Ok((bytes, modified)) => {
                 if let Some(token) = self.retention_token.as_ref() {
-                    publish_streaming_size_async(token, &path, bytes, modified, false).await;
+                    publish_streaming_size_async(token, path, bytes, modified, false).await;
                 }
             }
             Err(_) => {
@@ -1316,12 +1317,25 @@ impl RawOutputArtifactWriter {
                 }
             }
         }
+        let mut artifact = state.lock().await;
+        if let RawOutputArtifact::Stored {
+            id: stored_id,
+            bytes,
+            truncated,
+            ..
+        } = &mut *artifact
+            && *stored_id == id
+        {
+            *bytes = self.bytes;
+            *truncated = self.truncated;
+            return;
+        }
         let Some(handle) = self.handle.clone() else {
             return;
         };
-        *state.lock().await = RawOutputArtifact::Stored {
+        *artifact = RawOutputArtifact::Stored {
             id,
-            path,
+            path: path.clone(),
             bytes: self.bytes,
             truncated: self.truncated,
             handle,
@@ -2249,17 +2263,17 @@ fn response_fits_recovery_ceiling(value: &impl Serialize) -> bool {
 
 fn response_fits_recovery_token_ceiling(value: &impl Serialize, token_ceiling: usize) -> bool {
     serde_json::to_string(value)
-        .is_ok_and(|rendered| approx_token_count(&rendered) <= token_ceiling)
+        .is_ok_and(|rendered| !approx_token_count_exceeds(&rendered, token_ceiling))
 }
 
 fn response_fits_recovery_retry_avoidance_ceiling(
     value: &impl Serialize,
     token_ceiling: usize,
 ) -> bool {
-    serde_json::to_string(value).is_ok_and(|rendered| {
-        approx_token_count(&rendered)
-            <= token_ceiling.saturating_add(RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN)
-    })
+    response_fits_recovery_token_ceiling(
+        value,
+        token_ceiling.saturating_add(RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN),
+    )
 }
 
 fn successful_byte_selector_result(

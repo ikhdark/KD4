@@ -18,13 +18,13 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::require_network;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -76,7 +76,7 @@ async fn submit_text_turn(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -108,7 +108,7 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -158,7 +158,7 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_sent_once_on_start() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -193,7 +193,7 @@ async fn permissions_message_sent_once_on_start() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_added_on_override_change() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
@@ -261,7 +261,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_not_added_when_no_change() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
@@ -320,7 +320,7 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_omitted_when_disabled() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
@@ -391,7 +391,7 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_replays_permissions_messages() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -486,7 +486,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_and_fork_append_permissions_messages() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -629,7 +629,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_includes_writable_roots() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(

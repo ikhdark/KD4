@@ -55,7 +55,7 @@ fn test_turn_responses_metadata(
 
 #[tokio::test]
 async fn responses_stream_includes_subagent_header_on_review() {
-    core_test_support::skip_if_no_network!();
+    core_test_support::require_network!();
 
     let server = responses::start_mock_server().await;
     let response_body = responses::sse(vec![
@@ -192,7 +192,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
 
 #[tokio::test]
 async fn responses_stream_includes_subagent_header_on_other() {
-    core_test_support::skip_if_no_network!();
+    core_test_support::require_network!();
 
     let server = responses::start_mock_server().await;
     let response_body = responses::sse(vec![
@@ -315,7 +315,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
 
 #[tokio::test]
 async fn responses_includes_configured_reasoning_summary_for_supported_model() {
-    core_test_support::skip_if_no_network!();
+    core_test_support::require_network!();
 
     let server = responses::start_mock_server().await;
     let response_body = responses::sse(vec![
@@ -452,7 +452,7 @@ async fn responses_includes_configured_reasoning_summary_for_supported_model() {
 
 #[tokio::test]
 async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() {
-    core_test_support::skip_if_no_network!();
+    core_test_support::require_network!();
 
     let server = responses::start_mock_server().await;
     let response_body = responses::sse(vec![

@@ -595,15 +595,16 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
         .start(ExecParams {
             process_id: ProcessId::from("proc-windows-signal"),
             argv: vec![
-                "cmd".to_string(),
+                "cmd.exe".to_string(),
+                "/D".to_string(),
                 "/C".to_string(),
-                "echo ready && ping -n 30 127.0.0.1 >NUL".to_string(),
+                "echo ready & set /p input=".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
-            pipe_stdin: false,
+            pipe_stdin: true,
             arg0: None,
             sandbox: None,
             enforce_managed_network: false,
@@ -611,6 +612,19 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
         })
         .await?;
 
+    let ready = timeout(
+        Duration::from_secs(5),
+        session.process.read(None, None, Some(5_000)),
+    )
+    .await??;
+    assert_eq!(ready.exit_code, None, "signal requires a running process");
+    assert!(!ready.closed);
+    assert!(
+        ready.chunks.iter().any(
+            |chunk| String::from_utf8_lossy(&chunk.chunk.clone().into_inner()).contains("ready")
+        ),
+        "{ready:?}"
+    );
     let err = match session.process.signal(ProcessSignal::Interrupt).await {
         Ok(()) => anyhow::bail!("Windows non-TTY signal should report unsupported"),
         Err(err) => err,

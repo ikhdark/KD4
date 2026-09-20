@@ -305,7 +305,6 @@ fn spawn_supervised_runtime_thread(
     });
 }
 
-#[derive(Clone)]
 struct RuntimeConfig {
     tool_call_id: String,
     enabled_tools: Arc<EnabledToolCatalog>,
@@ -361,6 +360,8 @@ pub(super) struct RuntimeState {
     pending_notifications: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, JsonValue>,
+    stored_value_bytes: HashMap<String, usize>,
+    total_stored_value_bytes: usize,
     stored_value_writes: HashMap<String, JsonValue>,
     stored_value_limit_error: Option<String>,
     enabled_tools: Arc<EnabledToolCatalog>,
@@ -402,16 +403,6 @@ fn stored_value_entry_bytes(key: &str, value: &JsonValue) -> usize {
         return usize::MAX;
     }
     counter.bytes
-}
-
-pub(crate) fn stored_values_within_limits(values: &HashMap<String, JsonValue>) -> bool {
-    values.len() <= MAX_SESSION_STORED_VALUES
-        && values
-            .iter()
-            .try_fold(0usize, |total, (key, value)| {
-                total.checked_add(stored_value_entry_bytes(key, value))
-            })
-            .is_some_and(|bytes| bytes <= MAX_SESSION_STORED_VALUE_BYTES)
 }
 
 pub(crate) fn stored_values_with_writes_within_limits(
@@ -497,12 +488,22 @@ fn run_runtime(
     let scope = &mut v8::ContextScope::new(scope, context);
 
     let timer_scheduler = timers::TimerScheduler::new(runtime_command_tx);
+    let stored_value_bytes: HashMap<_, _> = config
+        .stored_values
+        .iter()
+        .map(|(key, value)| (key.clone(), stored_value_entry_bytes(key, value)))
+        .collect();
+    let total_stored_value_bytes = stored_value_bytes
+        .values()
+        .fold(0usize, |total, bytes| total.saturating_add(*bytes));
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
         pending_notifications: HashMap::new(),
         pending_timeouts: HashMap::new(),
         stored_values: config.stored_values,
+        stored_value_bytes,
+        total_stored_value_bytes,
         stored_value_writes: HashMap::new(),
         stored_value_limit_error: None,
         enabled_tools: config.enabled_tools,

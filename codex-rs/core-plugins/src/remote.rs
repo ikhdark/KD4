@@ -1877,7 +1877,10 @@ fn normalize_remote_default_prompts(prompts: &[String]) -> Option<Vec<String>> {
 
 fn normalize_remote_default_prompt(prompt: &str) -> Option<String> {
     let prompt = prompt.trim();
-    if prompt.is_empty() || prompt.chars().count() > MAX_REMOTE_DEFAULT_PROMPT_LEN {
+    if prompt.is_empty()
+        || (prompt.len() > MAX_REMOTE_DEFAULT_PROMPT_LEN
+            && prompt.chars().nth(MAX_REMOTE_DEFAULT_PROMPT_LEN).is_some())
+    {
         return None;
     }
     Some(prompt.to_string())

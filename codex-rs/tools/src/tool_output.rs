@@ -209,7 +209,7 @@ fn serialize_canonical_json(
                 }
                 append_json_string(key, output);
                 output.push(b':');
-                let escaped = key.replace('~', "~0").replace('/', "~1");
+                let escaped = codex_utils_string::json_pointer_segment(key);
                 let child = format!("{pointer}/{escaped}");
                 direct_children.push(child.clone());
                 serialize_canonical_json(value, &child, output, pointers);
@@ -642,6 +642,11 @@ impl PartialEq for JsonToolOutput {
 }
 
 impl JsonToolOutput {
+    /// Borrow the canonical JSON without creating another retained copy.
+    pub fn value(&self) -> &JsonValue {
+        &self.value
+    }
+
     pub fn new(value: JsonValue) -> Self {
         Self {
             value,
@@ -796,77 +801,71 @@ fn is_empty_projection(value: &JsonValue) -> bool {
 }
 
 fn is_essential_key(key: &str) -> bool {
-    let normalized = key.to_ascii_lowercase();
     key == "id"
         || key.ends_with("_id")
         || key.ends_with("Id")
-        || matches!(
-            normalized.as_str(),
-            "cursor"
-                | "next_cursor"
-                | "nextcursor"
-                | "next_cursors"
-                | "nextcursors"
-                | "previous_cursor"
-                | "previouscursor"
-                | "status"
-                | "agent_status"
-                | "process_status"
-                | "coverage_status"
-                | "index_status"
-                | "previous_status"
-                | "state"
-                | "attempt_state"
-                | "lease_state"
-                | "state_revision"
-                | "gate"
-                | "gates"
-                | "pending_gates"
-                | "unresolved_gates"
-                | "next_action"
-                | "next_required_action"
-                | "nextrequiredaction"
-        )
-        || normalized == "aborted"
-        || normalized == "abort_reason"
-        || normalized == "abortreason"
-        || matches!(
-            normalized.as_str(),
-            "omitted_count"
-                | "omittedcount"
-                | "omitted_result_count"
-                | "omittedresultcount"
-                | "omitted_error_count"
-                | "omittederrorcount"
-                | "omitted_item_counts"
-                | "truncated_count"
-                | "truncatedcount"
-                | "remaining_count"
-                | "remainingcount"
-                | "remaining_match_count"
-                | "remainingmatchcount"
-                | "remaining_result_count"
-                | "remainingresultcount"
-                | "retention_limit_reason"
-                | "retentionlimitreason"
-                | "raw_output_artifact_retention_limit_reason"
-                | "raw_output_artifact_retention_limit_hit"
-        )
-        || normalized == "retention_limit_hit"
-        || normalized == "retentionlimithit"
-        || normalized == "action"
-        || normalized == "outcome"
-        || matches!(
-            normalized.as_str(),
-            "sha256"
-                | "content_identity"
-                | "unchanged"
-                | "selected_test_count"
-                | "matched_tests"
-                | "command_was_executed"
-                | "failure_signature"
-                | "not_exercised"
-        )
+        || [
+            "abort_reason",
+            "aborted",
+            "abortreason",
+            "action",
+            "agent_status",
+            "attempt_state",
+            "command_was_executed",
+            "content_identity",
+            "coverage_status",
+            "cursor",
+            "failure_signature",
+            "gate",
+            "gates",
+            "index_status",
+            "lease_state",
+            "matched_tests",
+            "next_action",
+            "next_cursor",
+            "next_cursors",
+            "next_required_action",
+            "nextcursor",
+            "nextcursors",
+            "nextrequiredaction",
+            "not_exercised",
+            "omitted_count",
+            "omitted_error_count",
+            "omitted_item_counts",
+            "omitted_result_count",
+            "omittedcount",
+            "omittederrorcount",
+            "omittedresultcount",
+            "outcome",
+            "pending_gates",
+            "previous_cursor",
+            "previous_status",
+            "previouscursor",
+            "process_status",
+            "raw_output_artifact_retention_limit_hit",
+            "raw_output_artifact_retention_limit_reason",
+            "remaining_count",
+            "remaining_match_count",
+            "remaining_result_count",
+            "remainingcount",
+            "remainingmatchcount",
+            "remainingresultcount",
+            "retention_limit_hit",
+            "retention_limit_reason",
+            "retentionlimithit",
+            "retentionlimitreason",
+            "selected_test_count",
+            "sha256",
+            "state",
+            "state_revision",
+            "status",
+            "truncated_count",
+            "truncatedcount",
+            "unchanged",
+            "unresolved_gates",
+        ]
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
 }
 
 impl ToolOutput for JsonToolOutput {
@@ -1078,30 +1077,40 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
 }
 
 fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) -> JsonValue {
-    JsonValue::String(
-        items
-            .iter()
-            .filter_map(|item| match item {
-                FunctionCallOutputContentItem::InputText { text } if !text.trim().is_empty() => {
-                    Some(text.clone())
-                }
-                FunctionCallOutputContentItem::InputImage { image_url, .. }
-                    if !image_url.trim().is_empty() =>
-                {
-                    Some(image_url.clone())
-                }
-                FunctionCallOutputContentItem::InputText { .. }
-                | FunctionCallOutputContentItem::InputImage { .. }
-                | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    let mut output = String::new();
+    for text in items.iter().filter_map(|item| match item {
+        FunctionCallOutputContentItem::InputText { text } if !text.trim().is_empty() => {
+            Some(text.as_str())
+        }
+        FunctionCallOutputContentItem::InputImage { image_url, .. }
+            if !image_url.trim().is_empty() =>
+        {
+            Some(image_url.as_str())
+        }
+        FunctionCallOutputContentItem::InputText { .. }
+        | FunctionCallOutputContentItem::InputImage { .. }
+        | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+    }) {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(text);
+    }
+    JsonValue::String(output)
 }
 
 pub fn telemetry_preview(content: &str) -> String {
     let truncated_slice = &content[..content.floor_char_boundary(TELEMETRY_PREVIEW_MAX_BYTES)];
     let truncated_by_bytes = truncated_slice.len() < content.len();
+    if !truncated_by_bytes
+        && content
+            .lines()
+            .take(TELEMETRY_PREVIEW_MAX_LINES + 1)
+            .count()
+            <= TELEMETRY_PREVIEW_MAX_LINES
+    {
+        return content.to_string();
+    }
 
     let mut preview = String::new();
     let mut lines_iter = truncated_slice.lines();
@@ -1116,12 +1125,6 @@ pub fn telemetry_preview(content: &str) -> String {
             None => break,
         }
     }
-    let truncated_by_lines = lines_iter.next().is_some();
-
-    if !truncated_by_bytes && !truncated_by_lines {
-        return content.to_string();
-    }
-
     if preview.len() < truncated_slice.len()
         && truncated_slice
             .as_bytes()
@@ -1142,6 +1145,24 @@ pub fn telemetry_preview(content: &str) -> String {
 #[cfg(test)]
 mod canonical_tests {
     use super::*;
+
+    #[test]
+    fn essential_fields_preserve_case_insensitive_controls_and_exact_id_rules() {
+        assert_eq!(
+            essential_projection_fields(&serde_json::json!({
+                "STATUS": "ready", "NextCursor": "next", "task_id": "one",
+                "SHA256": "digest",
+                "taskId": "two", "ID": "spill", "task_ID": "spill",
+                "body": [{"GATES": ["approval"], "text": "spill"}],
+                "unrelated": "spill"
+            })),
+            serde_json::json!({
+                "STATUS": "ready", "NextCursor": "next", "task_id": "one",
+                "SHA256": "digest",
+                "taskId": "two", "body": [{"GATES": ["approval"]}]
+            })
+        );
+    }
 
     #[test]
     fn telemetry_preview_stops_before_split_utf8_character() {

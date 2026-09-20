@@ -1,6 +1,7 @@
 //! Watches subscribed files or directories and routes coarse-grained change
 //! notifications to the subscribers that own matching watched paths.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -226,31 +227,43 @@ fn compress_changed_paths(paths: &mut BTreeSet<PathBuf>, capacity: usize) -> boo
     if capacity == 0 {
         return false;
     }
+    if paths.len() < capacity {
+        return true;
+    }
 
-    while paths.len() >= capacity {
-        let deepest = paths
-            .iter()
-            .map(|path| path.components().count())
-            .max()
-            .unwrap_or(0);
-        let mut compressed = BTreeSet::new();
-        for path in paths.iter() {
-            if path.components().count() == deepest {
-                compressed.insert(
-                    path.parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| path.clone()),
-                );
+    // Move paths into depth buckets once. Only the deepest bucket changes in
+    // each round, and popping a component reuses the owned path allocation.
+    let mut by_depth = BTreeMap::<usize, BTreeSet<PathBuf>>::new();
+    let mut count = paths.len();
+    for path in std::mem::take(paths) {
+        by_depth
+            .entry(path.components().count())
+            .or_default()
+            .insert(path);
+    }
+    while count >= capacity {
+        let Some((depth, deepest)) = by_depth.pop_last() else {
+            break;
+        };
+        count -= deepest.len();
+        let mut changed = false;
+        for mut path in deepest {
+            let parent_depth = if path.pop() {
+                changed = true;
+                depth - 1
             } else {
-                compressed.insert(path.clone());
+                depth
+            };
+            if by_depth.entry(parent_depth).or_default().insert(path) {
+                count += 1;
             }
         }
-        if compressed == *paths {
-            return false;
+        if !changed {
+            break;
         }
-        *paths = compressed;
     }
-    true
+    *paths = by_depth.into_values().flatten().collect();
+    count < capacity
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -211,6 +211,7 @@ pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
+    pending_agent_message_mirror: Option<ThreadItem>,
     current_rollout_index: usize,
     next_rollout_index: usize,
     active_change_set: Option<ThreadHistoryChangeAccumulator>,
@@ -228,6 +229,7 @@ impl ThreadHistoryBuilder {
             turns: Vec::new(),
             current_turn: None,
             next_item_index: 1,
+            pending_agent_message_mirror: None,
             current_rollout_index: 0,
             next_rollout_index: 0,
             active_change_set: None,
@@ -327,6 +329,21 @@ impl ThreadHistoryBuilder {
     /// This function should handle all EventMsg variants that can be persisted in a rollout file.
     /// See `should_persist_event_msg` in `codex-rs/core/rollout/policy.rs`.
     pub fn handle_event(&mut self, event: &EventMsg) {
+        // Core emits the legacy compatibility event immediately after its canonical item.
+        // Consume only that mirror; identical text on another item is still a new message.
+        if let Some(ThreadItem::AgentMessage {
+            text,
+            phase,
+            memory_citation,
+            ..
+        }) = self.pending_agent_message_mirror.take()
+            && let EventMsg::AgentMessage(payload) = event
+            && payload.message == text
+            && payload.phase == phase
+            && payload.memory_citation.clone().map(Into::into) == memory_citation
+        {
+            return;
+        }
         match event {
             EventMsg::UserMessage(payload) => self.handle_user_message(payload),
             EventMsg::AgentMessage(payload) => self.handle_agent_message(
@@ -571,7 +588,25 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_item_completed(&mut self, payload: &ItemCompletedEvent) {
-        self.handle_materialized_item_lifecycle(&payload.turn_id, &payload.item);
+        if matches!(
+            &payload.item,
+            codex_protocol::items::TurnItem::AgentMessage(_)
+        ) {
+            let item = ThreadItem::from(payload.item.clone());
+            if matches!(&item, ThreadItem::AgentMessage { text, .. } if !text.is_empty()) {
+                self.upsert_item_in_turn_id(&payload.turn_id, item.clone());
+                if self
+                    .current_turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.id == payload.turn_id)
+                    || self.turns.iter().any(|turn| turn.id == payload.turn_id)
+                {
+                    self.pending_agent_message_mirror = Some(item);
+                }
+            }
+        } else {
+            self.handle_materialized_item_lifecycle(&payload.turn_id, &payload.item);
+        }
     }
 
     fn handle_materialized_item_lifecycle(
@@ -1708,6 +1743,64 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn persisted_assistant_items_keep_identity_without_duplicating_legacy_mirrors() {
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        for id in ["message-a", "message-b"] {
+            let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: codex_protocol::ThreadId::default(),
+                turn_id: "turn-1".into(),
+                completed_at_ms: 0,
+                item: codex_protocol::items::TurnItem::AgentMessage(
+                    codex_protocol::items::AgentMessageItem {
+                        id: id.into(),
+                        content: vec![codex_protocol::items::AgentMessageContent::Text {
+                            text: "same text".into(),
+                        }],
+                        phase: Some(MessagePhase::FinalAnswer),
+                        memory_citation: None,
+                    },
+                ),
+            });
+            // Unknown canonical turns must not consume the legacy fallback.
+            let mut unknown = ThreadHistoryBuilder::new();
+            unknown.handle_event(&completed);
+            unknown.handle_event(&EventMsg::AgentMessage(AgentMessageEvent {
+                message: "same text".into(),
+                phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+            }));
+            assert_eq!(unknown.finish()[0].items.len(), 1);
+            builder.handle_rollout_item(&RolloutItem::EventMsg(completed));
+            builder.handle_rollout_item(&RolloutItem::EventMsg(EventMsg::AgentMessage(
+                AgentMessageEvent {
+                    message: "same text".into(),
+                    phase: Some(MessagePhase::FinalAnswer),
+                    memory_citation: None,
+                },
+            )));
+        }
+        // A standalone legacy message must still survive, even with identical text.
+        builder.handle_event(&EventMsg::AgentMessage(AgentMessageEvent {
+            message: "same text".into(),
+            phase: Some(MessagePhase::FinalAnswer),
+            memory_citation: None,
+        }));
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 3);
+        assert_eq!(turns[0].items[0].id(), "message-a");
+        assert_eq!(turns[0].items[1].id(), "message-b");
+        assert_eq!(turns[0].items[2].id(), "item-1");
+    }
 
     #[test]
     fn interrupted_snapshot_is_not_an_in_progress_turn() {

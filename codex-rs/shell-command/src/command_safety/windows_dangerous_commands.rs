@@ -155,38 +155,36 @@ fn is_dangerous_cmd(command: &[String]) -> bool {
     };
 
     // Refine tokens by splitting concatenated CMD operators (e.g. "echo hi&del")
-    let tokens: Vec<String> = cmd_tokens
-        .into_iter()
-        .flat_map(|t| split_embedded_cmd_operators(&t))
+    let tokens: Vec<&str> = cmd_tokens
+        .iter()
+        .flat_map(|t| split_embedded_cmd_operators(t))
         .collect();
 
     const CMD_SEPARATORS: &[&str] = &["&", "&&", "|", "||"];
-    tokens
-        .split(|t| CMD_SEPARATORS.contains(&t.as_str()))
-        .any(|segment| {
-            let Some(cmd) = segment.first() else {
-                return false;
-            };
+    tokens.split(|t| CMD_SEPARATORS.contains(t)).any(|segment| {
+        let Some(cmd) = segment.first() else {
+            return false;
+        };
 
-            // Classic `cmd /c ... start https://...` ShellExecute path.
-            if cmd.eq_ignore_ascii_case("start") && args_have_url(segment) {
-                return true;
-            }
-            // Force delete: del /f, erase /f
-            if (cmd.eq_ignore_ascii_case("del") || cmd.eq_ignore_ascii_case("erase"))
-                && has_force_flag_cmd(segment)
-            {
-                return true;
-            }
-            // Recursive directory removal: rd /s /q, rmdir /s /q
-            if (cmd.eq_ignore_ascii_case("rd") || cmd.eq_ignore_ascii_case("rmdir"))
-                && has_recursive_flag_cmd(segment)
-                && has_quiet_flag_cmd(segment)
-            {
-                return true;
-            }
-            false
-        })
+        // Classic `cmd /c ... start https://...` ShellExecute path.
+        if cmd.eq_ignore_ascii_case("start") && args_have_url(segment) {
+            return true;
+        }
+        // Force delete: del /f, erase /f
+        if (cmd.eq_ignore_ascii_case("del") || cmd.eq_ignore_ascii_case("erase"))
+            && has_force_flag_cmd(segment)
+        {
+            return true;
+        }
+        // Recursive directory removal: rd /s /q, rmdir /s /q
+        if (cmd.eq_ignore_ascii_case("rd") || cmd.eq_ignore_ascii_case("rmdir"))
+            && has_recursive_flag_cmd(segment)
+            && has_quiet_flag_cmd(segment)
+        {
+            return true;
+        }
+        false
+    })
 }
 
 fn is_direct_gui_launch(command: &[String]) -> bool {
@@ -220,7 +218,7 @@ fn is_direct_gui_launch(command: &[String]) -> bool {
     false
 }
 
-fn split_embedded_cmd_operators(token: &str) -> Vec<String> {
+fn split_embedded_cmd_operators(token: &str) -> Vec<&str> {
     // Split concatenated CMD operators so `echo hi&del` becomes `["echo hi", "&", "del"]`.
     // Handles `&`, `&&`, `|`, `||`. Best-effort (CMD escaping is weird by nature).
     let mut parts = Vec::new();
@@ -230,7 +228,7 @@ fn split_embedded_cmd_operators(token: &str) -> Vec<String> {
     while let Some((i, ch)) = it.next() {
         if ch == '&' || ch == '|' {
             if i > start {
-                parts.push(token[start..i].to_string());
+                parts.push(&token[start..i]);
             }
 
             // Detect doubled operator: && or ||
@@ -242,13 +240,13 @@ fn split_embedded_cmd_operators(token: &str) -> Vec<String> {
                 _ => ch.len_utf8(),
             };
 
-            parts.push(token[i..i + op_len].to_string());
+            parts.push(&token[i..i + op_len]);
             start = i + op_len;
         }
     }
 
     if start < token.len() {
-        parts.push(token[start..].to_string());
+        parts.push(&token[start..]);
     }
 
     parts.retain(|s| !s.trim().is_empty());
@@ -258,87 +256,54 @@ fn split_embedded_cmd_operators(token: &str) -> Vec<String> {
 fn has_force_delete_cmdlet(tokens: &[String]) -> bool {
     const DELETE_CMDLETS: &[&str] = &["remove-item", "ri", "rm", "del", "erase", "rd", "rmdir"];
 
-    // Hard separators that end a command segment (so -Force must be in same segment)
-    const SEG_SEPS: &[char] = &[';', '|', '&', '\n', '\r', '\t'];
-
-    // Soft separators: punctuation that can stick to tokens (blocks, parens, brackets, commas, etc.)
-    const SOFT_SEPS: &[char] = &['{', '}', '(', ')', '[', ']', ',', ';'];
-
-    // Build rough command segments first
-    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
-    for tok in tokens {
-        // If token itself contains segment separators, split it (best-effort)
-        let mut cur = String::new();
-        for ch in tok.chars() {
-            if SEG_SEPS.contains(&ch) {
-                let s = cur.trim();
-                if let Some(msg) = segments.last_mut()
-                    && !s.is_empty()
-                {
-                    msg.push(s.to_string());
-                }
-                cur.clear();
-                if let Some(last) = segments.last()
-                    && !last.is_empty()
-                {
-                    segments.push(Vec::new());
-                }
-            } else {
-                cur.push(ch);
+    // Keep -Force in the same command segment as a delete cmdlet. Token
+    // boundaries preserve that state; shell operators reset it.
+    let mut has_delete = false;
+    let mut has_force = false;
+    for token in tokens {
+        for (index, segment) in token.split([';', '|', '&', '\n', '\r', '\t']).enumerate() {
+            if index > 0 {
+                has_delete = false;
+                has_force = false;
             }
-        }
-        let s = cur.trim();
-        if let Some(segment) = segments.last_mut()
-            && !s.is_empty()
-        {
-            segment.push(s.to_string());
+            for atom in segment
+                .split(['{', '}', '(', ')', '[', ']', ',', ';'])
+                .map(str::trim)
+                .filter(|atom| !atom.is_empty())
+            {
+                has_delete |= DELETE_CMDLETS
+                    .iter()
+                    .any(|cmd| atom.eq_ignore_ascii_case(cmd));
+                has_force |= atom.eq_ignore_ascii_case("-force")
+                    || atom
+                        .get(..7)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("-force:"));
+                if has_delete && has_force {
+                    return true;
+                }
+            }
         }
     }
-
-    // Now, inside each segment, normalize tokens by splitting on soft punctuation
-    segments.into_iter().any(|seg| {
-        let atoms = seg
-            .iter()
-            .flat_map(|t| t.split(|c| SOFT_SEPS.contains(&c)))
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-
-        let mut has_delete = false;
-        let mut has_force = false;
-
-        for a in atoms {
-            if DELETE_CMDLETS.iter().any(|cmd| a.eq_ignore_ascii_case(cmd)) {
-                has_delete = true;
-            }
-            if a.eq_ignore_ascii_case("-force")
-                || a.get(..7)
-                    .is_some_and(|p| p.eq_ignore_ascii_case("-force:"))
-            {
-                has_force = true;
-            }
-        }
-
-        has_delete && has_force
-    })
+    false
 }
 
 /// Check for /f or /F flag in CMD del/erase arguments.
-fn has_force_flag_cmd(args: &[String]) -> bool {
+fn has_force_flag_cmd(args: &[&str]) -> bool {
     args.iter().any(|a| a.eq_ignore_ascii_case("/f"))
 }
 
 /// Check for /s or /S flag in CMD rd/rmdir arguments.
-fn has_recursive_flag_cmd(args: &[String]) -> bool {
+fn has_recursive_flag_cmd(args: &[&str]) -> bool {
     args.iter().any(|a| a.eq_ignore_ascii_case("/s"))
 }
 
 /// Check for /q or /Q flag in CMD rd/rmdir arguments.
-fn has_quiet_flag_cmd(args: &[String]) -> bool {
+fn has_quiet_flag_cmd(args: &[&str]) -> bool {
     args.iter().any(|a| a.eq_ignore_ascii_case("/q"))
 }
 
-fn args_have_url(args: &[String]) -> bool {
-    args.iter().any(|arg| looks_like_url(arg))
+fn args_have_url(args: &[impl AsRef<str>]) -> bool {
+    args.iter().any(|arg| looks_like_url(arg.as_ref()))
 }
 
 fn looks_like_url(token: &str) -> bool {
@@ -397,6 +362,7 @@ fn is_browser_executable(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::has_force_delete_cmdlet;
     use super::is_dangerous_command_windows;
     use super::is_dangerous_powershell_words;
 
@@ -838,6 +804,45 @@ mod tests {
             "powershell",
             "-Command",
             "rm test -Force"
+        ])));
+    }
+
+    #[test]
+    fn powershell_force_delete_does_not_cross_command_separators() {
+        for separator in [";", "|", "&", "\n", "\r", "\t", "&&", "||"] {
+            let tokens = vec_str(&[
+                "Get-ChildItem",
+                &format!("-Force{separator}Remove-Item"),
+                "file",
+            ]);
+            assert!(
+                !has_force_delete_cmdlet(&tokens),
+                "separator: {separator:?}"
+            );
+            let tokens = vec_str(&[
+                "Remove-Item",
+                &format!("file{separator}Get-ChildItem"),
+                "-Force",
+            ]);
+            assert!(
+                !has_force_delete_cmdlet(&tokens),
+                "separator: {separator:?}"
+            );
+        }
+        assert!(has_force_delete_cmdlet(&vec_str(&[
+            "(REMOVE-ITEM)",
+            "file",
+            "[-Force:$true]"
+        ])));
+        assert!(has_force_delete_cmdlet(&vec_str(&[
+            "-Force",
+            "{Remove-Item}",
+            "file"
+        ])));
+        assert!(!has_force_delete_cmdlet(&vec_str(&[
+            "Remove-Item",
+            "file",
+            "-Forceful"
         ])));
     }
 

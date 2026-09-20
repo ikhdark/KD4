@@ -22,6 +22,13 @@ use crate::thread_manager::thread_store_from_config;
 use codex_extension_api::empty_extension_registry;
 
 /// Build the model-visible `input` list for a single debug turn.
+///
+/// This is a standalone preview, not a production request capture: it omits
+/// base instructions and tool schemas, uses an empty extension registry, and
+/// bypasses `run_turn` preparation (including task-selected skills and guidance
+/// injection). Do not use its output size as the total request size. Enable
+/// `CODEX_ROLLOUT_TRACE_ROOT` on the measured process to capture production
+/// requests and their effective settings instead.
 #[doc(hidden)]
 pub async fn build_prompt_input(
     mut config: Config,

@@ -26,7 +26,7 @@ impl Mode {
             // Cover both variants at the per-attempt cap, with 25%
             // headroom for deadline overshoot and native teardown scheduling.
             Self::Fast => 50,
-            Self::Full => 150,
+            Self::Full => 200,
         }) * 60
             * 1000
     }
@@ -127,7 +127,12 @@ pub fn schedule(mode: Mode) -> Vec<ScheduledAttempt> {
     }
     let tasks: &[&str] = match mode {
         Mode::Fast => &["rust_bugfix"],
-        Mode::Full => &["rust_bugfix", "typescript_feature", "kd4_python_refactor"],
+        Mode::Full => &[
+            "rust_bugfix",
+            "typescript_feature",
+            "kd4_python_refactor",
+            "python_consumer_refactor",
+        ],
     };
     for (index, workload) in tasks.iter().enumerate() {
         for variant in order(index) {
@@ -191,9 +196,17 @@ mod tests {
             fast_live.iter().map(|s| s.variant).collect::<Vec<_>>(),
             Variant::ALL
         );
-        assert_eq!(live(full).len(), 6);
+        let full_live = live(full);
+        assert_eq!(full_live.len(), 8);
+        assert_eq!(
+            full_live
+                .iter()
+                .filter(|s| s.workload == "python_consumer_refactor")
+                .count(),
+            2
+        );
         assert_eq!(Mode::Fast.live_limit_ms(), 3_000_000);
-        assert_eq!(Mode::Full.live_limit_ms(), 9_000_000);
+        assert_eq!(Mode::Full.live_limit_ms(), 12_000_000);
         for mode in [Mode::Fast, Mode::Full] {
             let attempts = schedule(mode)
                 .iter()

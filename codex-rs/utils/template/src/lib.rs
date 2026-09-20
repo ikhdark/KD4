@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
 use std::error::Error;
 use std::fmt;
 
@@ -116,6 +117,7 @@ enum Segment {
 pub struct Template {
     placeholders: BTreeSet<String>,
     segments: Vec<Segment>,
+    literal_bytes: usize,
 }
 
 impl Template {
@@ -161,9 +163,17 @@ impl Template {
         }
 
         push_literal(&mut segments, &source[literal_start..]);
+        let literal_bytes = segments
+            .iter()
+            .map(|segment| match segment {
+                Segment::Literal(literal) => literal.len(),
+                Segment::Placeholder(_) => 0,
+            })
+            .sum();
         Ok(Self {
             placeholders,
             segments,
+            literal_bytes,
         })
     }
 
@@ -202,7 +212,7 @@ impl Template {
             }
         }
 
-        let mut rendered = String::new();
+        let mut rendered = String::with_capacity(self.literal_bytes);
         for segment in &self.segments {
             match segment {
                 Segment::Literal(literal) => rendered.push_str(literal),
@@ -275,9 +285,15 @@ where
 {
     let mut map = BTreeMap::new();
     for (name, value) in variables {
-        let name = name.as_ref().to_string();
-        if map.insert(name.clone(), value).is_some() {
-            return Err(TemplateRenderError::DuplicateValue { name });
+        match map.entry(name.as_ref().to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            Entry::Occupied(entry) => {
+                return Err(TemplateRenderError::DuplicateValue {
+                    name: entry.key().clone(),
+                });
+            }
         }
     }
     Ok(map)

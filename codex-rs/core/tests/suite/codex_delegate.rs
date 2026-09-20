@@ -6,6 +6,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
+use core_test_support::require_network;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -16,7 +17,6 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
@@ -24,8 +24,9 @@ use std::time::Duration;
 
 async fn assert_review_completes_without_approval(
     codex: &codex_core::CodexThread,
-    explanation: &str,
+    expected: Result<&str, &str>,
 ) {
+    let mut errors = Vec::new();
     let mut entered = false;
     let mut exited = false;
     loop {
@@ -35,17 +36,33 @@ async fn assert_review_completes_without_approval(
                 panic!("the review child must honor its Never policy without asking the parent");
             }
             EventMsg::ExitedReviewMode(event) => {
-                let output = event
-                    .review_output
-                    .expect("review returns its final result");
-                assert_eq!(output.overall_explanation, explanation);
+                match expected {
+                    Ok(explanation) => {
+                        let output = event
+                            .review_output
+                            .expect("review returns its final result");
+                        assert_eq!(output.overall_explanation, explanation);
+                    }
+                    Err(_) => assert!(
+                        event.review_output.is_none(),
+                        "failed review has no verdict"
+                    ),
+                }
                 exited = true;
             }
+            EventMsg::Error(error) => errors.push(error.message),
             EventMsg::TurnComplete(_) => break,
             _ => {}
         }
     }
     assert!(entered && exited, "the real review lifecycle must complete");
+    match expected {
+        Ok(_) => assert!(errors.is_empty(), "unexpected review errors: {errors:?}"),
+        Err(message) => assert!(
+            errors.iter().any(|error| error.contains(message)),
+            "missing review failure: {errors:?}"
+        ),
+    }
 }
 
 /// Review children reject escalation even when the parent permits approval prompts.
@@ -60,7 +77,7 @@ async fn codex_delegate_review_rejects_exec_escalation_without_parent_approval()
     .to_string();
     let review_json = serde_json::json!({
         "findings": [],
-        "overall_correctness": "ok",
+        "overall_correctness": "patch is correct",
         "overall_explanation": "exec escalation rejected",
         "overall_confidence_score": 0.5
     })
@@ -101,7 +118,7 @@ async fn codex_delegate_review_rejects_exec_escalation_without_parent_approval()
         })
         .await
         .expect("submit review");
-    assert_review_completes_without_approval(&test.codex, "exec escalation rejected").await;
+    assert_review_completes_without_approval(&test.codex, Ok("exec escalation rejected")).await;
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
     let output = requests[1]
@@ -148,8 +165,11 @@ async fn codex_delegate_review_rejects_patch_without_parent_approval() {
         })
         .await
         .expect("submit review");
-    assert_review_completes_without_approval(&test.codex, "required tool `apply_patch` blocked")
-        .await;
+    assert_review_completes_without_approval(
+        &test.codex,
+        Err("Review did not return a valid structured result"),
+    )
+    .await;
     let requests = responses.requests();
     assert_eq!(
         requests.len(),
@@ -161,7 +181,7 @@ async fn codex_delegate_review_rejects_patch_without_parent_approval() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_delegate_ignores_legacy_deltas() {
-    skip_if_no_network!();
+    require_network!();
 
     // Single response with reasoning summary deltas.
     let sse_stream = sse(vec![

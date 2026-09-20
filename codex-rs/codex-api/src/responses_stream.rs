@@ -5,6 +5,8 @@ use crate::error::ApiError;
 use crate::rate_limits::RateLimitEventBody;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::rate_limits::rate_limit_snapshot_from_event;
+use crate::safety_buffering::X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER;
+use crate::safety_buffering::X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER;
 use crate::safety_buffering::treatment_from_headers;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
@@ -15,8 +17,8 @@ use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
 use serde::Deserialize;
-use serde_json::Map as JsonMap;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -118,6 +120,7 @@ pub(crate) struct ResponsesEventInterpreter {
     last_server_model: Option<String>,
     safety_buffering_treatment: SafetyBufferingTreatment,
     turn_state: Option<Arc<OnceLock<String>>>,
+    events: Vec<ResponseEvent>,
 }
 
 impl ResponsesEventInterpreter {
@@ -129,13 +132,28 @@ impl ResponsesEventInterpreter {
             last_server_model: None,
             safety_buffering_treatment: metadata.safety_buffering_treatment.clone(),
             turn_state,
+            events: Vec::new(),
         }
     }
 
     pub(crate) fn process_payload(
         &mut self,
         payload: &str,
-    ) -> Result<Vec<ResponseEvent>, ResponsesEventError> {
+    ) -> Result<std::vec::Drain<'_, ResponseEvent>, ResponsesEventError> {
+        self.process_payload_with_error_mapper(payload, || None)
+    }
+
+    /// Let a transport interpret its error envelope without reparsing ordinary events.
+    /// Also try the mapper on deserialization failures: transport errors may use
+    /// fields that are incompatible with the Responses event schema.
+    pub(crate) fn process_payload_with_error_mapper(
+        &mut self,
+        payload: &str,
+        map_error: impl FnOnce() -> Option<ApiError>,
+    ) -> Result<std::vec::Drain<'_, ResponseEvent>, ResponsesEventError> {
+        // Retain the allocation across frames, including when a previous frame
+        // failed after interpreting metadata. Both transports drain in order.
+        self.events.clear();
         // Ordinary frames take one JSON pass and never use flattened-field buffering.
         // A rate-limit frame may contain fields incompatible with the ordinary shape,
         // so only failed deserialization needs a discriminator-only fallback.
@@ -146,6 +164,13 @@ impl ResponsesEventInterpreter {
         }
 
         let event = serde_json::from_str::<ResponsesStreamEvent>(payload);
+        if match &event {
+            Ok(event) => event.kind == "error",
+            Err(_) => true,
+        } && let Some(error) = map_error()
+        {
+            return Err(ResponsesEventError::Api(error));
+        }
         let is_rate_limit = match &event {
             Ok(event) => event.kind == "codex.rate_limits",
             Err(_) => serde_json::from_str::<EventKindProbe<'_>>(payload)
@@ -153,10 +178,10 @@ impl ResponsesEventInterpreter {
         };
         if is_rate_limit {
             let event: RateLimitStreamEvent = serde_json::from_str(payload)?;
-            return Ok(rate_limit_snapshot_from_event(event.rate_limit)
-                .map(ResponseEvent::RateLimits)
-                .into_iter()
-                .collect());
+            self.events.extend(
+                rate_limit_snapshot_from_event(event.rate_limit).map(ResponseEvent::RateLimits),
+            );
+            return Ok(self.events.drain(..));
         }
 
         let event = event?;
@@ -168,32 +193,38 @@ impl ResponsesEventInterpreter {
         }
 
         if let Some(headers) = event.headers.as_ref().and_then(Value::as_object)
-            && let Some(updated_treatment) =
-                treatment_from_headers(&json_headers_to_http_headers(headers))
+            && let Some(updated_treatment) = treatment_from_headers(&json_headers_to_http_headers(
+                headers.iter().filter(|(name, _)| {
+                    name.eq_ignore_ascii_case(X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER)
+                        || name.eq_ignore_ascii_case(X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER)
+                }),
+            ))
         {
             self.safety_buffering_treatment = updated_treatment;
         }
 
-        let mut events = Vec::new();
         if let Some(model) = event.response_model()
-            && self.last_server_model.as_deref() != Some(model.as_str())
+            && self.last_server_model.as_deref() != Some(model)
         {
-            self.last_server_model = Some(model.clone());
-            events.push(ResponseEvent::ServerModel(model));
+            self.last_server_model = Some(model.to_owned());
+            self.events
+                .push(ResponseEvent::ServerModel(model.to_owned()));
         }
         if let Some(verifications) = event.model_verifications() {
-            events.push(ResponseEvent::ModelVerifications(verifications));
+            self.events
+                .push(ResponseEvent::ModelVerifications(verifications));
         }
         if let Some(metadata) = event.turn_moderation_metadata() {
-            events.push(ResponseEvent::TurnModerationMetadata(metadata));
+            self.events
+                .push(ResponseEvent::TurnModerationMetadata(metadata));
         }
         if let Some(buffering) = event.safety_buffering(&self.safety_buffering_treatment) {
-            events.push(ResponseEvent::SafetyBuffering(buffering));
+            self.events.push(ResponseEvent::SafetyBuffering(buffering));
         }
         if let Some(event) = process_responses_event(event)? {
-            events.push(event);
+            self.events.push(event);
         }
-        Ok(events)
+        Ok(self.events.drain(..))
     }
 }
 
@@ -262,9 +293,9 @@ struct ResponseCompletedOutputTokensDetails {
 }
 
 #[derive(Deserialize, Debug)]
-pub(crate) struct ResponsesStreamEvent {
-    #[serde(rename = "type")]
-    kind: String,
+pub(crate) struct ResponsesStreamEvent<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'a, str>,
     headers: Option<Value>,
     metadata: Option<Value>,
     response: Option<Value>,
@@ -290,12 +321,12 @@ pub(crate) struct RateLimitStreamEvent {
     rate_limit: RateLimitEventBody,
 }
 
-impl ResponsesStreamEvent {
+impl ResponsesStreamEvent<'_> {
     pub(crate) fn kind(&self) -> &str {
         &self.kind
     }
 
-    pub(crate) fn response_model(&self) -> Option<String> {
+    pub(crate) fn response_model(&self) -> Option<&str> {
         self.response
             .as_ref()
             .and_then(|response| response.get("headers"))
@@ -346,7 +377,7 @@ impl ResponsesStreamEvent {
     ) -> Option<SafetyBuffering> {
         let value = self.safety_buffering.as_ref()?;
         let retry_model_present = value.as_object()?.contains_key("retry_model");
-        let mut buffering: SafetyBuffering = serde_json::from_value(value.clone()).ok()?;
+        let mut buffering = SafetyBuffering::deserialize(value).ok()?;
         buffering.show_buffering_ui = true;
         if !retry_model_present {
             buffering.faster_model.clone_from(&treatment.faster_model);
@@ -355,7 +386,7 @@ impl ResponsesStreamEvent {
     }
 }
 
-fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
+fn header_openai_model_value_from_json(value: &Value) -> Option<&str> {
     value.as_object()?.iter().find_map(|(name, value)| {
         (name.eq_ignore_ascii_case(OPENAI_MODEL_HEADER)
             || name.eq_ignore_ascii_case("x-openai-model"))
@@ -367,7 +398,7 @@ fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
 fn header_turn_state_value_from_json(value: &Value) -> Option<String> {
     value.as_object()?.iter().find_map(|(name, value)| {
         name.eq_ignore_ascii_case(X_CODEX_TURN_STATE_HEADER)
-            .then(|| json_value_as_string(value))
+            .then(|| json_value_as_string(value).map(str::to_owned))
             .flatten()
     })
 }
@@ -399,18 +430,18 @@ fn parse_model_verification(value: &str) -> Option<ModelVerification> {
     }
 }
 
-fn json_value_as_string(value: &Value) -> Option<String> {
+fn json_value_as_string(value: &Value) -> Option<&str> {
     match value {
-        Value::String(value) => Some(value.clone()),
+        Value::String(value) => Some(value.as_str()),
         Value::Array(items) => items.first().and_then(json_value_as_string),
         _ => None,
     }
 }
 
 fn process_responses_event(
-    event: ResponsesStreamEvent,
+    event: ResponsesStreamEvent<'_>,
 ) -> Result<Option<ResponseEvent>, ResponsesEventError> {
-    match event.kind.as_str() {
+    match event.kind.as_ref() {
         "response.output_item.done" => {
             let item = parse_required_response_item("response.output_item.done", event.item)?;
             return Ok(Some(ResponseEvent::OutputItemDone(item)));
@@ -471,7 +502,7 @@ fn process_responses_event(
             };
             let mut response_error = ApiError::Stream("response.failed event received".into());
             if let Some(error) = response_value.get("error")
-                && let Ok(error) = serde_json::from_value::<Error>(error.clone())
+                && let Ok(error) = Error::deserialize(error)
             {
                 if is_context_window_error(&error) {
                     response_error = ApiError::ContextWindowExceeded;
@@ -562,7 +593,9 @@ fn parse_required_response_item(
     })
 }
 
-pub(crate) fn json_headers_to_http_headers(headers: &JsonMap<String, Value>) -> HeaderMap {
+pub(crate) fn json_headers_to_http_headers<'a>(
+    headers: impl IntoIterator<Item = (&'a String, &'a Value)>,
+) -> HeaderMap {
     let mut mapped = HeaderMap::new();
     for (name, value) in headers {
         let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
@@ -578,9 +611,9 @@ pub(crate) fn json_headers_to_http_headers(headers: &JsonMap<String, Value>) -> 
 
 fn json_header_value(value: &Value) -> Option<HeaderValue> {
     let value = match value {
-        Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        Value::Bool(value) => value.to_string(),
+        Value::String(value) => Cow::Borrowed(value.as_str()),
+        Value::Number(value) => Cow::Owned(value.to_string()),
+        Value::Bool(value) => Cow::Owned(value.to_string()),
         _ => return None,
     };
     HeaderValue::from_str(&value).ok()
@@ -647,6 +680,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ordinary_events_skip_transport_error_parsing() {
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        for payload in [
+            r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+            r#"{"delta":"hello","type":"response.output_text.\u0064elta"}"#,
+        ] {
+            let events = interpreter
+                .process_payload_with_error_mapper(payload, || {
+                    panic!("ordinary events must not invoke the transport error parser")
+                })
+                .expect("valid delta")
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                events.as_slice(),
+                [ResponseEvent::OutputTextDelta(text)] if text == "hello"
+            ));
+        }
+    }
+
+    #[test]
     fn metadata_parses_all_shared_headers_in_initial_event_order() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -703,7 +757,8 @@ mod tests {
                 })
                 .to_string(),
             )
-            .expect("metadata should be interpreted");
+            .expect("metadata should be interpreted")
+            .collect::<Vec<_>>();
         assert_eq!(turn_state.get().map(String::as_str), Some("sticky-1"));
         assert!(
             matches!(&metadata_events[0], ResponseEvent::ServerModel(model) if model == "routed-model")
@@ -716,7 +771,8 @@ mod tests {
             .process_payload(
                 r#"{"type":"response.output_text.delta","delta":"x","safety_buffering":{"use_cases":["cyber"],"reasons":[]}}"#,
             )
-            .expect("safety event should be interpreted");
+            .expect("safety event should be interpreted")
+            .collect::<Vec<_>>();
         assert!(
             matches!(&safety_events[0], ResponseEvent::SafetyBuffering(buffering) if buffering.faster_model.as_deref() == Some("fast-model"))
         );
@@ -726,9 +782,58 @@ mod tests {
             .process_payload(
                 r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":12.5,"window_minutes":60,"reset_at":42}}}"#,
             )
-            .expect("rate limits should be interpreted");
+            .expect("rate limits should be interpreted")
+            .collect::<Vec<_>>();
         assert!(
             matches!(&rate_limit_events[0], ResponseEvent::RateLimits(snapshot) if snapshot.primary.as_ref().is_some_and(|window| window.used_percent == 12.5))
+        );
+    }
+
+    #[test]
+    fn interpreter_reuses_event_storage_and_does_not_replay_dropped_or_failed_frames() {
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let frame = r#"{"type":"response.output_text.delta","delta":"first","headers":{"openai-model":["model-a"]}}"#;
+        let mut events = interpreter.process_payload(frame).unwrap();
+        assert!(
+            matches!(events.next(), Some(ResponseEvent::ServerModel(model)) if model == "model-a")
+        );
+        // Dropping a partially consumed frame must discard its remaining delta.
+        drop(events);
+        let allocation = interpreter.events.as_ptr();
+
+        for delta in ["second", "third"] {
+            let payload = json!({"type":"response.output_text.delta", "delta":delta,
+                "headers":{"X-OpenAI-Model":"model-a"}})
+            .to_string();
+            let mut events = interpreter.process_payload(&payload).unwrap();
+            assert!(
+                matches!(events.next(), Some(ResponseEvent::OutputTextDelta(text)) if text == delta)
+            );
+            assert!(
+                events.next().is_none(),
+                "unchanged model must not be re-emitted"
+            );
+            drop(events);
+            assert_eq!(interpreter.events.as_ptr(), allocation);
+        }
+
+        assert!(
+            interpreter
+                .process_payload(
+                    r#"{"type":"response.output_item.done","headers":{"openai-model":"model-b"}}"#
+                )
+                .is_err()
+        );
+        let mut events = interpreter
+            .process_payload(r#"{"type":"response.output_text.delta","delta":"after error"}"#)
+            .unwrap();
+        assert!(
+            matches!(events.next(), Some(ResponseEvent::OutputTextDelta(text)) if text == "after error")
+        );
+        assert!(
+            events.next().is_none(),
+            "failed frame metadata must not leak into the next frame"
         );
     }
 

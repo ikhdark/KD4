@@ -27,7 +27,7 @@ futures = { workspace = true, features = ["alloc", "std"] }
 gethostname = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 multimap = { workspace = true }
-prost = "0.14.3"
+prost = { workspace = true }
 regex-lite = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -58,7 +58,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["router", "transport"] }
-tonic-prost-build = { version = "=0.14.3", default-features = false, features = ["transport"] }
+tonic-prost-build = { workspace = true, default-features = false, features = ["transport"] }
 
 [lib]
 doctest = false

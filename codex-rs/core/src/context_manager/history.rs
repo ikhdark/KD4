@@ -534,7 +534,7 @@ enum PreparedAppendSource {
     Pending,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct ItemTokenEstimateCacheNamespace {
     history_version: u64,
     projection_revision: u64,
@@ -777,7 +777,7 @@ impl ContextManager {
             stable_context_target,
         };
         let source_items = Arc::downgrade(&self.items);
-        if let Some(prepared) = self
+        let prepared = self
             .prepared_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -793,9 +793,15 @@ impl ContextManager {
                     .stable_context_manifest
                     .with_local_reused(/*local_reused*/ true);
                 entry.prepared.clone()
-            })
-        {
+            });
+        if let Some(prepared) = prepared {
+            if let Some(metrics) = codex_otel::global() {
+                let _ = metrics.counter("codex.history.prepared_cache", 1, &[("result", "hit")]);
+            }
             return prepared;
+        }
+        if let Some(metrics) = codex_otel::global() {
+            let _ = metrics.counter("codex.history.prepared_cache", 1, &[("result", "miss")]);
         }
         evict_resolved_reasoning(Arc::make_mut(&mut self.items));
         self.normalize_history(input_modalities);
@@ -903,15 +909,14 @@ impl ContextManager {
         self,
         input_modalities: &[InputModality],
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-    ) -> Vec<ResponseItem> {
+    ) -> Arc<[ResponseItem]> {
         self.prepare_for_prompt_with_completed_tool_projection_target(
             input_modalities,
             StableContextTarget::FailOpen,
             workspace_identity,
             None,
         )
-        .items()
-        .to_vec()
+        .shared_items()
     }
 
     fn prepare_for_prompt_with_completed_tool_projection_target(
@@ -1072,20 +1077,19 @@ impl ContextManager {
         let last_instruction_boundary = pending_user_boundary
             .then_some(items.len())
             .or_else(|| items.iter().rposition(is_user_turn_boundary));
-        let items_tokens = items
-            .iter()
-            .enumerate()
-            .filter(|(index, item)| !is_resolved_reasoning(*index, item, last_instruction_boundary))
-            .map(|(index, item)| self.estimate_item_token_count_cached(index, item, policy))
-            .fold(0i64, i64::saturating_add);
+        let items_tokens = self.estimate_indexed_items_token_count_cached(
+            items.iter().enumerate().filter(|(index, item)| {
+                !is_resolved_reasoning(*index, item, last_instruction_boundary)
+            }),
+            policy,
+        );
 
         Some(base_tokens.saturating_add(items_tokens))
     }
 
-    fn estimate_item_token_count_cached(
+    fn estimate_indexed_items_token_count_cached<'a>(
         &self,
-        index: usize,
-        item: &ResponseItem,
+        items: impl Iterator<Item = (usize, &'a ResponseItem)>,
         policy: Option<PreparedHistoryPolicy>,
     ) -> i64 {
         // Positions are stable within a projection revision, including items
@@ -1112,25 +1116,37 @@ impl ContextManager {
             .item_token_estimates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(estimate) = estimates
-            .get(&namespace)
-            .and_then(|items| items.get(&index))
-            .copied()
-        {
-            return estimate;
+        let cached = estimates.get(&namespace);
+        let mut total = 0i64;
+        let mut missing = Vec::new();
+        for (index, item) in items {
+            if let Some(estimate) = cached.and_then(|cached| cached.get(&index)) {
+                total = total.saturating_add(*estimate);
+            } else {
+                missing.push((index, item));
+            }
         }
-
         drop(estimates);
-        let estimate = estimate_item_token_count(item);
+
+        // Hits require one lock and one namespace lookup for the entire pass.
+        // Keep potentially expensive image estimation outside the shared lock.
+        if missing.is_empty() {
+            return total;
+        }
+        let missing = missing
+            .into_iter()
+            .map(|(index, item)| (index, estimate_item_token_count(item)))
+            .collect::<Vec<_>>();
         let mut estimates = self
             .item_token_estimates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        estimates
-            .entry(namespace)
-            .or_default()
-            .insert(index, estimate);
-        estimate
+        let cached = estimates.entry(namespace).or_default();
+        for (index, estimate) in missing {
+            total = total.saturating_add(estimate);
+            cached.insert(index, estimate);
+        }
+        total
     }
 
     #[cfg(test)]
@@ -1357,17 +1373,14 @@ impl ContextManager {
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
         let tail_start = self.items.len() - items_after_last_model_generated.len();
-        let items_after_last_model_generated_tokens = items_after_last_model_generated
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                self.estimate_item_token_count_cached(
-                    tail_start + index,
-                    item,
-                    /*policy*/ None,
-                )
-            })
-            .fold(0i64, i64::saturating_add);
+        let items_after_last_model_generated_tokens = self
+            .estimate_indexed_items_token_count_cached(
+                items_after_last_model_generated
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| (tail_start + index, item)),
+                /*policy*/ None,
+            );
         let earlier_reasoning_tokens = if server_reasoning_included {
             0
         } else {

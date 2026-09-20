@@ -56,6 +56,7 @@ use codex_tools::CanonicalToolResult;
 use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
+use codex_utils_string::TokenCountEstimate;
 use futures::prelude::*;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -416,16 +417,13 @@ async fn run_compact_task_inner_impl(
         prefetched_workspace_identity,
     )
     .await;
-    let turn_input = history
-        .clone()
-        .for_compaction_prompt_with_completed_tool_projection(
-            &turn_context.model_info.input_modalities,
-            workspace_identity.as_ref(),
-        );
+    let tool_history = history.tool_history_state();
+    let turn_input = history.for_compaction_prompt_with_completed_tool_projection(
+        &turn_context.model_info.input_modalities,
+        workspace_identity.as_ref(),
+    );
     let turn_input = strip_compaction_startup_envelopes(turn_input);
-    let artifact_pin_payload = history
-        .tool_history_state()
-        .artifact_pin_payload_for_items(&turn_input);
+    let artifact_pin_payload = tool_history.artifact_pin_payload_for_items(&turn_input);
     let summary_text_result = if reuse_previous_summary {
         validated_compaction_summary(previous_summary.as_deref(), "", false)
     } else {
@@ -454,7 +452,7 @@ async fn run_compact_task_inner_impl(
 
         let mut prompt = Prompt {
             input: turn_input.into(),
-            base_instructions: base_instructions.clone(),
+            base_instructions,
             ..Default::default()
         };
         turn_context.turn_timing_state.begin_compaction_generation();
@@ -664,7 +662,9 @@ async fn workspace_identity_for_compaction(
     }
 }
 
-pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+pub(crate) fn strip_compaction_startup_envelopes(
+    items: impl Into<Arc<[ResponseItem]>>,
+) -> Vec<ResponseItem> {
     project_stable_context(items.into(), StableContextTarget::Sampling)
         .items
         .iter()
@@ -839,7 +839,7 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
     let mut preamble = Vec::new();
     let mut sections = COMPACTION_SECTIONS
         .iter()
-        .map(|(heading, budget)| (*heading, *budget, Vec::<Vec<String>>::new()))
+        .map(|(heading, budget)| (*heading, *budget, Vec::<Vec<&str>>::new()))
         .collect::<Vec<_>>();
     let mut current = None;
     for line in summary.lines() {
@@ -854,25 +854,53 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
         match current {
             Some(index) => {
                 if let Some(body) = sections[index].2.last_mut() {
-                    body.push(line.to_string());
+                    body.push(line);
                 }
             }
-            None => preamble.push(line.to_string()),
+            None => preamble.push(line),
         }
     }
 
     let sections = sections
         .into_iter()
         .filter(|(_, _, updates)| !updates.is_empty())
+        .map(|(heading, budget, updates)| {
+            let updates = updates
+                .into_iter()
+                .map(|lines| {
+                    let body = lines.join("\n");
+                    let tokens = approx_token_count(body.trim());
+                    (body, tokens)
+                })
+                .collect::<Vec<_>>();
+            (heading, budget, updates)
+        })
         .collect::<Vec<_>>();
     let mut bodies = vec!["[truncated]".to_string(); sections.len()];
     let mut bounded_preamble = String::new();
-    let mandatory = render_structured_compaction(&bounded_preamble, &sections, &bodies);
-    if approx_token_count(&mandatory) > max_tokens {
+    let headings = sections
+        .iter()
+        .map(|(heading, _, _)| TokenCountEstimate::new(heading))
+        .collect::<Vec<_>>();
+    let mut body_costs = bodies
+        .iter()
+        .map(|body| TokenCountEstimate::new(body))
+        .collect::<Vec<_>>();
+    let summary_cost = |preamble: Option<TokenCountEstimate>, costs: &[TokenCountEstimate]| {
+        let mut parts = headings
+            .iter()
+            .zip(costs)
+            .map(|(heading, body)| heading.then(*body, 1));
+        let first = preamble.unwrap_or_else(|| parts.next().unwrap_or_default());
+        parts
+            .fold(first, |total, part| total.then(part, 2))
+            .tokens()
+    };
+    if summary_cost(None, &body_costs) > max_tokens {
         // A syntactically complete handoff has an irreducible minimum. Callers use a
         // substantially larger bound, but preserve the typed structure if a future caller
         // supplies an impossible limit instead of cutting a heading or body mid-field.
-        return mandatory;
+        return render_structured_compaction(&bounded_preamble, &sections, &bodies);
     }
 
     let full_preamble = preamble.join("\n");
@@ -881,8 +909,8 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
     while low < high {
         let candidate_budget = low.saturating_add(high).saturating_add(1) / 2;
         let candidate = truncate_text_to_token_ceiling(&full_preamble, candidate_budget);
-        let rendered = render_structured_compaction(&candidate, &sections, &bodies);
-        if approx_token_count(&rendered) <= max_tokens {
+        let cost = (!candidate.trim().is_empty()).then(|| TokenCountEstimate::new(&candidate));
+        if summary_cost(cost, &body_costs) <= max_tokens {
             low = candidate_budget;
             bounded_preamble = candidate;
         } else {
@@ -890,10 +918,12 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
         }
     }
 
+    let preamble_cost =
+        (!bounded_preamble.trim().is_empty()).then(|| TokenCountEstimate::new(&bounded_preamble));
     for (index, (heading, configured_budget, updates)) in sections.iter().enumerate() {
         let mut low = 0usize;
         let mut high = (*configured_budget).min(max_tokens);
-        let mut selected = bodies[index].clone();
+        let mut selected_cost = body_costs[index];
         while low < high {
             let candidate_budget = low.saturating_add(high).saturating_add(1) / 2;
             let candidate = if *heading == GOAL_HEADING {
@@ -906,65 +936,67 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
             } else {
                 candidate
             };
-            // Only this section changes during a probe; retain the other bodies
-            // instead of cloning the whole checkpoint at every binary-search step.
-            bodies[index] = candidate;
-            let rendered = render_structured_compaction(&bounded_preamble, &sections, &bodies);
-            if approx_token_count(&rendered) <= max_tokens {
+            body_costs[index] = TokenCountEstimate::new(&candidate);
+            if summary_cost(preamble_cost, &body_costs) <= max_tokens {
                 low = candidate_budget;
-                selected = bodies[index].clone();
+                bodies[index] = candidate;
+                selected_cost = body_costs[index];
             } else {
                 high = candidate_budget.saturating_sub(1);
             }
         }
-        bodies[index] = selected;
+        body_costs[index] = selected_cost;
     }
 
     render_structured_compaction(&bounded_preamble, &sections, &bodies)
 }
 
+type CompactionSection<'a> = (&'a str, usize, Vec<(String, usize)>);
+
 fn render_structured_compaction(
     preamble: &str,
-    sections: &[(&str, usize, Vec<Vec<String>>)],
+    sections: &[CompactionSection<'_>],
     bodies: &[String],
 ) -> String {
-    let mut rendered = Vec::with_capacity(sections.len().saturating_add(1));
+    let mut rendered = String::new();
     if !preamble.trim().is_empty() {
-        rendered.push(preamble.to_string());
+        rendered.push_str(preamble);
     }
-    rendered.extend(
-        sections
-            .iter()
-            .zip(bodies)
-            .map(|((heading, _, _), body)| format!("{heading}\n{body}")),
-    );
-    rendered.join("\n\n")
+    for ((heading, _, _), body) in sections.iter().zip(bodies) {
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(heading);
+        rendered.push('\n');
+        rendered.push_str(body);
+    }
+    rendered
 }
 
-fn retain_newest_section_updates(updates: &[Vec<String>], max_tokens: usize) -> String {
+fn retain_newest_section_updates(updates: &[(String, usize)], max_tokens: usize) -> String {
     let mut retained = Vec::new();
     let mut remaining = max_tokens;
-    for update in updates.iter().rev() {
+    let separator_tokens = approx_token_count("\n\n");
+    for (update, tokens) in updates.iter().rev() {
         if remaining == 0 {
             break;
         }
-        let update = update.join("\n").trim().to_string();
+        let update = update.trim();
         if update.is_empty() {
             continue;
         }
-        let separator_tokens = usize::from(!retained.is_empty()) * approx_token_count("\n\n");
+        let separator_tokens = usize::from(!retained.is_empty()) * separator_tokens;
         if remaining <= separator_tokens {
             break;
         }
         remaining = remaining.saturating_sub(separator_tokens);
-        let tokens = approx_token_count(&update);
-        if tokens <= remaining {
-            remaining = remaining.saturating_sub(tokens);
-            retained.push(update);
+        if *tokens <= remaining {
+            remaining = remaining.saturating_sub(*tokens);
+            retained.push(std::borrow::Cow::Borrowed(update));
         } else {
-            let truncated = truncate_text_to_token_ceiling(&update, remaining);
+            let truncated = truncate_text_to_token_ceiling(update, remaining);
             if !truncated.is_empty() {
-                retained.push(truncated);
+                retained.push(std::borrow::Cow::Owned(truncated));
             }
             break;
         }
@@ -975,21 +1007,17 @@ fn retain_newest_section_updates(updates: &[Vec<String>], max_tokens: usize) -> 
 
 /// Keeps the original goal/constraints and the latest goal revision in agreement.
 /// Intermediate status belongs in the other checkpoint sections and may be evicted.
-fn retain_goal_boundary_updates(updates: &[Vec<String>], max_tokens: usize) -> String {
-    let nonempty = updates
+fn retain_goal_boundary_updates(updates: &[(String, usize)], max_tokens: usize) -> String {
+    let mut nonempty = updates
         .iter()
-        .map(|update| update.join("\n").trim().to_string())
-        .filter(|update| !update.is_empty())
-        .collect::<Vec<_>>();
-    let Some(oldest) = nonempty.first() else {
+        .map(|(body, _)| body.trim())
+        .filter(|body| !body.is_empty());
+    let Some(oldest) = nonempty.next() else {
         return String::new();
     };
-    let Some(newest) = nonempty.last() else {
-        return String::new();
-    };
-    if nonempty.len() == 1 {
+    let Some(newest) = nonempty.next_back() else {
         return truncate_text_to_token_ceiling(oldest, max_tokens);
-    }
+    };
 
     let separator = "\n\n";
     let separator_tokens = approx_token_count(separator);

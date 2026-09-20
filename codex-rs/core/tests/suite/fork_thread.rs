@@ -14,13 +14,13 @@ use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use wiremock::Mock;
@@ -31,7 +31,7 @@ use wiremock::matchers::path;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_thread_twice_drops_to_first_message() {
-    skip_if_no_network!();
+    require_network!();
 
     // Start a mock server that completes three turns.
     let server = MockServer::start().await;
@@ -152,7 +152,7 @@ async fn fork_thread_twice_drops_to_first_message() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let source_sse = sse(vec![
@@ -229,7 +229,7 @@ fn fork_thread_from_history_does_not_require_source_rollout_path() {
         .build()
         .expect("build fork-thread test runtime");
     runtime.block_on(async {
-        skip_if_no_network!();
+        require_network!();
 
         let server = MockServer::start().await;
         let initial_sse = sse(vec![

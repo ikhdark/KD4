@@ -28,13 +28,13 @@ impl Shell {
             ShellType::Zsh | ShellType::Bash | ShellType::Sh => {
                 let arg = if use_login_shell { "-lc" } else { "-c" };
                 Ok(vec![
-                    self.shell_path.to_string_lossy().to_string(),
+                    self.shell_path.to_string_lossy().into_owned(),
                     arg.to_string(),
                     command.to_string(),
                 ])
             }
             ShellType::PowerShell => {
-                let mut args = vec![self.shell_path.to_string_lossy().to_string()];
+                let mut args = vec![self.shell_path.to_string_lossy().into_owned()];
                 if !use_login_shell {
                     args.push("-NoProfile".to_string());
                 }
@@ -45,7 +45,7 @@ impl Shell {
                 Ok(args)
             }
             ShellType::Cmd => {
-                let mut args = vec![self.shell_path.to_string_lossy().to_string()];
+                let mut args = vec![self.shell_path.to_string_lossy().into_owned()];
                 args.push("/d".to_string());
                 args.push("/c".to_string());
                 args.push(command.to_string());

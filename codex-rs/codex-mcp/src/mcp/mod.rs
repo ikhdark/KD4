@@ -52,8 +52,10 @@ use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
 
 pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
-const MCP_TOOL_NAME_PREFIX: &str = "mcp";
-const MCP_TOOL_NAME_DELIMITER: &str = "__";
+/// Separator shared by model-name budgeting and legacy hook names.
+pub const MCP_TOOL_NAME_DELIMITER: &str = "__";
+/// Historical wire prefix retained for MCP hooks and prefixed model names.
+pub const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 const CODEX_CONNECTORS_TOKEN_ENV_VAR: &str = "CODEX_CONNECTORS_TOKEN";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,7 +73,7 @@ impl McpSnapshotDetail {
 
 pub fn qualified_mcp_tool_name_prefix(server_name: &str) -> String {
     sanitize_responses_api_tool_name(&format!(
-        "{MCP_TOOL_NAME_PREFIX}{MCP_TOOL_NAME_DELIMITER}{server_name}{MCP_TOOL_NAME_DELIMITER}"
+        "{LEGACY_MCP_TOOL_NAME_PREFIX}{server_name}{MCP_TOOL_NAME_DELIMITER}"
     ))
 }
 

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Bounded, evidence-backed source inventory. Run --help for the query format.
 
-Classification means a declared rule matched, not proof of runtime reachability.
-Ambiguous rules must set unresolved=true until their consumers are inspected.
-The state file belongs to the task: reuse it for subsequent queries.
+Categories default to runtime verification: matches remain unresolved until a
+decision supplies exact consumer evidence. Use verification=path for inventories
+that claim only file/rule matches. The state file belongs to the task; --render-only
+renders that retained snapshot without scanning the repository again.
 """
 
 import argparse
 import fnmatch
 import hashlib
+import html
 import json
-from pathlib import Path, PurePosixPath
 import re
 import sys
+from pathlib import Path, PurePosixPath
 
 if __package__:
     from .source_map_check import repository_source_records
@@ -28,11 +30,86 @@ def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def query_profile(query):
+    """Classification decisions do not change the discovery scope."""
+    return {"categories": sorted(query["categories"], key=lambda rule: rule["name"]),
+            "required_categories": sorted(set(query.get("required_categories", [r["name"] for r in query["categories"]]))),
+            "candidates": sorted(query.get("candidates", []), key=lambda r: (r["category"], r["path"]))}
+
+
+def query_identity(query):
+    return digest(json.dumps(query_profile(query), sort_keys=True, ensure_ascii=False).encode("utf-8"))
+
+
+def json_shape(value, depth=0, budget=None):
+    """Bounded structural evidence; string bodies never enter the display."""
+    budget = [64] if budget is None else budget
+    budget[0] -= 1
+    if isinstance(value, str):
+        return {"type": "string", "length": len(value)}
+    if isinstance(value, (dict, list)):
+        result = {"type": "object" if isinstance(value, dict) else "array", "length": len(value)}
+        if depth >= 4 or budget[0] <= 0:
+            result["omitted"] = len(value)
+            return result
+        items = list(value.items()) if isinstance(value, dict) else list(enumerate(value[:3]))
+        shown = {}
+        for index, (key, child) in enumerate(items[:32]):
+            if budget[0] <= 0:
+                break
+            label = str(key)
+            if len(label) > 80:
+                label = f"<field {index}: name length {len(label)}>"
+            shown[label] = json_shape(child, depth + 1, budget)
+        result["fields" if isinstance(value, dict) else "items"] = shown
+        result["omitted"] = len(value) - len(shown)
+        return result
+    return {"type": "null" if value is None else "boolean" if isinstance(value, bool) else "number"}
+
+
 def normalized_path(value):
     path = PurePosixPath(value.replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts or not path.parts or ":" in path.parts[0]:
         raise ValueError(f"expected a repository-relative candidate path: {value!r}")
     return path.as_posix()
+
+
+def discovery_paths(query):
+    prefixes = set()
+    for rule in query["categories"]:
+        for pattern in rule["paths"]:
+            normalized_path(pattern)
+            fixed = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
+            prefix = fixed if fixed == pattern else fixed.rsplit("/", 1)[0] if "/" in fixed else "."
+            prefixes.add(prefix.rstrip("/") or ".")
+    prefixes.update(normalized_path(r["path"]) for r in query.get("candidates", []))
+    return tuple(sorted(prefixes))
+
+
+def instruction_paths(root, scopes):
+    """Enumerate only selected subtrees and directly check their ancestors."""
+    root = root.resolve()
+    scopes = tuple(normalized_path(scope) for scope in scopes)
+    if any(part in PRUNE for scope in scopes for part in PurePosixPath(scope).parts):
+        raise ValueError("instruction scope is inside a pruned directory")
+    records = repository_source_records(root, prune=PRUNE, paths=scopes)
+    names = {"AGENTS.md", "AGENTS.override.md"}
+    found = {path for path, status in records.items()
+             if status != "deleted" and PurePosixPath(path).name in names}
+    for scope in scopes:
+        path = root / scope
+        if not path.resolve().is_relative_to(root) or path.is_symlink():
+            raise ValueError("instruction scope must remain inside the repository")
+        directory = path if path.is_dir() else path.parent
+        while directory.is_relative_to(root):
+            for name in names:
+                candidate = directory / name
+                if candidate.is_file() and not candidate.is_symlink():
+                    found.add(candidate.relative_to(root).as_posix())
+            if directory == root:
+                break
+            directory = directory.parent
+    return sorted(found)
 
 
 def compile_categories(query):
@@ -41,17 +118,86 @@ def compile_categories(query):
         name = rule["name"]
         if name in categories or not name or not rule.get("paths"):
             raise ValueError("categories require unique names and nonempty paths")
+        if rule.get("verification", "runtime") not in ("path", "runtime"):
+            raise ValueError("verification must be path or runtime")
         categories[name] = (rule, re.compile(rule["contains"]) if rule.get("contains") else None)
     if not categories:
         raise ValueError("at least one category is required")
     return categories
 
 
+def consumer_evidence(root, references, cache):
+    """Verify exact observations, not the reviewer's semantic interpretation."""
+    if not references:
+        return "runtime consumer requires inspection"
+    for reference in references:
+        path = normalized_path(reference["path"])
+        full_path = root / path
+        if path not in cache:
+            if (any(part in PRUNE for part in PurePosixPath(path).parts[:-1])
+                    or full_path.is_symlink()
+                    or not full_path.resolve().is_relative_to(root)):
+                cache[path] = None
+            else:
+                try:
+                    remaining = MAX_SCAN_BYTES - sum(len(v) for v in cache.values() if v)
+                    limit = min(MAX_FILE_BYTES, remaining)
+                    if full_path.stat().st_size > limit:
+                        data = None
+                    else:
+                        with full_path.open("rb") as source:
+                            data = source.read(limit + 1)
+                        if len(data) > limit:
+                            data = None
+                    cache[path] = data
+                except OSError:
+                    cache[path] = None
+        data = cache[path]
+        if data is None or digest(data) != reference.get("sha256"):
+            return "consumer evidence is unavailable or stale"
+        try:
+            lines = data.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            return "consumer evidence is not UTF-8"
+        line = reference.get("line")
+        text = reference.get("text")
+        if (type(line) is not int or not 1 <= line <= len(lines)
+                or not isinstance(text, str) or not text.strip() or text != lines[line - 1]):
+            return "consumer evidence does not match the exact source line"
+    return None
+
+
 def inventory(root, query, previous=None):
     root = root.resolve()
     categories = compile_categories(query)
-    states = repository_source_records(root, prune=PRUNE)
     previous = previous or {}
+    if previous and previous.get("root") != str(root):
+        raise ValueError("the retained state belongs to a different repository")
+    query_id = query_identity(query)
+    scope_changes = list(previous.get("scope_changes", []))
+    if previous and query_identity(previous["query"]) != query_id:
+        old_id = query_identity(previous["query"])
+        change = query.get("scope_change", {})
+        if change.get("from_query_id") != old_id or not change.get("reason", "").strip():
+            raise ValueError(f"query scope changed; retain the existing query or provide scope_change with from_query_id={old_id} and an explicit reason")
+        scope_changes.append({"query_id": old_id, "profile": query_profile(previous["query"]),
+                              "reason": change["reason"], "count": previous["output"]["count"],
+                              "unresolved": previous["output"]["unresolved"],
+                              "excluded": previous["output"].get("excluded", []),
+                              "missing_categories": previous["output"].get("missing_categories", [])})
+    query = json.loads(json.dumps(query))
+    if "decisions" not in query and previous and query_identity(previous["query"]) == query_id:
+        query["decisions"] = previous["query"].get("decisions", [])
+    decisions = {}
+    for decision in query.get("decisions", []):
+        key = (normalized_path(decision["path"]), decision["category"])
+        if key in decisions or key[1] not in categories:
+            raise ValueError("decisions require unique paths/categories from the query")
+        if decision.get("disposition") not in ("include", "exclude") or not decision.get("reason", "").strip():
+            raise ValueError("decisions require include/exclude and a review reason")
+        decisions[key] = decision
+    evidence_cache = {}
+    states = repository_source_records(root, prune=PRUNE, paths=discovery_paths(query))
     old_files = previous.get("files", {}) if previous.get("root") == str(root) else {}
     records = {}
     files = {}
@@ -138,6 +284,11 @@ def inventory(root, query, previous=None):
                                             "rule": name}
                         except UnicodeDecodeError:
                             reason = "non-UTF-8 source requires separate inspection"
+                    if matched and rule.get("json_summary"):
+                        try:
+                            evidence["structure"] = json_shape(json.loads(data))
+                        except (ValueError, UnicodeDecodeError):
+                            reason = "invalid JSON requires separate inspection"
                 if not matched and reason is None:
                     reason = "category rule did not match"
             elif reason is None:
@@ -146,9 +297,23 @@ def inventory(root, query, previous=None):
                              "evidence": evidence, "reason": reason}
             if not matched and path not in requested and reason == "category rule did not match":
                 continue
-            unresolved = reason or ("runtime consumer requires inspection" if rule.get("unresolved") else None)
+            runtime = rule.get("verification", "runtime") == "runtime" or rule.get("unresolved", False)
+            decision = decisions.get((path, name))
+            unresolved = reason
+            status = "matched"
+            if unresolved is None and runtime:
+                if decision is None:
+                    unresolved = "runtime consumer requires inspection"
+                elif decision.get("source_sha256") != content_hash:
+                    unresolved = "classification source is stale"
+                else:
+                    unresolved = consumer_evidence(root, decision.get("evidence"), evidence_cache)
+                    if unresolved is None:
+                        status = "verified" if decision["disposition"] == "include" else "excluded"
             record = {"path": path, "category": name, "exists": exists,
-                      "tracking": state, "evidence": evidence, "unresolved": unresolved}
+                      "tracking": state, "evidence": evidence, "unresolved": unresolved,
+                      "status": "unresolved" if unresolved else status,
+                      "decision": decision if runtime else None}
             records[(path, name)] = record
             if unresolved:
                 coverage[name]["unresolved"].append(path)
@@ -158,34 +323,147 @@ def inventory(root, query, previous=None):
             files[path] = {"sha256": content_hash, "categories": entries}
 
     result = list(records.values())
-    validated = [record for record in result if record["unresolved"] is None]
+    validated = [record for record in result if record["unresolved"] is None and record["status"] != "excluded"]
     tracked = sorted({record["path"] for record in validated if record["tracking"] == "tracked"})
     untracked = sorted({record["path"] for record in validated if record["tracking"] == "untracked"})
     by_category = {name: sorted({r["path"] for r in validated
                                 if r["category"] == name and r["tracking"] == "tracked"})
                    for name in categories}
-    output = {"paths": tracked, "count": len(tracked), "untracked_paths": untracked,
+    output = {"query_id": query_id, "scope_changes": scope_changes,
+              "paths": tracked, "count": len(tracked), "untracked_paths": untracked,
               "untracked_count": len(untracked), "categories": by_category,
               "category_counts": {name: len(paths) for name, paths in by_category.items()},
               "unresolved": [r for r in result if r["unresolved"]],
               "coverage": coverage, "searched_records": searched, "reused_records": reused}
-    state = {"version": 1, "root": str(root), "files": files, "records": result,
+    required = query.get("required_categories", list(categories))
+    if not isinstance(required, list) or any(not isinstance(name, str) or not name for name in required):
+        raise ValueError("required_categories must be a list of category names")
+    output["missing_categories"] = sorted(set(required) - set(categories))
+    output["excluded"] = [r for r in result if r["status"] == "excluded"]
+    output["ready_to_render"] = not output["unresolved"] and not output["missing_categories"]
+    output["next_action"] = "render" if output["ready_to_render"] else "resolve_remaining"
+    state = {"version": 3, "root": str(root), "files": files, "records": result,
+             "scope_changes": scope_changes,
              "query": query, "output": output}
     return output, state
 
 
+def render_report(state):
+    """All identifiers and counts come from one retained snapshot."""
+    output = state["output"]
+    def code(text):
+        return "<code>" + html.escape(str(text)) + "</code>"
+
+    statuses = {(r["category"], r["path"]): r["status"] for r in state["records"]}
+    lines = ["# Source inventory", "",
+             "Retained snapshot; rendering does not refresh workspace evidence.", "",
+             f"Root: {code(state['root'])}", "",
+             f"Query: {code(output.get('query_id', query_identity(state['query'])))}", "",
+             (f"Included tracked files: **{output['count']}**. "
+              f"Untracked files: **{output['untracked_count']}**."), "",
+             ("Coverage is limited to the declared query. Consumer evidence records a "
+              "reviewed classification; a path match alone does not establish runtime use."), "",
+             "Status: " + ("ready for the declared scope" if output["ready_to_render"] else "partial") + ".", ""]
+    for change in state.get("scope_changes", []):
+        lines.extend(["## Earlier scope (not covered by current completion)", "",
+                      f"Query: {code(change['query_id'])}. Change: {html.escape(change['reason'])}", "",
+                      f"Earlier required categories: {code(', '.join(change['profile']['required_categories']))}.", "",
+                      f"Earlier unresolved records: {len(change['unresolved'])}; reviewed exclusions: {len(change['excluded'])}.", ""])
+        lines.extend(f"- Not examined: {code(name)}" for name in change["missing_categories"])
+        lines.extend(f"- Unresolved: {code(r['category'])}: {code(r['path'])}" for r in change["unresolved"])
+        lines.extend(f"- Excluded: {code(r['category'])}: {code(r['path'])}" for r in change["excluded"])
+        lines.append("")
+    for name, paths in sorted(output["categories"].items()):
+        lines.extend([f"## {code(name)} ({len(paths)})", ""])
+        for path in paths:
+            status = statuses[(name, path)]
+            lines.append(f"- {code(path)} ({status})")
+        if not paths:
+            lines.append("No included tracked matches in the declared query.")
+        lines.append("")
+    if output["untracked_paths"]:
+        lines.extend(["## Untracked matches", ""] + [f"- {code(p)}" for p in output["untracked_paths"]] + [""])
+    lines.extend(["## Remaining work", ""])
+    lines.extend(f"- Missing required category: {code(name)}" for name in output["missing_categories"])
+    lines.extend(f"- {code(r['category'])}: {code(r['path'])} — {html.escape(r['unresolved'])}"
+                 for r in output["unresolved"])
+    if output["ready_to_render"]:
+        lines.append("None for the declared scope. Reuse this report unless relevant inputs change.")
+    if output["excluded"]:
+        lines.extend(["", "## Reviewed exclusions", ""])
+        lines.extend(f"- {code(r['path'])} — {html.escape(r['decision']['reason'])}" for r in output["excluded"])
+    return "\n".join(lines) + "\n"
+
+
+def export_delivery(state, report):
+    """Content-addressed delivery survives later state/report revisions."""
+    output = state["output"]
+    document = {"query_id": output.get("query_id", query_identity(state["query"])),
+                "profile": query_profile(state["query"]), "root": state["root"],
+                "selection": "all validated tracked identifiers",
+                **{key: output[key] for key in ("paths", "count", "untracked_paths", "untracked_count", "categories", "unresolved", "excluded", "missing_categories", "ready_to_render")},
+                "scope_changes": state.get("scope_changes", [])}
+    data = (json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    identity = digest(data)
+    canonical = report.with_name(f"{report.stem}-{identity}.json")
+    readable = canonical.with_suffix(".md")
+    rendered = (render_report(state) + f"\nCanonical path data: [{canonical.name}]({canonical.name})\n").encode("utf-8")
+    for path, content in ((canonical, data), (readable, rendered)):
+        try:
+            with path.open("xb") as artifact:
+                artifact.write(content)
+        except FileExistsError:
+            if path.read_bytes() != content:
+                raise ValueError(f"immutable delivery artifact was modified: {path}")
+    report.write_bytes(rendered)
+    return {"report": str(readable.resolve()), "canonical_paths": str(canonical.resolve()), "delivery_sha256": identity}
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, epilog='Query JSON: {"categories": [{"name": "templates", "paths": ["src/templates/*.md"], "contains": "optional regex", "unresolved": false}], "candidates": [{"path": "src/a.md", "category": "templates"}]}')
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Query JSON: {"required_categories": ["templates", "catalog"], "categories": [{"name": "templates", "paths": ["src/templates/*.md"], "verification": "runtime"}], "decisions": [{"path": "src/templates/a.md", "category": "templates", "source_sha256": "observed hash", "disposition": "include", "reason": "loaded as model input", "evidence": [{"path": "src/loader.rs", "sha256": "observed hash", "line": 1, "text": "exact source line"}]}]}')
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--query", type=Path, required=True)
-    parser.add_argument("--state", type=Path, required=True, help="Task-owned retained records and coverage; reused on subsequent calls")
+    parser.add_argument("--query", type=Path)
+    parser.add_argument("--state", type=Path, help="Task-owned retained records and coverage; reused on subsequent calls")
+    parser.add_argument("--instructions", nargs="+", metavar="SCOPE", help="List applicable ancestor and scoped descendant instruction paths, pruning build/dependency trees before descent")
     parser.add_argument("--paths", action="store_true", help="Emit the exact validated tracked path list for the final answer")
+    parser.add_argument("--report", type=Path, help="Write a readable Markdown report from the retained records")
+    parser.add_argument("--render-only", action="store_true", help="Read the state snapshot without rescanning or rewriting it")
+    parser.add_argument("--remaining", action="store_true", help="Include a bounded page of unresolved retained records and structural evidence")
+    parser.add_argument("--offset", type=int, default=0, help="Offset into unresolved records (50 per page)")
     args = parser.parse_args(argv)
-    query = json.loads(args.query.read_text(encoding="utf-8"))
+    if args.instructions:
+        if args.state or args.query or args.report or args.paths or args.render_only or args.remaining:
+            parser.error("--instructions is a standalone scoped discovery operation")
+        print(json.dumps({"scopes": args.instructions, "paths": instruction_paths(args.root, args.instructions)}))
+        return 0
+    if not args.state:
+        parser.error("--state is required for an inventory")
     previous = json.loads(args.state.read_text(encoding="utf-8")) if args.state.exists() else None
-    output, state = inventory(args.root, query, previous)
-    args.state.parent.mkdir(parents=True, exist_ok=True)
-    args.state.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.render_only:
+        if args.query or not previous or previous.get("version") not in (2, 3):
+            parser.error("--render-only requires a version 2 or 3 state and no --query")
+        state = previous
+        output = state["output"]
+    else:
+        if not args.query:
+            parser.error("--query is required unless --render-only is used")
+        query = json.loads(args.query.read_text(encoding="utf-8"))
+        output, state = inventory(args.root, query, previous)
+    if args.offset < 0 or (args.remaining and args.paths):
+        parser.error("offset must be nonnegative; --remaining cannot be combined with --paths")
+    delivery = {}
+    if args.report:
+        protected = [args.state, args.query] if args.query else [args.state]
+        if any(args.report.resolve() == p.resolve() for p in protected):
+            parser.error("report must not overwrite the query or state")
+        if args.report.resolve().is_relative_to(Path(state["root"]).resolve()):
+            parser.error("report must be outside the source tree")
+    if not args.render_only:
+        args.state.parent.mkdir(parents=True, exist_ok=True)
+        args.state.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        delivery = export_delivery(state, args.report)
     if args.paths:
         print("\n".join(output["paths"]))
     else:
@@ -193,6 +471,19 @@ def main(argv=None):
         summary = {key: output[key] for key in ("count", "untracked_count", "category_counts", "searched_records", "reused_records")}
         summary["unresolved_count"] = len(output["unresolved"])
         summary["artifact"] = str(args.state.resolve())
+        summary["query_id"] = output.get("query_id", query_identity(state["query"]))
+        summary["earlier_scope_count"] = len(state.get("scope_changes", []))
+        summary.update({key: output[key] for key in ("missing_categories", "ready_to_render", "next_action")})
+        if args.remaining:
+            # Decisions retain exact source lines in state; display only the
+            # bounded rule evidence, including JSON structure without bodies.
+            summary["remaining"] = [{key: r[key] for key in ("path", "category", "unresolved", "evidence")}
+                                    for r in output["unresolved"][args.offset:args.offset + 50]]
+            summary["next_offset"] = args.offset + 50 if args.offset + 50 < len(output["unresolved"]) else None
+        if args.report:
+            summary.update(delivery)
+            if output["ready_to_render"]:
+                summary["next_action"] = "deliver_report"
         print(json.dumps(summary, ensure_ascii=False))
     return 0
 

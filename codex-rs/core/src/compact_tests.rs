@@ -1103,7 +1103,11 @@ fn unresolved_tool_output_survives_local_compaction_as_typed_receipt() {
 #[test]
 fn newest_section_updates_include_separator_cost_in_their_budget() {
     let updates = (0..200)
-        .map(|index| vec![format!("update-{index}")])
+        .map(|index| {
+            let update = format!("update-{index}");
+            let tokens = approx_token_count(&update);
+            (update, tokens)
+        })
         .collect::<Vec<_>>();
 
     let retained = retain_newest_section_updates(&updates, 32);
@@ -1116,10 +1120,16 @@ fn newest_section_updates_include_separator_cost_in_their_budget() {
 #[test]
 fn goal_section_retains_original_constraints_and_latest_revision() {
     let updates = vec![
-        vec![format!("ORIGINAL_CONSTRAINT {}", "original ".repeat(200))],
-        vec!["obsolete intermediate goal".to_string()],
-        vec![format!("LATEST_REVISION {}", "latest ".repeat(200))],
-    ];
+        format!("ORIGINAL_CONSTRAINT {}", "original ".repeat(200)),
+        "obsolete intermediate goal".to_string(),
+        format!("LATEST_REVISION {}", "latest ".repeat(200)),
+    ]
+    .into_iter()
+    .map(|update| {
+        let tokens = approx_token_count(&update);
+        (update, tokens)
+    })
+    .collect::<Vec<_>>();
 
     let retained = retain_goal_boundary_updates(&updates, 96);
 

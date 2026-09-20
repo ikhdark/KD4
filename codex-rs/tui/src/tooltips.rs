@@ -262,7 +262,7 @@ pub(crate) mod announcement {
                 from_date,
                 to_date,
                 version_regex,
-                target_app: raw.target_app.unwrap_or("cli".to_string()).to_lowercase(),
+                target_app: raw.target_app.as_deref().unwrap_or("cli").to_lowercase(),
                 target_plan_types,
                 target_oses,
             })

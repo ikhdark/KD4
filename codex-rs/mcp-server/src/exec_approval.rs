@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -78,21 +79,22 @@ pub(crate) async fn handle_exec_approval_request(
     );
 
     if let Some(reason) = &event.reason {
-        message.push_str(&format!("\nReason: {reason}"));
+        let _ = write!(message, "\nReason: {reason}");
     }
     if let Some(cwd_uri) = &event.cwd_uri {
-        message.push_str(&format!("\nWorking directory URI: {cwd_uri}"));
+        let _ = write!(message, "\nWorking directory URI: {cwd_uri}");
     }
     if let Some(permissions) = &event.additional_permissions {
-        message.push_str(&format!("\nRequested permissions: {}", json!(permissions)));
+        let _ = write!(message, "\nRequested permissions: {}", json!(permissions));
     }
     if let Some(network) = &event.network_approval_context {
-        message.push_str(&format!("\nNetwork request: {}", json!(network)));
+        let _ = write!(message, "\nNetwork request: {}", json!(network));
     }
-    message.push_str(&format!(
+    let _ = write!(
+        message,
         "\nAllowed decisions: {}",
         json!(available_decisions)
-    ));
+    );
 
     let params = ExecApprovalElicitRequestParams {
         message,

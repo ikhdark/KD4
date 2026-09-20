@@ -1278,8 +1278,7 @@ async fn enter_submits_when_plan_stream_is_not_active() {
     assert!(chat.input_queue.queued_user_messages.is_empty());
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
-            personality: Some(Personality::Pragmatic),
-            ..
+            personality: None, ..
         } => {}
         other => panic!("expected Op::UserTurn, got {other:?}"),
     }
@@ -1570,7 +1569,7 @@ async fn collab_mode_is_sent_after_enabling() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: Some(Personality::Pragmatic),
+            personality: None,
             ..
         } => {}
         other => {
@@ -1594,7 +1593,7 @@ async fn collab_mode_applies_default_preset() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: Some(Personality::Pragmatic),
+            personality: None,
             ..
         } => {}
         other => {
@@ -1610,6 +1609,14 @@ async fn collab_mode_applies_default_preset() {
 async fn user_turn_includes_personality_from_config() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.set_feature_enabled(Feature::Personality, /*enabled*/ true);
+    let mut models = crate::test_support::TEST_MODEL_PRESETS.clone();
+    models
+        .iter_mut()
+        .find(|model| model.model == "gpt-5.4")
+        .expect("fixture model")
+        .supports_personality = true;
+    chat.model_catalog = std::sync::Arc::new(crate::model_catalog::ModelCatalog::new(models));
+    chat.set_feature_enabled(Feature::Personality, true);
     chat.thread_id = Some(ThreadId::new());
     chat.set_model("gpt-5.4");
     chat.set_personality(Personality::Friendly);

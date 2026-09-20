@@ -51,7 +51,7 @@ fn exec_command_boundary_normalizes_unambiguous_legacy_forms() {
     for (arguments, expected) in cases {
         let decoded: ExecCommandArgs =
             parse_arguments(&arguments.to_string()).expect("legacy boundary form should decode");
-        assert_eq!(decoded.command_invocation(), expected);
+        assert_eq!(decoded.command_invocation(), &expected);
     }
 }
 
@@ -122,7 +122,23 @@ fn exec_command_boundary_reports_branch_field_and_bound_errors() {
     .expect_err("out-of-range yield must be rejected");
     assert!(invalid_bound.contains("$.yield_time_ms"), "{invalid_bound}");
     assert!(invalid_bound.contains("actual value 50"), "{invalid_bound}");
-    assert!(invalid_bound.contains("250..=30000"), "{invalid_bound}");
+    assert!(invalid_bound.contains("250..=300000"), "{invalid_bound}");
+}
+
+#[test]
+fn exec_command_boundary_accepts_long_observation_without_a_process_deadline() {
+    for wait in [60_000, 300_000] {
+        let decoded: ExecCommandArgs = parse_arguments(
+            &serde_json::json!({"cmd": "cargo test", "yield_time_ms": wait}).to_string(),
+        )
+        .expect("long observation should be accepted");
+        assert_eq!(decoded.yield_time_ms, wait);
+    }
+    let error = validate_exec_command_arguments(
+        &serde_json::json!({"cmd": "cargo test", "yield_time_ms": 300_001}).to_string(),
+    )
+    .expect_err("the observation ceiling must still be enforced");
+    assert!(error.contains("250..=300000"), "{error}");
 }
 
 #[tokio::test]
@@ -177,7 +193,7 @@ async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
                 "program": program,
                 "args": ["-c", script],
                 "validation": {"covered_paths": ["cancelled-scope"]},
-                "yield_time_ms": 20_000
+                "yield_time_ms": 300_000
             })
             .to_string(),
         },
@@ -989,7 +1005,64 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
 
 #[tokio::test]
 async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches() {
-    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
+    let repo = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(initialized.status.success(), "{initialized:?}");
+    // Exercise retained artifacts as well as cache promotion, without relying on checkout size.
+    let fixture = "immutable cache fixture\n".repeat(300);
+    assert!(
+        fixture.len()
+            > crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES
+    );
+    std::fs::write(repo.path().join("fixture.txt"), fixture).unwrap();
+    // Cache namespaces use root commit identities, so an unborn repository is ineligible.
+    for args in [
+        vec!["add", "fixture.txt"],
+        vec![
+            "-c",
+            "user.name=Cache Test",
+            "-c",
+            "user.email=cache@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let (session, turn, rx_event) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            codex_home.path(),
+            |config| {
+                config.cwd =
+                    codex_utils_absolute_path::AbsolutePathBuf::try_from(repo.path()).unwrap();
+                config
+                    .permissions
+                    .set_permission_profile(PermissionProfile::Disabled)
+                    .unwrap();
+                config
+                    .permissions
+                    .approval_policy
+                    .set(codex_protocol::protocol::AskForApproval::Never)
+                    .unwrap();
+            },
+        )
+        .await;
     assert!(
         session
             .features()
@@ -998,13 +1071,13 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
     let repo_root =
         get_git_repo_root(turn.cwd().as_path()).expect("test cwd is in a git repository");
     let blob_output = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD:codex-rs/core/src/lib.rs"])
+        .args(["hash-object", "-w", "fixture.txt"])
         .current_dir(&repo_root)
         .output()
-        .expect("resolve committed test blob");
+        .expect("write immutable test blob");
     assert!(
         blob_output.status.success(),
-        "git rev-parse failed: {}",
+        "git hash-object failed: {}",
         String::from_utf8_lossy(&blob_output.stderr)
     );
     let blob = String::from_utf8(blob_output.stdout)
@@ -1045,7 +1118,15 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
                         &session,
                         &turn,
                         "known-delta-unified-third",
-                        payload.clone(),
+                        ToolPayload::Function {
+                            arguments: serde_json::json!({
+                                "kind": "argv",
+                                "program": "git",
+                                "args": ["-C", turn.cwd().as_path(), "show", blob.clone()],
+                                "yield_time_ms": 10_000,
+                            })
+                            .to_string(),
+                        },
                     )
                     .await;
                     let cached_lifecycle =
@@ -1820,7 +1901,8 @@ async fn intercepted_apply_patch_success_reports_terminal_completion_and_post_ho
         .tool_response
         .as_str()
         .expect("successful Bash PostToolUse should carry the patch result");
-    assert!(patch_result.contains("Exit code: 0"));
+    assert!(patch_result.contains("Success. Updated"));
+    assert!(!patch_result.contains("Exit code:"));
     assert!(patch_result.contains(&format!("M {target}")));
     assert_eq!(
         tokio::fs::read_to_string(target_path)
@@ -1835,7 +1917,7 @@ async fn kd4_latency_unpolled_background_failure_retires_live_metadata() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
         .expect("Python is required by the KD4 test environment");
-    let script = "import time; print('X' * 5000, flush=True); time.sleep(2.5); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)";
+    let script = "import time; print('X' * 5000, flush=True); time.sleep(6); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)";
     let program = python.to_string_lossy().into_owned();
     let command = vec![program.clone(), "-c".to_string(), script.to_string()];
     let (session, turn) = make_session_and_context().await;
@@ -1905,7 +1987,7 @@ async fn kd4_latency_unpolled_background_failure_retires_live_metadata() {
     let mut retained = String::new();
     let mut consecutive_failures = 0;
     let mut running_metadata_retired = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         retained = tokio::fs::read_to_string(artifact_directory.join(format!("{artifact_id}.log")))
             .await
             .unwrap_or_default();
@@ -2282,7 +2364,7 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
     };
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
-    let handler = WriteStdinHandler;
+    let handler = WriteStdinHandler::default();
 
     assert_eq!(
         handler.pre_tool_use_payload(&ToolInvocation {
@@ -2436,7 +2518,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         pending_deferred_completions: Vec::new(),
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
-    let handler = WriteStdinHandler;
+    let handler = WriteStdinHandler::default();
 
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
@@ -2470,7 +2552,7 @@ async fn empty_write_stdin_poll_does_not_increment_retry_or_reentry_counters() {
     ));
     let _ = crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
         Arc::clone(&timing),
-        WriteStdinHandler.handle(invocation),
+        WriteStdinHandler::default().handle(invocation),
     )
     .await;
 
@@ -2526,7 +2608,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;
-    let handler = WriteStdinHandler;
+    let handler = WriteStdinHandler::default();
 
     let payloads = [
         handler.post_tool_use_payload(&invocation_b, &output_b),
@@ -2607,9 +2689,7 @@ async fn assert_completed_exec_reports_tool_history_failure(background: bool) {
         Default::default(),
     )
     .expect("workspace observation");
-    session
-        .register_workspace_evidence(codex_home, observation, ())
-        .await;
+    session.register_workspace_evidence(observation, ()).await;
     session
         .flush_tool_history_persistence()
         .await
@@ -2668,7 +2748,7 @@ async fn assert_completed_exec_reports_tool_history_failure(background: bool) {
                 .is_some(),
             "the initial yield must retain a live command before stdin releases it"
         );
-        tokio::time::timeout(Duration::from_secs(15), WriteStdinHandler.handle(ToolInvocation {
+        tokio::time::timeout(Duration::from_secs(15), WriteStdinHandler::default().handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
@@ -2848,7 +2928,7 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
     let completed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         let mut chars = "go\n";
         loop {
-            let output = WriteStdinHandler
+            let output = WriteStdinHandler::default()
                 .handle(invoke(
                     "write_stdin",
                     serde_json::json!({

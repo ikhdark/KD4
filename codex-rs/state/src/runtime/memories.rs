@@ -92,7 +92,7 @@ WHERE thread_id = ?
     ) -> anyhow::Result<std::collections::HashSet<String>> {
         let sources = threads
             .iter()
-            .map(|thread| (thread.id.to_string(), thread.updated_at.timestamp()))
+            .map(|thread| (thread.id, thread.updated_at.timestamp()))
             .collect::<Vec<_>>();
         let rows = sqlx::query_scalar::<_, String>(
             r#"
@@ -181,6 +181,7 @@ SELECT
     threads.tokens_used,
     threads.first_user_message,
     threads.archived_at,
+    threads.project_id,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -598,6 +599,7 @@ SELECT
     threads.tokens_used,
     threads.first_user_message,
     threads.archived_at,
+    threads.project_id,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -690,41 +692,25 @@ WHERE id = ? AND memory_mode != 'polluted'
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
-        let existing_output = sqlx::query(
+        let up_to_date = sqlx::query_scalar::<_, bool>(
             r#"
-SELECT source_updated_at
-FROM stage1_outputs
-WHERE thread_id = ?
+SELECT EXISTS (
+    SELECT 1 FROM stage1_outputs WHERE thread_id = ? AND source_updated_at >= ?
+) OR EXISTS (
+    SELECT 1 FROM jobs WHERE kind = ? AND job_key = ? AND last_success_watermark >= ?
+)
             "#,
         )
         .bind(thread_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(existing_output) = existing_output {
-            let existing_source_updated_at: i64 = existing_output.try_get("source_updated_at")?;
-            if existing_source_updated_at >= source_updated_at {
-                tx.commit().await?;
-                return Ok(Stage1JobClaimOutcome::SkippedUpToDate);
-            }
-        }
-        let existing_job = sqlx::query(
-            r#"
-SELECT last_success_watermark
-FROM jobs
-WHERE kind = ? AND job_key = ?
-            "#,
-        )
+        .bind(source_updated_at)
         .bind(JOB_KIND_MEMORY_STAGE1)
         .bind(thread_id.as_str())
-        .fetch_optional(&mut *tx)
+        .bind(source_updated_at)
+        .fetch_one(&mut *tx)
         .await?;
-        if let Some(existing_job) = existing_job {
-            let last_success_watermark =
-                existing_job.try_get::<Option<i64>, _>("last_success_watermark")?;
-            if last_success_watermark.is_some_and(|watermark| watermark >= source_updated_at) {
-                tx.commit().await?;
-                return Ok(Stage1JobClaimOutcome::SkippedUpToDate);
-            }
+        if up_to_date {
+            tx.commit().await?;
+            return Ok(Stage1JobClaimOutcome::SkippedUpToDate);
         }
 
         let rows_affected = sqlx::query(

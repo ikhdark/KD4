@@ -276,7 +276,7 @@ pub struct LegacyFeatureUsage {
 /// Holds the effective set of enabled features.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Features {
-    enabled: BTreeSet<Feature>,
+    enabled: u128,
     legacy_usages: BTreeSet<LegacyFeatureUsage>,
 }
 
@@ -306,20 +306,17 @@ impl FeatureOverrides {
 impl Features {
     /// Starts with built-in defaults.
     pub fn with_defaults() -> Self {
-        let mut set = BTreeSet::new();
+        let mut features = Self::default();
         for spec in FEATURES {
             if spec.default_enabled {
-                set.insert(spec.id);
+                features.enable(spec.id);
             }
         }
-        Self {
-            enabled: set,
-            legacy_usages: BTreeSet::new(),
-        }
+        features
     }
 
     pub fn enabled(&self, f: Feature) -> bool {
-        self.enabled.contains(&f)
+        self.enabled & (1_u128 << f as u32) != 0
     }
 
     pub fn apps_enabled_for_auth(&self, has_chatgpt_auth: bool) -> bool {
@@ -327,12 +324,12 @@ impl Features {
     }
 
     pub fn enable(&mut self, f: Feature) -> &mut Self {
-        self.enabled.insert(f);
+        self.enabled |= 1_u128 << f as u32;
         self
     }
 
     pub fn disable(&mut self, f: Feature) -> &mut Self {
-        self.enabled.remove(&f);
+        self.enabled &= !(1_u128 << f as u32);
         self
     }
 
@@ -439,7 +436,17 @@ impl Features {
     }
 
     pub fn enabled_features(&self) -> Vec<Feature> {
-        self.enabled.iter().copied().collect()
+        let mut enabled = Vec::with_capacity(self.enabled.count_ones() as usize);
+        enabled.extend(
+            FEATURES
+                .iter()
+                .map(|spec| spec.id)
+                .filter(|feature| self.enabled(*feature)),
+        );
+        // Registry presentation order differs from Feature's derived Ord. Preserve
+        // the ordering callers received from the previous BTreeSet representation.
+        enabled.sort_unstable();
+        enabled
     }
 
     pub fn normalize_dependencies(&mut self) {
@@ -580,6 +587,11 @@ where
 
 impl Features {
     fn apply_toml(&mut self, features: &FeaturesToml) {
+        if features.removed_apps_mcp_path_override.is_some() {
+            tracing::warn!(
+                "[features].apps_mcp_path_override has been removed and is ignored; remove it from your config"
+            );
+        }
         let entries = features.entries();
         self.apply_map(&entries);
     }
@@ -754,6 +766,10 @@ macro_rules! define_features {
             $(consumer: $consumer:expr,)?
         }
     ),* $(,)?) => {
+        // The exhaustive feature_info match below ensures every enum variant is
+        // registered, so adding a variant beyond the bitset capacity fails to build.
+        const _: () = { $(assert!((Feature::$id as u32) < u128::BITS);)* };
+
         pub const FEATURES: &[FeatureSpec] = &[
             $(FeatureSpec {
                 id: Feature::$id,

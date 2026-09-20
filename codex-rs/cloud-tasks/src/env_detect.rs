@@ -93,7 +93,7 @@ pub async fn autodetect_environment_id(
     crate::append_error_log(format!("env: status={status} content-type={ct}"));
     match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(v) => {
-            let pretty = serde_json::to_string_pretty(&v).unwrap_or(body.clone());
+            let pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.clone());
             crate::append_error_log(format!("env: /environments JSON (pretty):\n{pretty}"));
         }
         Err(_) => crate::append_error_log(format!("env: /environments (raw):\n{body}")),

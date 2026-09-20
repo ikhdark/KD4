@@ -39,7 +39,6 @@ use super::PendingSpawnRegistration;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
-use super::head_tail_buffer::omitted_output_marker;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
@@ -165,11 +164,7 @@ pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
 async fn snapshot_retained_output(buffer: &OutputBuffer) -> (Vec<u8>, bool) {
     let guard = buffer.lock().await;
     let omitted_bytes = guard.omitted_bytes();
-    let bytes = if omitted_bytes == 0 {
-        guard.to_bytes()
-    } else {
-        guard.to_bytes_with_omission_marker(&omitted_output_marker(omitted_bytes))
-    };
+    let bytes = guard.to_bytes_with_loss_notice(&[]);
     (bytes, omitted_bytes == 0)
 }
 
@@ -693,7 +688,7 @@ impl UnifiedExecProcess {
         }
 
         let aggregated = self.snapshot_output().await;
-        let aggregated_text = String::from_utf8_lossy(&aggregated).to_string();
+        let aggregated_text = String::from_utf8_lossy(&aggregated);
         self.check_for_sandbox_denial_with_text(&aggregated_text)
             .await?;
 

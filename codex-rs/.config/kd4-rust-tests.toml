@@ -285,7 +285,10 @@ tests = ["tools::handlers::unified_exec::tests::known_delta_unified_exec_reuses_
 description = "Deferred executor readiness updates live context and tools."
 [[gates.capability-deferred-executor.steps]]
 target = "core_cli_workspace"
-tests = ["suite::remote_env::deferred_executor_updates_context_and_tools_after_startup"]
+tests = [
+  "suite::remote_env::deferred_executor_updates_context_and_tools_after_startup",
+  "suite::remote_env::deferred_executor_updates_context_and_tools_after_startup_with_inferred_environment",
+]
 
 [gates.capability-code-mode-runtime]
 description = "Code mode executes a native command and delivers its output."

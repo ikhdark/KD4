@@ -27,3 +27,4 @@ tracing = { workspace = true, features = ["log"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }

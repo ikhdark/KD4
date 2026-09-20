@@ -370,12 +370,11 @@ async fn forward_events(
                         .await;
                     }
                     Event {
-                        id,
                         msg: EventMsg::ApplyPatchApprovalRequest(event),
+                        ..
                     } => {
                         handle_patch_approval(
                             &codex,
-                            id,
                             &parent_session,
                             &parent_ctx,
                             event,
@@ -549,7 +548,6 @@ async fn handle_exec_approval(
 /// Handle an ApplyPatchApprovalRequest by consulting the parent session and replying.
 async fn handle_patch_approval(
     codex: &Codex,
-    _id: String,
     parent_session: &Arc<Session>,
     parent_ctx: &Arc<TurnContext>,
     event: ApplyPatchApprovalRequestEvent,

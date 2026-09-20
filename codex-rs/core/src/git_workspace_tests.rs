@@ -458,7 +458,9 @@ async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
         };
         let text = output.text_content().expect("text output");
         assert!(text.contains("\"stale_workspace_evidence\":true"));
-        assert!(!text.contains("first contents"));
+        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(notice["valid_for_current_workspace"], false);
+        assert_eq!(notice["historical_digest"], "first contents");
     }
 }
 

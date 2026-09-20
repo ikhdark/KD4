@@ -7,15 +7,13 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 
-use crate::render::line_utils::line_to_static;
+use crate::render::line_utils::line_into_static;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::decorate_spans;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::wrapping::RtOptions;
-use crate::wrapping::adaptive_wrap_line;
-use crate::wrapping::line_contains_url_like;
-use crate::wrapping::line_has_mixed_url_and_non_url_tokens;
+use crate::wrapping::adaptive_wrap_scrollback_line;
 use crossterm::Command;
 use crossterm::cursor::MoveDown;
 use crossterm::cursor::MoveTo;
@@ -78,7 +76,7 @@ where
 {
     insert_history_hyperlink_lines_with_wrap_policy(
         terminal,
-        &plain_hyperlink_lines(lines.iter().map(line_to_static).collect()),
+        &plain_hyperlink_lines(lines.into_iter().map(line_into_static).collect()),
         wrap_policy,
     )
 }
@@ -115,22 +113,15 @@ where
     for line in lines {
         let line_wrapped = match wrap_policy {
             HistoryLineWrapPolicy::Terminal => vec![line.clone()],
-            HistoryLineWrapPolicy::PreWrap
-                if line_contains_url_like(&line.line)
-                    && !line_has_mixed_url_and_non_url_tokens(&line.line) =>
-            {
-                vec![line.clone()]
-            }
-            HistoryLineWrapPolicy::PreWrap => remap_wrapped_line(
-                line,
-                adaptive_wrap_line(
-                    &line.line,
-                    RtOptions::new(wrap_width)
-                        .subsequent_indent(leading_whitespace_prefix(&line.line)),
-                )
-                .into_iter()
-                .map(|line| line_to_static(&line))
-                .collect(),
+            HistoryLineWrapPolicy::PreWrap => adaptive_wrap_scrollback_line(
+                &line.line,
+                RtOptions::new(wrap_width).subsequent_indent(leading_whitespace_prefix(&line.line)),
+            )
+            .map_or_else(
+                || vec![line.clone()],
+                |wrapped| {
+                    remap_wrapped_line(line, wrapped.into_iter().map(line_into_static).collect())
+                },
             ),
         };
         wrapped_rows += line_wrapped

@@ -21,6 +21,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::managed_network_requirements_loader;
+use core_test_support::require_network;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -31,7 +32,6 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -813,7 +813,7 @@ async fn wait_for_spawned_thread(
 
 #[tokio::test]
 async fn spawned_thread_wait_obeys_deadline_shorter_than_poll_interval() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = start_mock_server().await;
     let test = test_codex().build(&server).await?;
     assert_eq!(
@@ -1581,7 +1581,7 @@ async fn approval_matrix_covers_group(group: ScenarioGroup) -> Result<()> {
 }
 
 async fn run_scenario_group(group: ScenarioGroup) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     #[cfg(target_os = "windows")]
     let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
@@ -1826,7 +1826,7 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
 #[cfg_attr(target_os = "windows", serial(codex_home))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     #[cfg(target_os = "windows")]
     let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
@@ -2037,7 +2037,7 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
 #[tokio::test(flavor = "current_thread")]
 async fn denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     #[cfg(target_os = "windows")]
     let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
@@ -2313,7 +2313,7 @@ allow_local_binding = true
 #[cfg_attr(target_os = "windows", serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn network_approval_flow_survives_danger_full_access_session_start() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     #[cfg(target_os = "windows")]
     let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;

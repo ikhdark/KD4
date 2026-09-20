@@ -2947,11 +2947,11 @@ async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
     );
     assert!(
         developer_instructions
-            .contains("inherited fork history is provided only as reference context")
+            .contains("Inherited task objectives, plans, pending actions, and task-specific approvals are reference context.")
     );
     assert!(
         developer_instructions.contains(
-            "Only instructions submitted after the side-conversation boundary are active"
+            "Only user messages after the side-conversation boundary define the side task. Applicable higher-priority instructions, repository constraints, and this thread's live permissions remain in force."
         )
     );
     assert!(developer_instructions.contains("Do not continue, execute, or complete any task"));

@@ -72,7 +72,7 @@ fn reorder_pathext_for_stubs(env_map: &mut HashMap<String, String>) {
         .get("PATHEXT")
         .cloned()
         .or_else(|| env::var("PATHEXT").ok())
-        .unwrap_or(".COM;.EXE;.BAT;.CMD".to_string());
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
     let exts: Vec<String> = default
         .split(';')
         .filter(|e| !e.is_empty())

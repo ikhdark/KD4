@@ -365,7 +365,7 @@ fn bounds_cache_by_encoded_byte_size() {
     };
     let image = |size| EncodedImage {
         bytes: vec![0; size].into(),
-        mime: "image/png".to_string(),
+        mime: "image/png",
         width: 1,
         height: 1,
     };

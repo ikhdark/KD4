@@ -24,7 +24,7 @@ impl ContextualUserFragment for HookAdditionalContext {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.text.clone()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.text)
     }
 }

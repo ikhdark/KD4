@@ -2,6 +2,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::plan_tool::PlanItemArg;
+use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use serde::Deserialize;
 use serde::Serialize;
@@ -35,6 +36,13 @@ impl PlanUpdateEffect {
 pub(crate) struct PlanStoreUpdate {
     pub(crate) current: UpdatePlanArgs,
     pub(crate) effect: PlanUpdateEffect,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanStatusUpdate {
+    pub(crate) index: usize,
+    pub(crate) status: StepStatus,
 }
 
 /// Persisted `update_plan` response shared by rendering and legacy history replay.
@@ -102,6 +110,48 @@ impl PlanStore {
 
     pub(crate) async fn update(&self, next: UpdatePlanArgs) -> PlanStoreUpdate {
         let mut current = self.current.lock().await;
+        Self::commit(&mut current, next)
+    }
+
+    pub(crate) async fn update_statuses(
+        &self,
+        updates: Vec<PlanStatusUpdate>,
+        explanation: Option<String>,
+    ) -> Result<PlanStoreUpdate, String> {
+        let mut current = self.current.lock().await;
+        let mut next = current
+            .clone()
+            .ok_or("create a plan before updating statuses")?;
+        if updates.is_empty() {
+            return Err("set must contain at least one status update".to_string());
+        }
+        let mut seen = HashSet::new();
+        for update in updates {
+            if !seen.insert(update.index) {
+                return Err(format!("duplicate plan index {}", update.index));
+            }
+            let item = next
+                .plan
+                .get_mut(update.index)
+                .ok_or_else(|| format!("plan index {} is out of range", update.index))?;
+            item.status = update.status;
+        }
+        if next
+            .plan
+            .iter()
+            .filter(|item| item.status == StepStatus::InProgress)
+            .count()
+            > 1
+        {
+            return Err("update_plan permits at most one in_progress step at a time".to_string());
+        }
+        if explanation.is_some() {
+            next.explanation = explanation;
+        }
+        Ok(Self::commit(&mut current, next))
+    }
+
+    fn commit(current: &mut Option<UpdatePlanArgs>, next: UpdatePlanArgs) -> PlanStoreUpdate {
         let effect = match current.as_ref() {
             None => PlanUpdateEffect::Initial,
             Some(previous) if previous == &next => PlanUpdateEffect::NoOp,

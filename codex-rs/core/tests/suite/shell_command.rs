@@ -9,13 +9,13 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::local_selections;
@@ -214,7 +214,7 @@ fn assert_shell_command_output(output: &str, expected: &str) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_command_works() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
 
@@ -236,7 +236,7 @@ async fn shell_command_works() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn output_with_login() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
 
@@ -252,7 +252,7 @@ async fn output_with_login() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn output_without_login() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
 
@@ -268,7 +268,7 @@ async fn output_without_login() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_line_output_with_login() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
 
@@ -290,7 +290,7 @@ async fn multi_line_output_with_login() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
     let call_id = "shell-command-timeout";
@@ -319,7 +319,7 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_command_cancels_after_output_stalls() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
     let call_id = "shell-command-stall-timeout";
@@ -354,7 +354,7 @@ async fn shell_command_cancels_after_output_stalls() -> anyhow::Result<()> {
 #[test_case(true ; "with_login")]
 #[test_case(false ; "without_login")]
 async fn unicode_output(login: bool) -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.2")).await?;
 
@@ -377,7 +377,7 @@ async fn unicode_output(login: bool) -> anyhow::Result<()> {
 #[test_case(true ; "with_login")]
 #[test_case(false ; "without_login")]
 async fn unicode_output_with_newlines(login: bool) -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.2")).await?;
 

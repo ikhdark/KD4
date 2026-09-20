@@ -247,14 +247,14 @@ variant-selection switch. Prepared manifest schema 3 freezes this comparison;
 older manifests must be prepared again before comparison, rerun, or import.
 
 Both modes schedule 84 scripted attempts (14 workloads × three clusters ×
-two variants). Fast schedules two live attempts; full schedules six. Reports
+two variants). Fast schedules two live attempts; full schedules eight. Reports
 contain the overall comparison and both variants' configuration. Individual
 feature effects are not isolated.
 
 | Mode | Scripted execution ceiling | Real-model work and ceiling |
 |---|---:|---|
 | Fast | 30 minutes | Rust task Ã— two variants; 50 minutes |
-| Full | 30 minutes | Rust, TypeScript, Python tasks Ã— two variants; 150 minutes |
+| Full | 30 minutes | Rust, TypeScript, Python TOC and consumer-discovery tasks Ã— two variants; 200 minutes |
 
 Each real-model attempt has a twenty-minute ceiling. Execution is sequential: scripted work,
 cleanup, then real-model work. Variants and independent attempts run one at a time. These are
@@ -570,10 +570,12 @@ final source digest and saved changes exclude `.git`, `target`, `node_modules`,
 and `__pycache__`; these are source-state measurements, not build-output hashes.
 The pinned KD4 fixture still contains the full committed source tree.
 
-The live attempt allowance is 20 minutes. Fast and full segment ceilings are 50 and 150 minutes,
+The live attempt allowance is 20 minutes. Fast and full segment ceilings are 50 and 200 minutes,
 covering fork-on and upstream with 25% scheduling headroom. Replay uses the budgets frozen in each
 prepared manifest; these defaults apply to new preparations.
 
 Cancellation verification checks both PID creation time and actual exit state. A published retained
 process can intentionally survive turn interruption; such an attempt remains failed and does not
 become a passing pair merely because the turn reported interrupted.
+
+The python_consumer_refactor live task requires discovering five implementation files without source filenames in its prompt. Its 1,200 archived parsers share task search terms. The protected oracle checks every live consumer with a named record that cannot be indexed or unpacked, preserves original tests, and requires submitted tests to reject defective parser and consumer implementations. Helper Python modules inside the package are allowed.

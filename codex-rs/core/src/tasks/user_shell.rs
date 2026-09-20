@@ -28,7 +28,6 @@ use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
-use crate::tools::runtimes::RuntimePathPrepends;
 
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file;
 use crate::tools::runtimes::strip_managed_proxy_env;
@@ -496,7 +495,6 @@ async fn execute_remote_user_shell_command(
         shell_snapshot.as_deref(),
         &policy.r#set,
         &mut env,
-        &RuntimePathPrepends,
     );
     let process_id = call_id.into();
     let exec_backend = turn_environment.environment.get_exec_backend();
@@ -659,7 +657,6 @@ fn prepare_user_shell_exec_command(
             // On Windows, arg0 has already prepended the package path to the
             // process PATH before create_env() builds exec_env_map. Shell
             // snapshot replay does not need additional runtime path entries.
-            &RuntimePathPrepends,
         )
     }
 }

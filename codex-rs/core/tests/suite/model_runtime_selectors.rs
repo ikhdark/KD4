@@ -16,6 +16,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -24,7 +25,6 @@ use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -176,7 +176,7 @@ async fn response_body_for_remote_model(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn astra_default_completes_a_turn_with_its_bundled_runtime_settings() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = responses::start_mock_server().await;
     let response_mock = mount_sse_once(
         &server,
@@ -198,8 +198,8 @@ async fn astra_default_completes_a_turn_with_its_bundled_runtime_settings() -> R
     test.submit_turn("Say done.").await?;
     let body = response_mock.single_request().body_json();
     assert_eq!(body["model"], "gpt-6-astra");
-    // The fork's orientation phase selects High over the catalog's Low default.
-    assert_eq!(body["reasoning"]["effort"], "high");
+    // With no override, the bundled model catalog supplies the reasoning default.
+    assert_eq!(body["reasoning"]["effort"], "low");
     assert_eq!(body["text"]["verbosity"], "low");
     assert!(body.get("instructions").is_none());
     assert!(body.get("tools").is_none());
@@ -231,7 +231,7 @@ async fn astra_default_completes_a_turn_with_its_bundled_runtime_settings() -> R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let mut direct_model = remote_model("test-tool-mode-direct");
     direct_model.tool_mode = Some(ToolMode::Direct);
@@ -294,7 +294,7 @@ async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_code_mode_warning_is_emitted_each_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let model_slug = "test-tool-mode-warning-each-turn";
@@ -383,7 +383,7 @@ async fn unsupported_code_mode_warning_is_emitted_each_turn() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_multi_agent_selector_overrides_feature_flags() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let mut v2_model = remote_model("test-multi-agent-v2");
     v2_model.multi_agent_version = Some(MultiAgentVersion::V2);
@@ -427,7 +427,7 @@ async fn remote_multi_agent_selector_overrides_feature_flags() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_multi_agent_selector_uses_model_selected_before_first_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = wiremock::MockServer::start().await;
     let mut initial_model = remote_model(ROOT_MODEL);

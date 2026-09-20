@@ -58,6 +58,7 @@ pub(crate) struct ToolExposureIdentity {
     pub(crate) collaboration_mode: ModeKind,
     pub(crate) environment_mode: EnvironmentSurfaceMode,
     pub(crate) environment_starting: bool,
+    pub(crate) windows_shell_guidance: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +71,7 @@ pub(crate) struct DynamicToolExposureIdentity {
     pub(crate) collaboration_mode: ModeKind,
     pub(crate) environment_mode: EnvironmentSurfaceMode,
     pub(crate) environment_starting: bool,
+    pub(crate) windows_shell_guidance: bool,
 }
 
 impl ToolExposureIdentity {
@@ -83,6 +85,7 @@ impl ToolExposureIdentity {
             collaboration_mode: self.collaboration_mode,
             environment_mode: self.environment_mode,
             environment_starting: self.environment_starting,
+            windows_shell_guidance: self.windows_shell_guidance,
         }
     }
 }
@@ -102,6 +105,7 @@ impl Default for ToolExposureIdentity {
             collaboration_mode: ModeKind::Default,
             environment_mode: EnvironmentSurfaceMode::One,
             environment_starting: false,
+            windows_shell_guidance: true,
         }
     }
 }
@@ -202,6 +206,13 @@ mod tests {
         let mut dynamic_change = base.clone();
         dynamic_change.extension_tool_surface_revision = 7;
         assert_ne!(base.dynamic_identity(), dynamic_change.dynamic_identity());
+
+        let mut environment_platform_change = base.clone();
+        environment_platform_change.windows_shell_guidance = !base.windows_shell_guidance;
+        assert_ne!(
+            base.dynamic_identity(),
+            environment_platform_change.dynamic_identity()
+        );
 
         let mut catalog_change = base.clone();
         catalog_change.mcp_tool_catalog_revision = 1;

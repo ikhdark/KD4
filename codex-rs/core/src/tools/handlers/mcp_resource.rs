@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,17 +130,17 @@ fn append_omitted_array_entry_pointers(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let mut matched_visible = vec![false; visible_values.len()];
+    // Count occurrences, rather than treating equal entries as a set: one
+    // visible copy must not hide a second canonical copy from recovery.
+    let mut visible_counts = HashMap::<&Value, usize>::new();
+    for value in visible_values {
+        *visible_counts.entry(value).or_default() += 1;
+    }
     for (index, canonical_value) in canonical_values.iter().enumerate() {
-        if let Some(visible_index) =
-            visible_values
-                .iter()
-                .enumerate()
-                .position(|(visible_index, visible_value)| {
-                    !matched_visible[visible_index] && visible_value == canonical_value
-                })
+        if let Some(count) = visible_counts.get_mut(canonical_value)
+            && *count > 0
         {
-            matched_visible[visible_index] = true;
+            *count -= 1;
             continue;
         }
         push_mcp_resource_pointer(

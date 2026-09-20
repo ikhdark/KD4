@@ -387,20 +387,18 @@ impl ToolHistoryCandidate {
             bytes: self.artifact_bytes,
             sha256: self.artifact_sha256.clone(),
         };
-        if !self.source_dependencies_current {
-            receipt.digest = "STALE: a source dependency changed after this result was produced; rerun the tool before relying on it."
-                .to_string();
-            let rendered = serde_json::to_string(&receipt).ok()?;
-            let tokens = u64::try_from(approx_token_count(&rendered)).unwrap_or(u64::MAX);
-            return (tokens <= RECEIPT_MAX_TOKENS as u64).then_some((rendered, tokens));
-        }
-
         let mut digest_limit = RECEIPT_DIGEST_TARGET_TOKENS;
         while digest_limit > 0 {
             receipt.digest =
                 truncate_text_to_token_ceiling(&self.bounded_model_output, digest_limit);
             if receipt.digest.is_empty() {
                 return None;
+            }
+            if !self.source_dependencies_current {
+                receipt.digest = format!(
+                    "STALE: historical snapshot only; revalidate before using as current evidence. {}",
+                    receipt.digest
+                );
             }
             let rendered = serde_json::to_string(&receipt).ok()?;
             let receipt_tokens = u64::try_from(approx_token_count(&rendered)).unwrap_or(u64::MAX);
@@ -1836,6 +1834,26 @@ impl ToolHistoryState {
                     "current_revision": workspace_identity,
                     "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                 });
+                // Preserve useful history only when its captured bytes are
+                // verified. A missing observation or output mismatch cannot
+                // authenticate even a historical summary.
+                if origin_call_id == call_id && observation.is_some() && output_matches {
+                    notice["historical_digest"] = serde_json::json!(
+                        truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS)
+                    );
+                }
+                if items.iter().any(|item| {
+                    matches!(
+                        item,
+                        ResponseItem::FunctionCall { name, call_id, .. }
+                            if name == "read_file" && call_id == origin_call_id
+                    )
+                }) {
+                    notice["rerun"] = serde_json::json!({
+                        "tool": "read_file",
+                        "instruction": "Repeat the original read_file call to read current disk contents; read_tool_output recovers only the old snapshot.",
+                    });
+                }
                 if !current_nested_results.is_empty() {
                     notice["current_nested_results"] = current_nested_results.into();
                 }
@@ -2001,6 +2019,17 @@ impl ToolHistoryState {
         }
         let mut positions = BTreeMap::new();
         for (index, item) in items.iter().enumerate() {
+            // Small producer receipts can remain inline throughout projection.
+            // Their exact registered output still owns a canonical artifact;
+            // compaction must not depend on first replacing it with a receipt.
+            if let Some((call_id, text)) = canonical_textual_output_identity(item)
+                && let Some(candidate) = self.candidates.get(call_id)
+                && candidate.complete
+                && candidate.projection_eligible
+                && sha256(text.as_bytes()) == candidate.derived.bounded_model_output_sha256
+            {
+                positions.insert(call_id.to_string(), index);
+            }
             let Ok(value) = serde_json::to_value(item) else {
                 continue;
             };
@@ -2432,7 +2461,7 @@ async fn replay_tool_history_journal(
     };
     let mut offset = 0_usize;
     let mut writer_sequences = BTreeMap::<String, u64>::new();
-    while let Some(relative_end) = bytes[offset..].iter().position(|byte| *byte == b'\n') {
+    while let Some(relative_end) = memchr::memchr(b'\n', &bytes[offset..]) {
         let end = offset + relative_end;
         let line = &bytes[offset..end];
         offset = end + 1;
@@ -2748,16 +2777,17 @@ pub(crate) async fn persist_tool_history_mutations(
             .map_err(|error| format!("failed to inspect tool-history journal: {error}"))?
             .len();
         if existing_len > 0 {
-            // A complete journal needs only its final chunk inspected. Scan an
+            // A complete journal needs only its final byte inspected. Scan an
             // incomplete tail backwards with fixed memory instead of rereading
             // the full journal into a growing allocation on every append.
             let mut chunk = [0_u8; 8 * 1024];
             let mut remaining = existing_len;
+            let mut scan_bytes = 1;
             let complete_len = loop {
                 if remaining == 0 {
                     break 0;
                 }
-                let chunk_start = remaining.saturating_sub(chunk.len() as u64);
+                let chunk_start = remaining.saturating_sub(scan_bytes);
                 let chunk_len = (remaining - chunk_start) as usize;
                 file.seek(SeekFrom::Start(chunk_start))
                     .map_err(|error| format!("failed to seek tool-history journal: {error}"))?;
@@ -2767,6 +2797,7 @@ pub(crate) async fn persist_tool_history_mutations(
                     break chunk_start + index as u64 + 1;
                 }
                 remaining = chunk_start;
+                scan_bytes = chunk.len() as u64;
             };
             if complete_len < existing_len {
                 file.set_len(complete_len).map_err(|error| {
@@ -3292,7 +3323,8 @@ pub(crate) fn tool_search_receipt_item(
         execution,
         tools,
         omitted_result_count,
-        ..
+        id,
+        internal_chat_message_metadata_passthrough,
     } = item
     else {
         return None;
@@ -3307,14 +3339,24 @@ pub(crate) fn tool_search_receipt_item(
     ordered_tool_identities.truncate(RECEIPT_MAX_TOKENS);
     let mut arguments = compact_tool_search_arguments(arguments);
 
-    let mut receipt_item = item.clone();
-    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut receipt_item {
-        tools.clear();
-    }
+    let mut receipt_item = ResponseItem::ToolSearchOutput {
+        id: id.clone(),
+        call_id: Some(call_id.clone()),
+        status: status.clone(),
+        execution: execution.clone(),
+        tools: Vec::new(),
+        omitted_result_count: *omitted_result_count,
+        internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+            .clone(),
+    };
+    // Search for the largest fitting prefix instead of serializing every prefix.
+    let mut lower = 0;
+    let mut upper = ordered_tool_identities.len();
+    let mut retained = upper;
+    let mut best = None;
     loop {
         let complete = status == "completed" && omitted_result_count.unwrap_or(0) == 0;
-        let omitted_identity_count =
-            total_identity_count.saturating_sub(ordered_tool_identities.len());
+        let omitted_identity_count = total_identity_count.saturating_sub(retained);
         let receipt = ToolSearchReceiptV1 {
             version: TOOL_SEARCH_RECEIPT_VERSION,
             receipt_id: tool_search_receipt_id(
@@ -3337,7 +3379,7 @@ pub(crate) fn tool_search_receipt_item(
             omitted_result_count: *omitted_result_count,
             complete,
             omitted_identity_count,
-            ordered_tool_identities: ordered_tool_identities.clone(),
+            ordered_tool_identities: ordered_tool_identities[..retained].to_vec(),
         };
         let receipt_tokens = approx_token_count(&serde_json::to_string(&receipt).ok()?);
         let receipt_value = serde_json::json!({
@@ -3352,22 +3394,35 @@ pub(crate) fn tool_search_receipt_item(
         let tokens = approx_token_count(&serialized);
         if receipt_tokens <= RECEIPT_MAX_TOKENS && tokens <= TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS
         {
-            return Some((receipt_item, tokens));
+            if retained == upper {
+                return Some((receipt_item, tokens));
+            }
+            best = Some((receipt_item.clone(), tokens));
+            lower = retained + 1;
+        } else if retained > 0 {
+            upper = retained - 1;
+        } else {
+            // Even an empty prefix does not fit; only argument previews can shrink.
+            upper = 0;
         }
-        if ordered_tool_identities.pop().is_some() {
+        if lower > upper {
+            return best;
+        }
+        if retained > 0 || best.is_some() {
+            retained = lower + (upper - lower) / 2;
             continue;
         }
         // Per-field preview limits do not bound their combined receipt. Drop
         // the largest remaining preview while retaining its exact input hash.
         let compact = arguments.as_object_mut()?;
-        let key = ["query", "namespace", "limit", "cursor"]
+        let (key, serialized) = ["query", "namespace", "limit", "cursor"]
             .into_iter()
-            .filter(|key| compact.contains_key(*key))
-            .max_by_key(|key| compact[*key].to_string().len())?;
-        let value = compact.remove(key)?;
+            .filter_map(|key| compact.get(key).map(|value| (key, value.to_string())))
+            .max_by_key(|(_, serialized)| serialized.len())?;
+        compact.remove(key)?;
         compact
             .entry(format!("{key}_sha256"))
-            .or_insert_with(|| serde_json::Value::String(sha256(value.to_string().as_bytes())));
+            .or_insert_with(|| serde_json::Value::String(sha256(serialized.as_bytes())));
     }
 }
 
@@ -3506,7 +3561,13 @@ fn output_call_id(item: &ResponseItem) -> Option<&str> {
 pub(crate) fn tool_observes_workspace(tool_identity: &str) -> bool {
     matches!(
         tool_identity,
-        "exec_command" | "shell_command" | "unified_exec" | "write_stdin" | "cargo_test"
+        "exec_command"
+            | "shell_command"
+            | "unified_exec"
+            | "write_stdin"
+            | "cargo_test"
+            | "read_file"
+            | "list_files"
     )
 }
 
@@ -3530,7 +3591,8 @@ pub(crate) fn classify_workspace_tool_call(
         };
     }
     let arguments = workspace_call_arguments(payload);
-    let observes_workspace = workspace_call_observes_from_arguments(arguments.as_ref());
+    let observes_workspace =
+        workspace_call_observes_from_arguments(tool_identity, arguments.as_ref());
     let workspace_cwd = arguments.as_ref().map_or_else(
         || default_cwd.to_path_buf(),
         |arguments| workspace_cwd_from_arguments(arguments, default_cwd),
@@ -3561,7 +3623,7 @@ fn tool_call_observes_workspace_parts(tool_identity: &str, arguments: &str) -> b
         return false;
     }
     let arguments = serde_json::from_str(arguments).ok();
-    workspace_call_observes_from_arguments(arguments.as_ref())
+    workspace_call_observes_from_arguments(tool_identity, arguments.as_ref())
 }
 
 fn workspace_call_arguments(payload: &ToolPayload) -> Option<serde_json::Value> {
@@ -3571,10 +3633,19 @@ fn workspace_call_arguments(payload: &ToolPayload) -> Option<serde_json::Value> 
     serde_json::from_str(arguments).ok()
 }
 
-fn workspace_call_observes_from_arguments(arguments: Option<&serde_json::Value>) -> bool {
+fn workspace_call_observes_from_arguments(
+    tool_identity: &str,
+    arguments: Option<&serde_json::Value>,
+) -> bool {
     let Some(arguments) = arguments else {
         return true;
     };
+    if tool_identity == "read_file" {
+        return !arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX));
+    }
     let Some(command) = dependency_command(arguments) else {
         return true;
     };
@@ -3609,14 +3680,16 @@ pub(crate) fn source_dependencies_for_tool_call_with_parsed_arguments(
     if !tool_observes_workspace(tool_identity) {
         return BTreeSet::new();
     }
-    let arguments = parsed_arguments
-        .cloned()
-        .or_else(|| workspace_call_arguments(payload));
+    let owned_arguments = parsed_arguments
+        .is_none()
+        .then(|| workspace_call_arguments(payload))
+        .flatten();
+    let arguments = parsed_arguments.or(owned_arguments.as_ref());
     let Some(arguments) = arguments else {
         return BTreeSet::new();
     };
-    let cwd = workspace_cwd_from_arguments(&arguments, default_cwd);
-    source_dependencies_from_arguments(tool_identity, &arguments, &cwd)
+    let cwd = workspace_cwd_from_arguments(arguments, default_cwd);
+    source_dependencies_from_arguments(tool_identity, arguments, &cwd)
 }
 
 fn source_dependencies_from_arguments(
@@ -3624,6 +3697,33 @@ fn source_dependencies_from_arguments(
     arguments: &serde_json::Value,
     cwd: &Path,
 ) -> BTreeSet<SourceDependencyV1> {
+    if matches!(tool_identity, "read_file" | "list_files") {
+        let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
+            return BTreeSet::new();
+        };
+        if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX) {
+            return BTreeSet::new();
+        }
+        // A selected environment can have a different cwd or path convention.
+        // Keep its evidence conservative until classification has that context.
+        if arguments
+            .get("environment_id")
+            .is_some_and(|id| !id.is_null())
+        {
+            return BTreeSet::new();
+        }
+        return codex_utils_path_uri::PathUri::from_host_native_path(cwd)
+            .ok()
+            .and_then(|cwd| cwd.join(path).ok())
+            .and_then(|path| path.to_abs_path().ok())
+            .map(|path| {
+                BTreeSet::from([SourceDependencyV1::new(
+                    path.as_path(),
+                    tool_identity == "list_files",
+                )])
+            })
+            .unwrap_or_default();
+    }
     if tool_identity == "cargo_test" {
         return cargo_test_dependencies(arguments, cwd);
     }

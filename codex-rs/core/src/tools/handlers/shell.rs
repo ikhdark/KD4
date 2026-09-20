@@ -398,15 +398,16 @@ fn validation_diagnostic_range(
         return None;
     }
     let text = std::str::from_utf8(canonical_output).ok()?;
-    let lines = text.lines().collect::<Vec<_>>();
+    let lines = text.lines();
+    let line_count = lines.clone().count();
     let start =
-        if canonical_output.len() <= MAX_DIAGNOSTIC_BYTES && lines.len() <= MAX_DIAGNOSTIC_LINES {
+        if canonical_output.len() <= MAX_DIAGNOSTIC_BYTES && line_count <= MAX_DIAGNOSTIC_LINES {
             0
         } else {
             // Recover a bounded, exact range around the first compiler/test failure
             // even when the complete output is too large to keep inline.
             lines
-                .iter()
+                .clone()
                 .position(|line| {
                     let line = line.trim_start();
                     line.starts_with("error:")
@@ -416,11 +417,11 @@ fn validation_diagnostic_range(
                         || line.starts_with("FAIL [")
                         || line.contains(" panicked at ")
                 })
-                .unwrap_or_else(|| lines.len().saturating_sub(MAX_DIAGNOSTIC_LINES))
+                .unwrap_or_else(|| line_count.saturating_sub(MAX_DIAGNOSTIC_LINES))
         };
     let mut bytes = 0_usize;
     let count = lines
-        .iter()
+        .clone()
         .skip(start)
         .take(MAX_DIAGNOSTIC_LINES)
         .enumerate()

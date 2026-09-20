@@ -39,7 +39,6 @@ use codex_app_server_protocol::MigrationDetails;
 use codex_app_server_protocol::PluginsMigration;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SkillMigration;
-use codex_arg0::Arg0DispatchPaths;
 use codex_core::ThreadManager;
 use codex_external_agent_sessions::ExternalAgentSessionMigration as CoreSessionMigration;
 use codex_rollout::StateDbHandle;
@@ -75,7 +74,6 @@ pub(crate) struct ExternalAgentConfigRequestProcessorArgs {
     pub(crate) config_processor: ConfigRequestProcessor,
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
-    pub(crate) arg0_paths: Arg0DispatchPaths,
     pub(crate) codex_home: PathBuf,
     pub(crate) background_tasks: TaskTracker,
 }
@@ -90,7 +88,6 @@ impl ExternalAgentConfigRequestProcessor {
             config_processor,
             state_db,
             analytics_events_client,
-            arg0_paths,
             codex_home,
             background_tasks,
         } = args;
@@ -100,7 +97,6 @@ impl ExternalAgentConfigRequestProcessor {
             thread_store,
             state_db.clone(),
             config_manager,
-            arg0_paths,
         );
         let migration_service =
             ExternalAgentConfigService::new(codex_home, analytics_events_client.clone());

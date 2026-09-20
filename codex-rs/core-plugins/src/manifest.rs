@@ -515,7 +515,8 @@ fn resolve_default_prompt_str(manifest_path: &str, field: &str, prompt: &str) ->
         warn_invalid_default_prompt(manifest_path, field, "prompt must not be empty");
         return None;
     }
-    if prompt.chars().count() > MAX_DEFAULT_PROMPT_LEN {
+    if prompt.len() > MAX_DEFAULT_PROMPT_LEN && prompt.chars().nth(MAX_DEFAULT_PROMPT_LEN).is_some()
+    {
         warn_invalid_default_prompt(
             manifest_path,
             field,

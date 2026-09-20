@@ -25,6 +25,7 @@ pub enum LiveTask {
     RustBugfix,
     TypescriptFeature,
     Kd4PythonRefactor,
+    PythonConsumerRefactor,
 }
 
 impl LiveTask {
@@ -33,6 +34,7 @@ impl LiveTask {
             Self::RustBugfix => "rust_bugfix",
             Self::TypescriptFeature => "typescript_feature",
             Self::Kd4PythonRefactor => "kd4_python_refactor",
+            Self::PythonConsumerRefactor => "python_consumer_refactor",
         }
     }
 }

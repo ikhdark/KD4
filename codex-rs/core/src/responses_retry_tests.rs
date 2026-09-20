@@ -250,7 +250,7 @@ fn connection_recovery_wait_is_limited_to_user_facing_sampling_turns() {
 #[test]
 fn connection_retry_delay_backs_off_and_is_bounded() {
     let initial = ResponsesStreamRetryState::default().connection_retry_delay;
-    assert_eq!(initial, INITIAL_CONNECTION_RETRY_DELAY);
+    assert_eq!(initial, Duration::from_millis(500));
 
     assert_eq!(next_connection_retry_delay(initial), initial * 2);
     assert_eq!(
@@ -282,7 +282,7 @@ async fn connection_recovery_reaches_https_fallback_without_exhausting_network_w
     assert!(session.services.model_client.responses_websocket_enabled());
     tokio::time::pause();
 
-    for expected_delay in [Duration::from_secs(5), Duration::from_secs(10)] {
+    for expected_delay in [Duration::from_millis(500), Duration::from_secs(1)] {
         let started = tokio::time::Instant::now();
         handle_retryable_response_stream_error(
             &mut retry_state,
@@ -325,7 +325,9 @@ async fn connection_recovery_reaches_https_fallback_without_exhausting_network_w
     assert!(emitted.iter().any(|event| matches!(&event.msg,
         EventMsg::Warning(warning) if warning.message.contains("Falling back from WebSockets to HTTPS"))));
     assert!(emitted.iter().any(|event| matches!(&event.msg,
-        EventMsg::StreamError(error) if error.message.contains("attempt 2, next retry in 10s"))));
+        EventMsg::StreamError(error) if error.message.contains("attempt 1, next retry in 500.0ms"))));
+    assert!(emitted.iter().any(|event| matches!(&event.msg,
+        EventMsg::StreamError(error) if error.message.contains("attempt 2, next retry in 1.0s"))));
 
     // A real network outage still waits after the transport fallback.
     let started = tokio::time::Instant::now();
@@ -341,7 +343,7 @@ async fn connection_recovery_reaches_https_fallback_without_exhausting_network_w
     )
     .await
     .unwrap();
-    assert!((Duration::from_secs(20)..=Duration::from_millis(20_001)).contains(&started.elapsed()));
+    assert!((Duration::from_secs(2)..=Duration::from_millis(2_001)).contains(&started.elapsed()));
     assert_eq!(retry_state.retries, 2);
     assert_eq!(retry_state.connection_retries, 3);
 

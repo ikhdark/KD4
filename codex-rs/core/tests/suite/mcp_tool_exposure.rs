@@ -12,6 +12,7 @@ use core_test_support::apps_test_server::SEARCH_CALENDAR_CREATE_TOOL;
 use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
 use core_test_support::apps_test_server::apps_enabled_builder;
 use core_test_support::apps_test_server::search_capable_apps_builder;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -20,7 +21,6 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::namespace_child_tool;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
@@ -31,7 +31,7 @@ use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_exposes_direct_model_only_mcp_namespaces() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let apps_server = AppsTestServer::mount_searchable(&server).await?;
@@ -98,7 +98,7 @@ async fn code_mode_only_exposes_direct_model_only_mcp_namespaces() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apps_guidance_appears_after_background_recovery_within_a_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (apps_server, startup_control) =
@@ -230,7 +230,7 @@ async fn apps_guidance_appears_after_background_recovery_within_a_turn() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn later_follow_up_uses_background_recovered_apps_after_mid_thread_startup_failures()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let (apps_server, startup_control) =

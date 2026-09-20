@@ -42,7 +42,6 @@ const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
 // results near a 768-token projection (using the core's 4 bytes/token estimate).
 const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 3 * 1024;
 const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
-const MAX_COMPACT_TOOL_DESCRIPTION_BYTES: usize = 512;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
@@ -142,13 +141,13 @@ impl ToolSearchIndex {
         };
 
         let mut postings = HashMap::<String, Vec<(ToolSearchDocumentId, f32)>>::new();
+        let mut term_frequencies = HashMap::<String, usize>::new();
         for (index, tokens) in tokenized_documents.into_iter().enumerate() {
             let document_length = tokens.len() as f32;
-            let mut term_frequencies = HashMap::<String, usize>::new();
             for token in tokens {
                 *term_frequencies.entry(token).or_default() += 1;
             }
-            for (token, term_frequency) in term_frequencies {
+            for (token, term_frequency) in term_frequencies.drain() {
                 let term_frequency = term_frequency as f32;
                 let weight = term_frequency * (K1 + 1.0)
                     / (term_frequency
@@ -605,6 +604,8 @@ impl Default for ToolSearchHandlerCache {
 }
 
 impl ToolSearchBuildFlight {
+    // This waits on an OS thread. Production router construction runs inside
+    // spawn_blocking in session::turn; keep future callers off async workers.
     fn wait(&self) -> Option<Arc<ToolSearchHandler>> {
         let mut state = self
             .state
@@ -1093,19 +1094,11 @@ fn compact_exact_match_recovery(
 }
 
 fn compact_recovery_tool(tool: &ResponsesApiTool, qualified_name: &str) -> ResponsesApiTool {
-    let description_end = tool
-        .description
-        .floor_char_boundary(MAX_COMPACT_TOOL_DESCRIPTION_BYTES);
-    let description = &tool.description[..description_end];
-    let truncation = if description_end < tool.description.len() {
-        "…"
-    } else {
-        ""
-    };
     ResponsesApiTool {
         name: tool.name.clone(),
         description: format!(
-            "{description}{truncation}\n\nCompact exact-match definition for `{qualified_name}`; verbose schema details were removed to fit the tool-search response budget."
+            "{}\n\nCompact exact-match definition for `{qualified_name}`; verbose schema details were removed to fit the tool-search response budget.",
+            tool.description
         ),
         strict: tool.strict,
         defer_loading: Some(true),
@@ -2136,7 +2129,7 @@ mod tests {
             panic!("expected namespace");
         };
         let handler = ToolSearchHandler::new(vec![
-            ToolSearchInfo::from_tool_spec(ToolSpec::Namespace(namespace), None).unwrap(),
+            ToolSearchInfo::from_tool_spec(&ToolSpec::Namespace(namespace), None).unwrap(),
         ]);
         let (session, turn, _events) = make_session_and_context_with_rx().await;
         turn.refresh_deferred_tool_capabilities(Arc::new(
@@ -2310,9 +2303,10 @@ mod tests {
             panic!("test search info should contain one function");
         };
         source_tool.description = format!(
-            "Create a calendar event. {}",
-            "é".repeat(MAX_TOOL_SEARCH_RESULT_BYTES)
+            "Create a calendar event. {} Requires an existing calendar.",
+            "é".repeat(350)
         );
+        let expected_description = source_tool.description.clone();
         source_tool.parameters = codex_tools::JsonSchema::object(
             std::collections::BTreeMap::from([(
                 "title".to_string(),
@@ -2346,7 +2340,7 @@ mod tests {
         };
         assert_eq!(tool.name, "create_event");
         assert!(tool.description.starts_with("Create a calendar event."));
-        assert!(tool.description.contains("…\n\nCompact exact-match"));
+        assert!(tool.description.starts_with(&expected_description));
         assert!(tool.description.contains("verbose schema details"));
         assert_eq!(tool.parameters, expected_parameters);
         assert!(
@@ -2397,7 +2391,10 @@ mod tests {
             .expect("output schema should serialize");
         let source = ResponsesApiTool {
             name: "strict_tool".to_string(),
-            description: "verbose".to_string(),
+            description: format!(
+                "{} Timeout is in milliseconds; never retry a completed mutation.",
+                "context ".repeat(100)
+            ),
             strict: true,
             defer_loading: Some(true),
             parameters: codex_tools::JsonSchema::object(
@@ -2411,9 +2408,35 @@ mod tests {
         let compact = compact_recovery_tool(&source, "strict_tool");
 
         assert!(compact.strict);
+        assert!(compact.description.starts_with(&source.description));
         assert_eq!(compact.output_schema, Some(output_schema));
         assert_eq!(compact.parameters.required, Some(Vec::new()));
         assert_eq!(compact.parameters.additional_properties, Some(false.into()));
+    }
+
+    #[test]
+    fn oversized_tool_description_uses_omission_instead_of_a_partial_contract() {
+        let mut info = search_info("calendar", None, "calendar", "create_event");
+        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+            panic!("namespace fixture");
+        };
+        let [ResponsesApiNamespaceTool::Function(tool)] = namespace.tools.as_mut_slice() else {
+            panic!("single tool fixture");
+        };
+        tool.description = format!(
+            "{} Never retry a completed mutation.",
+            "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES)
+        );
+        let result = ToolSearchHandler::new(vec![info])
+            .search("create_event", TOOL_SEARCH_DEFAULT_LIMIT)
+            .unwrap();
+        assert!(result.tools.is_empty());
+        assert_eq!(result.omitted_result_count, 1);
+        assert_eq!(
+            result.activation_tools,
+            vec![ToolName::namespaced("mcp__calendar", "create_event")]
+        );
+        assert!(result.encoded_tools_len <= MAX_TOOL_SEARCH_RESULT_BYTES);
     }
 
     #[test]

@@ -15,6 +15,10 @@ path = "src/bin/config_schema.rs"
 [lints]
 workspace = true
 
+[features]
+# Enabled only by core_test_support, including for release-profile integration tests.
+test-deterministic-process-ids = []
+
 [dependencies]
 codex-client = { workspace = true }
 anyhow = { workspace = true }
@@ -153,7 +157,7 @@ maplit = { workspace = true }
 opentelemetry = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
-test-case = "3.3.1"
+test-case = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = [
     "experimental_metrics_custom_reader",
     "metrics",

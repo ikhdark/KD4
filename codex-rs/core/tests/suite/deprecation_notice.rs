@@ -1,8 +1,8 @@
 use codex_features::Feature;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::EventMsg;
+use core_test_support::require_network;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -51,7 +51,7 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn emits_deprecation_notice_for_web_search_feature_flag_values() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     for enabled in [true, false] {
         let server = start_mock_server().await;

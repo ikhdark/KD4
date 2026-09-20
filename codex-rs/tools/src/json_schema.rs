@@ -208,6 +208,12 @@ impl From<JsonSchema> for AdditionalProperties {
 
 /// Parse the tool `input_schema` or return an error for invalid schema.
 pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, serde_json::Error> {
+    parse_owned_tool_input_schema(input_schema.clone())
+}
+
+pub(crate) fn parse_owned_tool_input_schema(
+    input_schema: JsonValue,
+) -> Result<JsonSchema, serde_json::Error> {
     let mut schema = deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)?;
     compact_large_tool_schema(&mut schema);
     Ok(schema)
@@ -217,11 +223,10 @@ pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, s
 pub fn parse_tool_input_schema_without_compaction(
     input_schema: &JsonValue,
 ) -> Result<JsonSchema, serde_json::Error> {
-    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)
+    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema.clone())?)
 }
 
-fn prepare_tool_input_schema(input_schema: &JsonValue) -> Result<JsonValue, serde_json::Error> {
-    let mut input_schema = input_schema.clone();
+fn prepare_tool_input_schema(mut input_schema: JsonValue) -> Result<JsonValue, serde_json::Error> {
     sanitize_json_schema(&mut input_schema);
     prune_unreachable_definitions(&mut input_schema);
     reject_unsupported_assertions(&input_schema)?;
@@ -299,11 +304,22 @@ const MAX_COMPACT_TOOL_SCHEMA_BYTES: usize = 5_000;
 /// It is deliberately best-effort: validation keywords and reachable schema
 /// structure take precedence over the compact byte target.
 fn compact_large_tool_schema(value: &mut JsonSchema) {
+    let mut compact_bytes = compact_schema_bytes(value);
     for pass in LARGE_SCHEMA_COMPACTION_PASSES {
-        if compact_schema_fits_budget(value) {
-            break;
+        if compact_bytes.is_some_and(|bytes| bytes <= MAX_COMPACT_TOOL_SCHEMA_BYTES) {
+            return;
         }
         pass(value);
+        compact_bytes = compact_schema_bytes(value);
+    }
+    if let Some(bytes) = compact_bytes
+        && bytes > MAX_COMPACT_TOOL_SCHEMA_BYTES
+    {
+        tracing::debug!(
+            compact_bytes = bytes,
+            budget_bytes = MAX_COMPACT_TOOL_SCHEMA_BYTES,
+            "tool schema exceeds best-effort compaction budget; preserving validation constraints"
+        );
     }
 }
 
@@ -316,8 +332,24 @@ const LARGE_SCHEMA_COMPACTION_PASSES: &[LargeSchemaCompactionPass] = &[
     truncate_long_schema_descriptions,
 ];
 
-fn compact_schema_fits_budget(value: &JsonSchema) -> bool {
-    serde_json::to_vec(value).is_ok_and(|json| json.len() <= MAX_COMPACT_TOOL_SCHEMA_BYTES)
+fn compact_schema_bytes(value: &JsonSchema) -> Option<usize> {
+    #[derive(Default)]
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,12 +624,12 @@ fn prune_schema_table(
         return;
     };
 
-    definitions.retain(|name, _| {
-        reachable.contains(&DefinitionPointer {
-            table,
-            name: name.clone(),
-        })
-    });
+    let names = reachable
+        .iter()
+        .filter(|pointer| pointer.table == table)
+        .map(|pointer| pointer.name.as_str())
+        .collect::<BTreeSet<_>>();
+    definitions.retain(|name, _| names.contains(name.as_str()));
 
     if definitions.is_empty() {
         map.remove(table);
@@ -611,7 +643,7 @@ fn collect_reachable_definitions(value: &JsonValue) -> Option<BTreeSet<Definitio
         return None;
     }
     while let Some(pointer) = pending.pop() {
-        if !reachable.insert(pointer.clone()) {
+        if reachable.contains(&pointer) {
             continue;
         }
         if let Some(definition) = definition_for_pointer(value, &pointer)
@@ -619,6 +651,7 @@ fn collect_reachable_definitions(value: &JsonValue) -> Option<BTreeSet<Definitio
         {
             return None;
         }
+        reachable.insert(pointer);
     }
     Some(reachable)
 }

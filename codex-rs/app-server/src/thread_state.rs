@@ -217,6 +217,12 @@ struct IndexedItemKey {
     item_id: String,
 }
 
+#[derive(Clone, Copy)]
+struct ItemLocation {
+    position: usize,
+    offset: usize,
+}
+
 #[derive(Default)]
 struct ThreadTurnIndex {
     initialized: bool,
@@ -224,8 +230,7 @@ struct ThreadTurnIndex {
     turn_positions: HashMap<String, usize>,
     turns: HashMap<String, Turn>,
     item_order: Vec<IndexedItemKey>,
-    item_positions: HashMap<IndexedItemKey, usize>,
-    item_offsets: HashMap<IndexedItemKey, usize>,
+    item_locations: HashMap<IndexedItemKey, ItemLocation>,
 }
 
 impl ThreadTurnIndex {
@@ -247,7 +252,10 @@ impl ThreadTurnIndex {
                 turn_id: change.turn_id.clone(),
                 item_id: change.item.id().to_string(),
             };
-            let existing_offset = self.item_offsets.get(&key).copied();
+            let existing_offset = self
+                .item_locations
+                .get(&key)
+                .map(|location| location.offset);
             if let Some(index) = existing_offset {
                 self.turn_mut(&change.turn_id).items[index] = change.item;
             } else {
@@ -257,21 +265,25 @@ impl ThreadTurnIndex {
                     turn.items.push(change.item);
                     offset
                 };
-                self.item_offsets.insert(key.clone(), offset);
-                self.insert_item_key(key);
+                self.insert_item_key(key, offset);
             }
         }
     }
 
-    fn insert_item_key(&mut self, key: IndexedItemKey) {
+    fn insert_item_key(&mut self, key: IndexedItemKey, offset: usize) {
         let turn_position = self.turn_positions[&key.turn_id];
         let append = self
             .item_order
             .last()
             .is_none_or(|last| self.turn_positions[&last.turn_id] <= turn_position);
         if append {
-            self.item_positions
-                .insert(key.clone(), self.item_order.len());
+            self.item_locations.insert(
+                key.clone(),
+                ItemLocation {
+                    position: self.item_order.len(),
+                    offset,
+                },
+            );
             self.item_order.push(key);
             return;
         }
@@ -281,9 +293,18 @@ impl ThreadTurnIndex {
             .iter()
             .position(|existing| self.turn_positions[&existing.turn_id] > turn_position)
             .unwrap_or(self.item_order.len());
+        self.item_locations.insert(
+            key.clone(),
+            ItemLocation {
+                position: insertion_index,
+                offset,
+            },
+        );
         self.item_order.insert(insertion_index, key);
         for (position, key) in self.item_order.iter().enumerate().skip(insertion_index) {
-            self.item_positions.insert(key.clone(), position);
+            if let Some(location) = self.item_locations.get_mut(key) {
+                location.position = position;
+            }
         }
     }
 
@@ -390,12 +411,12 @@ impl ThreadTurnIndex {
             let anchor_index = anchor.and_then(|(anchor_turn_id, item_id, _)| {
                 (anchor_turn_id == turn_id)
                     .then(|| {
-                        self.item_offsets
+                        self.item_locations
                             .get(&IndexedItemKey {
                                 turn_id: turn_id.to_string(),
                                 item_id: item_id.to_string(),
                             })
-                            .copied()
+                            .map(|location| location.offset)
                     })
                     .flatten()
             });
@@ -433,7 +454,9 @@ impl ThreadTurnIndex {
                 turn_id: turn_id.to_string(),
                 item_id: item_id.to_string(),
             };
-            self.item_positions.get(&key).copied()
+            self.item_locations
+                .get(&key)
+                .map(|location| location.position)
         });
         if anchor.is_some() && anchor_index.is_none() {
             return Err(());
@@ -449,7 +472,7 @@ impl ThreadTurnIndex {
         let mut more_items_available = false;
         for index in ordered_indexes(start, end, sort_direction) {
             let key = &self.item_order[index];
-            let Some(offset) = self.item_offsets.get(key).copied() else {
+            let Some(offset) = self.item_locations.get(key).map(|location| location.offset) else {
                 continue;
             };
             let Some(item) = self
@@ -478,8 +501,7 @@ impl ThreadTurnIndex {
     fn rebuild_positions(&mut self) {
         self.turn_positions.clear();
         self.item_order.clear();
-        self.item_positions.clear();
-        self.item_offsets.clear();
+        self.item_locations.clear();
         for (turn_position, turn_id) in self.order.iter().enumerate() {
             self.turn_positions.insert(turn_id.clone(), turn_position);
             let Some(turn) = self.turns.get(turn_id) else {
@@ -490,9 +512,13 @@ impl ThreadTurnIndex {
                     turn_id: turn_id.clone(),
                     item_id: item.id().to_string(),
                 };
-                self.item_offsets.insert(key.clone(), offset);
-                self.item_positions
-                    .insert(key.clone(), self.item_order.len());
+                self.item_locations.insert(
+                    key.clone(),
+                    ItemLocation {
+                        position: self.item_order.len(),
+                        offset,
+                    },
+                );
                 self.item_order.push(key);
             }
         }
@@ -781,7 +807,11 @@ impl ThreadState {
         if self.listener_generation != listener_generation || self.listener_command_tx.is_none() {
             return false;
         }
-        self.seed_current_turn_history(items);
+        // Persisted history can lag events already consumed by this listener.
+        // Keep the live turn, including its pending approvals, when rejoining it.
+        if self.current_turn_history.in_progress_turn_id().is_none() {
+            self.seed_current_turn_history(items);
+        }
         self.resume_history_seeded_generation = Some(listener_generation);
         true
     }
@@ -1538,15 +1568,15 @@ mod tests {
             item_id: "item-1".to_string(),
         };
 
-        index.insert_item_key(turn_2_item.clone());
-        index.insert_item_key(turn_1_item.clone());
+        index.insert_item_key(turn_2_item.clone(), 0);
+        index.insert_item_key(turn_1_item.clone(), 0);
 
         assert_eq!(
             index.item_order,
             vec![turn_1_item.clone(), turn_2_item.clone()]
         );
-        assert_eq!(index.item_positions[&turn_1_item], 0);
-        assert_eq!(index.item_positions[&turn_2_item], 1);
+        assert_eq!(index.item_locations[&turn_1_item].position, 0);
+        assert_eq!(index.item_locations[&turn_2_item].position, 1);
     }
 
     #[test]
@@ -1570,6 +1600,9 @@ mod tests {
             listener_generation,
         ));
         assert!(state.resume_history_is_seeded_for_current_listener());
+        assert_eq!(state.in_progress_turn_id(), Some("turn-1"));
+
+        assert!(state.seed_resume_history_for_listener(&[], listener_generation));
         assert_eq!(state.in_progress_turn_id(), Some("turn-1"));
 
         state.listener_generation += 1;

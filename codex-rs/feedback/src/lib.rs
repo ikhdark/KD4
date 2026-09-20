@@ -242,7 +242,7 @@ impl CodexFeedback {
             feedback_diagnostics: FeedbackDiagnostics::collect_from_env(),
             thread_id: session_id
                 .map(|id| id.to_string())
-                .unwrap_or("no-active-thread-".to_string() + &ThreadId::new().to_string()),
+                .unwrap_or_else(|| format!("no-active-thread-{}", ThreadId::new())),
         }
     }
 }

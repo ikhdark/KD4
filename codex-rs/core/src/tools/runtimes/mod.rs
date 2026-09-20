@@ -78,7 +78,6 @@ pub(crate) struct ShellCommandPreparation<'a> {
 /// Applies the shared snapshot, sandbox-profile, and PowerShell handoff pipeline
 /// used by direct shell and unified exec launches.
 pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) -> Vec<String> {
-    let runtime_path_prepends = RuntimePathPrepends;
     let command = maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
         input.command,
         Some(input.command_for_approval),
@@ -86,7 +85,6 @@ pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) ->
         input.shell_snapshot,
         input.explicit_env_overrides,
         input.env,
-        &runtime_path_prepends,
     );
     let command = disable_powershell_profile_for_elevated_windows_sandbox(
         &command,
@@ -111,12 +109,15 @@ pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) ->
         prove_noprofile_powershell_direct_argv_async(proof_command, cwd, input.env)
             .await
             .and_then(|proof| proof.into_command_for_state(proof_command, cwd, input.env))
-            .filter(|direct| direct == approved)
-            .map(|_| command.clone())
+            .is_some_and(|direct| &direct == approved)
     } else {
-        None
+        false
     };
-    approved_direct_command.unwrap_or_else(|| prefix_powershell_script_with_utf8(&command))
+    if approved_direct_command {
+        command
+    } else {
+        prefix_powershell_script_with_utf8(&command)
+    }
 }
 
 /// Shared helper to construct sandbox transform inputs from a tokenized command line and native
@@ -186,12 +187,6 @@ pub(crate) fn strip_managed_proxy_env(env: &mut HashMap<String, String>) {
     env.retain(|key, value| !is_managed_proxy_env_var(key, value));
 }
 
-/// PATH entries owned by Codex runtime setup.
-///
-/// This is retained as a call-site boundary for runtime-owned PATH setup.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimePathPrepends;
-
 pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
     command: &[String],
     shell_type: Option<&ShellType>,
@@ -243,7 +238,6 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
     shell_snapshot: Option<&AbsolutePathBuf>,
     explicit_env_overrides: &HashMap<String, String>,
     env: &HashMap<String, String>,
-    runtime_path_prepends: &RuntimePathPrepends,
 ) -> Vec<String> {
     let metrics = codex_otel::global();
     maybe_wrap_shell_lc_with_snapshot_and_metrics(
@@ -252,7 +246,6 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
         shell_snapshot,
         explicit_env_overrides,
         env,
-        runtime_path_prepends,
         metrics.as_ref(),
     )
 }
@@ -263,7 +256,6 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file(
     shell_snapshot: Option<&ShellSnapshotFile>,
     explicit_env_overrides: &HashMap<String, String>,
     env: &mut HashMap<String, String>,
-    runtime_path_prepends: &RuntimePathPrepends,
 ) -> Vec<String> {
     maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
         command,
@@ -272,11 +264,9 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file(
         shell_snapshot,
         explicit_env_overrides,
         env,
-        runtime_path_prepends,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
     command: &[String],
     powershell_projection: Option<&[String]>,
@@ -284,7 +274,6 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
     shell_snapshot: Option<&ShellSnapshotFile>,
     explicit_env_overrides: &HashMap<String, String>,
     env: &mut HashMap<String, String>,
-    runtime_path_prepends: &RuntimePathPrepends,
 ) -> Vec<String> {
     let Some(snapshot) = shell_snapshot else {
         return command.to_vec();
@@ -309,7 +298,6 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
         snapshot.contents(),
         explicit_env_overrides,
         env,
-        runtime_path_prepends,
         metrics.as_ref(),
     )
 }
@@ -321,7 +309,6 @@ fn maybe_wrap_shell_lc_with_snapshot_and_metrics(
     shell_snapshot: Option<&AbsolutePathBuf>,
     explicit_env_overrides: &HashMap<String, String>,
     env: &HashMap<String, String>,
-    runtime_path_prepends: &RuntimePathPrepends,
     metrics: Option<&MetricsClient>,
 ) -> Vec<String> {
     let record_powershell_skip = |reason| {
@@ -351,13 +338,11 @@ fn maybe_wrap_shell_lc_with_snapshot_and_metrics(
         &snapshot_contents,
         explicit_env_overrides,
         env,
-        runtime_path_prepends,
         metrics,
     )
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 fn maybe_wrap_shell_lc_with_snapshot_source(
     command: &[String],
     session_shell: &Shell,
@@ -365,7 +350,6 @@ fn maybe_wrap_shell_lc_with_snapshot_source(
     snapshot_contents: &str,
     explicit_env_overrides: &HashMap<String, String>,
     env: &HashMap<String, String>,
-    runtime_path_prepends: &RuntimePathPrepends,
     metrics: Option<&MetricsClient>,
 ) -> Vec<String> {
     maybe_wrap_shell_lc_with_snapshot_source_and_powershell_projection(
@@ -376,7 +360,6 @@ fn maybe_wrap_shell_lc_with_snapshot_source(
         snapshot_contents,
         explicit_env_overrides,
         env,
-        runtime_path_prepends,
         metrics,
     )
 }
@@ -390,7 +373,6 @@ fn maybe_wrap_shell_lc_with_snapshot_source_and_powershell_projection(
     snapshot_contents: &str,
     explicit_env_overrides: &HashMap<String, String>,
     env: &HashMap<String, String>,
-    _runtime_path_prepends: &RuntimePathPrepends,
     metrics: Option<&MetricsClient>,
 ) -> Vec<String> {
     match session_shell.shell_type {
@@ -805,7 +787,6 @@ mod shell_snapshot_replay_tests {
             "# Snapshot file\n# non-Windows format\n",
             &HashMap::new(),
             &HashMap::new(),
-            &RuntimePathPrepends,
             None,
         );
 
@@ -841,7 +822,6 @@ mod shell_snapshot_replay_tests {
             &format!("# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n"),
             &HashMap::new(),
             &HashMap::new(),
-            &RuntimePathPrepends,
             None,
         );
 
@@ -972,7 +952,6 @@ mod shell_snapshot_replay_tests {
             Some(&snapshot_path),
             &explicit_overrides,
             &env,
-            &RuntimePathPrepends,
         );
 
         assert_eq!(rewritten.get(1).map(String::as_str), Some("-NoProfile"));
@@ -1015,7 +994,6 @@ mod shell_snapshot_replay_tests {
             Some(&snapshot_path),
             &HashMap::new(),
             &std::env::vars().collect(),
-            &RuntimePathPrepends,
         );
         let output = std::process::Command::new(&rewritten[0])
             .args(&rewritten[1..])
@@ -1064,7 +1042,6 @@ mod shell_snapshot_replay_tests {
             Some(&snapshot_path),
             &HashMap::new(),
             &env,
-            &RuntimePathPrepends,
             Some(&metrics),
         );
         assert_ne!(applied, command);
@@ -1074,7 +1051,6 @@ mod shell_snapshot_replay_tests {
             None,
             &HashMap::new(),
             &env,
-            &RuntimePathPrepends,
             Some(&metrics),
         );
         assert_eq!(skipped, command);

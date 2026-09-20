@@ -16,6 +16,7 @@ use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
+use crate::tools::handlers::ListFilesHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
 use crate::tools::handlers::McpHandler;
@@ -191,9 +192,10 @@ struct CoreToolPlanContext<'a> {
 #[instrument(level = "trace", skip_all)]
 pub(crate) fn build_tool_router(
     step_context: &StepContext,
-    params: ToolRouterParams<'_>,
+    mut params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> Result<ToolRouter, String> {
+    params.exposure_identity.windows_shell_guidance = requires_windows_shell_guidance(step_context);
     let exposure_identity = params.exposure_identity.clone();
     let (model_visible_specs, registry, warnings) =
         build_tool_specs_and_registry(step_context, params, tool_search_handler_cache)?;
@@ -233,8 +235,7 @@ fn build_tool_specs_and_registry(
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
-    promote_undiscoverable_deferred_tools(turn_context, &mut planned_tools);
-    promote_deferred_tools_without_search(turn_context, &mut planned_tools);
+    promote_deferred_tools(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     retain_unique_planned_tool_names(&mut planned_tools);
 
@@ -251,37 +252,21 @@ fn build_tool_specs_and_registry(
     ))
 }
 
-fn promote_undiscoverable_deferred_tools(
-    turn_context: &TurnContext,
-    planned_tools: &mut PlannedTools,
-) {
-    if !search_tool_enabled(turn_context) {
-        return;
-    }
-
+fn promote_deferred_tools(turn_context: &TurnContext, planned_tools: &mut PlannedTools) {
+    let search_enabled = search_tool_enabled(turn_context);
     for runtime in &mut planned_tools.runtimes {
-        if runtime.exposure() == ToolExposure::Deferred && runtime.search_info().is_none() {
+        if runtime.exposure() != ToolExposure::Deferred {
+            continue;
+        }
+        if !search_enabled {
+            runtime.set_exposure(ToolExposure::Direct);
+        } else if runtime.search_info().is_none() {
             let warning = format!(
                 "Tool `{}` was promoted to direct exposure because its deferred runtime has no search metadata.",
                 runtime.tool_name()
             );
             warn!("{warning}");
             planned_tools.warnings.push(warning);
-            runtime.set_exposure(ToolExposure::Direct);
-        }
-    }
-}
-
-fn promote_deferred_tools_without_search(
-    turn_context: &TurnContext,
-    planned_tools: &mut PlannedTools,
-) {
-    if search_tool_enabled(turn_context) {
-        return;
-    }
-
-    for runtime in &mut planned_tools.runtimes {
-        if runtime.exposure() == ToolExposure::Deferred {
             runtime.set_exposure(ToolExposure::Direct);
         }
     }
@@ -453,7 +438,7 @@ fn apply_namespace_description_budget(planned_tools: &mut PlannedTools) {
     }
 }
 
-fn apply_fair_description_budget(descriptions: &mut [String]) {
+pub(crate) fn apply_fair_description_budget(descriptions: &mut [String]) {
     if descriptions.is_empty() {
         return;
     }
@@ -476,7 +461,8 @@ fn apply_fair_description_budget(descriptions: &mut [String]) {
     for description in descriptions {
         *description = budget
             .take_up_to(description, per_item_cap)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_owned();
     }
 }
 
@@ -830,12 +816,25 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
 #[instrument(level = "trace", skip_all)]
 fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
     add_shell_tools(context, planned_tools);
+    if !requires_windows_shell_guidance(context.step_context) {
+        for runtime in &mut planned_tools.runtimes {
+            crate::tools::handlers::shell_spec::omit_windows_shell_guidance(runtime.spec_mut());
+        }
+    }
     add_mcp_resource_tools(context, planned_tools);
     add_core_utility_tools(context, planned_tools);
     add_collaboration_tools(context, planned_tools);
     add_mcp_runtime_tools(context, planned_tools);
     add_extension_tools(context, planned_tools);
     add_dynamic_tools(context, planned_tools);
+}
+
+pub(crate) fn requires_windows_shell_guidance(step_context: &StepContext) -> bool {
+    let environments = &step_context.environments.turn_environments;
+    environments.is_empty()
+        || environments.iter().any(|environment| {
+            environment.cwd().infer_path_convention() != Some(PathConvention::Posix)
+        })
 }
 
 fn standalone_web_search_enabled(turn_context: &TurnContext) -> bool {
@@ -911,7 +910,10 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                     TypedToolClass::Shell,
                 );
             }
-            planned_tools.add_with_authorization_class(WriteStdinHandler, TypedToolClass::Shell);
+            planned_tools.add_with_authorization_class(
+                WriteStdinHandler::new(turn_context.config.background_terminal_max_timeout),
+                TypedToolClass::Shell,
+            );
 
             // Keep the legacy shell tool registered while unified exec is
             // model-visible. Persisted and delegated calls may still target
@@ -933,8 +935,10 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
             // Foreign-cwd legacy calls forward to unified exec and can return a
             // live session; keep its existing polling consumer available.
             if primary_environment_uses_foreign_cwd(context.step_context) {
-                planned_tools
-                    .add_with_authorization_class(WriteStdinHandler, TypedToolClass::Shell);
+                planned_tools.add_with_authorization_class(
+                    WriteStdinHandler::new(turn_context.config.background_terminal_max_timeout),
+                    TypedToolClass::Shell,
+                );
             }
         }
     }
@@ -977,6 +981,14 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     // Host skill locators remain readable even when no execution environment exists.
     // The handler still requires an environment for ordinary filesystem paths.
     planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
+    if !context
+        .step_context
+        .environments
+        .turn_environments
+        .is_empty()
+    {
+        planned_tools.add_with_authorization_class(ListFilesHandler, TypedToolClass::ReadSearch);
+    }
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
@@ -1004,7 +1016,15 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         );
     }
 
-    if environment_mode.has_environment() && features.enabled(Feature::RequestPermissionsTool) {
+    let permission_requests_allowed = match turn_context.approval_policy.value() {
+        AskForApproval::Never => false,
+        AskForApproval::Granular(config) => config.allows_request_permissions(),
+        AskForApproval::OnRequest | AskForApproval::UnlessTrusted => true,
+    };
+    if environment_mode.has_environment()
+        && features.enabled(Feature::RequestPermissionsTool)
+        && permission_requests_allowed
+    {
         planned_tools
             .add_with_authorization_class(RequestPermissionsHandler, TypedToolClass::OwnTask);
     }

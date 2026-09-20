@@ -15,7 +15,7 @@ Operation headers:
 - `*** Update File: <path>`: patch a file with one or more `@@` hunks, or rename it without hunks.
 - Put `*** Move to: <new path>` immediately after an Update header to rename it.
 
-In a hunk, prefix unchanged context with a space, removals with `-`, and additions with `+`. Normally include three context lines before and after a change; do not duplicate overlapping context between adjacent hunks. When context is not unique, name the containing class, function, or other scope after `@@`; add nested `@@` scopes if needed.
+In a hunk, prefix unchanged context with a space, removals with `-`, and additions with `+`. Include only enough context to identify the change uniquely; one line before and after is often sufficient. Do not duplicate overlapping context between adjacent hunks. When context is not unique, name the containing class, function, or other scope after `@@`; add context or nested `@@` scopes as needed.
 
 Grammar:
 
@@ -70,10 +70,15 @@ Example combining operations:
 Important rules:
 
 - Use a complete, still-current read of the target region before patching. Refresh only missing, changed, or uncertain context, reconcile changes, and keep each patch to one coherent contract.
-- Paths must be relative; never use absolute paths.
+- Prefer paths relative to the selected working directory. Absolute paths are supported, subject to the same filesystem permissions.
+- Each source or move destination may occur only once per patch, including path aliases; put edits to a renamed file in its source Update File hunk. Order chunks from top to bottom.
+- Use exact indentation on removed lines. Matching can tolerate whitespace and Unicode punctuation differences; inspect the resulting diff.
+- Add File replaces an existing file, and Move to can replace its destination; inspect those paths first.
+- Moves write text then remove the source; they are not atomic renames and do not carry source permissions to new destinations. Use a shell tool to inspect or set executable permissions.
 - Use only this grammar. Do not include unified-diff headers such as `diff --git`, `---`, or `+++`.
 - Updates preserve whether a nonempty file ends with a newline. New lines use the file's first observed line ending; untouched lines retain their existing endings. Add operations use LF and terminate nonempty content with a newline.
 - A hunk containing only additions appends at EOF unless its `@@` header names a context line, in which case it inserts immediately after that line.
+- Include existing first lines as context to prepend. Application is incremental: failure or cancellation may leave earlier changes committed. Inspect reported changes and current files, then submit only remaining changes.
 - Success confirms application, not correctness or unchanged contents.
 - After stale context, a concurrent edit, a context mismatch, or a failure that may have modified files, re-read only the affected current sections before retrying. For errors known to occur before file mutation, correct the error without re-reading unchanged contents. Do not retry against stale context.
 - Preserve an implementation that already satisfies the request even when it differs from an earlier plan.

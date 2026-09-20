@@ -129,7 +129,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let options = parse(args)?;
     if options.operation == "help" {
         println!(
-            "Repo Benchmark: one Rust benchmark, scripted then real-model execution.\n\njust repo-benchmark [scan] [-fast|-full]\njust repo-benchmark prepare [-fast|-full] [--reference CHECKOUT] [--fork-ref COMMIT]\njust repo-benchmark compare --prepared MANIFEST [-fast|-full]\njust repo-benchmark import --result RESULT\njust repo-benchmark rerun --result RESULT --attempt ID\njust repo-benchmark rerun --result RESULT --analysis-only\n\nFast: 1 live task. Full: 3 live tasks. Fork features on versus upstream, 2 variants.\nDefault reference: newest local stable upstream release tag; verified native builds are reused until the release or build inputs change. No automatic fetch.\nAll execution is sequential and stops when finite work finishes. No performance pass/fail verdict."
+            "Repo Benchmark: one Rust benchmark, scripted then real-model execution.\n\njust repo-benchmark [scan] [-fast|-full]\njust repo-benchmark prepare [-fast|-full] [--reference CHECKOUT] [--fork-ref COMMIT]\njust repo-benchmark compare --prepared MANIFEST [-fast|-full]\njust repo-benchmark import --result RESULT\njust repo-benchmark rerun --result RESULT --attempt ID\njust repo-benchmark rerun --result RESULT --analysis-only\n\nFast: 1 live task. Full: 4 live tasks. Fork features on versus upstream, 2 variants.\nDefault reference: newest local stable upstream release tag; verified native builds are reused until the release or build inputs change. No automatic fetch.\nAll execution is sequential and stops when finite work finishes. No performance pass/fail verdict."
         );
         return Ok(());
     }
@@ -226,7 +226,7 @@ mod tests {
     }
     #[test]
     fn benchmark_always_compares_enabled_fork_with_reference() -> Result<()> {
-        for (flag, mode, live_count) in [("-fast", Mode::Fast, 2), ("-full", Mode::Full, 6)] {
+        for (flag, mode, live_count) in [("-fast", Mode::Fast, 2), ("-full", Mode::Full, 8)] {
             let options = parse(args(&["scan", flag]))?;
             assert_eq!(options.operation, "run");
             assert_eq!(options.mode, mode);

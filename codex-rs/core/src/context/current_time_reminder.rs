@@ -32,7 +32,7 @@ impl ContextualUserFragment for CurrentTimeReminder {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        format!("It is {}.", self.formatted_time())
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!("It is {}.", self.formatted_time()))
     }
 }

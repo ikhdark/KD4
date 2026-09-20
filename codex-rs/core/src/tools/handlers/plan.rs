@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::plan_store::PlanStatusUpdate;
 use crate::plan_store::PlanToolResponse;
 use crate::plan_store::PlanUpdateEffect;
 use crate::tools::context::ToolInvocation;
@@ -27,6 +28,14 @@ use std::sync::Mutex;
 use tokio::sync::Notify;
 
 pub struct PlanHandler;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanToolArgs {
+    explanation: Option<String>,
+    plan: Option<Vec<codex_protocol::plan_tool::PlanItemArg>>,
+    set: Option<Vec<PlanStatusUpdate>>,
+}
 
 pub struct PlanToolOutput {
     current_plan: UpdatePlanArgs,
@@ -195,15 +204,20 @@ impl PlanHandler {
             ));
         }
 
-        let requested_args =
-            serde_json::from_str::<UpdatePlanArgs>(&arguments).map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "failed to parse function arguments: {error}"
-                ))
-            })?;
+        let requested_args = serde_json::from_str::<PlanToolArgs>(&arguments).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to parse function arguments: {error}"
+            ))
+        })?;
+        if requested_args.plan.is_some() == requested_args.set.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "provide exactly one of plan or set".to_string(),
+            ));
+        }
         if requested_args
             .plan
             .iter()
+            .flatten()
             .filter(|item| item.status == codex_protocol::plan_tool::StepStatus::InProgress)
             .count()
             > 1
@@ -220,7 +234,26 @@ impl PlanHandler {
         #[cfg(test)]
         pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
 
-        let update = session.services.plan_store.update(requested_args).await;
+        let update = if let Some(plan) = requested_args.plan {
+            session
+                .services
+                .plan_store
+                .update(UpdatePlanArgs {
+                    explanation: requested_args.explanation,
+                    plan,
+                })
+                .await
+        } else {
+            session
+                .services
+                .plan_store
+                .update_statuses(
+                    requested_args.set.unwrap_or_default(),
+                    requested_args.explanation,
+                )
+                .await
+                .map_err(FunctionCallError::RespondToModel)?
+        };
         match update.effect {
             PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
             PlanUpdateEffect::StructuralRevision => {

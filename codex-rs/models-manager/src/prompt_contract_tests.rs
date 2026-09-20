@@ -31,6 +31,16 @@ struct PromptContract {
 
 const PROMPT_CONTRACTS: &[PromptContract] = &[
     PromptContract {
+        id: "omit-redundant-tool-arguments",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "Supply required tool arguments and optional arguments needed for the intended behavior.",
+            "Omit optional defaults, empty collections, and nulls when omission has the same meaning;",
+            "preserve explicit values when they change behavior.",
+        ],
+    },
+    PromptContract {
         id: "requirement-fidelity-and-runtime-grounding",
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
@@ -428,7 +438,12 @@ fn bundled_local_policy_models_match_prompt_policy_registration() {
         .models
         .iter()
         .map(|model| model.slug.as_str())
-        .filter(|slug| *slug == "gpt-6-astra" || slug.starts_with("gpt-5.6-"))
+        .filter(|slug| {
+            matches!(
+                *slug,
+                "gpt-6-astra" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.2"
+            ) || slug.starts_with("gpt-5.6-")
+        })
         .collect::<BTreeSet<_>>();
     let registered_slugs = LOCAL_PROMPT_POLICY_SLUGS
         .iter()
@@ -441,11 +456,7 @@ fn bundled_local_policy_models_match_prompt_policy_registration() {
 #[test]
 fn behavior_identical_instruction_templates_are_removed() {
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
-    for slug in LOCAL_PROMPT_POLICY_SLUGS
-        .iter()
-        .copied()
-        .chain(std::iter::once("gpt-5.2"))
-    {
+    for slug in LOCAL_PROMPT_POLICY_SLUGS.iter().copied() {
         let model = response
             .models
             .iter()

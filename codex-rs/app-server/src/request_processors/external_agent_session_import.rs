@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use codex_arg0::Arg0DispatchPaths;
 use codex_core::ThreadManager;
 use codex_core::config::ConfigOverrides;
 use codex_external_agent_sessions::CompletedExternalAgentSessionImport;
@@ -44,7 +43,6 @@ pub(super) struct ExternalAgentSessionImporter {
     thread_store: Arc<dyn ThreadStore>,
     state_db: Option<StateDbHandle>,
     config_manager: ConfigManager,
-    _arg0_paths: Arg0DispatchPaths,
 }
 
 impl ExternalAgentSessionImporter {
@@ -54,7 +52,6 @@ impl ExternalAgentSessionImporter {
         thread_store: Arc<dyn ThreadStore>,
         state_db: Option<StateDbHandle>,
         config_manager: ConfigManager,
-        arg0_paths: Arg0DispatchPaths,
     ) -> Self {
         Self {
             codex_home,
@@ -63,7 +60,6 @@ impl ExternalAgentSessionImporter {
             thread_store,
             state_db,
             config_manager,
-            _arg0_paths: arg0_paths,
         }
     }
 

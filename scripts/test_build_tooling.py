@@ -655,6 +655,22 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         self.assertNotEqual(first, second)
 
+    def test_local_just_shell_accepts_timestamp_rounding(self) -> None:
+        just_shell = load_just_shell_module()
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            command = ["fixture", "--version"]
+            just_shell.write_cached_tool_run(command, cache_dir, True)
+            warning = cache_dir / "fixture.warn"
+            warning.write_text("warned", encoding="utf-8")
+            for path in [warning, just_shell.tool_run_cache_path(command, cache_dir)]:
+                os.utime(path, (1000.0005, 1000.0005))
+            stderr = io.StringIO()
+            with mock.patch.object(just_shell.time, "time", return_value=1000):
+                self.assertTrue(just_shell.read_cached_tool_run(command, cache_dir))
+                just_shell.warn_once("fixture", "needs setup", cache_dir=cache_dir, stderr=stderr)
+            self.assertEqual(stderr.getvalue(), "")
+
     def test_local_just_shell_reprobes_future_dated_cache(self) -> None:
         just_shell = load_just_shell_module()
         with tempfile.TemporaryDirectory() as directory:

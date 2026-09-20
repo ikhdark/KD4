@@ -97,18 +97,19 @@ async fn process_sse_with_metadata(
     let mut received_payload_bytes = 0_usize;
 
     loop {
-        let start = Instant::now();
+        let start = telemetry.as_ref().map(|_| Instant::now());
         let response = tokio::select! {
             _ = tx_event.closed() => {
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::ConsumerCancelled, start.elapsed());
                 }
                 return;
             }
             response = timeout(idle_timeout, stream.next()) => response,
         };
-        if let Some(t) = telemetry.as_ref() {
-            t.on_sse_poll(&response, start.elapsed());
+        if let Some((t, start)) = telemetry.as_ref().zip(start) {
+            let poll_duration = start.elapsed();
+            t.on_sse_poll(&response, poll_duration);
             t.on_sse_phase(
                 if poll_ordinal == 0 {
                     SsePollPhase::FirstEvent
@@ -116,7 +117,7 @@ async fn process_sse_with_metadata(
                     SsePollPhase::SubsequentEvent
                 },
                 poll_ordinal,
-                start.elapsed(),
+                poll_duration,
             );
         }
         poll_ordinal = poll_ordinal.saturating_add(1);
@@ -125,7 +126,7 @@ async fn process_sse_with_metadata(
             Ok(Some(Err(e))) => {
                 debug!("SSE Error: {e:#}");
                 let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::TransportError, start.elapsed());
                 }
                 return;
@@ -136,7 +137,7 @@ async fn process_sse_with_metadata(
                         "stream closed before response.completed (received {received_events} SSE events, {received_payload_bytes} payload bytes)"
                     ))))
                     .await;
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(
                         SseCleanupOutcome::CarrierEofBeforeCompleted,
                         start.elapsed(),
@@ -151,7 +152,7 @@ async fn process_sse_with_metadata(
                         idle_timeout.as_millis()
                     ))))
                     .await;
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::IdleTimeout, start.elapsed());
                 }
                 return;
@@ -164,13 +165,13 @@ async fn process_sse_with_metadata(
 
         let events = match interpreter.process_payload(&sse.data) {
             Ok(events) => {
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_event(&sse.event, start.elapsed(), None);
                 }
                 events
             }
             Err(ResponsesEventError::Parse(error)) => {
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
                 }
                 debug!(event = %sse.event, payload_bytes = sse.data.len(), %error, "Failed to parse SSE event");
@@ -181,17 +182,17 @@ async fn process_sse_with_metadata(
                         sse.data.len()
                     ))))
                     .await;
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::ProtocolError, start.elapsed());
                 }
                 return;
             }
             Err(ResponsesEventError::Api(error)) => {
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
                 }
                 let _ = tx_event.send(Err(error)).await;
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::ResponseError, start.elapsed());
                 }
                 return;
@@ -201,7 +202,7 @@ async fn process_sse_with_metadata(
         for event in events {
             let is_completed = matches!(event, ResponseEvent::Completed { .. });
             if tx_event.send(Ok(event)).await.is_err() {
-                if let Some(t) = telemetry.as_ref() {
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::ConsumerCancelled, start.elapsed());
                 }
                 return;
@@ -1411,7 +1412,8 @@ mod tests {
                 event["safety_buffering"]["retry_model"] = retry_model;
             }
             let event: ResponsesStreamEvent =
-                serde_json::from_value(event).expect("deserialize safety buffering event");
+                <ResponsesStreamEvent as serde::Deserialize>::deserialize(&event)
+                    .expect("deserialize safety buffering event");
 
             let buffering = event
                 .safety_buffering(&treatment)
@@ -1431,23 +1433,21 @@ mod tests {
 
     #[test]
     fn responses_stream_event_response_model_reads_top_level_headers() {
-        let ev: ResponsesStreamEvent = serde_json::from_value(json!({
+        let value = json!({
             "type": "response.metadata",
             "headers": {
                 "openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS,
             }
-        }))
-        .expect("expected event to deserialize");
+        });
+        let ev = <ResponsesStreamEvent as serde::Deserialize>::deserialize(&value)
+            .expect("expected event to deserialize");
 
-        assert_eq!(
-            ev.response_model().as_deref(),
-            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
-        );
+        assert_eq!(ev.response_model(), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS));
     }
 
     #[test]
     fn responses_stream_event_response_model_prefers_response_headers() {
-        let ev: ResponsesStreamEvent = serde_json::from_value(json!({
+        let value = json!({
             "type": "response.created",
             "headers": {
                 "openai-model": "top-level-model"
@@ -1458,13 +1458,11 @@ mod tests {
                     "openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS
                 }
             }
-        }))
-        .expect("expected event to deserialize");
+        });
+        let ev = <ResponsesStreamEvent as serde::Deserialize>::deserialize(&value)
+            .expect("expected event to deserialize");
 
-        assert_eq!(
-            ev.response_model().as_deref(),
-            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
-        );
+        assert_eq!(ev.response_model(), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS));
     }
 
     #[test]
@@ -1478,7 +1476,8 @@ mod tests {
             }
         });
         let event: ResponsesStreamEvent =
-            serde_json::from_value(event).expect("expected event to deserialize");
+            <ResponsesStreamEvent as serde::Deserialize>::deserialize(&event)
+                .expect("expected event to deserialize");
 
         assert_eq!(
             event.model_verifications(),
@@ -1495,7 +1494,8 @@ mod tests {
             }
         });
         let event: ResponsesStreamEvent =
-            serde_json::from_value(event).expect("expected event to deserialize");
+            <ResponsesStreamEvent as serde::Deserialize>::deserialize(&event)
+                .expect("expected event to deserialize");
 
         assert_eq!(event.model_verifications(), None);
     }
@@ -1509,7 +1509,8 @@ mod tests {
             }
         });
         let event: ResponsesStreamEvent =
-            serde_json::from_value(event).expect("expected event to deserialize");
+            <ResponsesStreamEvent as serde::Deserialize>::deserialize(&event)
+                .expect("expected event to deserialize");
 
         assert_eq!(event.model_verifications(), None);
     }

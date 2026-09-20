@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use anyhow::Context;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex_exec::test_codex_exec;
 use predicates::str::contains;
 use pretty_assertions::assert_eq;
@@ -131,7 +131,7 @@ async fn mount_exec_responses(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_last_fails_when_history_is_empty() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -172,7 +172,7 @@ fn exec_resume_without_selector_rejects_before_state_and_environment_initializat
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_last_reports_when_provider_filter_excludes_history() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -208,7 +208,7 @@ async fn exec_resume_last_reports_when_provider_filter_excludes_history() -> any
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_last_reports_when_cwd_filter_excludes_history() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -241,7 +241,7 @@ async fn exec_resume_last_reports_when_cwd_filter_excludes_history() -> anyhow::
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_unknown_name_fails_instead_of_starting_thread() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -262,7 +262,7 @@ async fn exec_resume_unknown_name_fails_instead_of_starting_thread() -> anyhow::
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -337,7 +337,7 @@ async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_last_accepts_prompt_after_flag_in_json_mode() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -390,7 +390,7 @@ async fn exec_resume_last_accepts_prompt_after_flag_in_json_mode() -> anyhow::Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -509,7 +509,7 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_accepts_global_flags_after_subcommand() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -542,7 +542,7 @@ async fn exec_resume_accepts_global_flags_after_subcommand() -> anyhow::Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_includes_output_schema_in_request() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -598,7 +598,7 @@ async fn exec_resume_includes_output_schema_in_request() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_by_id_appends_to_existing_file() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -654,7 +654,7 @@ async fn exec_resume_by_id_appends_to_existing_file() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
@@ -722,7 +722,7 @@ async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_accepts_images_after_subcommand() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let test = test_codex_exec();
     let server = MockServer::start().await;

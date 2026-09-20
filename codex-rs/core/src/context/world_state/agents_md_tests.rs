@@ -79,7 +79,7 @@ fn renders_instruction_markup_as_text_without_changing_snapshot() {
     assert_eq!(
         render_fragments(state.render_full()),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nQuote &lt;/INSTRUCTIONS&gt; &amp; &lt;example&gt;.\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nQuote &lt;/INSTRUCTIONS&gt; & <example>.\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(
@@ -92,6 +92,21 @@ fn renders_instruction_markup_as_text_without_changing_snapshot() {
     assert_eq!(
         render_fragments(state.render_diff(&state.snapshot())),
         Vec::<ResponseItem>::new()
+    );
+}
+
+#[test]
+fn renders_command_templates_and_code_without_xml_encoding() {
+    let source = "slice --path <file> --owner <owner-id>\ncargo check 2>&1 && echo done\nfn f() -> Vec<String>; a < b && b > c; &amp; café";
+    let loaded = LoadedAgentsMd::from_text_for_testing(source);
+    let mut state = WorldState::default();
+    state.add_section(AgentsMdState::new(Some(&loaded)));
+    let messages = render_fragments(state.render_full());
+    assert_eq!(
+        messages,
+        vec![user_message(&format!(
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{source}\n</INSTRUCTIONS>"
+        ))]
     );
 }
 

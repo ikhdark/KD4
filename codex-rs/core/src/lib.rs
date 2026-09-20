@@ -1,5 +1,8 @@
 //! Root of the `codex-core` library.
 
+// The Windows transport future exceeds the default trait-solver recursion depth.
+#![recursion_limit = "256"]
+
 // Prevent accidental direct writes to stdout/stderr in library code. All
 // user-visible output must go through the appropriate abstraction (e.g.,
 // the TUI or the tracing stack).

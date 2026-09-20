@@ -182,7 +182,7 @@ impl HistoryCell for PlanUpdateCell {
             let note = Line::from(text.to_string().dim().italic());
             let wrapped = adaptive_wrap_line(&note, RtOptions::new(wrap_width));
             let mut out = Vec::new();
-            push_owned_lines(&wrapped, &mut out);
+            push_owned_lines(wrapped, &mut out);
             out
         };
 
@@ -199,7 +199,7 @@ impl HistoryCell for PlanUpdateCell {
             let step = Line::from(text.to_string().set_style(step_style));
             let wrapped = adaptive_wrap_line(&step, opts);
             let mut out = Vec::new();
-            push_owned_lines(&wrapped, &mut out);
+            push_owned_lines(wrapped, &mut out);
             out
         };
 

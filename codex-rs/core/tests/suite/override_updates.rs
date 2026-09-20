@@ -10,8 +10,8 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use core_test_support::TempDirExt;
+use core_test_support::require_network;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -42,7 +42,7 @@ fn persisted_thread_settings(path: &std::path::Path) -> Result<Vec<ThreadSetting
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_settings_update_without_user_turn_records_permissions_update() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
@@ -72,7 +72,7 @@ async fn thread_settings_update_without_user_turn_records_permissions_update() -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_settings_update_without_user_turn_records_environment_update() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let test = test_codex().build(&server).await?;
@@ -102,7 +102,7 @@ async fn thread_settings_update_without_user_turn_records_environment_update() -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_settings_update_without_user_turn_records_collaboration_update() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let test = test_codex().build(&server).await?;

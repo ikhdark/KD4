@@ -1,49 +1,22 @@
 use crate::FunctionCallError;
-use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_protocol::models::ResponseInputItem;
 use codex_tools::JsonSchema;
+use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
-use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 
 const NAMESPACE: &str = "clock";
 const TOOL_NAME: &str = "curr_time";
-
-struct CurrentTimeOutput(CurrentTimeReminder);
-
-impl ToolOutput for CurrentTimeOutput {
-    fn log_preview(&self) -> String {
-        self.0.render()
-    }
-
-    fn success_for_logging(&self) -> bool {
-        true
-    }
-
-    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.0.render(), Some(true))
-            .to_response_item(call_id, payload)
-    }
-
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        json!({
-            "current_time": self.0.formatted_time(),
-        })
-    }
-}
 
 pub struct CurrentTimeHandler;
 
@@ -102,9 +75,9 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
                 .map_err(|err| {
                     FunctionCallError::Fatal(format!("failed to read current time: {err:#}"))
                 })?;
-            Ok(boxed_tool_output(CurrentTimeOutput(
-                CurrentTimeReminder::new(current_time),
-            )))
+            Ok(boxed_tool_output(JsonToolOutput::new(json!({
+                "current_time": CurrentTimeReminder::new(current_time).formatted_time(),
+            }))))
         })
     }
 }

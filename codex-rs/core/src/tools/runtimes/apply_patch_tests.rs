@@ -27,6 +27,135 @@ fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::
     )
 }
 
+#[tokio::test]
+async fn finalization_failure_preserves_writes_and_exposes_a_warning_once() {
+    use codex_agent_task_store::AgentRole;
+    use codex_agent_task_store::AgentTaskBindingDraft;
+    use codex_agent_task_store::AssignmentDraft;
+    use codex_agent_task_store::CapabilityProfile;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let (session, mut turn, _) = make_session_and_context_with_rx().await;
+    let coordinator = session.services.agent_control.task_coordinator();
+    coordinator
+        .initialize_for_workspace_coordination(
+            None,
+            home.path().to_path_buf(),
+            "test".into(),
+            "root".into(),
+        )
+        .await
+        .unwrap();
+    let (assignment, attempt) = coordinator
+        .create_assignment(
+            repo.path(),
+            AssignmentDraft {
+                root_session_id: "root".into(),
+                admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+                role: AgentRole::Worker,
+                capability_profile: CapabilityProfile::ScopedSourceWrite,
+                objective: "write a file".into(),
+                acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                    id: "written".into(),
+                    text: "file is committed".into(),
+                }],
+                read_scope: vec![],
+                write_scope: vec![],
+                stop_condition: "file written".into(),
+                dependencies: vec![],
+                risk_hints: vec![],
+                required_evidence: vec![],
+                prohibited_changes: vec![],
+                contract_claims: vec![],
+                workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await
+        .unwrap();
+    let agent_path = codex_protocol::AgentPath::root().join("worker").unwrap();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: agent_path.to_string(),
+            task_name: "worker".into(),
+            thread_id: None,
+        })
+        .await
+        .unwrap();
+    std::sync::Arc::get_mut(&mut turn).unwrap().session_source =
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: codex_protocol::ThreadId::new(),
+            depth: 1,
+            agent_path: Some(agent_path),
+            agent_nickname: None,
+            agent_role: None,
+        });
+    let cwd = PathUri::from_abs_path(&repo.path().to_path_buf().abs());
+    let path = cwd.join("written.txt").unwrap();
+    let req = ApplyPatchRequest {
+        turn_environment: crate::session::turn_context::TurnEnvironment::new(
+            "local".into(),
+            std::sync::Arc::new(codex_exec_server::Environment::default_for_tests()),
+            cwd.clone(),
+            None,
+        ),
+        action: ApplyPatchAction::new_add_for_test(&path, "committed\n".into()),
+        file_paths: vec![path],
+        changes: HashMap::new(),
+        exec_approval_requirement: ExecApprovalRequirement::Skip {
+            bypass_sandbox: false,
+            proposed_execpolicy_amendment: None,
+        },
+        additional_permissions: None,
+        permissions_preapproved: false,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+    };
+    let ctx = ToolCtx {
+        session: session.clone(),
+        turn,
+        call_id: "evidence-failure".into(),
+        tool_name: codex_tools::ToolName::plain("apply_patch"),
+    };
+    let mut runtime = ApplyPatchRuntime::new();
+    runtime.begin_mutation_evidence(&req, &ctx).await.unwrap();
+    runtime.committed_delta = codex_apply_patch::apply_patch(
+        &req.action.patch,
+        &cwd,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        codex_exec_server::LOCAL_FS.as_ref(),
+        None,
+    )
+    .await
+    .unwrap();
+    // A competing finalizer makes the runtime's finalization fail with
+    // MutationAlreadyFinalized. Filesystem success must still be preserved.
+    coordinator
+        .store()
+        .unwrap()
+        .finalize_mutation(attempt.attempt_id, repo.path(), "written.txt".into())
+        .await
+        .unwrap();
+    runtime.finish_pending_mutation_evidence(&ctx).await;
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("written.txt")).unwrap(),
+        "committed\n"
+    );
+    assert_eq!(runtime.committed_delta().changes().len(), 1);
+    let warning = runtime
+        .mutation_evidence_warning()
+        .expect("finalization failure is visible");
+    assert!(warning.contains("1 path(s)"), "{warning}");
+    assert!(warning.contains("do not repeat the patch"), "{warning}");
+    runtime.finish_pending_mutation_evidence(&ctx).await;
+    assert_eq!(runtime.mutation_evidence_warning(), Some(warning));
+}
+
 #[test]
 fn wants_no_sandbox_approval_granular_respects_sandbox_flag() {
     let runtime = ApplyPatchRuntime::new();

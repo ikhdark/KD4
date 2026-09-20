@@ -10,13 +10,13 @@ use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -104,7 +104,7 @@ async fn submit_turn(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ultra_reasoning_uses_max_and_requires_explicit_request() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let response = mount_sse_once(
@@ -140,7 +140,7 @@ async fn ultra_reasoning_uses_max_and_requires_explicit_request() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sol_high_xhigh_and_max_require_explicit_request() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -188,7 +188,7 @@ async fn sol_high_xhigh_and_max_require_explicit_request() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -253,7 +253,7 @@ async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_configured_mode_hint_suppresses_builtin_text() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let response = mount_sse_once(
@@ -287,7 +287,7 @@ async fn empty_configured_mode_hint_suppresses_builtin_text() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -351,7 +351,7 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let response = mount_sse_once(
@@ -403,7 +403,7 @@ async fn assert_interrupted_isolated_spawn(namespace: Option<&str>) -> Result<()
     use std::process::Command;
     use std::time::Duration;
 
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = start_mock_server().await;
     let args = json!({
         "task_name": "cancelled_worker", "agent_type": "worker",
@@ -580,7 +580,7 @@ async fn typed_spawn_task_capsule_delivers_normalized_handles_and_file_revision(
     use core_test_support::responses::mount_sse_once_match;
     use std::time::Duration;
 
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = start_mock_server().await;
     const PROMPT: &str = "Please spawn a subagent to inspect target.txt using a task capsule.";
     const OBJECTIVE: &str = "Inspect the capsule target file";
@@ -748,7 +748,7 @@ async fn assert_registered_wait_item_terminal_with_stalled_store(
     use core_test_support::responses;
     use std::time::Duration;
 
-    skip_if_no_network!(Ok(()));
+    require_network!();
     const PROMPT: &str = "Spawn a subagent, then wait for its work.";
     const PRIME_PROMPT: &str =
         "Drain the child startup observations once before the lifecycle test.";

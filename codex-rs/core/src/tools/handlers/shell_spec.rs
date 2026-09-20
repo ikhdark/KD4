@@ -28,6 +28,8 @@ fn validation_context_schema() -> JsonSchema {
 
 const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Shell script to execute in the user's default shell. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, and builtins in script form. On Windows, also keep `.cmd`/`.bat` calls in script form; for complex PowerShell, prefer `kind: \"powershell_script\"`.";
 
+const FORCE_FRESH_DESCRIPTION: &str = "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.";
+
 fn bounded_integer(description: String, minimum: u64, maximum: u64) -> JsonSchema {
     JsonSchema {
         minimum: Some(Number::from(minimum)),
@@ -148,9 +150,9 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-30000 ms. Windows initial waits are floored to {} ms.", crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
+                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
-                crate::unified_exec::MAX_YIELD_TIME_MS,
+                crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
         ),
         (
@@ -197,9 +199,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
     ));
     properties.insert(
         "force_fresh".to_string(),
-        JsonSchema::boolean(Some(
-            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
-        )),
+        JsonSchema::boolean(Some(FORCE_FRESH_DESCRIPTION.to_string())),
     );
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
@@ -243,7 +243,17 @@ pub(crate) fn create_foreign_shell_command_tool(
     ToolSpec::Function(tool)
 }
 
+#[cfg(test)]
 pub fn create_write_stdin_tool() -> ToolSpec {
+    create_write_stdin_tool_with_max_timeout(
+        crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
+    )
+}
+
+pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> ToolSpec {
+    let max_timeout_ms = max_timeout_ms.max(crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS);
+    let default_timeout_ms =
+        crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS.min(max_timeout_ms);
     let properties = BTreeMap::from([
         (
             "session_id".to_string(),
@@ -256,30 +266,37 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         (
             "chars".to_string(),
             JsonSchema::string(Some(
-                "Bytes to write to stdin. Defaults to empty, which polls without writing.".to_string(),
+                "Bytes to write to stdin. Defaults to empty, which polls without writing."
+                    .to_string(),
             )),
         ),
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 60000 ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process.".to_string(),
+                format!(
+                    "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to {default_timeout_ms} ms and cap at {max_timeout_ms} ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process."
+                ),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
-                crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
+                max_timeout_ms.max(crate::unified_exec::MAX_YIELD_TIME_MS),
             ),
         ),
         (
             "max_output_tokens".to_string(),
-            bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
-                adaptive_output_budget_description()
-            ), 0, usize::MAX as u64),
+            bounded_integer(
+                format!(
+                    "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
+                    adaptive_output_budget_description()
+                ),
+                0,
+                usize::MAX as u64,
+            ),
         ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "write_stdin".to_string(),
         description:
-            "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C only with interrupt=true, and empty input to poll with polling=true. cancellation describes explicit process cancellation through this tool; false means no such operation is exposed. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
+            "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C by sending `chars: \"\\u0003\"` only when session_capabilities.interrupt=true, and empty input to poll with polling=true. `interrupt` is a returned capability, not an input parameter. cancellation describes explicit process cancellation through this tool; false means no such operation is exposed. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -335,7 +352,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
         (
             "timeout_ms".to_string(),
             bounded_integer(
-                "Maximum command runtime. Defaults to 10000 ms. Zero sets an immediate deadline; it does not disable the timeout.".to_string(),
+                "Maximum command runtime. Defaults to 300000 ms for recognized validation commands and 10000 ms otherwise. This is a hard deadline; use exec_command for resumable long-running work. Zero sets an immediate deadline; it does not disable the timeout.".to_string(),
                 0,
                 u64::MAX,
             ),
@@ -369,9 +386,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
     ));
     properties.insert(
         "force_fresh".to_string(),
-        JsonSchema::boolean(Some(
-            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
-        )),
+        JsonSchema::boolean(Some(FORCE_FRESH_DESCRIPTION.to_string())),
     );
 
     let description = format!(
@@ -675,13 +690,23 @@ Windows safety rules (apply when executing in a Windows environment, regardless 
 - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#
 }
 
+/// Keep the platform-independent rule while omitting Windows-only instructions
+/// when every selectable execution environment has a known POSIX cwd.
+pub(crate) fn omit_windows_shell_guidance(spec: &mut ToolSpec) {
+    if let ToolSpec::Function(tool) = spec
+        && let Some(start) = tool.description.find("\n\nWindows safety rules")
+    {
+        tool.description.truncate(start);
+    }
+}
+
 fn filesystem_safety_guidance() -> &'static str {
     windows_shell_guidance()
 }
 
 fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
-- Read known files directly. Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. Start unknown-location searches in a likely owning path and expand after a miss. For repository-wide inventories, search the requested scope and preserve the complete matching set; bound displayed evidence without treating truncated results as complete. Exclude build output with `-g '!target'` when outside the requested scope.
+- Read known files directly. Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. Start unknown-location searches in a likely owning path and expand after a miss. For repository-wide inventories, search the requested scope and preserve the complete matching set; bound displayed evidence without treating truncated results as complete. Exclude the repository's build and dependency output directories when they are outside the requested scope.
 - Search windows locate code. Before editing, read the complete enclosing function, type, or configuration unit and refresh it after intervening writes.
 - Output above the token budget is truncated. For a known source file, request enough `max_output_tokens` to read the needed range in one call."#
 }

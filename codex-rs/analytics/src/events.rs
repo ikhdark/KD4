@@ -67,7 +67,6 @@ pub(crate) enum TrackEventRequest {
     WebSearch(CodexWebSearchEventRequest),
     ImageGeneration(CodexImageGenerationEventRequest),
     AcceptedLineFingerprints(Box<CodexAcceptedLineFingerprintsEventRequest>),
-    #[allow(dead_code)]
     ReviewEvent(CodexReviewEventRequest),
     PluginUsed(CodexPluginUsedEventRequest),
     PluginInstallRequested(CodexPluginInstallRequestedEventRequest),

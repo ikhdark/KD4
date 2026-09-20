@@ -588,8 +588,12 @@ use codex_rollout_trace::ToolDispatchTraceContext;
 /// Shares one trace terminal between registry results and supervised cancellation.
 #[derive(Clone, Debug)]
 pub(crate) struct ToolDispatchTrace {
+    state: Option<Arc<EnabledToolDispatchTrace>>,
+}
+
+#[derive(Debug)]
+struct EnabledToolDispatchTrace {
     context: tokio::sync::watch::Receiver<Option<ToolDispatchTraceContext>>,
-    enabled: bool,
     terminal_tasks: tokio_util::task::TaskTracker,
     terminal_recording: Arc<Once>,
 }
@@ -597,27 +601,25 @@ pub(crate) struct ToolDispatchTrace {
 impl ToolDispatchTrace {
     pub(crate) fn start(invocation: &ToolInvocation) -> Self {
         let thread_trace = invocation.session.services.rollout_thread_trace.clone();
-        let enabled = thread_trace.is_enabled();
+        if !thread_trace.is_enabled() {
+            return Self { state: None };
+        }
         let terminal_tasks = invocation.session.terminal_tasks.clone();
         let (sender, context) = tokio::sync::watch::channel(None);
-        if enabled {
-            let invocation = invocation.clone();
-            // Publish a handle before awaiting the accepted write. Cancellation
-            // can then wait on the same initialization and record its terminal
-            // after the start, even if the registry waiter has been dropped.
-            drop(terminal_tasks.spawn_blocking(move || {
-                let context = thread_trace
-                    .start_tool_dispatch_trace(|| tool_dispatch_invocation(&invocation));
-                sender.send_replace(Some(context));
-            }));
-        } else {
-            sender.send_replace(Some(thread_trace.start_tool_dispatch_trace(|| None)));
-        }
+        let invocation = invocation.clone();
+        // Publish a handle before awaiting the accepted write. Cancellation
+        // owns the same initialization and terminal ordering.
+        drop(terminal_tasks.spawn_blocking(move || {
+            let context =
+                thread_trace.start_tool_dispatch_trace(|| tool_dispatch_invocation(&invocation));
+            sender.send_replace(Some(context));
+        }));
         Self {
-            context,
-            enabled,
-            terminal_tasks,
-            terminal_recording: Arc::new(Once::new()),
+            state: Some(Arc::new(EnabledToolDispatchTrace {
+                context,
+                terminal_tasks,
+                terminal_recording: Arc::new(Once::new()),
+            })),
         }
     }
 
@@ -626,7 +628,8 @@ impl ToolDispatchTrace {
     }
 
     async fn started_context(&self) -> Option<ToolDispatchTraceContext> {
-        let mut context = self.context.clone();
+        let state = self.state.as_ref()?;
+        let mut context = state.context.clone();
         match context.wait_for(Option::is_some).await {
             Ok(context) => context.as_ref().cloned(),
             Err(error) => {
@@ -643,18 +646,18 @@ impl ToolDispatchTrace {
         payload: &ToolPayload,
         result: &dyn ToolOutput,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        if !self.enabled {
+        let Some(state) = &self.state else {
             return Box::pin(async {});
-        }
+        };
 
         let Some(result_payload) = tool_dispatch_result(invocation, call_id, payload, result)
         else {
             return Box::pin(async {});
         };
-        let terminal_recording = Arc::clone(&self.terminal_recording);
+        let terminal_recording = Arc::clone(&state.terminal_recording);
         let status = execution_status_for_outcome(result.outcome_context());
         let trace = self.clone();
-        let terminal_tasks = self.terminal_tasks.clone();
+        let terminal_tasks = state.terminal_tasks.clone();
         Box::pin(async move {
             let Some(context) = trace.started_context().await else {
                 return;
@@ -672,13 +675,13 @@ impl ToolDispatchTrace {
         &self,
         error: &FunctionCallError,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        if !self.enabled {
+        let Some(state) = &self.state else {
             return Box::pin(async {});
-        }
+        };
         let trace = self.clone();
         let error = error.to_string();
-        let terminal_recording = Arc::clone(&self.terminal_recording);
-        let terminal_tasks = self.terminal_tasks.clone();
+        let terminal_recording = Arc::clone(&state.terminal_recording);
+        let terminal_tasks = state.terminal_tasks.clone();
         Box::pin(async move {
             let Some(context) = trace.started_context().await else {
                 return;
@@ -693,14 +696,14 @@ impl ToolDispatchTrace {
     }
 
     pub(crate) async fn record_cancelled(&self) {
-        if !self.enabled {
+        let Some(state) = &self.state else {
             return;
-        }
+        };
         let Some(context) = self.started_context().await else {
             return;
         };
-        let terminal_recording = Arc::clone(&self.terminal_recording);
-        defer_trace_recording(&self.terminal_tasks, move || {
+        let terminal_recording = Arc::clone(&state.terminal_recording);
+        defer_trace_recording(&state.terminal_tasks, move || {
             // Elect inside the owned write. A competing terminal writer waits
             // here for the accepted write to finish before cleanup can return.
             terminal_recording.call_once(|| {

@@ -120,7 +120,8 @@ enum Subcommand {
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
 
-    /// Run a code review non-interactively.
+    /// Unavailable: review is not supported by the exec app-server protocol.
+    #[command(hide = true)]
     Review(ReviewCommand),
 
     /// Manage login.
@@ -1756,7 +1757,7 @@ async fn run_debug_prompt_input_command(
         .collect::<Vec<_>>();
     if let Some(prompt) = cmd.prompt.or(interactive.prompt) {
         input.push(UserInput::Text {
-            text: prompt.replace("\r\n", "\n").replace('\r', "\n"),
+            text: codex_utils_string::normalize_newlines(prompt).into_owned(),
             text_elements: Vec::new(),
         });
     }
@@ -2044,7 +2045,7 @@ async fn run_interactive_tui(
 ) -> std::io::Result<AppExitInfo> {
     if let Some(prompt) = interactive.prompt.take() {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
-        interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
+        interactive.prompt = Some(codex_utils_string::normalize_newlines(prompt).into_owned());
     }
 
     let terminal_info = codex_terminal_detection::terminal_info();
@@ -2285,7 +2286,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     if let Some(prompt) = prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
-        interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
+        interactive.prompt = Some(codex_utils_string::normalize_newlines(prompt).into_owned());
     }
 
     interactive
@@ -2753,6 +2754,26 @@ mod tests {
             command
                 .get_subcommands()
                 .all(|subcommand| subcommand.get_name() != "responses")
+        );
+    }
+
+    #[test]
+    fn review_is_hidden_and_explains_protocol_limit() {
+        let help = help_from_args(&["codex", "--help"]);
+        assert!(
+            !help.contains("Run a code review non-interactively"),
+            "{help}"
+        );
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("review ")),
+            "{help}"
+        );
+        let review_help = help_from_args(&["codex", "review", "--help"]);
+        assert!(
+            review_help.contains("review is not supported by the exec app-server protocol"),
+            "{review_help}"
         );
     }
 

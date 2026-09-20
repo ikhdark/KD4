@@ -482,8 +482,9 @@ impl ToolEmitter {
                 ..
             } => {
                 let command_text = model_command_text
-                    .clone()
-                    .unwrap_or_else(|| command.join(" "));
+                    .as_deref()
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(command.join(" ")));
                 let projected = super::project_exec_output_for_model_with_budget(
                     output,
                     truncation_policy,
@@ -493,7 +494,9 @@ impl ToolEmitter {
                 projected.text
             }
             Self::ApplyPatch { .. } => {
-                super::format_exec_output_for_model(output, truncation_policy)
+                // Preserve the producer's complete edit summary. The registry
+                // retains the canonical patch result before projecting it.
+                super::build_content_with_timeout(output).into_owned()
             }
         }
     }
@@ -550,8 +553,7 @@ impl ToolEmitter {
             }
             Err(ToolError::Codex(err)) => {
                 let message = format!("execution error: {err}");
-                let message =
-                    truncate_middle_with_token_budget(&message, REJECTION_OUTPUT_MAX_TOKENS).0;
+                let message = self.bound_error_message(message);
                 let event = ToolEventStage::Failure(ToolEventFailure::Message(message.clone()));
                 let result = Err(FunctionCallError::RespondToModel(message));
                 (event, result)
@@ -564,8 +566,7 @@ impl ToolEmitter {
                 (ToolEventStage::Skipped(content.clone()), Ok(content))
             }
             Err(ToolError::Rejected(msg)) => {
-                let bounded =
-                    truncate_middle_with_token_budget(&msg, REJECTION_OUTPUT_MAX_TOKENS).0;
+                let bounded = self.bound_error_message(msg);
                 let event = ToolEventStage::Failure(ToolEventFailure::Message(bounded.clone()));
                 let result = Err(FunctionCallError::RespondToModel(bounded));
                 (event, result)
@@ -583,8 +584,7 @@ impl ToolEmitter {
                 } else {
                     msg
                 };
-                let bounded =
-                    truncate_middle_with_token_budget(&normalized, REJECTION_OUTPUT_MAX_TOKENS).0;
+                let bounded = self.bound_error_message(normalized);
                 let event = ToolEventStage::Failure(ToolEventFailure::Denied {
                     message: bounded.clone(),
                     applied_patch_delta,
@@ -597,6 +597,14 @@ impl ToolEmitter {
             .await
             .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
         result
+    }
+
+    fn bound_error_message(&self, message: String) -> String {
+        if matches!(self, Self::ApplyPatch { .. }) {
+            message
+        } else {
+            truncate_middle_with_token_budget(&message, REJECTION_OUTPUT_MAX_TOKENS).0
+        }
     }
 }
 
@@ -990,7 +998,6 @@ async fn emit_exec_end(
             persistence_result = ctx
                 .session
                 .invalidate_tool_history_source_dependencies(
-                    ctx.turn.config.codex_home.as_path(),
                     mutation_paths,
                     current_workspace_identity.as_ref(),
                 )
@@ -1027,11 +1034,7 @@ async fn emit_exec_end(
     if defer_workspace_identity && !mutation_deferred {
         persistence_result = ctx
             .session
-            .invalidate_tool_history_source_dependencies(
-                ctx.turn.config.codex_home.as_path(),
-                mutation_paths,
-                None,
-            )
+            .invalidate_tool_history_source_dependencies(mutation_paths, None)
             .await;
     }
     if !mutation_deferred && let Some(observed_mutation_revision) = observed_mutation_revision {
@@ -1191,7 +1194,6 @@ async fn emit_patch_end(
             persistence_result = ctx
                 .session
                 .invalidate_tool_history_source_dependencies(
-                    ctx.turn.config.codex_home.as_path(),
                     affected_paths.as_ref(),
                     current_workspace_identity.as_ref(),
                 )
@@ -1734,7 +1736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_execution_error_is_readable_and_bounded_for_model_and_event() {
+    async fn apply_patch_execution_error_preserves_full_diagnostics_for_model_and_event() {
         let (session, turn, rx_event) =
             make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
         let message = format!(
@@ -1758,7 +1760,7 @@ mod tests {
         };
         assert!(text.starts_with("execution error: failure-head\n"));
         assert!(text.ends_with("failure-tail"));
-        assert!(text.len() < message.len());
+        assert_eq!(text, format!("execution error: {message}"));
         assert!(!text.contains("InvalidRequest("));
         assert!(!text.contains("\\n"));
         let completed = rx_event.recv().await.expect("item completed event");
@@ -2424,9 +2426,7 @@ mod tests {
             BTreeSet::new(),
         )
         .expect("workspace observation");
-        session
-            .register_workspace_evidence(codex_home, observation, ())
-            .await;
+        session.register_workspace_evidence(observation, ()).await;
         session
             .flush_tool_history_persistence()
             .await

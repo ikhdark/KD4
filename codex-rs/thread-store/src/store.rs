@@ -150,7 +150,6 @@ pub trait ThreadStore: Any + Send + Sync {
         params: ReadThreadByRolloutPathParams,
     ) -> ThreadStoreFuture<'_, StoredThread>;
 
-    /// Lists stored threads matching the supplied filters.
     /// Whether this store supports durable host-owned projects.
     fn supports_projects(&self) -> bool {
         false
@@ -216,6 +215,7 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
+    /// Lists stored threads matching the supplied filters.
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>;
 
     /// Searches stored threads and returns search-only preview metadata.

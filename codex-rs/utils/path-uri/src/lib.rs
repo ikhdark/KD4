@@ -57,6 +57,11 @@ const BAD_PATH_URI_PREFIX: &str = "file:///%00/bad/path/";
 pub struct PathUri(Url);
 
 impl PathUri {
+    /// The serialized URI, without allocating a display string.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
     /// Parses and validates a `file:` URI.
     pub fn parse(uri: &str) -> Result<Self, PathUriParseError> {
         Url::parse(uri)?.try_into()
@@ -225,6 +230,7 @@ impl PathUri {
             .0
             .path_segments()?
             .filter(|segment| !segment.is_empty())
+            .take(anchor_depth + 1)
             .count();
         if depth <= anchor_depth {
             return None;
@@ -538,18 +544,21 @@ fn decode_bad_path_uri(url: &Url) -> Option<Vec<u8>> {
         return None;
     }
 
-    let path_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    // This engine rejects padding, non-alphabet bytes, and nonzero trailing bits,
+    // so a successful decode already proves the canonical unpadded spelling.
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded_path)
-        .ok()?;
-    (base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&path_bytes) == encoded_path)
-        .then_some(path_bytes)
+        .ok()
 }
 
 fn is_windows_drive_uri_segment(segment: &str) -> bool {
     matches!(segment.as_bytes(), [drive, b':'] if drive.is_ascii_alphabetic())
 }
 
-fn containment_path_segments(url: &Url, convention: PathConvention) -> Option<Vec<Vec<u8>>> {
+fn containment_path_segments(
+    url: &Url,
+    convention: PathConvention,
+) -> Option<Vec<std::borrow::Cow<'_, [u8]>>> {
     url.path_segments()?
         .filter(|segment| !segment.is_empty())
         .map(|segment| {
@@ -559,7 +568,7 @@ fn containment_path_segments(url: &Url, convention: PathConvention) -> Option<Ve
             }) {
                 None
             } else {
-                Some(decoded.into_owned())
+                Some(decoded)
             }
         })
         .collect()

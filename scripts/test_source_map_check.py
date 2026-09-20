@@ -398,6 +398,8 @@ class SourceMapCheckTest(unittest.TestCase):
             )
             (root / "AGENTS.md").write_text("# Policy\n", encoding="utf-8")
             (root / "local-untracked.txt").write_text("local\n", encoding="utf-8")
+            deleted = root / "deleted-tracked.txt"
+            deleted.write_text("removed from the working tree\n", encoding="utf-8")
             source_map = root / "SOURCEMAP.md"
             source_map.write_text(
                 "\n".join(
@@ -419,7 +421,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 encoding="utf-8",
             )
             subprocess.run(
-                ["git", "add", "AGENTS.md", "SOURCEMAP.md"],
+                ["git", "add", "AGENTS.md", "SOURCEMAP.md", deleted.name],
                 cwd=root,
                 capture_output=True,
                 text=True,
@@ -427,6 +429,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 timeout=30,
             )
 
+            deleted.unlink()
             original_run = source_map_check.subprocess.run
             with mock.patch.object(
                 source_map_check.subprocess,
@@ -438,19 +441,8 @@ class SourceMapCheckTest(unittest.TestCase):
                     0,
                 )
             git_run.assert_called_once()
-            self.assertEqual(
-                git_run.call_args.args[0],
-                [
-                    "git",
-                    "ls-files",
-                    "-t",
-                    "--stage",
-                    "--cached",
-                    "--deleted",
-                    "--exclude-standard",
-                    "-z",
-                ],
-            )
+            # Verify inventory behavior, allowing equivalent Git invocations.
+            # The tracked deletion and untracked file must both be excluded.
             synchronized = source_map.read_text(encoding="utf-8")
             self.assertIn(source_map_check.TRACKED_PATH_SNAPSHOT_BEGIN, synchronized)
             self.assertIn("count=2", synchronized)

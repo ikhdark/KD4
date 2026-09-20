@@ -115,7 +115,7 @@ fn validate_request_user_input_questions(
         if !question_ids.insert(question.id.as_str()) {
             return Err("question ids must be unique");
         }
-        if question.header.chars().count() > 12 {
+        if question.header.len() > 12 && question.header.chars().nth(12).is_some() {
             return Err("question header must be 12 characters or fewer");
         }
         if let Some(options) = &question.options

@@ -780,7 +780,6 @@ impl WorkspaceEvidenceGenerationBatch {
                 });
                 if let Err(error) = session
                     .invalidate_tool_history_source_dependencies_excluding_call_ids(
-                        turn.config.codex_home.as_path(),
                         affected_paths.as_ref(),
                         capture.identity.as_ref(),
                         &current_generation_response_call_ids,
@@ -1021,6 +1020,8 @@ fn workspace_call_may_share_resource(
             crate::tools::SHELL_COMMAND_TOOL_NAME
                 | crate::tools::EXEC_COMMAND_TOOL_NAME
                 | "unified_exec"
+                | "read_file"
+                | "list_files"
         )
 }
 
@@ -1531,11 +1532,7 @@ impl ToolCallRuntime {
             return;
         };
         session
-            .register_workspace_evidence(
-                turn.config.codex_home.as_path(),
-                observation,
-                workspace_gate_guard,
-            )
+            .register_workspace_evidence(observation, workspace_gate_guard)
             .await;
     }
 
@@ -1734,7 +1731,6 @@ impl ToolCallRuntime {
                     &call.payload,
                     self.step_context.turn.config.cwd.as_path(),
                 );
-            self.step_context.workspace_evidence_generation_batch.register_call(&call.call_id);
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_failure.as_ref()
             {
@@ -1979,7 +1975,6 @@ impl ToolCallRuntime {
                                 None => {
                                     self.session
                                         .register_non_workspace_code_mode_call(
-                                            self.step_context.turn.config.codex_home.as_path(),
                                             error_call.call_id.clone(),
                                         )
                                         .await;
@@ -2146,9 +2141,6 @@ impl ToolCallRuntime {
             );
             timing.mark_first_poll();
             let _tool_call_timing_guard = tool_call_timing_guard;
-            self.step_context
-                .workspace_evidence_generation_batch
-                .register_call(&call.call_id);
             let result = self
                 .handle_tool_call_with_source_and_timing(
                     call,
@@ -3488,6 +3480,119 @@ mod tests {
         writer.await.expect("writer task");
     }
 
+    #[tokio::test]
+    async fn registered_file_readers_share_the_repository_gate() {
+        use crate::session::turn_context::TurnEnvironment;
+        use crate::tools::handlers::ListFilesHandler;
+        use crate::tools::handlers::ReadFileHandler;
+        use codex_protocol::models::PermissionProfile;
+        use codex_utils_absolute_path::AbsolutePathBuf;
+        use codex_utils_path_uri::PathUri;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        std::fs::write(workspace.path().join("evidence.txt"), "reader evidence\n")
+            .expect("write fixture");
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        Arc::make_mut(&mut turn.config).cwd =
+            AbsolutePathBuf::from_absolute_path(workspace.path()).expect("workspace path");
+        turn.permission_profile = PermissionProfile::Disabled;
+        turn.environments.turn_environments = vec![TurnEnvironment::new(
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            PathUri::from_host_native_path(workspace.path()).expect("workspace URI"),
+            None,
+        )];
+        let timing = Arc::clone(&turn.turn_timing_state);
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([
+                Arc::new(ReadFileHandler) as Arc<dyn CoreToolRuntime>,
+                Arc::new(ListFilesHandler) as Arc<dyn CoreToolRuntime>,
+            ]),
+            Vec::new(),
+        ));
+        let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            Arc::new(session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let reader = acquire_workspace_gate(
+            Arc::clone(&runtime.parallel_execution),
+            Arc::clone(&runtime.workspace_execution),
+            Some(dunce::canonicalize(workspace.path()).expect("canonical workspace")),
+            true,
+            true,
+            true,
+            &timing,
+        )
+        .await;
+
+        for (name, path, expected) in [
+            ("read_file", "evidence.txt", "reader evidence"),
+            ("list_files", ".", "evidence.txt"),
+        ] {
+            for nested in [false, true] {
+                let call = ToolCall {
+                    tool_name: codex_tools::ToolName::plain(name),
+                    call_id: format!("{name}-{nested}"),
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::json!({"path": path}).to_string(),
+                    },
+                };
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    if nested {
+                        runtime
+                            .clone()
+                            .handle_tool_call_with_source(
+                                call,
+                                ToolCallSource::CodeMode {
+                                    cell_id: "reader-cell".into(),
+                                    parent_call_id: Some("outer-exec".into()),
+                                    runtime_tool_call_id: format!("nested-{name}"),
+                                    nested_deadline: None,
+                                    cancellation_cause: None,
+                                },
+                                CancellationToken::new(),
+                            )
+                            .await
+                            .map(|result| {
+                                result
+                                    .result
+                                    .to_response_item(&result.call_id, &result.payload)
+                            })
+                            .map_err(|error| error.to_string())
+                    } else {
+                        runtime
+                            .clone()
+                            .handle_tool_call(call, CancellationToken::new())
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .await
+                .expect("file reader must complete while another reader holds the gate")
+                .expect("file reader succeeds");
+                let ResponseInputItem::FunctionCallOutput { output, .. } = result else {
+                    panic!("expected function output");
+                };
+                assert_ne!(output.success, Some(false));
+                let FunctionCallOutputBody::Text(text) = output.body else {
+                    panic!("expected text output");
+                };
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        drop(reader);
+    }
+
     #[test]
     fn kd4_latency_exec_bypasses_outer_gate_while_nested_mutations_remain_exclusive() {
         let exec = codex_tools::ToolName::plain(crate::tools::code_mode::PUBLIC_TOOL_NAME);
@@ -4487,8 +4592,17 @@ mod tests {
                 panic!("projected read result");
             };
             if changed_file == "source.txt" {
-                let stale: serde_json::Value =
+                let mut stale: serde_json::Value =
                     serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+                let digest = stale
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("historical_digest")
+                    .expect("authenticated historical read");
+                assert_eq!(
+                    digest,
+                    "Exit code: 0\nWall time: 0 seconds\nOutput:\nbefore\n"
+                );
                 assert_eq!(
                     stale,
                     serde_json::json!({
@@ -4806,17 +4920,13 @@ mod tests {
             .expect("workspace evidence observation");
         let follower_gate = Arc::clone(&runtime.parallel_execution);
         let follower_session = Arc::clone(&session);
-        let follower_codex_home = turn_context.config.codex_home.clone();
+
         let (follower_admitted_tx, follower_admitted_rx) = oneshot::channel();
         let follower = tokio::spawn(async move {
             let read_guard = follower_gate.read_owned().await;
             let _ = follower_admitted_tx.send(());
             follower_session
-                .register_workspace_evidence(
-                    follower_codex_home.as_path(),
-                    follower_observation,
-                    read_guard,
-                )
+                .register_workspace_evidence(follower_observation, read_guard)
                 .await;
         });
         follower_admitted_rx
@@ -4843,7 +4953,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_workspace_result_relay_does_not_wait_for_durable_persistence() {
-        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
         let persistence_pause = crate::tool_history::pause_next_tool_history_persistence_for_test(
             &session.thread_id.to_string(),
@@ -4862,11 +4972,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            session.register_workspace_evidence(
-                turn_context.config.codex_home.as_path(),
-                observation,
-                (),
-            ),
+            session.register_workspace_evidence(observation, ()),
         )
         .await
         .expect("nested result relay must not wait for ledger durability");
@@ -5073,6 +5179,43 @@ mod tests {
         assert!(Arc::clone(&gate).try_write_owned().is_ok());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sleep_does_not_require_an_exclusive_workspace_gate() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let turn = Arc::new(turn);
+        let handler = Arc::new(crate::tools::handlers::SleepHandler) as Arc<dyn CoreToolRuntime>;
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step = StepContext::for_test(turn).with_tool_router_for_test(router);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let runtime = ToolCallRuntime::new(Arc::new(session), step, tracker);
+        // An independent read owns a shared gate for the entire sleep call.
+        let _read = Arc::clone(&runtime.parallel_execution).read_owned().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.handle_tool_call(
+                ToolCall {
+                    tool_name: codex_tools::ToolName::namespaced("clock", "sleep"),
+                    call_id: "parallel-sleep".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::json!({"duration_ms": 1}).to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("sleep must complete while an independent read holds the shared gate")
+        .expect("sleep succeeds");
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("Sleep completed.")
+        );
     }
 
     #[tokio::test]
@@ -7246,9 +7389,7 @@ mod tests {
             std::collections::BTreeSet::from([dependency]),
         )
         .expect("prior workspace observation");
-        session
-            .register_workspace_evidence(&turn.config.codex_home, observation, ())
-            .await;
+        session.register_workspace_evidence(observation, ()).await;
         session
             .flush_tool_history_persistence()
             .await
@@ -7636,9 +7777,7 @@ mod tests {
                     std::collections::BTreeSet::from([dependency]),
                 )
                 .expect("workspace observation");
-            session
-                .register_workspace_evidence(codex_home, observation, ())
-                .await;
+            session.register_workspace_evidence(observation, ()).await;
             let call_id = format!("mutation-{index}");
             assert!(batch.register_call(&call_id));
             tracker

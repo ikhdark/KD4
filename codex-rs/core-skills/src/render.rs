@@ -24,14 +24,28 @@ pub const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
     "Exceeded skills context budget. All skill descriptions were removed and";
 pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "Each entry gives a skill name, concise trigger or purpose, and an opaque locator for loading its full instructions after selection.";
 const SKILLS_INTRO_WITH_ALIASES: &str = "Catalog entries give a skill name, concise purpose, and deterministic `SKILL.md` locator. Expand `rN/...` locators through the roots below.";
-pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by the user or clearly matched by the task; announce it, state ordering when needed, and do not carry it to later turns.
+pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by the user or clearly matched by the task. Announce each skill on first use in the conversation, state ordering when needed, and reassess relevance on later turns without repeating the announcement.
 - Before task actions, the main agent must read each selected `SKILL.md` completely. Do not delegate that reading or interpretation.
 - Load `skill:` locators with `read_file`, and file, environment, orchestrator, or custom resources through their stated provider; resolve relative references from the skill source.
 - Read task-required linked instructions with the same mechanism, load only relevant variants, and reuse supplied scripts, templates, and assets.
 - If a named skill or required read is unavailable, state it and use the safest fallback; retry a rejected shell read through a dedicated read-only route."###;
 
 pub fn render_available_skills_body(skill_root_lines: &[String], skill_lines: &[String]) -> String {
-    let mut rendered = String::from("\n## Skills\n");
+    let intro_len = if skill_root_lines.is_empty() {
+        SKILLS_INTRO_WITH_ABSOLUTE_PATHS.len() + 1
+    } else {
+        SKILLS_INTRO_WITH_ALIASES.len() + "\n### Skill roots\n".len()
+    };
+    let capacity = "\n## Skills\n".len()
+        + intro_len
+        + "### Available skills\n".len()
+        + skill_root_lines
+            .iter()
+            .chain(skill_lines)
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+    let mut rendered = String::with_capacity(capacity);
+    rendered.push_str("\n## Skills\n");
     if skill_root_lines.is_empty() {
         rendered.push_str(SKILLS_INTRO_WITH_ABSOLUTE_PATHS);
         rendered.push('\n');
@@ -159,10 +173,7 @@ fn build_available_skills_from_lines(
         };
         Some(format!(
             "{} {} additional {} {} not included in the model-visible skills list.",
-            budget_warning_prefix(budget, SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX),
-            report.omitted_count,
-            skill_word,
-            verb
+            SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX, report.omitted_count, skill_word, verb
         ))
     } else if report.average_truncated_description_chars()
         > SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS
@@ -204,10 +215,6 @@ fn record_available_skills_side_effects(
             "truncated skill metadata to fit skills context budget"
         );
     }
-}
-
-fn budget_warning_prefix(_budget: SkillMetadataBudget, prefix: &str) -> String {
-    prefix.to_string()
 }
 
 fn record_skill_render_side_effects(

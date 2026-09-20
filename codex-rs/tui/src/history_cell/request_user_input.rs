@@ -179,7 +179,7 @@ fn wrap_with_prefix(
         .subsequent_indent(Line::from(vec![subsequent_prefix]));
     let wrapped = adaptive_wrap_line(&line, opts);
     let mut out = Vec::new();
-    push_owned_lines(&wrapped, &mut out);
+    push_owned_lines(wrapped, &mut out);
     out
 }
 

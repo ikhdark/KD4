@@ -110,7 +110,13 @@ fn apply_patch_code_mode_result_preserves_output() {
         output.code_mode_result(&ToolPayload::Function {
             arguments: "{}".to_string(),
         }),
-        json!(text)
+        json!({
+            "success": true,
+            "text": text,
+            "changes": [],
+            "changes_exact": true,
+            "environment_id": null,
+        })
     );
 }
 
@@ -1634,7 +1640,7 @@ async fn exec_code_mode_exposes_artifact_id_not_path() {
 }
 
 #[tokio::test]
-async fn exec_code_mode_makes_empty_completion_explicit() {
+async fn exec_code_mode_preserves_empty_output_and_explicit_lifecycle() {
     let (mut output, _, _, _retained_root) = artifact_backed_exec_output(b"", Some(1_000)).await;
     output.raw_output_artifact = None;
 
@@ -1642,10 +1648,19 @@ async fn exec_code_mode_makes_empty_completion_explicit() {
         arguments: "{}".to_string(),
     });
 
-    assert_eq!(
-        result["output"],
-        "Command completed with no output (exit code 0)."
-    );
+    assert_eq!(result["output"], "");
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["execution_state"], "exited");
+    assert_eq!(result["output_complete"], true);
+    output.exit_code = None;
+    output.process_exited = false;
+    output.process_id = Some(1);
+    let running = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".into(),
+    });
+    assert_eq!(running["output"], "");
+    assert_eq!(running["execution_state"], "running");
+    assert_eq!(running["output_complete"], false);
 }
 
 #[tokio::test]

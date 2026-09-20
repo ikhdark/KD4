@@ -6,6 +6,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::AssignmentId;
@@ -1268,13 +1269,14 @@ impl AgentTask {
             } else {
                 "[criterion ID omitted]"
             };
-            summary.push_str(&format!("{id}: {status}.\n"));
+            let _ = writeln!(summary, "{id}: {status}.");
         }
         if receipt.criterion_results.len() > 4 {
-            summary.push_str(&format!(
-                "{} more criterion results in the receipt.\n",
+            let _ = writeln!(
+                summary,
+                "{} more criterion results in the receipt.",
                 receipt.criterion_results.len() - 4
-            ));
+            );
         }
         if receipt.criterion_results.is_empty() {
             summary.push_str("No criterion evidence recorded; behavior unverified.\n");
@@ -1294,11 +1296,12 @@ impl AgentTask {
             }
             None => summary.push_str("Workspace: shared.\n"),
         }
-        summary.push_str(&format!(
+        let _ = write!(
+            summary,
             "Blockers: {}. Risks: {}. Running Desktop build: not established by this receipt.",
             receipt.blockers.len(),
             receipt.risks.len()
-        ));
+        );
         summary
     }
 }

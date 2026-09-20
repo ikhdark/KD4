@@ -40,8 +40,8 @@ impl ContextualUserFragment for TaskCapsuleFragment {
         Self::type_markers()
     }
 
-    fn body(&self) -> String {
-        self.canonical_payload.clone()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.canonical_payload)
     }
 
     fn type_markers() -> (&'static str, &'static str) {

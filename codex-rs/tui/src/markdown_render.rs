@@ -42,7 +42,7 @@
 use crate::markdown_text_merge::DecodedTextMerge;
 use crate::render::highlight::foreground_style_for_scopes;
 use crate::render::highlight::highlight_code_to_lines;
-use crate::render::line_utils::line_to_static;
+use crate::render::line_utils::line_into_static;
 use crate::style::table_separator_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::annotate_web_urls_in_line;
@@ -1628,7 +1628,7 @@ where
             let rendered =
                 word_wrap_line(&source_line.line, RtOptions::new(width.max(/*other*/ 1)))
                     .into_iter()
-                    .map(|line| line_to_static(&line))
+                    .map(line_into_static)
                     .collect::<Vec<_>>();
             if rendered.is_empty() {
                 wrapped.push(HyperlinkLine::new(Line::default()));
@@ -1868,7 +1868,7 @@ where
                     .subsequent_indent(self.current_subsequent_indent.clone().into());
                 let wrapped = adaptive_wrap_line(&line.line, opts)
                     .into_iter()
-                    .map(|wrapped| line_to_static(&wrapped))
+                    .map(line_into_static)
                     .collect();
                 for wrapped in remap_wrapped_line(&line, wrapped) {
                     self.push_output_line(wrapped.style(style));

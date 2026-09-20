@@ -167,7 +167,7 @@ impl McpServerContributor<Config> for SelectedExecutorPluginMcpContributor {
                 let Some(plugin) = self.metadata_for_root(&state, selected_root).await else {
                     continue;
                 };
-                let mut servers = plugin.servers.iter().cloned().collect::<HashMap<_, _>>();
+                let mut servers = plugin.servers.into_iter().collect::<HashMap<_, _>>();
                 context
                     .config()
                     .apply_plugin_mcp_server_requirements(&plugin.plugin_id, &mut servers);

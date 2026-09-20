@@ -39,6 +39,7 @@ use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_protocol::RemoteControlPairingStatusParams;
 use codex_app_server_protocol::RemoteControlPairingStatusResponse;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
+pub(super) use codex_core::X_CODEX_INSTALLATION_ID_HEADER as REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
@@ -66,8 +67,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
-
-pub(super) const REMOTE_CONTROL_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 
 fn remote_control_http_clients(factory: HttpClientFactory) -> RouteAwareClientPool {
     create_client_pool_without_request_logging(factory, ClientRouteClass::Api)

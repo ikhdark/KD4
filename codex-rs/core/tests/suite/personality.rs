@@ -19,12 +19,12 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
+use core_test_support::require_network;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -129,7 +129,7 @@ async fn base_instructions_override_disables_personality_template() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
@@ -167,7 +167,7 @@ async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
@@ -238,7 +238,7 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_personality_none_sends_no_personality() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
@@ -290,7 +290,7 @@ async fn config_personality_none_sends_no_personality() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
@@ -324,7 +324,7 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
         .iter()
         .find(|text| text.contains("<personality_spec>"))
         .expect("expected default personality message in developer input");
-    assert!(personality_text.contains(LOCAL_PRAGMATIC_TEMPLATE));
+    assert!(personality_text.contains("Be concise, direct, and engineering-focused."));
 
     assert!(personality_text.starts_with(
         "<personality_spec>Use the following communication style for future messages:\n"
@@ -337,7 +337,7 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
@@ -412,7 +412,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
@@ -510,7 +510,7 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_same_value_reinjects_update_message() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
@@ -599,7 +599,7 @@ async fn instructions_uses_base_if_feature_disabled() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
@@ -667,7 +667,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::builder()
         .body_print_limit(BodyPrintLimit::Limited(80_000))
@@ -790,7 +790,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_remote_model_template_includes_update_message() -> anyhow::Result<()>
 {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::builder()
         .body_print_limit(BodyPrintLimit::Limited(80_000))

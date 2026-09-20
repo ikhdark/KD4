@@ -17,6 +17,11 @@ pub(crate) mod telemetry;
 /// Beta feature value required by Responses WebSocket v2 handshakes.
 pub const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
+/// Authorization failure detail returned by the API identity layer.
+pub const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-error";
+/// Base64-encoded JSON error details returned by the API identity layer.
+pub const X_ERROR_JSON_HEADER: &str = "x-error-json";
+
 pub use crate::requests::headers::build_session_headers;
 pub use crate::responses_stream::X_CODEX_TURN_STATE_HEADER;
 pub use codex_client::RequestTelemetry;

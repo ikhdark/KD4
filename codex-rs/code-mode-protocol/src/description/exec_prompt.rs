@@ -32,30 +32,33 @@ pub fn build_exec_tool_description(
     has_deferred_tools: bool,
     direct_only_tool_names: &[String],
 ) -> String {
-    let mut sections = Vec::new();
-    sections.push(EXEC_DESCRIPTION_TEMPLATE.to_string());
+    let mut description = String::from(EXEC_DESCRIPTION_TEMPLATE);
     if !code_mode_only {
-        sections.push("For a single call, prefer its direct interface when advertised. Use `exec` for orchestration or result processing.".to_string());
+        description.push_str("\n\nFor a single call, prefer its direct interface when advertised. Use `exec` for orchestration or result processing.");
     }
     if !direct_only_tool_names.is_empty() {
-        let names = direct_only_tool_names
-            .iter()
-            .map(|name| format!("`{name}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sections.push(format!(
-            "Direct-only tools omitted from `ALL_TOOLS`: {names}. Call these through their direct model tool interface using the schema advertised there, not through `exec`."
-        ));
+        description.push_str("\n\nDirect-only tools omitted from `ALL_TOOLS`: ");
+        for (index, name) in direct_only_tool_names.iter().enumerate() {
+            if index > 0 {
+                description.push_str(", ");
+            }
+            description.push('`');
+            description.push_str(name);
+            description.push('`');
+        }
+        description.push_str(". Call these through their direct model tool interface using the schema advertised there, not through `exec`.");
     }
     if code_mode_only {
         // The grammar is stable; callers can append eager built-in contracts
         // to this description. External inventory changes stay lazy.
-        sections.push(LAZY_NESTED_TOOL_SCHEMA_GUIDANCE.to_string());
+        description.push_str("\n\n");
+        description.push_str(LAZY_NESTED_TOOL_SCHEMA_GUIDANCE);
     } else if has_deferred_tools {
-        sections.push(DEFERRED_NESTED_TOOLS_GUIDANCE.to_string());
+        description.push_str("\n\n");
+        description.push_str(DEFERRED_NESTED_TOOLS_GUIDANCE);
     }
 
-    sections.join("\n\n")
+    description
 }
 
 pub fn build_wait_tool_description() -> &'static str {

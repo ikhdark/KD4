@@ -15,9 +15,14 @@ pub const REQUEST_PLUGIN_INSTALL_PERSIST_ALWAYS_VALUE: &str = "always";
 #[derive(Debug, Deserialize)]
 pub struct RequestPluginInstallArgs {
     pub tool_type: DiscoverableToolType,
+    #[serde(default = "default_install_action")]
     pub action_type: DiscoverableToolAction,
     pub tool_id: String,
     pub suggest_reason: String,
+}
+
+fn default_install_action() -> DiscoverableToolAction {
+    DiscoverableToolAction::Install
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]

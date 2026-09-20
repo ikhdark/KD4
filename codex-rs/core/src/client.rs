@@ -585,7 +585,11 @@ impl ModelRequestMeasurements {
             logical_request_bytes,
             context,
             tool_schema_breakdown,
-            input_item_digests(&request.input),
+            encoded
+                .input
+                .iter()
+                .map(|item| Sha256::digest(item.get().as_bytes()).into())
+                .collect(),
         )
     }
 
@@ -2093,7 +2097,7 @@ fn websocket_setup_fingerprint(
     api_auth.add_auth_headers(&mut headers);
     let mut canonical_headers = headers
         .iter()
-        .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes()))
         .collect::<Vec<_>>();
     canonical_headers.sort_unstable();
 
@@ -2621,7 +2625,7 @@ impl ModelClient {
             tool_identity,
             &prompt.output_schema,
             prompt.output_schema_strict,
-            format!("{verbosity:?}"),
+            verbosity,
         ))?;
         let mut hasher = Sha256::new();
         hasher.update(b"codex.request-schema-cache.v1");

@@ -1,0 +1,9 @@
+*** Begin Patch
+*** Update File: a.txt
+@@
+-last
++LAST
+@@
+-first
++FIRST
+*** End Patch

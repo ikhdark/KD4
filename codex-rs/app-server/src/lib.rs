@@ -15,6 +15,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::path::Path;
@@ -386,8 +387,8 @@ fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> 
     .to_string();
     for (index, (folder, reason)) in disabled_folders.iter().enumerate() {
         let display_index = index + 1;
-        message.push_str(&format!("    {display_index}. {folder}\n"));
-        message.push_str(&format!("       {reason}\n"));
+        let _ = writeln!(message, "    {display_index}. {folder}");
+        let _ = writeln!(message, "       {reason}");
     }
 
     Some(ConfigWarningNotification {

@@ -164,7 +164,8 @@ enabled = true
         Some(Product::Codex),
         /*remote_global_catalog_active*/ false,
     )
-    .await;
+    .await
+    .expect("configured plugins resolve");
     let hooks_only = load_plugins_from_layer_stack_with_scope(
         &stack,
         HashMap::new(),
@@ -172,7 +173,8 @@ enabled = true
         /*remote_global_catalog_active*/ false,
         PluginLoadScope::HooksOnly,
     )
-    .await;
+    .await
+    .expect("configured plugins resolve");
 
     let validation_state = |plugins: &[LoadedPlugin<McpServerConfig>]| {
         plugins

@@ -16,8 +16,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_web_search_extension::install as install_web_search_extension;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -81,7 +81,7 @@ fn additional_tools(body: &Value) -> Result<&[Value]> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -137,7 +137,7 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_prepares_images() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -216,7 +216,7 @@ async fn responses_lite_prepares_images() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_uses_standalone_web_search_and_image_generation() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -262,7 +262,7 @@ async fn responses_lite_uses_standalone_web_search_and_image_generation() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_exposes_standalone_tools_for_actor_authorized_provider() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -307,7 +307,7 @@ async fn responses_lite_exposes_standalone_tools_for_actor_authorized_provider()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_omits_hosted_tools_without_standalone_extensions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -341,7 +341,7 @@ async fn responses_lite_omits_hosted_tools_without_standalone_extensions() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_lite_uses_standalone_image_generation_by_default() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(

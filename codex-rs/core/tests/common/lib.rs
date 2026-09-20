@@ -584,36 +584,15 @@ pub mod fs_wait {
     }
 }
 
-/// Legacy name retained for callers; a missing prerequisite fails instead of
-/// reporting a successful test that never exercised its behavioral path.
+/// Fail when `CODEX_SANDBOX_NETWORK_DISABLED` is present: the test requires
+/// network access and cannot verify its behavior in that sandbox.
+///
+/// This checks the sandbox marker, not connectivity to a remote endpoint.
 #[macro_export]
-macro_rules! skip_if_no_network {
+macro_rules! require_network {
     () => {{
         if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
             panic!("Behavior unverified: required network access is unavailable in this sandbox.");
-        }
-    }};
-    ($return_value:expr $(,)?) => {{
-        if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
-            panic!("Behavior unverified: required network access is unavailable in this sandbox.");
-        }
-    }};
-}
-
-// Exported so the public skip macros can expand in downstream test crates.
-#[macro_export]
-#[doc(hidden)]
-macro_rules! skip_if_test_condition {
-    ($condition:expr, $environment:expr, $reason:expr $(,)?) => {{
-        if $condition {
-            eprintln!("Skipping test in {}: {}", $environment, $reason);
-            return;
-        }
-    }};
-    ($return_value:expr, $condition:expr, $environment:expr, $reason:expr $(,)?) => {{
-        if $condition {
-            eprintln!("Skipping test in {}: {}", $environment, $reason);
-            return $return_value;
         }
     }};
 }
@@ -621,6 +600,42 @@ macro_rules! skip_if_test_condition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_prerequisite_fails_instead_of_skipping() {
+        const CHILD: &str = "CODEX_TEST_NETWORK_PREREQUISITE_CHILD";
+        const REACHED: &str = "network prerequisite passed";
+        if std::env::var_os(CHILD).is_some() {
+            require_network!();
+            println!("{REACHED}");
+            return;
+        }
+
+        for disabled in [false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tests::network_prerequisite_fails_instead_of_skipping",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove(sandbox_network_env_var());
+            if disabled {
+                child.env(sandbox_network_env_var(), "1");
+            }
+            let output = child
+                .output()
+                .expect("run prerequisite in isolated process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), !disabled, "{stdout}\n{stderr}");
+            assert_eq!(stdout.contains(REACHED), !disabled, "{stdout}\n{stderr}");
+            if disabled {
+                assert!(stderr.contains("Behavior unverified: required network access"));
+            }
+        }
+    }
 
     #[test]
     fn host_path_fixture_uses_host_convention() {

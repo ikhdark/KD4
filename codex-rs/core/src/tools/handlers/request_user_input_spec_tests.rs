@@ -243,18 +243,18 @@ fn request_user_input_unavailable_messages_respect_default_mode_feature_flag() {
             ModeKind::Default,
             &default_mode_disabled_available_modes()
         ),
-        Some("request_user_input is unavailable in Default mode".to_string())
+        Some("request_user_input is unavailable in Default mode. If the question is optional, state a reasonable assumption and continue. If explicit input or approval is required, ask the user in a message and wait; tool unavailability is not approval.".to_string())
     );
     assert_eq!(
         request_user_input_unavailable_message(ModeKind::Execute, &default_available_modes()),
-        Some("request_user_input is unavailable in Execute mode".to_string())
+        Some("request_user_input is unavailable in Execute mode. If the question is optional, state a reasonable assumption and continue. If explicit input or approval is required, ask the user in a message and wait; tool unavailability is not approval.".to_string())
     );
     assert_eq!(
         request_user_input_unavailable_message(
             ModeKind::PairProgramming,
             &default_available_modes()
         ),
-        Some("request_user_input is unavailable in Pair Programming mode".to_string())
+        Some("request_user_input is unavailable in Pair Programming mode. If the question is optional, state a reasonable assumption and continue. If explicit input or approval is required, ask the user in a message and wait; tool unavailability is not approval.".to_string())
     );
 }
 

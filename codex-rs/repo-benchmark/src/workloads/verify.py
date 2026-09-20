@@ -346,6 +346,83 @@ def workspace_hashes(root):
     return result
 
 
+def consumer_oracle(root):
+    sys.path.insert(0, str(root))
+    from types import SimpleNamespace
+    from inventory import records, totals, report, export, cli
+    record = records.parse_record(' Café , 003 ')
+    require(getattr(record, 'name', None) == 'Café' and getattr(record, 'quantity', None) == 3,
+            'parse_record must return named name and quantity attributes')
+    for invalid in ['', ',1', 'x,-1', 'x,+1', 'x,1.5', 'x,١', 'x,1,2']:
+        try:
+            records.parse_record(invalid)
+        except ValueError:
+            pass
+        else:
+            raise Incorrect(f'parse_record accepted invalid input: {invalid!r}')
+    require(totals.total_quantity(['a,2', 'b,3']) == 5, 'total quantity changed')
+    require(totals.total_quantity([]) == 0, 'empty total changed')
+    require(report.render_report(['a,2', 'Café,3']) == 'a: 2\nCafé: 3', 'report changed')
+    require(report.render_report([]) == '', 'empty report changed')
+    require(export.export_rows(['a,2']) == [{'name': 'a', 'quantity': 2}], 'export changed')
+    require(export.export_rows([]) == [], 'empty export changed')
+    require(cli.describe_record('a,2') == 'a (2)', 'command display changed')
+    # Exercise every entry point with an object that cannot be unpacked or indexed.
+    original = records.parse_record
+    def named_only(text):
+        value = original(text)
+        return SimpleNamespace(name=value.name, quantity=value.quantity)
+    for module in (records, totals, report, export, cli):
+        for name, value in list(vars(module).items()):
+            if value is original:
+                setattr(module, name, named_only)
+    require(totals.total_quantity(['a,2']) == 2, 'total consumer needs positional records')
+    require(report.render_report(['a,2']) == 'a: 2', 'report consumer needs positional records')
+    require(export.export_rows(['a,2']) == [{'name': 'a', 'quantity': 2}], 'export consumer needs positional records')
+    require(cli.describe_record('a,2') == 'a (2)', 'command consumer needs positional records')
+
+
+def consumer_tests(root, failing=False):
+    names = set()
+    for path in root.glob('test_*.py'):
+        names |= original_test_names('python_consumer_refactor', path.read_text(encoding='utf-8'))
+    return run([sys.executable, '-m', 'unittest', 'discover', '-v'], root,
+               expect_failure=failing, test_kind='python', expected_names=names)
+
+
+def consumer_verify(root, protected):
+    completion = uuid.uuid4().hex
+    run([sys.executable, str(Path(__file__).resolve()), '--consumer-oracle', str(root), completion],
+        protected, completion=completion)
+    baseline = protected / 'baseline_tests/test_inventory.py'
+    old_names = original_test_names('python_consumer_refactor', baseline.read_text(encoding='utf-8'))
+    submitted_names = original_test_names('python_consumer_refactor', (root / 'test_inventory.py').read_text(encoding='utf-8'))
+    require(old_names < submitted_names, 'preserve original tests and add regression tests')
+    consumer_tests(root)
+    with tempfile.TemporaryDirectory(prefix='consumer-original-', dir=protected) as directory:
+        scratch = Path(directory)
+        shutil.copytree(root / 'inventory', scratch / 'inventory', ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copy2(baseline, scratch / 'test_inventory.py')
+        consumer_tests(scratch)
+    mutations = [
+        ('records', "def parse_record(text):\n    name, quantity = text.split(',')\n    return name.strip(), int(quantity)\n"),
+        ('totals', "def total_quantity(lines):\n    return -1\n"),
+        ('report', "def render_report(lines):\n    return 'incorrect'\n"),
+        ('export', "def export_rows(lines):\n    return []\n"),
+        ('cli', "def describe_record(text):\n    return 'incorrect'\n"),
+    ]
+    for module, mutation in mutations:
+        with tempfile.TemporaryDirectory(prefix='consumer-mutation-', dir=protected) as directory:
+            scratch = Path(directory)
+            shutil.copytree(root / 'inventory', scratch / 'inventory', ignore=shutil.ignore_patterns('__pycache__'))
+            for test in root.glob('test_*.py'):
+                shutil.copy2(test, scratch / test.name)
+            with (scratch / 'inventory' / (module + '.py')).open('a', encoding='utf-8') as stream:
+                stream.write('\n' + mutation)
+            print('Regression coverage: ' + module, flush=True)
+            consumer_tests(scratch, failing=True)
+
+
 def original_test_names(task, source):
     if task == 'rust_bugfix':
         return set(re.findall(r'\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', source))
@@ -393,6 +470,13 @@ def main():
     allowed = set(fixture['initial_source_hashes']) | set(fixture['initial_test_hashes'])
     initial_workspace = fixture['initial_workspace_hashes']
     current_workspace = workspace_hashes(root)
+    consumer_task = fixture['task'] == 'python_consumer_refactor'
+    if consumer_task:
+        # The model discovers the surface within a package, including helper modules.
+        # Do not penalize a correct refactor for choosing a different file split.
+        allowed |= {name for name in set(initial_workspace) | set(current_workspace)
+                    if (name.startswith('inventory/') and name.endswith('.py'))
+                    or ('/' not in name and name.startswith('test_') and name.endswith('.py'))}
     unexpected = sorted(name for name in set(initial_workspace) | set(current_workspace)
                         if name not in allowed and initial_workspace.get(name) != current_workspace.get(name))
     if unexpected:
@@ -403,12 +487,15 @@ def main():
         path = root / name
         require(path.is_file(), f'required source disappeared: {name}')
         source_changed.append(hashlib.sha256(path.read_bytes()).hexdigest() != initial)
-    require(all(source_changed), 'requested source change was not made in every required file')
+    require(any(source_changed) if consumer_task else all(source_changed),
+            'requested source change was not made in every required file')
     for name, initial in fixture['initial_test_hashes'].items():
         path = root / name
         require(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() != initial,
                 f'regression tests were not added: {name}')
-    if fixture['task'] == 'rust_bugfix':
+    if consumer_task:
+        consumer_verify(root, protected)
+    elif fixture['task'] == 'rust_bugfix':
         # MSVC cannot reliably link artifacts beneath deeply nested evidence
         # paths. Keep protected sources/logs, but build in a short owned directory.
         with tempfile.TemporaryDirectory(prefix='rb-') as directory:
@@ -429,6 +516,9 @@ if __name__ == '__main__':
     try:
         if len(sys.argv) > 1 and sys.argv[1] == '--python-oracle':
             python_oracle(Path(sys.argv[2]))
+            print(sys.argv[3], flush=True)
+        elif len(sys.argv) > 1 and sys.argv[1] == '--consumer-oracle':
+            consumer_oracle(Path(sys.argv[2]))
             print(sys.argv[3], flush=True)
         else:
             main()

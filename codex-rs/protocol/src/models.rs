@@ -1816,15 +1816,8 @@ fn render_local_path_context(
     retry_margin: usize,
 ) -> String {
     // Escape the attribute delimiter, not native path separators as Rust Debug does.
-    let path = path
-        .to_string_lossy()
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('\r', "&#13;")
-        .replace('\n', "&#10;")
-        .replace('\t', "&#9;");
+    let path = path.to_string_lossy();
+    let path = codex_utils_string::xml_attribute(&path);
     let prefix = format!("<local_path_context path=\"{path}\">\n");
     let suffix = "\n</local_path_context>";
     let envelope_tokens = approx_token_count(&prefix) + approx_token_count(suffix);

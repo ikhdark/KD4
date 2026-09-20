@@ -347,10 +347,22 @@ impl ListSelectionView {
     /// soon as the query is non-empty, which can look like dropped data unless
     /// callers intentionally populate that field.
     pub fn new(
-        params: SelectionViewParams,
+        mut params: SelectionViewParams,
         app_event_tx: AppEventSender,
         keymap: ListKeymap,
     ) -> Self {
+        // Search values are owned by the view and never rendered or returned to callers.
+        if params.is_searchable {
+            for item in params
+                .items
+                .iter_mut()
+                .chain(params.tabs.iter_mut().flat_map(|tab| &mut tab.items))
+            {
+                if let Some(value) = item.search_value.as_mut() {
+                    *value = value.to_lowercase();
+                }
+            }
+        }
         let mut header = params.header;
         if params.title.is_some() || params.subtitle.is_some() {
             let title = params.title.map(|title| Line::from(title.bold()));
@@ -504,7 +516,7 @@ impl ListSelectionView {
                 .positions(|item| {
                     item.search_value
                         .as_ref()
-                        .is_some_and(|v| v.to_lowercase().contains(&query_lower))
+                        .is_some_and(|v| v.contains(&query_lower))
                 })
                 .collect();
         } else {
@@ -1839,6 +1851,43 @@ mod tests {
         assert_eq!(view.search_query, "feature/paste-support");
         assert_eq!(view.filtered_indices, vec![1]);
         assert_eq!(view.selected_actual_idx(), Some(1));
+    }
+
+    #[test]
+    fn search_normalization_preserves_unicode_and_missing_values() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut view = new_view(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "İΣ Alpha".into(),
+                        search_value: Some("İΣ Alpha".into()),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "missing".into(),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "empty".into(),
+                        search_value: Some(String::new()),
+                        ..Default::default()
+                    },
+                ],
+                is_searchable: true,
+                ..Default::default()
+            },
+            AppEventSender::new(tx),
+        );
+        view.set_search_query("i\u{307}ς".into());
+        assert_eq!(view.filtered_indices, vec![0]);
+        assert_eq!(view.active_items()[0].name, "İΣ Alpha");
+        view.set_search_query("ALPHA".into());
+        assert_eq!(view.filtered_indices, vec![0]);
+        view.set_search_query("absent".into());
+        assert!(view.filtered_indices.is_empty());
+        view.set_search_query(String::new());
+        assert_eq!(view.filtered_indices, vec![0, 1, 2]);
     }
 
     #[test]

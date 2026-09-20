@@ -23,10 +23,10 @@ impl ContextualUserFragment for AppsInstructions {
         (APPS_INSTRUCTIONS_OPEN_TAG, APPS_INSTRUCTIONS_CLOSE_TAG)
     }
 
-    fn body(&self) -> String {
-        format!(
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!(
             "\n## Apps (Connectors)\nUse a relevant installed app when named as `[$app-name](app://{{connector_id}})` or clearly matched by the task. Use the app's available `{CODEX_APPS_MCP_SERVER_NAME}` tools directly. Use `tool_search`, when available, only to discover missing tools needed for the task. If the required tools remain unavailable, explain the limitation. Do not discover apps through MCP resource-listing tools.\n"
-        )
+        ))
     }
 }
 
@@ -43,9 +43,10 @@ impl ContextualUserFragment for AppsInstructionsUnavailable {
         (APPS_INSTRUCTIONS_OPEN_TAG, APPS_INSTRUCTIONS_CLOSE_TAG)
     }
 
-    fn body(&self) -> String {
-        "\n## Apps (Connectors)\nApps are currently unavailable. Previously provided Apps guidance no longer applies.\n"
-            .to_string()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(
+            "\n## Apps (Connectors)\nApps are currently unavailable. Previously provided Apps guidance no longer applies.\n",
+        )
     }
 }
 

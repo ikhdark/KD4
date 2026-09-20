@@ -2218,6 +2218,7 @@ dependencies = [
  "codex-utils-cargo-bin",
  "codex-utils-cli",
  "codex-utils-oss",
+ "codex-utils-string",
  "codex-windows-sandbox",
  "crossterm",
  "http 1.5.0",
@@ -2670,6 +2671,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-output-truncation",
  "codex-utils-path-uri",
+ "codex-utils-string",
  "dirs",
  "dunce",
  "futures",
@@ -2856,6 +2858,7 @@ version = "0.0.0"
 dependencies = [
  "codex-file-system",
  "codex-hooks",
+ "codex-protocol",
  "noyalib",
  "pretty_assertions",
  "serde_json",
@@ -2890,6 +2893,7 @@ dependencies = [
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3519,6 +3523,7 @@ dependencies = [
  "codex-git-utils",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-string",
  "codex-utils-template",
  "pretty_assertions",
 ]
@@ -3755,6 +3760,7 @@ dependencies = [
  "codex-tools",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "codex-utils-string",
  "pretty_assertions",
  "schemars 0.8.22",
  "serde",
@@ -3865,6 +3871,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio-util",
+ "tracing",
  "urlencoding",
 ]
 

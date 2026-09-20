@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::ContextualUserFragment;
 use codex_protocol::ResponseItemId;
 
 fn text_message(role: &str, text: &str) -> ResponseItem {
@@ -77,7 +78,11 @@ fn visible_text(items: &[ResponseItem]) -> Vec<&str> {
 }
 
 fn repository(text: &str) -> String {
-    format!("# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>")
+    UserInstructions {
+        directory: Some("/repo".to_string()),
+        text: text.to_string(),
+    }
+    .render()
 }
 
 fn collaboration(mode: &str) -> String {
@@ -419,8 +424,15 @@ fn multi_agent_usage_hint_defers_to_the_active_mode() {
 
 #[test]
 fn repository_removal_removes_the_notice_and_obsolete_instructions() {
+    use crate::context::world_state::WorldState;
+
     let old = repository("old");
-    let removal = repository(REPOSITORY_REMOVAL_NOTICE);
+    let loaded = crate::agents_md::LoadedAgentsMd::from_text_for_testing("old");
+    let mut previous = WorldState::default();
+    previous.add_section(AgentsMdState::new(Some(&loaded)));
+    let mut world_state = WorldState::default();
+    world_state.add_section(AgentsMdState::default());
+    let removal = world_state.render_diff(&previous.snapshot())[0].render();
     let projection = project_stable_context(
         vec![text_message("user", &old), text_message("user", &removal)].into(),
         StableContextTarget::Sampling,
@@ -926,7 +938,7 @@ fn base_and_compact_catalog_identities_are_deterministic_without_local_reuse() {
 #[test]
 fn collaboration_reset_removes_plan_and_the_reset_notice() {
     let plan = collaboration("Plan");
-    let reset = collaboration(COLLABORATION_RESET_NOTICE);
+    let reset = CollaborationModeInstructions::reset().render();
     let projection = project_stable_context(
         vec![
             text_message("developer", &plan),

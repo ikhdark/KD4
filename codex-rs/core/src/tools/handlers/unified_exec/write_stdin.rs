@@ -18,7 +18,7 @@ use codex_tools::ToolSpec;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::super::shell_spec::create_write_stdin_tool;
+use super::super::shell_spec::create_write_stdin_tool_with_max_timeout;
 use super::post_unified_exec_tool_use_payload;
 
 #[derive(Debug, Deserialize)]
@@ -33,7 +33,21 @@ struct WriteStdinArgs {
     max_output_tokens: Option<usize>,
 }
 
-pub struct WriteStdinHandler;
+pub struct WriteStdinHandler {
+    max_timeout_ms: u64,
+}
+
+impl WriteStdinHandler {
+    pub(crate) fn new(max_timeout_ms: u64) -> Self {
+        Self { max_timeout_ms }
+    }
+}
+
+impl Default for WriteStdinHandler {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
+    }
+}
 
 impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
     fn tool_name(&self) -> ToolName {
@@ -41,7 +55,7 @@ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_write_stdin_tool()
+        create_write_stdin_tool_with_max_timeout(self.max_timeout_ms)
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
@@ -224,7 +238,7 @@ mod tests {
 
     #[test]
     fn empty_poll_uses_one_owner_wait_deadline() {
-        assert_eq!(owner_wait_yield_time_ms("", None), 60_000);
+        assert_eq!(owner_wait_yield_time_ms("", None), 300_000);
         assert_eq!(owner_wait_yield_time_ms("", Some(5_000)), 5_000);
         assert_eq!(owner_wait_yield_time_ms("", Some(250)), 250);
         assert_eq!(owner_wait_yield_time_ms("", Some(120_000)), 120_000);

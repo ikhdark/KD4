@@ -40,8 +40,8 @@ impl super::ContextualUserFragment for LegacyApplyPatchExecCommandWarning {
             && trimmed.ends_with("Use the apply_patch tool instead of exec_command.")
     }
 
-    fn body(&self) -> String {
-        String::new()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("")
     }
 }
 
@@ -71,8 +71,8 @@ impl super::ContextualUserFragment for LegacyModelMismatchWarning {
         )
     }
 
-    fn body(&self) -> String {
-        String::new()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("")
     }
 }
 
@@ -114,8 +114,8 @@ impl super::ContextualUserFragment for LegacyUnifiedExecProcessLimitWarning {
         is_count(limit) && is_count(open)
     }
 
-    fn body(&self) -> String {
-        String::new()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("")
     }
 }
 

@@ -20,8 +20,8 @@ use codex_mcp::ToolPluginProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::require_network;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use rmcp::model::ElicitationCapability;
 use serde_json::Value;
@@ -46,7 +46,7 @@ impl ExternalAuth for StaticExternalAuth {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let apps_server = AppsTestServer::mount_hosted_plugin_runtime_searchable(&server).await?;

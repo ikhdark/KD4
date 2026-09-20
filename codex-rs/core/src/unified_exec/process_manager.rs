@@ -44,7 +44,6 @@ use crate::turn_timing::TurnLocalPhase;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
-use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
 use crate::unified_exec::PendingSpawnRegistration;
 use crate::unified_exec::ProcessEntry;
@@ -57,7 +56,6 @@ use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::lagged_output_marker;
-use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::record_known_delta_from_process_output;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
@@ -153,20 +151,30 @@ impl Drop for WriteStdinWait {
 
 /// Test-only override for deterministic unified exec process IDs.
 ///
-/// In production builds this value should remain at its default (`false`) and
-/// must not be toggled.
+/// Integration tests enable this through `core_test_support`; ordinary builds
+/// contain neither the override nor its setters.
+#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 static FORCE_DETERMINISTIC_PROCESS_IDS: AtomicBool = AtomicBool::new(false);
 
+#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 pub(super) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     FORCE_DETERMINISTIC_PROCESS_IDS.store(enabled, Ordering::Relaxed);
 }
 
+#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 fn deterministic_process_ids_forced_for_tests() -> bool {
     FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
 }
 
 fn should_use_deterministic_process_ids() -> bool {
-    cfg!(test) || deterministic_process_ids_forced_for_tests()
+    #[cfg(any(test, feature = "test-deterministic-process-ids"))]
+    {
+        cfg!(test) || deterministic_process_ids_forced_for_tests()
+    }
+    #[cfg(not(any(test, feature = "test-deterministic-process-ids")))]
+    {
+        false
+    }
 }
 
 fn apply_unified_exec_env(
@@ -1301,14 +1309,10 @@ impl UnifiedExecProcessManager {
             Some(bound) => (start + Duration::from_millis(yield_time_ms)).min(bound),
             None => start + Duration::from_millis(yield_time_ms),
         };
-        // Build/test progress is not a result. Keep noninteractive validation
-        // attached until it exits or the caller's requested wait expires, so a
-        // brief compilation pause does not cost another model round trip.
-        let quiet_period = if !request.tty && request.validation_launch.is_some() {
-            None
-        } else {
-            Some(INITIAL_OUTPUT_QUIET_PERIOD)
-        };
+        // A burst from a noninteractive command is progress, not completion.
+        // Keep its existing observation window attached across quiet periods;
+        // interactive terminals still yield promptly when a prompt is ready.
+        let quiet_period = request.tty.then_some(INITIAL_OUTPUT_QUIET_PERIOD);
         let collected = Self::collect_output_until_deadline_with_quiet_yield(
             &output_buffer,
             &output_notify,
@@ -1343,7 +1347,7 @@ impl UnifiedExecProcessManager {
         drop(tool_execution_timing_guard);
         let wall_time = Instant::now().saturating_duration_since(start);
 
-        let text = String::from_utf8_lossy(&collected).to_string();
+        let text = String::from_utf8_lossy(&collected).into_owned();
         let chunk_id = generate_chunk_id();
         if deferred_network_approval
             .as_ref()
@@ -1681,7 +1685,7 @@ impl UnifiedExecProcessManager {
             // writes keep a fixed max cap so interactive stdin remains responsive.
             let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
             if request.input.is_empty() {
-                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
+                time_ms.min(self.max_write_stdin_yield_time_ms)
             } else {
                 time_ms.min(MAX_YIELD_TIME_MS)
             }
@@ -1762,10 +1766,10 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             pause_state,
             deadline,
-            // A validation run is silent between bursts of build output. Ending
-            // its poll at the first gap is what bills the extra round trips, so
-            // it waits the full requested yield instead.
-            (request.input.is_empty() && !validation_launch).then_some(INITIAL_OUTPUT_QUIET_PERIOD),
+            // Polling a noninteractive command continues through progress
+            // bursts until exit, handoff, or the existing bounded deadline.
+            (request.input.is_empty() && tty && !validation_launch)
+                .then_some(INITIAL_OUTPUT_QUIET_PERIOD),
             &mut handoff,
         )
         .await;
@@ -1842,7 +1846,7 @@ impl UnifiedExecProcessManager {
                 }
             }
         };
-        let text = String::from_utf8_lossy(&collected).to_string();
+        let text = String::from_utf8_lossy(&collected).into_owned();
         let original_token_count = approx_token_count(&text);
 
         let response = ExecCommandToolOutput {
@@ -2827,11 +2831,12 @@ impl UnifiedExecProcessManager {
             }
         };
 
-        let mut output = collected
-            .to_bytes_with_omission_marker(&omitted_output_marker(collected.omitted_bytes()));
-        if collected.lagged_chunks() > 0 {
-            output.extend_from_slice(&lagged_output_marker(collected.lagged_chunks()));
-        }
+        let lag_marker = if collected.lagged_chunks() > 0 {
+            lagged_output_marker(collected.lagged_chunks())
+        } else {
+            Vec::new()
+        };
+        let output = collected.to_bytes_with_loss_notice(&lag_marker);
         CollectedOutput {
             bytes: output,
             wake_reason,

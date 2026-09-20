@@ -3,9 +3,9 @@
 use codex_features::Feature;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::PermissionProfile;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -23,7 +23,7 @@ fn find_web_search_tool(body: &Value) -> &Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_mode_cached_sets_external_web_access_false() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let sse = responses::sse(vec![
@@ -61,7 +61,7 @@ async fn web_search_mode_cached_sets_external_web_access_false() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_mode_takes_precedence_over_legacy_flags() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let sse = responses::sse(vec![
@@ -103,7 +103,7 @@ async fn web_search_mode_takes_precedence_over_legacy_flags() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_mode_defaults_to_cached_when_features_disabled() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let sse = responses::sse(vec![
@@ -149,7 +149,7 @@ async fn web_search_mode_defaults_to_cached_when_features_disabled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_mode_updates_between_turns_with_permission_profile() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = responses::mount_sse_sequence(
@@ -219,7 +219,7 @@ async fn web_search_mode_updates_between_turns_with_permission_profile() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_tool_config_from_config_toml_is_forwarded_to_request() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let sse = responses::sse(vec![
@@ -277,7 +277,7 @@ location = { country = "US", city = "New York", timezone = "America/New_York" }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexed_web_search_mode_sets_indexed_access() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let sse = responses::sse(vec![

@@ -34,7 +34,11 @@ impl Handler {
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
         let arguments = function_arguments(payload)?;
-        let args: ListAgentsArgs = parse_arguments(&arguments)?;
+        let mut args: ListAgentsArgs = parse_arguments(&arguments)?;
+        // Normalize once so live agents and durable tasks use the same filter.
+        args.path_prefix = args
+            .path_prefix
+            .map(|prefix| prefix.trim_end_matches('/').to_string());
         session
             .services
             .agent_control

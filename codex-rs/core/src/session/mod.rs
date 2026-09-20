@@ -365,6 +365,7 @@ fn digest_context_fragments(items: &[ResponseItem]) -> Vec<ContextFragmentDigest
 }
 
 struct InitialContextBuild {
+    full_context_required: bool,
     items: Vec<ResponseItem>,
     turn_context_items: Vec<ResponseItem>,
     world_state_snapshot: WorldStateSnapshot,
@@ -2856,7 +2857,31 @@ impl Session {
             self.agent_status.send_replace(status);
         }
         let published_msg = publication_receipt.as_ref().map(|_| event.msg.clone());
-        match self.tx_event.send(event).await {
+        if let Some(metrics) = codex_otel::global() {
+            let _ = metrics.histogram(
+                "codex.event_channel.occupancy",
+                self.tx_event.len() as i64,
+                &[],
+            );
+        }
+        // Keep the timer alive until after the publication receipt is stored:
+        // telemetry must not run between channel acceptance and receipt ownership.
+        let _send_wait_timer;
+        let result = match self.tx_event.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(async_channel::TrySendError::Closed(event)) => Err(async_channel::SendError(event)),
+            Err(async_channel::TrySendError::Full(event)) => {
+                if let Some(metrics) = codex_otel::global() {
+                    let _ = metrics.counter("codex.event_channel.backpressure", 1, &[]);
+                }
+                _send_wait_timer = codex_otel::start_global_timer(
+                    "codex.event_channel.send_wait.duration_ms",
+                    &[],
+                );
+                self.tx_event.send(event).await
+            }
+        };
+        match result {
             Ok(()) => {
                 // No await separates channel acceptance from recording the receipt in the
                 // existing finalizer owner. A later post-dispatch panic must not publish again.
@@ -2896,7 +2921,7 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
-        record_turn_ttfm_metric(turn_context, &item).await;
+        record_turn_ttfm_metric(turn_context, &item);
         self.send_event(
             turn_context,
             EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -4716,6 +4741,18 @@ impl Session {
         world_state: &WorldState,
         estimate: bool,
     ) -> InitialContextBuild {
+        self.build_context_candidate(turn_context, world_state, estimate, None, None)
+            .await
+    }
+
+    async fn build_context_candidate(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
+        estimate: bool,
+        represented_context: Option<&TurnContextItem>,
+        represented_digests: Option<&[ContextFragmentDigest]>,
+    ) -> InitialContextBuild {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
         let mut separate_developer_sections = Vec::<String>::new();
@@ -4741,32 +4778,7 @@ impl Session {
         {
             developer_sections.push(model_switch_message);
         }
-        if turn_context.config.include_permissions_instructions {
-            developer_sections.push(
-                PermissionsInstructions::from_permission_profile(
-                    &turn_context.permission_profile,
-                    turn_context.approval_policy.value(),
-                    ApprovalPromptContext::new(
-                        turn_context
-                            .model_info
-                            .model_messages
-                            .as_ref()
-                            .and_then(|messages| messages.approvals.as_ref()),
-                    ),
-                    self.services.exec_policy.current().as_ref(),
-                    turn_context.cwd(),
-                    turn_context
-                        .config
-                        .features
-                        .enabled(Feature::ExecPermissionApprovals),
-                    turn_context
-                        .config
-                        .features
-                        .enabled(Feature::RequestPermissionsTool),
-                )
-                .render(),
-            );
-        }
+        let permissions_index = developer_sections.len();
 
         let configured_developer_instructions =
             crate::stable_context::configured_developer_instructions_sections(
@@ -4882,16 +4894,6 @@ impl Session {
                 &mut separate_developer_sections,
             );
         }
-        let (world_state_fragments, delivered_world_state_snapshot) =
-            world_state.render_full_with_snapshot();
-        for fragment in world_state_fragments {
-            match fragment.role() {
-                "developer" => developer_sections.push(fragment.render()),
-                "user" => contextual_user_sections.push(fragment.render()),
-                _ => {}
-            }
-        }
-
         let multi_agent_v2_usage_hint_text =
             multi_agents::usage_hint_text(turn_context, &session_source);
         let multi_agent_v2_usage_hint_sections =
@@ -4901,43 +4903,6 @@ impl Session {
                 )
             });
 
-        let mut items = Vec::with_capacity(4);
-        if let Some(developer_message) =
-            crate::context_manager::updates::build_developer_update_item(developer_sections)
-        {
-            items.push(developer_message);
-        }
-        for section in separate_developer_sections {
-            if let Some(developer_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![section])
-            {
-                items.push(developer_message);
-            }
-        }
-        if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections.as_ref()
-            && let Some(usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(
-                    usage_hint_sections.clone(),
-                )
-        {
-            items.push(usage_hint_message);
-        }
-        if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context) {
-            items.push(ContextualUserFragment::into(
-                MultiAgentModeInstructions::new(multi_agent_mode),
-            ));
-        }
-        if let Some(contextual_user_message) =
-            crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
-        {
-            items.push(contextual_user_message);
-        }
-
-        // New context windows and compaction install these items directly into replacement history.
-        for item in &mut items {
-            crate::stable_context::mark_trusted_stable_context_item(item);
-            item.set_turn_id_if_missing(&turn_context.sub_id);
-        }
         let mut stable_items = Vec::new();
         if let Some(message) =
             crate::context_manager::updates::build_developer_update_item(stable_developer_sections)
@@ -4952,7 +4917,7 @@ impl Session {
                 }),
         );
 
-        if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections
+        if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections.clone()
             && let Some(usage_hint_message) =
                 crate::context_manager::updates::build_developer_update_item(usage_hint_sections)
         {
@@ -4978,7 +4943,103 @@ impl Session {
         let turn_context_items = Self::build_context_contribution_items_from_rendered_fragments(
             rendered_turn_context_fragments,
         );
+        let full_context_required = represented_context.is_none()
+            || represented_digests.is_some_and(|represented| {
+                !represented
+                    .iter()
+                    .filter(|digest| !digest.key.starts_with("turn-contributor:"))
+                    .eq(fragment_digests
+                        .iter()
+                        .filter(|digest| !digest.key.starts_with("turn-contributor:")))
+            });
+        if !full_context_required {
+            // Typed settings and world state have their own delta paths. Poll live
+            // contributors above, but avoid rendering a full candidate that those
+            // paths would immediately discard. The snapshot is only used for full
+            // candidates; the delta path derives its accepted snapshot from history.
+            return InitialContextBuild {
+                full_context_required,
+                items: Vec::new(),
+                turn_context_items,
+                world_state_snapshot: WorldStateSnapshot::default(),
+                fragment_digests,
+            };
+        }
+        if turn_context.config.include_permissions_instructions {
+            developer_sections.insert(
+                permissions_index,
+                PermissionsInstructions::from_permission_profile(
+                    &turn_context.permission_profile,
+                    turn_context.approval_policy.value(),
+                    ApprovalPromptContext::new(
+                        turn_context
+                            .model_info
+                            .model_messages
+                            .as_ref()
+                            .and_then(|messages| messages.approvals.as_ref()),
+                    ),
+                    self.services.exec_policy.current().as_ref(),
+                    turn_context.cwd(),
+                    turn_context
+                        .config
+                        .features
+                        .enabled(Feature::ExecPermissionApprovals),
+                    turn_context
+                        .config
+                        .features
+                        .enabled(Feature::RequestPermissionsTool),
+                )
+                .render(),
+            );
+        }
+
+        let (world_state_fragments, delivered_world_state_snapshot) =
+            world_state.render_full_with_snapshot();
+        for fragment in world_state_fragments {
+            match fragment.role() {
+                "developer" => developer_sections.push(fragment.render()),
+                "user" => contextual_user_sections.push(fragment.render()),
+                _ => {}
+            }
+        }
+
+        let mut items = Vec::with_capacity(4);
+        if let Some(developer_message) =
+            crate::context_manager::updates::build_developer_update_item(developer_sections)
+        {
+            items.push(developer_message);
+        }
+        for section in separate_developer_sections {
+            if let Some(developer_message) =
+                crate::context_manager::updates::build_developer_update_item(vec![section])
+            {
+                items.push(developer_message);
+            }
+        }
+        if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections
+            && let Some(usage_hint_message) =
+                crate::context_manager::updates::build_developer_update_item(usage_hint_sections)
+        {
+            items.push(usage_hint_message);
+        }
+        if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context) {
+            items.push(ContextualUserFragment::into(
+                MultiAgentModeInstructions::new(multi_agent_mode),
+            ));
+        }
+        if let Some(contextual_user_message) =
+            crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
+        {
+            items.push(contextual_user_message);
+        }
+
+        // New context windows and compaction install these items directly into replacement history.
+        for item in &mut items {
+            crate::stable_context::mark_trusted_stable_context_item(item);
+            item.set_turn_id_if_missing(&turn_context.sub_id);
+        }
         InitialContextBuild {
+            full_context_required,
             items,
             turn_context_items,
             world_state_snapshot: delivered_world_state_snapshot,
@@ -5234,7 +5295,6 @@ impl Session {
 
     pub(crate) async fn register_tool_history_candidate(
         &self,
-        _codex_home: &std::path::Path,
         candidate: crate::tool_history::ToolHistoryCandidate,
     ) {
         let Ok(_reconciliation_permit) = self.tool_history_reconciliation_gate.acquire().await
@@ -5256,7 +5316,6 @@ impl Session {
 
     pub(crate) async fn register_workspace_evidence<WorkspaceGateGuard: Send>(
         &self,
-        _codex_home: &std::path::Path,
         observation: crate::tool_history::WorkspaceEvidenceObservation,
         workspace_gate_guard: WorkspaceGateGuard,
     ) {
@@ -5308,11 +5367,7 @@ impl Session {
         }
     }
 
-    pub(crate) async fn register_non_workspace_code_mode_call(
-        &self,
-        _codex_home: &std::path::Path,
-        call_id: String,
-    ) {
+    pub(crate) async fn register_non_workspace_code_mode_call(&self, call_id: String) {
         let Ok(_reconciliation_permit) = self.tool_history_reconciliation_gate.acquire().await
         else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
@@ -5342,12 +5397,10 @@ impl Session {
 
     pub(crate) async fn invalidate_tool_history_source_dependencies(
         &self,
-        codex_home: &std::path::Path,
         affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
         current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) -> CodexResult<()> {
         self.invalidate_tool_history_source_dependencies_excluding_call_ids(
-            codex_home,
             affected_paths,
             current_workspace_identity,
             &std::collections::BTreeSet::new(),
@@ -5357,7 +5410,6 @@ impl Session {
 
     pub(crate) async fn invalidate_tool_history_source_dependencies_excluding_call_ids(
         &self,
-        _codex_home: &std::path::Path,
         affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
         current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
         excluded_call_ids: &std::collections::BTreeSet<String>,
@@ -5483,19 +5535,6 @@ impl Session {
         } else {
             self.build_world_state_for_step(step_context).await
         });
-        let complete_context = self
-            .build_initial_context_with_world_state_and_mcp(
-                turn_context.as_ref(),
-                world_state.as_ref(),
-                estimate,
-            )
-            .await;
-        let InitialContextBuild {
-            items: complete_items,
-            turn_context_items,
-            world_state_snapshot: complete_world_state_snapshot,
-            fragment_digests,
-        } = complete_context;
         let represented_fragment_digests = pending_context_baseline
             .as_ref()
             .map(|candidate| candidate.fragment_digests.as_slice())
@@ -5506,15 +5545,23 @@ impl Session {
                     .map(|provenance| provenance.fragment_digests.as_slice())
             });
 
-        let should_inject_full_context = represented_context_item.is_none()
-            || represented_fragment_digests.is_some_and(|represented| {
-                !represented
-                    .iter()
-                    .filter(|digest| !digest.key.starts_with("turn-contributor:"))
-                    .eq(fragment_digests
-                        .iter()
-                        .filter(|digest| !digest.key.starts_with("turn-contributor:")))
-            });
+        let complete_context = self
+            .build_context_candidate(
+                turn_context.as_ref(),
+                world_state.as_ref(),
+                estimate,
+                represented_context_item,
+                represented_fragment_digests,
+            )
+            .await;
+        let InitialContextBuild {
+            full_context_required: should_inject_full_context,
+            items: complete_items,
+            turn_context_items,
+            world_state_snapshot: complete_world_state_snapshot,
+            fragment_digests,
+        } = complete_context;
+
         let turn_contributions_changed = represented_fragment_digests.is_some_and(|represented| {
             !represented
                 .iter()
@@ -5586,6 +5633,30 @@ impl Session {
                 .collect(),
         ) {
             context_items.push(removals);
+        }
+        if !estimate {
+            self.services.session_telemetry.counter(
+                "codex.context_update",
+                1,
+                &[
+                    (
+                        "result",
+                        if context_items.is_empty() {
+                            "empty"
+                        } else {
+                            "emitted"
+                        },
+                    ),
+                    (
+                        "projection",
+                        if should_inject_full_context {
+                            "full"
+                        } else {
+                            "delta"
+                        },
+                    ),
+                ],
+            );
         }
         PreparedContextUpdate {
             turn_context,

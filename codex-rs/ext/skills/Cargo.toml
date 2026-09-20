@@ -13,6 +13,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-utils-string = { workspace = true }
 codex-core-skills = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-extension-api = { workspace = true }

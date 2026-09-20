@@ -1,4 +1,5 @@
 use codex_config::schema::canonicalize as canonicalize_json;
+use codex_protocol::protocol::HookEventName;
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use schemars::r#gen::SchemaSettings;
@@ -130,6 +131,24 @@ pub(crate) enum HookEventNameWire {
     Stop,
     #[serde(rename = "Interrupt")]
     Interrupt,
+}
+
+impl From<HookEventName> for HookEventNameWire {
+    fn from(event: HookEventName) -> Self {
+        match event {
+            HookEventName::PreToolUse => Self::PreToolUse,
+            HookEventName::PermissionRequest => Self::PermissionRequest,
+            HookEventName::PostToolUse => Self::PostToolUse,
+            HookEventName::PreCompact => Self::PreCompact,
+            HookEventName::PostCompact => Self::PostCompact,
+            HookEventName::SessionStart => Self::SessionStart,
+            HookEventName::UserPromptSubmit => Self::UserPromptSubmit,
+            HookEventName::SubagentStart => Self::SubagentStart,
+            HookEventName::SubagentStop => Self::SubagentStop,
+            HookEventName::Stop => Self::Stop,
+            HookEventName::Interrupt => Self::Interrupt,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -866,6 +885,20 @@ fn default_continue() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hook_event_wire_names_match_protocol_labels() {
+        for event in codex_protocol::protocol::HookEventName::all() {
+            let wire = super::HookEventNameWire::from(event);
+            let value = serde_json::to_value(&wire).expect("serialize hook event");
+            assert_eq!(value, serde_json::json!(event.as_pascal_case_label()));
+            assert_eq!(
+                serde_json::from_value::<super::HookEventNameWire>(value)
+                    .expect("deserialize hook event"),
+                wire,
+            );
+        }
+    }
+
     use super::INTERRUPT_INPUT_FIXTURE;
     use super::INTERRUPT_OUTPUT_FIXTURE;
     use super::InterruptCommandInput;

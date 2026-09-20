@@ -1,7 +1,7 @@
 //! Migration helpers for importing external-agent configuration into Codex.
 
-use codex_hooks::HOOK_EVENT_NAMES;
-use codex_hooks::HOOK_EVENT_NAMES_WITH_MATCHERS;
+use codex_hooks::HookEventName;
+use codex_hooks::hook_event_supports_matcher;
 use noyalib::compat::serde_yaml;
 use noyalib::compat::serde_yaml::Value as YamlValue;
 use serde_json::Value as JsonValue;
@@ -558,7 +558,8 @@ fn append_convertible_hook_groups(
         return;
     };
 
-    for event_name in HOOK_EVENT_NAMES {
+    for event in HookEventName::all() {
+        let event_name = event.as_pascal_case_label();
         let Some(groups) = hooks_config.get(event_name).and_then(JsonValue::as_array) else {
             continue;
         };
@@ -656,7 +657,7 @@ fn append_convertible_hook_groups(
             }
 
             let mut group_payload = serde_json::Map::new();
-            if HOOK_EVENT_NAMES_WITH_MATCHERS.contains(&event_name)
+            if hook_event_supports_matcher(event)
                 && let Some(matcher) = group_object.get("matcher").and_then(JsonValue::as_str)
             {
                 group_payload.insert(
@@ -1114,7 +1115,7 @@ fn command_skill_name_if_supported(
     let source_name = command_source_name(source_commands, source_file);
     command_skill_description(document, &source_name)?;
     let name = command_skill_name(source_commands, source_file);
-    if name.chars().count() > MAX_SKILL_NAME_LEN {
+    if name.len() > MAX_SKILL_NAME_LEN && name.chars().nth(MAX_SKILL_NAME_LEN).is_some() {
         return None;
     }
     if has_unsupported_command_template_features(&document.body) {

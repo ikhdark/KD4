@@ -697,6 +697,39 @@ fn powershell_script_rejects_non_powershell_remote_environment() {
 }
 
 #[tokio::test]
+async fn shell_command_validation_deadline_defaults_preserve_explicit_overrides() {
+    let (session, turn) = make_session_and_context().await;
+    let environment = turn.environments.primary().unwrap();
+    for (command, timeout, expected) in [
+        ("cargo test -p example", None, 300_000),
+        ("pnpm build", None, 300_000),
+        ("echo cargo test", None, 10_000),
+        ("cargo test", Some(1_234), 1_234),
+        ("cargo test", Some(0), 0),
+    ] {
+        let params: ShellCommandToolCallParams = serde_json::from_value(serde_json::json!({
+            "command": command, "timeout_ms": timeout
+        }))
+        .unwrap();
+        let exec = ShellCommandHandler::to_exec_params(
+            &params,
+            &CommandInvocation::Script(command.to_string()),
+            &session,
+            &turn,
+            environment,
+            turn.config.cwd.clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(exec.expiration.timeout_ms(), Some(expected), "{command}");
+        assert_eq!(
+            effective_stall_timeout_ms(exec.expiration.timeout_ms(), Some(20_000)),
+            (expected > 20_000).then_some(20_000)
+        );
+    }
+}
+
+#[tokio::test]
 async fn shell_command_handler_to_exec_params_uses_selected_environment() {
     let (session, mut turn_context) = make_session_and_context().await;
     let permission_profile = turn_context.config.permissions.permission_profile().clone();
@@ -1382,7 +1415,7 @@ async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
     let rendered = output.code_mode_result(&payload).to_string();
     assert!(
         rendered.contains(
-            "command output reduced; recover the full retained output with read_tool_output"
+            "command output reduced; read a bounded selection from the retained output with read_tool_output"
         ),
         "{rendered}"
     );
@@ -1450,7 +1483,7 @@ async fn shell_attempt_fingerprint_distinguishes_non_unicode_workdirs() {
     let shell = base_turn.environments.primary().unwrap().shell.clone();
     let patch = "*** Begin Patch\n*** Environment ID: deliberately-other-environment\n*** Add File: forbidden.txt\n+must not be written\n*** End Patch";
     let expected_verification_error = format!(
-        "apply_patch verification failed: patch environment id `deliberately-other-environment` does not match selected shell environment `{selected_id}`"
+        "apply_patch verification failed: patch environment id `deliberately-other-environment` does not match selected shell environment `{selected_id}`; use the intended environment id from <environment_context> for both"
     );
     let mut turn = Arc::new(base_turn);
     // Only the cwd changes. The shared session ledger, environment identity, argv and policies stay equal.

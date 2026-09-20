@@ -21,7 +21,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "close_agent close shutdown stop agent subagent thread status target",
-            registered_spec.clone(),
+            registered_spec,
         )
     }
 

@@ -33,6 +33,7 @@ struct ParsedEnvironmentSkill {
     short_description: Option<String>,
     dependencies: Option<SkillDependencies>,
     policy: Option<SkillPolicy>,
+    warnings: Vec<String>,
 }
 
 /// URI-native metadata for one skill owned by an execution environment.
@@ -75,7 +76,7 @@ impl ParsedEnvironmentSkill {
             }
             SkillMetadataDiscovery::Absent | SkillMetadataDiscovery::Probe(_) => (
                 read_skill_contents(file_system, &skill.path).await?,
-                (None, None),
+                (None, None, Vec::new()),
             ),
         };
         let ParsedSkillFrontmatter {
@@ -84,7 +85,7 @@ impl ParsedEnvironmentSkill {
             short_description,
         } = parse_skill_frontmatter_metadata_inner(&contents, || default_skill_name(&skill.path))
             .map_err(|err| err.to_string())?;
-        let (dependencies, policy) = match &skill.metadata {
+        let (dependencies, policy, warnings) = match &skill.metadata {
             SkillMetadataDiscovery::Present(_) | SkillMetadataDiscovery::Absent => {
                 discovered_metadata
             }
@@ -100,6 +101,7 @@ impl ParsedEnvironmentSkill {
             short_description,
             dependencies,
             policy,
+            warnings,
         })
     }
 }
@@ -171,6 +173,7 @@ pub async fn load_environment_skills_from_root(
 
     for (path, result) in skill_results {
         let result = result.and_then(|skill| {
+            outcome.warnings.extend(skill.warnings);
             let name = namespace_resolver
                 .for_skill(root, &skill.path_to_skills_md)
                 .qualify(&skill.base_name);
@@ -219,17 +222,22 @@ async fn read_skill_contents(
 async fn probe_skill_metadata(
     file_system: &dyn ExecutorFileSystem,
     metadata_path: &PathUri,
-) -> (Option<SkillDependencies>, Option<SkillPolicy>) {
+) -> (Option<SkillDependencies>, Option<SkillPolicy>, Vec<String>) {
     match file_system
         .get_metadata(metadata_path, /*sandbox*/ None)
         .await
     {
         Ok(metadata) if metadata.is_file => {}
-        Ok(_) => return (None, None),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (None, None),
+        Ok(_) => return (None, None, Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (None, None, Vec::new()),
         Err(error) => {
-            tracing::warn!("ignoring {metadata_path}: failed to stat metadata: {error}");
-            return (None, None);
+            return (
+                None,
+                None,
+                vec![format!(
+                    "ignoring {metadata_path}: failed to stat metadata: {error}"
+                )],
+            );
         }
     }
     read_skill_metadata(file_system, metadata_path).await
@@ -238,28 +246,44 @@ async fn probe_skill_metadata(
 async fn read_skill_metadata(
     file_system: &dyn ExecutorFileSystem,
     metadata_path: &PathUri,
-) -> (Option<SkillDependencies>, Option<SkillPolicy>) {
+) -> (Option<SkillDependencies>, Option<SkillPolicy>, Vec<String>) {
     let contents = match file_system
         .read_file_text(metadata_path, /*sandbox*/ None)
         .await
     {
         Ok(contents) => contents,
         Err(error) => {
-            tracing::warn!("ignoring {metadata_path}: failed to read metadata: {error}");
-            return (None, None);
+            return (
+                None,
+                None,
+                vec![format!(
+                    "ignoring {metadata_path}: failed to read metadata: {error}"
+                )],
+            );
         }
     };
     let parsed: SkillMetadataFile = match serde_yaml::from_str(&contents) {
         Ok(parsed) => parsed,
         Err(error) => {
-            tracing::warn!("ignoring {metadata_path}: invalid metadata: {error}");
-            return (None, None);
+            return (
+                None,
+                None,
+                vec![format!(
+                    "ignoring {metadata_path}: invalid metadata: {error}"
+                )],
+            );
         }
     };
 
+    let mut diagnostics = Vec::new();
+    let dependencies = resolve_dependencies(&mut diagnostics, parsed.dependencies);
     (
-        resolve_dependencies(parsed.dependencies),
+        dependencies,
         resolve_policy(parsed.policy),
+        diagnostics
+            .into_iter()
+            .map(|message| format!("{metadata_path}: {message}"))
+            .collect(),
     )
 }
 

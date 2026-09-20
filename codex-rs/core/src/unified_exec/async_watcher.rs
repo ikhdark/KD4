@@ -1057,18 +1057,14 @@ pub(super) async fn resolve_aggregated_output(
 ) -> String {
     let guard = transcript.lock().await;
     let omitted_bytes = guard.omitted_bytes();
-    let retained = if omitted_bytes == 0 {
-        guard.to_bytes()
-    } else {
-        guard.to_bytes_with_omission_marker(&omitted_output_marker(omitted_bytes))
-    };
+    let retained = guard.to_bytes_with_loss_notice(&[]);
     let lagged_chunks = guard.lagged_chunks();
     drop(guard);
 
     let aggregated_output = if retained.is_empty() {
         fallback
     } else {
-        String::from_utf8_lossy(&retained).to_string()
+        String::from_utf8_lossy(&retained).into_owned()
     };
     append_output_loss_markers(aggregated_output, omitted_bytes, lagged_chunks)
 }

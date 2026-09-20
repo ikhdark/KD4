@@ -17,6 +17,22 @@ export type CommandExecutionItem = {
   exit_code: number | null;
   /** Current status of the command execution. */
   status: CommandExecutionStatus;
+  /** Core tool call and code-mode correlation identifiers, when available. */
+  call_id?: string;
+  parent_call_id?: string;
+  parent_cell_id?: string;
+  runtime_tool_call_id?: string;
+  execution_id?: string;
+};
+
+/** A terminally failed code-mode JavaScript cell. */
+export type CodeModeCellItem = {
+  id: string;
+  type: "code_mode_cell";
+  call_id: string;
+  cell_id: string;
+  status: "failed";
+  error: string;
 };
 
 /** Indicates the type of the file change. */
@@ -114,6 +130,12 @@ export type ReasoningItem = {
   text: string;
 };
 
+/** Context compaction. The enclosing event distinguishes start from completion. */
+export type ContextCompactionItem = {
+  id: string;
+  type: "context_compaction";
+};
+
 /** Action performed by a web search item. */
 export type WebSearchAction =
   | { type: "search"; query?: string; queries?: string[] }
@@ -156,7 +178,9 @@ export type TodoListItem = {
 export type ThreadItem =
   | AgentMessageItem
   | ReasoningItem
+  | ContextCompactionItem
   | CommandExecutionItem
+  | CodeModeCellItem
   | FileChangeItem
   | McpToolCallItem
   | CollabToolCallItem

@@ -60,8 +60,8 @@ impl ContextualUserFragment for SkillsUsageInstructions {
         )
     }
 
-    fn body(&self) -> String {
-        format!("\n## How to use skills\n{SKILLS_HOW_TO_USE}\n")
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!("\n## How to use skills\n{SKILLS_HOW_TO_USE}\n"))
     }
 }
 
@@ -78,8 +78,11 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
         (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG)
     }
 
-    fn body(&self) -> String {
-        render_available_skills_body(&self.skill_root_lines, &self.skill_lines)
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(render_available_skills_body(
+            &self.skill_root_lines,
+            &self.skill_lines,
+        ))
     }
 }
 

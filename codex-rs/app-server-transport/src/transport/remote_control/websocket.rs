@@ -48,6 +48,7 @@ use futures::stream::SplitSink;
 use futures::stream::SplitStream;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
@@ -2007,12 +2008,12 @@ fn format_remote_control_websocket_connect_error(
         return message;
     };
 
-    message.push_str(&format!(", {}", format_headers(response.headers())));
+    let _ = write!(message, ", {}", format_headers(response.headers()));
     if let Some(body) = response.body().as_ref()
         && !body.is_empty()
     {
         let body_preview = preview_remote_control_response_body(body);
-        message.push_str(&format!(", body: {body_preview}"));
+        let _ = write!(message, ", body: {body_preview}");
     }
 
     message

@@ -55,6 +55,7 @@ use core_test_support::PathBufExt;
 use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::load_default_config_for_test;
+use core_test_support::require_network;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -70,7 +71,6 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
 use core_test_support::responses::strip_metadata_from_json;
 use core_test_support::responses_metadata as test_responses_metadata;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -213,10 +213,15 @@ async fn unknown_tool_is_not_advertised_and_calls_are_rejected() -> anyhow::Resu
             "an unknown tool must not be advertised"
         );
     }
-    assert_eq!(
-        requests[1].function_call_output_text(call_id).as_deref(),
-        Some("unsupported call: unknown_tool")
+    let output = requests[1]
+        .function_call_output_text(call_id)
+        .expect("unknown tool response");
+    assert!(
+        output.starts_with("unsupported call: unknown_tool."),
+        "{output}"
     );
+    assert!(output.contains("No tool was run."), "{output}");
+    assert!(output.contains("if tool_search is available"), "{output}");
 
     Ok(())
 }
@@ -673,7 +678,7 @@ fn non_zero_u64(value: u64) -> NonZeroU64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_includes_initial_messages_and_sends_prior_items() {
-    skip_if_no_network!();
+    require_network!();
 
     // Create a fake rollout session file with prior user + system + assistant messages.
     let tmpdir = TempDir::new().unwrap();
@@ -883,7 +888,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
-    skip_if_no_network!();
+    require_network!();
 
     // Early js_repl builds persisted image tool results as two separate rollout items:
     // a string-valued custom_tool_call_output plus a standalone user input_image message.
@@ -1030,7 +1035,7 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_replays_image_tool_outputs_with_detail() {
-    skip_if_no_network!();
+    require_network!();
 
     let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let function_call_id = "view-image-call";
@@ -1163,7 +1168,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_session_id_thread_id_and_model_headers_in_request() {
-    skip_if_no_network!();
+    require_network!();
 
     // Mock server
     let server = MockServer::start().await;
@@ -1232,7 +1237,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_auth_command_supplies_bearer_token() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     mount_sse_once_match(
@@ -1248,7 +1253,7 @@ async fn provider_auth_command_supplies_bearer_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_auth_command_refreshes_after_401() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let auth_fixture = ProviderAuthCommandFixture::new(&["first-token", "second-token"]).unwrap();
@@ -1386,7 +1391,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_base_instructions_override_in_request() {
-    skip_if_no_network!();
+    require_network!();
     // Mock server
     let server = MockServer::start().await;
     let resp_mock = mount_sse_once(
@@ -1435,7 +1440,7 @@ async fn includes_base_instructions_override_in_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chatgpt_auth_sends_correct_request() {
-    skip_if_no_network!();
+    require_network!();
 
     // Mock server
     let server = MockServer::start().await;
@@ -1518,7 +1523,7 @@ async fn chatgpt_auth_sends_correct_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
-    skip_if_no_network!();
+    require_network!();
 
     // Mock server
     let server = MockServer::start().await;
@@ -1613,7 +1618,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_user_instructions_message_in_request() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -1692,7 +1697,7 @@ async fn includes_user_instructions_message_in_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
     let apps_server = AppsTestServer::mount(&server)
         .await
@@ -1754,7 +1759,7 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
     let apps_server = AppsTestServer::mount(&server)
         .await
@@ -1812,7 +1817,7 @@ async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn omits_apps_guidance_when_configured_off() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
     let apps_server = AppsTestServer::mount(&server)
         .await
@@ -1867,7 +1872,7 @@ async fn omits_apps_guidance_when_configured_off() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn omits_apps_guidance_when_orchestrator_mcp_is_disabled() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
     let apps_server = AppsTestServer::mount(&server)
         .await
@@ -1957,7 +1962,15 @@ async fn omits_apps_guidance_when_orchestrator_mcp_is_disabled() {
     let read_output = requests[2]
         .function_call_output_text(read_call_id)
         .expect("resource read output should be sent to the model");
-    assert_eq!(read_output, "unsupported call: read_mcp_resource");
+    assert!(
+        read_output.starts_with("unsupported call: read_mcp_resource."),
+        "{read_output}"
+    );
+    assert!(read_output.contains("No tool was run."), "{read_output}");
+    assert!(
+        read_output.contains("current tool declarations"),
+        "{read_output}"
+    );
 
     let resource_methods = server
         .received_requests()
@@ -2022,7 +2035,7 @@ async fn omits_environment_context_when_configured_off() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skills_append_to_developer_message() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2085,7 +2098,7 @@ async fn skills_append_to_developer_message() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2235,7 +2248,7 @@ async fn configured_effort_survives_tools_and_followup() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_turn_preserves_configured_reasoning_effort() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2246,7 +2259,7 @@ async fn initial_turn_preserves_configured_reasoning_effort() -> anyhow::Result<
     let TestCodex { codex, .. } = test_codex()
         .with_model("gpt-5.4")
         .with_config(|config| {
-            config.model_reasoning_effort = Some(ReasoningEffort::Max);
+            config.model_reasoning_effort = Some(ReasoningEffort::XHigh);
         })
         .build(&server)
         .await?;
@@ -2275,7 +2288,7 @@ async fn initial_turn_preserves_configured_reasoning_effort() -> anyhow::Result<
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("max")
+        Some("xhigh")
     );
 
     Ok(())
@@ -2283,7 +2296,7 @@ async fn initial_turn_preserves_configured_reasoning_effort() -> anyhow::Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_turn_uses_model_default_reasoning_effort() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2325,7 +2338,7 @@ async fn initial_turn_uses_model_default_reasoning_effort() -> anyhow::Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2385,7 +2398,7 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2448,7 +2461,7 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequential_cutoff_is_omitted_for_non_openai_provider() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2491,7 +2504,7 @@ async fn sequential_cutoff_is_omitted_for_non_openai_provider() -> anyhow::Resul
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls()
 -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2539,7 +2552,7 @@ async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() -> anyhow::Result<()>
 {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2615,7 +2628,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2662,7 +2675,7 @@ async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2718,7 +2731,7 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2760,7 +2773,7 @@ async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2807,7 +2820,7 @@ async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2855,7 +2868,7 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_developer_instructions_message_in_request() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2951,7 +2964,7 @@ async fn includes_developer_instructions_message_in_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn azure_responses_request_includes_store_and_omits_item_ids() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
 
@@ -3170,7 +3183,7 @@ async fn azure_responses_request_includes_store_and_omits_item_ids() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_count_includes_rate_limits_snapshot() {
-    skip_if_no_network!();
+    require_network!();
     let server = MockServer::start().await;
 
     let sse_body = sse(vec![ev_completed_with_tokens(
@@ -3305,7 +3318,7 @@ async fn token_count_includes_rate_limits_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let response = ResponseTemplate::new(429)
@@ -3397,7 +3410,7 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     const EFFECTIVE_CONTEXT_WINDOW: i64 = (272_000 * 95) / 100;
@@ -3502,7 +3515,7 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = MockServer::start().await;
 
     let incomplete_response = sse(vec![
@@ -3577,7 +3590,7 @@ const EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE: &str = "PATH";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn azure_overrides_assign_properties_used_for_responses_url() {
-    skip_if_no_network!();
+    require_network!();
 
     // Mock server
     let server = MockServer::start().await;
@@ -3667,7 +3680,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn env_var_overrides_loaded_auth() {
-    skip_if_no_network!();
+    require_network!();
 
     // Mock server
     let server = MockServer::start().await;
@@ -3768,7 +3781,7 @@ fn create_dummy_codex_auth() -> CodexAuth {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_dedupes_streamed_and_final_messages_across_turns() {
     // Skip under Codex sandbox network restrictions (mirrors other tests).
-    skip_if_no_network!();
+    require_network!();
 
     // Mock server that will receive three sequential requests and return the same SSE stream
     // each time: a few deltas, then a final assistant message, then completed.

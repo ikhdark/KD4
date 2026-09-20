@@ -356,13 +356,13 @@ fn map_api_error_extracts_identity_auth_details_from_headers() {
     headers.insert(REQUEST_ID_HEADER, http::HeaderValue::from_static("req-401"));
     headers.insert(CF_RAY_HEADER, http::HeaderValue::from_static("ray-401"));
     headers.insert(
-        X_OPENAI_AUTHORIZATION_ERROR_HEADER,
+        "x-openai-authorization-error",
         http::HeaderValue::from_static("missing_authorization_header"),
     );
     let x_error_json =
         base64::engine::general_purpose::STANDARD.encode(r#"{"error":{"code":"token_expired"}}"#);
     headers.insert(
-        X_ERROR_JSON_HEADER,
+        "x-error-json",
         http::HeaderValue::from_str(&x_error_json).expect("valid x-error-json header"),
     );
 

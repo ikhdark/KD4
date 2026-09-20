@@ -281,11 +281,9 @@ fn reconcile_lock(
         .env_remove("CARGO_TARGET_DIR")
         // The resolved graph is read back from the lockfile itself.
         .stdout(Stdio::null());
-    for package in requested
-        .iter()
-        .map(|(package, _)| *package)
-        .collect::<BTreeSet<_>>()
-    {
+    // Several requested binaries can belong to one package; keep arguments sorted and unique.
+    let packages = BTreeSet::from_iter(requested.iter().map(|(package, _)| *package));
+    for package in packages {
         command.args(["-p", package]);
     }
     v8::clear_inherited_overrides(&mut command);
@@ -716,6 +714,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
             LiveTask::RustBugfix,
             LiveTask::TypescriptFeature,
             LiveTask::Kd4PythonRefactor,
+            LiveTask::PythonConsumerRefactor,
         ]
     };
     for task in tasks {

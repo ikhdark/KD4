@@ -159,9 +159,8 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     config: &Config,
     force_refetch: bool,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    // TODO: Wire callers that already own an EnvironmentManager into
-    // list_accessible_connectors_from_mcp_tools_with_environment_manager instead
-    // of constructing a temporary manager here.
+    // Standalone discovery for callers without persistent managers. App-server
+    // callers reuse their managers through the with_mcp_manager entry point.
     let local_runtime_paths =
         ExecServerRuntimePaths::from_optional_path(config.codex_self_exe.clone())?;
     let environment_manager =
@@ -313,9 +312,9 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     let refreshed_tools_succeeded = refreshed_tools.is_some();
 
     let mut tools = if let Some(tools) = refreshed_tools {
-        tools
+        Arc::new(tools)
     } else {
-        mcp_connection_manager.list_all_tools().await
+        mcp_connection_manager.list_all_tools_snapshot().await
     };
     let mut should_reload_tools = false;
     let mut codex_apps_ready = if refreshed_tools_succeeded {
@@ -343,23 +342,27 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         false
     };
     if should_reload_tools {
-        tools = mcp_connection_manager.list_all_tools().await;
+        tools = mcp_connection_manager.list_all_tools_snapshot().await;
     }
     if codex_apps_ready {
         cancel_token.cancel();
     }
 
     mcp_connection_manager.shutdown().await;
-    if let Some(snapshot) = tools_cache
+    let snapshot = tools_cache
         .current_snapshot(config.codex_home.to_path_buf(), tools_cache_key)
-        .await
-        && snapshot.codex_apps_ready()
+        .await;
+    let tools = if let Some(snapshot) = snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.codex_apps_ready())
     {
-        tools = snapshot.tools().to_vec();
         codex_apps_ready = true;
-    }
+        snapshot.tools()
+    } else {
+        tools.as_slice()
+    };
     let accessible_connectors = with_app_plugin_sources(
-        accessible_connectors_for_app_list_from_mcp_tools(&tools),
+        accessible_connectors_for_app_list_from_mcp_tools(tools),
         &tool_plugin_provenance,
     );
     Ok(AccessibleConnectorsStatus {

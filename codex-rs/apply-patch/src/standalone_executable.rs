@@ -1,15 +1,14 @@
 use std::io::Read;
 use std::io::Write;
 
-// Support large PATCH inputs while bounding allocation from pipes without EOF.
-const MAX_PATCH_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+use crate::parser::MAX_PATCH_INPUT_BYTES;
 
 fn read_patch_input(reader: impl Read) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     reader
-        .take(MAX_PATCH_INPUT_BYTES + 1)
+        .take(MAX_PATCH_INPUT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_PATCH_INPUT_BYTES {
+    if bytes.len() > MAX_PATCH_INPUT_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("PATCH input exceeds the {MAX_PATCH_INPUT_BYTES}-byte limit"),
@@ -121,7 +120,7 @@ mod tests {
             super::read_patch_input(b"normal prompt\n".as_slice()).unwrap(),
             "normal prompt\n"
         );
-        let mut input = std::io::repeat(b'x').take(super::MAX_PATCH_INPUT_BYTES + 2);
+        let mut input = std::io::repeat(b'x').take(super::MAX_PATCH_INPUT_BYTES as u64 + 2);
         let error = super::read_patch_input(&mut input).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeds"));

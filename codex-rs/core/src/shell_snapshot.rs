@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
@@ -554,7 +555,7 @@ fn format_cmd_snapshot(snapshot: &str) -> Result<String> {
             continue;
         }
         let escaped_value = escape_cmd_set_value(value);
-        formatted.push_str(&format!("@set {name}={escaped_value}\r\n"));
+        let _ = writeln!(formatted, "@set {name}={escaped_value}\r");
     }
     Ok(formatted)
 }

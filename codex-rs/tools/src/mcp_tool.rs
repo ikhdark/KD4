@@ -1,8 +1,9 @@
 use crate::ToolDefinition;
-use crate::parse_tool_input_schema;
+use crate::json_schema::parse_owned_tool_input_schema;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
+#[tracing::instrument(level = "debug", skip(tool), fields(tool_name = %tool.name))]
 pub fn parse_mcp_tool(tool: &rmcp::model::Tool) -> Result<ToolDefinition, serde_json::Error> {
     let mut serialized_input_schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
 
@@ -18,7 +19,7 @@ pub fn parse_mcp_tool(tool: &rmcp::model::Tool) -> Result<ToolDefinition, serde_
         );
     }
 
-    let input_schema = parse_tool_input_schema(&serialized_input_schema)?;
+    let input_schema = parse_owned_tool_input_schema(serialized_input_schema)?;
     let structured_content_schema = tool
         .output_schema
         .as_ref()

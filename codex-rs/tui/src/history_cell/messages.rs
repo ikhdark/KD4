@@ -12,7 +12,13 @@ pub(crate) struct UserHistoryCell {
 }
 
 /// Remove CSI sequences and control characters, preserving tabs and newlines.
-pub(crate) fn sanitize_user_text(text: &str) -> String {
+pub(crate) fn sanitize_user_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
     let mut sanitized = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -22,7 +28,7 @@ pub(crate) fn sanitize_user_text(text: &str) -> String {
             sanitized.push(ch);
         }
     }
-    sanitized
+    std::borrow::Cow::Owned(sanitized)
 }
 
 /// Build logical lines for a user message with styled text elements.
@@ -131,7 +137,7 @@ fn trim_trailing_blank_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>
 impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let message = sanitize_user_text(&self.message);
-        let text_elements = if message == self.message {
+        let text_elements = if matches!(message, std::borrow::Cow::Borrowed(_)) {
             self.text_elements.as_slice()
         } else {
             &[]
@@ -267,20 +273,14 @@ impl ReasoningSummaryCell {
             &mut lines,
         );
         let summary_style = Style::default().dim().italic();
-        let summary_lines = lines
-            .into_iter()
-            .map(|mut line| {
-                line.spans = line
-                    .spans
-                    .into_iter()
-                    .map(|span| span.patch_style(summary_style))
-                    .collect();
-                line
-            })
-            .collect::<Vec<_>>();
+        for line in &mut lines {
+            for span in &mut line.spans {
+                span.style = span.style.patch(summary_style);
+            }
+        }
 
         adaptive_wrap_lines(
-            &summary_lines,
+            lines,
             RtOptions::new(width as usize)
                 .initial_indent("• ".dim().into())
                 .subsequent_indent("  ".into()),

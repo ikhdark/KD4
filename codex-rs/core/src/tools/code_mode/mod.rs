@@ -1532,8 +1532,16 @@ fn build_tool_search_payload(
     tool_name: &ToolName,
     input: Option<JsonValue>,
 ) -> Result<ToolPayload, String> {
-    let arguments = serialize_function_tool_arguments(tool_name, input)?;
-    let arguments = serde_json::from_str(&arguments)
+    let input = match input {
+        None => serde_json::json!({}),
+        Some(input @ JsonValue::Object(_)) => input,
+        Some(_) => {
+            return Err(format!(
+                "tool `{tool_name}` expects a JSON object for arguments"
+            ));
+        }
+    };
+    let arguments = serde_json::from_value(input)
         .map_err(|err| format!("failed to parse tool `{tool_name}` arguments: {err}"))?;
     Ok(ToolPayload::ToolSearch { arguments })
 }
@@ -2336,6 +2344,28 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn build_nested_tool_search_rejects_invalid_arguments() {
+        let name = ToolName::plain(codex_tools::TOOL_SEARCH_TOOL_NAME);
+        for input in [Some(json!(null)), Some(json!([])), Some(json!("query"))] {
+            assert_eq!(
+                build_nested_tool_payload(CodeModeToolKind::Function, &name, input),
+                Err("tool `tool_search` expects a JSON object for arguments".to_string())
+            );
+        }
+        for input in [
+            None,
+            Some(json!({"query": 3})),
+            Some(json!({"query": "x", "limit": -1})),
+        ] {
+            assert!(
+                build_nested_tool_payload(CodeModeToolKind::Function, &name, input)
+                    .unwrap_err()
+                    .starts_with("failed to parse tool `tool_search` arguments:")
+            );
+        }
     }
 
     #[test]

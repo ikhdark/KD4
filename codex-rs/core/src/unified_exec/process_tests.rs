@@ -731,7 +731,7 @@ async fn stalled_interrupt_respects_yield_deadline_without_replay_or_retirement(
         .expect("stored process")
         .tty = false;
     let began = Instant::now();
-    let result = WriteStdinHandler
+    let result = WriteStdinHandler::default()
         .handle(write_stdin_invocation_with_chars(
             Arc::clone(&session),
             Arc::clone(&turn),
@@ -810,7 +810,7 @@ async fn stalled_stdin_acknowledgement_is_not_replayed_and_preserves_unconfirmed
             "once\n",
         );
         let began = Instant::now();
-        let result = WriteStdinHandler.handle(invocation).await;
+        let result = WriteStdinHandler::default().handle(invocation).await;
         let error = match result {
             Err(error) => error.to_string(),
             Ok(_) => panic!("unconfirmed stdin must not report success"),
@@ -871,7 +871,7 @@ async fn non_empty_write_stdin_collects_later_output_until_the_interaction_cap()
         "hello\n",
     );
     let started_at = Instant::now();
-    let output = WriteStdinHandler
+    let output = WriteStdinHandler::default()
         .handle(invocation.clone())
         .await
         .expect("write_stdin should succeed");
@@ -954,7 +954,7 @@ async fn tool_result_correctness_exited_process_with_open_output_is_not_running(
         "poll-exited-open-output",
         process_id,
     );
-    let output = WriteStdinHandler
+    let output = WriteStdinHandler::default()
         .handle(invocation.clone())
         .await
         .expect("exited process output should remain readable");
@@ -2154,6 +2154,7 @@ async fn sandbox_denial_snapshot_separates_capacity_omission_seam() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_process_polls_do_not_share_an_interaction_lock() {
+    let handler = WriteStdinHandler::default();
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -2166,7 +2167,7 @@ async fn independent_process_polls_do_not_share_an_interaction_lock() {
     let interaction_guard = process_a.interaction_lock().lock_owned().await;
     let invocation_a =
         write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-a", 1001);
-    let mut poll_a = WriteStdinHandler.handle(invocation_a);
+    let mut poll_a = handler.handle(invocation_a);
     assert!(futures::poll!(&mut poll_a).is_pending());
 
     process_b
@@ -2175,18 +2176,16 @@ async fn independent_process_polls_do_not_share_an_interaction_lock() {
         .expect("process B should report confirmed completion");
     let invocation_b =
         write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-b", 1002);
-    let output_b = tokio::time::timeout(
-        Duration::from_secs(2),
-        WriteStdinHandler.handle(invocation_b.clone()),
-    )
-    .await
-    .expect("process B should complete while process A remains locked")
-    .expect("process B poll should succeed");
+    let output_b =
+        tokio::time::timeout(Duration::from_secs(2), handler.handle(invocation_b.clone()))
+            .await
+            .expect("process B should complete while process A remains locked")
+            .expect("process B poll should succeed");
     assert_eq!(
         output_b.code_mode_result(&invocation_b.payload)["session_id"],
         serde_json::Value::Null
     );
-    assert!(WriteStdinHandler.supports_parallel_tool_calls());
+    assert!(handler.supports_parallel_tool_calls());
 
     process_a
         .terminate_confirmed()
@@ -2201,6 +2200,7 @@ async fn independent_process_polls_do_not_share_an_interaction_lock() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() {
+    let handler = WriteStdinHandler::default();
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -2215,8 +2215,8 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
         write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-b", 1003);
     let poll_a_invocation = invocation_a.clone();
     let poll_b_invocation = invocation_b.clone();
-    let mut poll_a = WriteStdinHandler.handle(poll_a_invocation);
-    let mut poll_b = WriteStdinHandler.handle(poll_b_invocation);
+    let mut poll_a = handler.handle(poll_a_invocation);
+    let mut poll_b = handler.handle(poll_b_invocation);
     // Drive each invocation separately to the held interaction lock.
     assert!(futures::poll!(&mut poll_a).is_pending());
     assert!(futures::poll!(&mut poll_b).is_pending());
@@ -2244,7 +2244,7 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
                     output.code_mode_result(&invocation.payload)["session_id"],
                     serde_json::Value::Null
                 );
-                if WriteStdinHandler
+                if handler
                     .post_tool_use_payload(&invocation, output.as_ref())
                     .is_some()
                 {

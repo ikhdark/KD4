@@ -29,6 +29,34 @@ fn parse(
 }
 
 #[test]
+fn blank_command_fields_are_distinguished_from_missing_fields() {
+    for blank in ["", " \t\r\n", "\u{2003}"] {
+        for (script, program, body, field, branch) in [
+            (Some(blank), None, None, "cmd", "script"),
+            (None, Some(blank), None, "program", "argv"),
+            (None, None, Some(blank), "script_body", "powershell_script"),
+        ] {
+            for kind in [None, Some(branch)] {
+                let error = parse(script, kind, program, None, body).unwrap_err();
+                let FunctionCallError::RespondToModel(message) = error else {
+                    panic!("invalid input must be recoverable");
+                };
+                assert!(message.contains(&format!("`$.{field}`")), "{message}");
+                assert!(message.contains("supplied field was blank"), "{message}");
+                assert!(message.contains("omit this field"), "{message}");
+            }
+        }
+    }
+    for kind in ["script", "argv", "powershell_script"] {
+        let error = parse(None, Some(kind), None, None, None).unwrap_err();
+        assert!(error.to_string().contains("field is required"));
+        assert!(!error.to_string().contains("supplied field was blank"));
+    }
+    // A blank field must not silently disappear and select a different branch.
+    assert!(parse(Some(" "), None, Some("rg"), None, None).is_err());
+}
+
+#[test]
 fn powershell_script_mode_accepts_script_body_only() {
     let invocation = parse(
         None,

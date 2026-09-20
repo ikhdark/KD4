@@ -22,6 +22,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::normalized_directory_write_permissions;
 use core_test_support::requested_directory_write_permissions;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -30,7 +31,6 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -325,7 +325,7 @@ async fn expect_request_permissions_event(
 
 #[tokio::test(flavor = "current_thread")]
 async fn with_additional_permissions_requires_approval_under_on_request() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -419,7 +419,7 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_tool_is_auto_denied_when_granular_request_permissions_is_disabled()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::Granular(GranularApprovalConfig {
@@ -497,16 +497,15 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
         "request_permissions should not emit a prompt when granular.request_permissions is false: {event:?}"
     );
 
-    let call_output = results.single_request().function_call_output(call_id);
-    let result: RequestPermissionsResponse =
-        serde_json::from_str(call_output["output"].as_str().unwrap_or_default())?;
-    assert_eq!(
-        result,
-        RequestPermissionsResponse {
-            permissions: RequestPermissionProfile::default(),
-            scope: PermissionGrantScope::Turn,
-        }
+    let call_output = results
+        .single_request()
+        .function_call_output_text(call_id)
+        .expect("disabled permission tool returns a model-visible rejection");
+    assert!(
+        call_output.starts_with("unsupported call: request_permissions."),
+        "disabled permission requests must not run: {call_output}"
     );
+    assert!(call_output.contains("No tool was run."));
 
     Ok(())
 }
@@ -523,7 +522,7 @@ enum AdditionalPermissionsCommandTool {
 async fn relative_additional_permissions_resolve_against_tool_workdir(
     command_tool: AdditionalPermissionsCommandTool,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -643,7 +642,7 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
 
 #[tokio::test(flavor = "current_thread")]
 async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -750,7 +749,7 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
 
 #[tokio::test(flavor = "current_thread")]
 async fn with_additional_permissions_denied_approval_blocks_execution() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
     let permission_profile = workspace_write_excluding_tmp();
@@ -835,7 +834,7 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
 
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -959,7 +958,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_request() -> Result<()>
 {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1076,7 +1075,7 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
 
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1186,7 +1185,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1296,7 +1295,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
 
 #[tokio::test(flavor = "current_thread")]
 async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1514,7 +1513,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1640,7 +1639,7 @@ async fn granular_inline_execution_approval(
     sandbox_approval: bool,
     approve: bool,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     #[cfg(target_os = "windows")]
     let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
     #[cfg(target_os = "windows")]

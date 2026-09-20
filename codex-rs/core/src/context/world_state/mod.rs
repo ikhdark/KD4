@@ -196,8 +196,8 @@ impl ContextualUserFragment for WorldStateContextFragment {
         self.0.markers()
     }
 
-    fn body(&self) -> String {
-        self.0.body().to_string()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.0.body())
     }
 
     fn type_markers() -> (&'static str, &'static str) {
@@ -293,9 +293,6 @@ impl WorldStateSnapshot {
 
     /// Returns the RFC 7386 merge patch that advances `previous` to `self`.
     pub(crate) fn merge_patch_from(&self, previous: &Self) -> Option<Value> {
-        if self == previous {
-            return None;
-        }
         let mut patch = Map::new();
         for key in previous.sections.keys() {
             if !self.sections.contains_key(key) {
@@ -311,13 +308,26 @@ impl WorldStateSnapshot {
                 patch.insert(key.clone(), change);
             }
         }
-        Some(Value::Object(patch))
+        (!patch.is_empty()).then_some(Value::Object(patch))
     }
 
     pub(crate) fn apply_merge_patch(&mut self, patch: &Value) -> serde_json::Result<()> {
-        let mut current = self.clone().into_value();
-        apply_merge_patch_value(&mut current, patch);
-        *self = serde_json::from_value(current)?;
+        let Value::Object(patch) = patch else {
+            // Preserve deserialization errors and leave the snapshot untouched for
+            // invalid top-level replacements, as the previous round trip did.
+            *self = serde_json::from_value(patch.clone())?;
+            return Ok(());
+        };
+        for (key, value) in patch {
+            if value.is_null() {
+                self.sections.remove(key);
+            } else {
+                apply_merge_patch_value(
+                    self.sections.entry(key.clone()).or_insert(Value::Null),
+                    value,
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -453,6 +463,8 @@ impl WorldState {
         let mut fragments = Vec::new();
         let mut sections = BTreeMap::new();
         for (id, section) in &self.sections {
+            let _render_span =
+                tracing::trace_span!("world_state.render_section", section_id = *id).entered();
             let previous = previous(id, section.as_ref());
             let rejected_snapshot = match &previous {
                 PreviousSectionState::Known(previous) => Some(*previous),
@@ -517,7 +529,8 @@ impl WorldState {
                                     };
                                     budget = candidate_budget;
                                     fragments.push(Box::new(RenderedContextFragment::new(
-                                        role, rendered,
+                                        role,
+                                        rendered.into_owned(),
                                     ))
                                         as Box<dyn ContextualUserFragment>);
                                     sections.insert((*id).to_string(), snapshot);
@@ -604,12 +617,8 @@ fn remove_null_object_fields(value: &mut Value) {
 }
 
 fn create_merge_patch(previous: &Value, current: &Value) -> Option<Value> {
-    if previous == current {
-        return None;
-    }
-
     let Value::Object(current) = current else {
-        return Some(current.clone());
+        return (previous != current).then(|| current.clone());
     };
     let previous = previous.as_object();
     let mut patch = Map::new();
@@ -632,7 +641,8 @@ fn create_merge_patch(previous: &Value, current: &Value) -> Option<Value> {
         }
     }
 
-    Some(Value::Object(patch))
+    // An empty object still replaces a previous scalar or array.
+    (previous.is_none() || !patch.is_empty()).then_some(Value::Object(patch))
 }
 
 fn apply_merge_patch_value(target: &mut Value, patch: &Value) {

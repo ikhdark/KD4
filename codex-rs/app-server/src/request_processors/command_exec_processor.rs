@@ -79,7 +79,6 @@ fn legacy_command_exec_config(
 
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
-    _arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
@@ -89,14 +88,12 @@ pub(crate) struct CommandExecRequestProcessor {
 
 impl CommandExecRequestProcessor {
     pub(crate) fn new(
-        arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
         environment_manager: Arc<EnvironmentManager>,
     ) -> Self {
         Self {
-            _arg0_paths: arg0_paths,
             config,
             outgoing,
             config_manager,

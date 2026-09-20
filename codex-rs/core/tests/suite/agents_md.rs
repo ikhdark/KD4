@@ -16,6 +16,7 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::create_directory_symlink;
 use core_test_support::load_default_config_for_test;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -23,7 +24,6 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::request_has_last_message_input_text;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::RecordingUserInstructionsProvider;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
@@ -278,6 +278,27 @@ fn request_user_texts(request: &wiremock::Request) -> Vec<String> {
                 .map(|text| text.chars().take(80).collect())
         })
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_source_syntax_reaches_the_model_without_xml_encoding() -> Result<()> {
+    let source = "slice --path <file> --owner <owner-id>\ncargo check 2>&1 && echo done\nfn f() -> Vec<String>; &amp; café";
+    let instructions = agents_instructions(test_codex().with_workspace_setup(
+        move |cwd, fs| async move {
+            fs.write_file(
+                &PathUri::from_host_native_path(cwd.join("AGENTS.md"))?,
+                source.as_bytes().to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        },
+    ))
+    .await?;
+
+    assert!(instructions.contains(source), "{instructions}");
+    assert!(!instructions.contains("&lt;file&gt;"), "{instructions}");
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -960,13 +981,13 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forked_subagent_replays_one_creation_time_global_instruction_fragment() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     run_subagent_global_instruction_case(/*fork_context*/ true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_subagent_uses_creation_time_instructions_without_parent_history() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     run_subagent_global_instruction_case(/*fork_context*/ false).await
 }
 

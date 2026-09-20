@@ -12,6 +12,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::context::semantic_evidence_for_command_output;
+use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_BYTES;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_LEGACY_RANGES;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS;
@@ -32,6 +33,9 @@ use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::HashSet;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
@@ -316,7 +320,7 @@ pub struct ReadToolOutputHandler;
 
 struct ReadToolOutputToolOutput {
     inner: JsonToolOutput,
-    exact_recovery: Option<(TurnTimingDeterministicContinuationReceipt, Value)>,
+    exact_recovery: Option<TurnTimingDeterministicContinuationReceipt>,
     semantic_evidence: Vec<String>,
 }
 
@@ -341,14 +345,14 @@ impl ToolOutput for ReadToolOutputToolOutput {
     ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
         self.exact_recovery
             .as_ref()
-            .map(|(receipt, _)| vec![receipt.clone()])
+            .map(|receipt| vec![receipt.clone()])
             .unwrap_or_default()
     }
 
     fn deterministic_continuation_content(&self) -> Vec<Value> {
         self.exact_recovery
             .as_ref()
-            .map(|(_, value)| vec![value.clone()])
+            .map(|_| vec![self.inner.value().clone()])
             .unwrap_or_default()
     }
 
@@ -403,11 +407,11 @@ async fn handle_read_tool_output(
     let _legacy_max_bytes = resolved_max_bytes(args.max_bytes)?;
     let selectors = resolved_selectors(&args)?;
     let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
-    let action_bounds_hash = crate::tool_history::sha256(
-        serde_json::to_string(&selectors)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    let mut action_bounds_digest = Sha256::new();
+    serde_json::to_writer(&mut action_bounds_digest, &selectors).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("failed to serialize recovery selectors: {err}"))
+    })?;
+    let action_bounds_hash = format!("{:x}", action_bounds_digest.finalize());
     let transaction = execute_recovery_transaction_with_continuations(
         invocation.step_context.turn.config.codex_home.as_path(),
         &invocation.session.thread_id.to_string(),
@@ -431,11 +435,13 @@ async fn handle_read_tool_output(
             .turn_timing_state
             .record_tool_output_artifact_reread();
     }
+    // Typed overflow reports an incomplete selection without losing retained
+    // evidence. Recovery bypasses recursive spilling, so no retruncation occurs.
     invocation
         .step_context
         .turn
         .turn_timing_state
-        .record_tool_output_recovery(recovery_retruncation_count(&output));
+        .record_tool_output_recovery(/*retruncation_count*/ 0);
 
     let exact_recovery_receipt = exact_code_mode_recovery_receipt(
         code_mode_recovery,
@@ -457,19 +463,24 @@ async fn handle_read_tool_output(
             })?,
         );
     }
-    let exact_recovery = exact_recovery_receipt.map(|receipt| (receipt, output.clone()));
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
         inner: JsonToolOutput::new(output),
-        exact_recovery,
+        exact_recovery: exact_recovery_receipt,
         semantic_evidence,
     }))
 }
 
 fn parse_read_tool_output_args(arguments: &str) -> Result<ReadToolOutputArgs, FunctionCallError> {
-    serde_json::from_str(arguments).map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to parse read_tool_output arguments: {err}. Consult the advertised read_tool_output schema."
-        ))
+    parse_arguments(arguments).map_err(|err| match err {
+        FunctionCallError::RespondToModel(message) => {
+            let detail = message
+                .strip_prefix("failed to parse function arguments: ")
+                .unwrap_or(&message);
+            FunctionCallError::RespondToModel(format!(
+                "failed to parse read_tool_output arguments: {detail}. Consult the advertised read_tool_output schema."
+            ))
+        }
+        err => err,
     })
 }
 
@@ -477,22 +488,18 @@ fn read_tool_output_semantic_evidence(
     output: &ReadToolOutputResult,
     continuation_stop: Option<&RecoveryContinuationStopV1>,
 ) -> Vec<String> {
-    let recovered_fragments = output
+    let mut recovered_fragments = output
         .results
         .iter()
         .filter(|result| result.status == ToolOutputSelectorStatus::Ok)
         .filter_map(|result| result.text.as_deref().map(|text| (result, text)))
-        .collect::<Vec<_>>();
-    if !recovered_fragments.is_empty() {
+        .peekable();
+    if recovered_fragments.peek().is_some() {
         let mut evidence = Vec::new();
+        let mut seen_facts = HashSet::new();
         for (result, recovered_fragment) in recovered_fragments {
             let fragment_facts =
                 semantic_evidence_for_command_output(recovered_fragment.as_bytes());
-            for fact in &fragment_facts {
-                if !evidence.contains(fact) {
-                    evidence.push(fact.clone());
-                }
-            }
             let provenance = serde_json::to_vec(&serde_json::json!({
                 "canonical_sha256": output.canonical_sha256,
                 "selector": result.selector,
@@ -500,6 +507,12 @@ fn read_tool_output_semantic_evidence(
                 "facts": fragment_facts,
             }))
             .unwrap_or_default();
+            for fact in fragment_facts {
+                if !seen_facts.contains(&fact) {
+                    seen_facts.insert(fact.clone());
+                    evidence.push(fact);
+                }
+            }
             evidence.push(format!(
                 "artifact-recovery-fragment-v1:{}",
                 crate::tool_history::sha256(&provenance)
@@ -677,15 +690,6 @@ fn exact_code_mode_recovery_receipt(
         action_bounds_hash,
         suppressed_continuation_count,
     })
-}
-
-fn recovery_retruncation_count(
-    _output: &crate::tools::command_output_artifact::ReadToolOutputResult,
-) -> u32 {
-    // Typed overflow is a truthful transaction outcome, not loss of evidence
-    // that was already complete. Direct recovery bypasses recursive spilling,
-    // and code-mode fit is decided before the carrier is serialized.
-    0
 }
 
 fn resolved_selectors(
@@ -1236,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_overflow_is_not_counted_as_retruncation() {
+    fn typed_overflow_preserves_artifact_completeness() {
         let output = crate::tools::command_output_artifact::ReadToolOutputResult {
             artifact_id: "artifact".to_string(),
             canonical_sha256: "digest".to_string(),
@@ -1252,7 +1256,6 @@ mod tests {
             ],
         };
 
-        assert_eq!(recovery_retruncation_count(&output), 0);
         let delivered = serde_json::to_value(output).expect("recovery result");
         assert_eq!(delivered["retained_artifact_complete"], true);
         assert_eq!(delivered["delivered_selection_complete"], false);
@@ -1285,6 +1288,23 @@ mod tests {
             exact_code_mode_recovery_receipt(true, &output, "selector-bounds".to_string(), 0,)
                 .is_none()
         );
+        let value = serde_json::to_value(output).expect("recovery output");
+        let mut tool_output = ReadToolOutputToolOutput {
+            inner: JsonToolOutput::new(value.clone()),
+            exact_recovery: Some(receipt.clone()),
+            semantic_evidence: Vec::new(),
+        };
+        assert_eq!(
+            tool_output.deterministic_continuation_receipts(),
+            vec![receipt]
+        );
+        assert_eq!(
+            tool_output.deterministic_continuation_content(),
+            vec![value]
+        );
+        tool_output.exact_recovery = None;
+        assert!(tool_output.deterministic_continuation_receipts().is_empty());
+        assert!(tool_output.deterministic_continuation_content().is_empty());
     }
 
     #[test]
@@ -1333,6 +1353,21 @@ mod tests {
                 .filter(|fact| fact.starts_with("artifact-recovery-fragment-v1:"))
                 .count(),
             1
+        );
+        // Repeated selections keep their provenance but must not duplicate or
+        // reorder the semantic facts already emitted for the first fragment.
+        let provenance = evidence
+            .iter()
+            .find(|fact| fact.starts_with("artifact-recovery-fragment-v1:"))
+            .expect("fragment provenance")
+            .clone();
+        let mut repeated = output;
+        repeated.results.push(repeated.results[0].clone());
+        let mut expected_repeated = evidence;
+        expected_repeated.push(provenance);
+        assert_eq!(
+            read_tool_output_semantic_evidence(&repeated, None),
+            expected_repeated
         );
     }
 
@@ -1580,9 +1615,9 @@ mod tests {
             (selector_args(0), false),
             (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1), false),
             (range_args(1), true),
-            (range_args(READ_TOOL_OUTPUT_MAX_LEGACY_RANGES), true),
+            (range_args(64), true),
             (range_args(0), false),
-            (range_args(READ_TOOL_OUTPUT_MAX_LEGACY_RANGES + 1), false),
+            (range_args(65), false),
         ];
 
         for (arguments, expected) in cases {

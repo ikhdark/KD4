@@ -491,7 +491,7 @@ def read_cached_tool_run(
     path = tool_run_cache_path(command, cache_dir)
     try:
         age = time.time() - path.stat().st_mtime
-        if not 0 <= age <= ttl_seconds:
+        if not -0.001 <= age <= ttl_seconds:
             return None
         value = path.read_text(encoding="utf-8").strip()
     except OSError:
@@ -545,7 +545,7 @@ def warn_once(
         path = cache_dir / f"{sanitize_cache_part(key)}.warn"
         try:
             age = time.time() - path.stat().st_mtime
-            if 0 <= age <= PROBE_CACHE_TTL_SECONDS:
+            if -0.001 <= age <= PROBE_CACHE_TTL_SECONDS:
                 return
         except OSError:
             pass

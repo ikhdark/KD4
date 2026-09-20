@@ -22,35 +22,38 @@ pub struct ToolSearchInfo {
 
 impl ToolSearchInfo {
     pub fn from_tool_spec(
-        spec: ToolSpec,
+        spec: &ToolSpec,
         source_info: Option<ToolSearchSourceInfo>,
     ) -> Option<Self> {
-        let search_text = default_tool_search_text(&spec);
+        let search_text = default_tool_search_text(spec);
         Self::from_spec(search_text, spec, source_info)
     }
 
     pub fn from_spec(
         search_text: String,
-        spec: ToolSpec,
+        spec: &ToolSpec,
         source_info: Option<ToolSearchSourceInfo>,
     ) -> Option<Self> {
-        let tool_names = tool_names(&spec);
+        let tool_names = tool_names(spec);
         let output = match spec {
-            ToolSpec::Function(mut tool) => {
-                tool.defer_loading = Some(true);
-                tool.output_schema = None;
-                LoadableToolSpec::Function(tool)
-            }
-            ToolSpec::Namespace(mut namespace) => {
-                if namespace.description.trim().is_empty() {
-                    namespace.description = default_namespace_description(&namespace.name);
-                }
-                for tool in &mut namespace.tools {
-                    let ResponsesApiNamespaceTool::Function(tool) = tool;
-                    tool.defer_loading = Some(true);
-                    tool.output_schema = None;
-                }
-                LoadableToolSpec::Namespace(namespace)
+            ToolSpec::Function(tool) => LoadableToolSpec::Function(search_function(tool)),
+            ToolSpec::Namespace(namespace) => {
+                LoadableToolSpec::Namespace(crate::ResponsesApiNamespace {
+                    name: namespace.name.clone(),
+                    description: if namespace.description.trim().is_empty() {
+                        default_namespace_description(&namespace.name)
+                    } else {
+                        namespace.description.clone()
+                    },
+                    tools: namespace
+                        .tools
+                        .iter()
+                        .map(|tool| {
+                            let ResponsesApiNamespaceTool::Function(tool) = tool;
+                            ResponsesApiNamespaceTool::Function(search_function(tool))
+                        })
+                        .collect(),
+                })
             }
             ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => {
                 return None;
@@ -68,6 +71,19 @@ impl ToolSearchInfo {
     }
 }
 
+// Search results own their callable input contract, but never need a copy of
+// the runtime-only output schema.
+fn search_function(tool: &ResponsesApiTool) -> ResponsesApiTool {
+    ResponsesApiTool {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        strict: tool.strict,
+        defer_loading: Some(true),
+        parameters: tool.parameters.clone(),
+        output_schema: None,
+    }
+}
+
 fn tool_names(spec: &ToolSpec) -> Vec<String> {
     spec.callable_tool_names()
         .into_iter()
@@ -76,18 +92,18 @@ fn tool_names(spec: &ToolSpec) -> Vec<String> {
 }
 
 fn default_tool_search_text(spec: &ToolSpec) -> String {
-    let mut parts = Vec::new();
+    let mut parts = String::new();
 
     match spec {
         ToolSpec::Function(tool) => append_function_search_text(tool, &mut parts),
         ToolSpec::Namespace(namespace) => {
-            push_search_part(&mut parts, namespace.name.clone());
-            push_search_part(&mut parts, namespace.description.clone());
+            push_search_part(&mut parts, &namespace.name);
+            push_search_part(&mut parts, &namespace.description);
             for tool in &namespace.tools {
                 let ResponsesApiNamespaceTool::Function(tool) = tool;
                 push_search_part(
                     &mut parts,
-                    code_mode_name_for_tool_name(&crate::ToolName::namespaced(
+                    &code_mode_name_for_tool_name(&crate::ToolName::namespaced(
                         namespace.name.clone(),
                         tool.name.clone(),
                     )),
@@ -96,44 +112,44 @@ fn default_tool_search_text(spec: &ToolSpec) -> String {
             }
         }
         ToolSpec::ToolSearch { description, .. } => {
-            push_search_part(&mut parts, description.clone());
+            push_search_part(&mut parts, description);
         }
         ToolSpec::WebSearch { .. } => {
-            push_search_part(&mut parts, "web search".to_string());
+            push_search_part(&mut parts, "web search");
         }
         ToolSpec::Freeform(tool) => {
-            push_search_part(&mut parts, tool.name.clone());
-            push_search_part(&mut parts, tool.description.clone());
-            push_search_part(&mut parts, tool.format.syntax.clone());
+            push_search_part(&mut parts, &tool.name);
+            push_search_part(&mut parts, &tool.description);
+            push_search_part(&mut parts, &tool.format.syntax);
         }
     }
 
-    parts.join(" ")
+    parts
 }
 
-fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut Vec<String>) {
-    push_search_part(parts, tool.name.clone());
-    push_search_part(parts, tool.name.replace('_', " "));
-    push_search_part(parts, tool.description.clone());
+fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut String) {
+    push_search_part(parts, &tool.name);
+    push_search_part(parts, &tool.name.replace('_', " "));
+    push_search_part(parts, &tool.description);
     append_schema_search_text(&tool.parameters, parts);
 }
 
 pub fn schema_search_text(schema: &JsonSchema) -> String {
-    let mut parts = Vec::new();
+    let mut parts = String::new();
     append_schema_search_text(schema, &mut parts);
-    parts.join(" ")
+    parts
 }
 
-fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>) {
+fn append_schema_search_text(schema: &JsonSchema, parts: &mut String) {
     if let Some(schema_ref) = &schema.schema_ref {
-        push_search_part(parts, schema_ref.clone());
+        push_search_part(parts, schema_ref);
     }
     if let Some(description) = &schema.description {
-        push_search_part(parts, description.clone());
+        push_search_part(parts, description);
     }
     if let Some(required) = &schema.required {
         for name in required {
-            push_search_part(parts, name.clone());
+            push_search_part(parts, name);
         }
     }
     if let Some(values) = &schema.enum_values {
@@ -151,11 +167,11 @@ fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>) {
     .into_iter()
     .flatten()
     {
-        push_search_part(parts, value.to_string());
+        push_search_part(parts, &value.to_string());
     }
     if let Some(properties) = &schema.properties {
         for (name, schema) in properties {
-            push_search_part(parts, name.clone());
+            push_search_part(parts, name);
             append_schema_search_text(schema, parts);
         }
     }
@@ -175,18 +191,18 @@ fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>) {
     }
     for definitions in [&schema.defs, &schema.definitions].into_iter().flatten() {
         for (name, schema) in definitions {
-            push_search_part(parts, name.clone());
+            push_search_part(parts, name);
             append_schema_search_text(schema, parts);
         }
     }
 }
 
-fn append_json_search_text(value: &serde_json::Value, parts: &mut Vec<String>) {
+fn append_json_search_text(value: &serde_json::Value, parts: &mut String) {
     match value {
-        serde_json::Value::Null => push_search_part(parts, "null".to_string()),
-        serde_json::Value::Bool(value) => push_search_part(parts, value.to_string()),
-        serde_json::Value::Number(value) => push_search_part(parts, value.to_string()),
-        serde_json::Value::String(value) => push_search_part(parts, value.clone()),
+        serde_json::Value::Null => push_search_part(parts, "null"),
+        serde_json::Value::Bool(value) => push_search_part(parts, &value.to_string()),
+        serde_json::Value::Number(value) => push_search_part(parts, &value.to_string()),
+        serde_json::Value::String(value) => push_search_part(parts, value),
         serde_json::Value::Array(values) => {
             for value in values {
                 append_json_search_text(value, parts);
@@ -194,17 +210,20 @@ fn append_json_search_text(value: &serde_json::Value, parts: &mut Vec<String>) {
         }
         serde_json::Value::Object(values) => {
             for (name, value) in values {
-                push_search_part(parts, name.clone());
+                push_search_part(parts, name);
                 append_json_search_text(value, parts);
             }
         }
     }
 }
 
-fn push_search_part(parts: &mut Vec<String>, part: String) {
+fn push_search_part(parts: &mut String, part: &str) {
     let part = part.trim();
     if !part.is_empty() {
-        parts.push(part.to_string());
+        if !parts.is_empty() {
+            parts.push(' ');
+        }
+        parts.push_str(part);
     }
 }
 

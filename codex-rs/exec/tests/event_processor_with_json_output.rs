@@ -84,6 +84,57 @@ use codex_exec::Usage;
 use codex_exec::WebSearchItem;
 
 #[test]
+fn context_compaction_notifications_preserve_lifecycle_and_json_shape() {
+    for include_started in [true, false] {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        let item = ThreadItem::from(CoreTurnItem::ContextCompaction(
+            codex_protocol::items::ContextCompactionItem::new(),
+        ));
+        if include_started {
+            let started = processor.collect_thread_events(ServerNotification::ItemStarted(
+                ItemStartedNotification {
+                    item: item.clone(),
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    started_at_ms: 0,
+                },
+            ));
+            assert_eq!(started.status, CodexStatus::Running);
+            assert_eq!(
+                serde_json::to_value(started.events).expect("serialize compaction start"),
+                json!([{
+                    "type": "item.started",
+                    "item": {"id": "item_0", "type": "context_compaction"}
+                }]),
+            );
+        }
+        let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
+            ItemCompletedNotification {
+                item,
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: 0,
+            },
+        ));
+        assert_eq!(completed.status, CodexStatus::Running);
+        let expected = json!([{
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "context_compaction"}
+        }]);
+        assert_eq!(
+            serde_json::to_value(&completed.events).expect("serialize compaction completion"),
+            expected,
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<ThreadEvent>>(expected)
+                .expect("deserialize compaction completion"),
+            completed.events,
+        );
+        assert_eq!(processor.final_message(), None);
+    }
+}
+
+#[test]
 fn map_todo_items_preserves_text_and_completion_state() {
     let items = EventProcessorWithJsonOutput::map_todo_items(&[
         TurnPlanStep {

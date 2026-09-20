@@ -21,7 +21,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "send_input send message existing agent subagent follow up interrupt redirect queue target",
-            registered_spec.clone(),
+            registered_spec,
         )
     }
 

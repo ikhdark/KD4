@@ -100,7 +100,7 @@ impl ToolExecutor<ToolInvocation> for DynamicToolHandler {
         registered_spec: &ToolSpec,
     ) -> Option<ToolSearchInfo> {
         ToolSearchInfo::from_tool_spec(
-            registered_spec.clone(),
+            registered_spec,
             Some(ToolSearchSourceInfo {
                 name: "Dynamic tools".to_string(),
                 description: Some("Tools provided by the current Codex thread.".to_string()),

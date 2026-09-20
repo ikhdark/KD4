@@ -17,15 +17,25 @@ fn render_workspace_diff_file_bounds_large_diff() {
 
     let ascii = render_workspace_diff_file(&diff);
     let body = ascii.split_once("```diff\n").unwrap().1;
-    let cutoff = body.find("\n[workspace diff truncated;").unwrap();
-    // Put a multibyte character across the actual remaining artifact budget.
-    diff.unified_diff = format!("{}😀tail", "a".repeat(cutoff - 1));
+    assert!(body.starts_with("\n[workspace diff truncated;"));
+    // Retain the complete header and source line, but no prefix of the next
+    // oversized Unicode line, even when the byte budget lands within a scalar.
+    let complete_lines = "@@ -1 +1,2 @@\n+kept\n";
+    diff.unified_diff = format!(
+        "{complete_lines}+{}",
+        "😀".repeat(crate::workspace_diff::MAX_BYTES / 4)
+    );
     let rendered = render_workspace_diff_file(&diff);
 
     assert!(rendered.contains("- M MEMORY.md"));
     assert!(rendered.contains("[workspace diff truncated;"));
     assert!(rendered.len() <= crate::workspace_diff::MAX_BYTES);
     assert!(!rendered.contains('😀'));
+    let body = rendered.split_once("```diff\n").unwrap().1;
+    assert_eq!(
+        body.split_once("\n[workspace diff truncated;").unwrap().0,
+        complete_lines
+    );
     assert!(rendered.contains("Change coverage is partial"));
 }
 

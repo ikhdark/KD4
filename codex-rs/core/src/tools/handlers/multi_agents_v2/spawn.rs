@@ -1728,16 +1728,7 @@ fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> Strin
 }
 
 fn typed_task_store_error(error: StoreError) -> FunctionCallError {
-    let detail = match error {
-        StoreError::Io(_)
-        | StoreError::Sql(_)
-        | StoreError::Migration(_)
-        | StoreError::Json(_)
-        | StoreError::CorruptData(_) => {
-            "the typed task store is unavailable or contains invalid persisted state".to_string()
-        }
-        error => error.to_string(),
-    };
+    let detail = task_store_error_detail("spawn_agent", error);
     FunctionCallError::RespondToModel(format!("spawn_agent: {detail}"))
 }
 
@@ -1793,6 +1784,11 @@ impl ToolOutput for SpawnAgentResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_store_failures_log_causes_without_exposing_them_to_the_model() {
+        super::super::store_error_tests::assert_error_reporting("spawn_agent", typed_task_store_error);
+    }
 
     fn typed_assignment() -> TypedAssignmentArgs {
         TypedAssignmentArgs {

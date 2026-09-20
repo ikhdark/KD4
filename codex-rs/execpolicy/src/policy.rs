@@ -320,7 +320,7 @@ impl Policy {
         let Some(first) = cmd.first() else {
             return Vec::new();
         };
-        let Ok(program) = AbsolutePathBuf::try_from(first.clone()) else {
+        let Ok(program) = AbsolutePathBuf::try_from(first.as_str()) else {
             return Vec::new();
         };
         let Some(basename) = executable_path_lookup_key(program.as_path()) else {

@@ -2,7 +2,7 @@
 
 This document describes the in-process protocol between a Codex client and
 `codex-core`. It is a Rust API, not a stable JSON-RPC interface. Process-based
-clients should use the [app-server protocol](../app-server/README.md) instead.
+clients should use the [app-server protocol](app_server.md) instead.
 
 ## Overview
 
@@ -62,7 +62,7 @@ timing fields as applicable. It does not contain a response bookmark.
 
 ## Common operations
 
-The `Op` enum is non-exhaustive. Important operations currently include:
+The `Op` enum is non-exhaustive for downstream crates. Important operations currently include:
 
 - `UserInput` to start a turn;
 - `ThreadSettings` to update persistent settings;
@@ -71,7 +71,8 @@ The `Op` enum is non-exhaustive. Important operations currently include:
 - `ResolveElicitation`, `UserInputAnswer`, and
   `RequestPermissionsResponse` to answer interactive requests;
 - `Compact` to compact conversation history;
-- `Review` to start a code review; and
+- `Review` to start an in-process code review (the exec/app-server client does
+  not expose this operation); and
 - `Shutdown` to stop the thread.
 
 Consult the `Op` definition before depending on the complete variant list.
@@ -107,4 +108,5 @@ turn ends with `EventMsg::TurnComplete`.
 Because this protocol is an internal Rust API, adding enum variants or fields
 does not imply a versioned external wire contract. Clients that communicate
 with Codex over stdio or another process boundary should use `codex
-app-server`, whose request and notification types are documented separately.
+app-server`; see the [app-server protocol guide](app_server.md) and its links to
+the generated request and notification contracts.

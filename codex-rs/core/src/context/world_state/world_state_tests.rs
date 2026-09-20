@@ -48,8 +48,8 @@ impl ContextualUserFragment for TestFragment {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.0.clone()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.0)
     }
 }
 
@@ -67,6 +67,38 @@ impl WorldStateSection for DuplicateTestSection {
     ) -> Option<Box<dyn ContextualUserFragment>> {
         None
     }
+}
+
+#[test]
+fn snapshot_merge_patch_preserves_replacements_and_rejects_invalid_roots() {
+    let mut previous: WorldStateSnapshot = serde_json::from_value(json!({
+        "keep": {"deep": {"value": "unchanged"}},
+        "replace": [1, null],
+        "remove": {"old": true}
+    }))
+    .unwrap();
+    let current: WorldStateSnapshot = serde_json::from_value(json!({
+        "keep": {"deep": {"value": "unchanged"}},
+        "replace": {},
+        "new": {"nested": [null, 3]}
+    }))
+    .unwrap();
+    let patch = current.merge_patch_from(&previous).unwrap();
+    assert_eq!(
+        patch,
+        json!({"replace": {}, "remove": null, "new": {"nested": [null, 3]}})
+    );
+    previous.apply_merge_patch(&patch).unwrap();
+    assert_eq!(previous, current);
+    assert_eq!(previous.merge_patch_from(&current), None);
+    for invalid in [Value::Null, json!(3), json!([]), json!("invalid")] {
+        assert!(previous.apply_merge_patch(&invalid).is_err());
+        assert_eq!(previous, current);
+    }
+    previous
+        .apply_merge_patch(&json!({"replace": {"nested": {"absent": null}}}))
+        .unwrap();
+    assert_eq!(previous.section("replace"), Some(&json!({"nested": {}})));
 }
 
 #[test]
@@ -105,7 +137,7 @@ fn render_diff_restores_the_typed_section_snapshot() {
         vec!["after"],
         rendered
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|fragment| fragment.body().into_owned())
             .collect::<Vec<_>>()
     );
 }
@@ -253,7 +285,7 @@ fn missing_retained_fragment_is_rendered_again() {
         world_state
             .render_history_diff(Some(&previous), &[])
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|fragment| fragment.body().into_owned())
             .collect::<Vec<_>>(),
         vec!["<extension_test>current catalog</extension_test>"]
     );
@@ -282,7 +314,7 @@ fn unreadable_section_snapshot_is_treated_as_unknown() {
         vec!["unknown"],
         rendered
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|fragment| fragment.body().into_owned())
             .collect::<Vec<_>>()
     );
 }

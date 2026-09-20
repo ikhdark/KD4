@@ -25,21 +25,15 @@ pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
 /// of what it is doing.
 pub fn parse_command(command: &[String]) -> Vec<ParsedCommand> {
     // Parse and then collapse consecutive duplicate commands to avoid redundant summaries.
-    let parsed = parse_command_impl(command);
-    let mut deduped: Vec<ParsedCommand> = Vec::with_capacity(parsed.len());
-    for cmd in parsed.into_iter() {
-        if deduped.last().is_some_and(|prev| prev == &cmd) {
-            continue;
-        }
-        deduped.push(cmd);
-    }
-    if deduped
+    let mut parsed = parse_command_impl(command);
+    if parsed
         .iter()
         .any(|cmd| matches!(cmd, ParsedCommand::Unknown { .. }))
     {
         vec![single_unknown_for_command(command)]
     } else {
-        deduped
+        parsed.dedup();
+        parsed
     }
 }
 
@@ -1893,7 +1887,11 @@ fn parse_shell_script_impl(script: &str, preserve_paths: bool) -> Vec<ParsedComm
             try_parse_word_only_commands_with_operators(&tree, script)
         && !all_commands.is_empty()
     {
-        let single_command_text = shlex_join(&all_commands[0]);
+        let single_command_text = if all_commands.len() == 1 {
+            shlex_join(&all_commands[0])
+        } else {
+            String::new()
+        };
         let has_pipe = operators.iter().any(|op| op == "|");
         let has_sed_n = all_commands.iter().any(|words| {
             words.first().is_some_and(|word| word == "sed")

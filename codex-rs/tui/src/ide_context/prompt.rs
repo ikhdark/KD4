@@ -202,9 +202,11 @@ fn render_prompt_context(context: &IdeContext) -> Option<String> {
     if ide_context_section.is_empty() {
         None
     } else {
-        ModelContextBudget::default().take(&format!(
-            "# Context from my IDE setup:\n{ide_context_section}"
-        ))
+        ModelContextBudget::default()
+            .take(&format!(
+                "# Context from my IDE setup:\n{ide_context_section}"
+            ))
+            .map(std::borrow::Cow::into_owned)
     }
 }
 

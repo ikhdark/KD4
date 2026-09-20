@@ -2490,6 +2490,146 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 
 impl CoreToolRuntime for TestHandler {}
 
+struct RecoveryFormatHandler {
+    spec: ToolSpec,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolExecutor<ToolInvocation> for RecoveryFormatHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(self.spec.name())
+    }
+
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {
+            Ok(crate::tools::context::boxed_tool_output(
+                crate::tools::context::FunctionToolOutput::from_text("ok".to_string(), Some(true)),
+            ))
+        })
+    }
+}
+
+impl CoreToolRuntime for RecoveryFormatHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(
+            (&self.spec, payload),
+            (ToolSpec::Freeform(_), ToolPayload::Custom { .. })
+                | (ToolSpec::Function(_), ToolPayload::Function { .. })
+        )
+    }
+}
+
+#[tokio::test]
+async fn incompatible_tool_payload_is_recoverable_without_execution() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let name = ToolName::plain("format_probe");
+    let function_payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let custom_payload = ToolPayload::Custom {
+        input: "probe".to_string(),
+    };
+    let freeform_spec = ToolSpec::Freeform(codex_tools::FreeformTool {
+        name: name.name.clone(),
+        description: "Format probe".to_string(),
+        format: codex_tools::FreeformToolFormat {
+            r#type: "grammar".to_string(),
+            syntax: "lark".to_string(),
+            definition: "start: /.+/".to_string(),
+        },
+    });
+    for (spec, wrong, correct, expected) in [
+        (
+            test_spec(&name),
+            custom_payload.clone(),
+            function_payload.clone(),
+            "expected JSON arguments",
+        ),
+        (
+            freeform_spec,
+            function_payload,
+            custom_payload,
+            "expected raw text",
+        ),
+    ] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = ToolRegistry::from_tools([Arc::new(RecoveryFormatHandler {
+            spec,
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn CoreToolRuntime>]);
+        let mut invocation = test_invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "wrong-format",
+            name.clone(),
+        );
+        invocation.payload = wrong;
+        let result = registry
+            .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
+            .await;
+        let Err(FunctionCallError::RespondToModel(message)) = result else {
+            panic!("payload mismatch must be a recoverable tool error");
+        };
+        assert!(message.contains(expected), "{message}");
+        assert!(message.contains("tool was not run"), "{message}");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let mut invocation = test_invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "correct-format",
+            name.clone(),
+        );
+        invocation.payload = correct;
+        registry
+            .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
+            .await
+            .expect("corrected call must execute");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[tokio::test]
+async fn unsupported_tool_call_returns_discovery_guidance() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let registry = ToolRegistry::from_tools(std::iter::empty::<Arc<dyn CoreToolRuntime>>());
+    for payload in [
+        ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+        ToolPayload::Custom {
+            input: "probe".to_string(),
+        },
+    ] {
+        let mut invocation = test_invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "unknown-tool",
+            ToolName::plain("missing_probe"),
+        );
+        invocation.payload = payload;
+        let result = registry
+            .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
+            .await;
+        let Err(FunctionCallError::RespondToModel(message)) = result else {
+            panic!("missing tool must be recoverable");
+        };
+        assert!(message.contains("missing_probe"), "{message}");
+        assert!(message.contains("No tool was run"), "{message}");
+        assert!(message.contains("if tool_search is available"), "{message}");
+        assert!(message.contains("ALL_TOOL_NAMES"), "{message}");
+    }
+}
+
 struct PostHookGateHandler {
     tool_name: ToolName,
     success: bool,
@@ -2520,6 +2660,10 @@ impl ToolExecutor<ToolInvocation> for PostHookGateHandler {
 }
 
 impl CoreToolRuntime for PostHookGateHandler {
+    fn pre_tool_use_payload(&self, _invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        panic!("disabled pre-tool hooks must not build a payload");
+    }
+
     fn post_tool_use_hook_name(&self, _invocation: &ToolInvocation) -> Option<HookToolName> {
         self.name_calls.fetch_add(1, Ordering::Relaxed);
         Some(HookToolName::new(self.tool_name.to_string()))
@@ -3159,7 +3303,7 @@ async fn code_mode_wait_does_not_expose_default_hook_payloads() {
 async fn write_stdin_does_not_expose_default_pre_tool_use_payload() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
 
-    let write_stdin = crate::tools::handlers::WriteStdinHandler;
+    let write_stdin = crate::tools::handlers::WriteStdinHandler::default();
     let invocation = test_invocation(
         Arc::new(session),
         Arc::new(turn),

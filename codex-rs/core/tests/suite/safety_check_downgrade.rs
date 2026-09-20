@@ -9,6 +9,7 @@ use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_model_verification_metadata;
@@ -19,7 +20,6 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -67,7 +67,7 @@ fn disabled_text_turn(test: &TestCodex, text: &str) -> Op {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_model_header_mismatch_emits_warning_event() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let requested_model = "requested-model-for-reroute-test";
     let server_model = "server-model-for-reroute-test";
@@ -111,7 +111,7 @@ async fn openai_model_header_mismatch_emits_warning_event() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let response = ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -145,7 +145,7 @@ async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_model_field_mismatch_emits_warning_when_header_matches_requested() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let response = sse_response(sse(vec![
@@ -207,7 +207,7 @@ async fn response_model_field_mismatch_emits_warning_when_header_matches_request
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let tool_args = serde_json::json!({
@@ -266,7 +266,7 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_model_header_casing_only_mismatch_does_not_warn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let requested_header = REQUESTED_MODEL.to_ascii_uppercase();
@@ -307,7 +307,7 @@ async fn openai_model_header_casing_only_mismatch_does_not_warn() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_verification_emits_structured_event_without_reroute_or_warning() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let response = sse_response(sse(vec![
@@ -375,7 +375,7 @@ async fn model_verification_emits_structured_event_without_reroute_or_warning() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_verification_only_emits_once_per_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let tool_args = serde_json::json!({

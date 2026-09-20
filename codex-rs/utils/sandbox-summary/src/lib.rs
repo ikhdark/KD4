@@ -2,6 +2,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use std::fmt::Write as _;
 
 pub fn summarize_sandbox_policy(sandbox_policy: &SandboxPolicy) -> String {
     match sandbox_policy {
@@ -39,7 +40,7 @@ pub fn summarize_sandbox_policy(sandbox_policy: &SandboxPolicy) -> String {
                     .map(|p| p.to_string_lossy().to_string()),
             );
 
-            summary.push_str(&format!(" [{}]", writable_entries.join(", ")));
+            let _ = write!(summary, " [{}]", writable_entries.join(", "));
             if *network_access {
                 summary.push_str(" (network access enabled)");
             }
@@ -71,7 +72,7 @@ pub fn summarize_permission_profile(
                     .map(|root| root.to_string_lossy().to_string()),
             );
 
-            summary.push_str(&format!(" [{}]", writable_entries.join(", ")));
+            let _ = write!(summary, " [{}]", writable_entries.join(", "));
             if network_access {
                 summary.push_str(" (network access enabled)");
             }

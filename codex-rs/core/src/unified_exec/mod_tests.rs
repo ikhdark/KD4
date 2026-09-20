@@ -606,6 +606,63 @@ async fn an_empty_poll_on_an_interactive_process_keeps_the_quiet_period() -> any
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn noninteractive_poll_keeps_progress_until_completion_or_deadline() -> anyhow::Result<()> {
+    for completes in [false, true] {
+        let (session, turn) = test_session_and_turn().await;
+        let (process_id, process, allow_terminate) =
+            register_pollable_process(&session, &turn, "discovery-poll", false).await?;
+        session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get_mut(&process_id)
+            .expect("registered process")
+            .tty = false;
+        emit_burst_then_go_silent(&process, Duration::from_secs(1));
+        if completes {
+            let process = Arc::clone(&process);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let handles = process.output_handles();
+                handles.output_buffer.lock().await.push_chunk(b"complete\n");
+                process.signal_exit_for_test(Some(0));
+                handles
+                    .output_closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                handles.output_closed_notify.notify_waiters();
+            });
+        }
+        let started_at = Instant::now();
+        let output = write_stdin(&session, process_id, "", 20_000).await?;
+        assert_eq!(
+            Instant::now() - started_at,
+            Duration::from_secs(if completes { 3 } else { 20 }),
+            "progress must not cause an extra model poll"
+        );
+        assert!(String::from_utf8_lossy(&output.raw_output).contains("Compiling codex-core"));
+        assert_eq!(
+            output.process_id,
+            if completes { None } else { Some(process_id) }
+        );
+        assert_eq!(output.exit_code, if completes { Some(0) } else { None });
+        if completes {
+            assert!(String::from_utf8_lossy(&output.raw_output).contains("complete"));
+        }
+        session
+            .services
+            .unified_exec_manager
+            .release_process_id(process_id)
+            .await;
+        allow_terminate.notify_one();
+        process.terminate();
+    }
+    Ok(())
+}
+
 /// Preservation: a direct model call has no wrapper bounding it, so the
 /// configured background maximum still governs the wait.
 #[tokio::test(start_paused = true)]
@@ -616,17 +673,13 @@ async fn a_direct_call_without_a_nested_budget_keeps_the_background_maximum() ->
 
     let started_at = Instant::now();
     let output = write_stdin_within(
-        &session,
-        process_id,
-        "",
-        /*yield_time_ms*/ 120_000,
-        /*nested_deadline*/ None,
+        &session, process_id, "", /*yield_time_ms*/ 600_000, /*nested_deadline*/ None,
     )
     .await?;
 
     assert_eq!(
         Instant::now().saturating_duration_since(started_at),
-        Duration::from_secs(60)
+        Duration::from_secs(300)
     );
     assert_eq!(output.process_id, Some(process_id));
 
@@ -694,28 +747,32 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
     let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 0).await?;
     assert_eq!(
         Instant::now().saturating_duration_since(started_at),
-        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS)
+        Duration::from_millis(MIN_YIELD_TIME_MS)
     );
-    assert_eq!(
-        output.wall_time,
-        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS)
-    );
+    assert_eq!(output.wall_time, Duration::from_millis(MIN_YIELD_TIME_MS));
     assert!(output.raw_output.is_empty());
     assert_eq!(output.process_id, Some(process_id));
     assert_eq!(output.exit_code, None);
     assert!(!output.process_exited);
 
     let started_at = Instant::now();
-    let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 120_000).await?;
+    let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 600_000).await?;
     assert_eq!(
         Instant::now().saturating_duration_since(started_at),
-        Duration::from_secs(60)
+        Duration::from_secs(300)
     );
-    assert_eq!(output.wall_time, Duration::from_secs(60));
+    assert_eq!(output.wall_time, Duration::from_secs(300));
     assert!(output.raw_output.is_empty());
     assert_eq!(output.process_id, Some(process_id));
     assert_eq!(output.exit_code, None);
     assert!(!output.process_exited);
+
+    let output = write_stdin(
+        &session, process_id, "input", /*yield_time_ms*/ 300_000,
+    )
+    .await?;
+    assert_eq!(output.wall_time, Duration::from_secs(30));
+    assert_eq!(output.process_id, Some(process_id));
 
     manager.release_process_id(process_id).await;
     allow_terminate.notify_one();
@@ -1278,6 +1335,34 @@ async fn unified_exec_silent_command_finishes_within_requested_initial_yield() -
         result.truncated_output(TEST_MAX_OUTPUT_TOKENS).trim(),
         "silent-command-complete"
     );
+    assert!(session.list_background_terminals().await.is_empty());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn unified_exec_noninteractive_bursts_finish_in_one_initial_call() -> anyhow::Result<()> {
+    let (session, mut turn) = test_session_and_turn().await;
+    Arc::get_mut(&mut turn)
+        .expect("turn is uniquely owned")
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)?;
+    let result = exec_command_with_tty(
+        &session,
+        &turn,
+        "Write-Output 'first'; Start-Sleep -Milliseconds 1000; Write-Output 'last'",
+        10_000,
+        None,
+        false,
+    )
+    .await?;
+    assert_eq!(result.exit_code, Some(0));
+    assert!(
+        result.process_id.is_none(),
+        "progress must not require a model poll"
+    );
+    let output = result.truncated_output(TEST_MAX_OUTPUT_TOKENS);
+    assert_eq!(output.lines().collect::<Vec<_>>(), vec!["first", "last"]);
     assert!(session.list_background_terminals().await.is_empty());
     Ok(())
 }

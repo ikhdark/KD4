@@ -579,7 +579,7 @@ async fn load_bootstrap_config_or_exit(
             if let Some(config_error) = config_error {
                 eprintln!(
                     "Error loading config.toml:\n{}",
-                    format_config_error_with_source(config_error)
+                    format_config_error_with_source(config_error).await
                 );
             } else {
                 eprintln!("Error loading config.toml: {err}");

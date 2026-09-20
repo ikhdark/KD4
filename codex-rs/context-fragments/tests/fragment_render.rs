@@ -10,9 +10,22 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 
 #[test]
+fn budget_and_rendered_fragment_borrow_unchanged_text() {
+    let text = "instructions".to_string();
+    let mut budget = ModelContextBudget::new(100);
+    let admitted = budget.take(&text).expect("fits");
+    assert!(matches!(admitted, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(admitted.as_ptr(), text.as_ptr());
+    assert_eq!(budget.remaining_bytes(), 400 - text.len());
+    let fragment = RenderedContextFragment::new("developer", text);
+    assert!(matches!(fragment.body(), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(fragment.render(), "instructions");
+}
+
+#[test]
 fn model_context_budget_enforces_aggregate_limit() {
     let mut budget = ModelContextBudget::new(4);
-    assert_eq!(budget.take("12345678"), Some("12345678".to_string()));
+    assert_eq!(budget.take("12345678"), Some("12345678".into()));
     let truncated = budget.take("abcdefghijklmnop").expect("final item");
     assert_eq!(truncated, "abcdefgh");
     assert_eq!(budget.remaining_bytes(), 0);
@@ -23,7 +36,7 @@ fn model_context_budget_enforces_aggregate_limit() {
 fn model_context_budget_truncates_at_utf8_boundary() {
     let mut budget = ModelContextBudget::new(1);
 
-    assert_eq!(budget.take("a😀"), Some("a".to_string()));
+    assert_eq!(budget.take("a😀"), Some("a".into()));
     assert_eq!(budget.remaining_bytes(), 3);
 }
 
@@ -32,10 +45,10 @@ fn item_cap_preserves_aggregate_budget_for_later_fragments() {
     let mut budget = ModelContextBudget::new(10);
     assert_eq!(
         budget.take_up_to(&"x".repeat(100), 12),
-        Some("x".repeat(12))
+        Some("x".repeat(12).into())
     );
     assert_eq!(budget.remaining_bytes(), 28);
-    assert_eq!(budget.take("later"), Some("later".to_string()));
+    assert_eq!(budget.take("later"), Some("later".into()));
     assert_eq!(budget.remaining_bytes(), 23);
 }
 
@@ -45,15 +58,15 @@ fn model_context_budget_rejects_empty_unicode_truncation_without_charging() {
         let mut budget = ModelContextBudget::new(1);
         assert_eq!(budget.take_up_to("😀", cap), None);
         assert_eq!(budget.remaining_bytes(), 4);
-        assert_eq!(budget.take("😀"), Some("😀".to_string()));
+        assert_eq!(budget.take("😀"), Some("😀".into()));
         assert_eq!(budget.remaining_bytes(), 0);
     }
 
     let mut budget = ModelContextBudget::new(1);
-    assert_eq!(budget.take("abc"), Some("abc".to_string()));
+    assert_eq!(budget.take("abc"), Some("abc".into()));
     assert_eq!(budget.take("😀"), None);
     assert_eq!(budget.remaining_bytes(), 1);
-    assert_eq!(budget.take(""), Some(String::new()));
+    assert_eq!(budget.take(""), Some("".into()));
     assert_eq!(budget.remaining_bytes(), 1);
 }
 
@@ -63,12 +76,12 @@ fn model_context_budget_preserves_head_tail_and_marker_with_exact_charge() {
     let text = "😀abcdefghijklmnopqrstuvwxyz😀";
     assert_eq!(
         budget.take_up_to(text, 33),
-        Some("\n[... context truncated ...]\n".to_string())
+        Some("\n[... context truncated ...]\n".into())
     );
     assert_eq!(budget.remaining_bytes(), 51);
     assert_eq!(
         budget.take_up_to("abcdefghijklmnopqrstuvwxyz0123456789", 35),
-        Some("abc\n[... context truncated ...]\n789".to_string())
+        Some("abc\n[... context truncated ...]\n789".into())
     );
     assert_eq!(budget.remaining_bytes(), 16);
 }
@@ -148,8 +161,8 @@ impl ContextualUserFragment for TestFragment {
         ("<test_context>", "</test_context>")
     }
 
-    fn body(&self) -> String {
-        self.body.clone()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.body)
     }
 }
 
@@ -304,8 +317,8 @@ impl ContextualUserFragment for OverlappingMarkerFragment {
         ("ab", "bc")
     }
 
-    fn body(&self) -> String {
-        String::new()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("")
     }
 }
 
@@ -423,8 +436,8 @@ fn marker_match_allows_prefix_markers_ending_with_space() {
             ("# PREFIX ", "</PREFIX>")
         }
 
-        fn body(&self) -> String {
-            "value\n".to_string()
+        fn body(&self) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed("value\n")
         }
     }
 

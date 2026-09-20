@@ -10,13 +10,13 @@ use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
 use indexmap::IndexMap;
@@ -24,7 +24,7 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let request = mount_sse_once(
@@ -124,7 +124,7 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_context_like_user_text_remains_a_user_message_item() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let request = mount_sse_once(
@@ -176,7 +176,7 @@ async fn external_context_like_user_text_remains_a_user_message_item() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_trust_controls_message_role() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let request = mount_sse_once(
@@ -244,7 +244,7 @@ async fn additional_context_trust_controls_message_role() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_is_deduplicated_between_turns_while_retained() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let first_request = mount_sse_once(
@@ -324,7 +324,7 @@ async fn additional_context_is_deduplicated_between_turns_while_retained() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_removes_one_value_while_adding_another() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let first_request = mount_sse_once(
@@ -486,7 +486,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_values_are_truncated_before_model_input() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     const MAX_EXPECTED_EXTERNAL_CONTEXT_TEXT_BYTES: usize = 5 * 1024;
 
@@ -648,7 +648,7 @@ async fn submit_plain_user_text(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     // Default configuration: the per-turn guidance fragment stays out of the
     // request entirely.
@@ -727,7 +727,7 @@ async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_model_guidance_owned_by_base_instructions_is_not_duplicated() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = start_mock_server().await;
     let request = mount_sse_once(
         &server,
@@ -751,8 +751,152 @@ async fn task_model_guidance_owned_by_base_instructions_is_not_duplicated() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_model_guidance_production_capture_matches_effective_settings() -> Result<()> {
+    require_network!();
+
+    // Isolate the opt-in trace environment from concurrently running tests.
+    const TRACE_CHILD: &str = "CODEX_GUIDANCE_CAPTURE_TEST_CHILD";
+    if std::env::var_os(TRACE_CHILD).is_none() {
+        let trace_root = tempfile::tempdir()?;
+        let output = tokio::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("suite::additional_context::task_model_guidance_production_capture_matches_effective_settings")
+            .arg("--nocapture")
+            .env(TRACE_CHILD, "1")
+            .env(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV, trace_root.path())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "trace child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+
+    let trace_root = std::path::PathBuf::from(
+        std::env::var_os(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV)
+            .expect("trace child has an explicit capture directory"),
+    );
+    let mut sampling_ids = std::collections::BTreeSet::new();
+    let mut attempt_ids = std::collections::BTreeSet::new();
+    for enabled in [false, true] {
+        for owned in [false, true] {
+            let instructions = if owned {
+                "<task_model_guidance_policy version=\"1\" />\nRetain exact observed paths."
+            } else {
+                // Similar prose without the exact ownership marker must not
+                // suppress the separate fragment when the feature is enabled.
+                "Retain exact observed paths."
+            };
+            let server = start_mock_server().await;
+            let test = test_codex()
+                .with_config(move |config| {
+                    config.include_environment_context = false;
+                    config.base_instructions = Some(instructions.to_string());
+                    config
+                        .features
+                        .set_enabled(Feature::TaskModelGuidance, enabled)
+                        .unwrap();
+                })
+                .build(&server)
+                .await?;
+            let mut wire_requests = Vec::new();
+            for turn in 0..2 {
+                let request = mount_sse_once(
+                    &server,
+                    sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+                )
+                .await;
+                submit_plain_user_text(
+                    &test,
+                    &format!("capture enabled={enabled} owned={owned} turn={turn}"),
+                )
+                .await?;
+                let request = request.single_request();
+                let wire = request.body_json();
+                assert!(wire.get("_codex").is_none());
+                assert_eq!(wire["instructions"], instructions);
+                assert!(!wire["tools"].as_array().expect("tool schemas").is_empty());
+                assert_eq!(
+                    task_model_guidance_texts(&request).len(),
+                    usize::from(enabled && !owned)
+                );
+                wire_requests.push(wire);
+            }
+            // Stop trace producers before reading payload files.
+            test.codex.shutdown_and_wait().await?;
+
+            for wire in wire_requests {
+                let mut captures = Vec::new();
+                for bundle in std::fs::read_dir(&trace_root)? {
+                    let payloads = bundle?.path().join("payloads");
+                    for entry in std::fs::read_dir(payloads)? {
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+                        if value.get("_codex").is_some() && value["input"] == wire["input"] {
+                            captures.push(value);
+                        }
+                    }
+                }
+                assert_eq!(
+                    captures.len(),
+                    1,
+                    "normal turn must save its production request"
+                );
+                let mut captured = captures.pop().unwrap();
+                let metadata = captured.as_object_mut().unwrap().remove("_codex").unwrap();
+                assert_eq!(
+                    captured, wire,
+                    "capture must preserve instructions, input, tools, and wire settings"
+                );
+                let settings = &metadata["settings"];
+                assert_eq!(settings["task_model_guidance_enabled"], enabled);
+                assert_eq!(settings["base_instructions_own_task_model_guidance"], owned);
+                assert_eq!(
+                    settings["enabled_features"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|key| key == Feature::TaskModelGuidance.key()),
+                    enabled
+                );
+                assert!(settings.get("configured_reasoning_effort").is_some());
+                assert!(settings.get("resolved_reasoning_effort").is_some());
+                assert_eq!(
+                    settings["resolved_reasoning_effort"],
+                    wire["reasoning"]["effort"]
+                );
+                assert_eq!(settings["parallel_tool_calls"], wire["parallel_tool_calls"]);
+                sampling_ids.insert(
+                    metadata["sampling_request_id"]
+                        .as_str()
+                        .expect("sampling ID")
+                        .to_string(),
+                );
+                attempt_ids.insert(
+                    metadata["physical_attempt_id"]
+                        .as_str()
+                        .expect("attempt ID")
+                        .to_string(),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        sampling_ids.len(),
+        8,
+        "each turn has a distinct logical request"
+    );
+    assert_eq!(attempt_ids.len(), 8, "each dispatch has a distinct attempt");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_overflow_resets_stale_values_in_the_model_request() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let first = mount_sse_once(

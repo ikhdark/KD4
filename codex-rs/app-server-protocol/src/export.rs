@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -2222,7 +2223,7 @@ fn index_ts_entries(paths: &[&Path], has_v2_ts: bool) -> String {
 
     let mut entries = String::new();
     for name in stems {
-        entries.push_str(&format!("export type {{ {name} }} from \"./{name}\";\n"));
+        let _ = writeln!(entries, "export type {{ {name} }} from \"./{name}\";");
     }
     if has_v2_ts {
         entries.push_str("export * as v2 from \"./v2\";\n");

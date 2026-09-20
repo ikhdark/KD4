@@ -5,6 +5,7 @@ use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SkillScope;
+use codex_utils_string::xml_text as escape_fragment_text;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AvailableSkillsInstructions {
@@ -33,8 +34,8 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
         )
     }
 
-    fn body(&self) -> String {
-        render_available_skills_body(&[], &self.skill_lines)
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(render_available_skills_body(&[], &self.skill_lines))
     }
 }
 
@@ -61,21 +62,16 @@ impl ContextualUserFragment for SkillInstructions {
         ("<skill>", "</skill>")
     }
 
-    fn body(&self) -> String {
-        let name = escape_fragment_text(&self.name);
-        let path = escape_fragment_text(&self.path);
-        let contents = escape_fragment_text(&self.contents);
-        let scope = self
-            .source_scope
-            .map(|scope| format!("\n<scope>{}</scope>", skill_scope_label(scope)))
-            .unwrap_or_default();
-        format!("\n<name>{name}</name>\n<path>{path}</path>{scope}\n{contents}\n")
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned({
+            let name = escape_fragment_text(&self.name);
+            let path = escape_fragment_text(&self.path);
+            let contents = escape_fragment_text(&self.contents);
+            let scope = self
+                .source_scope
+                .map(|scope| format!("\n<scope>{}</scope>", skill_scope_label(scope)))
+                .unwrap_or_default();
+            format!("\n<name>{name}</name>\n<path>{path}</path>{scope}\n{contents}\n")
+        })
     }
-}
-
-fn escape_fragment_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }

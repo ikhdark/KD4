@@ -38,6 +38,68 @@ use wiremock::matchers::query_param;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[tokio::test]
+async fn skills_list_reports_metadata_errors_and_clears_them_after_reload() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    write_skill(&codex_home, "diagnostics")?;
+    let metadata_dir = codex_home.path().join("skills/diagnostics/agents");
+    std::fs::create_dir_all(&metadata_dir)?;
+    let metadata_path = metadata_dir.join("openai.yaml");
+    std::fs::write(&metadata_path, "interface:\n  icon_small: ../outside.png\n")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    for repaired in [false, true] {
+        if repaired {
+            std::fs::write(&metadata_path, "interface:\n  display_name: Repaired\n")?;
+        }
+        let request_id = mcp
+            .send_skills_list_request(SkillsListParams {
+                cwds: vec![cwd.path().to_path_buf()],
+                force_reload: true,
+            })
+            .await?;
+        let response = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        let SkillsListResponse { data } = to_response(response)?;
+        assert_eq!(data.len(), 1);
+        let skill = data[0]
+            .skills
+            .iter()
+            .find(|skill| skill.name == "diagnostics")
+            .context("valid skill remains available")?;
+        if repaired {
+            assert_eq!(data[0].errors, Vec::new());
+            assert_eq!(
+                skill
+                    .interface
+                    .as_ref()
+                    .and_then(|interface| interface.display_name.as_deref()),
+                Some("Repaired")
+            );
+        } else {
+            assert_eq!(skill.interface, None);
+            assert_eq!(data[0].errors.len(), 1);
+            assert_eq!(
+                std::fs::canonicalize(&data[0].errors[0].path)?,
+                std::fs::canonicalize(&metadata_path)?
+            );
+            assert_eq!(
+                data[0].errors[0].message,
+                "ignoring interface.icon_small: icon path must not contain '..'"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn write_skill(root: &TempDir, name: &str) -> Result<()> {
     let skill_dir = root.path().join("skills").join(name);
     std::fs::create_dir_all(&skill_dir)?;

@@ -1005,8 +1005,8 @@ fn build_payload_roots(
     read_roots = filter_user_profile_root(read_roots);
     read_roots = filter_user_profile_root_exclusions(read_roots);
     read_roots = filter_ssh_config_dependency_roots(read_roots);
-    let write_root_set: HashSet<PathBuf> = write_roots.iter().cloned().collect();
-    read_roots.retain(|root| !write_root_set.contains(root));
+    let write_root_set: HashSet<&PathBuf> = write_roots.iter().collect();
+    read_roots.retain(|root| !write_root_set.contains(&root));
     (read_roots, write_roots)
 }
 

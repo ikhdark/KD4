@@ -44,6 +44,52 @@ const _: () = assert!(
 
 pub(crate) struct RetainedInventoryHandler;
 
+/// The receipt is explanatory; history recovery must retain the exact export,
+/// including when the small receipt itself would fit without an artifact.
+struct RenderedInventoryOutput {
+    receipt: JsonToolOutput,
+    canonical: CanonicalToolResult,
+    artifact_id: String,
+    delivery: Value,
+}
+
+impl codex_tools::ToolOutput for RenderedInventoryOutput {
+    fn log_preview(&self) -> String {
+        self.receipt.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn requires_canonical_artifact(&self) -> bool {
+        true
+    }
+
+    fn canonical_result(&self, _: &ToolPayload) -> Option<CanonicalToolResult> {
+        Some(self.canonical.clone())
+    }
+
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        let mut metadata = self.receipt.projection_metadata()?;
+        metadata.essential_inline["raw_output_artifact_id"] = json!(self.artifact_id);
+        metadata.essential_inline["delivery"] = self.delivery.clone();
+        Some(metadata)
+    }
+
+    fn to_response_item(
+        &self,
+        call_id: &str,
+        payload: &ToolPayload,
+    ) -> codex_protocol::models::ResponseInputItem {
+        self.receipt.to_response_item(call_id, payload)
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> Value {
+        self.receipt.code_mode_result(payload)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Profile {
@@ -214,7 +260,7 @@ fn nonempty(value: &str) -> bool {
 impl Snapshot {
     fn new(scope: Value, profile: Profile) -> Result<Self, FunctionCallError> {
         if !scope.is_object()
-            || scope.as_object().is_none_or(|scope| scope.is_empty())
+            || scope.as_object().is_none_or(serde_json::Map::is_empty)
             || scope.to_string().len() > 4_096
             || profile.categories.is_empty()
             || profile.categories.len() > 32
@@ -534,7 +580,7 @@ async fn observe(
                 .split(|byte| *byte == 0)
                 .filter(|entry| !entry.is_empty())
             {
-                if let Some(tab) = entry.iter().position(|byte| *byte == b'\t')
+                if let Some(tab) = memchr::memchr(b'\t', entry)
                     && let Ok(path) = std::str::from_utf8(&entry[tab + 1..])
                 {
                     ids.insert(native_key(&repo.join(path)));
@@ -749,7 +795,11 @@ async fn persist(invocation: &ToolInvocation, value: Value) -> Result<String, Fu
         .ok_or_else(|| invalid("inventory snapshot has no artifact identity"))
 }
 
-async fn execute(invocation: &ToolInvocation, args: Args) -> Result<Value, FunctionCallError> {
+async fn execute(
+    invocation: &ToolInvocation,
+    args: Args,
+    canonical_render: &mut Option<CanonicalToolResult>,
+) -> Result<Value, FunctionCallError> {
     if let Args::Create {
         scope,
         profile,
@@ -931,19 +981,23 @@ async fn execute(invocation: &ToolInvocation, args: Args) -> Result<Value, Funct
                 return Err(invalid("offset is past the record count"));
             }
             let mut page = Vec::new();
+            let summary = snapshot.summary();
+            let mut page_tokens = codex_utils_string::approx_token_count(
+                &json!({"summary": summary, "records": []}).to_string(),
+            );
             for record in all.iter().skip(offset).take(limit) {
                 let row = json!({"category": record.category, "candidate": record.candidate,
                     "classification": record.classification, "status": record.status,
                     "unresolved_reason": record.unresolved_reason,
                     "record": {"artifact_id": id, "pointer": format!("/records/{}/{}", escape_pointer(&record.category), escape_pointer(&record.candidate.id))}});
-                let mut trial = page.clone();
-                trial.push(row.clone());
-                if codex_utils_string::approx_token_count(
-                    &json!({"summary": snapshot.summary(), "records": trial}).to_string(),
-                ) > PAGE_TOKENS
-                {
+                // JSON row boundaries are punctuation, so the sum of row
+                // estimates plus commas conservatively bounds the full page.
+                let row_tokens = codex_utils_string::approx_token_count(&row.to_string())
+                    + usize::from(!page.is_empty());
+                if page_tokens.saturating_add(row_tokens) > PAGE_TOKENS {
                     break;
                 }
+                page_tokens += row_tokens;
                 page.push(row);
             }
             if page.is_empty() && offset < all.len() {
@@ -953,7 +1007,7 @@ async fn execute(invocation: &ToolInvocation, args: Args) -> Result<Value, Funct
             }
             let end = offset + page.len();
             return Ok(
-                json!({"inventory_id": id, "reused": true, "summary": snapshot.summary(), "records": page,
+                json!({"inventory_id": id, "reused": true, "summary": summary, "records": page,
                 "page_complete": end == all.len(), "next_offset": if end < all.len() { Some(end) } else { None }}),
             );
         }
@@ -979,6 +1033,7 @@ async fn execute(invocation: &ToolInvocation, args: Args) -> Result<Value, Funct
                 "classifications": classifications, "summary": snapshot.summary(),
                 "count": identifiers.len(), "identifiers": identifiers});
             let count = rendered["count"].clone();
+            *canonical_render = Some(CanonicalToolResult::json(rendered.clone()));
             let artifact_id = persist(invocation, rendered).await?;
             // Snapshots are capped below the artifact segment size: this file
             // contains the complete rendered document, not a head fragment.
@@ -1028,8 +1083,8 @@ async fn execute(invocation: &ToolInvocation, args: Args) -> Result<Value, Funct
     )
 }
 
-fn escape_pointer(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
+fn escape_pointer(value: &str) -> impl std::fmt::Display + '_ {
+    codex_utils_string::json_pointer_segment(value)
 }
 
 impl ToolExecutor<ToolInvocation> for RetainedInventoryHandler {
@@ -1090,7 +1145,21 @@ impl ToolExecutor<ToolInvocation> for RetainedInventoryHandler {
             if invocation.cancellation_token.is_cancelled() {
                 return Err(invalid("inventory operation cancelled"));
             }
-            let result = execute(&invocation, args).await?;
+            let mut canonical_render = None;
+            let result = execute(&invocation, args, &mut canonical_render).await?;
+            if let Some(canonical) = canonical_render {
+                let artifact_id = result["rendered_artifact_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid("rendered inventory has no artifact identity"))?
+                    .to_string();
+                return Ok(boxed_tool_output(RenderedInventoryOutput {
+                    delivery: json!({"rendered_path": result["rendered_path"], "count": result["count"],
+                        "scope_id": result["summary"]["scope_id"], "complete": result["summary"]["complete"]}),
+                    receipt: JsonToolOutput::new(result),
+                    canonical,
+                    artifact_id,
+                }));
+            }
             Ok(boxed_tool_output(JsonToolOutput::new(result)))
         })
     }

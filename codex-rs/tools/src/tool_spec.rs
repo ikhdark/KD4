@@ -87,8 +87,16 @@ impl ToolSpec {
 
     /// Returns the callable identity when this spec declares exactly one.
     pub fn sole_callable_tool_name(&self) -> Option<ToolName> {
-        let mut names = self.callable_tool_names();
-        (names.len() == 1).then(|| names.remove(0))
+        match self {
+            ToolSpec::Namespace(namespace) => match namespace.tools.as_slice() {
+                [crate::ResponsesApiNamespaceTool::Function(tool)] => Some(ToolName::namespaced(
+                    namespace.name.clone(),
+                    tool.name.clone(),
+                )),
+                _ => None,
+            },
+            _ => Some(ToolName::plain(self.name())),
+        }
     }
 }
 

@@ -4,6 +4,20 @@ use super::JsonSchemaPrimitiveType;
 use super::JsonSchemaType;
 use super::parse_tool_input_schema;
 use super::parse_tool_input_schema_without_compaction;
+
+#[test]
+fn compact_schema_byte_count_matches_serialized_utf8_and_escapes() {
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object", "properties": {
+            "quoted\"field": {"type": "string", "description": "Unicode: 界\n\t\\"}
+        }
+    }))
+    .unwrap();
+    assert_eq!(
+        super::compact_schema_bytes(&schema),
+        Some(serde_json::to_vec(&schema).unwrap().len())
+    );
+}
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 

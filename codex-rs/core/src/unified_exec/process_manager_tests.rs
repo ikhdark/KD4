@@ -152,7 +152,7 @@ async fn input_handoff_preserves_poll_bytes_and_reports_actual_wait() {
     assert_eq!(wait.requested_timeout_ms, Some(120_000));
     assert_eq!(
         wait.effective_timeout_ms,
-        Some(manager.max_write_stdin_yield_time_ms)
+        Some(120_000.min(manager.max_write_stdin_yield_time_ms))
     );
     assert_eq!(wait.wake_reason, ToolLifecycleWakeReason::Retry);
     assert!(input.await.unwrap().raw_output.is_empty());
@@ -186,13 +186,8 @@ async fn poll_progress_is_completed_and_silence_is_timeout() {
             ToolLifecycleWakeReason::Completed,
             250,
         ),
-        // Silence runs out the effective empty-poll timeout, not the smaller
-        // requested yield.
-        (
-            b"".as_slice(),
-            ToolLifecycleWakeReason::Timeout,
-            crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS,
-        ),
+        // Silence honors the explicitly requested observation timeout.
+        (b"".as_slice(), ToolLifecycleWakeReason::Timeout, 1_000),
     ] {
         process
             .output_handles()
@@ -224,12 +219,7 @@ async fn poll_progress_is_completed_and_silence_is_timeout() {
             .find(|wait| wait.wait_kind == "write_stdin_yield")
             .unwrap();
         assert_eq!(wait.wake_reason, expected);
-        // An empty poll is a background wait, so the requested yield is raised
-        // to the empty-poll floor rather than used as written.
-        assert_eq!(
-            wait.effective_timeout_ms,
-            Some(crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS)
-        );
+        assert_eq!(wait.effective_timeout_ms, Some(1_000));
     }
     manager.process_store.lock().await.remove(1000);
     process.terminate_confirmed().await.unwrap();
@@ -1584,7 +1574,7 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
 
 #[test]
 fn initial_exec_yield_time_uses_platform_floor() {
-    let above_max_yield_time_ms = crate::unified_exec::MAX_YIELD_TIME_MS + 1;
+    let above_max_yield_time_ms = crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS + 1;
     let expected_initial_yield_time_ms = if cfg!(windows) {
         crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
     } else {
@@ -1596,9 +1586,10 @@ fn initial_exec_yield_time_uses_platform_floor() {
         expected_initial_yield_time_ms
     );
     assert_eq!(clamp_yield_time(/*yield_time_ms*/ 10_000), 10_000);
+    assert_eq!(clamp_yield_time(/*yield_time_ms*/ 300_000), 300_000);
     assert_eq!(
         clamp_yield_time(/*yield_time_ms*/ above_max_yield_time_ms),
-        crate::unified_exec::MAX_YIELD_TIME_MS
+        crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS
     );
 }
 
@@ -2513,10 +2504,7 @@ fn warm_executor_yield_time_does_not_reapply_windows_cold_floor() {
 
 #[test]
 fn executor_readiness_is_scoped_to_environment() {
-    let manager = UnifiedExecProcessManager::new_with_deferred_executor(
-        DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
-        /*deferred_executor_enabled*/ false,
-    );
+    let manager = UnifiedExecProcessManager::new(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
 
     assert!(!manager.mark_executor_ready("environment-a"));
     assert!(manager.mark_executor_ready("environment-a"));
@@ -3575,7 +3563,7 @@ fn registered_nonpty_interrupt_yields_to_worker_and_preserves_unsupported_proces
         };
         // Exercise the normal handler directly to isolate native signal work
         // from the registered pipeline's earlier worker-backed preflight.
-        let handler = crate::tools::handlers::WriteStdinHandler;
+        let handler = crate::tools::handlers::WriteStdinHandler::default();
         let mut interrupt = handler.handle(crate::tools::context::ToolInvocation {
             session: Arc::clone(&session),
             step_context: Arc::clone(&step),

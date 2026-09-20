@@ -758,15 +758,21 @@ fn middle_truncate(value: &str, max_chars: usize, options: HumanOutputOptions) -
     let head_len = max_chars / 2;
     let marker = if options.ascii { "..." } else { "…" };
     let tail_len = max_chars.saturating_sub(head_len + marker.chars().count());
-    let head = value.chars().take(head_len).collect::<String>();
-    let tail = value
-        .chars()
+    let head_end = value
+        .char_indices()
+        .nth(head_len)
+        .map_or(value.len(), |(index, _)| index);
+    let tail_start = value
+        .char_indices()
         .rev()
-        .take(tail_len)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+        .nth(tail_len.saturating_sub(1))
+        .map_or(0, |(index, _)| index);
+    let head = &value[..head_end];
+    let tail = if tail_len == 0 {
+        ""
+    } else {
+        &value[tail_start..]
+    };
     format!("{head}{marker}{tail}")
 }
 

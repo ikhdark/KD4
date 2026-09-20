@@ -42,9 +42,5 @@ pub fn version_for_toml(value: &TomlValue) -> String {
     let mut hasher = Sha256::new();
     hasher.update(serialized);
     let hash = hasher.finalize();
-    let hex = hash
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("sha256:{hex}")
+    format!("sha256:{hash:x}")
 }

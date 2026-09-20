@@ -76,8 +76,8 @@ use codex_protocol::models::ImageDetail;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_utils_absolute_path::test_support::PathExt;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -1726,7 +1726,7 @@ async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<(
 
 #[tokio::test]
 async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -1825,7 +1825,7 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
 #[tokio::test]
 async fn turn_start_uses_thread_feature_overrides_for_request_user_input_tool_description_v2()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -1921,7 +1921,7 @@ async fn turn_start_uses_thread_feature_overrides_for_request_user_input_tool_de
 
 #[tokio::test]
 async fn turn_start_accepts_personality_override_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -2001,7 +2001,7 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let sse1 = responses::sse(vec![
@@ -2118,7 +2118,7 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
 
 #[tokio::test]
 async fn app_server_startup_does_not_run_retired_personality_migration_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let codex_home = TempDir::new()?;
@@ -2183,7 +2183,7 @@ async fn turn_start_forwards_custom_local_image_detail() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().to_path_buf();
@@ -2348,7 +2348,7 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_exec_approval_decline_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().to_path_buf();
@@ -2490,7 +2490,7 @@ async fn turn_start_exec_approval_decline_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
@@ -2842,7 +2842,7 @@ fn environment_params(ids: Option<&[&str]>, cwd: &Path) -> Option<Vec<TurnEnviro
 
 #[tokio::test]
 async fn turn_start_file_change_approval_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
@@ -3017,7 +3017,7 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
@@ -3129,7 +3129,7 @@ async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v
 
 #[tokio::test]
 async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
@@ -3278,7 +3278,7 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     const CHILD_PROMPT: &str = "child: do work";
     const PARENT_PROMPT: &str = "spawn a child and continue";
@@ -3660,7 +3660,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_emits_spawn_agent_item_with_effective_role_model_metadata_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     const CHILD_PROMPT: &str = "child: do work";
     const PARENT_PROMPT: &str = "spawn a child and continue";
@@ -3852,7 +3852,7 @@ config_file = "./custom-role.toml"
 
 #[tokio::test]
 async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
@@ -4041,7 +4041,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
 
 #[tokio::test]
 async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
@@ -4199,7 +4199,7 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
 
 #[tokio::test]
 async fn command_execution_notifications_include_process_id() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let responses = vec![
         create_exec_command_sse_response("uexec-1")?,

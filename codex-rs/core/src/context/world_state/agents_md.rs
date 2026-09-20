@@ -10,7 +10,6 @@ use serde::Serialize;
 
 const REPLACEMENT_NOTICE: &str =
     "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.";
-const REMOVAL_NOTICE: &str = "The previously provided AGENTS.md instructions no longer apply.";
 
 /// The AGENTS.md instructions currently visible to the model.
 #[derive(Clone, Debug, Default)]
@@ -29,6 +28,9 @@ pub(crate) struct AgentsMdSnapshot {
 }
 
 impl AgentsMdState {
+    pub(crate) const REMOVAL_NOTICE: &str =
+        "The previously provided AGENTS.md instructions no longer apply.";
+
     #[cfg(test)]
     pub(crate) fn new(loaded: Option<&LoadedAgentsMd>) -> Self {
         Self::from_instructions(
@@ -131,7 +133,7 @@ impl WorldStateSection for AgentsMdState {
             (Some(instructions), false) => instructions.clone(),
             (None, true) => UserInstructions {
                 directory: None,
-                text: REMOVAL_NOTICE.to_string(),
+                text: Self::REMOVAL_NOTICE.to_string(),
             },
             (None, false) => return None,
         };

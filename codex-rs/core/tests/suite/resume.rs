@@ -4,6 +4,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_reasoning_item;
@@ -12,7 +13,6 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
@@ -62,7 +62,7 @@ async fn resume_until_initial_messages(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
@@ -123,6 +123,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
                     EventMsg::ThreadSettingsApplied(_),
                     EventMsg::TurnStarted(_),
                     EventMsg::UserMessage(_),
+                    EventMsg::ItemCompleted(_),
                     EventMsg::AgentMessage(_),
                     EventMsg::TokenCount(_),
                     EventMsg::TurnComplete(_),
@@ -140,6 +141,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
             EventMsg::ThreadSettingsApplied(_),
             EventMsg::TurnStarted(started),
             EventMsg::UserMessage(first_user),
+            EventMsg::ItemCompleted(canonical),
             EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
@@ -147,6 +149,15 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
             assert_eq!(first_user.message, "Record some messages");
             assert_eq!(first_user.text_elements, text_elements);
             assert_eq!(assistant_message.message, "Completed first turn");
+            assert_eq!(canonical.turn_id, started.turn_id);
+            let codex_protocol::items::TurnItem::AgentMessage(item) = &canonical.item else {
+                panic!("expected canonical assistant message: {canonical:?}");
+            };
+            assert_eq!(item.id, "msg-1");
+            assert_eq!(item.phase, assistant_message.phase);
+            assert!(
+                matches!(item.content.as_slice(), [codex_protocol::items::AgentMessageContent::Text { text }] if text == &assistant_message.message)
+            );
             assert_eq!(completed.turn_id, started.turn_id);
             assert_eq!(
                 completed.last_agent_message.as_deref(),
@@ -161,7 +172,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
@@ -221,6 +232,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
                     EventMsg::UserMessage(_),
                     EventMsg::AgentReasoning(_),
                     EventMsg::AgentReasoningRawContent(_),
+                    EventMsg::ItemCompleted(_),
                     EventMsg::AgentMessage(_),
                     EventMsg::TokenCount(_),
                     EventMsg::TurnComplete(_),
@@ -241,6 +253,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
             EventMsg::UserMessage(first_user),
             EventMsg::AgentReasoning(reasoning),
             EventMsg::AgentReasoningRawContent(raw),
+            EventMsg::ItemCompleted(canonical),
             EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
@@ -249,6 +262,15 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
             assert_eq!(reasoning.text, "Summarized step");
             assert_eq!(raw.text, "raw detail");
             assert_eq!(assistant_message.message, "Completed reasoning turn");
+            assert_eq!(canonical.turn_id, started.turn_id);
+            let codex_protocol::items::TurnItem::AgentMessage(item) = &canonical.item else {
+                panic!("expected canonical assistant message: {canonical:?}");
+            };
+            assert_eq!(item.id, "msg-1");
+            assert_eq!(item.phase, assistant_message.phase);
+            assert!(
+                matches!(item.content.as_slice(), [codex_protocol::items::AgentMessageContent::Text { text }] if text == &assistant_message.message)
+            );
             assert_eq!(completed.turn_id, started.turn_id);
             assert_eq!(
                 completed.last_agent_message.as_deref(),
@@ -297,7 +319,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_preserves_persisted_model_and_refreshes_base_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     const PERSISTED_INSTRUCTIONS: &str = "Preserve this specific instruction across cold resume.";
     const RESUMED_INSTRUCTIONS: &str = "Use these current instructions after cold resume.";
@@ -446,7 +468,7 @@ async fn resume_preserves_persisted_model_and_refreshes_base_instructions() -> R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {

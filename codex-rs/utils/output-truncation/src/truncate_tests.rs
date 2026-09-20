@@ -21,6 +21,67 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn token_ceiling_borrows_unchanged_text_and_reports_actual_omission() {
+    for (source, limit, expected, truncated) in [
+        ("", 0, "", false),
+        ("abcd", 1, "abcd", false),
+        ("abcd", 0, "", true),
+        ("!!!", 2, "!…", true),
+    ] {
+        let text = crate::truncate_text_to_token_ceiling_cow(source, limit);
+        assert_eq!(matches!(text, std::borrow::Cow::Owned(_)), truncated);
+        assert_eq!(text, expected);
+        let result = crate::truncate_text_with_output_limit(
+            source,
+            crate::OutputLimitResolution {
+                requested_limit: Some(limit),
+                default_limit: limit,
+                hard_limit: limit,
+                applied_limit: limit,
+            },
+        );
+        assert_eq!(result.text, expected);
+        assert_eq!(result.was_truncated, truncated);
+    }
+}
+
+#[test]
+fn sampled_region_smaller_than_a_character_is_empty() {
+    let text = "雪雪";
+    assert_eq!(
+        crate::retained_text(
+            text,
+            text.ceil_char_boundary(1),
+            text.floor_char_boundary(2)
+        ),
+        ""
+    );
+}
+#[test]
+fn token_truncation_preserves_complete_lines_at_each_seam() {
+    for ending in ["\n", "\r\n"] {
+        let content = (0..200)
+            .map(|index| format!("line {index:03}: precise source context{ending}"))
+            .collect::<String>();
+        let result = truncate_text_to_token_ceiling(&content, 240);
+        assert!(approx_token_count(&result) <= 240);
+        assert!(result.contains("[omitted before retained middle]"));
+        assert!(result.contains("line 000:"));
+        assert!(result.contains("line 199:"));
+        for line in result
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('['))
+        {
+            assert!(
+                content.lines().any(|source| source == line),
+                "partial source line: {line:?}"
+            );
+        }
+        assert!(result.lines().any(|line| line.starts_with("line 10")));
+    }
+}
+
+#[test]
 fn truncate_bytes_less_than_placeholder_returns_placeholder() {
     let content = "example output";
 
@@ -770,6 +831,34 @@ fn validation_launcher_chains_do_not_require_recursive_stack_space() {
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(&command), "ok", 20_000);
         assert_eq!(limits.applied_limit, expected);
+    }
+}
+
+#[test]
+fn validation_launchers_preserve_diagnostic_budgets_without_promoting_arguments() {
+    for launcher in ["pnpm exec", "bunx", "poetry run", "pipx run"] {
+        for (invocation, expected) in [
+            ("pytest -q", DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS),
+            ("pytest --help", DEFAULT_SUCCESS_OUTPUT_TOKENS),
+            ("echo pytest", DEFAULT_SUCCESS_OUTPUT_TOKENS),
+        ] {
+            let command = format!("{launcher} {invocation}");
+            let limits =
+                resolve_output_limits(None, OutputOutcome::Success, Some(&command), "ok", 20_000);
+            assert_eq!(limits.applied_limit, expected, "{command}");
+        }
+        let command = format!("{launcher} echo pytest");
+        let limits = resolve_output_limits(
+            None,
+            OutputOutcome::Failure,
+            Some(&command),
+            "failed",
+            20_000,
+        );
+        assert_eq!(
+            limits.applied_limit, DEFAULT_FAILURE_OUTPUT_TOKENS,
+            "{command}"
+        );
     }
 }
 

@@ -22,6 +22,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::TempDirExt;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -32,7 +33,6 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_metadata_from_json;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -98,6 +98,11 @@ fn assert_default_env_context(text: &str, cwd: &str) {
         "expected timezone in environment context: {text}"
     );
 
+    assert_env_context_location(text, cwd);
+}
+
+fn assert_env_context_location(text: &str, cwd: &str) {
+    assert_env_context_fragment(text);
     assert!(
         text.contains(&format!("<cwd>{cwd}</cwd>")),
         "expected cwd in environment context: {text}"
@@ -162,7 +167,6 @@ fn normalize_newlines(text: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
@@ -237,9 +241,12 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
     let expected_tools_names = vec![
         "exec",
         "wait",
+        "tool_search",
         "exec_command",
         "write_stdin",
         "read_tool_output",
+        "read_file",
+        "list_files",
         "update_plan",
         "request_user_input",
         "request_permissions",
@@ -248,18 +255,23 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "web_search",
     ];
     let body0 = req1.single_request().body_json();
-
-    let expected_instructions = if expected_tools_names.contains(&"apply_patch") {
-        base_instructions
-    } else {
-        [base_instructions, APPLY_PATCH_TOOL_INSTRUCTIONS.to_string()].join("\n")
-    };
+    let expected_instructions = base_instructions;
 
     assert_eq!(
         body0["instructions"],
         serde_json::json!(expected_instructions),
     );
     assert_tool_names(&body0, &expected_tools_names);
+    let patch_tool = body0["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "apply_patch")
+        .unwrap();
+    assert!(
+        normalize_newlines(patch_tool["description"].as_str().unwrap())
+            .contains(&normalize_newlines(APPLY_PATCH_TOOL_INSTRUCTIONS))
+    );
 
     let body1 = req2.single_request().body_json();
     assert_eq!(
@@ -272,8 +284,8 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gpt_5_tools_without_apply_patch_keep_base_instructions_consistent() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+async fn gpt_5_patch_tool_keeps_base_instructions_consistent() -> anyhow::Result<()> {
+    require_network!();
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
@@ -359,7 +371,7 @@ async fn gpt_5_tools_without_apply_patch_keep_base_instructions_consistent() -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefixes_context_and_instructions_once_and_consistently_across_requests()
 -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
@@ -442,7 +454,7 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
@@ -557,7 +569,7 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn override_before_first_turn_emits_environment_context() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -716,7 +728,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
@@ -815,7 +827,9 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     assert_eq!(env_contexts.len(), 1);
     let env_text = env_contexts[0];
     let expected_cwd = new_cwd.path().display().to_string();
-    assert_default_env_context(env_text, &expected_cwd);
+    assert_env_context_location(env_text, &expected_cwd);
+    assert!(!env_text.contains("<current_date>"));
+    assert!(!env_text.contains("<timezone>"));
     let second_user_texts = message_texts(&body2, "user");
     assert!(second_user_texts.contains(&"hello 1"));
     assert!(second_user_texts.contains(&"hello 2"));
@@ -825,7 +839,7 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
@@ -941,7 +955,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
@@ -1066,7 +1080,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_rollout()
 -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let plan_args = serde_json::json!({

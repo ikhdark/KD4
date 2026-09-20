@@ -3,10 +3,12 @@ use codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS;
 
 use super::EXIT_SENTINEL;
 use super::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
+use super::MAX_SESSION_STORED_VALUE_BYTES;
+use super::MAX_SESSION_STORED_VALUES;
 use super::RuntimeEvent;
 use super::RuntimeState;
+use super::stored_value_entry_bytes;
 use super::stored_value_limit_message;
-use super::stored_values_within_limits;
 use super::timers;
 use super::value::json_to_v8;
 use super::value::normalize_output_image;
@@ -19,8 +21,8 @@ pub(super) fn tool_callback(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
-    let tool_index = match args.data().to_rust_string_lossy(scope).parse::<usize>() {
-        Ok(tool_index) => tool_index,
+    let tool_index = match v8::Local::<v8::Uint32>::try_from(args.data()) {
+        Ok(tool_index) => tool_index.value() as usize,
         Err(_) => {
             throw_type_error(scope, "invalid tool callback data");
             return;
@@ -256,20 +258,24 @@ pub(super) fn store_callback(
             return Some(error.clone());
         }
 
-        let previous = state.stored_values.insert(key.clone(), serialized.clone());
-        if stored_values_within_limits(&state.stored_values) {
+        let bytes = stored_value_entry_bytes(&key, &serialized);
+        let previous_bytes = state.stored_value_bytes.get(&key).copied();
+        let total_bytes = state
+            .total_stored_value_bytes
+            .checked_sub(previous_bytes.unwrap_or(0))
+            .and_then(|total| total.checked_add(bytes));
+        if state.stored_values.len() + usize::from(previous_bytes.is_none())
+            <= MAX_SESSION_STORED_VALUES
+            && let Some(total_bytes) =
+                total_bytes.filter(|total| *total <= MAX_SESSION_STORED_VALUE_BYTES)
+        {
+            state.total_stored_value_bytes = total_bytes;
+            state.stored_value_bytes.insert(key.clone(), bytes);
+            state.stored_values.insert(key.clone(), serialized.clone());
             state.stored_value_writes.insert(key, serialized);
             return None;
         }
 
-        match previous {
-            Some(previous) => {
-                state.stored_values.insert(key, previous);
-            }
-            None => {
-                state.stored_values.remove(&key);
-            }
-        }
         state.stored_value_writes.clear();
         let error = stored_value_limit_message();
         state.stored_value_limit_error = Some(error.clone());

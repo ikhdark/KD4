@@ -22,8 +22,9 @@ impl ContextualUserFragment for ModelSwitchInstructions {
         ("<model_switch>", "</model_switch>")
     }
 
-    fn body(&self) -> String {
-        "\nThe user was previously using a different model. Continue following the session's existing base instructions. Adapt only to the capabilities and tools available in the current request.\n"
-            .to_string()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(
+            "\nThe user was previously using a different model. Continue following the session's existing base instructions. Adapt only to the capabilities and tools available in the current request.\n",
+        )
     }
 }

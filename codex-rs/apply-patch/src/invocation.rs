@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use codex_exec_server::ExecutorFileSystem;
@@ -265,28 +264,7 @@ async fn try_verify_apply_patch_args(
         .into());
     }
 
-    let mut mutation_endpoints = HashSet::new();
-    for hunk in &hunks {
-        let source_path = hunk.resolve_path(&effective_cwd)?;
-        let move_path = match hunk {
-            Hunk::UpdateFile {
-                move_path: Some(move_path),
-                ..
-            } => Some(effective_cwd.join(&move_path.to_string_lossy())?),
-            _ => None,
-        };
-
-        for path in std::iter::once(source_path).chain(move_path) {
-            let identity = mutation_endpoint_identity(fs, &path, sandbox).await?;
-            if !mutation_endpoints.insert(identity) {
-                return Err(ParseError::InvalidPatchError(format!(
-                    "path '{}' is mutated more than once in the same patch",
-                    path.inferred_native_path_string()
-                ))
-                .into());
-            }
-        }
-    }
+    validate_mutation_endpoints(&hunks, &effective_cwd, fs, sandbox).await?;
 
     let mut changes = HashMap::new();
     for (hunk_index, hunk) in hunks.into_iter().enumerate() {
@@ -338,6 +316,48 @@ async fn try_verify_apply_patch_args(
         patch,
         cwd: effective_cwd,
     })
+}
+
+/// Check the complete endpoint set before either verified or standalone writes.
+pub(crate) async fn validate_mutation_endpoints(
+    hunks: &[Hunk],
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+) -> Result<(), ApplyPatchError> {
+    let mut mutation_endpoints = HashMap::new();
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
+        let source_path = hunk.resolve_path(cwd)?;
+        let move_path = match hunk {
+            Hunk::UpdateFile {
+                move_path: Some(move_path),
+                ..
+            } => Some(cwd.join(&move_path.to_string_lossy())?),
+            _ => None,
+        };
+
+        for path in std::iter::once(source_path).chain(move_path) {
+            let identity = mutation_endpoint_identity(fs, &path, sandbox).await?;
+            if let Some((previous_path, previous_hunk)) =
+                mutation_endpoints.insert(identity, (path.clone(), hunk_index + 1))
+            {
+                let same_move = if previous_hunk == hunk_index + 1 {
+                    "move source and destination identify the same path; "
+                } else {
+                    ""
+                };
+                return Err(ParseError::InvalidPatchError(format!(
+                    "{same_move}path '{}' (hunk {}) is mutated more than once in the same patch; it identifies the same endpoint as '{}' (hunk {previous_hunk}). Combine edits into one Update File hunk, including edits to a move destination.",
+                    path.inferred_native_path_string(),
+                    hunk_index + 1,
+                    previous_path.inferred_native_path_string(),
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve existing endpoints through links and resolve the closest existing
@@ -607,14 +627,28 @@ mod tests {
     }
 
     fn assert_duplicate_path_error(result: MaybeApplyPatchVerified, expected_path: &PathUri) {
-        let expected_message = format!(
-            "path '{}' is mutated more than once in the same patch",
-            expected_path.inferred_native_path_string()
-        );
         match result {
             MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ParseError(
                 ParseError::InvalidPatchError(message),
-            )) => assert_eq!(message, expected_message),
+            )) => {
+                assert!(
+                    message.contains(&format!(
+                        "path '{}' (hunk ",
+                        expected_path.inferred_native_path_string()
+                    )),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("is mutated more than once in the same patch"),
+                    "{message}"
+                );
+                assert!(message.contains("same endpoint as"), "{message}");
+                assert!(message.contains("hunk 1"), "{message}");
+                assert!(
+                    message.contains("Combine edits into one Update File hunk"),
+                    "{message}"
+                );
+            }
             other => panic!("expected duplicate path error, got {other:?}"),
         }
     }
@@ -781,12 +815,20 @@ mod tests {
             None,
         )
         .await;
-        let MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ComputeReplacements(
-            message,
+        let MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::PatchContextMismatch(
+            mismatch,
         )) = result
         else {
             panic!("{result:?}")
         };
+        assert_eq!(
+            mismatch.kind,
+            crate::PatchContextMismatchKind::AmbiguousMatch
+        );
+        assert_eq!((mismatch.hunk_ordinal, mismatch.chunk_ordinal), (2, 1));
+        assert_eq!(mismatch.current_line_start, 1);
+        assert!(mismatch.current_excerpt.contains("old"));
+        let message = mismatch.message;
         assert!(
             message.contains("Ambiguous exact match at lines 1 and 2"),
             "{message}"

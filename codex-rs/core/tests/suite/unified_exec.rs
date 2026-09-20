@@ -19,6 +19,7 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::assert_regex_match;
 use core_test_support::managed_network_requirements_loader;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -26,11 +27,9 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
-use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -299,7 +298,7 @@ fn retained_process_exec_args(program: &std::path::Path, yield_time_ms: u64) -> 
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_command_retained_session_lifecycle_completes_without_stale_processes() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let server = start_mock_server().await;
     let mut builder = test_codex()
         .with_raw_response_items()
@@ -782,7 +781,7 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_command_interrupt_closes_unpublished_retained_process_before_turn_aborted()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     const CALL_ID: &str = "retained-interrupt-exec";
     const READY_MARKER: &str = "__KD4_RETAINED_READY__";
@@ -1132,7 +1131,7 @@ async fn wait_for_unified_exec_end(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let open_args = json!({
         "kind": "powershell_script",
@@ -1151,9 +1150,8 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
     let poll_args = json!({
         "chars": "",
         "session_id": 1000,
-        // Even a model-requested short poll must wait for real output instead of
-        // burning another generation on the still-running, silent process.
-        "yield_time_ms": 250,
+        // Omitting the timeout requests an owner wait until output or completion.
+
     });
     let responses = mount_sse_sequence(
         &server,
@@ -1242,7 +1240,7 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
     expected_exit_code: i32,
     expected_interrupt_output: Option<&str>,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1362,7 +1360,7 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 
 async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1424,9 +1422,11 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
     )
     .await?;
 
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
+    )
     .await;
 
     let start_output = request_log
@@ -1461,7 +1461,7 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_runs_on_windows() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 

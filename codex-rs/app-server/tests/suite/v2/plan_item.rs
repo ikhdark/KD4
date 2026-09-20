@@ -21,8 +21,8 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::TempDir;
@@ -34,7 +34,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let plan_block = "<proposed_plan>\n# Final plan\n- first\n- second\n</proposed_plan>\n";
     let full_message = format!("Preface\n{plan_block}Postscript");
@@ -99,7 +99,7 @@ async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plan_mode_without_proposed_plan_does_not_emit_plan_item() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let responses = vec![responses::sse(vec![
         responses::ev_response_created("resp-1"),

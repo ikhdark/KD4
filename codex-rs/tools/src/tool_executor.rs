@@ -81,7 +81,7 @@ pub trait ToolExecutor<Invocation>: Send + Sync {
         &self,
         registered_spec: &ToolSpec,
     ) -> Option<ToolSearchInfo> {
-        ToolSearchInfo::from_tool_spec(registered_spec.clone(), /*source_info*/ None)
+        ToolSearchInfo::from_tool_spec(registered_spec, /*source_info*/ None)
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {

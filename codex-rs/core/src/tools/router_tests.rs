@@ -573,7 +573,7 @@ async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow
 async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()> {
     let tool_name = "create_event".to_string();
 
-    let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+    let call = ToolRouter::build_tool_call(&ResponseItem::FunctionCall {
         id: None,
         name: tool_name.clone(),
         namespace: Some("mcp__codex_apps__calendar".to_string()),
@@ -602,7 +602,7 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
 async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()> {
     let tool_name = "exec".to_string();
 
-    let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+    let call = ToolRouter::build_tool_call(&ResponseItem::CustomToolCall {
         id: None,
         status: None,
         call_id: "call-namespace".to_string(),
@@ -629,7 +629,7 @@ async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Re
 
 #[test]
 fn malformed_client_tool_search_call_retains_output_correlation() {
-    let error = ToolRouter::build_tool_call(ResponseItem::ToolSearchCall {
+    let error = ToolRouter::build_tool_call(&ResponseItem::ToolSearchCall {
         id: None,
         call_id: Some("search-malformed".to_string()),
         status: None,
@@ -1202,7 +1202,7 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
         } else {
             "successful-two-hunk-patch"
         };
-        let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+        let call = ToolRouter::build_tool_call(&ResponseItem::CustomToolCall {
             id: None, status: None, call_id: call_id.to_string(), name: "apply_patch".to_string(), namespace: None,
             input: "*** Begin Patch\n*** Update File: first.txt\n@@\n-before\n+after\n*** Add File: tail.txt\n+must-not-be-written\n*** End Patch".to_string(),
             internal_chat_message_metadata_passthrough: None,
@@ -1546,7 +1546,7 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         "production tool planning must register apply_patch"
     );
 
-    let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+    let call = ToolRouter::build_tool_call(&ResponseItem::CustomToolCall {
         id: None,
         status: None,
         call_id: "router-apply-patch".to_string(),
@@ -1657,7 +1657,7 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         "expected extension-provided tool to be visible to the model"
     );
 
-    let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+    let call = ToolRouter::build_tool_call(&ResponseItem::FunctionCall {
         id: None,
         name: "echo".to_string(),
         namespace: Some("extension/".to_string()),
@@ -1810,7 +1810,7 @@ async fn router_apply_patch_cancel_during_approval_has_no_mutation() -> anyhow::
         Arc::clone(&tracker),
     );
     let call_id = "cancel-patch-before-approval";
-    let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+    let call = ToolRouter::build_tool_call(&ResponseItem::CustomToolCall {
         id: None, status: None, call_id: call_id.to_string(), name: "apply_patch".to_string(), namespace: None,
         input: "*** Begin Patch\n*** Update File: tracked.txt\n@@\n-before\n+after\n*** Add File: tail.txt\n+must-not-be-written\n*** End Patch".to_string(),
         internal_chat_message_metadata_passthrough: None,
@@ -1928,7 +1928,7 @@ async fn task_authority_fixture(
     std::fs::write(repo.join("tracked.txt"), "before\n")?;
     assert!(
         Command::new("git")
-            .args(["add", "tracked.txt"])
+            .args(["-c", "core.autocrlf=false", "add", "tracked.txt"])
             .current_dir(&repo)
             .status()?
             .success()
@@ -2140,7 +2140,7 @@ async fn task_authority_fixture(
     } else {
         receipt_args
     };
-    let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+    let call = ToolRouter::build_tool_call(&ResponseItem::FunctionCall {
         id: None,
         name: registered.name,
         namespace: registered.namespace,
@@ -2375,7 +2375,7 @@ async fn router_task_authority_git_read_keeps_executor_responsive() -> anyhow::R
                 .build()?;
             let _entered_runtime = runtime.enter();
             let mut pipes = Vec::new();
-            for index in 0..=prior_reads {
+            for index in 0..2 * (prior_reads + 1) {
                 pipes.push(
                     ServerOptions::new()
                         .first_pipe_instance(index == 0)
@@ -2390,7 +2390,11 @@ async fn router_task_authority_git_read_keeps_executor_responsive() -> anyhow::R
                     Duration::from_secs(10),
                     pipe.connect(),
                 ))??;
-                if index == prior_reads {
+                if index % 2 == 0 {
+                    // symlink_metadata opens and closes without reading pipe content.
+                    continue;
+                }
+                if index == 2 * prior_reads + 1 {
                     entered_tx
                         .take()
                         .expect("single policy-read handshake")
@@ -2445,4 +2449,27 @@ async fn router_task_authority_git_read_keeps_executor_responsive() -> anyhow::R
         .await?;
     }
     Ok(())
+}
+
+#[test]
+fn large_tool_schemas_warn_without_removing_callable_contracts() {
+    for bytes in [32, super::TOOL_SCHEMA_WARNING_BYTES + 1] {
+        let spec = ToolSpec::Function(ResponsesApiTool {
+            name: "large_contract".to_string(),
+            description: "x".repeat(bytes),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        });
+        let router = ToolRouter::from_parts(ToolRegistry::empty_for_test(), vec![spec.clone()]);
+        assert_eq!(router.model_visible_specs(), vec![spec]);
+        assert_eq!(
+            router.planning_warnings().len(),
+            usize::from(bytes > super::TOOL_SCHEMA_WARNING_BYTES)
+        );
+        if bytes > super::TOOL_SCHEMA_WARNING_BYTES {
+            assert!(router.planning_warnings()[0].contains("model-visible tool schemas"));
+        }
+    }
 }

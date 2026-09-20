@@ -92,33 +92,89 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> S
 }
 
 pub fn approx_token_count(text: &str) -> usize {
-    let byte_estimate = text
-        .len()
-        .saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
-        / APPROX_BYTES_PER_TOKEN;
-    let mut lexical_estimate = 0usize;
-    let mut word_bytes = 0usize;
+    TokenCountEstimate::new(text).tokens()
+}
 
-    for ch in text.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            word_bytes = word_bytes.saturating_add(ch.len_utf8());
-            continue;
-        }
-        lexical_estimate = lexical_estimate.saturating_add(
-            word_bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
-                / APPROX_BYTES_PER_TOKEN,
-        );
-        word_bytes = 0;
-        if !ch.is_whitespace() {
-            lexical_estimate = lexical_estimate.saturating_add(1);
+/// Cached components of the approximate token count. Keeping both components
+/// avoids rounding each fragment before combining whitespace-separated text.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokenCountEstimate {
+    bytes: usize,
+    lexical: usize,
+}
+
+impl TokenCountEstimate {
+    pub fn new(text: &str) -> Self {
+        Self {
+            bytes: text.len(),
+            lexical: lexical_token_count(text, usize::MAX),
         }
     }
-    lexical_estimate = lexical_estimate.saturating_add(
-        word_bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
-            / APPROX_BYTES_PER_TOKEN,
-    );
 
-    byte_estimate.max(lexical_estimate)
+    pub fn tokens(self) -> usize {
+        token_byte_estimate(self.bytes).max(self.lexical)
+    }
+
+    /// Combine fragments with a nonempty separator consisting only of whitespace.
+    /// The separator terminates words, so their lexical counts are additive.
+    pub fn then(self, next: Self, whitespace_bytes: usize) -> Self {
+        assert!(
+            whitespace_bytes > 0,
+            "a separator must terminate the preceding word"
+        );
+        Self {
+            bytes: self
+                .bytes
+                .saturating_add(whitespace_bytes)
+                .saturating_add(next.bytes),
+            lexical: self.lexical.saturating_add(next.lexical),
+        }
+    }
+}
+
+/// Compare against the same estimate as `approx_token_count`, stopping as soon
+/// as either its byte lower bound or its lexical lower bound exceeds the limit.
+pub fn approx_token_count_exceeds(text: &str, limit: usize) -> bool {
+    token_byte_estimate(text.len()) > limit || lexical_token_count(text, limit) > limit
+}
+
+fn token_byte_estimate(bytes: usize) -> usize {
+    bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1)) / APPROX_BYTES_PER_TOKEN
+}
+
+fn lexical_token_count(text: &str, limit: usize) -> usize {
+    let mut lexical_estimate = 0usize;
+    let mut word_bytes = 0usize;
+    let mut offset = 0;
+    while let Some(&byte) = text.as_bytes().get(offset) {
+        let (word, whitespace, width) = if byte.is_ascii() {
+            (
+                byte.is_ascii_alphanumeric() || byte == b'_',
+                matches!(byte, b' ' | b'\t'..=b'\r'),
+                1,
+            )
+        } else {
+            // `offset` always advances by a complete UTF-8 character.
+            let Some(ch) = text[offset..].chars().next() else {
+                break;
+            };
+            (ch.is_alphanumeric(), ch.is_whitespace(), ch.len_utf8())
+        };
+        offset += width;
+        if word {
+            word_bytes = word_bytes.saturating_add(width);
+            continue;
+        }
+        lexical_estimate = lexical_estimate.saturating_add(token_byte_estimate(word_bytes));
+        word_bytes = 0;
+        if !whitespace {
+            lexical_estimate = lexical_estimate.saturating_add(1);
+        }
+        if lexical_estimate > limit {
+            return lexical_estimate;
+        }
+    }
+    lexical_estimate.saturating_add(token_byte_estimate(word_bytes))
 }
 
 pub fn approx_bytes_for_tokens(tokens: usize) -> usize {

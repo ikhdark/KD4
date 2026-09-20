@@ -62,10 +62,10 @@ impl SkillNamespaceResolver {
             .into_iter()
             .filter(|namespace_root| namespace_root != root)
             .collect::<Vec<_>>();
-        let namespace_root_set = namespace_roots.iter().cloned().collect::<HashSet<_>>();
+        let namespace_root_set = namespace_roots.iter().collect::<HashSet<_>>();
         let plugin_roots = plugin_roots
             .into_iter()
-            .filter(|plugin_root| plugin_root != root && !namespace_root_set.contains(plugin_root))
+            .filter(|plugin_root| plugin_root != root && !namespace_root_set.contains(&plugin_root))
             .collect::<Vec<_>>();
 
         let lookup_roots = std::iter::once(root.clone())

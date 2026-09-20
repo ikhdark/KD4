@@ -363,6 +363,10 @@ impl EventProcessorWithJsonOutput {
                     },
                 }),
             }),
+            ThreadItem::ContextCompaction { .. } => Some(ExecThreadItem {
+                id: make_id(),
+                details: ThreadItemDetails::ContextCompaction {},
+            }),
             _ => None,
         }
     }

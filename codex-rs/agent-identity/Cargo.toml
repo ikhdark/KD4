@@ -22,7 +22,7 @@ crypto_box = { workspace = true }
 ed25519-dalek = { workspace = true }
 http = { workspace = true }
 jsonwebtoken = { workspace = true }
-percent-encoding = "2"
+percent-encoding = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

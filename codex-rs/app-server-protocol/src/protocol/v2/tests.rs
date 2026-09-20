@@ -979,11 +979,12 @@ fn thread_fork_last_turn_id_round_trips() {
 }
 
 #[test]
-fn fs_get_metadata_response_round_trips_minimal_fields() {
+fn fs_get_metadata_response_round_trips_size_and_timestamps() {
     let response = FsGetMetadataResponse {
         is_directory: false,
         is_file: true,
         is_symlink: false,
+        size: 789,
         created_at_ms: 123,
         modified_at_ms: 456,
     };
@@ -995,6 +996,7 @@ fn fs_get_metadata_response_round_trips_minimal_fields() {
             "isDirectory": false,
             "isFile": true,
             "isSymlink": false,
+            "size": 789,
             "createdAtMs": 123,
             "modifiedAtMs": 456,
         })

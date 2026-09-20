@@ -26,7 +26,7 @@ impl ContextualUserFragment for ApprovedCommandPrefixSaved {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        format!("Approved command prefix saved:\n{}", self.prefixes)
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!("Approved command prefix saved:\n{}", self.prefixes))
     }
 }

@@ -729,11 +729,11 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
                     path: policy_path.clone(),
                     source,
                 })?;
-        let identifier = policy_path.to_string_lossy().to_string();
+        let identifier = policy_path.to_string_lossy();
         parser
             .parse(&identifier, &contents)
             .map_err(|source| ExecPolicyError::ParsePolicy {
-                path: identifier,
+                path: identifier.into_owned(),
                 source,
             })?;
     }

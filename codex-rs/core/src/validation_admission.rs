@@ -521,10 +521,10 @@ pub(crate) async fn admit_validation_invocations(
     invocations: &[CommandInvocation],
     explicitly_tagged: bool,
 ) -> ValidationAdmission {
-    let authorization = authorization.read().await;
     // Classification also drives execution diagnostics. Only denial enforcement
     // is disabled when production validation authorization is inactive.
     let classification = classify_validation_invocations(invocations);
+    let authorization = authorization.read().await;
     if let Some(skipped) =
         prohibited_skip_for_classification(&authorization, &classification, explicitly_tagged)
     {
@@ -549,6 +549,12 @@ pub(crate) fn classify_validation(invocation: &CommandInvocation) -> ValidationC
     }
 }
 
+pub(crate) fn classify_validation_script(script: &str) -> ValidationClassification {
+    #[cfg(test)]
+    VALIDATION_CLASSIFICATION_COUNT.with(|count| count.set(count.get() + 1));
+    classify_simple_script(script, 0)
+}
+
 fn classify_powershell_script(script: &str) -> ValidationClassification {
     // Preserve control-flow information before the PowerShell parser flattens
     // pipelines and command chains into argv leaves.
@@ -570,10 +576,10 @@ fn classify_powershell_script(script: &str) -> ValidationClassification {
     let Some(commands) =
         codex_shell_command::powershell::parse_powershell_command_into_plain_commands(&command)
     else {
-        return classify_simple_script(script, 0);
+        return simple;
     };
     if commands.is_empty() {
-        return classify_simple_script(script, 0);
+        return simple;
     }
     combine_validation_classifications(commands.into_iter().filter_map(|argv| {
         let mut arguments = argv.into_iter();

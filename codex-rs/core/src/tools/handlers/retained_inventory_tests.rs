@@ -457,6 +457,15 @@ async fn call_through_registry(
     context: &ToolInvocation,
     arguments: Value,
 ) -> Result<Value, FunctionCallError> {
+    dispatch_through_registry(context, arguments)
+        .await
+        .map(crate::tools::registry::AnyToolResult::code_mode_result)
+}
+
+async fn dispatch_through_registry(
+    context: &ToolInvocation,
+    arguments: Value,
+) -> Result<crate::tools::registry::AnyToolResult, FunctionCallError> {
     let registry =
         crate::tools::registry::ToolRegistry::from_tools([
             Arc::new(RetainedInventoryHandler) as Arc<dyn CoreToolRuntime>
@@ -480,7 +489,120 @@ async fn call_through_registry(
             dispatch,
         )
         .await
-        .map(|output| output.code_mode_result())
+}
+
+#[tokio::test]
+async fn inventory_delivery_survives_history_projection_and_compaction_without_rescan() {
+    use codex_protocol::models::ResponseInputItem;
+    use codex_protocol::models::ResponseItem;
+
+    let context = context().await;
+    let initial = create(&context).await;
+    let expected = [
+        "prompts/compact/incremental_prompt.md",
+        "prompts/review/exit_success.xml",
+    ];
+    let imported = import(
+        &context,
+        &initial,
+        "entrypoint",
+        expected
+            .iter()
+            .map(|id| candidate(id, "retained-revision"))
+            .collect(),
+        true,
+    )
+    .await;
+    let evidence = artifact(&context, json!({"consumer":"reviewed"})).await;
+    let decisions = expected
+        .iter()
+        .map(|id| {
+            json!({
+                "category":"entrypoint", "candidate_id":id, "classification":"active",
+                "evidence":[{"artifact_id":evidence}]
+            })
+        })
+        .collect::<Vec<_>>();
+    let classified = call(&context, json!({"operation":"classify", "inventory_id":imported["inventory_id"], "decisions":decisions})).await.unwrap();
+    let dispatched = dispatch_through_registry(&context, json!({"operation":"render", "inventory_id":classified["inventory_id"], "classifications":["active"]})).await.unwrap();
+    let ResponseInputItem::FunctionCallOutput { call_id, output } = dispatched.response() else {
+        panic!("inventory must produce a function output")
+    };
+    let delivered = dispatched.code_mode_result();
+    let projection: Value =
+        serde_json::from_str(output.body.to_text().unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!(
+        projection["essential"]["delivery"]["rendered_path"],
+        delivered["rendered_path"]
+    );
+    assert_eq!(projection["essential"]["delivery"]["count"], 2);
+    assert_eq!(
+        projection["essential"]["delivery"]["scope_id"],
+        initial["summary"]["scope_id"]
+    );
+    assert_eq!(projection["essential"]["delivery"]["complete"], false);
+    let artifact_id = delivered["rendered_artifact_id"].as_str().unwrap();
+    let items = Arc::from([ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id,
+        output,
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+    let mut history = context
+        .session
+        .lock_history_state_for_test()
+        .await
+        .tool_history_state();
+    assert!(history.artifact_references().contains_key(artifact_id));
+    assert!(history.mark_consumed(
+        &items,
+        crate::tool_history::ModelGenerationId {
+            turn_id: "inventory-turn".to_string(),
+            ordinal: 1,
+        }
+    ));
+    let projected = history.project(items);
+    let pins = history
+        .artifact_pin_payload_for_items(&projected.items)
+        .expect("deterministic recovery pins");
+    assert!(pins.contains(artifact_id));
+    history.retain_for_history(&[ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "compaction-sidecar".to_string(),
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text(pins),
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+    assert!(history.artifact_references().contains_key(artifact_id));
+    let (recovered, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: artifact_id.to_string(),
+            pointer: String::new(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered["identifiers"], json!(expected));
+    assert_eq!(recovered["count"], 2);
+    assert_ne!(
+        recovered["identifiers"],
+        json!([expected[0], "prompts/review/exit_success.md"])
+    );
+    assert_ne!(
+        recovered["identifiers"],
+        json!(["prompts/compaction/incremental_prompt.md", expected[1]])
+    );
+    // Rendering a selected classification never clears the untouched category.
+    assert_eq!(recovered["summary"]["complete"], false);
+    assert_eq!(
+        recovered["summary"]["unresolved_required_categories"],
+        json!(["configuration"])
+    );
+    assert_eq!(
+        recovered["summary"]["scope_id"],
+        initial["summary"]["scope_id"]
+    );
 }
 
 async fn artifact(context: &ToolInvocation, value: Value) -> String {
@@ -889,7 +1011,12 @@ async fn inventory_pages_are_bounded_and_exact_output_uses_existing_recovery() {
     let context = context().await;
     let initial = create(&context).await;
     let candidates = (0..120)
-        .map(|i| candidate(&format!("src/{i:04}-{}.rs", "x".repeat(60)), "unchanged"))
+        .map(|i| {
+            candidate(
+                &format!("src/{i:04}-{}.rs", "界-x ".repeat(20)),
+                "unchanged",
+            )
+        })
         .collect();
     let imported = import(&context, &initial, "entrypoint", candidates, true).await;
     let mut offset = 0usize;
@@ -897,6 +1024,11 @@ async fn inventory_pages_are_bounded_and_exact_output_uses_existing_recovery() {
     loop {
         let page=call(&context,json!({"operation":"read","inventory_id":imported["inventory_id"],"offset":offset,"limit":50})).await.unwrap();
         assert!(codex_utils_string::approx_token_count(&page.to_string()) < 3_000);
+        assert!(
+            codex_utils_string::approx_token_count(
+                &json!({"summary": page["summary"], "records": page["records"]}).to_string()
+            ) <= PAGE_TOKENS
+        );
         for record in page["records"].as_array().unwrap() {
             assert!(ids.insert(record["candidate"]["id"].as_str().unwrap().to_string()));
         }

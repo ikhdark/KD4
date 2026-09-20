@@ -95,7 +95,7 @@ pub fn render_code_mode_sample(
 }
 
 fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
-    let description = definition.description.trim().to_string();
+    let description = definition.description.trim();
     let input_name = match definition.kind {
         CodeModeToolKind::Function => "args",
         CodeModeToolKind::Freeform => "input",
@@ -137,7 +137,7 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         return format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```");
     }
     render_code_mode_sample(
-        &description,
+        description,
         &definition.name,
         input_name,
         input_type,

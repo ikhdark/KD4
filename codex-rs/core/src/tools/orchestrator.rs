@@ -71,12 +71,6 @@ impl ToolOrchestrator {
             Err(err) => return (Err(err), None),
         };
 
-        let attempt_tool_ctx = ToolCtx {
-            session: tool_ctx.session.clone(),
-            turn: tool_ctx.turn.clone(),
-            call_id: tool_ctx.call_id.clone(),
-            tool_name: tool_ctx.tool_name.clone(),
-        };
         let attempt_with_network_approval = SandboxAttempt {
             codex_home: attempt.codex_home,
             sandbox: attempt.sandbox,
@@ -97,7 +91,7 @@ impl ToolOrchestrator {
         };
         let tool_execution_timing_guard = tool_ctx.turn.turn_timing_state.begin_tool_execution();
         let run_result = tool
-            .run(req, &attempt_with_network_approval, &attempt_tool_ctx)
+            .run(req, &attempt_with_network_approval, tool_ctx)
             .await;
         drop(tool_execution_timing_guard);
 

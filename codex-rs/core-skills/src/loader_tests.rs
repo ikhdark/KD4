@@ -135,6 +135,43 @@ async fn load_skills_for_test(config: &TestConfig) -> SkillLoadOutcome {
 }
 
 #[tokio::test]
+async fn project_marker_probes_preserve_nearest_root_and_nested_markers() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let nearest = tmp.path().join("near");
+    let cwd = nearest.join("child");
+    fs::create_dir_all(&cwd)?;
+    fs::write(tmp.path().join("outer-marker"), "")?;
+    fs::create_dir_all(nearest.join("nested"))?;
+    fs::write(nearest.join("nested/inner-marker"), "")?;
+    let cwd = cwd.abs();
+    let markers = vec![
+        "missing-marker".into(),
+        "outer-marker".into(),
+        "nested/inner-marker".into(),
+    ];
+    assert_eq!(
+        {
+            fn require_send<T: Send>(value: T) -> T {
+                value
+            }
+            require_send(find_project_root(LOCAL_FS.as_ref(), &cwd, &markers)).await
+        },
+        nearest.abs()
+    );
+    assert_eq!(find_project_root(LOCAL_FS.as_ref(), &cwd, &[]).await, cwd);
+    assert_eq!(
+        find_project_root(
+            LOCAL_FS.as_ref(),
+            &cwd,
+            &["kd4-absent-review-marker".into()]
+        )
+        .await,
+        cwd
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn repo_skill_roots_reuse_config_project_discovery_snapshot() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let project_root = tmp.path().join("repo");
@@ -457,6 +494,26 @@ fn expected_user_skill(path: &Path, name: &str, description: &str) -> SkillMetad
 }
 
 #[tokio::test]
+async fn reports_invalid_optional_metadata_without_dropping_skill() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_skill(&codex_home, "demo", "metadata-skill", "valid skill");
+    let metadata_path = write_skill_metadata_at(skill_path.parent().unwrap(), "interface: [");
+    let cfg = make_config(&codex_home).await;
+    let outcome = load_skills_for_test(&cfg).await;
+    assert_eq!(outcome.skills.len(), 1);
+    assert_eq!(outcome.skills[0].name, "metadata-skill");
+    assert_eq!(outcome.skills[0].interface, None);
+    assert_eq!(outcome.errors.len(), 1);
+    assert_eq!(outcome.errors[0].path, normalized(&metadata_path));
+    assert!(outcome.errors[0].message.contains("invalid openai.yaml"));
+
+    fs::remove_file(metadata_path).unwrap();
+    let outcome = load_skills_for_test(&cfg).await;
+    assert_eq!(outcome.skills.len(), 1);
+    assert_eq!(outcome.errors, Vec::new());
+}
+
+#[tokio::test]
 async fn loads_skill_dependencies_metadata_from_yaml() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let skill_path = write_skill(&codex_home, "demo", "dep-skill", "from json");
@@ -764,10 +821,12 @@ async fn ignores_invalid_brand_color() {
     let cfg = make_config(&codex_home).await;
     let outcome = load_skills_for_test(&cfg).await;
 
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
+    assert_eq!(
+        outcome.errors,
+        vec![SkillError {
+            path: normalized(skill_dir).join("agents/openai.yaml"),
+            message: "ignoring interface.brand_color: expected #RRGGBB, got blue".to_string()
+        }]
     );
     assert_eq!(
         outcome.skills,
@@ -811,10 +870,13 @@ async fn ignores_default_prompt_over_max_length() {
     let cfg = make_config(&codex_home).await;
     let outcome = load_skills_for_test(&cfg).await;
 
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
+    assert_eq!(
+        outcome.errors,
+        vec![SkillError {
+            path: normalized(skill_dir).join("agents/openai.yaml"),
+            message: "ignoring interface.default_prompt: exceeds maximum length of 1024 characters"
+                .to_string()
+        }]
     );
     assert_eq!(
         outcome.skills,
@@ -860,10 +922,20 @@ async fn drops_interface_when_icons_are_invalid() {
     let cfg = make_config(&codex_home).await;
     let outcome = load_skills_for_test(&cfg).await;
 
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
+    assert_eq!(
+        outcome.errors,
+        vec![
+            SkillError {
+                path: normalized(skill_dir).join("agents/openai.yaml"),
+                message: "ignoring interface.icon_small: icon path must be under assets/"
+                    .to_string()
+            },
+            SkillError {
+                path: normalized(skill_dir).join("agents/openai.yaml"),
+                message: "ignoring interface.icon_large: icon path must not contain '..'"
+                    .to_string()
+            }
+        ]
     );
     assert_eq!(
         outcome.skills,
@@ -978,11 +1050,9 @@ interface:
     )
     .await;
 
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
+    assert_eq!(outcome.errors, vec![
+            SkillError { path: normalized(skill_dir).join("agents/openai.yaml"), message: "ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/".to_string() }
+    ]);
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {

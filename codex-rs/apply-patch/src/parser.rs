@@ -1,28 +1,10 @@
 //! This module is responsible for parsing & validating a patch into a list of "hunks".
 //! (It does not attempt to actually check that the patch can be applied to the filesystem.)
 //!
-//! The official Lark grammar for the apply-patch format is:
-//!
-//! start: begin_patch environment_id? hunk+ end_patch
-//! begin_patch: "*** Begin Patch" LF
-//! environment_id: "*** Environment ID: " filename LF
-//! end_patch: "*** End Patch" LF?
-//!
-//! hunk: add_hunk | delete_hunk | update_hunk
-//! add_hunk: "*** Add File: " filename LF add_line+
-//! delete_hunk: "*** Delete File: " filename LF
-//! update_hunk: "*** Update File: " filename LF (change_move change? | change)
-//! filename: /(.+)/
-//! add_line: "+" /(.+)/ LF -> line
-//!
-//! change_move: "*** Move to: " filename LF
-//! change: (change_context | change_line)+ eof_line?
-//! change_context: ("@@" | "@@ " /(.+)/) LF
-//! change_line: ("+" | "-" | " ") /(.+)/ LF
-//! eof_line: "*** End of File" LF
-//!
-//! The parser below is a little more lenient than the explicit spec and allows for
-//! leading/trailing whitespace around patch markers.
+//! The model-facing Lark rules live in `core/src/tools/handlers/apply_patch.lark`;
+//! `apply_patch_spec.rs` supplies the start rule and optional environment header.
+//! This parser also accepts compatibility forms, including leading/trailing
+//! whitespace around patch markers and a shell heredoc wrapper.
 use crate::ApplyPatchArgs;
 use crate::streaming_parser::StreamingPatchParser;
 #[cfg(test)]
@@ -43,6 +25,9 @@ pub(crate) const MOVE_TO_MARKER: &str = "*** Move to: ";
 pub(crate) const EOF_MARKER: &str = "*** End of File";
 pub(crate) const CHANGE_CONTEXT_MARKER: &str = "@@ ";
 pub(crate) const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
+
+/// Shared bound for stdin, argument, and in-process patch inputs.
+pub(crate) const MAX_PATCH_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Error, Clone)]
 pub enum ParseError {
@@ -166,6 +151,11 @@ enum ParseMode {
 }
 
 fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, ParseError> {
+    if patch.len() > MAX_PATCH_INPUT_BYTES {
+        return Err(InvalidPatchError(format!(
+            "PATCH input exceeds the {MAX_PATCH_INPUT_BYTES}-byte limit"
+        )));
+    }
     // Keep CRLF bytes intact: the streaming parser strips exactly one CR.
     let lines: Vec<&str> = patch.trim().split('\n').collect();
     let patch_lines = match mode {

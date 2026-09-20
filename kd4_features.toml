@@ -99,8 +99,8 @@ runtime_verification = { kind = "integration_test", path = "codex-rs/core/tests/
 
 [[features.evidence]]
 kind = "entrypoint"
-path = "codex-rs/core/src/unified_exec/mod.rs"
-contains = "pub(crate) fn new_with_deferred_executor("
+path = "codex-rs/core/src/environment_selection.rs"
+contains = "self.snapshot_with_wait_policy(!self.non_blocking_snapshots)"
 
 [[features.evidence]]
 kind = "registration"

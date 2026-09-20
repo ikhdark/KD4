@@ -84,6 +84,7 @@ struct LoadedSkillMetadata {
     interface: Option<SkillInterface>,
     dependencies: Option<SkillDependencies>,
     policy: Option<SkillPolicy>,
+    diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -450,11 +451,27 @@ async fn find_project_root(
     }
 
     for ancestor in cwd.ancestors() {
-        for marker in project_root_markers {
-            let marker_path = ancestor.join(marker);
-            let marker_path_uri = PathUri::from_abs_path(&marker_path);
-            match fs.get_metadata(&marker_path_uri, /*sandbox*/ None).await {
-                Ok(_) => return ancestor,
+        // Materialize the futures before awaiting so the borrowed marker iterator's
+        // closure does not become part of the Send future used by session tasks.
+        let probes = project_root_markers
+            .iter()
+            .map(|marker| {
+                let marker_path = ancestor.join(marker);
+                async move {
+                    let marker_path_uri = PathUri::from_abs_path(&marker_path);
+                    let result = fs.get_metadata(&marker_path_uri, /*sandbox*/ None).await;
+                    (marker_path, result)
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut probes = futures::stream::iter(probes).buffer_unordered(MAX_CONCURRENT_SKILL_LOADS);
+        let mut found = false;
+        while let Some((marker_path, result)) = probes.next().await {
+            match result {
+                Ok(_) => {
+                    found = true;
+                    break;
+                }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => {
                     tracing::warn!(
@@ -463,6 +480,10 @@ async fn find_project_root(
                     );
                 }
             }
+        }
+        drop(probes);
+        if found {
+            return ancestor;
         }
     }
 
@@ -617,7 +638,8 @@ async fn load_skills_under_root(
         .boxed();
     let (namespace_resolver, skill_results) = tokio::join!(namespace_resolver, skill_results);
     for (path, path_uri, result) in skill_results {
-        let result = result.and_then(|mut skill| {
+        let result = result.and_then(|(mut skill, errors)| {
+            outcome.errors.extend(errors);
             skill.name = namespace_resolver
                 .for_skill(&root_uri, &path_uri)
                 .qualify(&skill.name);
@@ -643,7 +665,7 @@ async fn parse_skill_file(
     scope: SkillScope,
     plugin_id: Option<&str>,
     plugin_root: Option<&AbsolutePathBuf>,
-) -> Result<SkillMetadata, SkillParseError> {
+) -> Result<(SkillMetadata, Vec<SkillError>), SkillParseError> {
     let metadata_path = path_uri
         .parent()
         .and_then(|parent| parent.join(SKILLS_METADATA_DIR).ok())
@@ -668,19 +690,36 @@ async fn parse_skill_file(
         interface,
         dependencies,
         policy,
+        diagnostics,
     } = loaded_metadata;
 
-    Ok(SkillMetadata {
-        name: base_name,
-        description,
-        short_description,
-        interface,
-        dependencies,
-        policy,
-        path_to_skills_md: path.clone(),
-        scope,
-        plugin_id: plugin_id.map(str::to_string),
-    })
+    let errors = if let Some(skill_dir) = path.parent() {
+        diagnostics
+            .into_iter()
+            .map(|message| SkillError {
+                path: skill_dir.join("agents/openai.yaml"),
+                message,
+            })
+            .collect()
+    } else {
+        // Metadata loading returns no diagnostics when the skill has no parent.
+        Vec::new()
+    };
+
+    Ok((
+        SkillMetadata {
+            name: base_name,
+            description,
+            short_description,
+            interface,
+            dependencies,
+            policy,
+            path_to_skills_md: path.clone(),
+            scope,
+            plugin_id: plugin_id.map(str::to_string),
+        },
+        errors,
+    ))
 }
 
 fn parse_skill_frontmatter_metadata_inner(
@@ -751,9 +790,13 @@ async fn load_skill_metadata(
     metadata: &SkillMetadataDiscovery,
     plugin_root: Option<&AbsolutePathBuf>,
 ) -> LoadedSkillMetadata {
-    // Fail open: optional metadata should not block loading SKILL.md.
+    // Optional metadata failures are reported without blocking valid SKILL.md content.
+    let mut diagnostics = Vec::new();
     let Some(skill_dir) = skill_path.parent() else {
-        return LoadedSkillMetadata::default();
+        return LoadedSkillMetadata {
+            diagnostics,
+            ..LoadedSkillMetadata::default()
+        };
     };
     let metadata_path_uri = match metadata {
         SkillMetadataDiscovery::Present(path) => path,
@@ -763,15 +806,19 @@ async fn load_skill_metadata(
                 Ok(metadata) if metadata.is_file => {}
                 Ok(_) => return LoadedSkillMetadata::default(),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return LoadedSkillMetadata::default();
+                    return LoadedSkillMetadata {
+                        diagnostics,
+                        ..LoadedSkillMetadata::default()
+                    };
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        "ignoring {path}: failed to stat {label}: {error}",
-                        path = path,
-                        label = SKILLS_METADATA_FILENAME
-                    );
-                    return LoadedSkillMetadata::default();
+                    diagnostics.push(format!(
+                        "ignoring {path}: failed to stat {SKILLS_METADATA_FILENAME}: {error}"
+                    ));
+                    return LoadedSkillMetadata {
+                        diagnostics,
+                        ..LoadedSkillMetadata::default()
+                    };
                 }
             }
             path
@@ -781,12 +828,13 @@ async fn load_skill_metadata(
     let contents = match fs.read_file_text(metadata_path_uri, /*sandbox*/ None).await {
         Ok(contents) => contents,
         Err(error) => {
-            tracing::warn!(
-                "ignoring {path}: failed to read {label}: {error}",
-                path = metadata_path_uri,
-                label = SKILLS_METADATA_FILENAME
-            );
-            return LoadedSkillMetadata::default();
+            diagnostics.push(format!(
+                "ignoring {metadata_path_uri}: failed to read {SKILLS_METADATA_FILENAME}: {error}"
+            ));
+            return LoadedSkillMetadata {
+                diagnostics,
+                ..LoadedSkillMetadata::default()
+            };
         }
     };
 
@@ -795,12 +843,13 @@ async fn load_skill_metadata(
         match serde_yaml::from_str(&contents) {
             Ok(parsed) => parsed,
             Err(error) => {
-                tracing::warn!(
-                    "ignoring {path}: invalid {label}: {error}",
-                    path = metadata_path_uri,
-                    label = SKILLS_METADATA_FILENAME
-                );
-                return LoadedSkillMetadata::default();
+                diagnostics.push(format!(
+                    "ignoring {metadata_path_uri}: invalid {SKILLS_METADATA_FILENAME}: {error}"
+                ));
+                return LoadedSkillMetadata {
+                    diagnostics,
+                    ..LoadedSkillMetadata::default()
+                };
             }
         }
     };
@@ -811,13 +860,15 @@ async fn load_skill_metadata(
         policy,
     } = parsed;
     LoadedSkillMetadata {
-        interface: resolve_interface(interface, &skill_dir, plugin_root),
-        dependencies: resolve_dependencies(dependencies),
+        interface: resolve_interface(&mut diagnostics, interface, &skill_dir, plugin_root),
+        dependencies: resolve_dependencies(&mut diagnostics, dependencies),
         policy: resolve_policy(policy),
+        diagnostics,
     }
 }
 
 fn resolve_interface(
+    diagnostics: &mut Vec<String>,
     interface: Option<Interface>,
     skill_dir: &AbsolutePathBuf,
     plugin_root: Option<&AbsolutePathBuf>,
@@ -825,29 +876,34 @@ fn resolve_interface(
     let interface = interface?;
     let interface = SkillInterface {
         display_name: resolve_str(
+            diagnostics,
             interface.display_name,
             MAX_NAME_LEN,
             "interface.display_name",
         ),
         short_description: resolve_str(
+            diagnostics,
             interface.short_description,
             MAX_SHORT_DESCRIPTION_LEN,
             "interface.short_description",
         ),
         icon_small: resolve_asset_path(
+            diagnostics,
             skill_dir,
             plugin_root,
             "interface.icon_small",
             interface.icon_small,
         ),
         icon_large: resolve_asset_path(
+            diagnostics,
             skill_dir,
             plugin_root,
             "interface.icon_large",
             interface.icon_large,
         ),
-        brand_color: resolve_color_str(interface.brand_color, "interface.brand_color"),
+        brand_color: resolve_color_str(diagnostics, interface.brand_color, "interface.brand_color"),
         default_prompt: resolve_str(
+            diagnostics,
             interface.default_prompt,
             MAX_DEFAULT_PROMPT_LEN,
             "interface.default_prompt",
@@ -862,12 +918,15 @@ fn resolve_interface(
     if has_fields { Some(interface) } else { None }
 }
 
-fn resolve_dependencies(dependencies: Option<Dependencies>) -> Option<SkillDependencies> {
+fn resolve_dependencies(
+    diagnostics: &mut Vec<String>,
+    dependencies: Option<Dependencies>,
+) -> Option<SkillDependencies> {
     let dependencies = dependencies?;
     let tools: Vec<SkillToolDependency> = dependencies
         .tools
         .into_iter()
-        .filter_map(resolve_dependency_tool)
+        .filter_map(|tool| resolve_dependency_tool(diagnostics, tool))
         .collect();
     if tools.is_empty() {
         None
@@ -883,33 +942,46 @@ fn resolve_policy(policy: Option<Policy>) -> Option<SkillPolicy> {
     })
 }
 
-fn resolve_dependency_tool(tool: DependencyTool) -> Option<SkillToolDependency> {
+fn resolve_dependency_tool(
+    diagnostics: &mut Vec<String>,
+    tool: DependencyTool,
+) -> Option<SkillToolDependency> {
     let r#type = resolve_required_str(
+        diagnostics,
         tool.kind,
         MAX_DEPENDENCY_TYPE_LEN,
         "dependencies.tools.type",
     )?;
     let value = resolve_required_str(
+        diagnostics,
         tool.value,
         MAX_DEPENDENCY_VALUE_LEN,
         "dependencies.tools.value",
     )?;
     let description = resolve_str(
+        diagnostics,
         tool.description,
         MAX_DEPENDENCY_DESCRIPTION_LEN,
         "dependencies.tools.description",
     );
     let transport = resolve_str(
+        diagnostics,
         tool.transport,
         MAX_DEPENDENCY_TRANSPORT_LEN,
         "dependencies.tools.transport",
     );
     let command = resolve_str(
+        diagnostics,
         tool.command,
         MAX_DEPENDENCY_COMMAND_LEN,
         "dependencies.tools.command",
     );
-    let url = resolve_str(tool.url, MAX_DEPENDENCY_URL_LEN, "dependencies.tools.url");
+    let url = resolve_str(
+        diagnostics,
+        tool.url,
+        MAX_DEPENDENCY_URL_LEN,
+        "dependencies.tools.url",
+    );
 
     Some(SkillToolDependency {
         r#type,
@@ -922,6 +994,7 @@ fn resolve_dependency_tool(tool: DependencyTool) -> Option<SkillToolDependency> 
 }
 
 fn resolve_asset_path(
+    diagnostics: &mut Vec<String>,
     skill_dir: &AbsolutePathBuf,
     plugin_root: Option<&AbsolutePathBuf>,
     field: &'static str,
@@ -936,10 +1009,10 @@ fn resolve_asset_path(
 
     let assets_dir = skill_dir.join("assets");
     if path.is_absolute() {
-        tracing::warn!(
+        diagnostics.push(format!(
             "ignoring {field}: icon must be a relative assets path (not {})",
             assets_dir.display()
-        );
+        ));
         return None;
     }
 
@@ -949,10 +1022,16 @@ fn resolve_asset_path(
             Component::CurDir => {}
             Component::Normal(component) => normalized.push(component),
             Component::ParentDir => {
-                return resolve_plugin_shared_asset_path(skill_dir, plugin_root, field, &path);
+                return resolve_plugin_shared_asset_path(
+                    diagnostics,
+                    skill_dir,
+                    plugin_root,
+                    field,
+                    &path,
+                );
             }
             _ => {
-                tracing::warn!("ignoring {field}: icon path must be under assets/");
+                diagnostics.push(format!("ignoring {field}: icon path must be under assets/"));
                 return None;
             }
         }
@@ -962,7 +1041,7 @@ fn resolve_asset_path(
     match components.next() {
         Some(Component::Normal(component)) if component == "assets" => {}
         _ => {
-            tracing::warn!("ignoring {field}: icon path must be under assets/");
+            diagnostics.push(format!("ignoring {field}: icon path must be under assets/"));
             return None;
         }
     }
@@ -971,26 +1050,31 @@ fn resolve_asset_path(
 }
 
 fn resolve_plugin_shared_asset_path(
+    diagnostics: &mut Vec<String>,
     skill_dir: &AbsolutePathBuf,
     plugin_root: Option<&AbsolutePathBuf>,
     field: &'static str,
     path: &Path,
 ) -> Option<AbsolutePathBuf> {
     let Some(plugin_root) = plugin_root else {
-        tracing::warn!("ignoring {field}: icon path must not contain '..'");
+        diagnostics.push(format!("ignoring {field}: icon path must not contain '..'"));
         return None;
     };
 
     let plugin_assets_dir = lexically_normalize(plugin_root.join("assets").as_path());
     let resolved = lexically_normalize(skill_dir.join(path).as_path());
     if !resolved.starts_with(&plugin_assets_dir) {
-        tracing::warn!("ignoring {field}: icon path with '..' must resolve under plugin assets/");
+        diagnostics.push(format!(
+            "ignoring {field}: icon path with '..' must resolve under plugin assets/"
+        ));
         return None;
     }
 
     AbsolutePathBuf::try_from(resolved)
         .map_err(|err| {
-            tracing::warn!("ignoring {field}: icon path must resolve to an absolute path: {err}");
+            diagnostics.push(format!(
+                "ignoring {field}: icon path must resolve to an absolute path: {err}"
+            ));
             err
         })
         .ok()
@@ -1013,32 +1097,35 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 }
 
 fn sanitize_single_line(raw: &str) -> String {
-    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut words = raw.split_whitespace();
+    let mut sanitized = words.next().unwrap_or_default().to_owned();
+    for word in words {
+        sanitized.push(' ');
+        sanitized.push_str(word);
+    }
+    sanitized
 }
 
 fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
     let mut changed = false;
     let mut block_scalar_indent: Option<usize> = None;
-    let mut repaired_lines: Vec<String> = Vec::new();
+    let mut repaired_lines: Vec<std::borrow::Cow<'_, str>> = Vec::new();
     for line in frontmatter.lines() {
-        let indent = line
-            .chars()
-            .take_while(|character| *character == ' ')
-            .count();
+        let indent = line.len() - line.trim_start_matches(' ').len();
         if let Some(block_indent) = block_scalar_indent {
             if line.trim().is_empty() || indent > block_indent {
-                repaired_lines.push(line.to_string());
+                repaired_lines.push(std::borrow::Cow::Borrowed(line));
                 continue;
             }
             block_scalar_indent = None;
         }
 
         let Some((key, value)) = line.split_once(':') else {
-            repaired_lines.push(line.to_string());
+            repaired_lines.push(std::borrow::Cow::Borrowed(line));
             continue;
         };
         if key.trim().is_empty() || !value.chars().next().is_none_or(char::is_whitespace) {
-            repaired_lines.push(line.to_string());
+            repaired_lines.push(std::borrow::Cow::Borrowed(line));
             continue;
         }
 
@@ -1063,16 +1150,16 @@ fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
 
         let scalar = scalar.trim_end();
         let Some(first_char) = scalar.chars().next() else {
-            repaired_lines.push(line.to_string());
+            repaired_lines.push(std::borrow::Cow::Borrowed(line));
             continue;
         };
         if matches!(first_char, '|' | '>') {
             block_scalar_indent = Some(indent);
-            repaired_lines.push(line.to_string());
+            repaired_lines.push(std::borrow::Cow::Borrowed(line));
             continue;
         }
         if matches!(first_char, '\'' | '"') {
-            repaired_lines.push(line.to_string());
+            repaired_lines.push(std::borrow::Cow::Borrowed(line));
             continue;
         }
         let mut has_colon_separator = false;
@@ -1088,14 +1175,14 @@ fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
         let invalid_flow_like_scalar = matches!(first_char, '[' | '{' | '@' | '`')
             && serde_yaml::from_str::<serde_yaml::Value>(scalar).is_err();
         if !has_colon_separator && !invalid_flow_like_scalar {
-            repaired_lines.push(line.to_string());
+            repaired_lines.push(std::borrow::Cow::Borrowed(line));
             continue;
         }
 
         let quoted_scalar = format!("'{}'", scalar.replace('\'', "''"));
-        repaired_lines.push(format!(
+        repaired_lines.push(std::borrow::Cow::Owned(format!(
             "{key}:{leading_whitespace}{quoted_scalar}{comment}"
-        ));
+        )));
         changed = true;
     }
     changed.then(|| repaired_lines.join("\n"))
@@ -1109,7 +1196,7 @@ fn validate_len(
     if value.is_empty() {
         return Err(SkillParseError::MissingField(field_name));
     }
-    if value.chars().count() > max_len {
+    if value.len() > max_len && value.chars().nth(max_len).is_some() {
         return Err(SkillParseError::InvalidField {
             field: field_name,
             reason: format!("exceeds maximum length of {max_len} characters"),
@@ -1118,44 +1205,56 @@ fn validate_len(
     Ok(())
 }
 
-fn resolve_str(value: Option<String>, max_len: usize, field: &'static str) -> Option<String> {
+fn resolve_str(
+    diagnostics: &mut Vec<String>,
+    value: Option<String>,
+    max_len: usize,
+    field: &'static str,
+) -> Option<String> {
     let value = value?;
     let value = sanitize_single_line(&value);
     if value.is_empty() {
-        tracing::warn!("ignoring {field}: value is empty");
+        diagnostics.push(format!("ignoring {field}: value is empty"));
         return None;
     }
-    if value.chars().count() > max_len {
-        tracing::warn!("ignoring {field}: exceeds maximum length of {max_len} characters");
+    if value.len() > max_len && value.chars().nth(max_len).is_some() {
+        diagnostics.push(format!(
+            "ignoring {field}: exceeds maximum length of {max_len} characters"
+        ));
         return None;
     }
     Some(value)
 }
 
 fn resolve_required_str(
+    diagnostics: &mut Vec<String>,
     value: Option<String>,
     max_len: usize,
     field: &'static str,
 ) -> Option<String> {
     let Some(value) = value else {
-        tracing::warn!("ignoring {field}: value is missing");
+        diagnostics.push(format!("ignoring {field}: value is missing"));
         return None;
     };
-    resolve_str(Some(value), max_len, field)
+    resolve_str(diagnostics, Some(value), max_len, field)
 }
 
-fn resolve_color_str(value: Option<String>, field: &'static str) -> Option<String> {
+fn resolve_color_str(
+    diagnostics: &mut Vec<String>,
+    value: Option<String>,
+    field: &'static str,
+) -> Option<String> {
     let value = value?;
     let value = value.trim();
     if value.is_empty() {
-        tracing::warn!("ignoring {field}: value is empty");
+        diagnostics.push(format!("ignoring {field}: value is empty"));
         return None;
     }
     let mut chars = value.chars();
     if value.len() == 7 && chars.next() == Some('#') && chars.all(|c| c.is_ascii_hexdigit()) {
         Some(value.to_string())
     } else {
-        tracing::warn!("ignoring {field}: expected #RRGGBB, got {value}");
+        diagnostics.push(format!("ignoring {field}: expected #RRGGBB, got {value}"));
         None
     }
 }

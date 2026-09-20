@@ -20,6 +20,37 @@ use toml::Table;
 use toml::Value as TomlValue;
 
 #[test]
+fn feature_membership_is_independent_and_enumeration_preserves_enum_order() {
+    let mut features = Features::default();
+    let mut expected = std::collections::BTreeSet::new();
+    for spec in crate::FEATURES.iter().rev() {
+        features.enable(spec.id).enable(spec.id);
+        expected.insert(spec.id);
+        for candidate in crate::FEATURES {
+            assert_eq!(
+                features.enabled(candidate.id),
+                expected.contains(&candidate.id)
+            );
+        }
+        assert_eq!(
+            features.enabled_features(),
+            expected.iter().copied().collect::<Vec<_>>()
+        );
+    }
+    let all_enabled = features.clone();
+    for spec in crate::FEATURES {
+        features.disable(spec.id).disable(spec.id);
+        expected.remove(&spec.id);
+        assert_eq!(
+            features.enabled_features(),
+            expected.iter().copied().collect::<Vec<_>>()
+        );
+        assert!(all_enabled.enabled(spec.id));
+    }
+    assert_eq!(features, Features::default());
+}
+
+#[test]
 fn feature_metadata_is_exhaustive_and_single_sourced() {
     assert_eq!(crate::ALL_FEATURES.len(), crate::FEATURES.len());
     let mut ids = std::collections::BTreeSet::new();
@@ -161,6 +192,67 @@ fn retired_feature_keys_are_unknown_and_ignored_by_feature_sources() {
         );
 
         assert_eq!(features, Features::with_defaults(), "{key}");
+    }
+}
+
+#[test]
+fn removed_apps_override_warns_without_changing_features_or_serializing() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for input in [
+        "apps_mcp_path_override = true",
+        "apps_mcp_path_override = false",
+        "[apps_mcp_path_override]\nenabled = true",
+        "",
+    ] {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let features_toml: FeaturesToml = toml::from_str(input).unwrap();
+            let features = Features::from_sources(
+                FeatureConfigSource {
+                    features: Some(&features_toml),
+                },
+                FeatureConfigSource::default(),
+                FeatureOverrides::default(),
+            );
+            assert_eq!(features, Features::with_defaults());
+            assert!(
+                !toml::to_string(&features_toml)
+                    .unwrap()
+                    .contains("apps_mcp_path_override")
+            );
+        });
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        if input.is_empty() {
+            assert!(log.is_empty(), "absent setting must not warn: {log}");
+        } else {
+            assert!(
+                log.contains("[features].apps_mcp_path_override has been removed and is ignored"),
+                "missing removal diagnostic: {log}"
+            );
+        }
     }
 }
 

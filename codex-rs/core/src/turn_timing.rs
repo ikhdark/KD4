@@ -126,7 +126,7 @@ pub(crate) enum ContinuationCause {
     InvalidImageRecovery,
 }
 
-pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent) {
+pub(crate) fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent) {
     let Some(duration) = turn_context
         .turn_timing_state
         .record_response_event_milestones(event)
@@ -136,7 +136,7 @@ pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &
     turn_context.session_telemetry.record_turn_ttft(duration);
 }
 
-pub(crate) async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &TurnItem) {
+pub(crate) fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &TurnItem) {
     let Some(duration) = turn_context
         .turn_timing_state
         .record_ttfm_for_turn_item(item)
@@ -561,21 +561,28 @@ impl TurnTimingSnapshot {
             // Summed over dispatched requests, each already attributed to the
             // one representation it sent. A projection prepared and discarded
             // never reaches this list, so it contributes nothing.
-            tool_output_budget_drop_count: profile.model_requests.iter().fold(0, |total, request| {
-                total.saturating_add(
-                    request
-                        .request_token_categories
-                        .as_ref()
-                        .map_or(0, |categories| categories.tool_output_budget_drop_count),
-                )
-            }),
+            tool_output_budget_drop_count: profile.model_requests.iter().fold(
+                0,
+                |total, request| {
+                    total.saturating_add(
+                        request
+                            .request_token_categories
+                            .as_ref()
+                            .map_or(0, |categories| categories.tool_output_budget_drop_count),
+                    )
+                },
+            ),
             tool_output_budget_dropped_token_count: profile.model_requests.iter().fold(
                 0,
                 |total, request| {
-                    total.saturating_add(request.request_token_categories.as_ref().map_or(
-                        0,
-                        |categories| categories.tool_output_budget_dropped_token_count,
-                    ))
+                    total.saturating_add(
+                        request
+                            .request_token_categories
+                            .as_ref()
+                            .map_or(0, |categories| {
+                                categories.tool_output_budget_dropped_token_count
+                            }),
+                    )
                 },
             ),
             purpose_aggregates,

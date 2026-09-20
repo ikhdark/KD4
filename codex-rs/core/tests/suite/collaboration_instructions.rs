@@ -7,12 +7,12 @@ use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -61,7 +61,7 @@ fn count_messages_containing(texts: &[String], target: &str) -> usize {
 async fn assert_clearing_collaboration_instructions_emits_reset(
     cleared_instructions: Option<&str>,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -126,7 +126,7 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_collaboration_instructions_by_default() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -169,7 +169,7 @@ async fn no_collaboration_instructions_by_default() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_input_includes_collaboration_instructions_after_override() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -215,7 +215,7 @@ async fn user_input_includes_collaboration_instructions_after_override() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_instructions_added_on_user_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -263,7 +263,7 @@ async fn collaboration_instructions_added_on_user_turn() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_instructions_omitted_when_disabled() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -315,7 +315,7 @@ async fn collaboration_instructions_omitted_when_disabled() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn override_then_next_turn_uses_updated_collaboration_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -361,7 +361,7 @@ async fn override_then_next_turn_uses_updated_collaboration_instructions() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_overrides_collaboration_instructions_after_override() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(
@@ -422,7 +422,7 @@ async fn user_turn_overrides_collaboration_instructions_after_override() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -505,7 +505,7 @@ async fn clearing_collaboration_mode_instructions_removes_stable_slot() -> Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -578,7 +578,7 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_mode_update_emits_new_instruction_message_when_mode_changes() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -660,7 +660,7 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_mode_update_noop_does_not_append_when_mode_is_unchanged() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -739,7 +739,7 @@ async fn collaboration_mode_update_noop_does_not_append_when_mode_is_unchanged()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_replays_collaboration_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let _req1 = mount_sse_once(
@@ -813,7 +813,7 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_collaboration_instructions_are_ignored() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let req = mount_sse_once(

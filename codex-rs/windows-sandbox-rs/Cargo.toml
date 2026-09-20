@@ -43,7 +43,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "signal", "time"] }
 tracing-appender = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
-windows = { version = "0.58", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_WindowsFirewall",
     "Win32_System_Com",

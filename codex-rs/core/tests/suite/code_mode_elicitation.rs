@@ -15,6 +15,7 @@ use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
@@ -22,7 +23,6 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -153,7 +153,7 @@ async fn submit_turn(test: &TestCodex, permission_profile: PermissionProfile) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_holds_yielded_result_during_command_approval() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
@@ -194,7 +194,7 @@ await tools.exec_command({
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(codex_home)]
 async fn code_mode_holds_yielded_result_during_patch_approval() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
@@ -231,7 +231,7 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_patch_approval
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_holds_yielded_result_during_permission_request() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
@@ -275,7 +275,7 @@ await tools.request_permissions({
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(codex_home)]
 async fn code_mode_nested_denial_completes_without_follow_up_or_error() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
@@ -416,7 +416,7 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_interrupt_closes_direct_and_nested_calls_before_turn_aborted() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
@@ -583,7 +583,7 @@ await tools.request_permissions({
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_failure_returns_to_model_for_repair() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = CodeModeElicitationHarness::start(
         r#"throw new Error("terminal failure marker");"#,
@@ -672,7 +672,7 @@ async fn code_mode_failure_returns_to_model_for_repair() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_nested_nonzero_returns_to_model_for_repair() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = CodeModeElicitationHarness::start(
         r#"await tools.exec_command({

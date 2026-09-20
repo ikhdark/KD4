@@ -115,6 +115,52 @@ async fn session_event_channel_applies_ordered_backpressure() {
     assert_eq!(last_id, "overflow");
 }
 
+#[tokio::test]
+async fn event_delivery_records_receipts_only_after_channel_acceptance() {
+    let (session, _turn, _tx, rx) = make_session_and_context_with_event_capacity(1).await;
+    let event = |id: &str| Event {
+        id: id.to_string(),
+        msg: EventMsg::Warning(WarningEvent {
+            message: id.to_string(),
+        }),
+    };
+    let mut receipt = None;
+    session
+        .deliver_event_raw_with_receipt(event("first"), Some(&mut receipt))
+        .await;
+    assert!(matches!(receipt, Some(EventMsg::Warning(ref warning)) if warning.message == "first"));
+
+    receipt = None;
+    {
+        let pending = session.deliver_event_raw_with_receipt(event("second"), Some(&mut receipt));
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(rx.recv().await.expect("first delivery").id, "first");
+        pending.await;
+    }
+    assert!(matches!(receipt, Some(EventMsg::Warning(ref warning)) if warning.message == "second"));
+    assert_eq!(rx.recv().await.expect("second delivery").id, "second");
+
+    // Cancelling a blocked delivery must neither publish nor record a receipt.
+    session.deliver_event_raw(event("third")).await;
+    receipt = None;
+    {
+        let pending =
+            session.deliver_event_raw_with_receipt(event("cancelled"), Some(&mut receipt));
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+    }
+    assert!(receipt.is_none());
+    assert_eq!(rx.recv().await.expect("third delivery").id, "third");
+    assert!(rx.try_recv().is_err());
+
+    rx.close();
+    session
+        .deliver_event_raw_with_receipt(event("closed"), Some(&mut receipt))
+        .await;
+    assert!(receipt.is_none());
+}
+
 #[test]
 fn model_prefetch_only_runs_for_an_explicit_model_that_needs_refresh() {
     use codex_models_manager::manager::RefreshStrategy;
@@ -257,6 +303,72 @@ use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
 #[tokio::test]
+async fn tool_history_persistence_queue_restarts_use_independent_writer_ids() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let thread_id = ThreadId::new();
+    let io_gate = Arc::new(Semaphore::new(1));
+    let mut state = crate::tool_history::ToolHistoryState::default();
+    let mut writer_ids = std::collections::HashSet::new();
+
+    for index in 0..2 {
+        let queue = super::session::ToolHistoryPersistenceQueue::new(
+            Arc::clone(&io_gate),
+            codex_home.path().to_path_buf(),
+            thread_id,
+            state,
+        );
+        queue
+            .enqueue_mutation(
+                crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                    call_id: format!("restart-{index}"),
+                },
+                "test restarted persistence worker",
+            )
+            .await
+            .expect("enqueue mutation");
+        queue.drain().await.expect("persist mutation");
+        let journal = tokio::fs::read_to_string(
+            codex_home
+                .path()
+                .join("tool-history")
+                .join(format!("{thread_id}.journal.jsonl")),
+        )
+        .await
+        .expect("read journal");
+        let record: serde_json::Value =
+            serde_json::from_str(journal.trim()).expect("one journal record per writer");
+        let writer_id = uuid::Uuid::parse_str(record["writer_id"].as_str().expect("writer id"))
+            .expect("writer identity must be independent of PID and wall-clock formatting");
+        assert_eq!(writer_id.get_version(), Some(uuid::Version::Random));
+        assert!(
+            writer_ids.insert(writer_id),
+            "restarted writer must be unique"
+        );
+        assert_eq!(record["sequence"], json!(1));
+
+        let (replayed, warning) =
+            crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
+                .await
+                .into_state_and_warning();
+        assert_eq!(warning, None);
+        let expected_calls = (0..=index)
+            .map(|index| format!("restart-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(&replayed).expect("serialize replayed history")["non_workspace_code_mode_calls"],
+            json!(expected_calls),
+            "the previous writer's checkpoint must not suppress the restarted writer's sequence",
+        );
+        queue
+            .checkpoint()
+            .await
+            .expect("checkpoint writer progress");
+        drop(queue);
+        state = replayed;
+    }
+}
+
+#[tokio::test]
 async fn tool_history_persistence_queue_batches_mutations_without_dropping_them() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let thread_id = ThreadId::new();
@@ -319,8 +431,7 @@ async fn tool_history_registration_waits_without_blocking_or_partially_mutating(
     assert!(
         tokio::time::timeout(
             Duration::from_millis(25),
-            session
-                .register_non_workspace_code_mode_call(&codex_home, "cancelled-call".to_string()),
+            session.register_non_workspace_code_mode_call("cancelled-call".to_string()),
         )
         .await
         .is_err(),
@@ -335,7 +446,7 @@ async fn tool_history_registration_waits_without_blocking_or_partially_mutating(
 
     drop(writer);
     session
-        .register_non_workspace_code_mode_call(&codex_home, "persisted-call".to_string())
+        .register_non_workspace_code_mode_call("persisted-call".to_string())
         .await;
     session
         .flush_tool_history_persistence()
@@ -708,7 +819,7 @@ async fn shutdown_reports_failed_tool_history_checkpoint_before_completion() {
     .await
     .expect("obstruct actual filesystem persistence");
     session
-        .register_non_workspace_code_mode_call(codex_home.path(), "undurable-call".to_string())
+        .register_non_workspace_code_mode_call("undurable-call".to_string())
         .await;
     session
         .tool_history_persistence
@@ -8144,7 +8255,10 @@ async fn mailbox_submission_reports_overflow_and_allows_retry() {
         .expect("mailbox admission timed out")
         .expect("accepted or duplicate message should succeed");
     }
-    let (activity, _) = session.input_queue.subscribe_activity(None, /*has_internal_completion*/ false).await;
+    let (activity, _) = session
+        .input_queue
+        .subscribe_activity(None, /*has_internal_completion*/ false)
+        .await;
     let error = tokio::time::timeout(
         StdDuration::from_secs(5),
         codex.submit(Op::InterAgentCommunication {
@@ -8681,9 +8795,8 @@ async fn shutdown_continues_when_tool_history_persistence_stalls() {
     let persistence_pause = crate::tool_history::pause_next_tool_history_persistence_for_test(
         &session.thread_id.to_string(),
     );
-    let codex_home = session.get_config().await.codex_home.clone();
     session
-        .register_non_workspace_code_mode_call(&codex_home, "stalled-call".to_string())
+        .register_non_workspace_code_mode_call("stalled-call".to_string())
         .await;
     persistence_pause.wait_until_reached().await;
 
@@ -8730,32 +8843,27 @@ async fn completed_tool_consumption_does_not_wait_for_persistence() {
     .await
     .expect("protect canonical artifact for history reload");
     session
-        .register_tool_history_candidate(
-            codex_home.path(),
-            crate::tool_history::ToolHistoryCandidate {
-                call_id: call_id.to_string(),
-                tool_identity: "functions.exec".to_string(),
-                semantic_class: "tool_output".to_string(),
-                successful: true,
-                source_dependencies: std::collections::BTreeSet::new(),
-                source_dependencies_current: true,
-                artifact_id,
-                artifact_bytes: canonical.exact_bytes,
-                artifact_sha256: canonical.sha256,
-                original_output_sha256: crate::tool_history::sha256(
-                    bounded_model_output.as_bytes(),
-                ),
-                original_tokens: 100,
-                preserved_non_text_tokens: Some(0),
-                bounded_model_output: bounded_model_output.clone(),
-                complete: true,
-                projection_eligible: true,
-                proof_identity: None,
-                supersession_identity: None,
-                consumed_by_generation: None,
-                derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
-            },
-        )
+        .register_tool_history_candidate(crate::tool_history::ToolHistoryCandidate {
+            call_id: call_id.to_string(),
+            tool_identity: "functions.exec".to_string(),
+            semantic_class: "tool_output".to_string(),
+            successful: true,
+            source_dependencies: std::collections::BTreeSet::new(),
+            source_dependencies_current: true,
+            artifact_id,
+            artifact_bytes: canonical.exact_bytes,
+            artifact_sha256: canonical.sha256,
+            original_output_sha256: crate::tool_history::sha256(bounded_model_output.as_bytes()),
+            original_tokens: 100,
+            preserved_non_text_tokens: Some(0),
+            bounded_model_output: bounded_model_output.clone(),
+            complete: true,
+            projection_eligible: true,
+            proof_identity: None,
+            supersession_identity: None,
+            consumed_by_generation: None,
+            derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+        })
         .await;
     session
         .flush_tool_history_persistence()
@@ -9982,32 +10090,27 @@ async fn compaction_persistence_fixture_with_rollout(
     .await
     .expect("protect canonical artifact for history reload");
     session
-        .register_tool_history_candidate(
-            codex_home.path(),
-            crate::tool_history::ToolHistoryCandidate {
-                call_id: call_id.to_string(),
-                tool_identity: "functions.exec".to_string(),
-                semantic_class: "tool_output".to_string(),
-                successful: true,
-                source_dependencies: std::collections::BTreeSet::new(),
-                source_dependencies_current: true,
-                artifact_id: artifact_id.clone(),
-                artifact_bytes: canonical.exact_bytes,
-                artifact_sha256: canonical.sha256,
-                original_output_sha256: crate::tool_history::sha256(
-                    bounded_model_output.as_bytes(),
-                ),
-                original_tokens: 100,
-                preserved_non_text_tokens: Some(0),
-                bounded_model_output: bounded_model_output.clone(),
-                complete: true,
-                projection_eligible: true,
-                proof_identity: None,
-                supersession_identity: None,
-                consumed_by_generation: None,
-                derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
-            },
-        )
+        .register_tool_history_candidate(crate::tool_history::ToolHistoryCandidate {
+            call_id: call_id.to_string(),
+            tool_identity: "functions.exec".to_string(),
+            semantic_class: "tool_output".to_string(),
+            successful: true,
+            source_dependencies: std::collections::BTreeSet::new(),
+            source_dependencies_current: true,
+            artifact_id: artifact_id.clone(),
+            artifact_bytes: canonical.exact_bytes,
+            artifact_sha256: canonical.sha256,
+            original_output_sha256: crate::tool_history::sha256(bounded_model_output.as_bytes()),
+            original_tokens: 100,
+            preserved_non_text_tokens: Some(0),
+            bounded_model_output: bounded_model_output.clone(),
+            complete: true,
+            projection_eligible: true,
+            proof_identity: None,
+            supersession_identity: None,
+            consumed_by_generation: None,
+            derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+        })
         .await;
 
     session
@@ -10636,10 +10739,7 @@ async fn compacted_history_rollout_flush_failure_retains_prune_until_physical_re
     );
     assert!(fixture.rollout_path.is_dir());
     session
-        .register_non_workspace_code_mode_call(
-            fixture.codex_home.path(),
-            "after-rollout-barrier-failure".to_string(),
-        )
+        .register_non_workspace_code_mode_call("after-rollout-barrier-failure".to_string())
         .await;
     timeout(
         Duration::from_secs(5),
@@ -11475,6 +11575,134 @@ async fn build_initial_context_includes_prompt_fragments_from_extensions() {
             .flatten()
             .any(|text| *text == "prompt extension enabled"),
         "expected prompt extension developer text, got {developer_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn prepared_context_update_renders_full_world_only_when_required() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    struct Contributor {
+        phase: Arc<AtomicUsize>,
+        full_renders: Arc<AtomicUsize>,
+        delta_renders: Arc<AtomicUsize>,
+    }
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _session: &'a codex_extension_api::ExtensionData,
+            _thread: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
+            let changed = self.phase.load(Ordering::SeqCst) >= 3;
+            Box::pin(async move {
+                vec![codex_extension_api::PromptFragment::developer_policy(
+                    if changed {
+                        "changed stable policy"
+                    } else {
+                        "original stable policy"
+                    },
+                )]
+            })
+        }
+
+        fn contribute_world_state<'a>(
+            &'a self,
+            _input: codex_extension_api::WorldStateContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<
+            'a,
+            Vec<codex_extension_api::WorldStateSectionContribution>,
+        > {
+            let revision = usize::from(self.phase.load(Ordering::SeqCst) >= 2);
+            let full_renders = Arc::clone(&self.full_renders);
+            let delta_renders = Arc::clone(&self.delta_renders);
+            Box::pin(async move {
+                vec![codex_extension_api::WorldStateSectionContribution::new(
+                    "counted-world",
+                    json!({"revision": revision}),
+                    move |previous| {
+                        if let codex_extension_api::PreviousWorldStateSection::Known(previous) =
+                            previous
+                        {
+                            delta_renders.fetch_add(1, Ordering::SeqCst);
+                            if previous == &json!({"revision": revision}) {
+                                return None;
+                            }
+                        } else {
+                            full_renders.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Some(codex_extension_api::RenderedWorldStateFragment::new(
+                            "developer",
+                            ("<counted_world>", "</counted_world>"),
+                            format!("world revision {revision}"),
+                        ))
+                    },
+                )]
+            })
+        }
+    }
+    let (mut session, turn) = make_session_and_context().await;
+    let phase = Arc::new(AtomicUsize::new(0));
+    let full_renders = Arc::new(AtomicUsize::new(0));
+    let delta_renders = Arc::new(AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(Contributor {
+        phase: Arc::clone(&phase),
+        full_renders: Arc::clone(&full_renders),
+        delta_renders: Arc::clone(&delta_renders),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    for current_phase in 0..4 {
+        phase.store(current_phase, Ordering::SeqCst);
+        let prepared = session.prepare_context_update(&step).await;
+        let texts = developer_input_texts(prepared.context_items());
+        if current_phase == 1 {
+            assert!(prepared.context_items().is_empty());
+        } else {
+            let revision = usize::from(current_phase >= 2);
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(&format!("world revision {revision}")))
+            );
+        }
+        if current_phase == 2 {
+            assert!(
+                !texts
+                    .iter()
+                    .any(|text| text.contains("original stable policy"))
+            );
+        }
+        if current_phase == 3 {
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains("changed stable policy"))
+            );
+        }
+        assert!(
+            session
+                .compare_and_record_context_updates(
+                    prepared,
+                    session.services.planning_generation()
+                )
+                .await
+                .is_some()
+        );
+    }
+    assert_eq!(full_renders.load(Ordering::SeqCst), 2);
+    assert_eq!(delta_renders.load(Ordering::SeqCst), 2);
+    let state = session.state.lock().await;
+    assert_eq!(
+        state
+            .pending_context_baseline()
+            .unwrap()
+            .world_state_snapshot
+            .section("counted-world"),
+        Some(&json!({"revision": 1}))
     );
 }
 
@@ -15121,11 +15349,11 @@ fn assert_interruption_recovery_guidance(event: EventMsg) {
     assert!(text.starts_with("<turn_aborted>\n"));
     assert!(text.ends_with("\n</turn_aborted>"));
     assert!(text.contains(
-        "Any tools, commands, or nested code-mode work may have partially executed or may still be running."
+        "If tools, commands, or nested code-mode work were in flight, inspect only the affected state and live sessions needed to resolve uncertain effects before relying on them or repeating an operation."
     ));
-    assert!(text.contains(
-        "Before continuing, inspect the affected state and any live sessions; do not assume pre-interruption evidence is still current or repeat operations whose effects are uncertain."
-    ));
+    assert!(
+        text.contains("Reuse unaffected evidence and continue with the user's latest direction.")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16408,7 +16636,10 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
                 .await
                 .expect("mailbox admission")
         );
-        let (mut activity, _) = sess.input_queue.subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false).await;
+        let (mut activity, _) = sess
+            .input_queue
+            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false)
+            .await;
         assert!(!activity.has_changed().unwrap());
         let candidate_context = IndexMap::from([(
             "candidate-source".to_string(),
@@ -16952,6 +17183,55 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     );
 }
 
+#[tokio::test]
+async fn rejected_tool_calls_preserve_eager_read_prefix() {
+    for sealed in [false, true] {
+        let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+        if sealed {
+            crate::state::TurnTerminalCoordinator::new_with_tool_call_acceptance(
+                tc.sub_id.clone(),
+                Arc::clone(&tc.tool_call_acceptance),
+            )
+            .seal_tool_call_acceptance(&tc.turn_timing_state);
+        } else {
+            assert!(tc.turn_timing_state.try_record_accepted_tool_call(
+                "rejected-call",
+                &codex_protocol::protocol::ToolExecutionId("prior-execution".to_string()),
+                codex_protocol::protocol::TurnTimingToolCallSource::Direct,
+                None,
+            ));
+        }
+        let mut ctx = HandleOutputCtx {
+            sess: Arc::clone(&sess),
+            turn_context: Arc::clone(&tc),
+            turn_store: Arc::new(codex_extension_api::ExtensionData::new(tc.sub_id.clone())),
+            tool_runtime: test_tool_runtime(Arc::clone(&sess), Arc::clone(&tc)),
+            cancellation_token: CancellationToken::new(),
+            response_item_recorder: OrderedResponseItemRecorder::default(),
+        };
+        let mut earlier_calls_eligible = true;
+        let result = handle_output_item_done(
+            &mut ctx,
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "test_tool".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "rejected-call".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            None,
+            &mut earlier_calls_eligible,
+        )
+        .await;
+        assert!(matches!(result, Err(CodexErr::Fatal(_))));
+        assert!(
+            earlier_calls_eligible,
+            "rejected calls must not close the prefix"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
@@ -17250,7 +17530,7 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
             },
             &Default::default(),
         );
-        let call = ToolRouter::build_tool_call(recovery_call.clone())
+        let call = ToolRouter::build_tool_call(&recovery_call)
             .expect("build registered recovery call")
             .expect("function call");
         let dispatch = Arc::new(ToolDispatchState::new());
@@ -17297,7 +17577,6 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
         let prompt = super::turn::prepare_sampling_prompt_for_client(
             session.clone_history().await,
             &turn,
-            &test_model_client_session(),
             &session.services.git_workspace,
         )
         .await;
@@ -17358,7 +17637,7 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
 }
 
 #[tokio::test]
-async fn fatal_tool_error_stops_turn_and_reports_error() {
+async fn incompatible_tool_payload_returns_recoverable_error() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let tools = {
         session
@@ -17392,7 +17671,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let call = ToolRouter::build_tool_call(item.clone())
+    let call = ToolRouter::build_tool_call(&item)
         .expect("build tool call")
         .expect("tool call present");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -17410,16 +17689,15 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         )
         .await
         .err()
-        .expect("expected fatal error");
+        .expect("expected recoverable payload error");
 
     match err {
-        FunctionCallError::Fatal(message) => {
-            assert_eq!(
-                message,
-                "tool shell_command invoked with incompatible payload"
-            );
+        FunctionCallError::RespondToModel(message) => {
+            assert!(message.starts_with("tool shell_command invoked with incompatible payload"));
+            assert!(message.contains("expected JSON arguments"), "{message}");
+            assert!(message.contains("The tool was not run"), "{message}");
         }
-        other => panic!("expected FunctionCallError::Fatal, got {other:?}"),
+        other => panic!("expected FunctionCallError::RespondToModel, got {other:?}"),
     }
 }
 

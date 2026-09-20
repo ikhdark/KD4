@@ -192,6 +192,14 @@ pub(crate) struct Session {
     state: Arc<SessionState>,
 }
 
+/// Routes and undelivered failures share one lock so cleanup is atomic without
+/// cloning either map on each registration or terminal event.
+#[derive(Default)]
+struct HttpBodyStreams {
+    streams: HashMap<String, mpsc::Sender<HttpRequestBodyDeltaNotification>>,
+    failures: HashMap<String, String>,
+}
+
 struct Inner {
     connection: StdMutex<ConnectionState>,
     connection_changed: watch::Sender<()>,
@@ -208,9 +216,7 @@ struct Inner {
     // because they share the same connection-global notification channel as
     // process output. Keep the routing table local to the client so higher
     // layers can consume body chunks like a normal byte stream.
-    http_body_streams: ArcSwap<HashMap<String, mpsc::Sender<HttpRequestBodyDeltaNotification>>>,
-    http_body_stream_failures: ArcSwap<HashMap<String, String>>,
-    http_body_streams_write_lock: Mutex<()>,
+    http_body_streams: Mutex<HttpBodyStreams>,
     http_body_stream_next_id: AtomicU64,
     session_id: OnceLock<String>,
     environment_info: OnceLock<EnvironmentInfo>,
@@ -944,9 +950,7 @@ impl ExecServerClient {
             connection_changed,
             sessions: ArcSwap::from_pointee(HashMap::new()),
             sessions_write_lock: StdMutex::new(()),
-            http_body_streams: ArcSwap::from_pointee(HashMap::new()),
-            http_body_stream_failures: ArcSwap::from_pointee(HashMap::new()),
-            http_body_streams_write_lock: Mutex::new(()),
+            http_body_streams: Mutex::new(HttpBodyStreams::default()),
             http_body_stream_next_id: AtomicU64::new(1),
             session_id,
             environment_info: OnceLock::new(),

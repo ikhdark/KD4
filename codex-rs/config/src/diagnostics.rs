@@ -280,7 +280,7 @@ pub fn format_config_error(error: &ConfigError, contents: &str) -> String {
     };
 
     let line_number = start.line;
-    let gutter = line_number.to_string().len();
+    let gutter = line_number.checked_ilog10().unwrap_or(0) as usize + 1;
     let _ = writeln!(output, "{:width$} |", "", width = gutter);
     let _ = writeln!(output, "{line_number:>gutter$} | {line}");
 
@@ -297,8 +297,8 @@ pub fn format_config_error(error: &ConfigError, contents: &str) -> String {
     output.trim_end().to_string()
 }
 
-pub fn format_config_error_with_source(error: &ConfigError) -> String {
-    match std::fs::read_to_string(&error.path) {
+pub async fn format_config_error_with_source(error: &ConfigError) -> String {
+    match tokio::fs::read_to_string(&error.path).await {
         Ok(contents) => format_config_error(error, &contents),
         Err(_) => format_config_error(error, ""),
     }
@@ -437,7 +437,7 @@ fn span_for_features_value(contents: &str) -> Option<std::ops::Range<usize>> {
 }
 
 fn node_for_path<'a>(item: &'a Item, path: &SerdePath) -> Option<TomlNode<'a>> {
-    let segments: Vec<_> = path.iter().cloned().collect();
+    let segments: Vec<_> = path.iter().collect();
     let mut node = TomlNode::Item(item);
     let mut index = 0;
     while index < segments.len() {
@@ -490,6 +490,28 @@ fn seq_child<'a>(node: &TomlNode<'a>, index: usize) -> Option<TomlNode<'a>> {
 mod consolidated_type_tests {
     use super::TextPosition;
     use super::TextRange;
+
+    #[tokio::test]
+    async fn formats_config_error_with_source_and_missing_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("config.toml");
+        let contents = "allow_login_shell = 123\n";
+        tokio::fs::write(&path, contents)
+            .await
+            .expect("write config");
+        let error =
+            super::config_error_from_typed_toml::<crate::config_toml::ConfigToml>(&path, contents)
+                .expect("invalid boolean");
+        assert_eq!(
+            super::format_config_error_with_source(&error).await,
+            super::format_config_error(&error, contents),
+        );
+        tokio::fs::remove_file(&path).await.expect("remove config");
+        assert_eq!(
+            super::format_config_error_with_source(&error).await,
+            super::format_config_error(&error, ""),
+        );
+    }
 
     #[test]
     fn invalid_config_value_has_exact_coordinates_and_rendered_highlight() {

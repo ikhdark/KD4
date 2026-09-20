@@ -70,6 +70,9 @@ fn preparation_preserves_small_image_bytes_and_replaces_remote_urls() {
 #[test]
 fn detail_policies_apply_the_expected_budgets() {
     for (detail, input_dimensions, expected_dimensions) in [
+        (Some(ImageDetail::Low), (2048, 2048), (512, 512)),
+        (Some(ImageDetail::Low), (2048, 1024), (512, 256)),
+        (Some(ImageDetail::Low), (64, 32), (64, 32)),
         (Some(ImageDetail::High), (2048, 2048), (1600, 1600)),
         (Some(ImageDetail::Original), (6401, 100), (6000, 94)),
         (Some(ImageDetail::Original), (3201, 3201), (3200, 3200)),
@@ -90,10 +93,17 @@ fn detail_policies_apply_the_expected_budgets() {
         let ResponseItem::Message { content, .. } = &items[0] else {
             panic!("expected message");
         };
-        let [ContentItem::InputImage { image_url, .. }] = content.as_slice() else {
+        let [
+            ContentItem::InputImage {
+                image_url,
+                detail: prepared_detail,
+            },
+        ] = content.as_slice()
+        else {
             panic!("expected image");
         };
         assert_eq!(decoded_image(image_url).1.dimensions(), expected_dimensions);
+        assert_eq!(*prepared_detail, detail);
     }
 }
 
@@ -151,8 +161,9 @@ fn preparation_replaces_only_failed_tool_images_and_preserves_metadata() {
                     FunctionCallOutputContentItem::InputText {
                         text: IMAGE_PROCESSING_ERROR_PLACEHOLDER.to_string(),
                     },
-                    FunctionCallOutputContentItem::InputText {
-                        text: UNSUPPORTED_LOW_DETAIL_PLACEHOLDER.to_string(),
+                    FunctionCallOutputContentItem::InputImage {
+                        image_url: expected_valid_image_url.clone(),
+                        detail: Some(ImageDetail::Low),
                     },
                     FunctionCallOutputContentItem::InputImage {
                         image_url: expected_valid_image_url,
@@ -172,10 +183,6 @@ fn preparation_errors_use_bounded_actionable_placeholders() {
         (
             ImagePreparationError::RemoteUrlUnsupported,
             REMOTE_IMAGE_URL_PLACEHOLDER,
-        ),
-        (
-            ImagePreparationError::UnsupportedLowDetail,
-            UNSUPPORTED_LOW_DETAIL_PLACEHOLDER,
         ),
         (
             ImagePreparationError::Processing(ImageProcessingError::ImageTooLarge {

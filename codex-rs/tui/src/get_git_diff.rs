@@ -102,9 +102,7 @@ pub(crate) async fn get_git_diff(
     let untracked_output = untracked_output_res?;
 
     let mut untracked_diff = String::new();
-    let null_device: &Path = Path::new("/dev/null");
-
-    let null_path = null_device.to_str().unwrap_or("/dev/null");
+    let null_path = "/dev/null";
     let untracked_files = match untracked_output {
         Some(output) => parse_untracked_files(&output)?,
         None => {

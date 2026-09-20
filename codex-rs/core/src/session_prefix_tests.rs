@@ -9,6 +9,30 @@ use super::format_inter_agent_completion_message;
 use super::format_subagent_notification_message;
 
 #[test]
+fn complete_error_does_not_require_fetching_the_same_error_again() {
+    let message = format_inter_agent_completion_message(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        &AgentStatus::Errored("missing required command".to_string()),
+    )
+    .expect("error status should produce a completion message");
+    assert!(message.contains("Agent errored: missing required command"));
+    assert!(!message.contains("get_agent_task"));
+}
+
+#[test]
+fn control_character_error_completion_bounds_the_rendered_envelope() {
+    let message = format_inter_agent_completion_message(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        &AgentStatus::Errored("\0".repeat(10_000)),
+    )
+    .expect("error status should produce a completion message");
+    assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
+    assert!(message.contains(ERROR_NEXT_ACTION));
+}
+
+#[test]
 fn error_completion_message_stays_below_manual_review_threshold() {
     let message = format_inter_agent_completion_message(
         AgentPath::root(),

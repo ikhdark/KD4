@@ -87,12 +87,13 @@ struct SearchNarrowingScope {
 
 impl SearchNarrowingAttempt {
     fn parent_scope(&self) -> Option<SearchNarrowingScope> {
+        let scope_identity = self.parent_scope_identity.as_ref()?;
         Some(SearchNarrowingScope {
             turn_id: self.turn_id.clone(),
             environment_id: self.environment_id.clone(),
             repository_identity: self.repository_identity.clone(),
             query_identity: self.query_identity.clone(),
-            scope_identity: self.parent_scope_identity.clone()?,
+            scope_identity: scope_identity.clone(),
         })
     }
 }
@@ -184,6 +185,9 @@ impl CommandAttemptKey {
     }
 
     pub(crate) fn with_search_environment(mut self, environment: &HashMap<String, String>) -> Self {
+        let Some(search) = self.search_narrowing.as_mut() else {
+            return self;
+        };
         // The scope snapshot cannot account for options or further file inputs
         // loaded from external configuration. Run the search instead of caching
         // a negative result based only on the unchanged configuration pathname.
@@ -196,8 +200,7 @@ impl CommandAttemptKey {
                 ]
                 .iter()
                 .any(|name| key.eq_ignore_ascii_case(name))
-        }) && let Some(search) = self.search_narrowing.as_mut()
-        {
+        }) {
             search.can_record_miss = false;
         }
         self
@@ -250,23 +253,19 @@ impl CommandAttemptKey {
 }
 
 fn fingerprint_value<T: Serialize + ?Sized>(value: &T) -> String {
-    let encoded = match serde_json::to_vec(value) {
-        Ok(encoded) => encoded,
-        Err(error) => {
-            tracing::warn!(%error, "command fingerprint unavailable; disabling equivalent-attempt reuse");
-            // A unique value fails open for execution without equating two
-            // authorization contexts that could not be serialized.
-            return format!(
-                "{COMMAND_FINGERPRINT_VERSION}:unavailable:{}",
-                uuid::Uuid::new_v4()
-            );
-        }
-    };
     let mut hasher = Sha256::new();
     hasher.update(b"kd4-command-fingerprint\0");
     hasher.update(COMMAND_FINGERPRINT_VERSION.as_bytes());
     hasher.update(b"\0");
-    hasher.update(encoded);
+    if let Err(error) = serde_json::to_writer(&mut hasher, value) {
+        tracing::warn!(%error, "command fingerprint unavailable; disabling equivalent-attempt reuse");
+        // A unique value fails open for execution without equating two
+        // authorization contexts that could not be serialized.
+        return format!(
+            "{COMMAND_FINGERPRINT_VERSION}:unavailable:{}",
+            uuid::Uuid::new_v4()
+        );
+    }
     format!("{}:{:x}", COMMAND_FINGERPRINT_VERSION, hasher.finalize())
 }
 

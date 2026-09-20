@@ -266,8 +266,9 @@ fn tool_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     tool_index: usize,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let data = v8::String::new(scope, &tool_index.to_string())
-        .ok_or_else(|| "failed to allocate tool callback data".to_string())?;
+    let index =
+        u32::try_from(tool_index).map_err(|_| "tool callback index exceeds u32".to_string())?;
+    let data = v8::Integer::new_from_unsigned(scope, index);
     let template = v8::FunctionTemplate::builder(tool_callback)
         .data(data.into())
         .build(scope);

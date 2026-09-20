@@ -62,7 +62,7 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction() {
                     (
                         "max_workers".to_string(),
                         JsonSchema::integer(Some(
-                            "Alias for max_concurrency. Defaults to 16 and is capped by config."
+                            "Legacy alias; prefer max_concurrency and omit this field."
                                 .to_string(),
                         )),
                     ),

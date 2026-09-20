@@ -46,7 +46,8 @@ pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
                 escape_identifier_for_error(value),
             ));
         }
-        if value.chars().count() > max_len {
+        // The identifier check above already guarantees ASCII.
+        if value.len() > max_len {
             return Err(format!(
                 "{label} must be at most {max_len} characters to match Responses API: {}",
                 escape_identifier_for_error(value),

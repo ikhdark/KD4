@@ -789,7 +789,7 @@ mod tests {
             tokio::spawn(async move { deleting.rollback_created_thread(thread_id).await });
         tokio::time::timeout(Duration::from_secs(3), async {
             while state.get_thread(thread_id).await.unwrap().is_some() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -824,7 +824,9 @@ mod tests {
             .execute(&mut logs_lock)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
+        // The state layer permits a five-second SQLite busy wait. Allow that worker
+        // to finish after unlocking, and avoid racing cleanup with a tight I/O poll.
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let name_gone = codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
                     .await
@@ -840,7 +842,7 @@ mod tests {
                 if name_gone && staging_gone {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await

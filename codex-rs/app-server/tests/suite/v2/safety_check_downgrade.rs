@@ -20,8 +20,8 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::WarningNotification;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -36,7 +36,7 @@ const CYBER_POLICY_MESSAGE: &str =
 
 #[tokio::test]
 async fn openai_model_header_mismatch_emits_model_rerouted_notification_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -104,7 +104,7 @@ async fn openai_model_header_mismatch_emits_model_rerouted_notification_v2() -> 
 
 #[tokio::test]
 async fn cyber_policy_response_emits_typed_error_notification_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response = ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -178,7 +178,7 @@ async fn cyber_policy_response_emits_typed_error_notification_v2() -> Result<()>
 #[tokio::test]
 async fn response_model_field_mismatch_emits_model_rerouted_notification_v2_when_header_matches_requested()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -254,7 +254,7 @@ async fn response_model_field_mismatch_emits_model_rerouted_notification_v2_when
 
 #[tokio::test]
 async fn model_verification_emits_typed_notification_and_warning_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -334,7 +334,7 @@ async fn model_verification_emits_typed_notification_and_warning_v2() -> Result<
 
 #[tokio::test]
 async fn turn_moderation_metadata_emits_typed_notification_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![

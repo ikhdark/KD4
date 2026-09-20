@@ -15,7 +15,7 @@ pub struct ResolvedReviewRequest {
     pub user_facing_hint: String,
 }
 
-const UNCOMMITTED_PROMPT: &str = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.";
+const UNCOMMITTED_PROMPT: &str = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Run `git status --short --untracked-files=all`, `git diff`, and `git diff --cached` to establish the scope. Read relevant untracked files directly; git diff does not include their contents.";
 
 const BASE_BRANCH_PROMPT: &str = "Review the code changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git diff {{merge_base_sha}}` to inspect tracked changes relative to {{base_branch}}, including staged and unstaged edits. Provide prioritized, actionable findings.";
 static BASE_BRANCH_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {

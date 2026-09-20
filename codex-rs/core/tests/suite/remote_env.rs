@@ -287,6 +287,16 @@ async fn wait_for_response_request_count(response_mock: &ResponseMock, expected_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<()> {
+    deferred_executor_startup_case(true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_executor_updates_context_and_tools_after_startup_with_inferred_environment()
+-> Result<()> {
+    deferred_executor_startup_case(false).await
+}
+
+async fn deferred_executor_startup_case(explicit_environment: bool) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server = start_mock_server().await;
     let wait_call_id = "wait-for-startup";
@@ -301,9 +311,11 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
                 ev_function_call(
                     wait_call_id,
                     "wait_for_environment",
-                    &json!({
-                        "environment_id": REMOTE_ENVIRONMENT_ID,
-                    })
+                    &if explicit_environment {
+                        json!({"environment_id": REMOTE_ENVIRONMENT_ID})
+                    } else {
+                        json!({})
+                    }
                     .to_string(),
                 ),
                 ev_completed("resp-1"),

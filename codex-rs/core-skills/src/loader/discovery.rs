@@ -136,9 +136,14 @@ pub(super) async fn discover_skills(
                 }
             }
             WalkEntryKind::File => {
-                file_paths.insert(entry.path.clone());
-                if entry.path.basename().as_deref() == Some(SKILLS_FILENAME) {
-                    skill_files.push(entry.path);
+                match entry.path.basename().as_deref() {
+                    Some(SKILLS_FILENAME) => skill_files.push(entry.path),
+                    // Only metadata files are queried below. Move their paths instead of
+                    // cloning and retaining every file in the walked tree.
+                    Some(SKILLS_METADATA_FILENAME) => {
+                        file_paths.insert(entry.path);
+                    }
+                    _ => {}
                 }
             }
         }

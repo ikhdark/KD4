@@ -736,6 +736,7 @@ fn model_request_measurements_reuse_encoded_item_and_tool_bytes() {
         measured.prompt_context_categories,
         expected.prompt_context_categories
     );
+    assert_eq!(measured.input_item_digests, expected.input_item_digests);
     assert_eq!(measured.tool_token_count, expected.tool_token_count);
     assert_eq!(
         measured.tool_schema_breakdown[0].serialized_bytes,
@@ -1204,11 +1205,7 @@ fn history_prefix_divergence_separates_appending_from_rewriting() {
     );
 
     // Re-sending the same items is still full reuse.
-    let mut unchanged = measure(vec![
-        first_item.clone(),
-        second_item.clone(),
-        third_item.clone(),
-    ]);
+    let mut unchanged = measure(vec![first_item.clone(), second_item, third_item.clone()]);
     unchanged.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
     assert_eq!(divergence(&unchanged), (Some(3), Some(3), Some(3)));
 
@@ -1218,7 +1215,7 @@ fn history_prefix_divergence_separates_appending_from_rewriting() {
     let mut rewritten = measure(vec![
         first_item.clone(),
         history_test_tool_output("call-2", "rewritten result"),
-        third_item.clone(),
+        third_item,
     ]);
     rewritten.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
     assert_eq!(

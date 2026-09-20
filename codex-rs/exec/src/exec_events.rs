@@ -111,6 +111,8 @@ pub enum ThreadItemDetails {
     AgentMessage(AgentMessageItem),
     /// Agent's reasoning summary.
     Reasoning(ReasoningItem),
+    /// Marks context compaction. The enclosing event distinguishes start from completion.
+    ContextCompaction {},
     /// Tracks a command executed by the agent. The item starts when the command is
     /// spawned, and completes when the process exits with an exit code.
     CommandExecution(CommandExecutionItem),

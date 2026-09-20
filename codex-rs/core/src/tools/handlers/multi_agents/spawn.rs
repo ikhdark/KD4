@@ -38,7 +38,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "spawn_agent spawn agent subagent sub-agent delegate delegation parallel work worker explorer no-apps fork model reasoning",
-            registered_spec.clone(),
+            registered_spec,
         )
     }
 

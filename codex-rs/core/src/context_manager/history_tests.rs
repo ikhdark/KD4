@@ -374,30 +374,55 @@ fn prepared_token_estimates_cache_existing_items_and_only_measure_appends() {
         text: "base instructions".to_string(),
     };
 
-    history
+    let first_estimate = history
         .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
         .expect("first estimate");
+    assert_eq!(
+        Some(first_estimate),
+        ContextManager::estimate_items_token_count_with_base_instructions(
+            history.raw_items(),
+            &base
+        ),
+    );
     assert_eq!(history.cached_item_token_estimate_count(), 1);
-    history
-        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
-        .expect("cached estimate");
+    assert_eq!(
+        history.estimate_prepared_token_count_with_base_instructions(
+            &default_input_modalities(),
+            &base
+        ),
+        Some(first_estimate),
+    );
     assert_eq!(history.cached_item_token_estimate_count(), 1);
     assert_eq!(history.cached_item_token_estimate_namespace_count(), 1);
 
     let mut second = assistant_msg("new response");
     second.set_id(Some(ResponseItemId::with_suffix("msg", "second")));
     history.record_items([&second], TruncationPolicy::Tokens(10_000));
-    history
-        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
-        .expect("estimate after append");
+    assert_eq!(
+        history.estimate_prepared_token_count_with_base_instructions(
+            &default_input_modalities(),
+            &base
+        ),
+        ContextManager::estimate_items_token_count_with_base_instructions(
+            history.raw_items(),
+            &base
+        ),
+    );
     assert_eq!(history.cached_item_token_estimate_count(), 2);
 
     let mut third = assistant_msg("another response");
     third.set_id(Some(ResponseItemId::with_suffix("msg", "third")));
     history.record_items([&third], TruncationPolicy::Tokens(10_000));
-    history
-        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
-        .expect("estimate after second append");
+    assert_eq!(
+        history.estimate_prepared_token_count_with_base_instructions(
+            &default_input_modalities(),
+            &base
+        ),
+        ContextManager::estimate_items_token_count_with_base_instructions(
+            history.raw_items(),
+            &base
+        ),
+    );
     assert_eq!(history.cached_item_token_estimate_count(), 3);
 
     history.replace(vec![first, second, third]);
@@ -642,7 +667,7 @@ fn world_state_reconciles_matching_legacy_history_once() {
         vec!["# AGENTS.md instructions\n\n<INSTRUCTIONS>\nunknown\n</INSTRUCTIONS>"],
         fragments
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|fragment| fragment.body().into_owned())
             .collect::<Vec<_>>()
     );
     assert!(rollout_item.is_some_and(|item| item.full));
@@ -3115,10 +3140,7 @@ async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
     let registration_session = Arc::clone(&session);
     let mut registration = tokio::spawn(async move {
         registration_session
-            .register_non_workspace_code_mode_call(
-                turn.config.codex_home.as_path(),
-                "independent-tool-call".to_string(),
-            )
+            .register_non_workspace_code_mode_call("independent-tool-call".to_string())
             .await;
     });
     let completed =

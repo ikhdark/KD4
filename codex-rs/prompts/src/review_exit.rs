@@ -15,10 +15,7 @@ static REVIEW_EXIT_SUCCESS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 
 pub fn render_review_exit_success(results: &str) -> String {
     // Reviewer output is raw text, not markup belonging to the user-action envelope.
-    let results = results
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    let results = codex_utils_string::xml_text(results).to_string();
     REVIEW_EXIT_SUCCESS_TEMPLATE
         .render([("results", results.as_str())])
         .unwrap_or_else(|err| panic!("review exit success template must render: {err}"))
@@ -29,11 +26,7 @@ pub fn render_review_exit_interrupted() -> String {
 }
 
 fn normalize_review_template_line_endings(template: &str) -> Cow<'_, str> {
-    if template.contains('\r') {
-        Cow::Owned(template.replace("\r\n", "\n").replace('\r', "\n"))
-    } else {
-        Cow::Borrowed(template)
-    }
+    codex_utils_string::normalize_newlines(template)
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -265,7 +266,7 @@ fn audit_everyone_writable_with_timeout(
     if !flagged.is_empty() {
         let mut list = String::new();
         for p in &flagged {
-            list.push_str(&format!("\n - {}", p.display()));
+            let _ = write!(list, "\n - {}", p.display());
         }
         crate::logging::log_note(
             &format!(

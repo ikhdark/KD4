@@ -75,3 +75,14 @@ pub(crate) use task_model_guidance::base_instructions_own_task_model_guidance;
 pub(crate) use turn_aborted::TurnAborted;
 pub(crate) use user_instructions::UserInstructions;
 pub(crate) use user_shell_command::UserShellCommand;
+
+/// Preserve source syntax in model-facing prose while keeping embedded copies of
+/// the fragment's own delimiters from closing or reopening its sections.
+fn escape_fragment_delimiters(text: &str, delimiters: &[&str]) -> String {
+    delimiters.iter().fold(text.to_string(), |text, delimiter| {
+        text.replace(
+            delimiter,
+            &delimiter.replace('<', "&lt;").replace('>', "&gt;"),
+        )
+    })
+}

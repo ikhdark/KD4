@@ -856,14 +856,10 @@ async fn run_websocket_response_stream(
 
         match message {
             Message::Text(text) => {
-                if let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
-                    && let Some(error) =
-                        map_wrapped_websocket_error_event(wrapped_error, text.to_string())
-                {
-                    return Err(error);
-                }
-
-                let events = match interpreter.process_payload(&text) {
+                let events = match interpreter.process_payload_with_error_mapper(&text, || {
+                    let wrapped_error = parse_wrapped_websocket_error_event(&text)?;
+                    map_wrapped_websocket_error_event(wrapped_error, text.to_string())
+                }) {
                     Ok(events) => events,
                     Err(ResponsesEventError::Parse(error)) => {
                         debug!(
@@ -1716,6 +1712,59 @@ mod tests {
             assert!(
                 rx_event.recv().await.is_none(),
                 "case {case} emitted a response event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapped_errors_preempt_completion_even_with_incompatible_response_fields() {
+        for payload in [
+            r#"{"type":"error","status":429,"error":{"message":"slow down"},"headers":{"retry-after":"3"}}"#,
+            r#"{"response":false,"status_code":429,"headers":{"retry-after":"3"},"type":"\u0065rror"}"#,
+        ] {
+            let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
+            let (tx_message, rx_message) = ws_ingress_channel(2, 2048);
+            tx_message
+                .try_send(Message::Text(payload.into()))
+                .expect("error fits ingress queue");
+            tx_message
+                .try_send(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp1"}}"#.into(),
+                ))
+                .expect("completion fits ingress queue");
+            let mut ws_stream = WsStream {
+                tx_command,
+                rx_message,
+                rx_failure: None,
+                pending_failure: None,
+                pump_task: tokio::spawn(std::future::pending()),
+            };
+            let (tx_event, mut rx_event) = mpsc::channel(2);
+            let error = run_websocket_response_stream(
+                &mut ws_stream,
+                tx_event,
+                Duration::from_secs(1),
+                None,
+                ResponsesStreamMetadata::default(),
+                None,
+            )
+            .await
+            .expect_err("wrapped error must terminate the stream");
+            let ApiError::Transport(TransportError::Http {
+                status,
+                headers,
+                body,
+                ..
+            }) = error
+            else {
+                panic!("expected the wrapped HTTP error, got {error:?}");
+            };
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(headers.expect("error headers")["retry-after"], "3");
+            assert_eq!(body.as_deref(), Some(payload));
+            assert!(
+                rx_event.recv().await.is_none(),
+                "completion must not escape"
             );
         }
     }

@@ -23,6 +23,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
 use codex_web_search_extension::install as install_web_search_extension;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -31,7 +32,6 @@ use core_test_support::responses::ev_web_search_call_done;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -569,7 +569,7 @@ async fn web_search_marks_thread_memory_mode_polluted_when_configured() -> Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_web_search_marks_thread_memory_mode_polluted_when_configured() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     Mock::given(method("POST"))
@@ -643,7 +643,7 @@ async fn standalone_web_search_marks_thread_memory_mode_polluted_when_configured
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let call_id = "call-123";

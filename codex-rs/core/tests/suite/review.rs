@@ -18,11 +18,11 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::review_format::render_review_output_text;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexThread;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -42,7 +42,7 @@ use wiremock::http::Method;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_op_emits_lifecycle_and_review_output() {
     // Skip under Codex sandbox network restrictions.
-    skip_if_no_network!();
+    require_network!();
 
     // Start mock Responses API server. Return a single assistant message whose
     // text is a JSON-encoded ReviewOutputEvent.
@@ -59,7 +59,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
                 }
             }
         ],
-        "overall_correctness": "good",
+        "overall_correctness": "patch is incorrect",
         "overall_explanation": "All good with some improvements suggested.",
         "overall_confidence_score": 0.8
     })
@@ -188,7 +188,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
                 line_range: ReviewLineRange { start: 10, end: 20 },
             },
         }],
-        overall_correctness: "good".to_string(),
+        overall_correctness: "patch is incorrect".to_string(),
         overall_explanation: "All good with some improvements suggested.".to_string(),
         overall_confidence_score: 0.8,
     };
@@ -289,7 +289,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_review_does_not_forward_delegate_mcp_startup() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = start_mock_server().await;
     let request_log = responses::mount_response_once(
@@ -376,14 +376,13 @@ async fn cancelled_review_does_not_forward_delegate_mcp_startup() {
     server.verify().await;
 }
 
-/// When the model returns plain text that is not JSON, ensure the child
-/// lifecycle still occurs and the plain text is surfaced via
-/// ExitedReviewMode(Some(..)) as the overall_explanation.
+/// Malformed reviewer output must report failure and close review mode without
+/// publishing a successful empty result.
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
-async fn review_op_with_plain_text_emits_review_fallback() {
-    skip_if_no_network!();
+async fn review_op_with_plain_text_reports_invalid_result() {
+    require_network!();
 
     let (server, _request_log) = start_responses_server_with_sse(
         assistant_message_sse("just plain text"),
@@ -406,21 +405,23 @@ async fn review_op_with_plain_text_emits_review_fallback() {
         .unwrap();
 
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let error = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+    match error {
+        EventMsg::Error(error) => assert!(error.message.contains("not a clean review verdict")),
+        other => panic!("expected Error(..), got {other:?}"),
+    }
     let closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
     let review = match closed {
-        EventMsg::ExitedReviewMode(ev) => ev
-            .review_output
-            .expect("expected ExitedReviewMode with Some(review_output)"),
+        EventMsg::ExitedReviewMode(ev) => ev.review_output,
         other => panic!("expected ExitedReviewMode(..), got {other:?}"),
     };
 
-    // Expect a structured fallback carrying the plain text.
-    let expected = ReviewOutputEvent {
-        overall_explanation: "just plain text".to_string(),
-        ..Default::default()
-    };
-    assert_eq!(expected, review);
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(review, None);
+    let complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    match complete {
+        EventMsg::TurnComplete(complete) => assert!(complete.error.is_some()),
+        other => panic!("expected TurnComplete(..), got {other:?}"),
+    }
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -433,7 +434,7 @@ async fn review_op_with_plain_text_emits_review_fallback() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
 async fn review_filters_agent_message_related_events() {
-    skip_if_no_network!();
+    require_network!();
 
     let (server, _request_log) = start_responses_server_with_sse(
         vec![
@@ -495,7 +496,7 @@ async fn review_filters_agent_message_related_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
 async fn review_does_not_emit_agent_message_on_structured_output() {
-    skip_if_no_network!();
+    require_network!();
 
     let review_json = serde_json::json!({
         "findings": [
@@ -510,7 +511,7 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
                 }
             }
         ],
-        "overall_correctness": "ok",
+        "overall_correctness": "patch is incorrect",
         "overall_explanation": "ok",
         "overall_confidence_score": 0.5
     })
@@ -568,7 +569,7 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
 /// request uses that model (and not the main chat model).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_custom_review_model_from_config() {
-    skip_if_no_network!();
+    require_network!();
 
     let (server, request_log) =
         start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
@@ -620,7 +621,7 @@ async fn review_uses_custom_review_model_from_config() {
 /// uses the session model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_session_model_when_review_model_unset() {
-    skip_if_no_network!();
+    require_network!();
 
     let (server, request_log) =
         start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
@@ -672,7 +673,7 @@ async fn review_uses_session_model_when_review_model_unset() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
 async fn review_input_isolated_from_parent_history() {
-    skip_if_no_network!();
+    require_network!();
 
     let (server, request_log) =
         start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
@@ -854,10 +855,17 @@ async fn review_input_isolated_from_parent_history() {
 /// parent session so later turns can reference the results.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_history_surfaces_in_parent_session() {
-    skip_if_no_network!();
+    require_network!();
 
+    let review_json = serde_json::json!({
+        "findings": [],
+        "overall_correctness": "patch is correct",
+        "overall_explanation": "review assistant output",
+        "overall_confidence_score": 0.8
+    })
+    .to_string();
     let (server, request_log) = start_responses_server_with_sse(
-        assistant_message_sse("review assistant output"),
+        assistant_message_sse(&review_json),
         /*expected_requests*/ 2,
     )
     .await;
@@ -953,7 +961,7 @@ async fn review_history_surfaces_in_parent_session() {
 /// when resolving base-branch review prompts (merge-base computation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
-    skip_if_no_network!();
+    require_network!();
 
     let (server, request_log) =
         start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
@@ -1055,7 +1063,7 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_missing_base_branch_errors_without_model_request() {
-    skip_if_no_network!();
+    require_network!();
 
     let repo = TempDir::new().expect("create repository directory");
     run_git_command(repo.path(), &["init", "-b", "main"]);
@@ -1070,7 +1078,7 @@ async fn review_missing_base_branch_errors_without_model_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_unborn_repository_errors_without_model_request() {
-    skip_if_no_network!();
+    require_network!();
 
     let repo = TempDir::new().expect("create repository directory");
     run_git_command(repo.path(), &["init", "-b", "main"]);

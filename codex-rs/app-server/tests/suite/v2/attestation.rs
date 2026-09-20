@@ -18,10 +18,10 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::start_websocket_server_with_headers;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::TempDir;
@@ -35,7 +35,7 @@ const APP_SERVER_ATTESTATION_HEADER: &str = r#"{"v":1,"s":0,"t":"v1.integration-
 #[tokio::test]
 async fn attestation_generate_round_trip_adds_header_to_responses_websocket_handshake() -> Result<()>
 {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let websocket_server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![

@@ -21,8 +21,8 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_protocol::ThreadId as CoreThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,7 +35,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 #[tokio::test]
 async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -125,7 +125,7 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
 
 #[tokio::test]
 async fn turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -206,7 +206,7 @@ async fn turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2() -> 
 
 #[tokio::test]
 async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
@@ -316,7 +316,7 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
 
 #[tokio::test]
 async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let codex_home = TempDir::new()?;
 
@@ -447,7 +447,7 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
 #[tokio::test]
 async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body_v2() -> Result<()>
 {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let websocket_server = responses::start_websocket_server(vec![vec![
         vec![

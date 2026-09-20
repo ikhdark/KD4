@@ -1,4 +1,6 @@
 use crate::TransportError;
+use crate::X_ERROR_JSON_HEADER;
+use crate::X_OPENAI_AUTHORIZATION_ERROR_HEADER;
 use crate::error::ApiError;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
@@ -182,8 +184,6 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
-const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-error";
-const X_ERROR_JSON_HEADER: &str = "x-error-json";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";

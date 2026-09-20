@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
@@ -435,14 +436,13 @@ impl TurnDiffTracker {
                     display
                 }
             };
-            let key = (display, path.clone());
             let paired_destination = self
                 .origin_by_current_path
                 .get(&path)
                 .and_then(|origin| self.rename_destination(origin))
                 .is_some();
             if paired_destination {
-                self.rendered_diffs.remove(&key);
+                self.rendered_diffs.remove(&(display, path));
                 continue;
             }
             let right_path = self.rename_destination(&path).unwrap_or(&path);
@@ -452,6 +452,7 @@ impl TurnDiffTracker {
                 right_path,
                 self.current_by_path.get(right_path),
             );
+            let key = (display, path);
             match rendered {
                 Some(mut fragment) => {
                     if !fragment.ends_with('\n') {
@@ -637,7 +638,7 @@ impl TurnDiffTracker {
                     .and_then(|content| content.mode.as_deref())
                     .or_else(|| self.file_mode(right_path))
                 {
-                    diff.push_str(&format!("new file mode {mode}\n"));
+                    let _ = writeln!(diff, "new file mode {mode}");
                 }
             }
             (Some(_), None) => {
@@ -645,14 +646,14 @@ impl TurnDiffTracker {
                     .and_then(|content| content.mode.as_deref())
                     .or_else(|| self.file_mode(left_path))
                 {
-                    diff.push_str(&format!("deleted file mode {mode}\n"));
+                    let _ = writeln!(diff, "deleted file mode {mode}");
                 }
             }
             (Some(_), Some(_)) => {}
             (None, None) => return None,
         }
 
-        diff.push_str(&format!("index {left_oid}..{right_oid}\n"));
+        let _ = writeln!(diff, "index {left_oid}..{right_oid}");
 
         let old_header = if left_text.is_some() {
             format!("a/{left_display}")
@@ -667,13 +668,10 @@ impl TurnDiffTracker {
 
         let mut config = similar::TextDiff::configure();
         config.timeout(DIFF_TIMEOUT);
-        let unified = config
-            .diff_lines(left_text.unwrap_or(""), right_text.unwrap_or(""))
-            .unified_diff()
-            .context_radius(3)
-            .header(&old_header, &new_header)
-            .to_string();
-        diff.push_str(&unified);
+        let changes = config.diff_lines(left_text.unwrap_or(""), right_text.unwrap_or(""));
+        let mut unified = changes.unified_diff();
+        let unified = unified.context_radius(3).header(&old_header, &new_header);
+        let _ = write!(diff, "{unified}");
         Some(diff)
     }
 
@@ -717,7 +715,7 @@ impl TurnDiffTracker {
             .get(&path.environment_id)
             .and_then(|root| strip_tracked_root(&path.path, root))
             .unwrap_or(path.path.as_path());
-        let display = display.display().to_string().replace('\\', "/");
+        let display = display.to_string_lossy().replace('\\', "/");
         if self.display_roots_by_environment.len() > 1 && !path.environment_id.is_empty() {
             format!("{}/{display}", path.environment_id)
         } else {
@@ -764,7 +762,7 @@ pub(crate) async fn resolve_patch_index_modes(
         PATCH_MODE_QUERY_COUNT.with(|count| count.set(count.get() + 1));
         if let Some(output) = codex_git_utils::git_index_entries(&root, &paths[start..end]).await {
             for record in output.split(|byte| *byte == 0) {
-                let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                let Some(tab) = memchr::memchr(b'\t', record) else {
                     continue;
                 };
                 let fields = record[..tab]
@@ -886,21 +884,48 @@ fn unwrap_command_tokens(tokens: &[String]) -> &[String] {
     tokens
 }
 
-fn is_format_only_command(command: &[String]) -> bool {
-    let tokens = normalized_command_tokens(command);
+fn is_format_only_tokens(tokens: &[String]) -> bool {
     matches!(
-        tokens.as_slice(),
-        [first, second, ..] if (first == "just" || first == "cargo") && second == "fmt"
+        tokens,
+        [first, second, ..] if matches!(command_basename(first), "just" | "cargo") && second == "fmt"
     ) || matches!(
-        tokens.first().map(String::as_str),
+        tokens.first().map(|token| command_basename(token)),
         Some("rustfmt" | "prettier")
     )
+}
+
+fn is_read_only_format_command(command: &[String], tokens: &[String]) -> bool {
+    if command
+        .iter()
+        .any(|token| token.contains([';', '&', '|', '>', '<', '`', '$', '\n', '\r']))
+    {
+        return false;
+    }
+    let Some(program) = tokens.first().map(|token| command_basename(token)) else {
+        return false;
+    };
+    match program {
+        "prettier" => {
+            !tokens
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--write" | "-w"))
+                && tokens
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--check" | "-c" | "--list-different" | "-l"))
+        }
+        // A just recipe is user-defined; its --check argument is not proof of
+        // read-only behavior. Let the ordinary workspace observation decide.
+        "cargo" | "rustfmt" => {
+            is_format_only_tokens(tokens) && tokens.iter().any(|arg| arg == "--check")
+        }
+        _ => false,
+    }
 }
 
 fn is_validation_only_command(command: &[String], unwrapped: &[String]) -> bool {
     if command
         .iter()
-        .any(|token| token.contains([';', '&', '|', '>', '<', '`', '$']))
+        .any(|token| token.contains([';', '&', '|', '>', '<', '`', '$', '\n', '\r']))
     {
         return false;
     }
@@ -929,6 +954,7 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
         || is_read_only_powershell_command(command)
         || is_direct_file_read_command(command, unwrapped)
         || is_validation_only_command(command, unwrapped)
+        || is_read_only_format_command(command, unwrapped)
     {
         return false;
     }
@@ -942,10 +968,8 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
         // is read-only. Do not classify it from a flattened argv prefix.
         return true;
     }
-    let format_check =
-        is_format_only_command(command) && unwrapped.iter().any(|token| token == "--check");
     let mutating_format =
-        is_format_only_command(command) && !unwrapped.iter().any(|token| token == "--check");
+        is_format_only_tokens(unwrapped) && !unwrapped.iter().any(|token| token == "--check");
     let mutating_just_recipe = matches!(
         unwrapped,
         [first, second, ..]
@@ -977,10 +1001,6 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
             return false;
         }
     }
-    if format_check {
-        return false;
-    }
-
     let joined = command.join(" ").to_ascii_lowercase();
     let tokens = shell_filter_tokens(&joined);
     let explicit_dry_run = tokens.iter().any(|token| token == "--dry-run");
@@ -1289,7 +1309,7 @@ pub(crate) fn command_mutation(command: &[String], cwd: Option<&Path>) -> Comman
     if !looks_like_mutating_command(command) {
         return CommandMutation::ReadOnly;
     }
-    let paths = command_mutation_paths(command, cwd);
+    let paths = mutating_command_paths(command, cwd);
     if paths.is_some() || is_known_mutating_command(command) {
         CommandMutation::KnownMutation { paths }
     } else {
@@ -1310,7 +1330,7 @@ pub(crate) fn resolve_uncertain_command_observation(
 fn is_known_mutating_command(command: &[String]) -> bool {
     let normalized = normalized_command_tokens(command);
     let unwrapped = unwrap_command_tokens(&normalized);
-    if (is_format_only_command(command) && !unwrapped.iter().any(|token| token == "--check"))
+    if (is_format_only_tokens(unwrapped) && !unwrapped.iter().any(|token| token == "--check"))
         || matches!(
             unwrapped,
             [first, second, ..]
@@ -1458,14 +1478,17 @@ fn is_read_only_git_subcommand(subcommand: &str) -> bool {
 /// Returns exact paths only for simple, direct mutators whose operands can be
 /// interpreted without shell expansion. Complex scripts deliberately fall back
 /// to unknown mutation invalidation.
-pub(crate) fn command_mutation_paths(
-    command: &[String],
-    cwd: Option<&Path>,
-) -> Option<BTreeSet<PathBuf>> {
-    if !looks_like_mutating_command(command) || command.is_empty() {
+#[cfg(test)]
+fn command_mutation_paths(command: &[String], cwd: Option<&Path>) -> Option<BTreeSet<PathBuf>> {
+    if !looks_like_mutating_command(command) {
         return None;
     }
-    let program = command_basename(&command[0].to_ascii_lowercase()).to_string();
+    mutating_command_paths(command, cwd)
+}
+
+fn mutating_command_paths(command: &[String], cwd: Option<&Path>) -> Option<BTreeSet<PathBuf>> {
+    let program = command.first()?.to_ascii_lowercase();
+    let program = command_basename(&program);
     let args = &command[1..];
     if args.iter().any(|arg| {
         arg.contains(['*', '?', '|', '>', '<', ';', '&', '$', '`']) || arg.starts_with('@')
@@ -1473,7 +1496,7 @@ pub(crate) fn command_mutation_paths(
         return None;
     }
 
-    let operands = match program.as_str() {
+    let operands = match program {
         "touch" | "truncate" | "mkdir" | "md" | "rmdir" | "rd" | "rm" | "del" | "erase" => {
             simple_path_operands(args)?
         }

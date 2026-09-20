@@ -329,8 +329,10 @@ async fn scan_compressed_rollout_matches(
 }
 
 fn json_escaped_search_term(search_term: &str) -> io::Result<String> {
-    let serialized = serde_json::to_string(search_term).map_err(io::Error::other)?;
-    Ok(serialized[1..serialized.len() - 1].to_string())
+    let mut serialized = serde_json::to_string(search_term).map_err(io::Error::other)?;
+    serialized.pop();
+    serialized.remove(0);
+    Ok(serialized)
 }
 
 fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Regex> {

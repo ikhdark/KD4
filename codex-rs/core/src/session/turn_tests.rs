@@ -524,12 +524,8 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
         /*terminal_completion_only*/ false,
     );
     let first_scaffold = Arc::clone(&first.scaffold);
-    let first_prompt = build_projected_prompt_from_scaffold(
-        session.as_ref(),
-        &first_prepared,
-        step_context.as_ref(),
-        &first,
-    );
+    let first_prompt =
+        build_projected_prompt_from_scaffold(&first_prepared, step_context.as_ref(), &first);
     drop(cache);
     let mut cache = session
         .request_scaffold_cache
@@ -546,12 +542,8 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
     assert!(second.locally_reused);
     assert!(Arc::ptr_eq(&first_scaffold, &second.scaffold));
     assert_eq!(cache.build_count(), 1);
-    let second_prompt = build_projected_prompt_from_scaffold(
-        session.as_ref(),
-        &second_prepared,
-        step_context.as_ref(),
-        &second,
-    );
+    let second_prompt =
+        build_projected_prompt_from_scaffold(&second_prepared, step_context.as_ref(), &second);
     assert_ne!(first_prompt.input, second_prompt.input);
     assert_eq!(
         first_prompt.digests.instructions,
@@ -714,7 +706,6 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
         /*terminal_completion_only*/ false,
     );
     let changed_prompt = build_projected_prompt_from_scaffold(
-        session.as_ref(),
         &second_prepared,
         step_context.as_ref(),
         &changed_surface,
@@ -820,7 +811,7 @@ async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
         Some(terminal.scaffold.tools.digest())
     );
     let mut terminal_prompt =
-        build_projected_prompt_from_scaffold(&session, &prepared, step_context.as_ref(), &terminal);
+        build_projected_prompt_from_scaffold(&prepared, step_context.as_ref(), &terminal);
     enforce_terminal_prompt_contract(&mut terminal_prompt, true);
     assert!(terminal_prompt.tools.specs().is_empty());
     assert_eq!(
@@ -1022,9 +1013,8 @@ async fn built_tools_uses_the_revision_tagged_on_the_step_mcp_snapshot() -> Resu
 
 #[tokio::test]
 async fn sampling_prompt_workspace_capture_is_skipped_without_workspace_evidence() {
-    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
     let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
-    let client_session = session.services.model_client.new_session();
     let mut history = ContextManager::new();
     let user_message = ResponseItem::Message {
         id: None,
@@ -1038,17 +1028,15 @@ async fn sampling_prompt_workspace_capture_is_skipped_without_workspace_evidence
     history.record_items([&user_message], TruncationPolicy::Tokens(10_000));
 
     let _prepared =
-        prepare_sampling_prompt_for_client(history, &turn_context, &client_session, &git_workspace)
-            .await;
+        prepare_sampling_prompt_for_client(history, &turn_context, &git_workspace).await;
 
     assert_eq!(git_workspace.workspace_evidence_capture_count(), 0);
 }
 
 #[tokio::test]
 async fn sampling_prompt_workspace_capture_is_skipped_for_non_workspace_code_mode_exec() {
-    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
     let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
-    let client_session = session.services.model_client.new_session();
     let mut history = ContextManager::new();
     let call_id = "non-workspace-code-mode";
     let call = ResponseItem::FunctionCall {
@@ -1069,17 +1057,15 @@ async fn sampling_prompt_workspace_capture_is_skipped_for_non_workspace_code_mod
     history.record_items([&call, &output], TruncationPolicy::Tokens(10_000));
 
     let _prepared =
-        prepare_sampling_prompt_for_client(history, &turn_context, &client_session, &git_workspace)
-            .await;
+        prepare_sampling_prompt_for_client(history, &turn_context, &git_workspace).await;
 
     assert_eq!(git_workspace.workspace_evidence_capture_count(), 0);
 }
 
 #[tokio::test]
 async fn sampling_prompt_workspace_capture_is_preserved_for_workspace_evidence() {
-    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
     let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
-    let client_session = session.services.model_client.new_session();
     let mut history = ContextManager::new();
     let call = ResponseItem::FunctionCall {
         id: None,
@@ -1098,8 +1084,7 @@ async fn sampling_prompt_workspace_capture_is_preserved_for_workspace_evidence()
     history.record_items([&call, &output], TruncationPolicy::Tokens(10_000));
 
     let _prepared =
-        prepare_sampling_prompt_for_client(history, &turn_context, &client_session, &git_workspace)
-            .await;
+        prepare_sampling_prompt_for_client(history, &turn_context, &git_workspace).await;
 
     assert_eq!(git_workspace.workspace_evidence_capture_count(), 1);
 }
@@ -2673,6 +2658,7 @@ async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
         collaboration_mode: current.collaboration_mode,
         environment_mode: current.environment_mode,
         environment_starting: current.environment_starting,
+        windows_shell_guidance: current.windows_shell_guidance,
         ..ToolExposureIdentity::default()
     };
     let matching_router = ToolRouter::from_parts_with_warnings_and_identity(
@@ -2701,6 +2687,10 @@ async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
         },
         ToolExposureIdentity {
             environment_starting: !matching_identity.environment_starting,
+            ..matching_identity.clone()
+        },
+        ToolExposureIdentity {
+            windows_shell_guidance: !matching_identity.windows_shell_guidance,
             ..matching_identity.clone()
         },
         ToolExposureIdentity {
@@ -2985,7 +2975,7 @@ fn streamed_item_with_empty_id_gets_a_generated_id() -> Result<()> {
 }
 
 async fn streamed_item_with_empty_id_gets_a_generated_id_impl() -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     for provider_id in ["", "msg_sctx_provider", "ordinary-provider-id"] {
         assert_streamed_item_id(provider_id).await?;
     }
@@ -3065,7 +3055,7 @@ fn generation_budget_survives_reentry_and_terminal_directive_is_request_local() 
 
 async fn generation_budget_survives_reentry_and_terminal_directive_is_request_local_impl()
 -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let mut sequence = (0..126)
         .map(|i| {
@@ -3242,7 +3232,7 @@ fn mid_turn_compaction_failure_preserves_completed_message() -> Result<()> {
 }
 
 async fn mid_turn_compaction_failure_preserves_completed_message_impl() -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let requests = responses::mount_response_sequence(
         &server,
@@ -3304,7 +3294,7 @@ fn deterministic_protocol_completion_does_not_count_a_cancelled_generation() -> 
 
 async fn deterministic_protocol_completion_does_not_count_a_cancelled_generation_impl() -> Result<()>
 {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let mut completed = responses::ev_completed("protocol-only");
     completed["response"]["end_turn"] = serde_json::json!(false);
@@ -3350,7 +3340,7 @@ fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error() -> Resul
 }
 
 async fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl() -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let requests = responses::mount_sse_sequence(
         &server,
@@ -4733,7 +4723,7 @@ fn initial_response_item_triggers_compaction_before_the_stream_request() -> Resu
 }
 
 async fn initial_response_item_triggers_compaction_before_the_stream_request_impl() -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let request_log = responses::mount_sse_sequence(
         &server,
@@ -4743,7 +4733,7 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
                 responses::ev_assistant_message("seed-response-item-message", "seed complete"),
                 responses::ev_completed_with_tokens(
                     "seed-response-item-response",
-                    /*total_tokens*/ 21_000,
+                    /*total_tokens*/ 99_000,
                 ),
             ]),
             responses::sse(vec![
@@ -4774,8 +4764,8 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
     let provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = provider;
-        config.model_context_window = Some(100_000);
-        config.model_auto_compact_token_limit = Some(22_000);
+        config.model_context_window = Some(1_000_000);
+        config.model_auto_compact_token_limit = Some(100_000);
         config.model_auto_compact_token_limit_scope =
             codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
         config.model_provider.request_max_retries = Some(0);
@@ -4858,7 +4848,7 @@ fn oversized_pending_input_compacts_once_when_committed_history_is_also_over_lim
 
 async fn oversized_pending_input_compacts_once_when_committed_history_is_also_over_limit_impl()
 -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let request_log = responses::mount_sse_sequence(
         &server,
@@ -4866,7 +4856,7 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
             responses::sse(vec![
                 responses::ev_response_created("seed-response"),
                 responses::ev_assistant_message("seed-message", "seed complete"),
-                responses::ev_completed_with_tokens("seed-response", /*total_tokens*/ 23_000),
+                responses::ev_completed_with_tokens("seed-response", /*total_tokens*/ 101_000),
             ]),
             responses::sse(vec![
                 responses::ev_response_created("compact-response"),
@@ -4894,8 +4884,8 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
         .with_extensions(Arc::new(extension_builder.build()))
         .with_config(move |config| {
             config.model_provider = provider;
-            config.model_context_window = Some(100_000);
-            config.model_auto_compact_token_limit = Some(22_000);
+            config.model_context_window = Some(1_000_000);
+            config.model_auto_compact_token_limit = Some(100_000);
             config.model_auto_compact_token_limit_scope =
                 codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
             config.model_provider.request_max_retries = Some(0);
@@ -5509,7 +5499,7 @@ async fn registered_exec_rejects_invalid_yield_without_starting_the_command_impl
                         "kind": "argv",
                         "program": "powershell.exe",
                         "args": ["-NoProfile", "-NonInteractive", "-Command", script],
-                        "yield_time_ms": 120_000,
+                        "yield_time_ms": 300_001,
                     })
                     .to_string(),
                 ),
@@ -5543,7 +5533,7 @@ async fn registered_exec_rejects_invalid_yield_without_starting_the_command_impl
         .function_call_output_text("invalid-yield")
         .expect("model receives argument rejection");
     assert!(rejected.contains("$.yield_time_ms"), "{rejected}");
-    assert!(rejected.contains("30000"), "{rejected}");
+    assert!(rejected.contains("300000"), "{rejected}");
     assert!(
         !marker.exists(),
         "invalid arguments must not start the command"
@@ -5751,7 +5741,7 @@ fn direct_runtime_stop_hook_continuation_reaches_the_final_response() -> Result<
 async fn stop_hook_continuation_reaches_the_final_response_impl(
     direct_runtime: bool,
 ) -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let response_log = responses::mount_sse_sequence(
         &server,
@@ -5838,7 +5828,7 @@ fn models_etag_refresh_does_not_block_tool_continuation() -> Result<()> {
 }
 
 async fn models_etag_refresh_does_not_block_tool_continuation_impl() -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     const REFRESH_ETAG: &str = "\"phase-68-models-2\"";
 
     let server = responses::start_mock_server().await;
@@ -5952,7 +5942,7 @@ async fn models_etag_refresh_does_not_block_tool_continuation_impl() -> Result<(
 
 #[tokio::test]
 async fn unchanged_model_and_comp_hash_skip_previous_model_context_reconstruction() -> Result<()> {
-    core_test_support::skip_if_no_network!(Ok(()));
+    core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -6441,6 +6431,25 @@ fn plan_mode_memory_citations_are_parsed_once_for_live_events() {
         take_new_memory_citation(&mut state, vec![raw.to_string()]),
         None
     );
+}
+
+#[test]
+fn assistant_stream_parsers_reuse_state_across_interleaved_deltas() {
+    let mut parsers = AssistantMessageStreamParsers::new(false);
+    let first = parsers.seed_item_text("one", "hello <oai-mem-citation>doc");
+    assert_eq!(first.visible_text, "hello ");
+    assert!(first.citations.is_empty());
+    assert_eq!(parsers.parse_delta("two", "other").visible_text, "other");
+    let next = parsers.parse_delta("one", "1</oai-mem-citation> world");
+    assert_eq!(next.visible_text, " world");
+    assert_eq!(next.citations, vec!["doc1"]);
+    assert_eq!(parsers.parsers_by_item.len(), 2);
+    assert!(parsers.finish_item("one").is_empty());
+    assert!(!parsers.parsers_by_item.contains_key("one"));
+    assert_eq!(parsers.parse_delta("two", " tail").visible_text, " tail");
+    assert!(parsers.finish_item("two").is_empty());
+    assert!(parsers.parsers_by_item.is_empty());
+    assert!(parsers.finish_item("absent").is_empty());
 }
 
 #[test]

@@ -1,13 +1,13 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
 use super::TransportEvent;
-use super::forward_incoming_message;
+use super::enqueue_incoming_message;
 use super::next_connection_id;
-use super::serialize_outgoing_message;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCRequest;
+use serde::Deserialize;
 use std::io::BufRead;
 use std::io::ErrorKind;
 use std::io::Read;
@@ -27,6 +27,8 @@ use tracing::info;
 
 // Bound allocation before JSON parsing and request-queue admission can run.
 const MAX_STDIN_LINE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STDOUT_BATCH_MESSAGES: usize = 64;
+const STDOUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
 
 pub async fn start_stdio_connection(
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -291,19 +293,26 @@ where
             };
             match line {
                 Some(Ok(line)) => {
+                    let message = match serde_json::from_str::<JSONRPCMessage>(&line) {
+                        Ok(message) => message,
+                        Err(err) => {
+                            error!("Failed to deserialize JSONRPCMessage: {err}");
+                            continue;
+                        }
+                    };
                     if initialize_client_name_tx.is_some()
-                        && let Some(client_name) = stdio_initialize_client_name(&line)
+                        && let Some(client_name) = stdio_initialize_client_name(&message)
                         && let Some(initialize_client_name_tx) = initialize_client_name_tx.take()
                     {
                         let _ = initialize_client_name_tx.send(client_name);
                     }
                     let forwarded = tokio::select! {
                         _ = cancellation_for_reader.cancelled() => break,
-                        forwarded = forward_incoming_message(
+                        forwarded = enqueue_incoming_message(
                             &transport_event_tx_for_reader,
                             &writer_tx_for_reader,
                             connection_id,
-                            &line,
+                            message,
                         ) => forwarded,
                     };
                     if !forwarded {
@@ -336,27 +345,54 @@ where
     let cancellation_for_writer = cancellation;
     let connection_closed_for_writer = Arc::clone(&connection_closed);
     stdio_handles.push(tokio::spawn(async move {
+        let mut batch = Vec::new();
         'writer: loop {
             let queued_message = tokio::select! {
                 _ = cancellation_for_writer.cancelled() => break,
                 queued_message = writer_rx.recv() => queued_message,
             };
-            let Some(queued_message) = queued_message else {
+            let Some(mut queued_message) = queued_message else {
                 break;
             };
-            let Some(mut json) = serialize_outgoing_message(queued_message.message) else {
+            batch.clear();
+            let mut write_complete_tx = None;
+            for index in 0..MAX_STDOUT_BATCH_MESSAGES {
+                let frame_start = batch.len();
+                match serde_json::to_writer(&mut batch, &queued_message.message) {
+                    Ok(()) => {
+                        batch.push(b'\n');
+                        write_complete_tx = queued_message.write_complete_tx;
+                    }
+                    Err(err) => {
+                        batch.truncate(frame_start);
+                        error!("Failed to serialize OutgoingMessage: {err}");
+                    }
+                }
+                // Only coalesce messages already admitted. A receipt is a flush
+                // boundary: later traffic must not delay its acknowledgement.
+                if write_complete_tx.is_some()
+                    || batch.len() >= STDOUT_BATCH_TARGET_BYTES
+                    || index + 1 == MAX_STDOUT_BATCH_MESSAGES
+                {
+                    break;
+                }
+                match writer_rx.try_recv() {
+                    Ok(next) => queued_message = next,
+                    Err(_) => break,
+                }
+            }
+            if batch.is_empty() {
                 continue;
-            };
-            json.push('\n');
+            }
             let write_result = tokio::select! {
                 _ = cancellation_for_writer.cancelled() => break 'writer,
-                result = stdout.write_all(json.as_bytes()) => result,
+                result = stdout.write_all(&batch) => result,
             };
             if let Err(err) = write_result {
                 error!("Failed to write to stdout: {err}");
                 break;
             }
-            if queued_message.write_complete_tx.is_some() {
+            if write_complete_tx.is_some() {
                 let flush_result = tokio::select! {
                     _ = cancellation_for_writer.cancelled() => break 'writer,
                     result = stdout.flush() => result,
@@ -366,7 +402,7 @@ where
                     break;
                 }
             }
-            if let Some(write_complete_tx) = queued_message.write_complete_tx {
+            if let Some(write_complete_tx) = write_complete_tx {
                 let _ = write_complete_tx.send(());
             }
         }
@@ -400,15 +436,14 @@ async fn close_stdio_connection(
     }
 }
 
-fn stdio_initialize_client_name(line: &str) -> Option<String> {
-    let message = serde_json::from_str::<JSONRPCMessage>(line).ok()?;
+fn stdio_initialize_client_name(message: &JSONRPCMessage) -> Option<String> {
     let JSONRPCMessage::Request(JSONRPCRequest { method, params, .. }) = message else {
         return None;
     };
     if method != "initialize" {
         return None;
     }
-    let params = serde_json::from_value::<InitializeParams>(params?).ok()?;
+    let params = InitializeParams::deserialize(params.as_ref()?).ok()?;
     Some(params.client_info.name)
 }
 
@@ -423,6 +458,132 @@ mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingMessage;
     use crate::outgoing_message::OutgoingResponse;
+
+    #[tokio::test]
+    async fn stdio_batches_ready_messages_in_order_and_preserves_flush_receipts() {
+        use std::pin::Pin;
+        use std::sync::Mutex;
+        use std::task::Context;
+        use std::task::Poll;
+
+        #[derive(Default)]
+        struct Writes {
+            batches: Vec<Vec<u8>>,
+            flushes: usize,
+        }
+        struct RecordingWriter {
+            writes: Arc<Mutex<Writes>>,
+            fail_flush: bool,
+        }
+        impl AsyncWrite for RecordingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<IoResult<usize>> {
+                self.writes.lock().unwrap().batches.push(bytes.to_vec());
+                Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+                self.writes.lock().unwrap().flushes += 1;
+                Poll::Ready(if self.fail_flush {
+                    Err(std::io::Error::new(ErrorKind::BrokenPipe, "flush failed"))
+                } else {
+                    Ok(())
+                })
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+                self.poll_flush(cx)
+            }
+        }
+
+        for fail_flush in [false, true] {
+            let (events_tx, mut events_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            let (lines_tx, lines_rx) = mpsc::channel(1);
+            let (initialize_tx, _) = oneshot::channel();
+            let writes = Arc::new(Mutex::new(Writes::default()));
+            let mut handles = Vec::new();
+            start_stdio_connection_with_io(
+                events_tx,
+                &mut handles,
+                initialize_tx,
+                lines_rx,
+                RecordingWriter {
+                    writes: Arc::clone(&writes),
+                    fail_flush,
+                },
+            )
+            .await
+            .unwrap();
+            let Some(TransportEvent::ConnectionOpened { writer, .. }) = events_rx.recv().await
+            else {
+                panic!("expected stdio connection");
+            };
+            let (first_tx, first_rx) = oneshot::channel();
+            let (second_tx, second_rx) = oneshot::channel();
+            for (id, receipt) in [
+                (1, None),
+                (2, None),
+                (3, Some(first_tx)),
+                (4, Some(second_tx)),
+            ] {
+                writer
+                    .try_send(QueuedOutgoingMessage {
+                        message: OutgoingMessage::Response(OutgoingResponse {
+                            id: RequestId::Integer(id),
+                            result: json!({"text": "line one\nline two"}),
+                        }),
+                        write_complete_tx: receipt,
+                    })
+                    .unwrap();
+            }
+            assert_eq!(
+                timeout(Duration::from_secs(2), first_rx)
+                    .await
+                    .unwrap()
+                    .is_ok(),
+                !fail_flush
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(2), second_rx)
+                    .await
+                    .unwrap()
+                    .is_ok(),
+                !fail_flush
+            );
+            {
+                let writes = writes.lock().unwrap();
+                assert_eq!(writes.batches.len(), if fail_flush { 1 } else { 2 });
+                assert_eq!(writes.flushes, if fail_flush { 1 } else { 2 });
+                let ids = |bytes: &[u8]| {
+                    assert_eq!(bytes.last(), Some(&b'\n'));
+                    std::str::from_utf8(bytes)
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                                .as_i64()
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(ids(&writes.batches[0]), vec![1, 2, 3]);
+                if !fail_flush {
+                    assert_eq!(ids(&writes.batches[1]), vec![4]);
+                }
+            }
+            drop(lines_tx);
+            drop(writer);
+            for handle in handles {
+                timeout(Duration::from_secs(2), handle)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    }
 
     #[tokio::test]
     async fn stdio_invalid_utf8_does_not_drop_the_next_request() {
@@ -507,12 +668,17 @@ mod tests {
             let mut handles = Vec::new();
             start_stdio_connection_with_io(events_tx, &mut handles, initialize_tx, lines_rx, tokio::io::sink()).await.unwrap();
             assert!(matches!(events_rx.recv().await, Some(TransportEvent::ConnectionOpened { .. })));
+            lines_tx.send(Ok(r#"{"id":{},"method":"initialize"}"#.to_string())).await.unwrap();
+            let before = json!({"id":0,"method":"config/read","params":{"includeLayers":false}});
+            let invalid_initialize = json!({"id":3,"method":"initialize","params":{"clientInfo":{"name":"missing-version"}}});
+            lines_tx.send(Ok(before.to_string())).await.unwrap();
+            lines_tx.send(Ok(invalid_initialize.to_string())).await.unwrap();
             let initialize = json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"first-client","version":"1"}}});
             lines_tx.send(Ok(initialize.to_string())).await.unwrap();
             assert_eq!(initialize_rx.await.unwrap(), "first-client");
             let later = json!({"id":2,"method":"config/read","params":{"includeLayers":false}});
             lines_tx.send(Ok(later.to_string())).await.unwrap();
-            for expected in [initialize, later] {
+            for expected in [before, invalid_initialize, initialize, later] {
                 match events_rx.recv().await.unwrap() {
                     TransportEvent::IncomingMessage { message, .. } => {
                         let expected: JSONRPCMessage = serde_json::from_value(expected).unwrap();

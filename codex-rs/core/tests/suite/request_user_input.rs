@@ -15,6 +15,7 @@ use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use core_test_support::TempDirExt;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -24,7 +25,6 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
@@ -78,7 +78,7 @@ async fn request_user_input_round_trip_emits_auto_resolution_ms() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let call_id = "active-turn-call";
@@ -188,7 +188,7 @@ async fn request_user_input_round_trip_for_mode(
     mode: ModeKind,
     auto_resolution_ms: Option<u64>,
 ) -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -359,7 +359,7 @@ fn ev_rate_limits() -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let TestCodex {
@@ -455,7 +455,7 @@ async fn assert_request_user_input_rejected<F>(
 where
     F: FnOnce(String) -> CollaborationMode,
 {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -536,7 +536,12 @@ where
     let req = second_mock.single_request();
     let (output, success) = call_output_content_and_success(&req, &call_id);
     assert_eq!(success, None);
-    assert_eq!(output, "unsupported call: request_user_input");
+    assert!(
+        output.starts_with("unsupported call: request_user_input."),
+        "{output}"
+    );
+    assert!(output.contains("No tool was run."), "{output}");
+    assert!(output.contains("current tool declarations"), "{output}");
 
     Ok(())
 }

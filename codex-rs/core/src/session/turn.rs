@@ -148,6 +148,7 @@ use codex_config::config_toml::AfterAgentPolicy;
 use codex_context_fragments::ModelContextBudget;
 use codex_context_fragments::RenderedContextFragment;
 use codex_core_plugins::PluginLoadOutcome;
+use codex_core_plugins::PluginsConfigInput;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_core_skills::injection::PlannedSkillInjections;
@@ -246,7 +247,6 @@ fn ordinary_continuation_cause(
 pub(crate) async fn prepare_sampling_prompt_for_client(
     history: ContextManager,
     turn_context: &TurnContext,
-    _client_session: &ModelClientSession,
     git_workspace: &crate::git_workspace::GitWorkspaceCache,
 ) -> PreparedPromptInput {
     let workspace_identity = if history.requires_workspace_evidence_validation() {
@@ -641,7 +641,6 @@ pub(crate) async fn run_turn(
                         prepare_sampling_prompt_for_client(
                             history,
                             turn_context.as_ref(),
-                            &client_session,
                             sess.services.git_workspace.as_ref(),
                         )
                         .await
@@ -1659,6 +1658,7 @@ fn task_relevant_recommended_plugins(
 async fn build_recommended_plugin_items(
     sess: &Session,
     turn_context: &TurnContext,
+    plugins_config: &PluginsConfigInput,
     loaded_plugins: &PluginLoadOutcome,
     user_input: &[ContentItem],
 ) -> Vec<ResponseItem> {
@@ -1667,12 +1667,11 @@ async fn build_recommended_plugin_items(
     }
 
     let auth = sess.services.auth_manager.auth().await;
-    let plugins_config = turn_context.config.plugins_config_input();
     let Some(candidates) = sess
         .services
         .plugins_manager
         .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
-            plugins_config: &plugins_config,
+            plugins_config,
             loaded_plugins,
             auth: auth.as_ref(),
             disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
@@ -1747,6 +1746,7 @@ async fn build_pure_pending_turn_plan(
         build_recommended_plugin_items(
             sess,
             turn_context,
+            &plugins_config_input,
             &loaded_plugins,
             &recommended_plugin_input,
         ),
@@ -2387,9 +2387,9 @@ fn build_bounded_skill_context_items(
     rendered_skill_items
         .into_iter()
         .filter_map(|(role, text)| {
-            budget
-                .take(&text)
-                .map(|text| ContextualUserFragment::into(RenderedContextFragment::new(role, text)))
+            budget.take(&text).map(|text| {
+                ContextualUserFragment::into(RenderedContextFragment::new(role, text.into_owned()))
+            })
         })
         .collect()
 }
@@ -2472,9 +2472,9 @@ async fn build_extension_turn_input_items(
         let contributed_fragments = contributed_fragments?;
         items.extend(contributed_fragments.into_iter().filter_map(|fragment| {
             let role = fragment.role();
-            budget
-                .take(&fragment.render())
-                .map(|text| ContextualUserFragment::into(RenderedContextFragment::new(role, text)))
+            budget.take(&fragment.render()).map(|text| {
+                ContextualUserFragment::into(RenderedContextFragment::new(role, text.into_owned()))
+            })
         }));
     }
 
@@ -2491,13 +2491,12 @@ async fn track_turn_resolved_config_analytics(
     turn_context: &TurnContext,
     input: &[TurnInput],
 ) {
-    let thread_config = {
-        let state = sess.state.lock().await;
-        state.session_configuration.thread_config_snapshot()
-    };
-    let is_first_turn = {
+    let (thread_config, is_first_turn) = {
         let mut state = sess.state.lock().await;
-        state.take_next_turn_is_first()
+        (
+            state.session_configuration.thread_config_snapshot(),
+            state.take_next_turn_is_first(),
+        )
     };
     sess.services
         .analytics_events_client
@@ -3406,11 +3405,10 @@ pub(crate) fn build_projected_prompt(
         )),
         locally_reused: false,
     };
-    build_projected_prompt_from_scaffold(sess, prepared, step_context, &scaffold)
+    build_projected_prompt_from_scaffold(prepared, step_context, &scaffold)
 }
 
 fn build_projected_prompt_from_scaffold(
-    _sess: &Session,
     prepared: &PreparedPromptInput,
     step_context: &StepContext,
     resolved_scaffold: &ResolvedRequestScaffold,
@@ -3606,7 +3604,6 @@ async fn run_sampling_request(
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::PromptConstruction);
     let mut prompt = build_projected_prompt_from_scaffold(
-        sess.as_ref(),
         &prepared_input,
         step_context.as_ref(),
         &request_scaffold,
@@ -3682,7 +3679,6 @@ async fn run_sampling_request(
             let retry_input = prepare_sampling_prompt_for_client(
                 history,
                 turn_context.as_ref(),
-                client_session,
                 sess.services.git_workspace.as_ref(),
             )
             .await;
@@ -3692,7 +3688,6 @@ async fn run_sampling_request(
             if !prompt_is_proven_unchanged {
                 accepted_attempt_input = retry_input.shared_items();
                 prompt = build_projected_prompt_from_scaffold(
-                    sess.as_ref(),
                     &retry_input,
                     step_context.as_ref(),
                     &request_scaffold,
@@ -3773,6 +3768,9 @@ async fn current_dynamic_tool_exposure_identity(
             step_context.environments.turn_environments.len(),
         ),
         environment_starting: !step_context.environments.starting.is_empty(),
+        windows_shell_guidance: crate::tools::spec_plan::requires_windows_shell_guidance(
+            step_context,
+        ),
     }
 }
 
@@ -4116,6 +4114,9 @@ fn derive_tool_exposure_identity(
         collaboration_mode: turn_context.collaboration_mode.mode,
         environment_mode,
         environment_starting,
+        windows_shell_guidance: crate::tools::spec_plan::requires_windows_shell_guidance(
+            step_context,
+        ),
     }
 }
 
@@ -4255,10 +4256,15 @@ impl AssistantMessageStreamParsers {
     }
 
     fn parser_mut(&mut self, item_id: &str) -> &mut AssistantTextStreamParser {
-        let plan_mode = self.plan_mode;
+        if !self.parsers_by_item.contains_key(item_id) {
+            self.parsers_by_item.insert(
+                item_id.to_owned(),
+                AssistantTextStreamParser::new(self.plan_mode),
+            );
+        }
         self.parsers_by_item
-            .entry(item_id.to_string())
-            .or_insert_with(|| AssistantTextStreamParser::new(plan_mode))
+            .get_mut(item_id)
+            .unwrap_or_else(|| unreachable!("stream parser was inserted above"))
     }
 
     pub(super) fn seed_item_text(&mut self, item_id: &str, text: &str) -> ParsedAssistantTextDelta {
@@ -5633,7 +5639,7 @@ async fn try_run_sampling_request(
         sess.services
             .session_telemetry
             .record_responses(&handle_responses, &event);
-        record_turn_ttft_metric(&turn_context, &event).await;
+        record_turn_ttft_metric(&turn_context, &event);
 
         if !context_baseline_committed && let Some(identity) = attempt_identity.as_ref() {
             let context_baseline_was_bound = bound_context_attempts
@@ -5948,14 +5954,14 @@ async fn try_run_sampling_request(
                     if !active_item_is_streaming_to_client {
                         continue;
                     }
-                    let item_id = active.id();
-                    if matches!(active, TurnItem::AgentMessage(_)) {
-                        let parsed = assistant_message_stream_parsers.parse_delta(&item_id, &delta);
+                    if let TurnItem::AgentMessage(message) = active {
+                        let item_id = message.id.as_str();
+                        let parsed = assistant_message_stream_parsers.parse_delta(item_id, &delta);
                         if let Some(event) = emit_streamed_assistant_text_delta(
                             &sess,
                             &turn_context,
                             plan_mode_state.as_mut(),
-                            &item_id,
+                            item_id,
                             parsed,
                         )
                         .await
@@ -5966,7 +5972,7 @@ async fn try_run_sampling_request(
                         let event = AgentMessageContentDeltaEvent {
                             thread_id: sess.thread_id.to_string(),
                             turn_id: turn_context.sub_id.clone(),
-                            item_id,
+                            item_id: active.id(),
                             delta,
                             memory_citation: None,
                         };

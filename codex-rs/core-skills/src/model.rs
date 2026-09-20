@@ -142,17 +142,17 @@ impl SkillLoadOutcome {
 #[derive(Debug, Clone)]
 pub struct HostSkillsSnapshot {
     outcome: Arc<SkillLoadOutcome>,
-    skills_by_catalog_id: Arc<HashMap<String, SkillMetadata>>,
+    skills_by_catalog_id: Arc<HashMap<String, usize>>,
 }
 
 impl HostSkillsSnapshot {
     pub fn new(outcome: Arc<SkillLoadOutcome>) -> Self {
         let mut skills_by_catalog_id = HashMap::with_capacity(outcome.skills.len());
-        for skill in &outcome.skills {
+        for (index, skill) in outcome.skills.iter().enumerate() {
             let catalog_id = skill_catalog_id(skill);
             assert!(
                 skills_by_catalog_id
-                    .insert(catalog_id.clone(), skill.clone())
+                    .insert(catalog_id.clone(), index)
                     .is_none(),
                 "duplicate deterministic skill catalog ID: {catalog_id}"
             );
@@ -198,7 +198,9 @@ impl HostSkillsSnapshot {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("skill exceeds the {max_bytes} byte read limit or changed while being read"),
+                    format!(
+                        "skill exceeds the {max_bytes} byte read limit or changed while being read"
+                    ),
                 )
             })?;
         let text = String::from_utf8(bytes)
@@ -208,7 +210,9 @@ impl HostSkillsSnapshot {
 
     pub fn resolve_catalog_locator(&self, locator: &str) -> Option<&SkillMetadata> {
         let catalog_id = locator.strip_prefix(SKILL_CATALOG_LOCATOR_PREFIX)?;
-        self.skills_by_catalog_id.get(catalog_id)
+        self.skills_by_catalog_id
+            .get(catalog_id)
+            .map(|&index| &self.outcome.skills[index])
     }
 
     pub async fn read_skill_text_by_catalog_locator(&self, locator: &str) -> io::Result<String> {

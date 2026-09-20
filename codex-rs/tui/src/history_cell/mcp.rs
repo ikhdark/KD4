@@ -167,7 +167,10 @@ impl HistoryCell for McpToolCallCell {
                 .initial_indent("".into())
                 .subsequent_indent("    ".into());
             let wrapped = adaptive_wrap_line(invocation_line, opts);
-            let body_lines: Vec<Line<'static>> = wrapped.iter().map(line_to_static).collect();
+            let body_lines: Vec<Line<'static>> = wrapped
+                .into_iter()
+                .map(crate::render::line_utils::line_into_static)
+                .collect();
             lines.extend(prefix_lines(body_lines, "  └ ".dim(), "    ".into()));
         }
 

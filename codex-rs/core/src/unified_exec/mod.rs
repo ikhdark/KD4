@@ -59,6 +59,7 @@ mod process;
 mod process_manager;
 mod process_state;
 
+#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
@@ -71,10 +72,11 @@ pub(crate) use process::UnifiedExecProcess;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
-// Minimum yield time for an empty `write_stdin`.
+// Minimum configurable ceiling for background `write_stdin` waits.
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
-pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const MAX_INITIAL_YIELD_TIME_MS: u64 = 300_000;
+pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
 
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
@@ -300,16 +302,6 @@ pub(crate) struct UnifiedExecProcessManager {
 
 impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
-        Self::new_with_deferred_executor(
-            max_write_stdin_yield_time_ms,
-            /*deferred_executor_enabled*/ false,
-        )
-    }
-
-    pub(crate) fn new_with_deferred_executor(
-        max_write_stdin_yield_time_ms: u64,
-        _deferred_executor_enabled: bool,
-    ) -> Self {
         Self {
             process_store: Arc::new(Mutex::new(ProcessStore::default())),
             pending_cleanup_owners: Arc::new(StdMutex::new(Vec::new())),
@@ -373,7 +365,7 @@ pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready:
     } else {
         yield_time_ms
     };
-    yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+    yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_INITIAL_YIELD_TIME_MS)
 }
 
 pub(crate) fn generate_chunk_id() -> String {

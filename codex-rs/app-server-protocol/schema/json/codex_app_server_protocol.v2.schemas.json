@@ -6400,6 +6400,12 @@
           "description": "File modification time in Unix milliseconds when available, otherwise `0`.",
           "format": "int64",
           "type": "integer"
+        },
+        "size": {
+          "description": "Size in bytes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "required": [
@@ -6407,7 +6413,8 @@
         "isDirectory",
         "isFile",
         "isSymlink",
-        "modifiedAtMs"
+        "modifiedAtMs",
+        "size"
       ],
       "title": "FsGetMetadataResponse",
       "type": "object"
@@ -6614,7 +6621,7 @@
       "description": "Write a file on the host filesystem.",
       "properties": {
         "dataBase64": {
-          "description": "File contents encoded as base64.",
+          "description": "File contents encoded as base64. Decoded contents must not exceed 10 MiB.",
           "type": "string"
         },
         "path": {

@@ -29,7 +29,7 @@ pub struct FsReadFileResponse {
 pub struct FsWriteFileParams {
     /// Absolute path to write.
     pub path: AbsolutePathBuf,
-    /// File contents encoded as base64.
+    /// File contents encoded as base64. Decoded contents must not exceed 10 MiB.
     pub data_base64: String,
 }
 
@@ -77,6 +77,9 @@ pub struct FsGetMetadataResponse {
     pub is_file: bool,
     /// Whether the path itself is a symbolic link.
     pub is_symlink: bool,
+    /// Size in bytes.
+    #[ts(type = "number")]
+    pub size: u64,
     /// File creation time in Unix milliseconds when available, otherwise `0`.
     #[ts(type = "number")]
     pub created_at_ms: i64,

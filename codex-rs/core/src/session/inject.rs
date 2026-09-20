@@ -23,6 +23,11 @@ impl Session {
     ) -> Result<(), Vec<ResponseItem>> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
+            // Terminalization has detached the worker and may already have drained its queue.
+            // Let the caller record late context in history instead of losing it on detach.
+            Some(active_turn) if active_turn.task.is_none() && active_turn.terminal.is_some() => {
+                Err(input)
+            }
             Some(active_turn) => {
                 let pending_input = input
                     .iter()
@@ -54,6 +59,11 @@ impl Session {
     ) -> Result<(), Vec<ResponseItem>> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
+            // Terminalization has detached the worker and may already have drained its queue.
+            // Let the caller record late context in history instead of losing it on detach.
+            Some(active_turn) if active_turn.task.is_none() && active_turn.terminal.is_some() => {
+                Err(input)
+            }
             Some(active_turn) => {
                 let pending_input = input
                     .iter()
@@ -286,6 +296,60 @@ mod tests {
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn late_notifications_are_recorded_after_finalizer_detaches_worker() {
+        for internal in [false, true] {
+            let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+            let session = Arc::new(session);
+            let terminal = crate::state::TurnTerminalCoordinator::new(turn_context.sub_id.clone());
+            let _permit = terminal
+                .try_claim()
+                .expect("finalizer owns terminalization");
+            let active_turn = ActiveTurn {
+                terminal: Some(terminal),
+                ..Default::default()
+            };
+            let turn_state = Arc::clone(&active_turn.turn_state);
+            *session.active_turn.lock().await = Some(active_turn);
+
+            if internal {
+                session
+                    .inject_internal_no_new_turn(vec![objective_update_item()], None)
+                    .await
+                    .expect("late internal context is recorded");
+            } else {
+                session
+                    .inject_no_new_turn(vec![objective_update_item()], None)
+                    .await;
+            }
+
+            assert!(
+                session
+                    .input_queue
+                    .take_pending_input_for_turn_state(turn_state.as_ref())
+                    .await
+                    .is_empty(),
+                "late notifications must not enter the detached worker's queue"
+            );
+            let history = session.clone_history().await;
+            let recorded = history.raw_items().iter().filter(|item| matches!(item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer" && matches!(content.as_slice(),
+                        [ContentItem::InputText { text }] if text == "The active goal objective was updated."))
+            ).count();
+            assert_eq!(recorded, 1, "late context must reach history exactly once");
+            let active = session.active_turn.lock().await;
+            let active = active
+                .as_ref()
+                .expect("existing finalizer remains installed");
+            assert!(
+                active.task.is_none(),
+                "notification must not start another turn"
+            );
+            assert!(Arc::ptr_eq(&active.turn_state, &turn_state));
         }
     }
 

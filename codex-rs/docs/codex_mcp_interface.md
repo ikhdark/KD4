@@ -79,7 +79,7 @@ App-server JSON-RPC methods such as `thread/start`, `turn/start`, account
 methods, configuration methods, and model-list methods are not exposed by
 `codex mcp-server`; custom requests that are not part of its MCP surface return
 method-not-found. Use `codex app-server` and the
-[app-server protocol documentation](../app-server/README.md) for those APIs.
+[app-server protocol documentation](app_server.md) for those APIs.
 
 Similarly, `codex mcp` manages external MCP server launchers in Codex
 configuration. It does not call the `codex mcp-server` tools described here.

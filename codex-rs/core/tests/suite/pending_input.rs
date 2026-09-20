@@ -1125,8 +1125,8 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
 
     let large_output_command = "[Console]::Out.Write([string]::new([char]'0', 40000))";
     let large_output_args = json!({
-        "kind": "script",
-        "command": large_output_command,
+        "kind": "powershell_script",
+        "script_body": large_output_command,
         "login": false,
         "timeout_ms": 2000,
     })
@@ -1142,14 +1142,17 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         gated_chunk(
             gate_first_completed_rx,
             vec![ev_completed_with_tokens(
-                "resp-1", /*total_tokens*/ 19_000,
+                "resp-1", /*total_tokens*/ 99_000,
             )],
         ),
     ];
 
     let compact_chunks = vec![
         chunk(ev_response_created("resp-compact")),
-        chunk(ev_message_item_done("msg-compact", "TOOL_OUTPUT_SUMMARY")),
+        chunk(ev_message_item_done(
+            "msg-compact",
+            "## Goal\nresume turn\n\n## Current state\nTOOL_OUTPUT_SUMMARY\n\n## Completed work\ncommand ran\n\n## Unresolved work\nrespond to user\n\n## Evidence\ncommand output\n\n## Next action\ncontinue",
+        )),
         chunk(ev_completed_with_tokens(
             "resp-compact",
             /*total_tokens*/ 5_000,
@@ -1193,7 +1196,10 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
             config.model_provider.supports_websockets = false;
-            config.model_auto_compact_token_limit = Some(20_000);
+            config.model_auto_compact_token_limit = Some(100_000);
+            config.model_context_window = Some(1_000_000);
+            config.model_auto_compact_token_limit_scope =
+                codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
         })
         .build_with_streaming_server(&server)
         .await

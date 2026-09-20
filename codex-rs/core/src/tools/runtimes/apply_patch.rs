@@ -73,6 +73,7 @@ pub struct ApplyPatchRuntime {
     mutation_repo_paths: Vec<String>,
     workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
     mutation_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mutation_evidence_failures: usize,
 }
 
 #[derive(Debug)]
@@ -103,10 +104,17 @@ impl ApplyPatchRuntime {
         &self.committed_delta
     }
 
-    pub async fn finish_cancelled_mutation_evidence(&mut self, ctx: &ToolCtx) {
+    pub async fn finish_pending_mutation_evidence(&mut self, ctx: &ToolCtx) {
         if self.mutation_repo_root.is_some() && !self.mutation_finalization_attempted {
             self.finish_mutation_evidence(ctx, true).await;
         }
+    }
+
+    pub(crate) fn mutation_evidence_warning(&self) -> Option<String> {
+        (self.mutation_evidence_failures > 0).then(|| format!(
+            "Warning: apply_patch could not finalize mutation evidence for {} path(s). Filesystem changes remain committed, but the durable mutation ledger may be incomplete; do not repeat the patch to repair it.",
+            self.mutation_evidence_failures,
+        ))
     }
 
     async fn begin_mutation_evidence(
@@ -250,6 +258,12 @@ impl ApplyPatchRuntime {
                         .finalize_mutation(binding.attempt_id, repo_root, path.clone())
                         .await
                     {
+                        self.mutation_evidence_failures += 1;
+                        ctx.session.services.session_telemetry.counter(
+                            "codex.apply_patch.evidence_finalization_failed",
+                            1,
+                            &[],
+                        );
                         tracing::warn!(
                             %error,
                             path,
@@ -346,7 +360,7 @@ impl Sandboxable for ApplyPatchRuntime {
         SandboxablePreference::Auto
     }
     fn escalate_on_failure(&self) -> bool {
-        true
+        self.committed_delta.is_empty() && self.committed_delta.is_exact()
     }
 }
 
@@ -469,6 +483,19 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         self.mutation_in_progress
             .store(true, std::sync::atomic::Ordering::Release);
         let result = async {
+            if self.workspace_operation_permit.is_none() {
+                self.workspace_operation_permit = Some(tokio::select! {
+                    biased;
+                    _ = req.cancellation_token.cancelled() => {
+                        self.finish_mutation_evidence(ctx, true).await;
+                        return Err(ToolError::Codex(CodexErr::TurnAborted));
+                    }
+                    permit = crate::workspace_operation_gate::acquire_patch_operation(
+                        &req.turn_environment.environment,
+                        &req.action.cwd,
+                    ) => permit,
+                });
+            }
             if let Err(error) = self.begin_mutation_evidence(req, ctx).await {
                 self.finish_mutation_evidence(ctx, true).await;
                 return Err(error);
@@ -478,25 +505,6 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            if self.workspace_operation_permit.is_none() {
-                self.workspace_operation_permit =
-                    if let Ok(native_cwd) = req.action.cwd.to_abs_path() {
-                        let workspace_root = get_git_repo_root(&native_cwd)
-                            .unwrap_or_else(|| native_cwd.to_path_buf());
-                        Some(tokio::select! {
-                            biased;
-                            _ = req.cancellation_token.cancelled() => {
-                                self.finish_mutation_evidence(ctx, true).await;
-                                return Err(ToolError::Codex(CodexErr::TurnAborted));
-                            }
-                            permit = crate::workspace_operation_gate::acquire_workspace_operation(
-                                &workspace_root,
-                            ) => permit,
-                        })
-                    } else {
-                        None
-                    };
-            }
             let result = codex_apply_patch::apply_patch_with_cancellation(
                 &req.action.patch,
                 &req.action.cwd,
@@ -508,14 +516,23 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             )
             .await;
             let stdout = String::from_utf8_lossy(&stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&stderr).into_owned();
+            let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
             let failed = result.is_err();
             let exit_code = if failed { 1 } else { 0 };
-            let delta = match result {
-                Ok(delta) => delta,
-                Err(failure) => failure.into_parts().1,
+            let (delta, failure_kind, io_failure) = match result {
+                Ok(delta) => (delta, "none", false),
+                Err(failure) => {
+                    let (error, delta) = failure.into_parts();
+                    let kind = patch_failure_kind(&error);
+                    let io_failure = matches!(error, codex_apply_patch::ApplyPatchError::IoError(_));
+                    (delta, kind, io_failure)
+                }
             };
             self.committed_delta.append(delta);
+            let retry_safe = self.escalate_on_failure();
+            if failed && !retry_safe {
+                stderr.push_str("Automatic patch retry withheld because files changed or a failed write may have changed them.\n");
+            }
             let output = ExecToolCallOutput {
                 exit_code,
                 stdout: StreamOutput::new(stdout.clone()),
@@ -524,7 +541,23 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 duration: started_at.elapsed(),
                 timed_out: false,
             };
-            let sandbox_denied = failed && is_likely_sandbox_denied(attempt.sandbox, &output);
+            let sandbox_denied = io_failure
+                && retry_safe
+                && is_likely_sandbox_denied(attempt.sandbox, &output);
+            ctx.session.services.session_telemetry.counter(
+                "codex.apply_patch.attempt", 1,
+                &[
+                    ("outcome", if failed { "failed" } else { "success" }),
+                    ("failure_kind", failure_kind),
+                    ("mutation", if self.committed_delta.is_empty() && self.committed_delta.is_exact() {
+                        "none"
+                    } else if self.committed_delta.is_exact() {
+                        "exact"
+                    } else {
+                        "uncertain"
+                    }),
+                ],
+            );
             self.finish_mutation_evidence(ctx, !sandbox_denied).await;
             if sandbox_denied {
                 // Keep the verified file state serialized across retry approval too.
@@ -542,6 +575,22 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         self.mutation_in_progress
             .store(false, std::sync::atomic::Ordering::Release);
         result
+    }
+}
+
+pub(crate) fn patch_failure_kind(error: &codex_apply_patch::ApplyPatchError) -> &'static str {
+    use codex_apply_patch::ApplyPatchError;
+    match error {
+        ApplyPatchError::PatchContextMismatch(mismatch) => match mismatch.kind {
+            codex_apply_patch::PatchContextMismatchKind::AmbiguousMatch => "ambiguous_match",
+            _ => "context_mismatch",
+        },
+        ApplyPatchError::ParseError(_) => "parse",
+        ApplyPatchError::IoError(_) => "io",
+        ApplyPatchError::ComputeReplacements(_) => "replacement",
+        ApplyPatchError::PathUri(_) => "path",
+        ApplyPatchError::ImplicitInvocation => "implicit_invocation",
+        ApplyPatchError::EnvironmentIdMismatch { .. } => "environment_mismatch",
     }
 }
 

@@ -9,7 +9,7 @@
   "description": "Write a file on the host filesystem.",
   "properties": {
     "dataBase64": {
-      "description": "File contents encoded as base64.",
+      "description": "File contents encoded as base64. Decoded contents must not exceed 10 MiB.",
       "type": "string"
     },
     "path": {

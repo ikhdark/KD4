@@ -446,13 +446,18 @@ fn render_line_count_summary(added: usize, removed: usize) -> Vec<RtSpan<'static
     spans
 }
 
+const PATCH_SUMMARY_MAX_ROWS: usize = 200;
+const PATCH_SUMMARY_MAX_FILE_ROWS: usize = 40;
+
 fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec<RtLine<'static>> {
     let mut out: Vec<RtLine<'static>> = Vec::new();
 
     let style_context = current_diff_render_style_context();
-    let total_counts = rows.iter().try_fold((0, 0), |(a, d), row| {
-        row.counts.map(|(added, removed)| (a + added, d + removed))
-    });
+    let missing_counts = rows.iter().filter(|row| row.counts.is_none()).count();
+    let total_counts = rows
+        .iter()
+        .filter_map(|row| row.counts)
+        .fold((0, 0), |(a, d), (added, removed)| (a + added, d + removed));
     let file_count = rows.len();
     let noun = if file_count == 1 { "file" } else { "files" };
     let mut header_spans: Vec<RtSpan<'static>> = vec!["• ".dim()];
@@ -470,10 +475,17 @@ fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec
     } else {
         header_spans.push("Edited".bold());
         header_spans.push(format!(" {file_count} {noun} ").into());
-        header_spans.extend(render_optional_line_count_summary(total_counts));
+        if missing_counts == 0 || missing_counts < file_count {
+            header_spans.extend(render_line_count_summary(total_counts.0, total_counts.1));
+        }
+        if missing_counts > 0 {
+            let noun = if missing_counts == 1 { "file" } else { "files" };
+            header_spans.push(format!(" (counts unavailable for {missing_counts} {noun})").dim());
+        }
     }
     out.push(RtLine::from(header_spans));
 
+    let mut remaining_rows = PATCH_SUMMARY_MAX_ROWS;
     for (idx, r) in rows.into_iter().enumerate() {
         // Insert a blank separator between file chunks (except before the first)
         if idx > 0 {
@@ -495,16 +507,38 @@ fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec
         let lang_path = r.move_path.unwrap_or(r.path);
         let lang = detect_lang_for_path(lang_path);
         let mut lines = vec![];
-        render_prepared_change(
-            r.change,
-            r.patch.as_ref(),
-            &mut lines,
-            wrap_cols.saturating_sub(4),
-            lang.as_deref(),
-            style_context,
-            usize::MAX,
-        );
+        let budget = remaining_rows.min(PATCH_SUMMARY_MAX_FILE_ROWS);
+        if budget > 0 {
+            render_prepared_change(
+                r.change,
+                r.patch.as_ref(),
+                &mut lines,
+                wrap_cols.saturating_sub(4),
+                lang.as_deref(),
+                style_context,
+                budget + 1,
+            );
+        }
+        let truncated = if budget == 0 {
+            let mut has_lines = false;
+            visit_change_lines(r.change, r.patch.as_ref(), |_| {
+                has_lines = true;
+                false
+            });
+            has_lines
+        } else {
+            lines.len() > budget
+        };
+        lines.truncate(budget);
+        remaining_rows = remaining_rows.saturating_sub(lines.len());
         out.extend(prefix_lines(lines, "    ".into(), "    ".into()));
+        if truncated {
+            out.push(
+                "    … diff preview truncated; inspect the file for remaining changes"
+                    .dim()
+                    .into(),
+            );
+        }
     }
 
     out
@@ -1185,7 +1219,7 @@ pub(crate) fn line_number_width(max_line_number: usize) -> usize {
     if max_line_number == 0 {
         1
     } else {
-        max_line_number.to_string().len()
+        max_line_number.ilog10() as usize + 1
     }
 }
 
@@ -1477,6 +1511,75 @@ mod tests {
     use ratatui::widgets::Paragraph;
     use ratatui::widgets::WidgetRef;
     use ratatui::widgets::Wrap;
+
+    #[test]
+    fn summary_bounds_large_batches_and_keeps_every_file_header() {
+        let changes = (0..30)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("file-{index:02}.txt")),
+                    FileChange::Add {
+                        content: "changed\n".repeat(3_000),
+                    },
+                )
+            })
+            .collect();
+        let lines = create_diff_summary(&changes, Path::new("/"), 120);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lines.len() <= PATCH_SUMMARY_MAX_ROWS + 30 * 3 + 1);
+        assert!(text.contains("Edited 30 files (+90000 -0)"));
+        for index in 0..30 {
+            assert!(text.contains(&format!("file-{index:02}.txt (+3000 -0)")));
+        }
+        assert_eq!(text.matches("diff preview truncated").count(), 30);
+    }
+
+    #[test]
+    fn summary_budget_counts_wrapped_rows() {
+        let changes = HashMap::from([(
+            PathBuf::from("long.txt"),
+            FileChange::Add {
+                content: "x".repeat(1_000),
+            },
+        )]);
+        let lines = create_diff_summary(&changes, Path::new("/"), 10);
+        assert_eq!(lines.len(), PATCH_SUMMARY_MAX_FILE_ROWS + 2);
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .to_string()
+                .contains("diff preview truncated")
+        );
+    }
+
+    #[test]
+    fn summary_retains_known_counts_when_another_diff_is_invalid() {
+        let changes = HashMap::from([
+            (
+                PathBuf::from("good.txt"),
+                FileChange::Add {
+                    content: "one\ntwo\n".to_string(),
+                },
+            ),
+            (
+                PathBuf::from("broken.txt"),
+                FileChange::Update {
+                    unified_diff: "invalid".to_string(),
+                    move_path: None,
+                },
+            ),
+        ]);
+        let lines = create_diff_summary(&changes, Path::new("/"), 120);
+        assert_eq!(
+            lines[0].to_string(),
+            "• Edited 2 files (+2 -0) (counts unavailable for 1 file)"
+        );
+    }
 
     #[test]
     fn invalid_patch_reports_unavailable_instead_of_zero_changes() {

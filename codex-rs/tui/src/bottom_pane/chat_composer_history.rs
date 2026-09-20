@@ -114,6 +114,8 @@ pub(crate) struct ChatComposerHistory {
 
     /// Cache of persistent history entries fetched on-demand (text-only).
     fetched_history: HashMap<usize, HistoryEntry>,
+    /// Lowercase text is reused across query edits; offsets belong to the current metadata.
+    search_texts: std::cell::RefCell<HashMap<usize, String>>,
 
     /// Current cursor within the combined (persistent + local) history. `None`
     /// indicates the user is *not* currently browsing history.
@@ -220,6 +222,7 @@ impl ChatComposerHistory {
             local_history: Vec::new(),
             replay_seeded_history: Vec::new(),
             fetched_history: HashMap::new(),
+            search_texts: Default::default(),
             history_cursor: None,
             pending_navigation_direction: None,
             last_history_text: None,
@@ -237,6 +240,7 @@ impl ChatComposerHistory {
         self.persistent_log_id = Some(log_id);
         self.persistent_entry_count = entry_count;
         self.fetched_history.clear();
+        self.search_texts.get_mut().clear();
         self.local_history.clear();
         self.replay_seeded_history.clear();
         self.history_cursor = None;
@@ -419,6 +423,7 @@ impl ChatComposerHistory {
         let entry = entry.map(HistoryEntry::new);
         if let Some(entry) = entry.clone() {
             self.fetched_history.insert(offset, entry);
+            self.search_texts.get_mut().remove(&offset);
         }
 
         if self
@@ -437,7 +442,7 @@ impl ChatComposerHistory {
                     boundary_if_exhausted: false,
                 });
             if let Some(entry) = entry
-                && self.search_matches(&entry)
+                && self.search_matches(offset, &entry)
                 && self.search_result_is_unique(&entry)
             {
                 return HistoryEntryResponse::Search(self.search_match(offset, entry));
@@ -626,7 +631,7 @@ impl ChatComposerHistory {
         let total_entries = self.total_entries();
         while offset < total_entries {
             if let Some(entry) = self.entry_at_cached_offset(offset) {
-                if self.search_matches(entry) && self.search_result_is_unique(entry) {
+                if self.search_matches(offset, entry) && self.search_result_is_unique(entry) {
                     let entry = entry.clone();
                     return self.search_match(offset, entry);
                 }
@@ -671,11 +676,17 @@ impl ChatComposerHistory {
         }
     }
 
-    fn search_matches(&self, entry: &HistoryEntry) -> bool {
+    fn search_matches(&self, offset: usize, entry: &HistoryEntry) -> bool {
         let Some(search) = self.search.as_ref() else {
             return false;
         };
-        search.query.is_empty() || entry.text.to_lowercase().contains(&search.query_lower)
+        search.query.is_empty()
+            || self
+                .search_texts
+                .borrow_mut()
+                .entry(offset)
+                .or_insert_with(|| entry.text.to_lowercase())
+                .contains(&search.query_lower)
     }
 
     fn search_result_is_unique(&self, entry: &HistoryEntry) -> bool {
@@ -1483,6 +1494,42 @@ mod tests {
                 /*restart*/ true,
                 &tx
             )
+        );
+    }
+
+    #[test]
+    fn search_cache_tracks_replaced_entries_and_metadata() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let mut history = ChatComposerHistory::new();
+        history.set_metadata(test_thread_id(), 1, 1);
+        history.on_entry_response(1, 0, Some("İΣ Alpha".into()), &tx);
+        assert_eq!(
+            history.search("i\u{307}ς", HistorySearchDirection::Older, true, &tx),
+            HistorySearchResult::Found(HistoryEntry::new("İΣ Alpha".into())),
+        );
+        assert_eq!(
+            history.search("ALPHA", HistorySearchDirection::Older, true, &tx),
+            HistorySearchResult::Found(HistoryEntry::new("İΣ Alpha".into())),
+        );
+        history.on_entry_response(1, 0, Some("Beta".into()), &tx);
+        assert_eq!(
+            history.search("alpha", HistorySearchDirection::Older, true, &tx),
+            HistorySearchResult::NotFound,
+        );
+        assert_eq!(
+            history.search("BETA", HistorySearchDirection::Older, true, &tx),
+            HistorySearchResult::Found(HistoryEntry::new("Beta".into())),
+        );
+        history.set_metadata(test_thread_id(), 2, 0);
+        history.record_local_submission(HistoryEntry::new("Gamma".into()));
+        assert_eq!(
+            history.search("beta", HistorySearchDirection::Older, true, &tx),
+            HistorySearchResult::NotFound,
+        );
+        assert_eq!(
+            history.search("GAMMA", HistorySearchDirection::Older, true, &tx),
+            HistorySearchResult::Found(HistoryEntry::new("Gamma".into())),
         );
     }
 

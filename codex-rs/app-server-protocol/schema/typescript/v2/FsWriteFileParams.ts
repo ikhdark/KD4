@@ -12,6 +12,6 @@ export type FsWriteFileParams = {
  */
 path: AbsolutePathBuf,
 /**
- * File contents encoded as base64.
+ * File contents encoded as base64. Decoded contents must not exceed 10 MiB.
  */
 dataBase64: string, };

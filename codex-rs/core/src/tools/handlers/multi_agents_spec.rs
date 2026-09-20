@@ -301,7 +301,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update or durable typed-task progress. Pass the returned cursor to receive only later assignment, workspace-epoch, gate, receipt, lease, and progress deltas. Does not return the content; returns either a summary of which agents have updates (if any), typed-task deltas, an interruption summary, or a timeout summary. The wait also ends early when new user input is steered into the active turn."
+        description: "Wait for a mailbox update or durable typed-task progress. Omit cursor to receive new assignment, workspace-epoch, gate, receipt, lease, and progress deltas using the caller's automatically retained position. Set an explicit cursor only to replay from that position. Does not return the content; returns either a summary of which agents have updates (if any), typed-task deltas, an interruption summary, or a timeout summary. The wait also ends early when new user input is steered into the active turn."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -314,7 +314,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "path_prefix".to_string(),
         JsonSchema::string(Some(
-            "Task-path prefix filter without a trailing slash. Omit to list all live agents."
+            "Task-path prefix filter; trailing slashes are ignored. Omit to list all live agents."
                 .to_string(),
         )),
     )]);
@@ -1195,7 +1195,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "cursor".to_string(),
             JsonSchema::string(Some(
-                "Opaque durable typed-task cursor returned by a previous wait_agent call."
+                "Omit to continue from the caller's automatically retained cursor. Set a cursor returned by wait_agent only to replay from that position."
                     .to_string(),
             )),
         ),

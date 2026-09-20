@@ -12,10 +12,13 @@ pub(crate) const IMAGE_PROCESSING_ERROR_PLACEHOLDER: &str =
     "image content omitted because it could not be processed";
 const IMAGE_TOO_LARGE_PLACEHOLDER: &str =
     "image content omitted because it exceeded the supported size limit; use a smaller image";
-const UNSUPPORTED_LOW_DETAIL_PLACEHOLDER: &str = "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'";
 const REMOTE_IMAGE_URL_PLACEHOLDER: &str =
     "image content omitted because remote image URLs are not supported";
 
+const LOW_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
+    max_dimension: 512,
+    max_patches: 256,
+};
 const HIGH_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
     max_dimension: 2048,
     max_patches: 2_500,
@@ -28,8 +31,6 @@ const ORIGINAL_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits 
 enum ImagePreparationError {
     #[error("remote image URLs are not supported")]
     RemoteUrlUnsupported,
-    #[error("image detail `low` is not supported")]
-    UnsupportedLowDetail,
     #[error(transparent)]
     Processing(#[from] ImageProcessingError),
 }
@@ -38,7 +39,6 @@ impl ImagePreparationError {
     fn placeholder(&self) -> &'static str {
         match self {
             ImagePreparationError::RemoteUrlUnsupported => REMOTE_IMAGE_URL_PLACEHOLDER,
-            ImagePreparationError::UnsupportedLowDetail => UNSUPPORTED_LOW_DETAIL_PLACEHOLDER,
             ImagePreparationError::Processing(ImageProcessingError::ImageTooLarge { .. }) => {
                 IMAGE_TOO_LARGE_PLACEHOLDER
             }
@@ -157,7 +157,7 @@ fn prepare_image(
     let limits = match detail {
         None | Some(ImageDetail::Auto | ImageDetail::High) => HIGH_DETAIL_LIMITS,
         Some(ImageDetail::Original) => ORIGINAL_DETAIL_LIMITS,
-        Some(ImageDetail::Low) => return Err(ImagePreparationError::UnsupportedLowDetail),
+        Some(ImageDetail::Low) => LOW_DETAIL_LIMITS,
     };
     let image = load_data_url_for_prompt(image_url, PromptImageMode::ResizeWithLimits(limits))?;
     *image_url = image.into_data_url();

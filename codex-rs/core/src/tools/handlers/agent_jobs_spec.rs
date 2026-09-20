@@ -58,7 +58,7 @@ pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
         (
             "max_workers".to_string(),
             JsonSchema::integer(Some(
-                "Alias for max_concurrency. Defaults to 16 and is capped by config.".to_string(),
+                "Legacy alias; prefer max_concurrency and omit this field.".to_string(),
             )),
         ),
         (

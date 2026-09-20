@@ -285,7 +285,7 @@ VALUES (?, ?, TRUE, ?, 0)
         .expect("compatible index creation should be idempotent");
 
     assert_eq!(migration_ledger(&pool).await, original_ledger);
-    assert_eq!(latest_known_version, 44);
+    assert_eq!(latest_known_version, 46);
     assert_eq!(
         STATE_MIGRATOR
             .migrations

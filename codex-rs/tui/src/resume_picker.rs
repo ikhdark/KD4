@@ -869,6 +869,7 @@ impl SearchState {
 
 #[derive(Clone)]
 struct Row {
+    search_fields: std::cell::OnceCell<std::sync::Arc<[String; 5]>>,
     path: Option<PathBuf>,
     preview: String,
     thread_id: Option<ThreadId>,
@@ -897,35 +898,27 @@ impl Row {
     }
 
     fn matches_query(&self, query: &str) -> bool {
-        if self.preview.to_lowercase().contains(query) {
-            return true;
-        }
-        if let Some(thread_name) = self.thread_name.as_ref()
-            && thread_name.to_lowercase().contains(query)
-        {
-            return true;
-        }
-        if self
-            .thread_id
-            .is_some_and(|thread_id| thread_id.to_string().to_lowercase().contains(query))
-        {
-            return true;
-        }
-        if self
-            .git_branch
-            .as_ref()
-            .is_some_and(|branch| branch.to_lowercase().contains(query))
-        {
-            return true;
-        }
-        if self
-            .cwd
-            .as_ref()
-            .is_some_and(|cwd| cwd.to_string_lossy().to_lowercase().contains(query))
-        {
-            return true;
-        }
-        false
+        self.search_fields
+            .get_or_init(|| {
+                std::sync::Arc::new([
+                    self.preview.to_lowercase(),
+                    self.thread_name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                    self.thread_id.map(|id| id.to_string()).unwrap_or_default(),
+                    self.git_branch
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                    self.cwd
+                        .as_ref()
+                        .map(|cwd| cwd.to_string_lossy().to_lowercase())
+                        .unwrap_or_default(),
+                ])
+            })
+            .iter()
+            .any(|field| field.contains(query))
     }
 }
 
@@ -1825,6 +1818,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
     };
     let preview = thread.preview.trim();
     Some(Row {
+        search_fields: Default::default(),
         path: thread.path,
         preview: if preview.is_empty() {
             String::from("(no message yet)")
@@ -3421,6 +3415,7 @@ mod tests {
     fn make_row(path: &str, ts: &str, preview: &str) -> Row {
         let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
         Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from(path)),
             preview: preview.to_string(),
             thread_id: None,
@@ -3635,6 +3630,7 @@ mod tests {
     #[test]
     fn row_display_preview_prefers_thread_name() {
         let row = Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("first message"),
             thread_id: None,
@@ -3675,8 +3671,9 @@ mod tests {
         let thread_id =
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let row = Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/a.jsonl")),
-            preview: String::from("initial prompt"),
+            preview: String::from("Initial İΣ Prompt"),
             thread_id: Some(thread_id),
             thread_name: Some(String::from("Named conversation")),
             created_at: None,
@@ -3686,11 +3683,18 @@ mod tests {
         };
 
         assert!(row.matches_query("initial"));
+        assert!(row.matches_query("i\u{307}ς"));
+        assert!(!row.matches_query("promptnamed"));
         assert!(row.matches_query("conversation"));
         assert!(row.matches_query("project-workspace"));
         assert!(row.matches_query("topic-branch"));
         assert!(row.matches_query("019dabc1"));
         assert!(!row.matches_query("unrelated-query"));
+        let cloned = row.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            row.search_fields.get().unwrap(),
+            cloned.search_fields.get().unwrap(),
+        ));
     }
 
     #[test]
@@ -3738,6 +3742,7 @@ mod tests {
         );
         state.relative_time_reference = parse_timestamp_str("2026-05-02T14:48:19Z");
         let row = Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("first message"),
             thread_id: Some(thread_id),
@@ -3955,6 +3960,7 @@ mod tests {
         }
 
         let row = Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("remote session"),
             thread_id: Some(ThreadId::new()),
@@ -3980,6 +3986,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         let row = Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("remote session"),
             thread_id: Some(ThreadId::new()),
@@ -4011,6 +4018,7 @@ mod tests {
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
         let rows = vec![
             Row {
+                search_fields: Default::default(),
                 path: Some(PathBuf::from("/tmp/a.jsonl")),
                 preview: String::from("Fix resume picker timestamps"),
                 thread_id: None,
@@ -4021,6 +4029,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                search_fields: Default::default(),
                 path: Some(PathBuf::from("/tmp/b.jsonl")),
                 preview: String::from("Investigate lazy pagination cap"),
                 thread_id: None,
@@ -4031,6 +4040,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                search_fields: Default::default(),
                 path: Some(PathBuf::from("/tmp/c.jsonl")),
                 preview: String::from("Explain the codebase"),
                 thread_id: None,
@@ -4459,6 +4469,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -4497,6 +4508,7 @@ mod tests {
         );
         state.filtered_rows = vec![
             Row {
+                search_fields: Default::default(),
                 path: None,
                 preview: String::from("one"),
                 thread_id: Some(ThreadId::new()),
@@ -4507,6 +4519,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                search_fields: Default::default(),
                 path: None,
                 preview: String::from("two"),
                 thread_id: Some(ThreadId::new()),
@@ -4576,6 +4589,7 @@ mod tests {
         state.pending_transcript_open = Some(thread_id);
         state.filtered_rows = vec![
             Row {
+                search_fields: Default::default(),
                 path: None,
                 preview: String::from("Find pending threads and emails"),
                 thread_id: Some(thread_id),
@@ -4586,6 +4600,7 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                search_fields: Default::default(),
                 path: None,
                 preview: String::from("Plan raw scrollback mode"),
                 thread_id: Some(ThreadId::new()),
@@ -4641,6 +4656,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -4671,6 +4687,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("preview"),
             thread_id: None,
@@ -4747,6 +4764,7 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -4911,6 +4929,7 @@ session_picker_view = "dense"
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -4950,6 +4969,7 @@ session_picker_view = "dense"
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -5050,6 +5070,7 @@ session_picker_view = "dense"
 
     fn dense_snapshot_row() -> Row {
         Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from(
                 "Propose session picker redesign with enough title text to exercise truncation",
@@ -5330,6 +5351,7 @@ session_picker_view = "dense"
         let thread_id =
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let row = Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("Investigate picker expansion"),
             thread_id: Some(thread_id),
@@ -5397,6 +5419,7 @@ session_picker_view = "dense"
 
         let loader = page_only_loader(|_| {});
         let row = Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("Investigate picker expansion"),
             thread_id: Some(
@@ -5457,6 +5480,7 @@ session_picker_view = "dense"
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
         state.all_rows = (0..5)
             .map(|idx| Row {
+                search_fields: Default::default(),
                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
                 preview: format!("item-{idx}"),
                 thread_id: None,
@@ -5509,6 +5533,7 @@ session_picker_view = "dense"
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
         state.all_rows = (0..4)
             .map(|idx| Row {
+                search_fields: Default::default(),
                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
                 preview: format!("item-{idx}"),
                 thread_id: None,
@@ -6062,6 +6087,7 @@ session_picker_view = "dense"
         );
 
         let row = Row {
+            search_fields: Default::default(),
             path: Some(PathBuf::from("/tmp/missing.jsonl")),
             preview: String::from("missing metadata"),
             thread_id: None,
@@ -6101,6 +6127,7 @@ session_picker_view = "dense"
         );
         let thread_id = ThreadId::new();
         let row = Row {
+            search_fields: Default::default(),
             path: None,
             preview: String::from("pathless thread"),
             thread_id: Some(thread_id),

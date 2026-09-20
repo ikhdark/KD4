@@ -252,6 +252,20 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
         })
         .await?;
 
+    #[cfg(windows)]
+    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
+        let error = mcp
+            .read_stream_until_error_message(RequestId::Integer(command_request_id))
+            .await?;
+        assert!(
+            error
+                .error
+                .message
+                .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR),
+            "{error:?}"
+        );
+        return Ok(());
+    }
     let response = mcp
         .read_stream_until_response_message(RequestId::Integer(command_request_id))
         .await?;
@@ -373,6 +387,20 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
         })
         .await?;
 
+    #[cfg(windows)]
+    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
+        let error = mcp
+            .read_stream_until_error_message(RequestId::Integer(command_request_id))
+            .await?;
+        assert!(
+            error
+                .error
+                .message
+                .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR),
+            "{error:?}"
+        );
+        return Ok(());
+    }
     let response = mcp
         .read_stream_until_response_message(RequestId::Integer(command_request_id))
         .await?;
@@ -438,6 +466,22 @@ async fn command_exec_legacy_policy_workspace_write_uses_request_cwd() -> Result
         })
         .await?;
 
+    #[cfg(windows)]
+    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
+        let error = mcp
+            .read_stream_until_error_message(RequestId::Integer(command_request_id))
+            .await?;
+        assert!(
+            error
+                .error
+                .message
+                .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR),
+            "{error:?}"
+        );
+        assert!(!request_cwd.join("request-cwd-write.txt").exists());
+        assert!(!codex_home.join("request-cwd-write.txt").exists());
+        return Ok(());
+    }
     let response = mcp
         .read_stream_until_response_message(RequestId::Integer(command_request_id))
         .await?;

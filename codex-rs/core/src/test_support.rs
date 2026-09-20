@@ -3,6 +3,8 @@
 //! Production code should not depend on this module.
 //! We prefer this to using a crate feature to avoid building multiple
 //! permutations of the crate.
+//! The process-ID override is the exception: `core_test_support` enables
+//! `test-deterministic-process-ids` so ordinary binaries cannot toggle it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
 use crate::thread_manager;
+#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 use crate::unified_exec;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::LoadUserInstructionsFuture;
@@ -61,6 +64,7 @@ pub fn set_thread_manager_test_mode(enabled: bool) {
     thread_manager::set_thread_manager_test_mode_for_tests(enabled);
 }
 
+#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 pub fn set_deterministic_process_ids(enabled: bool) {
     unified_exec::set_deterministic_process_ids_for_tests(enabled);
 }

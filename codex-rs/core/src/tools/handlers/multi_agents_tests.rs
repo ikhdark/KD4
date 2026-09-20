@@ -828,8 +828,10 @@ async fn multi_agent_v2_spawn_model_override_defaults_to_no_fork() {
     assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Low));
 }
 
+#[test_case::test_case(true; "compact")]
+#[test_case::test_case(false; "explicit")]
 #[tokio::test]
-async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start() {
+async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(compact: bool) {
     let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     let workspace = tempfile::tempdir().expect("isolated typed-task workspace");
@@ -1067,30 +1069,125 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
     child_session.thread_id = child_thread_id;
     child_turn.session_source = child_source;
     set_turn_config(&mut child_turn, child_config);
+    let child_session = Arc::new(child_session);
+    let child_turn = Arc::new(child_turn);
+    let observation_output = crate::tools::handlers::multi_agents_v2::GetAgentTaskHandler
+        .handle(invocation(
+            Arc::clone(&child_session),
+            Arc::clone(&child_turn),
+            "get_agent_task",
+            function_payload(json!({
+                "assignment_id": assignment_id.to_string(),
+                "observation_limit": 101
+            })),
+        ))
+        .await
+        .expect("oversized observation reads are capped before reaching the store");
+    let (observation_text, _) = expect_text_output(observation_output);
+    assert!(observation_text.contains(&assignment_id.to_string()));
+
+    let mut receipt_args = json!({
+        "status": "completed",
+        "summary": "reported bounded evidence",
+        "criterion_results": [{
+            "criterion_id": "criterion-1",
+            "status": "passed",
+            "evidence_ref": evidence_ref.clone()
+        }],
+        "declared_changes": [{
+            "path": risk_path.clone(),
+            "summary": "recorded high-risk evidence"
+        }],
+        "validation_call_ids": [validation_call_id.clone()],
+        "blockers": [],
+        "risks": []
+    });
+    if compact {
+        receipt_args["criterion_results"][0]["evidence_ref"] =
+            json!({"call_id": validation_call_id});
+        for key in ["validation_call_ids", "blockers", "risks", "next_action"] {
+            receipt_args.as_object_mut().unwrap().remove(key);
+        }
+        // Defaults must not repair an explicitly incorrect claim or accept an unknown call.
+        for (field, invalid_value, expected_error) in [
+            (
+                "workspace_id",
+                json!("wrong-workspace"),
+                "must reference its workspace",
+            ),
+            (
+                "evidence_epoch",
+                json!(proof.evidence.end_epoch.unwrap() + 1),
+                "recorded epoch",
+            ),
+            ("call_id", json!("unknown-call"), "no recorded end epoch"),
+        ] {
+            let mut invalid_args = receipt_args.clone();
+            invalid_args["criterion_results"][0]["evidence_ref"][field] = invalid_value;
+            let error = crate::tools::handlers::multi_agents_v2::SubmitAgentReceiptHandler
+                .handle(invocation(
+                    Arc::clone(&child_session),
+                    Arc::clone(&child_turn),
+                    "submit_agent_receipt",
+                    function_payload(invalid_args),
+                ))
+                .await
+                .err()
+                .expect("incorrect evidence must be rejected");
+            assert!(error.to_string().contains(expected_error), "{error}");
+            let unsealed = task_store
+                .get_agent_task(assignment_id, Some(0))
+                .await
+                .unwrap();
+            assert!(unsealed.receipt.is_none());
+            assert_eq!(
+                unsealed.current_attempt.state,
+                codex_agent_task_store::AttemptState::Active
+            );
+        }
+        let mut no_selected_calls = receipt_args.clone();
+        no_selected_calls["validation_call_ids"] = json!([]);
+        let error = crate::tools::handlers::multi_agents_v2::SubmitAgentReceiptHandler
+            .handle(invocation(
+                Arc::clone(&child_session),
+                Arc::clone(&child_turn),
+                "submit_agent_receipt",
+                function_payload(no_selected_calls),
+            ))
+            .await
+            .err()
+            .expect("an explicit empty call list must not be replaced by inferred calls");
+        assert!(
+            error.to_string().contains("must reference its workspace"),
+            "{error}"
+        );
+        assert!(
+            task_store
+                .get_agent_task(assignment_id, Some(0))
+                .await
+                .unwrap()
+                .receipt
+                .is_none()
+        );
+    }
+    let codex_tools::ToolSpec::Function(receipt_spec) =
+        crate::tools::handlers::multi_agents_v2::SubmitAgentReceiptHandler.spec()
+    else {
+        panic!("receipt tool must expose its argument schema");
+    };
+    let schema = serde_json::to_value(receipt_spec.parameters).unwrap();
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&receipt_args)
+    );
     let receipt_gate =
         crate::workspace_operation_gate::acquire_workspace_operation(&repo_root).await;
     let receipt_invocation = invocation(
-        Arc::new(child_session),
-        Arc::new(child_turn),
+        child_session,
+        child_turn,
         "submit_agent_receipt",
-        function_payload(json!({
-            "status": "completed",
-            "summary": "reported bounded evidence",
-            "criterion_results": [{
-                "criterion_id": "criterion-1",
-                "status": "passed",
-                "evidence_ref": evidence_ref.clone(),
-                "evidence": validation_call_id.clone()
-            }],
-            "declared_changes": [{
-                "path": risk_path.clone(),
-                "summary": "recorded high-risk evidence"
-            }],
-            "validation_call_ids": [validation_call_id.clone()],
-            "blockers": [],
-            "risks": [],
-            "next_action": null
-        })),
+        function_payload(receipt_args),
     );
     let receipt_router = Arc::new(crate::tools::router::ToolRouter::from_context(
         receipt_invocation.step_context.as_ref(),
@@ -1237,6 +1334,10 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         reloaded_task.current_attempt.state,
         codex_agent_task_store::AttemptState::Completed
     );
+    let sealed = reloaded_task.receipt.as_ref().unwrap();
+    assert!(sealed.blockers.is_empty());
+    assert!(sealed.risks.is_empty());
+    assert_eq!(sealed.next_action, None);
     assert_eq!(
         serde_json::to_value(
             reloaded_task.receipt.as_ref().unwrap().criterion_results[0]
@@ -3036,8 +3137,11 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
     assert_eq!(success, Some(true));
 }
 
+#[test_case::test_case("worker"; "relative")]
+#[test_case::test_case("worker/"; "relative_trailing_slash")]
+#[test_case::test_case("/root/researcher/worker/"; "absolute_trailing_slash")]
 #[tokio::test]
-async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
+async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix(prefix: &str) {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let mut config = (*turn.config).clone();
@@ -3107,7 +3211,7 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
             Arc::new(turn),
             "list_agents",
             function_payload(json!({
-                "path_prefix": "worker"
+                "path_prefix": prefix
             })),
         ))
         .await

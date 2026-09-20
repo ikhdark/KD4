@@ -21,7 +21,7 @@ pub(crate) fn executor_skills_world_state_section(
     include_instructions: bool,
 ) -> WorldStateSectionContribution {
     let body = if include_instructions {
-        available_skills_fragment(catalog).map(|fragment| fragment.body())
+        available_skills_fragment(catalog).map(|fragment| fragment.body().into_owned())
     } else {
         None
     };
@@ -74,7 +74,7 @@ pub(crate) fn executor_skills_world_state_section(
         });
     match retained_body {
         Some(body) => contribution.with_retained_fragment_matcher(move |role, text| {
-            role == "developer" && text.contains(&body)
+            role == "developer" && text.contains(body.as_str())
         }),
         None => contribution,
     }

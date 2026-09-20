@@ -556,7 +556,7 @@ pub(crate) async fn handle_output_item_done(
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
 
-    match ToolRouter::build_tool_call(item.clone()) {
+    match ToolRouter::build_tool_call(&item) {
         // The model emitted a tool call; admit it, persist it, and queue the tool execution.
         Ok(Some(call)) => {
             ctx.turn_context
@@ -577,14 +577,7 @@ pub(crate) async fn handle_output_item_done(
                 return Ok(output);
             }
 
-            output.eager_read_eligible = ctx
-                .tool_runtime
-                .take_eager_read_eligibility(&call, earlier_tool_calls_eligible);
             let call_id = call.call_id.clone();
-            let timing = ctx
-                .tool_runtime
-                .create_tool_dispatch_timing(item_accepted_at, output.eager_read_eligible);
-            let execution_id = timing.execution_id().clone();
             if ctx
                 .turn_context
                 .turn_timing_state
@@ -597,6 +590,14 @@ pub(crate) async fn handle_output_item_done(
                     "refusing tool call `{call_id}` because the same call ID was already accepted in this model generation"
                 )));
             }
+            let mut next_earlier_tool_calls_eligible = *earlier_tool_calls_eligible;
+            output.eager_read_eligible = ctx
+                .tool_runtime
+                .take_eager_read_eligibility(&call, &mut next_earlier_tool_calls_eligible);
+            let timing = ctx
+                .tool_runtime
+                .create_tool_dispatch_timing(item_accepted_at, output.eager_read_eligible);
+            let execution_id = timing.execution_id().clone();
             let accepted = ctx.turn_context.tool_call_acceptance.try_accept(|| {
                 ctx.turn_context
                     .turn_timing_state
@@ -612,6 +613,7 @@ pub(crate) async fn handle_output_item_done(
                     "refusing tool call `{call_id}` because acceptance was sealed or the same call ID was already accepted in this model generation"
                 )));
             }
+            *earlier_tool_calls_eligible = next_earlier_tool_calls_eligible;
             ctx.response_item_recorder
                 .record_accepted_tool_call(call.clone())
                 .await;

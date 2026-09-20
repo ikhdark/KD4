@@ -44,14 +44,14 @@ pub use crate::error::ImageProcessingError;
 #[derive(Debug, Clone)]
 pub struct EncodedImage {
     pub bytes: Arc<[u8]>,
-    pub mime: String,
+    pub mime: &'static str,
     pub width: u32,
     pub height: u32,
 }
 
 impl EncodedImage {
     pub fn into_data_url(self) -> String {
-        data_url_from_bytes(&self.mime, &self.bytes)
+        data_url_from_bytes(self.mime, &self.bytes)
     }
 }
 
@@ -447,12 +447,12 @@ fn apply_image_metadata(
     Ok(())
 }
 
-fn format_to_mime(format: ImageFormat) -> String {
+fn format_to_mime(format: ImageFormat) -> &'static str {
     match format {
-        ImageFormat::Jpeg => "image/jpeg".to_string(),
-        ImageFormat::Gif => "image/gif".to_string(),
-        ImageFormat::WebP => "image/webp".to_string(),
-        _ => "image/png".to_string(),
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::Gif => "image/gif",
+        ImageFormat::WebP => "image/webp",
+        _ => "image/png",
     }
 }
 

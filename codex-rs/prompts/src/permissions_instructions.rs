@@ -169,8 +169,8 @@ impl ContextualUserFragment for PermissionsInstructions {
         ("<permissions instructions>", "</permissions instructions>")
     }
 
-    fn body(&self) -> String {
-        PermissionsInstructions::body(self)
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(PermissionsInstructions::body(self))
     }
 }
 

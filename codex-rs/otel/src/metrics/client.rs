@@ -33,6 +33,7 @@ use opentelemetry_sdk::metrics::Temporality;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use opentelemetry_sdk::metrics::reader::MetricReader;
 use opentelemetry_semantic_conventions as semconv;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,10 +56,20 @@ const SECOND_DURATION_BOUNDARIES: &[f64] = &[
 ];
 
 #[derive(Debug, Eq, Hash, PartialEq)]
-struct InstrumentKey {
-    name: String,
+struct InstrumentKey<'a> {
+    name: Cow<'a, str>,
     unit: Option<&'static str>,
-    description: Option<String>,
+    description: Option<Cow<'a, str>>,
+}
+
+impl InstrumentKey<'_> {
+    fn into_owned(self) -> InstrumentKey<'static> {
+        InstrumentKey {
+            name: Cow::Owned(self.name.into_owned()),
+            unit: self.unit,
+            description: self.description.map(|value| Cow::Owned(value.into_owned())),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -98,12 +109,13 @@ impl MetricReader for SharedManualReader {
 struct MetricsClientInner {
     meter_provider: SdkMeterProvider,
     meter: Meter,
-    counters: Mutex<HashMap<InstrumentKey, Counter<u64>>>,
-    gauges: Mutex<HashMap<InstrumentKey, Gauge<i64>>>,
+    counters: Mutex<HashMap<InstrumentKey<'static>, Counter<u64>>>,
+    gauges: Mutex<HashMap<InstrumentKey<'static>, Gauge<i64>>>,
     histograms: Mutex<HashMap<String, Histogram<f64>>>,
-    duration_histograms: Mutex<HashMap<InstrumentKey, Histogram<f64>>>,
+    duration_histograms: Mutex<HashMap<InstrumentKey<'static>, Histogram<f64>>>,
     runtime_reader: Option<Arc<ManualReader>>,
     default_tags: BTreeMap<String, String>,
+    default_attributes: Vec<KeyValue>,
 }
 
 impl MetricsClientInner {
@@ -135,9 +147,9 @@ impl MetricsClientInner {
         attributes: &[KeyValue],
     ) {
         let key = InstrumentKey {
-            name: name.to_string(),
+            name: Cow::Borrowed(name),
             unit: None,
-            description: description.map(str::to_string),
+            description: description.map(Cow::Borrowed),
         };
         let cached = self
             .counters
@@ -156,7 +168,7 @@ impl MetricsClientInner {
             self.counters
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(key)
+                .entry(key.into_owned())
                 .or_insert(created)
                 .clone()
         });
@@ -197,9 +209,9 @@ impl MetricsClientInner {
         let attributes = self.attributes(tags)?;
 
         let key = InstrumentKey {
-            name: name.to_string(),
+            name: Cow::Borrowed(name),
             unit: None,
-            description: description.map(str::to_string),
+            description: description.map(Cow::Borrowed),
         };
         let cached = self
             .gauges
@@ -216,7 +228,7 @@ impl MetricsClientInner {
             self.gauges
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(key)
+                .entry(key.into_owned())
                 .or_insert(created)
                 .clone()
         });
@@ -232,7 +244,7 @@ impl MetricsClientInner {
         tags: &[(&str, &str)],
     ) -> Result<()> {
         validate_metric_name(name)?;
-        let attributes = self.attributes(tags)?;
+        let attributes = self.attributes(tags)?.into_owned();
         let _gauge = self
             .meter
             .i64_observable_gauge(name.to_string())
@@ -268,9 +280,9 @@ impl MetricsClientInner {
         attributes: &[KeyValue],
     ) {
         let key = InstrumentKey {
-            name: name.to_string(),
+            name: Cow::Borrowed(name),
             unit: Some(unit),
-            description: Some(description.to_string()),
+            description: Some(Cow::Borrowed(description)),
         };
         let cached = self
             .duration_histograms
@@ -289,7 +301,7 @@ impl MetricsClientInner {
             self.duration_histograms
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(key)
+                .entry(key.into_owned())
                 .or_insert(created)
                 .clone()
         });
@@ -325,26 +337,28 @@ impl MetricsClientInner {
         Ok(())
     }
 
-    fn attributes(&self, tags: &[(&str, &str)]) -> Result<Vec<KeyValue>> {
+    fn attributes(&self, tags: &[(&str, &str)]) -> Result<Cow<'_, [KeyValue]>> {
         if tags.is_empty() {
-            return Ok(self
-                .default_tags
-                .iter()
-                .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
-                .collect());
+            return Ok(Cow::Borrowed(&self.default_attributes));
         }
 
-        let mut merged = self.default_tags.clone();
+        let mut merged: BTreeMap<&str, &str> = self
+            .default_tags
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
         for (key, value) in tags {
             validate_tag_key(key)?;
             validate_tag_value(value)?;
-            merged.insert((*key).to_string(), (*value).to_string());
+            merged.insert(key, value);
         }
 
-        Ok(merged
-            .into_iter()
-            .map(|(key, value)| KeyValue::new(key, value))
-            .collect())
+        Ok(Cow::Owned(
+            merged
+                .into_iter()
+                .map(|(key, value)| KeyValue::new(key.to_owned(), value.to_owned()))
+                .collect(),
+        ))
     }
 
     fn shutdown(&self) -> Result<()> {
@@ -415,6 +429,10 @@ impl MetricsClient {
             histograms: Mutex::new(HashMap::new()),
             duration_histograms: Mutex::new(HashMap::new()),
             runtime_reader,
+            default_attributes: default_tags
+                .iter()
+                .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
+                .collect(),
             default_tags,
         })))
     }
@@ -716,6 +734,7 @@ mod counter_cache_tests {
             duration_histograms: Mutex::new(HashMap::new()),
             runtime_reader: None,
             default_tags: BTreeMap::new(),
+            default_attributes: Vec::new(),
         }));
         let error = metrics.shutdown().unwrap_err();
         let MetricsError::ProviderShutdown { source } = error else {
@@ -777,6 +796,7 @@ mod counter_cache_tests {
             duration_histograms: Mutex::new(HashMap::new()),
             runtime_reader: Some(reader),
             default_tags: BTreeMap::new(),
+            default_attributes: Vec::new(),
         }));
         record(&metrics, kind, "codex.warm", 2, "upserted").unwrap();
         let cold = metrics.clone();

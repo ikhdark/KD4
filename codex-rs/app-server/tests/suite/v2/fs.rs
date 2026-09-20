@@ -66,7 +66,7 @@ fn absolute_path(path: PathBuf) -> AbsolutePathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_get_metadata_returns_only_used_fields() -> Result<()> {
+async fn fs_get_metadata_returns_file_size_and_timestamps() -> Result<()> {
     let codex_home = TempDir::new()?;
     let file_path = codex_home.path().join("note.txt");
     std::fs::write(&file_path, "hello")?;
@@ -97,6 +97,7 @@ async fn fs_get_metadata_returns_only_used_fields() -> Result<()> {
             "isFile".to_string(),
             "isSymlink".to_string(),
             "modifiedAtMs".to_string(),
+            "size".to_string(),
         ]
     );
 
@@ -107,6 +108,7 @@ async fn fs_get_metadata_returns_only_used_fields() -> Result<()> {
             is_directory: false,
             is_file: true,
             is_symlink: false,
+            size: 5,
             created_at_ms: stat.created_at_ms,
             modified_at_ms: stat.modified_at_ms,
         }
@@ -177,10 +179,52 @@ async fn fs_read_file_enforces_exact_size_limit() -> Result<()> {
     expect_error_message(
         &mut mcp,
         oversized_request_id,
-        "fs/readFile file exceeds maximum size of 10485760 bytes",
+        "fs/readFile file exceeds maximum size of 10485760 bytes or changed while reading",
     )
     .await?;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fs_write_file_enforces_exact_size_limit_without_mutating_rejected_paths() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let file_path = codex_home.path().join("boundary.bin");
+    let mut mcp = initialized_mcp(&codex_home).await?;
+    let bytes = vec![b'a'; READ_FILE_LIMIT_BYTES];
+    let request_id = mcp
+        .send_fs_write_file_request(FsWriteFileParams {
+            path: absolute_path(file_path.clone()),
+            data_base64: STANDARD.encode(&bytes),
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(std::fs::read(&file_path)?, bytes);
+
+    // +1 shares the boundary's encoded length; +3 also exercises the
+    // pre-decode bound. Neither may truncate an existing file or create one.
+    for extra in [1, 3] {
+        for path in [&file_path, &codex_home.path().join("absent.bin")] {
+            let before = std::fs::read(path).ok();
+            let request_id = mcp
+                .send_fs_write_file_request(FsWriteFileParams {
+                    path: absolute_path(path.clone()),
+                    data_base64: STANDARD.encode(vec![b'b'; READ_FILE_LIMIT_BYTES + extra]),
+                })
+                .await?;
+            expect_error_message(
+                &mut mcp,
+                request_id,
+                "fs/writeFile data exceeds maximum size of 10485760 bytes",
+            )
+            .await?;
+            assert_eq!(std::fs::read(path).ok(), before);
+        }
+    }
     Ok(())
 }
 
@@ -641,6 +685,8 @@ async fn fs_watch_directory_reports_changed_child_paths_and_unwatch_stops_notifi
     )
     .await??;
 
+    // The response reader may have buffered notifications emitted before the unwatch ack.
+    mcp.clear_message_buffer();
     std::fs::write(git_dir.join("packed-refs"), "refs\n")?;
     let maybe_notification = timeout(
         Duration::from_millis(1500),

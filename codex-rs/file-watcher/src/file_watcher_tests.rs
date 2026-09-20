@@ -8,6 +8,24 @@ use tokio::time::timeout;
 
 const TEST_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
 
+#[test]
+fn compression_processes_complete_depth_rounds_and_preserves_roots() {
+    let mut paths = ["a/b/c", "a/b/d", "a/b", "x/y", "z"]
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    assert!(compress_changed_paths(&mut paths, 5));
+    assert_eq!(
+        paths,
+        ["a/b", "x/y", "z"].map(PathBuf::from).into_iter().collect()
+    );
+    assert!(compress_changed_paths(&mut paths, 3));
+    assert_eq!(paths, [""].map(PathBuf::from).into_iter().collect());
+    assert!(!compress_changed_paths(&mut paths, 1));
+    assert_eq!(paths, [""].map(PathBuf::from).into_iter().collect());
+    assert!(!compress_changed_paths(&mut paths, 0));
+}
+
 fn path(name: &str) -> PathBuf {
     PathBuf::from(name)
 }

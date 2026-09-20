@@ -107,10 +107,12 @@ impl ContextualUserFragment for InternalModelContextFragment {
         is_valid_source(source) && body_and_close.ends_with(CONTEXT_END_MARKER)
     }
 
-    fn body(&self) -> String {
-        let source = self.source.as_str();
-        let body = &self.body;
-        format!(" source=\"{source}\">\n{body}\n")
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned({
+            let source = self.source.as_str();
+            let body = &self.body;
+            format!(" source=\"{source}\">\n{body}\n")
+        })
     }
 }
 

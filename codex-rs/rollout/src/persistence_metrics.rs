@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -43,7 +44,7 @@ pub struct RolloutSizeTotals {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutItemMeasurement {
     pub decision: PersistenceDecision,
-    pub rollout_item_type: String,
+    pub rollout_item_type: Cow<'static, str>,
     pub payload_bytes: Option<u64>,
 }
 
@@ -224,23 +225,24 @@ impl Write for CountingWriter {
     }
 }
 
-fn rollout_item_type(item: &RolloutItem) -> String {
+fn rollout_item_type(item: &RolloutItem) -> Cow<'static, str> {
     match item {
-        RolloutItem::SessionMeta(_) => "session_meta".to_string(),
-        RolloutItem::ToolManifest(_) => "tool_manifest".to_string(),
-        RolloutItem::SamplingBoundary(_) => "sampling_boundary".to_string(),
-        RolloutItem::ResponseItem(item) => response_item_type(item).to_string(),
-        RolloutItem::InterAgentCommunication(_) => "inter_agent_communication".to_string(),
+        RolloutItem::SessionMeta(_) => Cow::Borrowed("session_meta"),
+        RolloutItem::ToolManifest(_) => Cow::Borrowed("tool_manifest"),
+        RolloutItem::SamplingBoundary(_) => Cow::Borrowed("sampling_boundary"),
+        RolloutItem::ResponseItem(item) => Cow::Borrowed(response_item_type(item)),
+        RolloutItem::InterAgentCommunication(_) => Cow::Borrowed("inter_agent_communication"),
         RolloutItem::InterAgentCommunicationMetadata { .. } => {
-            "inter_agent_communication_metadata".to_string()
+            Cow::Borrowed("inter_agent_communication_metadata")
         }
-        RolloutItem::Compacted(_) => "compacted".to_string(),
-        RolloutItem::TurnContext(_) => "turn_context".to_string(),
-        RolloutItem::WorldState(_) => "world_state".to_string(),
-        RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
-            format!("event.item_completed.{}", turn_item_type(&event.item))
-        }
-        RolloutItem::EventMsg(event) => format!("event.{event}"),
+        RolloutItem::Compacted(_) => Cow::Borrowed("compacted"),
+        RolloutItem::TurnContext(_) => Cow::Borrowed("turn_context"),
+        RolloutItem::WorldState(_) => Cow::Borrowed("world_state"),
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => Cow::Owned(format!(
+            "event.item_completed.{}",
+            turn_item_type(&event.item)
+        )),
+        RolloutItem::EventMsg(event) => Cow::Owned(format!("event.{event}")),
     }
 }
 
@@ -328,7 +330,7 @@ impl RolloutPersistenceTelemetry {
                     saturating_i64(payload_bytes),
                     &[
                         ("decision", item.decision.as_str()),
-                        ("rollout_item_type", item.rollout_item_type.as_str()),
+                        ("rollout_item_type", item.rollout_item_type.as_ref()),
                         ("encoding", "rollout_item_json_v1"),
                         ("sample_rate", SAMPLE_RATE_LABEL),
                     ],
@@ -338,7 +340,7 @@ impl RolloutPersistenceTelemetry {
                     MEASUREMENT_ERROR_METRIC,
                     /*inc*/ 1,
                     &[
-                        ("rollout_item_type", item.rollout_item_type.as_str()),
+                        ("rollout_item_type", item.rollout_item_type.as_ref()),
                         ("phase", "serialize"),
                     ],
                 );

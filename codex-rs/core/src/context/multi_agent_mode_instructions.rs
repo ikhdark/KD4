@@ -26,9 +26,9 @@ mod tests {
         );
         assert!(rendered.contains("Do not run shared-state mutations concurrently."));
         assert!(rendered.contains("query ownership when it resolves a task uncertainty"));
-        assert!(rendered.contains("For implementation tasks, fix affected callers"));
-        assert!(rendered.contains("For implementation tasks, reuse passing validation"));
-        assert!(rendered.contains("For implementation tasks, use owner-required checks"));
+        assert!(rendered.contains("Fix affected callers"));
+        assert!(rendered.contains("Reuse passing validation"));
+        assert!(rendered.contains("Use owner-required checks"));
         assert!(!rendered.contains("before broad inventory"));
         assert!(
             rendered
@@ -102,8 +102,8 @@ impl ContextualUserFragment for RootOrchestrationInstructions {
         )
     }
 
-    fn body(&self) -> String {
-        ROOT_ORCHESTRATION_TEXT.trim().to_string()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(ROOT_ORCHESTRATION_TEXT.trim())
     }
 }
 
@@ -131,12 +131,12 @@ impl ContextualUserFragment for MultiAgentModeInstructions {
         (MULTI_AGENT_MODE_OPEN_TAG, MULTI_AGENT_MODE_CLOSE_TAG)
     }
 
-    fn body(&self) -> String {
-        match &self.multi_agent_mode {
-            EffectiveMultiAgentMode::Custom(hint_text) => hint_text.clone(),
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(match &self.multi_agent_mode {
+            EffectiveMultiAgentMode::Custom(hint_text) => hint_text,
             EffectiveMultiAgentMode::ExplicitRequestOnly => {
-                EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT.to_string()
+                EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT
             }
-        }
+        })
     }
 }

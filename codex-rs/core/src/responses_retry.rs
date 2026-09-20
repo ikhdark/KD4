@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const MAX_RESPONSE_STREAM_RETRY_DELAY: Duration = Duration::from_secs(5);
-const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
@@ -107,9 +107,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
         sess.notify_stream_error(
             turn_context,
             format!(
-                "Reconnecting... waiting for network (attempt {}, next retry in {}s)",
+                "Reconnecting... waiting for network (attempt {}, next retry in {retry_delay:.1?})",
                 retry_state.connection_retries,
-                retry_delay.as_secs(),
             ),
             err,
         )

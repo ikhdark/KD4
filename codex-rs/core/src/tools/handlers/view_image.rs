@@ -63,6 +63,7 @@ struct ViewImageArgs {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ViewImageDetail {
+    Low,
     High,
     Original,
 }
@@ -85,7 +86,7 @@ impl ToolExecutor<ToolInvocation> for ViewImageHandler {
         registered_spec: &ToolSpec,
     ) -> Option<ToolSearchInfo> {
         ToolSearchInfo::from_tool_spec(
-            registered_spec.clone(),
+            registered_spec,
             Some(ToolSearchSourceInfo {
                 name: "Images".to_string(),
                 description: Some(
@@ -144,11 +145,12 @@ impl ViewImageHandler {
         // Other string values remain invalid rather than being silently reinterpreted.
         let detail = match detail.as_deref() {
             None => None,
+            Some("low") => Some(ViewImageDetail::Low),
             Some("high") => Some(ViewImageDetail::High),
             Some("original") => Some(ViewImageDetail::Original),
             Some(detail) => {
                 return Err(FunctionCallError::RespondToModel(format!(
-                    "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `{detail}`"
+                    "view_image.detail only supports `low`, `high` or `original`; omit `detail` for default high resized behavior, got `{detail}`"
                 )));
             }
         };
@@ -212,6 +214,8 @@ impl ViewImageHandler {
             can_request_original_detail && matches!(detail, Some(ViewImageDetail::Original));
         let image_detail = if use_original_detail {
             ImageDetail::Original
+        } else if matches!(detail, Some(ViewImageDetail::Low)) {
+            ImageDetail::Low
         } else {
             DEFAULT_IMAGE_DETAIL
         };
@@ -388,7 +392,7 @@ mod tests {
                 tool_name: codex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
                 payload: ToolPayload::Function {
-                    arguments: json!({ "path": "image.png", "detail": "low" }).to_string(),
+                    arguments: json!({ "path": "image.png", "detail": "invalid" }).to_string(),
                 },
             })
             .await;
@@ -398,12 +402,14 @@ mod tests {
         };
         assert_eq!(
             message,
-            "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `low`"
+            "view_image.detail only supports `low`, `high` or `original`; omit `detail` for default high resized behavior, got `invalid`"
         );
     }
 
+    #[test_case::test_case("low", ImageDetail::Low; "low")]
+    #[test_case::test_case("high", ImageDetail::High; "high")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn handle_accepts_explicit_high_detail() {
+    async fn handle_preserves_explicit_detail(detail: &str, expected: ImageDetail) {
         let (session, mut turn) = make_session_and_context().await;
         let image_dir = tempfile::tempdir().expect("create image temp dir");
         let image_cwd = image_dir.abs();
@@ -424,12 +430,27 @@ mod tests {
                 tool_name: codex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
                 payload: ToolPayload::Function {
-                    arguments: json!({ "path": "image.png", "detail": "high" }).to_string(),
+                    arguments: json!({ "path": "image.png", "detail": detail }).to_string(),
                 },
             })
             .await;
 
-        result.expect("explicit high detail should be accepted");
+        let output = result.expect("explicit detail should be accepted");
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
+        assert_eq!(output.code_mode_result(&payload)["detail"], json!(expected));
+        let ResponseInputItem::FunctionCallOutput { output, .. } =
+            output.to_response_item("call-view-image", &payload)
+        else {
+            panic!("expected function call output");
+        };
+        let FunctionCallOutputBody::ContentItems(items) = output.body else {
+            panic!("expected image content");
+        };
+        assert!(
+            matches!(items.as_slice(), [FunctionCallOutputContentItem::InputImage { detail: Some(actual), .. }] if *actual == expected)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

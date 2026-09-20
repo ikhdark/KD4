@@ -439,7 +439,8 @@ pub fn item_event_to_server_notification(
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
             let item_id = exec_command_output_delta_event.call_id;
-            let delta = String::from_utf8_lossy(&exec_command_output_delta_event.chunk).to_string();
+            let delta =
+                String::from_utf8_lossy(&exec_command_output_delta_event.chunk).into_owned();
             ServerNotification::CommandExecutionOutputDelta(
                 CommandExecutionOutputDeltaNotification {
                     thread_id,

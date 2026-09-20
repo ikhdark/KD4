@@ -193,7 +193,7 @@ impl HistoryCell for ExecCell {
                         .map(|line| ansi_escape_line(line.as_ref()))
                     {
                         let wrapped = adaptive_wrap_line(&unwrapped, wrap_opts.clone());
-                        push_owned_lines(&wrapped, &mut lines);
+                        push_owned_lines(wrapped, &mut lines);
                     }
                 }
                 if !call.is_complete() {
@@ -286,7 +286,7 @@ impl ExecCell {
                             lines.push(("Read", vec![name.clone().into()]));
                         }
                         ParsedCommand::ListFiles { cmd, path } => {
-                            lines.push(("List", vec![path.clone().unwrap_or(cmd.clone()).into()]));
+                            lines.push(("List", vec![path.as_ref().unwrap_or(cmd).clone().into()]));
                         }
                         ParsedCommand::Search { cmd, query, path } => {
                             let spans = match (query, path) {
@@ -316,7 +316,7 @@ impl ExecCell {
                         .initial_indent(initial_indent)
                         .subsequent_indent(subsequent_indent),
                 );
-                push_owned_lines(&wrapped, &mut out_indented);
+                push_owned_lines(wrapped, &mut out_indented);
             }
         }
 
@@ -382,7 +382,7 @@ impl ExecCell {
                 RtOptions::new(available_first_width).word_splitter(WordSplitter::NoHyphenation);
 
             let mut first_wrapped: Vec<Line<'static>> = Vec::new();
-            push_owned_lines(&adaptive_wrap_line(first, first_opts), &mut first_wrapped);
+            push_owned_lines(adaptive_wrap_line(first, first_opts), &mut first_wrapped);
             let mut first_wrapped_iter = first_wrapped.into_iter();
             if let Some(first_segment) = first_wrapped_iter.next() {
                 header_line.extend(first_segment);
@@ -391,7 +391,7 @@ impl ExecCell {
 
             for line in rest {
                 push_owned_lines(
-                    &adaptive_wrap_line(line, continuation_opts.clone()),
+                    adaptive_wrap_line(line, continuation_opts.clone()),
                     &mut continuation_lines,
                 );
             }
@@ -458,7 +458,7 @@ impl ExecCell {
                         continue;
                     }
                     push_owned_lines(
-                        &adaptive_wrap_line(line, output_opts.clone()),
+                        adaptive_wrap_line(line, output_opts.clone()),
                         &mut wrapped_output,
                     );
                 }
@@ -822,7 +822,7 @@ mod tests {
         let mut full_wrapped_output: Vec<Line<'static>> = Vec::new();
         for line in &raw_output.lines {
             push_owned_lines(
-                &adaptive_wrap_line(line, output_opts.clone()),
+                adaptive_wrap_line(line, output_opts.clone()),
                 &mut full_wrapped_output,
             );
         }

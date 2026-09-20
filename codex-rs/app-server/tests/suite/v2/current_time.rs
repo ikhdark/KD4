@@ -13,8 +13,8 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::Duration;
@@ -27,7 +27,7 @@ const CURRENT_TIME_REMINDER: &str = "It is 2026-06-17 17:34:15 UTC.";
 
 #[tokio::test]
 async fn current_time_read_round_trip_adds_reminder_to_model_input() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(

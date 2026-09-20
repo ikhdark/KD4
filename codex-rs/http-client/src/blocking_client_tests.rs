@@ -48,6 +48,8 @@ fn blocking_client_sends_buffered_request_and_reads_response_without_exposing_tr
                 Err(error) => panic!("accept request: {error}"),
             }
         };
+        // Windows accepted sockets can inherit the listener's nonblocking mode.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
@@ -136,6 +138,8 @@ fn explicit_none_disables_blocking_transport_timeout() {
                 Err(error) => panic!("accept request: {error}"),
             }
         };
+        // Accepted Windows sockets may inherit the nonblocking listener mode.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();

@@ -709,8 +709,8 @@ fn project_configuration_comparison_records_explicit_differences_per_arm_without
         comparison.by_variant[&Variant::Reference].project_only,
         [
             "allow_login_shell",
-            "features.kd4_runtime",
-            "example_settings.verify"
+            "example_settings.verify",
+            "features.kd4_runtime"
         ]
     );
     let frozen = serde_json::to_string(&comparison).unwrap();

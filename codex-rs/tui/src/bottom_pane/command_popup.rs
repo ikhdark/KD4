@@ -186,7 +186,11 @@ impl CommandPopup {
             .iter()
             .filter_map(|command| {
                 let command_name = command.command();
-                let exact_name_match = command_name.to_lowercase() == filter_lower;
+                let exact_name_match = if command_name.is_ascii() {
+                    command_name.eq_ignore_ascii_case(&filter_lower)
+                } else {
+                    command_name.to_lowercase() == filter_lower
+                };
                 if let Some((indices, score)) =
                     fuzzy_match_slash_command_name(command_name, filter, !has_name_prefix_match)
                 {

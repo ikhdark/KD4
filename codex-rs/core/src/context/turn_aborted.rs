@@ -6,8 +6,8 @@ pub(crate) struct TurnAborted {
 }
 
 impl TurnAborted {
-    pub(crate) const INTERRUPTED_GUIDANCE: &'static str = "The user interrupted the previous turn on purpose. Any tools, commands, or nested code-mode work may have partially executed or may still be running. Before continuing, inspect the affected state and any live sessions; do not assume pre-interruption evidence is still current or repeat operations whose effects are uncertain.";
-    pub(crate) const INTERRUPTED_DEVELOPER_GUIDANCE: &'static str = "The previous turn was interrupted on purpose. Any tools, commands, or nested code-mode work may have partially executed or may still be running. Before continuing, inspect the affected state and any live sessions; do not assume pre-interruption evidence is still current or repeat operations whose effects are uncertain.";
+    pub(crate) const INTERRUPTED_GUIDANCE: &'static str = "The user interrupted the previous turn on purpose. If tools, commands, or nested code-mode work were in flight, inspect only the affected state and live sessions needed to resolve uncertain effects before relying on them or repeating an operation. Reuse unaffected evidence and continue with the user's latest direction.";
+    pub(crate) const INTERRUPTED_DEVELOPER_GUIDANCE: &'static str = "The previous turn was interrupted on purpose. If tools, commands, or nested code-mode work were in flight, inspect only the affected state and live sessions needed to resolve uncertain effects before relying on them or repeating an operation. Reuse unaffected evidence and continue with the user's latest direction.";
 
     pub(crate) fn new(guidance: impl Into<String>) -> Self {
         Self {
@@ -29,7 +29,7 @@ impl ContextualUserFragment for TurnAborted {
         ("<turn_aborted>", "</turn_aborted>")
     }
 
-    fn body(&self) -> String {
-        format!("\n{}\n", self.guidance)
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!("\n{}\n", self.guidance))
     }
 }

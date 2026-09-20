@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use codex_protocol::protocol::TurnTiming;
+use core_test_support::require_network;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -10,7 +11,6 @@ use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -158,7 +158,7 @@ fn print_timing_breakdown(workflow: &str, baseline_requests: u32, timing: &TurnT
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_edit_batches_validation_and_git_into_three_model_requests() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let baseline_server = start_mock_server().await;
     let baseline_responses = mount_semantically_gated_sequence(
@@ -320,7 +320,7 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identical_parallel_tool_calls_reach_immediate_continuation() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -419,7 +419,7 @@ async fn identical_parallel_tool_calls_reach_immediate_continuation() -> anyhow:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_semantically_gated_sequence(
@@ -508,7 +508,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_production_request_contains_bounded_orchestration_guidance() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -537,6 +537,7 @@ async fn root_production_request_contains_bounded_orchestration_guidance() -> an
         .and_then(|(_, suffix)| suffix.split_once(close).map(|(body, _)| body))
         .expect("normal root request should contain registered orchestration guidance");
     let guidance = guidance.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(guidance.contains("For implementation tasks: Fix affected callers"));
     assert!(guidance.contains("request them together using the available parallel tools"));
     assert!(guidance.contains("parallel tools or execution wrapper"));
     assert!(guidance.contains("Do not run shared-state mutations concurrently"));

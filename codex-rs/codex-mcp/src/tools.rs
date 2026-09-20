@@ -19,12 +19,12 @@ use serde_json::Map;
 use serde_json::Value as JsonValue;
 use tracing::warn;
 
+use crate::mcp::LEGACY_MCP_TOOL_NAME_PREFIX;
+use crate::mcp::MCP_TOOL_NAME_DELIMITER;
 use crate::mcp::sanitize_responses_api_tool_name;
 
 pub(crate) const MCP_TOOLS_CACHE_WRITE_DURATION_METRIC: &str =
     "codex.mcp.tools.cache_write.duration_ms";
-
-const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolInfo {
@@ -256,7 +256,6 @@ struct CallableToolCandidate {
     callable_name: String,
 }
 
-const MCP_TOOL_NAME_DELIMITER: &str = "__";
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 const CALLABLE_NAME_HASH_LEN: usize = 12;
 const META_OPENAI_FILE_PARAMS: &str = "openai/fileParams";

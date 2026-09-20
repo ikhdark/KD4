@@ -711,11 +711,55 @@ impl ToolOutput for FunctionToolOutput {
 
 pub struct ApplyPatchToolOutput {
     pub text: String,
+    pub success: bool,
+    pub changes: Vec<JsonValue>,
+    pub changes_exact: bool,
+    pub environment_id: Option<String>,
 }
 
 impl ApplyPatchToolOutput {
     pub fn from_text(text: String) -> Self {
-        Self { text }
+        Self::from_delta(text, true, &Default::default(), None)
+    }
+
+    pub(crate) fn from_delta(
+        text: String,
+        success: bool,
+        delta: &codex_apply_patch::AppliedPatchDelta,
+        environment_id: Option<String>,
+    ) -> Self {
+        use codex_apply_patch::AppliedPatchFileChange;
+        let changes = delta
+            .changes()
+            .iter()
+            .map(|applied| {
+                let (kind, move_path) = match &applied.change {
+                    AppliedPatchFileChange::Add { .. } => ("add", None),
+                    AppliedPatchFileChange::Delete { .. } => ("delete", None),
+                    AppliedPatchFileChange::Update { move_path, .. } => {
+                        ("update", move_path.as_ref())
+                    }
+                };
+                serde_json::json!({"path": applied.path, "kind": kind, "move_path": move_path})
+            })
+            .collect();
+        Self {
+            text,
+            success,
+            changes,
+            changes_exact: delta.is_exact(),
+            environment_id,
+        }
+    }
+
+    fn structured_result(&self) -> JsonValue {
+        serde_json::json!({
+            "success": self.success,
+            "text": self.text,
+            "changes": self.changes,
+            "changes_exact": self.changes_exact,
+            "environment_id": self.environment_id,
+        })
     }
 }
 
@@ -725,18 +769,32 @@ impl ToolOutput for ApplyPatchToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        true
+        self.success
+    }
+
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        Some(CanonicalToolResult::json(self.structured_result()))
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         Some(ToolOutputProjectionMetadata {
-            outcome: ToolOutputOutcome::Success,
+            outcome: if self.success {
+                ToolOutputOutcome::Success
+            } else {
+                ToolOutputOutcome::Failure
+            },
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: Vec::new(),
             spillable_text: vec![self.text.clone()],
-            essential_inline: JsonValue::Object(serde_json::Map::new()),
+            essential_inline: serde_json::json!({
+                "success": self.success,
+                "changes_count": self.changes.len(),
+                "changes_exact": self.changes_exact,
+                "environment_id": self.environment_id,
+            }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
+            // Canonical JSON indexes every change automatically when spilled.
             predetermined_json_pointers: Vec::new(),
         })
     }
@@ -748,16 +806,16 @@ impl ToolOutput for ApplyPatchToolOutput {
             vec![FunctionCallOutputContentItem::InputText {
                 text: self.text.clone(),
             }],
-            Some(true),
+            Some(self.success),
         )
     }
 
     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
-        Some(JsonValue::String(self.text.clone()))
+        Some(self.structured_result())
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        JsonValue::String(self.text.clone())
+        self.structured_result()
     }
 }
 
@@ -1024,22 +1082,6 @@ impl ToolOutput for ExecCommandToolOutput {
         let model_output = self.projected_model_output(raw_output.as_ref());
         let output_reduced = model_output.reduced;
         let output = self.output_with_reduction_notice(model_output);
-        let output = if output.is_empty() {
-            match (self.exit_code, self.process_id, self.process_exited) {
-                (Some(exit_code), _, _) => {
-                    format!("Command completed with no output (exit code {exit_code}).")
-                }
-                (None, _, true) => {
-                    "Command exited with no output and no available exit code.".to_string()
-                }
-                (None, Some(_), false) => {
-                    "Command is still running and has not produced output.".to_string()
-                }
-                (None, None, false) => "Command returned no output.".to_string(),
-            }
-        } else {
-            output
-        };
 
         let result = UnifiedExecCodeModeResult {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),

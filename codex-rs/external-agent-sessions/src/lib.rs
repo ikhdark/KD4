@@ -98,10 +98,11 @@ fn truncate(text: &str, max_len: usize) -> String {
     if text.chars().take(max_len.saturating_add(1)).count() <= max_len {
         return text.to_string();
     }
-    let prefix = text
-        .chars()
-        .take(max_len.saturating_sub(3))
-        .collect::<String>();
+    let end = text
+        .char_indices()
+        .nth(max_len.saturating_sub(3))
+        .map_or(text.len(), |(index, _)| index);
+    let prefix = &text[..end];
     format!("{prefix}...")
 }
 

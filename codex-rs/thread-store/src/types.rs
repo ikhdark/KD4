@@ -225,6 +225,11 @@ pub struct ListThreadsParams {
     pub cwd_filters: Option<Vec<PathBuf>>,
     /// Omit to include every project, set to None for unassigned threads,
     /// or provide a project ID to match that project.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_option"
+    )]
     pub project_id: ClearableField<String>,
     /// Whether archived threads should be listed instead of active threads.
     pub archived: bool,
@@ -755,6 +760,35 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn list_threads_params_preserve_all_project_filter_states() {
+        for project_id in [None, Some(None), Some(Some("project-1".to_string()))] {
+            let params = ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::UpdatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                project_id: project_id.clone(),
+                archived: false,
+                search_term: None,
+                relation_filter: None,
+                storage_mode: ThreadListStorageMode::PreferStateDb,
+            };
+            let value = serde_json::to_value(&params).expect("serialize listing request");
+            match &project_id {
+                None => assert!(value.get("project_id").is_none()),
+                Some(None) => assert_eq!(value.get("project_id"), Some(&json!(null))),
+                Some(Some(id)) => assert_eq!(value.get("project_id"), Some(&json!(id))),
+            }
+            let decoded: ListThreadsParams =
+                serde_json::from_value(value).expect("deserialize listing request");
+            assert_eq!(decoded, params);
+        }
+    }
 
     #[test]
     fn recency_advances_merge_by_maximum() {

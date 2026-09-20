@@ -611,6 +611,7 @@ impl WorkspaceStatusReader {
 async fn workspace_generation_status(
     repo_root: &Path,
 ) -> Option<(Vec<u8>, Vec<WorkspaceGenerationPath>)> {
+    let _timer = codex_otel::start_global_timer("codex.workspace.git_status.duration_ms", &[]);
     let mut command = Command::new("git");
     command
         .arg("-c")

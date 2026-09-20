@@ -13,8 +13,9 @@ pub(crate) async fn queue_strict_refresh(
     config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await?;
-    let mut refreshes = Vec::new();
-    for thread_id in thread_manager.list_thread_ids().await {
+    let thread_ids = thread_manager.list_thread_ids().await;
+    let mut refreshes = Vec::with_capacity(thread_ids.len());
+    for thread_id in thread_ids {
         let thread = thread_manager
             .get_thread(thread_id)
             .await
@@ -33,8 +34,9 @@ pub(crate) async fn queue_best_effort_refresh(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
 ) {
-    let mut refreshes = Vec::new();
-    for thread_id in thread_manager.list_thread_ids().await {
+    let thread_ids = thread_manager.list_thread_ids().await;
+    let mut refreshes = Vec::with_capacity(thread_ids.len());
+    for thread_id in thread_ids {
         let thread = match thread_manager.get_thread(thread_id).await {
             Ok(thread) => thread,
             Err(err) => {

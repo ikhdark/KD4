@@ -43,13 +43,15 @@ impl ContextualUserFragment for RecommendedPluginsInstructions {
         ("<recommended_plugins>", "</recommended_plugins>")
     }
 
-    fn body(&self) -> String {
-        let plugins = self
-            .plugins
-            .iter()
-            .map(|plugin| format!("- {} ({})", plugin.name(), plugin.id()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("\n{RECOMMENDED_PLUGINS_INTRO}\n\n{plugins}\n")
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned({
+            let plugins = self
+                .plugins
+                .iter()
+                .map(|plugin| format!("- {} ({})", plugin.name(), plugin.id()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n{RECOMMENDED_PLUGINS_INTRO}\n\n{plugins}\n")
+        })
     }
 }

@@ -3,7 +3,7 @@ use super::APPLY_PATCH_TOOL_INSTRUCTIONS;
 #[test]
 fn apply_patch_instructions_stay_compact_and_complete() {
     assert!(
-        APPLY_PATCH_TOOL_INSTRUCTIONS.len() <= 3_000,
+        APPLY_PATCH_TOOL_INSTRUCTIONS.len() <= 4_096,
         "apply_patch instructions grew to {} bytes",
         APPLY_PATCH_TOOL_INSTRUCTIONS.len()
     );
@@ -16,7 +16,10 @@ fn apply_patch_instructions_stay_compact_and_complete() {
         "*** Update File:",
         "*** Move to:",
         "@@",
-        "Paths must be relative; never use absolute paths.",
+        "Absolute paths are supported, subject to the same filesystem permissions.",
+        "Each source or move destination may occur only once per patch",
+        "Order chunks from top to bottom.",
+        "failure or cancellation may leave earlier changes committed",
         "Do not include unified-diff headers such as `diff --git`, `---`, or `+++`.",
         "After stale context, a concurrent edit, a context mismatch, or a failure that may have modified files, re-read only the affected current sections before retrying.",
         "For errors known to occur before file mutation, correct the error without re-reading unchanged contents.",

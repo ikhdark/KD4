@@ -56,24 +56,46 @@ pub(crate) fn seek_sequence(
         })
     }
 
-    type LineMatcher = fn(&str, &str) -> bool;
-    let tiers: [(&str, LineMatcher); 4] = [
-        ("exact", |line, pattern| line == pattern),
-        ("trailing-whitespace", |line, pattern| {
-            line.trim_end() == pattern.trim_end()
-        }),
-        ("whitespace", |line, pattern| line.trim() == pattern.trim()),
-        ("Unicode-normalized", |line, pattern| {
-            normalise(line).eq(normalise(pattern))
-        }),
+    type NormalizeLine = fn(&str) -> &str;
+    let tiers: [(&str, NormalizeLine); 4] = [
+        ("exact", |line| line),
+        ("trailing-whitespace", str::trim_end),
+        ("whitespace", str::trim),
+        ("Unicode-normalized", str::trim),
     ];
-    for (strictness, matches) in tiers {
+    for (strictness, prepare) in tiers {
+        // Borrow trimmed views once per tier instead of trimming each line pair
+        // again for every overlapping candidate. Keep the exact pass allocation-free.
+        let prepared = matches!(strictness, "trailing-whitespace" | "whitespace").then(|| {
+            (
+                lines[search_start..]
+                    .iter()
+                    .map(|line| prepare(line))
+                    .collect::<Vec<_>>(),
+                pattern.iter().map(|line| prepare(line)).collect::<Vec<_>>(),
+            )
+        });
+        let normalized_pattern = (strictness == "Unicode-normalized").then(|| {
+            pattern
+                .iter()
+                .map(|line| normalise(line).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        });
         let mut found = None;
         for index in search_start..=last_start {
             if lines[index..index + pattern.len()]
                 .iter()
                 .zip(pattern)
-                .all(|(line, pattern)| matches(line, pattern))
+                .enumerate()
+                .all(|(offset, (line, pattern))| match &normalized_pattern {
+                    Some(normalized) => normalise(line).eq(normalized[offset].iter().copied()),
+                    None => match &prepared {
+                        Some((lines, pattern)) => {
+                            lines[index - search_start + offset] == pattern[offset]
+                        }
+                        None => line == pattern,
+                    },
+                })
             {
                 if let Some(first) = found {
                     return Err(AmbiguousMatch {
@@ -98,8 +120,8 @@ pub(crate) fn seek_sequence(
     "Ambiguous {strictness} match at lines {first_line} and {second_line}; add more context to select one location"
 )]
 pub(crate) struct AmbiguousMatch {
-    first_line: usize,
-    second_line: usize,
+    pub(crate) first_line: usize,
+    pub(crate) second_line: usize,
     strictness: &'static str,
 }
 

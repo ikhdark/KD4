@@ -20,7 +20,7 @@ async fn offline_model_info_without_tool_output_override() {
 
     assert_eq!(
         model_info.truncation_policy,
-        TruncationPolicyConfig::bytes(/*limit*/ 10_000)
+        TruncationPolicyConfig::tokens(/*limit*/ 10_000)
     );
 }
 
@@ -45,6 +45,6 @@ async fn offline_model_info_with_tool_output_override() {
     let byte_model_info = manager.get_model_info("gpt-5.2", &config).await;
     assert_eq!(
         byte_model_info.truncation_policy,
-        TruncationPolicyConfig::bytes(492)
+        TruncationPolicyConfig::tokens(123)
     );
 }

@@ -13,6 +13,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 
 - Product documentation: [OpenAI Codex documentation](https://developers.openai.com/codex)
 - Local build and publish policy: [`AGENTS.md`](AGENTS.md)
+- Local app-server protocol guide: [`codex-rs/docs/app_server.md`](codex-rs/docs/app_server.md)
 - Standalone installation guidance: [`scripts/install/README.md`](scripts/install/README.md)
 - License: [`LICENSE`](LICENSE)
 
@@ -50,7 +51,7 @@ Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
 
-Tracked repository path snapshot: `count=4924 sha256=79ee89adc9c817f004a1d641c61a80ed98b108c8536dddf74d165b231b70e38e`.
+Tracked repository path snapshot: `count=4919 sha256=d079e47efa38cf974ff23f470f60998e0297bf71b1833891640681eddab321bd`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -155,10 +156,28 @@ mismatches alone do not establish that repository contents changed. The owning
 
 `scripts/source_inventory.py` uses the source-map checker's Git enumeration to
 produce normalized inventory records, category evidence, and unresolved cases.
-Task-owned state retains coverage and content hashes; unchanged classifications
-are reused. Its CLI emits bounded summaries or the exact validated tracked list.
-Category rules establish matches, not runtime reachability; ambiguous categories
-remain unresolved until their consumers are inspected. Validate with
+Task-owned version 3 state retains query identity, coverage, content hashes, and
+reviewed include/exclude decisions. Categories default to runtime verification;
+each decision requires a source hash, review reason, and exact hashed consumer
+line evidence. Setting `unresolved: false` alone does not verify a classification.
+Use `verification: "path"` only for inventories claiming file/rule matches.
+
+Declare `required_categories` to retain coverage questions. Scope changes require
+`scope_change: {from_query_id, reason}` and preserve earlier unresolved and
+excluded scope in the report. Unchanged decisions are reused and revalidated;
+changed source or consumer evidence reopens the record.
+
+`--report` writes immutable Markdown and canonical JSON artifacts outside the
+source tree. Link the returned `report` and `canonical_paths`; counts and paths
+come from the same records. `--state <state.json> --render-only --report <report.md>`
+renders retained results without rescanning. Add `--remaining` to page unresolved
+evidence. Categories can set `json_summary: true` to report JSON fields, types,
+and lengths without printing string bodies.
+
+`--instructions <relative-scope> ...` lists ancestor and scoped descendant
+`AGENTS.md`/`AGENTS.override.md` files, pruning build and dependency directories
+before descent. Read the returned applicable instructions before editing.
+Validate these inventory and instruction-discovery paths with
 `python -m unittest scripts.test_source_inventory scripts.test_source_map_check`.
 
 ## Runtime architecture
@@ -195,7 +214,6 @@ below.
 | Path                                                             | Owns                                                                                                                                                                                                                                                                  |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `.codex/`                                                        | Repo-local Codex configuration, environment setup, fork-local skills, and workspace policy                                                                                                                                                                            |
-| `.kdv/`                                                          | Audit evidence attribution and recorded disputes for repository changes                                                                                                                                                                                               |
 | `.vscode/`                                                       | Checked-in editor and workspace defaults                                                                                                                                                                                                                              |
 | `architecture_index.json`                                        | Generated, manifest-keyed source-owner relationship graph consumed by task-scoped architecture discovery                                                                                                                                                              |
 | `codex-cli/`                                                     | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs                                                                                                                                                                                   |

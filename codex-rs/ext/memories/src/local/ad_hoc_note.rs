@@ -62,7 +62,7 @@ async fn ensure_notes_dir(
 async fn ensure_directory(path: &Path) -> Result<(), MemoriesBackendError> {
     match LocalMemoriesBackend::metadata_or_none(path).await? {
         Some(metadata) => {
-            reject_symlink(&path.display().to_string(), &metadata)?;
+            reject_symlink(&path.to_string_lossy(), &metadata)?;
             if metadata.is_dir() {
                 return Ok(());
             }
@@ -83,7 +83,7 @@ async fn ensure_directory(path: &Path) -> Result<(), MemoriesBackendError> {
             path: path.display().to_string(),
         });
     };
-    reject_symlink(&path.display().to_string(), &metadata)?;
+    reject_symlink(&path.to_string_lossy(), &metadata)?;
     if !metadata.is_dir() {
         return Err(MemoriesBackendError::invalid_path(
             path.display().to_string(),

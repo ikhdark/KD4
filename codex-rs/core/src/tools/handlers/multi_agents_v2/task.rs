@@ -172,13 +172,10 @@ async fn handle_get_agent_task(
     let arguments = function_arguments(payload)?;
     let args: GetAgentTaskArgs = parse_arguments(&arguments)?;
     let assignment_id = parse_assignment_id(GET_AGENT_TASK_TOOL, &args.assignment_id)?;
-    let observation_limit = args.observation_limit.unwrap_or(DEFAULT_OBSERVATION_LIMIT);
-    if observation_limit > MAX_OBSERVATION_LIMIT {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{GET_AGENT_TASK_TOOL}: observation_limit must be between 0 and \
-             {MAX_OBSERVATION_LIMIT}, got {observation_limit}"
-        )));
-    }
+    let observation_limit = args
+        .observation_limit
+        .unwrap_or(DEFAULT_OBSERVATION_LIMIT)
+        .min(MAX_OBSERVATION_LIMIT);
 
     let coordinator = session.services.agent_control.task_coordinator();
     let caller_binding = if turn.session_source.is_non_root_agent() {
@@ -261,7 +258,7 @@ async fn handle_submit_agent_receipt(
         .unwrap_or_else(|| turn.config.cwd.to_path_buf());
     let _workspace_operation_permit =
         crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await;
-    let draft = args.into_receipt_draft();
+    let draft = args.into_receipt_draft(&task)?;
     if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
         tracing::warn!(
             %error,
@@ -993,14 +990,7 @@ fn task_store_error(tool_name: &'static str, error: StoreError) -> FunctionCallE
             "obligations": obligations,
         })
         .to_string(),
-        StoreError::Io(_)
-        | StoreError::Sql(_)
-        | StoreError::Migration(_)
-        | StoreError::Json(_)
-        | StoreError::CorruptData(_) => {
-            "the typed task store is unavailable or contains invalid persisted state".to_string()
-        }
-        error => error.to_string(),
+        error => task_store_error_detail(tool_name, error),
     };
     FunctionCallError::RespondToModel(format!("{tool_name}: {detail}"))
 }
@@ -1019,8 +1009,10 @@ struct SubmitAgentReceiptArgs {
     summary: String,
     criterion_results: Vec<ReceiptCriterionArgs>,
     declared_changes: Vec<DeclaredChangeArgs>,
-    validation_call_ids: Vec<String>,
+    validation_call_ids: Option<Vec<String>>,
+    #[serde(default)]
     blockers: Vec<String>,
+    #[serde(default)]
     risks: Vec<String>,
     next_action: Option<String>,
     #[serde(default)]
@@ -1028,26 +1020,38 @@ struct SubmitAgentReceiptArgs {
 }
 
 impl SubmitAgentReceiptArgs {
-    fn into_receipt_draft(self) -> ReceiptDraft {
-        ReceiptDraft {
+    fn into_receipt_draft(self, task: &AgentTask) -> Result<ReceiptDraft, FunctionCallError> {
+        let criterion_results = self
+            .criterion_results
+            .into_iter()
+            .map(|criterion| criterion.into_criterion_result(task))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Infer only cited calls, not every call the attempt executed. Explicit lists retain
+        // their meaning and the store still validates ownership, success, epoch, and coverage.
+        let validation_call_ids = self.validation_call_ids.unwrap_or_else(|| {
+            criterion_results
+                .iter()
+                .filter_map(|criterion| criterion.evidence_ref.as_ref())
+                .map(|reference| reference.call_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        });
+        Ok(ReceiptDraft {
             status: self.status,
             summary: self.summary,
-            criterion_results: self
-                .criterion_results
-                .into_iter()
-                .map(ReceiptCriterionArgs::into_criterion_result)
-                .collect(),
+            criterion_results,
             declared_changes: self
                 .declared_changes
                 .into_iter()
                 .map(DeclaredChangeArgs::into_declared_change)
                 .collect(),
-            validation_call_ids: self.validation_call_ids,
+            validation_call_ids,
             blockers: self.blockers,
             risks: self.risks,
             next_action: self.next_action,
             architecture_contract: self.architecture_contract,
-        }
+        })
     }
 }
 
@@ -1057,17 +1061,57 @@ struct ReceiptCriterionArgs {
     criterion_id: String,
     status: CriterionStatus,
     evidence: Option<String>,
-    evidence_ref: Option<codex_agent_task_store::CriterionEvidenceRef>,
+    evidence_ref: Option<ReceiptEvidenceRefArgs>,
 }
 
 impl ReceiptCriterionArgs {
-    fn into_criterion_result(self) -> CriterionResult {
-        CriterionResult {
-            evidence_ref: self.evidence_ref,
+    fn into_criterion_result(self, task: &AgentTask) -> Result<CriterionResult, FunctionCallError> {
+        Ok(CriterionResult {
+            evidence_ref: self
+                .evidence_ref
+                .map(|reference| reference.resolve(task))
+                .transpose()?,
             criterion_id: self.criterion_id,
             status: self.status,
             evidence: self.evidence,
-        }
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptEvidenceRefArgs {
+    call_id: String,
+    workspace_id: Option<String>,
+    evidence_epoch: Option<u64>,
+    kind: Option<codex_agent_task_store::CriterionEvidenceKind>,
+}
+
+impl ReceiptEvidenceRefArgs {
+    fn resolve(
+        self,
+        task: &AgentTask,
+    ) -> Result<codex_agent_task_store::CriterionEvidenceRef, FunctionCallError> {
+        let evidence_epoch = match self.evidence_epoch {
+            Some(epoch) => epoch,
+            None => task.validation_calls.iter()
+                .find(|call| call.call_id == self.call_id && call.attempt_id == task.current_attempt.attempt_id)
+                .and_then(|call| call.evidence.end_epoch)
+                .ok_or_else(|| FunctionCallError::RespondToModel(format!(
+                    "{SUBMIT_AGENT_RECEIPT_TOOL}: validation call {} has no recorded end epoch in the bound attempt",
+                    self.call_id
+                )))?,
+        };
+        Ok(codex_agent_task_store::CriterionEvidenceRef {
+            call_id: self.call_id,
+            workspace_id: self
+                .workspace_id
+                .unwrap_or_else(|| task.assignment.workspace_id.clone()),
+            evidence_epoch,
+            kind: self
+                .kind
+                .unwrap_or(codex_agent_task_store::CriterionEvidenceKind::ValidationExecution),
+        })
     }
 }
 
@@ -1948,7 +1992,7 @@ fn get_agent_task_spec() -> ToolSpec {
         GET_AGENT_TASK_TOOL,
         "Read a durable typed-agent assignment, its current attempt, gates, receipt, captured \
          validation calls, and recent observations. A bound reviewer or verifier also receives \
-         isolated evidence for its target. observation_limit defaults to 20 and cannot exceed 100.",
+         isolated evidence for its target. observation_limit defaults to 20 and is capped at 100.",
         object_schema(
             [
                 (
@@ -1960,9 +2004,8 @@ fn get_agent_task_spec() -> ToolSpec {
                 (
                     "observation_limit",
                     JsonSchema::integer(Some(
-                        "Number of newest observations to return, from 0 through 100. Defaults to \
-                         20."
-                        .to_string(),
+                        "Number of newest observations to return. Defaults to 20; capped at 100."
+                            .to_string(),
                     )),
                 ),
             ],
@@ -2091,11 +2134,11 @@ fn submit_agent_receipt_spec() -> ToolSpec {
             (
                 "evidence_ref",
                 object_schema([
-                    ("call_id", JsonSchema::string(Some("Successful owned validation ID also listed in validation_call_ids.".to_string()))),
-                    ("workspace_id", JsonSchema::string(Some("Workspace identity from this task's assignment.".to_string()))),
-                    ("evidence_epoch", JsonSchema::integer(Some("The validation call's recorded end_epoch.".to_string()))),
-                    ("kind", enum_schema(["validation_execution"], "Execution evidence does not by itself establish test coverage or deployment.")),
-                ], &["call_id", "workspace_id", "evidence_epoch", "kind"]),
+                    ("call_id", JsonSchema::string(Some("Successful owned validation ID; included automatically when validation_call_ids is omitted.".to_string()))),
+                    ("workspace_id", JsonSchema::string(Some("Omit to use the bound assignment's workspace.".to_string()))),
+                    ("evidence_epoch", JsonSchema::integer(Some("Omit to use the validation call's recorded end_epoch.".to_string()))),
+                    ("kind", enum_schema(["validation_execution"], "Omit for validation_execution. Execution alone does not establish test coverage or deployment.")),
+                ], &["call_id"]),
             ),
         ],
         &["criterion_id", "status"],
@@ -2155,34 +2198,27 @@ fn submit_agent_receipt_spec() -> ToolSpec {
                 (
                     "validation_call_ids",
                     string_array_schema(
-                        "Completed validation tool-call ids owned by this attempt.",
+                        "Completed validation tool-call ids owned by this attempt. Omit to use the distinct calls cited by criterion evidence_ref fields; include a list only to select additional or different calls.",
                     ),
                 ),
                 (
                     "blockers",
-                    string_array_schema("Blockers that prevented completion."),
+                    string_array_schema("Blockers that prevented completion. Omit when empty."),
                 ),
                 (
                     "risks",
-                    string_array_schema("Known remaining risks or uncertainties."),
+                    string_array_schema("Known remaining risks or uncertainties. Omit when empty."),
                 ),
                 (
                     "next_action",
                     JsonSchema::string(Some(
-                        "Recommended next action for the root agent.".to_string(),
+                        "Include only when the root agent needs a concrete follow-up action."
+                            .to_string(),
                     )),
                 ),
                 ("architecture_contract", architecture_contract),
             ],
-            &[
-                "status",
-                "summary",
-                "criterion_results",
-                "declared_changes",
-                "validation_call_ids",
-                "blockers",
-                "risks",
-            ],
+            &["status", "summary", "criterion_results", "declared_changes"],
         ),
     )
 }
@@ -2380,6 +2416,26 @@ mod projection_tests {
     use codex_agent_task_store::WakeEventId;
     use codex_agent_task_store::WorkspaceStrategy;
     use codex_agent_task_store::WorkspaceTaskStatus;
+
+    #[test]
+    fn task_store_failures_log_causes_without_exposing_them_to_the_model() {
+        super::super::store_error_tests::assert_error_reporting(GET_AGENT_TASK_TOOL, |error| {
+            task_store_error(GET_AGENT_TASK_TOOL, error)
+        });
+        let FunctionCallError::RespondToModel(detail) = task_store_error(
+            SUBMIT_AGENT_RECEIPT_TOOL,
+            StoreError::RequiredEvidenceMissing {
+                obligations: Vec::new(),
+            },
+        ) else {
+            panic!("missing evidence must remain a tool response");
+        };
+        let payload = detail.strip_prefix("submit_agent_receipt: ").unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(payload).unwrap(),
+            json!({"kind": "required_evidence_missing", "obligations": []})
+        );
+    }
 
     #[test]
     fn oversized_receipt_projection_owner_recovery_is_hard_bounded_and_prioritized() {

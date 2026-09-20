@@ -21,6 +21,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_image_generation_call;
 use core_test_support::responses::ev_response_created;
@@ -30,7 +31,6 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -118,7 +118,7 @@ fn test_model_info(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     const INITIAL_MODEL: &str = "gpt-5.2";
     const NEXT_MODEL: &str = "gpt-5.4";
@@ -216,7 +216,7 @@ async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_switch_with_unchanged_personality_reinjects_personality_delta() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
@@ -292,7 +292,7 @@ async fn model_switch_with_unchanged_personality_reinjects_personality_delta() -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
@@ -322,7 +322,7 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flex_service_tier_is_applied_to_http_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let model_slug = "test-flex-model";
@@ -360,7 +360,7 @@ async fn flex_service_tier_is_applied_to_http_turn() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_service_tier_is_omitted_from_http_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let model_slug = "test-no-tier-model";
@@ -393,7 +393,7 @@ async fn unsupported_service_tier_is_omitted_from_http_turn() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_configured_service_tier_warns_at_session_start() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let model_slug = "test-no-tier-model";
@@ -433,7 +433,7 @@ async fn unsupported_configured_service_tier_warns_at_session_start() -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let model_slug = "test-default-tier-model";
@@ -472,7 +472,7 @@ async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn null_service_tier_override_is_omitted_from_http_turn_with_catalog_default() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let model_slug = "test-null-default-tier-model";
@@ -511,7 +511,7 @@ async fn null_service_tier_override_is_omitted_from_http_turn_with_catalog_defau
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::start().await;
     let image_model_slug = "test-image-model";
@@ -614,7 +614,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::start().await;
     let image_model_slug = "test-image-model";
@@ -709,7 +709,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_from_generated_image_to_text_preserves_prior_generated_image_call()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::start().await;
     let image_model_slug = "test-image-model";
@@ -820,7 +820,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_rollback_after_generated_image_drops_entire_image_turn_history() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = MockServer::start().await;
     let image_model_slug = "test-image-model";
@@ -919,7 +919,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 

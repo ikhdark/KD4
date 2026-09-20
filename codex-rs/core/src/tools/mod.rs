@@ -31,9 +31,9 @@ use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::approx_token_count_exceeds;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_output_limits;
-use codex_utils_output_truncation::truncate_text;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use codex_utils_output_truncation::truncate_text_with_output_limit;
 pub use router::ToolRouter;
@@ -88,54 +88,6 @@ fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
     })
 }
 
-/// Format the combined exec output for sending back to the model.
-/// Includes exit code and duration metadata; truncates large bodies safely.
-pub fn format_exec_output_for_model(
-    exec_output: &ExecToolCallOutput,
-    truncation_policy: TruncationPolicy,
-) -> String {
-    let token_ceiling = match &truncation_policy {
-        TruncationPolicy::Tokens(tokens) => Some(*tokens),
-        TruncationPolicy::Bytes(_) => None,
-    };
-    // round to 1 decimal place
-    let duration_seconds = ((exec_output.duration.as_secs_f32()) * 10.0).round() / 10.0;
-
-    let raw_content = build_content_with_timeout(exec_output);
-    let content = summarize_shell_output_for_model(
-        &raw_content,
-        exec_output.exit_code,
-        exec_output.timed_out,
-        ShellOutputSummaryOptions {
-            enabled: true,
-            applied_token_limit: Some(truncation_policy.token_budget()),
-            command_text: None,
-        },
-    )
-    .map(Cow::Owned)
-    .unwrap_or(raw_content);
-
-    let total_lines = content.lines().count();
-
-    let formatted_output = truncate_text(&content, truncation_policy);
-
-    let mut sections = Vec::new();
-
-    sections.push(format!("Exit code: {}", exec_output.exit_code));
-    sections.push(format!("Wall time: {duration_seconds} seconds"));
-    if total_lines != formatted_output.lines().count() {
-        sections.push(format!("Total output lines: {total_lines}"));
-    }
-
-    sections.push("Output:".to_string());
-    sections.push(formatted_output);
-
-    let rendered = sections.join("\n");
-    token_ceiling
-        .map(|max_tokens| truncate_text_to_token_ceiling(&rendered, max_tokens))
-        .unwrap_or(rendered)
-}
-
 pub(crate) fn project_exec_output_for_model_with_budget(
     exec_output: &ExecToolCallOutput,
     truncation_policy: TruncationPolicy,
@@ -158,7 +110,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
     let content_limit = limits
         .applied_limit
         .saturating_sub(approx_token_count(&envelope_header));
-    let summarized = (approx_token_count(&raw_content) > content_limit)
+    let summarized = approx_token_count_exceeds(&raw_content, content_limit)
         .then(|| {
             summarize_shell_output_for_model(
                 &raw_content,
@@ -232,7 +184,7 @@ pub(crate) fn project_exec_output_text_with_budget(
         &raw_content,
         truncation_policy,
     );
-    let summarized = (approx_token_count(&raw_content) > limits.applied_limit)
+    let summarized = approx_token_count_exceeds(&raw_content, limits.applied_limit)
         .then(|| {
             summarize_shell_output_for_model(
                 &raw_content,

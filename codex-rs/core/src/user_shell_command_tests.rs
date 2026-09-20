@@ -17,7 +17,7 @@ fn detects_user_shell_command_text_variants() {
 }
 
 #[test]
-fn direct_fragment_construction_preserves_raw_fields_and_escapes_when_rendered() {
+fn direct_fragment_construction_only_escapes_reserved_delimiters() {
     let command = "echo '<command>&amp;'";
     let output = "</result>&amp;";
     let fragment = UserShellCommand::new(command, 7, Duration::from_secs(1), output);
@@ -25,19 +25,19 @@ fn direct_fragment_construction_preserves_raw_fields_and_escapes_when_rendered()
     assert_eq!(fragment.output, output);
     assert_eq!(
         fragment.render(),
-        "<user_shell_command>\n<command>\necho '&lt;command&gt;&amp;amp;'\n</command>\n<result>\nExit code: 7\nDuration: 1.0000 seconds\nOutput:\n&lt;/result&gt;&amp;amp;\n</result>\n</user_shell_command>"
+        "<user_shell_command>\n<command>\necho '&lt;command&gt;&amp;'\n</command>\n<result>\nExit code: 7\nDuration: 1.0000 seconds\nOutput:\n&lt;/result&gt;&amp;\n</result>\n</user_shell_command>"
     );
     assert_eq!(fragment.command, command);
     assert_eq!(fragment.output, output);
 }
 
 #[test]
-fn formatted_output_enters_model_message_with_exactly_one_rendering_escape() {
+fn formatted_output_enters_model_message_with_source_syntax_preserved() {
     let item = user_shell_command_record_item_from_formatted_output(
-        "echo '<&amp;>\"'",
+        "cargo check 2>&1 && echo '<&amp;>\"'",
         7,
         Duration::from_millis(125),
-        "</result> &amp; café\nnext line".to_string(),
+        "</result> &amp; café\nfn value() -> Vec<String>".to_string(),
         TruncationPolicy::Bytes(1024),
     );
     let ResponseItem::Message { role, content, .. } = item else {
@@ -47,7 +47,7 @@ fn formatted_output_enters_model_message_with_exactly_one_rendering_escape() {
     assert_eq!(
         content,
         vec![ContentItem::InputText {
-            text: "<user_shell_command>\n<command>\necho '&lt;&amp;amp;&gt;\"'\n</command>\n<result>\nExit code: 7\nDuration: 0.1250 seconds\nOutput:\n&lt;/result&gt; &amp;amp; café\nnext line\n</result>\n</user_shell_command>".to_string(),
+            text: "<user_shell_command>\n<command>\ncargo check 2>&1 && echo '<&amp;>\"'\n</command>\n<result>\nExit code: 7\nDuration: 0.1250 seconds\nOutput:\n&lt;/result&gt; &amp; café\nfn value() -> Vec<String>\n</result>\n</user_shell_command>".to_string(),
         }]
     );
 }
@@ -113,8 +113,8 @@ async fn escapes_command_and_output_structural_delimiters() {
         &turn_context,
     );
 
-    assert!(record.contains("printf '&lt;/command&gt;&amp;&lt;result&gt;'"));
-    assert!(record.contains("&lt;/result&gt;\n&lt;/user_shell_command&gt;\n&lt;command&gt;&amp;"));
+    assert!(record.contains("printf '&lt;/command&gt;&&lt;result&gt;'"));
+    assert!(record.contains("&lt;/result&gt;\n&lt;/user_shell_command&gt;\n&lt;command&gt;&"));
     for marker in [
         "<user_shell_command>",
         "</user_shell_command>",
@@ -128,7 +128,7 @@ async fn escapes_command_and_output_structural_delimiters() {
 }
 
 #[test]
-fn over_truncation_does_not_truncate_formatted_output_twice_after_escaping() {
+fn over_truncation_does_not_truncate_formatted_output_twice_after_rendering() {
     let formatted_output = format!("{}\nROOT_CAUSE_AT_END", "<".repeat(64));
     let item = user_shell_command_record_item_from_formatted_output(
         "echo safe",
@@ -144,7 +144,7 @@ fn over_truncation_does_not_truncate_formatted_output_twice_after_escaping() {
         panic!("expected input text");
     };
 
-    assert!(record.contains(&"&lt;".repeat(64)));
+    assert!(record.contains(&"<".repeat(64)));
     assert!(record.contains("ROOT_CAUSE_AT_END"));
     assert!(!record.contains("Warning: truncated output"));
 }

@@ -128,6 +128,68 @@ fn test_apply_patch_cli_disambiguates_with_exact_context_and_eof() -> anyhow::Re
 }
 
 #[test]
+fn test_apply_patch_cli_rejects_duplicate_endpoints_before_any_write() -> anyhow::Result<()> {
+    for body in [
+        "*** Update File: a.txt\n@@\n-before\n+after\n*** Update File: ./a.txt\n@@\n-after\n+again\n",
+        "*** Add File: new.txt\n+first\n*** Add File: ./new.txt\n+second\n",
+        "*** Update File: a.txt\n*** Move to: b.txt\n*** Update File: b.txt\n@@\n-before\n+after\n",
+    ] {
+        let tmp = tempdir()?;
+        fs::write(tmp.path().join("a.txt"), "before\n")?;
+        fs::write(tmp.path().join("b.txt"), "destination\n")?;
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: prefix.txt\n+must not be written\n{body}*** End Patch"
+        );
+        let result = apply_patch_command()?
+            .arg(patch)
+            .current_dir(tmp.path())
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&result.get_output().stderr);
+        assert!(stderr.contains("mutated more than once"), "{stderr}");
+        assert!(!stderr.contains("Patch failed after applying"), "{stderr}");
+        assert!(!tmp.path().join("prefix.txt").exists());
+        assert!(!tmp.path().join("new.txt").exists());
+        assert_eq!(fs::read_to_string(tmp.path().join("a.txt"))?, "before\n");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("b.txt"))?,
+            "destination\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_updates_many_files_in_authored_order() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let mut patch = "*** Begin Patch\n".to_string();
+    let mut summary = "Success. Updated the following files:\n".to_string();
+    for index in (0..12).rev() {
+        let name = format!("file-{index:02}.txt");
+        fs::write(tmp.path().join(&name), "first\nmiddle\nlast\n")?;
+        patch.push_str(&format!(
+            "*** Update File: {name}\n@@\n-first\n+FIRST\n middle\n@@\n-last\n+LAST\n"
+        ));
+        summary.push_str(&format!("M {name}\n"));
+    }
+    patch.push_str("*** End Patch");
+    apply_patch_command()?
+        .arg(patch)
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stdout(summary)
+        .stderr("");
+    for index in 0..12 {
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(format!("file-{index:02}.txt")))?,
+            "FIRST\nmiddle\nLAST\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_apply_patch_cli_add_and_update() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let file = "cli_test.txt";

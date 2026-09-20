@@ -17,6 +17,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-utils-string = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = { workspace = true }

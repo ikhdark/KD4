@@ -102,14 +102,15 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         }
 
         if let Some(yield_time_ms) = raw.yield_time_ms
-            && !(crate::unified_exec::MIN_YIELD_TIME_MS..=crate::unified_exec::MAX_YIELD_TIME_MS)
+            && !(crate::unified_exec::MIN_YIELD_TIME_MS
+                ..=crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS)
                 .contains(&yield_time_ms)
         {
             return Err(format!(
                 "exec_command schema error at `$.yield_time_ms`: actual value {} violates the inclusive bound {}..={}",
                 yield_time_ms,
                 crate::unified_exec::MIN_YIELD_TIME_MS,
-                crate::unified_exec::MAX_YIELD_TIME_MS,
+                crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ));
         }
 
@@ -157,8 +158,8 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
 }
 
 impl ExecCommandArgs {
-    pub(crate) fn command_invocation(&self) -> CommandInvocation {
-        self.command.clone()
+    pub(crate) fn command_invocation(&self) -> &CommandInvocation {
+        &self.command
     }
 
     pub(crate) fn replace_command_invocation(&mut self, invocation: &CommandInvocation) {

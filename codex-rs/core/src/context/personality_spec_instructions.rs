@@ -34,7 +34,7 @@ impl ContextualUserFragment for PersonalitySpecInstructions {
         ("<personality_spec>", "</personality_spec>")
     }
 
-    fn body(&self) -> String {
-        self.body.clone()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.body)
     }
 }

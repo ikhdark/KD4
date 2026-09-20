@@ -23,9 +23,12 @@ SOURCE: /[\s\S]+/
         has_deferred_tools,
         direct_only_tool_names,
     );
-    for eager_description in eager_nested_tool_descriptions {
-        description.push_str("\n\nEager nested tool contract:\n\n");
-        description.push_str(eager_description);
+    if !eager_nested_tool_descriptions.is_empty() {
+        description.push_str("\n\nEager nested tool contracts:");
+        for eager_description in eager_nested_tool_descriptions {
+            description.push_str("\n\n");
+            description.push_str(eager_description);
+        }
     }
 
     ToolSpec::Freeform(FreeformTool {
@@ -100,12 +103,23 @@ SOURCE: /[\s\S]+/
             /*code_mode_only*/ true,
             /*has_deferred_tools*/ false,
             &[],
-            &["exec command description\n\ndeclare const tools: { exec_command(args: unknown): Promise<unknown>; };".to_string()],
+            &[
+                "declare const tools: { exec_command(args: unknown): Promise<unknown>; };"
+                    .to_string(),
+                "declare const tools: { write_stdin(args: unknown): Promise<unknown>; };"
+                    .to_string(),
+            ],
         ) else {
             panic!("expected code mode exec tool");
         };
 
-        assert!(exec.description.contains("Eager nested tool contract:"));
+        assert_eq!(
+            exec.description
+                .matches("Eager nested tool contracts:")
+                .count(),
+            1
+        );
+        assert!(exec.description.contains("write_stdin(args:"));
         assert!(exec.description.contains("exec_command(args:"));
     }
 }

@@ -38,6 +38,8 @@ use std::sync::Arc;
 // enough to bound both the read buffer and the encoded JSON-RPC response while
 // still accommodating ordinary source and document reads.
 const MAX_READ_FILE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_WRITE_FILE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_WRITE_FILE_BASE64_BYTES: usize = MAX_WRITE_FILE_BYTES.div_ceil(3) * 4;
 
 #[derive(Clone)]
 pub(crate) struct FsRequestProcessor {
@@ -79,7 +81,7 @@ impl FsRequestProcessor {
             .map_err(map_fs_error)?
             .ok_or_else(|| {
                 invalid_request(format!(
-                    "fs/readFile file exceeds maximum size of {MAX_READ_FILE_BYTES} bytes"
+                    "fs/readFile file exceeds maximum size of {MAX_READ_FILE_BYTES} bytes or changed while reading"
                 ))
             })?;
         Ok(FsReadFileResponse {
@@ -91,11 +93,17 @@ impl FsRequestProcessor {
         &self,
         params: FsWriteFileParams,
     ) -> Result<FsWriteFileResponse, JSONRPCErrorError> {
+        if params.data_base64.len() > MAX_WRITE_FILE_BASE64_BYTES {
+            return Err(write_file_size_error());
+        }
         let bytes = STANDARD.decode(params.data_base64).map_err(|err| {
             invalid_request(format!(
                 "fs/writeFile requires valid base64 dataBase64: {err}"
             ))
         })?;
+        if bytes.len() > MAX_WRITE_FILE_BYTES {
+            return Err(write_file_size_error());
+        }
         let path = PathUri::from_abs_path(&params.path);
         self.file_system()?
             .write_file(&path, bytes, /*sandbox*/ None)
@@ -136,6 +144,7 @@ impl FsRequestProcessor {
             is_directory: metadata.is_directory,
             is_file: metadata.is_file,
             is_symlink: metadata.is_symlink,
+            size: metadata.size,
             created_at_ms: metadata.created_at_ms,
             modified_at_ms: metadata.modified_at_ms,
         })
@@ -222,6 +231,12 @@ impl FsRequestProcessor {
         self.file_system()?;
         self.fs_watch_manager.unwatch(connection_id, params).await
     }
+}
+
+fn write_file_size_error() -> JSONRPCErrorError {
+    invalid_request(format!(
+        "fs/writeFile data exceeds maximum size of {MAX_WRITE_FILE_BYTES} bytes"
+    ))
 }
 
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {

@@ -561,7 +561,7 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
         )
         .await;
 
-    assert!(matches!(result, Err(FunctionCallError::Fatal(_))));
+    assert!(matches!(result, Err(FunctionCallError::RespondToModel(_))));
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     let tool_call = &replayed.tool_calls["incompatible-call"];
     assert_eq!(tool_call.execution.status, ExecutionStatus::Failed);
@@ -684,4 +684,25 @@ fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf> {
     entries.sort();
     assert_eq!(entries.len(), 1);
     Ok(entries.remove(0))
+}
+
+#[tokio::test]
+async fn disabled_dispatch_trace_has_no_tracking_state_or_pending_terminal() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "disabled",
+        "test_tool",
+        ToolCallSource::Direct,
+        "{}",
+    );
+    let trace = super::ToolDispatchTrace::start(&invocation);
+    assert!(trace.state.is_none());
+    trace.wait_for_start().await;
+    trace
+        .record_failed(&FunctionCallError::RespondToModel("failed".to_string()))
+        .await;
+    trace.record_cancelled().await;
+    assert!(invocation.session.terminal_tasks.is_empty());
 }

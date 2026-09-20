@@ -71,14 +71,14 @@ use super::get_command;
 use super::post_unified_exec_tool_use_payload;
 
 async fn get_command_async(
-    args: &ExecCommandArgs,
+    args: ExecCommandArgs,
     shell: Arc<Shell>,
     allow_login_shell: bool,
     environment_is_remote: bool,
-) -> Result<super::ResolvedCommand, FunctionCallError> {
-    let args = args.clone();
+) -> Result<(ExecCommandArgs, super::ResolvedCommand), FunctionCallError> {
     crate::tools::run_blocking_command_analysis(move || {
         get_command(&args, shell, allow_login_shell, environment_is_remote)
+            .map(|resolved| (args, resolved))
     })
     .await
     .map_err(|error| {
@@ -347,9 +347,8 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
-        let original_invocation = args.command_invocation();
         let environment_is_remote = environment.is_remote();
-        if environment_is_remote && !original_invocation.is_argv() {
+        if environment_is_remote && !args.command_invocation().is_argv() {
             if turn_environment.shell.is_none() {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "environment `{}` does not report a shell",
@@ -372,20 +371,20 @@ impl ExecCommandHandler {
             .clone()
             .map(Arc::new)
             .unwrap_or_else(|| session.user_shell());
-        let original_resolved_command = get_command_async(
-            &args,
+        let (mut args, original_resolved_command) = get_command_async(
+            args,
             Arc::clone(&shell),
             turn.config.permissions.allow_login_shell,
             environment_is_remote,
         )
         .await?;
-        let original_safety_command = original_resolved_command.safety_command.clone();
+        let original_invocation = args.command_invocation();
         let direct_runtime = turn.config.features.enabled(Feature::DirectRuntime);
         let preflight = preflight_invocation_for_kd4_runtime(
             turn.config.features.enabled(Feature::Kd4Runtime),
             direct_runtime,
-            &original_invocation,
-            &original_safety_command,
+            original_invocation,
+            &original_resolved_command.safety_command,
             original_resolved_command.preflight_shell_type,
         )
         .await
@@ -398,18 +397,20 @@ impl ExecCommandHandler {
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let repair_notice = preflight.repair_notice;
-        let invocation_changed = command_invocation != original_invocation;
+        let invocation_changed = &command_invocation != original_invocation;
         if invocation_changed {
             args.replace_command_invocation(&command_invocation);
         }
         let resolved_command = if invocation_changed {
-            get_command_async(
-                &args,
+            let (updated_args, resolved) = get_command_async(
+                args,
                 Arc::clone(&shell),
                 turn.config.permissions.allow_login_shell,
                 environment_is_remote,
             )
-            .await?
+            .await?;
+            args = updated_args;
+            resolved
         } else {
             original_resolved_command
         };

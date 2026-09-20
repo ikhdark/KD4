@@ -95,16 +95,22 @@ pub(crate) struct NonCuratedCacheRefreshError {
     pub(crate) message: String,
 }
 
-pub(crate) fn log_plugin_load_errors(plugins: &[LoadedPlugin<McpServerConfig>]) {
-    for plugin in plugins.iter().filter(|plugin| plugin.error.is_some()) {
+pub(crate) fn plugin_load_warnings(plugins: &[LoadedPlugin<McpServerConfig>]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for plugin in plugins.iter().filter(|plugin| plugin.enabled) {
         if let Some(error) = plugin.error.as_deref() {
             warn!(
                 plugin = plugin.config_name,
                 path = %plugin.root.display(),
                 "failed to load plugin: {error}"
             );
+            warnings.push(format!(
+                "Failed to load plugin `{}`: {error}",
+                plugin.config_name
+            ));
         }
     }
+    warnings
 }
 
 /// Load configured plugins without applying auth-dependent runtime policies.
@@ -116,7 +122,7 @@ pub(crate) async fn load_plugins_from_layer_stack(
     plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
     restriction_product: Option<Product>,
     remote_global_catalog_active: bool,
-) -> Vec<LoadedPlugin<McpServerConfig>> {
+) -> Result<Vec<LoadedPlugin<McpServerConfig>>, String> {
     let skill_config_rules = skill_config_rules_from_stack(config_layer_stack);
     load_plugins_from_layer_stack_with_scope(
         config_layer_stack,
@@ -138,7 +144,7 @@ async fn load_plugins_from_layer_stack_with_scope(
     store: &PluginStore,
     remote_global_catalog_active: bool,
     scope: PluginLoadScope<'_>,
-) -> Vec<LoadedPlugin<McpServerConfig>> {
+) -> Result<Vec<LoadedPlugin<McpServerConfig>>, String> {
     let config_layer_stack = config_layer_stack.clone();
     let store_for_config = store.clone();
     let configured_plugins = tokio::task::spawn_blocking(move || {
@@ -162,10 +168,7 @@ async fn load_plugins_from_layer_stack_with_scope(
         configured_plugins
     })
     .await
-    .unwrap_or_else(|err| {
-        warn!("failed to resolve configured plugins: {err}");
-        Vec::new()
-    });
+    .map_err(|err| format!("failed to resolve configured plugins: {err}"))?;
 
     let mut plugins = Vec::with_capacity(configured_plugins.len());
     for (configured_name, plugin) in configured_plugins {
@@ -173,7 +176,7 @@ async fn load_plugins_from_layer_stack_with_scope(
         plugins.push(loaded_plugin);
     }
 
-    plugins
+    Ok(plugins)
 }
 
 /// Load hooks from enabled plugins without loading their skills, MCP servers, or apps.
@@ -191,17 +194,29 @@ pub async fn load_plugin_hooks_from_layer_stack(
         PluginLoadScope::HooksOnly,
     )
     .await;
+    let plugins = match plugins {
+        Ok(plugins) => plugins,
+        Err(warning) => {
+            return PluginHookLoadOutcome {
+                hook_sources: Vec::new(),
+                hook_load_warnings: vec![warning],
+            };
+        }
+    };
+    let mut hook_load_warnings = plugin_load_warnings(&plugins);
+    hook_load_warnings.extend(
+        plugins
+            .iter()
+            .filter(|plugin| plugin.is_active())
+            .flat_map(|plugin| plugin.hook_load_warnings.iter().cloned()),
+    );
     PluginHookLoadOutcome {
         hook_sources: plugins
             .iter()
             .filter(|plugin| plugin.is_active())
             .flat_map(|plugin| plugin.hook_sources.iter().cloned())
             .collect(),
-        hook_load_warnings: plugins
-            .iter()
-            .filter(|plugin| plugin.is_active())
-            .flat_map(|plugin| plugin.hook_load_warnings.iter().cloned())
-            .collect(),
+        hook_load_warnings,
     }
 }
 

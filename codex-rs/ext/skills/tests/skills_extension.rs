@@ -685,7 +685,9 @@ async fn skills_read_honors_response_budgets_without_rereading_cached_contents()
             truncation_policy: TruncationPolicy::Bytes(16),
             source: ToolCallSource::CodeMode {
                 cell_id: "cell-1".to_string(),
+                parent_call_id: None,
                 runtime_tool_call_id: "nested-read-1".to_string(),
+                nested_deadline: None,
             },
             payload: code_mode_payload.clone(),
             ..base_call.clone()

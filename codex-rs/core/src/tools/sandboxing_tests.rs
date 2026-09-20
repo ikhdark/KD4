@@ -75,6 +75,73 @@ fn bash_permission_request_payload_omits_missing_description() {
     );
 }
 
+#[tokio::test]
+async fn cached_approval_serializes_once_and_reuses_session_grants() {
+    struct CountedKey<'a>(&'a std::sync::atomic::AtomicUsize);
+    impl Serialize for CountedKey<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            serializer.serialize_str("command")
+        }
+    }
+
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    assert_eq!(
+        with_cached_approval(
+            &session.services,
+            "shell",
+            vec![CountedKey(&count)],
+            || async { ReviewDecision::ApprovedForSession }
+        )
+        .await,
+        ReviewDecision::ApprovedForSession
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        with_cached_approval(
+            &session.services,
+            "shell",
+            vec![CountedKey(&count)],
+            || async { panic!("a cached session grant must not prompt again") }
+        )
+        .await,
+        ReviewDecision::ApprovedForSession
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        with_cached_approval(
+            &session.services,
+            "other",
+            vec![CountedKey(&count)],
+            || async { ReviewDecision::Denied }
+        )
+        .await,
+        ReviewDecision::Denied
+    );
+}
+
+#[tokio::test]
+async fn unserializable_approval_keys_never_hit_the_cache() {
+    struct InvalidKey;
+    impl Serialize for InvalidKey {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("invalid approval key"))
+        }
+    }
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    for decision in [ReviewDecision::ApprovedForSession, ReviewDecision::Denied] {
+        assert_eq!(
+            with_cached_approval(&session.services, "shell", vec![InvalidKey], || async {
+                decision.clone()
+            })
+            .await,
+            decision
+        );
+    }
+    assert!(session.services.tool_approvals.lock().await.map.is_empty());
+}
+
 #[test]
 fn bash_permission_request_payload_includes_description_when_present() {
     assert_eq!(

@@ -1356,6 +1356,7 @@ class FsGetMetadataResponse(BaseModel):
             description="File modification time in Unix milliseconds when available, otherwise `0`.",
         ),
     ]
+    size: Annotated[int, Field(description="Size in bytes.", ge=0)]
 
 
 class FsReadDirectoryEntry(BaseModel):
@@ -1477,7 +1478,11 @@ class FsWriteFileParams(BaseModel):
         populate_by_name=True,
     )
     data_base64: Annotated[
-        str, Field(alias="dataBase64", description="File contents encoded as base64.")
+        str,
+        Field(
+            alias="dataBase64",
+            description="File contents encoded as base64. Decoded contents must not exceed 10 MiB.",
+        ),
     ]
     path: Annotated[AbsolutePathBuf, Field(description="Absolute path to write.")]
 

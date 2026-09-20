@@ -45,9 +45,17 @@ impl CommandInvocation {
         args: Option<&[String]>,
         script_body: Option<&str>,
     ) -> Result<Self, FunctionCallError> {
-        let script = script.and_then(non_blank);
-        let program = program.and_then(non_blank);
-        let script_body = script_body.and_then(non_blank);
+        for (branch, field, value) in [
+            ("script", script_field, script),
+            ("argv", "program", program),
+            ("powershell_script", "script_body", script_body),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "{tool_name} schema error in `{branch}` branch at `$.{field}`: the supplied field was blank; provide a non-blank string, or omit this field when using another command branch."
+                )));
+            }
+        }
         let has_argv_fields = program.is_some() || args.is_some();
         let has_powershell_script_fields = script_body.is_some();
         let kind = match kind {
@@ -347,10 +355,6 @@ fn encoded_command_args(script: &str) -> [String; 2] {
         utf16.extend_from_slice(&unit.to_le_bytes());
     }
     ["-EncodedCommand".to_string(), BASE64_STANDARD.encode(utf16)]
-}
-
-fn non_blank(value: &str) -> Option<&str> {
-    (!value.trim().is_empty()).then_some(value)
 }
 
 fn optional_string<'a>(

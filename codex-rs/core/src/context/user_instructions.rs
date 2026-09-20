@@ -1,4 +1,5 @@
 use super::ContextualUserFragment;
+use super::escape_fragment_delimiters;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserInstructions {
@@ -16,15 +17,18 @@ impl ContextualUserFragment for UserInstructions {
     }
 
     fn type_markers() -> (&'static str, &'static str) {
-        ("# AGENTS.md instructions", "</INSTRUCTIONS>")
+        (Self::OPEN_MARKER, Self::CLOSE_MARKER)
     }
 
-    fn body(&self) -> String {
-        self.body_with_observation(None)
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(self.body_with_observation(None))
     }
 }
 
 impl UserInstructions {
+    pub(crate) const OPEN_MARKER: &str = "# AGENTS.md instructions";
+    pub(crate) const CLOSE_MARKER: &str = "</INSTRUCTIONS>";
+
     pub(crate) fn with_observation(
         &self,
         observation: &str,
@@ -43,25 +47,31 @@ impl UserInstructions {
         let directory = self
             .directory
             .as_ref()
-            .map(|directory| format!(" for {}", escape_xml_text(directory)))
+            .map(|directory| format!(" for {}", escape_instruction_delimiters(directory)))
             .unwrap_or_default();
         let observation = observation
             .map(|text| {
                 format!(
                     "<AGENTS_MD_OBSERVATION>\n{}\n</AGENTS_MD_OBSERVATION>\n\n",
-                    escape_xml_text(text)
+                    escape_instruction_delimiters(text)
                 )
             })
             .unwrap_or_default();
         format!(
             "{directory}\n\n{observation}<INSTRUCTIONS>\n{}\n",
-            escape_xml_text(&self.text)
+            escape_instruction_delimiters(&self.text)
         )
     }
 }
 
-fn escape_xml_text(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+fn escape_instruction_delimiters(text: &str) -> String {
+    escape_fragment_delimiters(
+        text,
+        &[
+            "<INSTRUCTIONS>",
+            UserInstructions::CLOSE_MARKER,
+            "<AGENTS_MD_OBSERVATION>",
+            "</AGENTS_MD_OBSERVATION>",
+        ],
+    )
 }

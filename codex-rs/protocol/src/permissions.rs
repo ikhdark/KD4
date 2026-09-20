@@ -125,11 +125,17 @@ pub enum FileSystemAccessMode {
 
 impl FileSystemAccessMode {
     pub fn can_read(self) -> bool {
-        !matches!(self, FileSystemAccessMode::Deny)
+        match self {
+            Self::Read | Self::Write => true,
+            Self::Deny => false,
+        }
     }
 
     pub fn can_write(self) -> bool {
-        matches!(self, FileSystemAccessMode::Write)
+        match self {
+            Self::Write => true,
+            Self::Read | Self::Deny => false,
+        }
     }
 }
 

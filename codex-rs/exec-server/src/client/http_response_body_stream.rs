@@ -4,7 +4,6 @@
 //! capability plus the remote-side routing table used to turn
 //! `http/request/bodyDelta` notifications back into per-request streams.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -21,6 +20,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::debug;
 
 use crate::client::ExecServerError;
+use crate::client::HttpBodyStreams;
 use crate::client::Inner;
 use crate::protocol::HTTP_REQUEST_BODY_DELTA_METHOD;
 use crate::protocol::HttpRequestBodyDeltaNotification;
@@ -232,12 +232,14 @@ impl Inner {
         let params: HttpRequestBodyDeltaNotification = from_value(params.unwrap_or(Value::Null))?;
         // Unknown request ids are ignored intentionally: a stream may have already
         // reached EOF and released its route.
-        if let Some(tx) = self
+        let tx = self
             .http_body_streams
-            .load()
+            .lock()
+            .await
+            .streams
             .get(&params.request_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(tx) = tx {
             let request_id = params.request_id.clone();
             let terminal_delta = params.done || params.error.is_some();
             match tx.try_send(params) {
@@ -268,17 +270,13 @@ impl Inner {
     /// Fails active streamed HTTP bodies so callers do not wait forever after a
     /// transport disconnect or notification handling failure.
     pub(crate) async fn fail_all_http_body_streams(&self, message: String) {
-        let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
-        let streams = self.http_body_streams.load();
-        let mut next_failures = self.http_body_stream_failures.load().as_ref().clone();
-        for (request_id, tx) in streams.iter() {
+        let mut state = self.http_body_streams.lock().await;
+        let HttpBodyStreams { streams, failures } = &mut *state;
+        for (request_id, tx) in streams.drain() {
             if !tx.is_closed() {
-                next_failures.insert(request_id.clone(), message.clone());
+                failures.insert(request_id, message.clone());
             }
         }
-        self.http_body_stream_failures
-            .store(Arc::new(next_failures));
-        self.http_body_streams.store(Arc::new(HashMap::new()));
     }
 
     /// Allocates a connection-local streamed HTTP response id.
@@ -295,23 +293,14 @@ impl Inner {
         request_id: String,
         tx: mpsc::Sender<HttpRequestBodyDeltaNotification>,
     ) -> Result<(), ExecServerError> {
-        let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
-        let streams = self.http_body_streams.load();
-        if streams.contains_key(&request_id) {
+        let mut state = self.http_body_streams.lock().await;
+        if state.streams.contains_key(&request_id) {
             return Err(ExecServerError::Protocol(format!(
                 "http response stream already registered for request {request_id}"
             )));
         }
-        let mut next_streams = streams.as_ref().clone();
-        next_streams.insert(request_id.clone(), tx);
-        self.http_body_streams.store(Arc::new(next_streams));
-        let failures = self.http_body_stream_failures.load();
-        if failures.contains_key(&request_id) {
-            let mut next_failures = failures.as_ref().clone();
-            next_failures.remove(&request_id);
-            self.http_body_stream_failures
-                .store(Arc::new(next_failures));
-        }
+        state.failures.remove(&request_id);
+        state.streams.insert(request_id, tx);
         Ok(())
     }
 
@@ -320,60 +309,37 @@ impl Inner {
         &self,
         request_id: &str,
     ) -> Option<mpsc::Sender<HttpRequestBodyDeltaNotification>> {
-        let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
-        self.remove_http_body_stream_locked(request_id)
-    }
-
-    fn remove_http_body_stream_locked(
-        &self,
-        request_id: &str,
-    ) -> Option<mpsc::Sender<HttpRequestBodyDeltaNotification>> {
-        let streams = self.http_body_streams.load();
-        let stream = streams.get(request_id).cloned();
-        stream.as_ref()?;
-        let mut next_streams = streams.as_ref().clone();
-        next_streams.remove(request_id);
-        self.http_body_streams.store(Arc::new(next_streams));
-        stream
+        self.http_body_streams
+            .lock()
+            .await
+            .streams
+            .remove(request_id)
     }
 
     async fn record_http_body_stream_failure(&self, request_id: &str, message: String) {
-        let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
+        let mut state = self.http_body_streams.lock().await;
         // An abandonment may already have removed this route while delivery was in flight.
-        let Some(tx) = self.remove_http_body_stream_locked(request_id) else {
+        let Some(tx) = state.streams.remove(request_id) else {
             return;
         };
-        if tx.is_closed() {
-            return;
+        if !tx.is_closed() {
+            state.failures.insert(request_id.to_string(), message);
         }
-        let failures = self.http_body_stream_failures.load();
-        let mut next_failures = failures.as_ref().clone();
-        next_failures.insert(request_id.to_string(), message);
-        self.http_body_stream_failures
-            .store(Arc::new(next_failures));
     }
 
     /// Consumer abandonment clears both routing and any undelivered failure atomically.
     pub(super) async fn abandon_http_body_stream(&self, request_id: &str) {
-        let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
-        self.remove_http_body_stream_locked(request_id);
-        self.take_http_body_stream_failure_locked(request_id);
+        let mut state = self.http_body_streams.lock().await;
+        state.streams.remove(request_id);
+        state.failures.remove(request_id);
     }
 
     async fn take_http_body_stream_failure(&self, request_id: &str) -> Option<String> {
-        let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
-        self.take_http_body_stream_failure_locked(request_id)
-    }
-
-    fn take_http_body_stream_failure_locked(&self, request_id: &str) -> Option<String> {
-        let failures = self.http_body_stream_failures.load();
-        let error = failures.get(request_id).cloned();
-        error.as_ref()?;
-        let mut next_failures = failures.as_ref().clone();
-        next_failures.remove(request_id);
-        self.http_body_stream_failures
-            .store(Arc::new(next_failures));
-        error
+        self.http_body_streams
+            .lock()
+            .await
+            .failures
+            .remove(request_id)
     }
 }
 
@@ -382,7 +348,9 @@ mod tests {
     use super::*;
     use crate::client::ConnectionState;
     use crate::client::ConnectionStatus;
+    use crate::client::HttpBodyStreams;
     use arc_swap::ArcSwap;
+    use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::OnceLock;
     use std::sync::atomic::AtomicU64;
@@ -398,9 +366,7 @@ mod tests {
             connection_changed: watch::channel(()).0,
             sessions: ArcSwap::from_pointee(HashMap::new()),
             sessions_write_lock: StdMutex::new(()),
-            http_body_streams: ArcSwap::from_pointee(HashMap::new()),
-            http_body_stream_failures: ArcSwap::from_pointee(HashMap::new()),
-            http_body_streams_write_lock: Mutex::new(()),
+            http_body_streams: Mutex::new(HttpBodyStreams::default()),
             http_body_stream_next_id: AtomicU64::new(1),
             session_id: OnceLock::new(),
             environment_info: OnceLock::new(),
@@ -447,7 +413,7 @@ mod tests {
                 .handle_http_body_delta_notification(delta(seq, true, error))
                 .await
                 .expect("route delta");
-            let guard = inner.http_body_streams_write_lock.lock().await;
+            let guard = inner.http_body_streams.lock().await;
             {
                 let mut receive = Box::pin(stream.recv());
                 assert!(futures::poll!(receive.as_mut()).is_pending());
@@ -465,8 +431,8 @@ mod tests {
                 assert_eq!(outcome.expect("final data"), Some(b"last".to_vec()));
             }
             assert_eq!(stream.recv().await.expect("closed stream"), None);
-            assert!(inner.http_body_streams.load().is_empty());
-            assert!(inner.http_body_stream_failures.load().is_empty());
+            assert!(inner.http_body_streams.lock().await.streams.is_empty());
+            assert!(inner.http_body_streams.lock().await.failures.is_empty());
         }
     }
 
@@ -489,8 +455,10 @@ mod tests {
                 .expect("overflow delta");
             assert_eq!(
                 inner
-                    .http_body_stream_failures
-                    .load()
+                    .http_body_streams
+                    .lock()
+                    .await
+                    .failures
                     .get("test")
                     .map(String::as_str),
                 Some("body delta channel filled before delivery")
@@ -500,7 +468,7 @@ mod tests {
         drop(stream);
         runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !inner.http_body_stream_failures.load().is_empty() {
+                while !inner.http_body_streams.lock().await.failures.is_empty() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -509,9 +477,44 @@ mod tests {
             inner
                 .record_http_body_stream_failure("test", "late failure".into())
                 .await;
-            assert!(inner.http_body_stream_failures.load().is_empty());
-            assert!(inner.http_body_streams.load().is_empty());
+            assert!(inner.http_body_streams.lock().await.failures.is_empty());
+            assert!(inner.http_body_streams.lock().await.streams.is_empty());
         });
+    }
+
+    #[tokio::test]
+    async fn disconnect_preserves_each_live_stream_failure_and_clears_routes() {
+        let inner = inner();
+        let mut first = register(&inner).await;
+        let (tx, rx) = mpsc::channel(1);
+        inner
+            .insert_http_body_stream("second".into(), tx)
+            .await
+            .expect("register second");
+        let mut second = HttpResponseBodyStream::remote(Arc::clone(&inner), "second".into(), rx);
+        let (duplicate, _) = mpsc::channel(1);
+        assert!(
+            inner
+                .insert_http_body_stream("test".into(), duplicate)
+                .await
+                .is_err()
+        );
+        inner
+            .fail_all_http_body_streams("disconnected".into())
+            .await;
+        assert!(inner.http_body_streams.lock().await.streams.is_empty());
+        for stream in [&mut first, &mut second] {
+            assert!(
+                stream
+                    .recv()
+                    .await
+                    .expect_err("disconnect failure")
+                    .to_string()
+                    .contains("disconnected")
+            );
+            assert_eq!(stream.recv().await.expect("closed"), None);
+        }
+        assert!(inner.http_body_streams.lock().await.failures.is_empty());
     }
 
     #[tokio::test]

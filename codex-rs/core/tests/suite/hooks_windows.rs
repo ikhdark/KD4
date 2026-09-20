@@ -6,6 +6,7 @@ use anyhow::Result;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use core_test_support::hooks::trust_discovered_hooks;
+use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
@@ -13,7 +14,6 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -135,7 +135,7 @@ fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() -> Res
 }
 
 async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution_impl() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let call_id = "pretooluse-code-mode-rewrite-windows";

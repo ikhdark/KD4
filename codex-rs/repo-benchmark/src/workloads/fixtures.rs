@@ -83,8 +83,65 @@ pub(super) fn install(task: LiveTask, root: &Path) -> Result<Spec> {
                 tests: &["test_repo_benchmark_refactor.py"],
             })
         }
+        LiveTask::PythonConsumerRefactor => {
+            for (path, contents) in CONSUMER_SOURCES {
+                write(root, path, contents)?;
+            }
+            write(root, "inventory/__init__.py", "")?;
+            write(root, "test_inventory.py", CONSUMER_TEST)?;
+            write(root, "TASK.md", CONSUMER_PROMPT)?;
+            for area in 0..40 {
+                for module in 0..30 {
+                    write(
+                        root,
+                        &format!("archive/area_{area:02}/records_{module:02}.py"),
+                        &format!(
+                            "# Historical inventory parser {area}/{module}; not imported by the application.\ndef parse_record(text):\n    name, quantity = text.split(',')\n    return name, int(quantity)\n"
+                        ),
+                    )?;
+                }
+            }
+            Ok(Spec {
+                prompt: CONSUMER_PROMPT,
+                sources: &[
+                    "inventory/records.py",
+                    "inventory/totals.py",
+                    "inventory/report.py",
+                    "inventory/export.py",
+                    "inventory/cli.py",
+                ],
+                tests: &["test_inventory.py"],
+            })
+        }
     }
 }
+
+pub(super) const CONSUMER_PROMPT: &str = "Refactor the inventory application's record representation. parse_record currently returns a positional tuple; change it to return a record with named name and quantity attributes and update every live consumer to use those attributes. Records must not require iteration or indexing. Preserve input validation and all existing totals, report, JSON-export, and command-display behavior, including empty collections and Unicode names. Discover the implementation and consumers yourself. You may edit or add Python files in the inventory package and test_*.py files at the workspace root; preserve other files, including archived historical implementations. Extend the existing regression tests to exercise all consumers and reject a positional-only record. Run python -m unittest discover -v. No third-party dependencies are needed.";
+
+pub(super) const CONSUMER_SOURCES: &[(&str, &str)] = &[
+    (
+        "inventory/records.py",
+        "def parse_record(text):\n    name, quantity = text.split(',')\n    name, quantity = name.strip(), quantity.strip()\n    if not name or not quantity.isascii() or not quantity.isdecimal():\n        raise ValueError('invalid record')\n    return name, int(quantity)\n",
+    ),
+    (
+        "inventory/totals.py",
+        "from .records import parse_record\n\ndef total_quantity(lines):\n    return sum(parse_record(line)[1] for line in lines)\n",
+    ),
+    (
+        "inventory/report.py",
+        "from .records import parse_record\n\ndef render_report(lines):\n    rows = [parse_record(line) for line in lines]\n    return '\\n'.join(f'{row[0]}: {row[1]}' for row in rows)\n",
+    ),
+    (
+        "inventory/export.py",
+        "from .records import parse_record\n\ndef export_rows(lines):\n    return [{'name': row[0], 'quantity': row[1]} for row in map(parse_record, lines)]\n",
+    ),
+    (
+        "inventory/cli.py",
+        "from .records import parse_record\n\ndef describe_record(text):\n    row = parse_record(text)\n    return f'{row[0]} ({row[1]})'\n",
+    ),
+];
+
+pub(super) const CONSUMER_TEST: &str = "import unittest\nfrom inventory.report import render_report\n\nclass InventoryTests(unittest.TestCase):\n    def test_one_record(self):\n        self.assertEqual(render_report(['apples,2']), 'apples: 2')\n";
 
 fn distractors(root: &Path, extension: &str) -> Result<()> {
     // A fixed, versioned discovery workload. These modules are intentionally outside the build graph.

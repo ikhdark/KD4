@@ -1,4 +1,3 @@
-use super::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::auth::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::load_persisted_remote_control_enrollment;
@@ -1531,9 +1530,7 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         vec!["account_id"]
     );
     assert_eq!(
-        enroll_request
-            .headers
-            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
+        enroll_request.headers.get_all("x-codex-installation-id"),
         vec![TEST_INSTALLATION_ID]
     );
     assert_eq!(
@@ -1580,9 +1577,7 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         None
     );
     assert_eq!(
-        handshake_request
-            .headers
-            .get(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
+        handshake_request.headers.get("x-codex-installation-id"),
         Some(&TEST_INSTALLATION_ID.to_string())
     );
     assert_eq!(
@@ -1785,9 +1780,7 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
         vec!["account_id"]
     );
     assert_eq!(
-        refresh_request
-            .headers
-            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
+        refresh_request.headers.get_all("x-codex-installation-id"),
         vec![TEST_INSTALLATION_ID]
     );
     assert_eq!(

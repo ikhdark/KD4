@@ -27,8 +27,8 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
@@ -60,7 +60,7 @@ fn image_generation_extensions(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
@@ -156,7 +156,7 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(codex_home)]
 async fn extension_tool_uses_granted_turn_permissions_without_local_persistence() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = responses::start_mock_server().await;
     Mock::given(method("POST"))

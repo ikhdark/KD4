@@ -18,7 +18,7 @@ base64 = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-config = { workspace = true }
-codex-core = { workspace = true }
+codex-core = { workspace = true, features = ["test-deterministic-process-ids"] }
 codex-extension-api = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-home = { workspace = true }

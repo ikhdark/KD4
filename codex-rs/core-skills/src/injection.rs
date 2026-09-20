@@ -1,3 +1,4 @@
+use codex_utils_string::xml_text as escape_fragment_text;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -45,23 +46,15 @@ impl ContextualUserFragment for SkillInjection {
         ("<skill>", "</skill>")
     }
 
-    fn body(&self) -> String {
-        format!(
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(format!(
             "\n<name>{}</name>\n<path>{}</path>\n<scope>{}</scope>\n{}\n",
             escape_fragment_text(&self.name),
             escape_fragment_text(&self.path),
             crate::skill_scope_label(self.scope),
             escape_fragment_text(&self.contents)
-        )
+        ))
     }
-}
-
-// Keep skill-supplied text inside the fragment's delimiters, including examples
-// that themselves contain XML tags. Escape ampersands first to preserve literals.
-fn escape_fragment_text(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// Read-only skill resolution result. Observability is applied separately so a

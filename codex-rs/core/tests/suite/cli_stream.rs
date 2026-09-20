@@ -4,8 +4,8 @@ use codex_login::CODEX_API_KEY_ENV_VAR;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::GitInfo;
 use core_test_support::fs_wait;
+use core_test_support::require_network;
 use core_test_support::responses;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use std::io;
 
@@ -82,7 +82,7 @@ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Co
         .arg("--skip-git-repo-check")
         .arg("-c")
         .arg(format!(
-            "model_providers.pat={{ name = \"pat\", base_url = \"{}/api/codex\", wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false }}",
+            "model_providers.pat={{ name = \"pat\", base_url = \"{}/api/codex\", wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false, request_max_retries = 0, stream_max_retries = 0 }}",
             server.uri()
         ))
         .arg("-c")
@@ -90,7 +90,7 @@ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Co
         .arg("-c")
         .arg(format!("chatgpt_base_url=\"{}/backend-api\"", server.uri()))
         .arg("-C")
-        .arg(repo_root())
+        .arg(home.path())
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
         .env_remove(codex_state::SQLITE_HOME_ENV)
@@ -135,7 +135,20 @@ fn run_cli_command(command: &mut Command) -> io::Result<Output> {
     match receiver.recv_timeout(CLI_TIMEOUT) {
         Ok(output) => output,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"))
+            // Reap the process tree before returning, and retain its actual failure diagnostics.
+            drop(_cleanup);
+            let diagnostics = match receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(output)) => format!(
+                    "stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                other => format!("output collection after termination: {other:?}"),
+            };
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("process timed out\n{diagnostics}"),
+            ))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err(io::Error::other("process output reader thread exited"))
@@ -145,7 +158,7 @@ fn run_cli_command(command: &mut Command) -> io::Result<Output> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_mode_stream_cli_supports_personal_access_tokens() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     mount_personal_access_token_startup(&server).await;
@@ -153,7 +166,10 @@ async fn responses_mode_stream_cli_supports_personal_access_tokens() {
     let home = TempDir::new().unwrap();
 
     let mut cmd = personal_access_token_exec_command(&server, &home);
-    let output = run_cli_command(&mut cmd).unwrap();
+    let output = tokio::task::spawn_blocking(move || run_cli_command(&mut cmd))
+        .await
+        .expect("CLI worker joins")
+        .expect("CLI completes");
 
     assert!(
         output.status.success(),
@@ -177,7 +193,7 @@ async fn responses_mode_stream_cli_supports_personal_access_tokens() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_mode_stream_cli_does_not_attempt_oauth_refresh_for_personal_access_tokens_after_401()
  {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     mount_personal_access_token_startup(&server).await;
@@ -202,7 +218,10 @@ async fn responses_mode_stream_cli_does_not_attempt_oauth_refresh_for_personal_a
     let home = TempDir::new().unwrap();
 
     let mut cmd = personal_access_token_exec_command(&server, &home);
-    let output = run_cli_command(&mut cmd).unwrap();
+    let output = tokio::task::spawn_blocking(move || run_cli_command(&mut cmd))
+        .await
+        .expect("CLI worker joins")
+        .expect("CLI completes");
 
     assert!(!output.status.success());
     server.verify().await;
@@ -211,7 +230,7 @@ async fn responses_mode_stream_cli_does_not_attempt_oauth_refresh_for_personal_a
 /// Tests streaming the Responses API through the CLI using a mock server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_mode_stream_cli() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let _models_mock =
@@ -257,7 +276,7 @@ async fn responses_mode_stream_cli() {
 /// Ensures `openai_base_url` config override routes built-in openai provider requests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -305,7 +324,7 @@ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
 /// received by a mock OpenAI Responses endpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_cli_applies_model_instructions_file() {
-    skip_if_no_network!();
+    require_network!();
 
     // Start mock server which will capture the request and return a minimal
     // SSE stream for a single turn.
@@ -378,7 +397,7 @@ async fn exec_cli_applies_model_instructions_file() {
 /// profile's `model_instructions_file` reaches the outbound request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_cli_profile_applies_model_instructions_file() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let sse = concat!(
@@ -447,7 +466,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
 /// Tests streaming responses through the CLI using a local Responses API server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_api_stream_cli() {
-    skip_if_no_network!();
+    require_network!();
 
     let server = MockServer::start().await;
     let resp_mock = responses::mount_sse_once(&server, cli_sse_response()).await;
@@ -482,7 +501,7 @@ async fn responses_api_stream_cli() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     // Honor sandbox network restrictions for CI parity with the other tests.
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     // 1. Temp home so we read/write isolated session files.
     let home = TempDir::new()?;

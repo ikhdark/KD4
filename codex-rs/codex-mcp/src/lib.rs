@@ -24,6 +24,8 @@ pub use catalog::ResolvedMcpCatalog;
 pub use catalog::ResolvedMcpServer;
 
 pub use mcp::CODEX_APPS_MCP_SERVER_NAME;
+pub use mcp::LEGACY_MCP_TOOL_NAME_PREFIX;
+pub use mcp::MCP_TOOL_NAME_DELIMITER;
 pub use mcp::McpConfig;
 pub use mcp::ToolPluginProvenance;
 pub use server::EffectiveMcpServer;

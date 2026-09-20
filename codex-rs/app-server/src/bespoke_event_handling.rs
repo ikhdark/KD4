@@ -755,6 +755,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 }))
                 .await;
         }
+        // The legacy ImageView projection duplicates the canonical item events
+        // forwarded below as item/started and item/completed notifications.
         EventMsg::ViewImageToolCall(_) => {}
         EventMsg::ItemStarted(event) => {
             let should_emit = match &event.item {

@@ -1,4 +1,152 @@
 use super::*;
+
+#[test]
+fn stale_receipt_keeps_a_bounded_historical_digest() {
+    let mut tracked = candidate("historical-receipt", "old finding: ".repeat(2000));
+    tracked.source_dependencies_current = false;
+    tracked.refresh_derived();
+    let rendered = tracked.derived.receipt.as_ref().expect("stale receipt");
+    let receipt: ToolHistoryReceiptV2 = serde_json::from_str(rendered).unwrap();
+    assert!(!receipt.source_dependencies_current);
+    assert!(
+        receipt
+            .digest
+            .starts_with("STALE: historical snapshot only;")
+    );
+    assert!(receipt.digest.contains("old finding:"));
+    assert!(approx_token_count(rendered) <= RECEIPT_MAX_TOKENS);
+}
+
+#[test]
+fn stale_workspace_projection_keeps_only_authenticated_historical_text() {
+    let call_id = "historical-evidence";
+    let captured = workspace_identity("captured");
+    let changed = workspace_identity("changed");
+    let original = "old finding: ".repeat(2000);
+    let output = text_output(call_id, original.clone());
+    for (record_observation, visible_output, expect_digest) in [
+        (true, original.clone(), true),
+        (false, original, false),
+        (true, "tampered output".to_string(), false),
+    ] {
+        let mut state = ToolHistoryState::default();
+        if record_observation {
+            state.register_workspace_evidence(
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(captured.clone()),
+                    &output,
+                    BTreeSet::new(),
+                )
+                .unwrap(),
+            );
+        }
+        let projection = state.project_with_workspace_identity(
+            Arc::from([function_call(call_id), text_output(call_id, visible_output)]),
+            Some(&changed),
+        );
+        let (_, text) = textual_output_identity(&projection.items[1]).unwrap();
+        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(notice["valid_for_current_workspace"], false);
+        assert_eq!(notice["stale_workspace_evidence"], true);
+        assert_eq!(notice.get("historical_digest").is_some(), expect_digest);
+        if expect_digest {
+            let digest = notice["historical_digest"].as_str().unwrap();
+            assert!(digest.contains("old finding:"));
+            assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
+        }
+    }
+}
+
+#[test]
+fn read_file_workspace_evidence_tracks_paths_and_preserves_skill_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    let file = cwd.join("a file.txt");
+    let arguments = serde_json::json!({"path": "a file.txt", "selectors": [{"kind": "lines", "start": 1, "end": 1}]});
+    let payload = ToolPayload::Function {
+        arguments: arguments.to_string(),
+    };
+    let classification = classify_workspace_tool_call("read_file", &payload, cwd);
+    assert!(classification.observes_workspace);
+    assert_eq!(
+        classification.source_dependencies,
+        BTreeSet::from([SourceDependencyV1::new(&file, false)])
+    );
+    let call_id = "file-read";
+    let output = text_output(call_id, "old file text".to_string());
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        named_function_call_with_arguments(call_id, "read_file", arguments),
+        output.clone(),
+    ]);
+    let captured = workspace_identity("captured");
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(captured.clone()),
+            &output,
+            classification.source_dependencies,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        state
+            .project_with_workspace_identity(Arc::clone(&canonical), Some(&captured))
+            .items,
+        canonical
+    );
+    state.invalidate_source_dependencies(
+        Some(&BTreeSet::from([cwd.join("other.txt")])),
+        Some(&captured),
+    );
+    assert_eq!(
+        state
+            .project_with_workspace_identity(Arc::clone(&canonical), Some(&captured))
+            .items,
+        canonical
+    );
+    state.invalidate_source_dependencies(Some(&BTreeSet::from([file.clone()])), Some(&captured));
+    let stale = state.project_with_workspace_identity(canonical, Some(&captured));
+    let (_, text) = textual_output_identity(&stale.items[1]).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(notice["reason_code"], "source_dependency_changed");
+    assert_eq!(notice["rerun"]["tool"], "read_file");
+    assert!(notice["rerun"].get("force_fresh").is_none());
+
+    let uri = codex_utils_path_uri::PathUri::from_host_native_path(&file).unwrap();
+    let uri_payload = ToolPayload::Function {
+        arguments: serde_json::json!({"path": uri.inferred_native_path_string()}).to_string(),
+    };
+    assert_eq!(
+        source_dependencies_for_tool_call("read_file", &uri_payload, cwd),
+        BTreeSet::from([SourceDependencyV1::new(&file, false)])
+    );
+    let remote_payload = ToolPayload::Function {
+        arguments: serde_json::json!({"path": "a file.txt", "environment_id": "remote"})
+            .to_string(),
+    };
+    let remote = classify_workspace_tool_call("read_file", &remote_payload, cwd);
+    assert!(remote.observes_workspace);
+    assert!(remote.source_dependencies.is_empty());
+    let skill_args = serde_json::json!({"path": "skill:example"});
+    let skill_payload = ToolPayload::Function {
+        arguments: skill_args.to_string(),
+    };
+    assert!(!classify_workspace_tool_call("read_file", &skill_payload, cwd).observes_workspace);
+    let skill_history: Arc<[ResponseItem]> = Arc::from([
+        named_function_call_with_arguments("skill-read", "read_file", skill_args),
+        text_output("skill-read", "skill instructions".to_string()),
+    ]);
+    assert_eq!(
+        state
+            .project_with_workspace_identity(
+                Arc::clone(&skill_history),
+                Some(&workspace_identity("changed"))
+            )
+            .items,
+        skill_history
+    );
+}
+
 #[test]
 fn source_dependency_normalization_preserves_case_on_case_sensitive_filesystems() {
     let upper = normalized_source_path_with_case_sensitivity(Path::new("src/Owner.rs"), true);
@@ -492,6 +640,8 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
         state.project_with_workspace_identity(canonical, Some(&workspace_identity("changed")));
     let (_, output) = textual_output_identity(&projection.items[1]).expect("stale recovery");
     assert!(output.contains("\"stale_workspace_evidence\":true"));
+    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
+    assert!(notice.get("historical_digest").is_none());
 }
 
 #[test]
@@ -838,7 +988,8 @@ fn nested_workspace_evidence_retains_only_current_results_after_resume() {
         ])
     );
     assert!(!output.contains("old A"));
-    assert!(!output.contains("combined A and B"));
+    assert_eq!(notice["historical_digest"], "combined A and B");
+    assert_eq!(notice["valid_for_current_workspace"], false);
 
     // An unobserved external revision has no proof that B stayed unchanged.
     let projected =
@@ -1680,7 +1831,7 @@ fn aggregate_budget_drops_are_recorded_per_representation() {
         items
             .iter()
             .filter_map(textual_output_identity)
-            .map(|(call_id, text)| (call_id.to_string(), approx_token_count(&text)))
+            .map(|(call_id, text)| (call_id.to_string(), approx_token_count(text)))
             .collect::<Vec<_>>()
     };
     let mut budgeted = ProjectedResponseItems::Shared(Arc::clone(&canonical));
@@ -1745,9 +1896,7 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
         tracked.refresh_derived();
         items.push(function_call(&call_id));
         items.push(text_output(&call_id, tracked.artifact_pin().unwrap().0));
-        session
-            .register_tool_history_candidate(&turn_context.config.codex_home, tracked)
-            .await;
+        session.register_tool_history_candidate(tracked).await;
     }
     items.push(ResponseItem::Compaction {
         id: None,
@@ -2087,6 +2236,67 @@ fn tool_history_admission_budgets_structured_tool_search_pairs() {
             && receipt.arguments["query"] == "example"
     }));
     assert!(projection.unreplaced_items.is_empty());
+}
+
+#[test]
+fn tool_search_receipt_retains_largest_fitting_identity_prefix() {
+    for count in [0, 1, 10, 99, 256] {
+        let mut item = tool_search_pair("prefix", 0)[1].clone();
+        let ResponseItem::ToolSearchOutput { tools, .. } = &mut item else {
+            unreachable!()
+        };
+        *tools = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("tool_{index}_{}", "long_name".repeat(index % 7)),
+                })
+            })
+            .collect();
+        let identities = tools
+            .iter()
+            .filter_map(tool_search_result_identity)
+            .collect::<Vec<_>>();
+        let (result, tokens) = tool_search_receipt_item(&item, None).expect("receipt fits");
+        let receipt = tool_search_receipt(&result).unwrap();
+        let retained = receipt.ordered_tool_identities.len();
+        assert_eq!(receipt.ordered_tool_identities, identities[..retained]);
+        assert_eq!(receipt.omitted_identity_count, count - retained);
+        assert_eq!(
+            tokens,
+            approx_token_count(&serde_json::to_string(&result).unwrap())
+        );
+        assert!(tokens <= TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS);
+        assert!(
+            approx_token_count(&serde_json::to_string(&receipt).unwrap()) <= RECEIPT_MAX_TOKENS
+        );
+        // Every longer prefix must fail at least one of the two independent ceilings.
+        for length in retained + 1..=count {
+            let mut larger = receipt.clone();
+            larger.ordered_tool_identities = identities[..length].to_vec();
+            larger.omitted_identity_count = count - length;
+            larger.receipt_id = tool_search_receipt_id(
+                &larger.call_id,
+                &larger.status,
+                &larger.execution,
+                &larger.arguments,
+                &larger.result_set_sha256,
+                larger.result_count,
+                larger.omitted_result_count,
+                larger.complete,
+                larger.omitted_identity_count,
+            );
+            let mut envelope = result.clone();
+            let ResponseItem::ToolSearchOutput { tools, .. } = &mut envelope else {
+                unreachable!()
+            };
+            *tools = vec![serde_json::json!({"type": "tool_search_receipt", "receipt": larger})];
+            assert!(
+                approx_token_count(&serde_json::to_string(&larger).unwrap()) > RECEIPT_MAX_TOKENS
+                    || approx_token_count(&serde_json::to_string(&envelope).unwrap())
+                        > TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS
+            );
+        }
+    }
 }
 
 #[test]
@@ -2592,6 +2802,34 @@ fn plain_text_artifact_id_does_not_pin_tool_history() {
 }
 
 #[test]
+fn compaction_pins_exact_inline_output_but_rejects_same_count_changed_identifiers() {
+    let call_id = "inventory-render";
+    let output =
+        r#"{"count":2,"identifiers":["prompts/compact/incremental.md","prompts/review/exit.xml"]}"#;
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, output.to_string()));
+    let pins = state
+        .artifact_pin_payload_for_items(&[text_output(call_id, output.to_string())])
+        .unwrap();
+    assert!(pins.contains("artifact-1"));
+    for altered in [
+        output.replace(".xml", ".md"),
+        output.replace("compact/", "compaction/"),
+    ] {
+        assert!(
+            state
+                .artifact_pin_payload_for_items(&[text_output(call_id, altered)])
+                .is_none()
+        );
+    }
+    assert!(
+        state
+            .artifact_pin_payload_for_items(&[text_output("different-call", output.to_string())])
+            .is_none()
+    );
+}
+
+#[test]
 fn compaction_tool_history_receipt_survives_history_replacement() {
     let call_id = "call-1";
     let candidate = candidate(call_id, bounded_output());
@@ -2782,7 +3020,15 @@ async fn persist_empty_tool_history_state_compacts_existing_journal() {
 
 #[tokio::test]
 async fn mutation_journal_repairs_an_incomplete_tail_before_appending() {
-    for (has_complete_prefix, incomplete_bytes) in [(true, 10), (true, 24_577), (false, 24_577)] {
+    for (has_complete_prefix, incomplete_bytes) in [
+        (true, 0),
+        (true, 1),
+        (true, 10),
+        (true, 8_192),
+        (true, 24_577),
+        (false, 1),
+        (false, 24_577),
+    ] {
         let temp = tempfile::tempdir().expect("tempdir");
         let thread_id = "journal-tail-thread";
         persist_tool_history_mutations(
@@ -3379,8 +3625,16 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
                 state.project_with_workspace_identity(Arc::clone(&canonical), Some(&changed));
             if must_be_stale {
                 let (_, text) = textual_output_identity(&projected.items[1]).expect("stale output");
-                let value: serde_json::Value =
+                let mut value: serde_json::Value =
                     serde_json::from_str(text).expect("stale evidence JSON");
+                let digest = value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("historical_digest")
+                    .expect("authenticated historical output");
+                let digest = digest.as_str().unwrap();
+                assert!(digest.contains("bounded model-visible tool output"));
+                assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
                 assert_eq!(
                     value,
                     serde_json::json!({

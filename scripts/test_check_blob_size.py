@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +16,49 @@ from scripts.check_blob_size import ChangedBlob
 
 
 class CheckBlobSizeTest(unittest.TestCase):
+    def test_just_recipe_preserves_stdin_allowlist_and_failure_status(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="blob check ") as temp:
+            allowlist = Path(temp) / "allowed blobs.txt"
+            allowlist.write_text("", encoding="utf-8")
+            command = [
+                "just",
+                "check-blob-size",
+                "--base",
+                "HEAD",
+                "--head",
+                "HEAD",
+                "--allowlist",
+                str(allowlist),
+                "--max-bytes",
+                "1",
+            ]
+
+            def run(*extra: str, paths: str = "") -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [*command, *extra],
+                    cwd=check_blob_size.REPO_ROOT / "scripts",
+                    input=paths,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=30,
+                    check=False,
+                )
+
+            unchanged = run()
+            self.assertEqual(unchanged.returncode, 0, unchanged.stderr)
+            self.assertIn("No changed files", unchanged.stdout)
+            rejected = run("--stdin-paths", paths="LICENSE\n")
+            self.assertEqual(rejected.returncode, 1, rejected.stderr)
+            self.assertIn("LICENSE:", rejected.stdout)
+            allowlist.write_text("LICENSE\n", encoding="utf-8")
+            allowed = run("--stdin-paths", paths="LICENSE\n")
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertIn("Checked 1 changed file(s)", allowed.stdout)
+            absent = run("--stdin-paths", paths="audit-missing-blob.txt\n")
+            self.assertEqual(absent.returncode, 2, absent.stderr)
+            self.assertIn("Blob size check failed", absent.stderr)
+
     def test_size_only_diff_includes_type_changes_without_numstat(self):
         def git(*args):
             self.assertIn("--name-only", args)

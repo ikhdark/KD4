@@ -13,6 +13,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
+use crate::tools::registry::RegisteredTool;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
@@ -59,6 +60,16 @@ pub struct ToolCall {
 pub(crate) enum ToolCallBuildError {
     #[error("{message}")]
     ToolSearchArguments { call_id: String, message: String },
+}
+
+// Advisory only: schemas carry executable contracts and must not be silently cut.
+const TOOL_SCHEMA_WARNING_BYTES: usize = 128 * 1024;
+
+fn tool_schema_size_warning(schemas: &ToolSchemaArtifact) -> Option<String> {
+    let bytes = schemas.serialized().len();
+    (bytes > TOOL_SCHEMA_WARNING_BYTES).then(|| format!(
+        "The model-visible tool schemas use {bytes} bytes (advisory budget: {TOOL_SCHEMA_WARNING_BYTES}). Disable unused tools or enable deferred tool discovery to reduce request overhead."
+    ))
 }
 
 pub struct ToolRouter {
@@ -179,6 +190,11 @@ impl ToolRouter {
         exposure_identity: ToolExposureIdentity,
     ) -> Self {
         registry.set_model_visible_specs(model_visible_specs);
+        let mut planning_warnings = planning_warnings;
+        if let Some(warning) = tool_schema_size_warning(&registry.model_visible_schemas()) {
+            tracing::warn!("{warning}");
+            planning_warnings.push(warning);
+        }
         Self {
             registry,
             planning_warnings,
@@ -321,6 +337,11 @@ impl ToolRouter {
             }
             Arc::new(ToolSchemaArtifact::new(visible))
         };
+        if !activated.is_empty()
+            && let Some(warning) = tool_schema_size_warning(&schemas)
+        {
+            tracing::warn!("{warning}");
+        }
         #[cfg(test)]
         self.schema_snapshot_build_count
             .fetch_add(1, Ordering::Relaxed);
@@ -461,7 +482,7 @@ impl ToolRouter {
     }
 
     #[instrument(level = "trace", skip_all, err)]
-    pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, ToolCallBuildError> {
+    pub fn build_tool_call(item: &ResponseItem) -> Result<Option<ToolCall>, ToolCallBuildError> {
         match item {
             ResponseItem::FunctionCall {
                 name,
@@ -470,11 +491,13 @@ impl ToolRouter {
                 call_id,
                 ..
             } => {
-                let tool_name = ToolName::new(namespace, name);
+                let tool_name = ToolName::new(namespace.clone(), name.clone());
                 Ok(Some(ToolCall {
                     tool_name,
-                    call_id,
-                    payload: ToolPayload::Function { arguments },
+                    call_id: call_id.clone(),
+                    payload: ToolPayload::Function {
+                        arguments: arguments.clone(),
+                    },
                 }))
             }
             ResponseItem::ToolSearchCall {
@@ -483,18 +506,19 @@ impl ToolRouter {
                 arguments,
                 ..
             } if execution == "client" => {
-                let arguments: SearchToolCallParams = match serde_json::from_value(arguments) {
-                    Ok(arguments) => arguments,
-                    Err(err) => {
-                        return Err(ToolCallBuildError::ToolSearchArguments {
-                            call_id,
-                            message: format!("failed to parse tool_search arguments: {err}"),
-                        });
-                    }
-                };
+                let arguments: SearchToolCallParams =
+                    match serde::Deserialize::deserialize(arguments) {
+                        Ok(arguments) => arguments,
+                        Err(err) => {
+                            return Err(ToolCallBuildError::ToolSearchArguments {
+                                call_id: call_id.clone(),
+                                message: format!("failed to parse tool_search arguments: {err}"),
+                            });
+                        }
+                    };
                 Ok(Some(ToolCall {
                     tool_name: ToolName::plain("tool_search"),
-                    call_id,
+                    call_id: call_id.clone(),
                     payload: ToolPayload::ToolSearch { arguments },
                 }))
             }
@@ -506,9 +530,11 @@ impl ToolRouter {
                 call_id,
                 ..
             } => Ok(Some(ToolCall {
-                tool_name: ToolName::new(namespace, name),
-                call_id,
-                payload: ToolPayload::Custom { input },
+                tool_name: ToolName::new(namespace.clone(), name.clone()),
+                call_id: call_id.clone(),
+                payload: ToolPayload::Custom {
+                    input: input.clone(),
+                },
             })),
             _ => Ok(None),
         }
@@ -527,7 +553,8 @@ impl ToolRouter {
         dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let _completion_guard = ToolDispatchCompletionGuard(Arc::clone(&dispatch_state));
-        if self.registry.tool_exposure(&call.tool_name)
+        let registered = self.registry.registered_tool(&call.tool_name);
+        if registered.map(RegisteredTool::exposure)
             == Some(crate::tools::registry::ToolExposure::Deferred)
             && !step_context
                 .turn
@@ -550,11 +577,12 @@ impl ToolRouter {
                 )));
             }
         }
-        let external_mutation_intent = self
-            .registry
-            .tool_external_mutation_intent(&call.tool_name)
+        let external_mutation_intent = registered
+            .map(RegisteredTool::external_mutation_intent)
             .unwrap_or(ExternalMutationIntent::MayMutate);
-        let tool_class = self.classify_tool_name(step_context.turn.as_ref(), &call.tool_name);
+        let tool_class = registered
+            .map(RegisteredTool::authorization_class)
+            .unwrap_or(TypedToolClass::Unknown);
         authorize_independent_review_tool_call(
             &step_context.turn.session_source,
             tool_class,

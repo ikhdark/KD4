@@ -441,6 +441,50 @@ async fn windows_cmd_snapshot_captures_validates_and_replays_environment() -> Re
             .map(|(_, value)| value.as_str()),
         Some(marker_value)
     );
+    let command = vec![
+        shell.shell_path.to_string_lossy().into_owned(),
+        "/c".to_string(),
+        format!("@set {marker_name}"),
+    ];
+    let mut launch_environment = current_environment();
+    launch_environment.remove(marker_name);
+    let replayed = crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file(
+        &command,
+        &shell,
+        Some(&snapshot_file),
+        &HashMap::new(),
+        &mut launch_environment,
+    );
+    assert_eq!(
+        launch_environment.get(marker_name).map(String::as_str),
+        Some(marker_value)
+    );
+    let output = tokio::process::Command::new(&replayed[0])
+        .args(&replayed[1..])
+        .env_clear()
+        .envs(&launch_environment)
+        .output()
+        .await?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("{marker_name}={marker_value}")
+    );
+
+    let override_value = "explicit override";
+    let explicit = HashMap::from([(marker_name.to_string(), override_value.to_string())]);
+    launch_environment.insert(marker_name.to_string(), override_value.to_string());
+    crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file(
+        &command,
+        &shell,
+        Some(&snapshot_file),
+        &explicit,
+        &mut launch_environment,
+    );
+    assert_eq!(
+        launch_environment.get(marker_name).map(String::as_str),
+        Some(override_value)
+    );
     Ok(())
 }
 

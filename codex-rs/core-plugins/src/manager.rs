@@ -12,9 +12,9 @@ use crate::loader::load_plugin_hooks_from_layer_stack;
 use crate::loader::load_plugin_mcp_servers_from_manifest;
 use crate::loader::load_plugin_skills;
 use crate::loader::load_plugins_from_layer_stack;
-use crate::loader::log_plugin_load_errors;
 use crate::loader::materialize_marketplace_plugin_source;
 use crate::loader::plugin_capability_summary_from_root;
+use crate::loader::plugin_load_warnings;
 use crate::loader::refresh_curated_plugin_cache;
 use crate::loader::refresh_non_curated_plugin_cache_detailed;
 use crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed;
@@ -492,7 +492,8 @@ fn resolve_loaded_plugins_for_auth_mode(
             plugin_active,
         );
     }
-    let warnings = retain_first_active_plugin_mcp_server_by_name(&mut plugins);
+    let mut warnings = plugin_load_warnings(&plugins);
+    warnings.extend(retain_first_active_plugin_mcp_server_by_name(&mut plugins));
     PluginLoadOutcome::from_plugins(plugins).with_load_warnings(warnings)
 }
 
@@ -655,7 +656,10 @@ impl PluginsManager {
             remote_global_catalog_active,
         )
         .await;
-        log_plugin_load_errors(&plugins);
+        let plugins = match plugins {
+            Ok(plugins) => plugins,
+            Err(warning) => return PluginLoadOutcome::default().with_load_warnings(vec![warning]),
+        };
         let resolved_auth_mode = self.auth_mode();
         let outcome = resolve_loaded_plugins_for_auth_mode(plugins.clone(), resolved_auth_mode);
         self.cache_loaded_plugins_if_current(
@@ -760,7 +764,10 @@ impl PluginsManager {
             self.remote_global_catalog_active(config),
         )
         .await;
-        self.resolve_loaded_plugins_for_auth(plugins)
+        match plugins {
+            Ok(plugins) => self.resolve_loaded_plugins_for_auth(plugins),
+            Err(warning) => PluginLoadOutcome::default().with_load_warnings(vec![warning]),
+        }
     }
 
     /// Resolve plugin hooks for a config layer stack without loading other plugin capabilities.

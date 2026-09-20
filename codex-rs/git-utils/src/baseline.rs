@@ -7,6 +7,7 @@ use gix::objs::tree::EntryMode;
 use similar::TextDiff;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -413,17 +414,18 @@ fn render_change_diff(
     let mut section = format!("diff --git a/{0} b/{0}\n", change.path);
     match (old_entry, new_entry) {
         (None, Some(entry)) => {
-            section.push_str(&format!("new file mode {}\n", mode_label(entry.mode)));
+            let _ = writeln!(section, "new file mode {}", mode_label(entry.mode));
         }
         (Some(entry), None) => {
-            section.push_str(&format!("deleted file mode {}\n", mode_label(entry.mode)));
+            let _ = writeln!(section, "deleted file mode {}", mode_label(entry.mode));
         }
         (Some(old), Some(new)) if old.mode != new.mode => {
-            section.push_str(&format!(
-                "old mode {}\nnew mode {}\n",
+            let _ = writeln!(
+                section,
+                "old mode {}\nnew mode {}",
                 mode_label(old.mode),
                 mode_label(new.mode)
-            ));
+            );
         }
         (Some(_), Some(_)) => {}
         (None, None) => return Ok(String::new()),

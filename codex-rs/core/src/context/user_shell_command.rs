@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::ContextualUserFragment;
+use super::escape_fragment_delimiters;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserShellCommand {
@@ -39,20 +40,24 @@ impl ContextualUserFragment for UserShellCommand {
         ("<user_shell_command>", "</user_shell_command>")
     }
 
-    fn body(&self) -> String {
-        format!(
-            "\n<command>\n{}\n</command>\n<result>\nExit code: {}\nDuration: {:.4} seconds\nOutput:\n{}\n</result>\n",
-            escape_xml_text(&self.command),
-            self.exit_code,
-            self.duration_seconds,
-            escape_xml_text(&self.output),
-        )
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned({
+            let (open, close) = Self::type_markers();
+            let delimiters = [
+                open,
+                close,
+                "<command>",
+                "</command>",
+                "<result>",
+                "</result>",
+            ];
+            format!(
+                "\n<command>\n{}\n</command>\n<result>\nExit code: {}\nDuration: {:.4} seconds\nOutput:\n{}\n</result>\n",
+                escape_fragment_delimiters(&self.command, &delimiters),
+                self.exit_code,
+                self.duration_seconds,
+                escape_fragment_delimiters(&self.output, &delimiters),
+            )
+        })
     }
-}
-
-fn escape_xml_text(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }

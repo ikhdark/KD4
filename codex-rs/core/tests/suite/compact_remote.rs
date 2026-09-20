@@ -3,9 +3,9 @@ use codex_login::CodexAuth;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use core_test_support::require_network;
 use core_test_support::responses;
 use core_test_support::responses::start_websocket_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex as base_test_codex;
@@ -35,7 +35,7 @@ async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_compaction_stops_when_replacement_still_exceeds_limit() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -108,7 +108,7 @@ async fn automatic_compaction_stops_when_replacement_still_exceeds_limit() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_pending_input_stops_after_one_compaction_without_sampling() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -182,7 +182,7 @@ async fn oversized_pending_input_stops_after_one_compaction_without_sampling() -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = TestCodexHarness::with_builder(
         test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
@@ -318,7 +318,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     // The child uses the real session startup trace configuration without changing
     // this test process's environment while other tests may be running.
@@ -590,7 +590,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = TestCodexHarness::with_builder(
         test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
@@ -676,7 +676,7 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let harness = TestCodexHarness::with_builder(
         test_codex()
@@ -770,7 +770,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_websocket_server(vec![vec![
         vec![
@@ -823,6 +823,9 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
             config.model_auto_compact_token_limit = Some(200_000);
         });
     let test = builder.build_with_websocket_server(&server).await?;
+    // Let startup warmup consume its own fixture response before submitting the turn.
+    let warmup = server.wait_for_request(0, 0).await.body_json();
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
 
     // Phase 1: startup prewarm stays empty, then WebSocket sampling mints state and schedules
     // inline v2 compaction.

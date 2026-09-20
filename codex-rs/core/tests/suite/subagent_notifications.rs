@@ -14,6 +14,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
+use core_test_support::require_network;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -24,7 +25,6 @@ use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -531,7 +531,7 @@ async fn spawn_child_and_capture_snapshot(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subagent_start_replaces_session_start_and_injects_context() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
@@ -660,7 +660,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
@@ -872,7 +872,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subagent_notification_is_included_without_wait() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let (test, _spawned_id) =
@@ -916,7 +916,7 @@ async fn subagent_notification_is_included_without_wait() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_child_receives_forked_parent_context() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
 
@@ -1052,7 +1052,7 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_uses_built_in_model_and_reasoning_defaults() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let child_snapshot = spawn_child_and_capture_snapshot(
@@ -1076,7 +1076,7 @@ async fn spawn_agent_uses_built_in_model_and_reasoning_defaults() -> Result<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_requested_model_and_reasoning_override_inherited_settings_without_role()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let child_snapshot = spawn_child_and_capture_snapshot(
@@ -1101,7 +1101,7 @@ async fn spawn_agent_requested_model_and_reasoning_override_inherited_settings_w
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_model_override_keeps_built_in_reasoning_default() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let child_snapshot = spawn_child_and_capture_snapshot(
@@ -1125,7 +1125,7 @@ async fn spawn_agent_model_override_keeps_built_in_reasoning_default() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_instruction_only_role_keeps_built_in_model_defaults() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let child_snapshot = spawn_child_and_capture_snapshot(
@@ -1164,7 +1164,7 @@ async fn spawn_agent_instruction_only_role_keeps_built_in_model_defaults() -> Re
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_history()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let seed_turn = mount_sse_once_match(
@@ -1444,13 +1444,7 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
         "Agent errored: durable typed receipt status: needs_main: typed agent /root/worker finished with status {status} without submitting a receipt"
     );
     let notification = format!(
-        concat!(
-            "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}\n\n",
-            "This agent's turn failed. The full sealed error remains available through get_agent_task; ",
-            "retrieve it with the assignment id returned by spawn_agent before deciding whether to retry. ",
-            "If you still need this agent, use the available collaboration tools to give it another task."
-        ),
-        payload = payload,
+        "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"
     );
     // If the child is still running when the parent turn starts, wait_agent blocks
     // until mailbox delivery. The follow-up request must then contain that delivery.
@@ -1584,7 +1578,7 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
@@ -1664,7 +1658,7 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let child_snapshot = spawn_child_and_capture_snapshot(
@@ -1706,7 +1700,7 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    require_network!();
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once_match(

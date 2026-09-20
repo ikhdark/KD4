@@ -277,7 +277,6 @@ pub(crate) async fn handle_mcp_tool_call(
     let default_tool_input = arguments_value
         .clone()
         .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
-    let skipped_tool_input = default_tool_input.clone();
     let operation_invocation = invocation.clone();
     let operation = async {
         let approval_mode = if server == CODEX_APPS_MCP_SERVER_NAME {
@@ -313,13 +312,13 @@ pub(crate) async fn handle_mcp_tool_call(
                 McpToolApprovalDecision::Decline { message } => {
                     return McpToolCallOutcome::skipped(
                         message.unwrap_or_else(|| "user rejected MCP tool call".to_string()),
-                        skipped_tool_input.clone(),
+                        default_tool_input.clone(),
                     );
                 }
                 McpToolApprovalDecision::Cancel => {
                     return McpToolCallOutcome::skipped(
                         "user cancelled MCP tool call".to_string(),
-                        skipped_tool_input.clone(),
+                        default_tool_input.clone(),
                     );
                 }
             }
@@ -485,10 +484,10 @@ async fn execute_approved_mcp_tool_call(
 ) -> McpToolCallOutcome {
     let turn_context = step_context.turn.as_ref();
     let manager = step_context.mcp.manager();
-    let server = invocation.server.clone();
-    maybe_mark_thread_memory_mode_polluted(sess, turn_context, manager, &server).await;
-    let tool_name = invocation.tool.clone();
-    let arguments_value = invocation.arguments.clone();
+    let server = invocation.server.as_str();
+    maybe_mark_thread_memory_mode_polluted(sess, turn_context, manager, server).await;
+    let tool_name = invocation.tool.as_str();
+    let arguments_value = &invocation.arguments;
     let connector_id = tool_info.connector_id.as_deref();
     let connector_name = tool_info.connector_name.as_deref();
     let server_origin = tool_info.server_origin.as_deref();
@@ -511,7 +510,7 @@ async fn execute_approved_mcp_tool_call(
         async {
             let rewritten_arguments = rewrite?;
             let request_meta =
-                build_mcp_tool_call_request_meta(turn_context, &server, call_id, metadata);
+                build_mcp_tool_call_request_meta(turn_context, server, call_id, metadata);
             execute_mcp_tool_call(
                 sess,
                 step_context,
@@ -529,8 +528,8 @@ async fn execute_approved_mcp_tool_call(
         sess,
         turn_context,
         McpToolCallSpanFields {
-            server_name: &server,
-            tool_name: &tool_name,
+            server_name: server,
+            tool_name,
             call_id,
             server_origin,
             connector_id,
@@ -600,6 +599,9 @@ struct McpToolCallSpanFields<'a> {
 }
 
 fn record_server_fields(span: &Span, url: Option<&str>) {
+    if span.is_disabled() {
+        return;
+    }
     let Some(url) = url else {
         return;
     };
@@ -615,6 +617,9 @@ fn record_server_fields(span: &Span, url: Option<&str>) {
 }
 
 fn record_mcp_result_span_telemetry(span: &Span, result: &Result<CallToolResult, String>) {
+    if span.is_disabled() {
+        return;
+    }
     record_mcp_call_outcome_span_telemetry(span, result);
 
     let Some(span_telemetry) = result

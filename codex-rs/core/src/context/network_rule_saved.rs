@@ -30,14 +30,16 @@ impl ContextualUserFragment for NetworkRuleSaved {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        let (action, list_name) = match self.action {
-            NetworkPolicyRuleAction::Allow => ("Allowed", "allowlist"),
-            NetworkPolicyRuleAction::Deny => ("Denied", "denylist"),
-        };
-        format!(
-            "{action} network rule saved in execpolicy ({list_name}): {}",
-            self.host
-        )
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned({
+            let (action, list_name) = match self.action {
+                NetworkPolicyRuleAction::Allow => ("Allowed", "allowlist"),
+                NetworkPolicyRuleAction::Deny => ("Denied", "denylist"),
+            };
+            format!(
+                "{action} network rule saved in execpolicy ({list_name}): {}",
+                self.host
+            )
+        })
     }
 }

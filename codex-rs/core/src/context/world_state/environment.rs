@@ -192,8 +192,8 @@ impl ContextualUserFragment for EnvironmentsState {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
-        self.rendered_full().body()
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(self.rendered_full().body().into_owned())
     }
 }
 
@@ -226,58 +226,61 @@ impl ContextualUserFragment for RenderedEnvironments {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
-        let mut rendered = "\n".to_string();
-        if self.replace_all {
-            rendered.push_str("  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n");
-        }
-        if self.legacy_single {
-            if let Some(EnvironmentUpdate::Current(environment)) = self.updates.values().next() {
-                push_environment_values(&mut rendered, environment, "  ");
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned({
+            let mut rendered = "\n".to_string();
+            if self.replace_all {
+                rendered.push_str("  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n");
             }
-        } else if !self.updates.is_empty() {
-            rendered.push_str("  <environments>\n");
-            for (id, update) in &self.updates {
-                match update {
-                    EnvironmentUpdate::Current(environment) => {
-                        rendered.push_str("    <environment id=\"");
-                        push_xml_escaped_attribute(&mut rendered, id);
-                        rendered.push('"');
-                        rendered.push_str(">\n");
-                        push_environment_values(&mut rendered, environment, "      ");
-                        rendered.push_str("    </environment>\n");
-                    }
-                    EnvironmentUpdate::Unavailable => {
-                        rendered.push_str("    <environment id=\"");
-                        push_xml_escaped_attribute(&mut rendered, id);
-                        rendered.push_str("\" status=\"unavailable\" />\n");
+            if self.legacy_single {
+                if let Some(EnvironmentUpdate::Current(environment)) = self.updates.values().next()
+                {
+                    push_environment_values(&mut rendered, environment, "  ");
+                }
+            } else if !self.updates.is_empty() {
+                rendered.push_str("  <environments>\n");
+                for (id, update) in &self.updates {
+                    match update {
+                        EnvironmentUpdate::Current(environment) => {
+                            rendered.push_str("    <environment id=\"");
+                            push_xml_escaped_attribute(&mut rendered, id);
+                            rendered.push('"');
+                            rendered.push_str(">\n");
+                            push_environment_values(&mut rendered, environment, "      ");
+                            rendered.push_str("    </environment>\n");
+                        }
+                        EnvironmentUpdate::Unavailable => {
+                            rendered.push_str("    <environment id=\"");
+                            push_xml_escaped_attribute(&mut rendered, id);
+                            rendered.push_str("\" status=\"unavailable\" />\n");
+                        }
                     }
                 }
+                rendered.push_str("  </environments>\n");
             }
-            rendered.push_str("  </environments>\n");
-        }
-        push_optional_element(&mut rendered, "current_date", self.current_date.as_deref());
-        push_optional_element(&mut rendered, "timezone", self.timezone.as_deref());
-        if let Some(network) = &self.network {
-            rendered.push_str("  ");
-            rendered.push_str(network);
-            rendered.push('\n');
-        }
-        if let Some(filesystem) = &self.filesystem {
-            rendered.push_str("  ");
-            rendered.push_str(filesystem);
-            rendered.push('\n');
-        }
-        if let Some(subagents) = &self.subagents {
-            rendered.push_str("  <subagents>\n");
-            for line in subagents.lines() {
-                rendered.push_str("    ");
-                push_xml_escaped_text(&mut rendered, line);
+            push_optional_element(&mut rendered, "current_date", self.current_date.as_deref());
+            push_optional_element(&mut rendered, "timezone", self.timezone.as_deref());
+            if let Some(network) = &self.network {
+                rendered.push_str("  ");
+                rendered.push_str(network);
                 rendered.push('\n');
             }
-            rendered.push_str("  </subagents>\n");
-        }
-        rendered
+            if let Some(filesystem) = &self.filesystem {
+                rendered.push_str("  ");
+                rendered.push_str(filesystem);
+                rendered.push('\n');
+            }
+            if let Some(subagents) = &self.subagents {
+                rendered.push_str("  <subagents>\n");
+                for line in subagents.lines() {
+                    rendered.push_str("    ");
+                    push_xml_escaped_text(&mut rendered, line);
+                    rendered.push('\n');
+                }
+                rendered.push_str("  </subagents>\n");
+            }
+            rendered
+        })
     }
 }
 

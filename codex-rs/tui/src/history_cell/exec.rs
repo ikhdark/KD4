@@ -40,7 +40,7 @@ impl HistoryCell for UnifiedExecInteractionCell {
 
         let mut out: Vec<Line<'static>> = Vec::new();
         let header_wrapped = adaptive_wrap_line(&header, RtOptions::new(wrap_width));
-        push_owned_lines(&header_wrapped, &mut out);
+        push_owned_lines(header_wrapped, &mut out);
 
         if waited_only {
             return out;

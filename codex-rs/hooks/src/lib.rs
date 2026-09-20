@@ -8,43 +8,28 @@ mod registry;
 mod schema;
 mod types;
 
-use codex_protocol::protocol::HookEventName;
+pub use codex_protocol::protocol::HookEventName;
 
 pub use config_rules::hook_states_from_stack;
 pub use declarations::PluginHookDeclaration;
 pub use declarations::plugin_hook_declarations;
 pub use engine::HookListEntry;
 pub use events::common::SubagentHookContext;
-/// Hook event names as they appear in hooks JSON and config files.
-pub const HOOK_EVENT_NAMES: [&str; 11] = [
-    "PreToolUse",
-    "PermissionRequest",
-    "PostToolUse",
-    "PreCompact",
-    "PostCompact",
-    "SessionStart",
-    "UserPromptSubmit",
-    "SubagentStart",
-    "SubagentStop",
-    "Stop",
-    "Interrupt",
-];
-
-/// Hook event names whose matcher fields are meaningful during dispatch.
-///
-/// Other events can appear in hooks JSON, but Codex ignores their matcher
-/// fields because those events do not dispatch against a tool, compaction
-/// trigger, or session-start source.
-pub const HOOK_EVENT_NAMES_WITH_MATCHERS: [&str; 8] = [
-    "PreToolUse",
-    "PermissionRequest",
-    "PostToolUse",
-    "PreCompact",
-    "PostCompact",
-    "SessionStart",
-    "SubagentStart",
-    "SubagentStop",
-];
+/// Whether this event dispatches against a matcher value.
+/// Keep this exhaustive so new events explicitly choose their matcher behavior.
+pub fn hook_event_supports_matcher(event: HookEventName) -> bool {
+    match event {
+        HookEventName::PreToolUse
+        | HookEventName::PermissionRequest
+        | HookEventName::PostToolUse
+        | HookEventName::PreCompact
+        | HookEventName::PostCompact
+        | HookEventName::SessionStart
+        | HookEventName::SubagentStart
+        | HookEventName::SubagentStop => true,
+        HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => false,
+    }
+}
 
 pub use events::common::ContextInjectingHookOutcome;
 pub use events::common::StatelessHookOutcome;

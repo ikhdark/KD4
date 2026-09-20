@@ -1,5 +1,129 @@
 use super::*;
 
+fn install_correct_consumer_refactor(fixture: &PreparedFixture) {
+    for (path, baseline) in fixtures::CONSUMER_SOURCES {
+        let content = if path.ends_with("/records.py") {
+            format!(
+                "from types import SimpleNamespace\n{}",
+                baseline.replace(
+                    "return name, int(quantity)",
+                    "return SimpleNamespace(name=name, quantity=int(quantity))",
+                )
+            )
+        } else {
+            baseline.replace("[0]", ".name").replace("[1]", ".quantity")
+        };
+        fs::write(fixture.workspace.join(path), content).unwrap();
+    }
+    fs::write(
+        fixture.workspace.join("test_inventory.py"),
+        format!("{}\n{}", fixtures::CONSUMER_TEST, CONSUMER_REGRESSIONS),
+    )
+    .unwrap();
+}
+
+const CONSUMER_REGRESSIONS: &str = r#"
+    def test_named_consumers(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from inventory import records, totals, report, export, cli
+        record = records.parse_record(' Café , 003 ')
+        self.assertEqual((record.name, record.quantity), ('Café', 3))
+        for module in (totals, report, export, cli):
+            with patch.object(module, 'parse_record', return_value=SimpleNamespace(name='named', quantity=7)):
+                if module is totals:
+                    self.assertEqual(module.total_quantity(['ignored']), 7)
+                elif module is report:
+                    self.assertEqual(module.render_report(['ignored']), 'named: 7')
+                elif module is export:
+                    self.assertEqual(module.export_rows(['ignored']), [{'name': 'named', 'quantity': 7}])
+                else:
+                    self.assertEqual(module.describe_record('ignored'), 'named (7)')
+"#;
+
+#[test]
+fn consumer_refactor_oracle_requires_discovery_and_every_live_consumer() {
+    let (_temp, fixture) = setup(LiveTask::PythonConsumerRefactor);
+    assert_eq!(fixture.initial_source_hashes.len(), 5);
+    for name in fixture.initial_source_hashes.keys() {
+        assert!(!fixture.prompt.contains(name), "prompt disclosed {name}");
+    }
+    assert!(
+        fixture
+            .workspace
+            .join("archive/area_39/records_29.py")
+            .is_file()
+    );
+    assert_eq!(
+        verify_fixture(&fixture).unwrap().status,
+        VerificationStatus::Incorrect
+    );
+    install_correct_consumer_refactor(&fixture);
+    let result = verify_fixture(&fixture).unwrap();
+    assert_eq!(result.status, VerificationStatus::Passed, "{result:?}");
+    for (path, original) in fixtures::CONSUMER_SOURCES {
+        let candidate = fs::read_to_string(fixture.workspace.join(path)).unwrap();
+        fs::write(fixture.workspace.join(path), original).unwrap();
+        let result = verify_fixture(&fixture).unwrap();
+        assert_eq!(
+            result.status,
+            VerificationStatus::Incorrect,
+            "missed consumer {path}: {result:?}"
+        );
+        fs::write(fixture.workspace.join(path), candidate).unwrap();
+    }
+    fs::write(
+        fixture.workspace.join("test_inventory.py"),
+        format!(
+            "{}\n    def test_comment_only(self):\n        pass\n",
+            fixtures::CONSUMER_TEST
+        ),
+    )
+    .unwrap();
+    let result = verify_fixture(&fixture).unwrap();
+    assert_eq!(
+        result.status,
+        VerificationStatus::Incorrect,
+        "weak regressions: {result:?}"
+    );
+    assert!(
+        result.detail.contains("Regression coverage: totals"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn consumer_refactor_allows_helpers_but_protects_archives() {
+    let (_temp, fixture) = setup(LiveTask::PythonConsumerRefactor);
+    install_correct_consumer_refactor(&fixture);
+    fs::write(fixture.workspace.join("inventory/model.py"), "from types import SimpleNamespace\n\ndef make_record(name, quantity):\n    return SimpleNamespace(name=name, quantity=quantity)\n").unwrap();
+    let records = fixture.workspace.join("inventory/records.py");
+    let content = fs::read_to_string(&records)
+        .unwrap()
+        .replace(
+            "from types import SimpleNamespace",
+            "from .model import make_record",
+        )
+        .replace(
+            "SimpleNamespace(name=name, quantity=int(quantity))",
+            "make_record(name, int(quantity))",
+        );
+    fs::write(records, content).unwrap();
+    let result = verify_fixture(&fixture).unwrap();
+    assert_eq!(result.status, VerificationStatus::Passed, "{result:?}");
+    fs::write(
+        fixture.workspace.join("archive/area_00/records_00.py"),
+        "changed\n",
+    )
+    .unwrap();
+    let result = verify_fixture(&fixture).unwrap();
+    assert_eq!(
+        result.status,
+        VerificationStatus::ScopeViolation,
+        "{result:?}"
+    );
+}
+
 fn setup(task: LiveTask) -> (tempfile::TempDir, PreparedFixture) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");

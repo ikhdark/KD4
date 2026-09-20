@@ -94,11 +94,17 @@ where
         return fetch().await;
     }
 
+    // Reuse each serialized key if the user grants session approval. Keep failed
+    // serializations as misses so they can never accidentally authorize a call.
+    let serialized_keys = keys
+        .iter()
+        .map(|key| ApprovalStore::serialized_key(tool_name, key))
+        .collect::<Vec<_>>();
     let already_approved = {
         let store = services.tool_approvals.lock().await;
-        keys.iter().all(|key| {
+        serialized_keys.iter().all(|key| {
             matches!(
-                store.get(tool_name, key),
+                key.as_ref().and_then(|key| store.map.get(key)),
                 Some(ReviewDecision::ApprovedForSession)
             )
         })
@@ -121,8 +127,8 @@ where
 
     if matches!(decision, ReviewDecision::ApprovedForSession) {
         let mut store = services.tool_approvals.lock().await;
-        for key in keys {
-            store.put(tool_name, key, ReviewDecision::ApprovedForSession);
+        for key in serialized_keys.into_iter().flatten() {
+            store.map.insert(key, ReviewDecision::ApprovedForSession);
         }
     }
 

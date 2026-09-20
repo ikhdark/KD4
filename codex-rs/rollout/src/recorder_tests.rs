@@ -916,13 +916,13 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         rollout_path.clone(),
         Default::default(),
     );
-    state.add_items(captured(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
-        AgentMessageEvent {
+    state.add_items(captured(vec![RolloutItem::EventMsg(
+        EventMsg::AgentMessage(AgentMessageEvent {
             message: "queued-after-writer-error".to_string(),
             phase: None,
             memory_citation: None,
-        },
-    ))]));
+        }),
+    )]));
 
     state.flush().await?;
     let text_after_retry = std::fs::read_to_string(&rollout_path)?;
@@ -1144,9 +1144,8 @@ fn recorded_lines(path: &Path) -> std::io::Result<Vec<RolloutLine>> {
 }
 
 fn parse_record_timestamp(timestamp: &str) -> OffsetDateTime {
-    let format: &[FormatItem] = format_description!(
-        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-    );
+    let format: &[FormatItem] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
     time::PrimitiveDateTime::parse(timestamp, &format)
         .unwrap_or_else(|err| {
             panic!("record timestamp {timestamp:?} is not in record format: {err}")
@@ -1197,9 +1196,10 @@ async fn records_coalesced_into_one_flush_keep_their_own_capture_times() -> std:
     let messages = recorded_lines(&rollout_path)?
         .iter()
         .filter_map(|line| match &line.item {
-            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => {
-                Some((event.message.clone(), parse_record_timestamp(&line.timestamp)))
-            }
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some((
+                event.message.clone(),
+                parse_record_timestamp(&line.timestamp),
+            )),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1373,13 +1373,13 @@ async fn assert_failed_append_is_written_once(
         rollout_path.clone(),
         Default::default(),
     );
-    state.add_items(captured(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
-        AgentMessageEvent {
+    state.add_items(captured(vec![RolloutItem::EventMsg(
+        EventMsg::AgentMessage(AgentMessageEvent {
             message: message.to_string(),
             phase: None,
             memory_citation: None,
-        },
-    ))]));
+        }),
+    )]));
 
     state.flush().await?;
 
@@ -1563,7 +1563,21 @@ async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::
         1,
         "one durability barrier should use one append lock, write, and flush"
     );
-    assert_eq!(fs::read_to_string(&rollout_path)?.lines().count(), 3);
+    let bytes = fs::read_to_string(&rollout_path)?;
+    assert!(bytes.ends_with('\n'));
+    let messages = bytes
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+            assert_eq!(value["format_version"], CURRENT_ROLLOUT_FORMAT_VERSION);
+            let line: RolloutLine = serde_json::from_str(line).expect("valid rollout JSONL");
+            let RolloutItem::EventMsg(EventMsg::AgentMessage(message)) = line.item else {
+                panic!("expected persisted agent message");
+            };
+            message.message
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(messages, ["first", "second", "third"]);
     Ok(())
 }
 

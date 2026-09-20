@@ -241,9 +241,9 @@ pub fn resolve_windows_elevated_filesystem_overrides(
         .iter()
         .map(|root| (normalize_path(root.root.to_path_buf()), root))
         .collect();
-    let legacy_root_paths: BTreeSet<PathBuf> = normalized_legacy_roots
+    let legacy_root_paths: BTreeSet<&PathBuf> = normalized_legacy_roots
         .iter()
-        .map(|(path, _)| path.clone())
+        .map(|(path, _)| path)
         .collect();
     let split_readable_roots: Vec<PathBuf> = file_system_sandbox_policy
         .get_readable_roots_with_cwd(sandbox_policy_cwd)
@@ -255,7 +255,7 @@ pub fn resolve_windows_elevated_filesystem_overrides(
         .iter()
         .map(|root| normalize_path(root.root.to_path_buf()))
         .collect();
-    let split_root_path_set: BTreeSet<PathBuf> = split_root_paths.iter().cloned().collect();
+    let split_root_path_set: BTreeSet<&PathBuf> = split_root_paths.iter().collect();
 
     // `has_full_disk_read_access()` is intentionally false when deny-read
     // entries exist. For Windows setup overrides, the important question is

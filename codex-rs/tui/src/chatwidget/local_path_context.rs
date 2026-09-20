@@ -304,17 +304,18 @@ fn render_directory(
     instructions.extend(
         entries
             .iter()
-            .filter(|path| path.is_dir())
-            .filter_map(|path| instruction_file_in(path, discovery)),
+            .filter(|entry| entry.file_type.is_dir())
+            .filter_map(|entry| instruction_file_in(&entry.path, discovery)),
     );
     instructions.sort();
     instructions.dedup();
     append_instruction_files(&mut output, instructions, instructions_seen, max_output / 2);
 
     append_bounded(&mut output, "[directory inventory]\n", max_output);
-    for path in &entries {
+    for entry in &entries {
+        let path = &entry.path;
         let relative = path.strip_prefix(root).unwrap_or(path);
-        let suffix = if path.is_dir() { "/" } else { "" };
+        let suffix = if entry.file_type.is_dir() { "/" } else { "" };
         if !append_bounded(
             &mut output,
             &format!("{}{}\n", relative.display(), suffix),
@@ -331,7 +332,8 @@ fn render_directory(
         );
     }
     let mut files_added = 0;
-    for path in entries.iter().filter(|path| path.is_file()) {
+    for entry in entries.iter().filter(|entry| entry.file_type.is_file()) {
+        let path = &entry.path;
         if is_instruction_filename(path, discovery) {
             continue;
         }
@@ -354,7 +356,12 @@ fn render_directory(
     output
 }
 
-fn directory_entries(root: &Path) -> (Vec<PathBuf>, bool) {
+struct DirectoryEntry {
+    path: PathBuf,
+    file_type: fs::FileType,
+}
+
+fn directory_entries(root: &Path) -> (Vec<DirectoryEntry>, bool) {
     let mut pending = vec![root.to_path_buf()];
     let mut entries = Vec::new();
     let mut examined = 0;
@@ -377,27 +384,27 @@ fn directory_entries(root: &Path) -> (Vec<PathBuf>, bool) {
                 continue;
             };
             let path = entry.path();
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
+            let Ok(file_type) = entry.file_type() else {
                 omitted = true;
                 continue;
             };
-            if metadata.file_type().is_symlink() || is_ignored_directory(&path, &metadata) {
+            if file_type.is_symlink() || is_ignored_directory(&path, file_type) {
                 continue;
             }
-            if metadata.is_dir() {
+            if file_type.is_dir() {
                 pending.push(path.clone());
             }
-            if metadata.is_file() || metadata.is_dir() {
-                entries.push(path);
+            if file_type.is_file() || file_type.is_dir() {
+                entries.push(DirectoryEntry { path, file_type });
             }
         }
     }
-    entries.sort();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
     (entries, omitted)
 }
 
-fn is_ignored_directory(path: &Path, metadata: &fs::Metadata) -> bool {
-    metadata.is_dir()
+fn is_ignored_directory(path: &Path, file_type: fs::FileType) -> bool {
+    file_type.is_dir()
         && path
             .file_name()
             .and_then(|name| name.to_str())
@@ -784,6 +791,8 @@ mod tests {
                 < content.find("[directory inventory]").expect("inventory")
         );
         assert!(content.contains("nested\\code.rs") || content.contains("nested/code.rs"));
+        assert!(content.contains("nested/\n"));
+        assert!(content.contains("fn example() {}"));
         assert!(content.len() <= MAX_CONTEXT_BYTES);
     }
 
