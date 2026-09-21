@@ -4796,6 +4796,7 @@ pub(crate) async fn read_complete_canonical_snapshot(
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
+#[cfg(test)]
 pub(crate) async fn read_tool_output_selectors_with_reuse(
     codex_home: &Path,
     thread_id: &str,

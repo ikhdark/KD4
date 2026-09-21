@@ -1758,7 +1758,7 @@ fn projection_admission_required(
     force_inline_carrier: bool,
 ) -> bool {
     projection_is_provider_visible(source)
-        && (crate::tools::code_mode::is_exec_tool_name(tool_name)
+        && (crate::tools::code_mode::is_orchestration_tool_name(tool_name)
             || !generic_projection_is_exempt(tool_name, force_inline_carrier))
 }
 
@@ -1966,12 +1966,13 @@ async fn prepare_model_projection(
 ) -> Option<ModelProjectionInput> {
     // Exact artifact reads are already bounded and must never recursively spill.
     // Code mode also performs its own coherent outer projection after merging
-    // native nested results. Keep the first `functions.exec` result byte-for-byte
+    // native nested results. Keep the first `exec`/`wait` result byte-for-byte
     // provider-visible, but admit it to completed-tool history so later
     // generations can replace consumed output with an exact-artifact receipt.
-    let admit_code_mode_output = crate::tools::code_mode::is_exec_tool_name(&invocation.tool_name)
-        && !force_inline_carrier
-        && track_for_admission;
+    let admit_code_mode_output =
+        crate::tools::code_mode::is_orchestration_tool_name(&invocation.tool_name)
+            && !force_inline_carrier
+            && track_for_admission;
     if generic_projection_is_exempt(&invocation.tool_name, force_inline_carrier)
         && !admit_code_mode_output
     {
@@ -2357,7 +2358,7 @@ fn generic_projection_is_exempt(tool_name: &ToolName, force_inline_carrier: bool
             .namespace
             .as_deref()
             .is_some_and(|namespace| namespace.starts_with("mcp__"))
-        || (crate::tools::code_mode::is_exec_tool_name(tool_name) && !force_inline_carrier)
+        || (crate::tools::code_mode::is_orchestration_tool_name(tool_name) && !force_inline_carrier)
 }
 
 fn projection_packet_token_limit(

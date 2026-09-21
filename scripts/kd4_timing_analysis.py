@@ -1114,6 +1114,7 @@ def _population_report(
         "toolActiveUnionNs": 0,
     }
     deterministic = dict(nonprogress)
+    residual_measurements: list[int] = []
     decision_ready_attempts = 0
     decision_latency_ns = 0
     request_count = 0
@@ -1229,11 +1230,18 @@ def _population_report(
         totals["suppressedDeterministicContinuationCount"] += int(
             counters.get("suppressedDeterministicContinuationCount", 0)
         )
+        residual = counters.get("residualDeterministicGenerationCount")
+        if residual is not None:
+            residual_measurements.append(int(residual))
+        totals["waitGenerationsWithSameRevisionCount"] += int(
+            counters.get(
+                "waitGenerationsWithSameRevisionCount",
+                counters.get("exactRepeatedWaitCount", 0),
+            )
+        )
         for key in (
-            "residualDeterministicGenerationCount",
             "ownerDrainedContinuationCount",
             "executedValidationCount",
-            "exactRepeatedWaitCount",
             "waitOnlyGenerationCount",
             "internallyDrainedWaitCount",
             "noProgressDirectiveCount",
@@ -1271,7 +1279,7 @@ def _population_report(
                 requests,
                 lambda request: (
                     request.get("generationPurpose")
-                    == "deterministic_tool_continuation"
+                    in ("tool_result_interpretation", "deterministic_tool_continuation")
                 ),
             ),
         )
@@ -1288,6 +1296,11 @@ def _population_report(
         "turns": len(records),
         "statusCounts": dict(sorted(status_counts.items())),
         **dict(totals),
+        "residualDeterministicGenerationCount": (
+            sum(residual_measurements)
+            if len(residual_measurements) == len(records) and records
+            else None
+        ),
         "modelShare": model / machine if machine else None,
         "toolShare": tool / machine if machine else None,
         "agentActiveShareOfWall": machine / inclusive if inclusive else None,
@@ -1354,7 +1367,7 @@ def _population_report(
         else {},
         "toolRelay": _tool_relay_report(all_tool_calls, tool_call_timing_overflow),
         "observationalNonprogressLatency": nonprogress,
-        "deterministicToolContinuationLatency": deterministic,
+        "toolResultInterpretationLatency": deterministic,
     }
 
 

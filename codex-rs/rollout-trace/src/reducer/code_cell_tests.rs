@@ -221,6 +221,54 @@ fn code_cell_terminal_observation_links_nested_tools_waits_and_outputs() -> anyh
         vec![output_item_id.clone()]
     );
 
+    // Slow lifecycle storage must not require dispatch to wait for the start
+    // record. Replay joins the same cell even when its nested tool persisted first.
+    let log_path = temp.path().join(crate::bundle::RAW_EVENT_LOG_FILE_NAME);
+    let mut events = std::fs::read_to_string(&log_path)?
+        .lines()
+        .map(serde_json::from_str::<crate::raw_event::RawTraceEvent>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let index = events
+        .iter()
+        .position(|event| matches!(event.payload, RawTraceEventPayload::CodeCellStarted { .. }))
+        .unwrap();
+    let start = events.remove(index);
+    // The persistence queue preserves lifecycle order even while nested tool
+    // events overtake it. Delay the initial response together with the start.
+    let initial_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.payload,
+                RawTraceEventPayload::CodeCellInitialResponse { .. }
+            )
+        })
+        .unwrap();
+    let initial_response = events.remove(initial_index);
+    let after_nested = events
+        .iter()
+        .position(|event| matches!(event.payload, RawTraceEventPayload::ToolCallEnded { .. }))
+        .unwrap()
+        + 1;
+    events.insert(after_nested, start);
+    events.insert(after_nested + 1, initial_response);
+    let first_seq = events[0].seq;
+    for (index, event) in events.iter_mut().enumerate() {
+        event.seq = first_seq + u64::try_from(index)?;
+    }
+    std::fs::write(
+        &log_path,
+        events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n"),
+    )?;
+    let delayed = replay_bundle(temp.path())?;
+    let cell = &delayed.code_cells[&code_cell_id];
+    assert_eq!(cell.nested_tool_call_ids, vec!["nested-tool-1"]);
+    assert_eq!(cell.runtime_status, CodeCellRuntimeStatus::Completed);
+    assert_eq!(cell.wait_tool_call_ids, vec!["wait-tool-1"]);
     Ok(())
 }
 

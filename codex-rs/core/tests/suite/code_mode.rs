@@ -1370,7 +1370,7 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         })
         .build(&server)
         .await?;
-    let mut events = vec![ev_response_created("many-results")];
+    let mut events = Vec::new();
     // One result cannot exceed the aggregate budget on its own: a cell's output
     // is capped per call. Emit several so the raw aggregate clears the budget
     // and the admission path has to choose what to keep.
@@ -1389,8 +1389,17 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
             "invalid",
         ));
     }
-    events.push(ev_completed("many-results"));
-    let first = responses::mount_sse_once(&server, sse(events)).await;
+    // Pressure is cumulative across requests. Keep each mocked response bounded
+    // so this budget test does not also stress hundreds of simultaneous dispatch
+    // futures on a Windows debug worker's stack.
+    let mut batches = Vec::new();
+    for (batch, calls) in events.chunks(50).enumerate() {
+        let response_id = format!("many-results-{batch}");
+        let mut events = vec![ev_response_created(&response_id)];
+        events.extend_from_slice(calls);
+        events.push(ev_completed(&response_id));
+        batches.push(responses::mount_sse_once(&server, sse(events)).await);
+    }
     let final_request = responses::mount_sse_once(
         &server,
         sse(vec![
@@ -1401,7 +1410,9 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
     .await;
     test.submit_turn("Collect the requested results.").await?;
 
-    assert_eq!(first.requests().len(), 1);
+    for batch in batches {
+        assert_eq!(batch.requests().len(), 1);
+    }
     let request = final_request.single_request();
     let body = request.body_json();
     let input = body["input"].as_array().unwrap();
@@ -1575,23 +1586,19 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
     test.submit_turn("Recover the retained result.").await?;
     let output = custom_tool_output_last_non_empty_text(&recovered.single_request(), "recover-pin")
         .expect("registered recovery tool must return the stored output");
-    // Byte recovery includes the serialized completion header and only a prefix
-    // of the payload, so it is not a complete JSON string. Check the variable
-    // header separately, then compare every recovered payload byte.
+    // Text artifacts preserve real line boundaries. Check the variable
+    // completion header separately, then compare every recovered payload byte.
     assert_eq!(output.len(), 256);
     let (header, payload) = output
-        .split_once(r"\nOutput:\n\n")
+        .split_once("\nOutput:\n\n")
         .expect("recovered artifact must include its completion header");
     assert_regex_match(
-        r#"\A"Script completed with cell ID \d+\\nWall time \d+(?:\.\d+)? seconds\z"#,
+        r"\AScript completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\z",
         header,
     );
-    let expected = serde_json::to_string(&format!(
-        "recovery-{index:03}\n{}",
-        "evidence\n".repeat(1000)
-    ))?;
+    let expected = format!("recovery-{index:03}\n{}", "evidence\n".repeat(1000));
     assert!(!payload.is_empty(), "recovery must include payload bytes");
-    assert_eq!(payload, &expected[1..1 + payload.len()]);
+    assert_eq!(payload, &expected[..payload.len()]);
     Ok(())
 }
 
@@ -3769,37 +3776,48 @@ text("must not run after cancellation");
         _ => None,
     })
     .await;
-    assert_eq!(
-        completed.as_deref(),
-        Some("required tool `wait` was cancelled")
-    );
-    assert_eq!(server.requests().await.len(), 2);
-    // Cancelling the pending required nested call completes this turn in the
-    // host. The next user turn must still receive its retained tool evidence.
-    test.submit_turn("show the cancellation outcome").await?;
+    assert_eq!(completed.as_deref(), Some("terminated"));
+    // The outer wait must not hold the workspace gate while cancellation drains
+    // the nested call. Its retained evidence is available in this same turn.
     let sent = server.requests().await;
     assert_eq!(sent.len(), 3);
-    let visible = output_for(&sent[2], "retained-terminate").to_string();
+    let termination_output = output_for(&sent[2], "retained-terminate");
+    let visible = termination_output
+        .as_array()
+        .expect("termination content items")
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(visible.contains("Script terminated"), "{visible}");
     assert!(visible.contains("progress log"), "{visible}");
-    assert_eq!(visible.matches("RETAINED_RESULT_").count(), 8, "{visible}");
-    for index in 0..8 {
+    assert_eq!(visible.matches("RETAINED_RESULT_").count(), 7, "{visible}");
+    for index in 0..7 {
         assert!(
             visible.contains(&format!("RETAINED_RESULT_{index}")),
             "{visible}"
         );
     }
     // Ten successful calls and the cancelled eleventh call produce eleven
-    // outcomes. The fallback retains the first eight and reports the other three.
+    // outcomes. The fallback prioritizes the cancellation plus seven successful
+    // results, and reports the other three.
     assert!(
         visible.contains("3 additional nested tool results were omitted"),
         "{visible}"
     );
-    assert!(
-        visible
-            .contains("Required nested tool outcome: required nested tool `result` was cancelled"),
-        "{visible}"
-    );
+    let retained = visible
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|item| item.get("runtime_tool_call_id").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 8, "{visible}");
+    let cancelled = retained
+        .iter()
+        .find(|item| item["runtime_tool_call_id"] == "tool-11")
+        .expect("the cancelled nested call must survive the retention limit");
+    assert_eq!(cancelled["failed"], true);
+    let cancelled_output: Value = serde_json::from_str(cancelled["output"].as_str().unwrap())?;
+    assert_eq!(cancelled_output["status"], "aborted");
     assert!(!visible.contains("must not run after cancellation"));
 
     test.submit_turn("observe the closed cell again").await?;
@@ -4281,7 +4299,7 @@ text("token one token two token three token four token five token six token seve
                 &serde_json::to_string(&serde_json::json!({
                     "cell_id": cell_id.clone(),
                     "yield_time_ms": 1_000,
-                    "max_tokens": 6,
+                    "max_tokens": 8,
                 }))?,
             ),
             ev_completed("resp-3"),
@@ -4312,8 +4330,9 @@ text("token one token two token three token four token five token six token seve
     let truncated = text_item(&second_items, /*index*/ 1);
     assert!(truncated.starts_with("token"), "{truncated}");
     assert!(truncated.contains('\u{2026}'), "{truncated}");
-    assert!(truncated.ends_with("seven"), "{truncated}");
-    assert!(codex_utils_output_truncation::approx_token_count(truncated) <= 6);
+    // Nested command receipts share this budget, so the retained tail can be
+    // receipt text instead of the last word printed by the script.
+    assert!(codex_utils_output_truncation::approx_token_count(truncated) <= 8);
 
     Ok(())
 }

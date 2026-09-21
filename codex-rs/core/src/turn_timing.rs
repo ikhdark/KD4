@@ -45,6 +45,7 @@ use codex_protocol::protocol::TurnTimingModelRequest;
 use codex_protocol::protocol::TurnTimingPreFirstModelOutput;
 use codex_protocol::protocol::TurnTimingProgressKind;
 use codex_protocol::protocol::TurnTimingProviderTokenUsage;
+use codex_protocol::protocol::TurnTimingRequestDiagnosticsStatus;
 use codex_protocol::protocol::TurnTimingRequestTokenCategories;
 use codex_protocol::protocol::TurnTimingTerminalization;
 use codex_protocol::protocol::TurnTimingToolCall;
@@ -61,7 +62,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 27;
+const TIMING_SCHEMA_VERSION: u16 = 28;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -242,7 +243,7 @@ impl ModelAttemptGenerationMetadata {
             TurnTimingGenerationPurpose::ValidationInterpretation => "validation_interpretation",
             TurnTimingGenerationPurpose::Repair => "repair",
             TurnTimingGenerationPurpose::Coordination => "agent_coordination",
-            TurnTimingGenerationPurpose::ArtifactContinuation => "deterministic_tool_continuation",
+            TurnTimingGenerationPurpose::ArtifactContinuation => "tool_result_interpretation",
             TurnTimingGenerationPurpose::CompactionRecovery => "compaction_recovery",
             TurnTimingGenerationPurpose::TerminalCompletionReasoning => "terminal",
         })
@@ -503,6 +504,7 @@ impl TurnTimingSnapshot {
                     reasoning_output_tokens: request.reasoning_output_tokens,
                     token_usage: request.token_usage.clone(),
                     request_token_categories,
+                    request_diagnostics_status: request.request_diagnostics_status,
                     fixed_prefix_reuse_eligible: request.fixed_prefix_reuse_eligible,
                     prompt_cache_key_fingerprint: request.prompt_cache_key_fingerprint.clone(),
                     dispatch_ms: request
@@ -531,7 +533,8 @@ impl TurnTimingSnapshot {
             &mut saturation_count,
         );
         let purpose_aggregates = purpose_aggregates(&profile.model_requests, &mut saturation_count);
-        let exact_repeated_wait_count = exact_repeated_wait_count(&profile.model_requests);
+        let wait_generations_with_same_revision_count =
+            wait_generations_with_same_revision_count(&profile.model_requests);
         let failure_diagnosis_count = primary_generation_count(
             &profile.model_requests,
             TurnTimingGenerationPurpose::FailureDiagnosis,
@@ -587,7 +590,7 @@ impl TurnTimingSnapshot {
             ),
             purpose_aggregates,
             same_purpose_continuation_count: profile.counters.same_purpose_continuation_count,
-            exact_repeated_wait_count,
+            wait_generations_with_same_revision_count,
             planning_generation_count: profile.counters.planning_generation_count,
             plan_revision_generation_count: profile.counters.plan_revision_generation_count,
             planning_fixed_point_iteration_count: profile
@@ -732,6 +735,7 @@ pub(crate) struct ModelRequestTiming {
     reasoning_output_tokens: u64,
     token_usage: Option<TurnTimingProviderTokenUsage>,
     request_token_categories: Option<TurnTimingRequestTokenCategories>,
+    request_diagnostics_status: TurnTimingRequestDiagnosticsStatus,
     fixed_prefix_reuse_eligible: Option<bool>,
     prompt_cache_key_fingerprint: Option<String>,
     dispatch_ns: Option<u128>,
@@ -876,7 +880,7 @@ pub(crate) struct TimingCounters {
     pub(crate) generations_by_purpose: TurnTimingGenerationPurposeCounts,
     pub(crate) generations_by_disposition: TurnTimingGenerationDispositionCounts,
     pub(crate) suppressed_deterministic_continuation_count: u32,
-    pub(crate) residual_deterministic_generation_count: u32,
+    pub(crate) residual_deterministic_generation_count: Option<u32>,
     pub(crate) owner_drained_continuation_count: u32,
     pub(crate) executed_validation_count: u32,
     pub(crate) executed_validation_duration_ns: u64,
@@ -2035,7 +2039,17 @@ impl TurnTimingState {
         let output_collected_at_ms = first_poll_at_ms
             .zip(timing.first_poll_to_output_collected_ms)
             .map(|(first_poll, duration)| first_poll.saturating_add(duration));
-        let generation_index = state.current_generation_index;
+        let generation_index = timing
+            .sampling_generation_id
+            .0
+            .strip_prefix("generation-")
+            .and_then(|index| index.parse::<u32>().ok())
+            .filter(|index| {
+                state
+                    .model_requests
+                    .iter()
+                    .any(|request| request.generation_index == *index)
+            });
         let pending_process_exit = state
             .background_tool_process_exits
             .remove(&(call_id.to_string(), timing.execution_id.clone()));
@@ -2382,7 +2396,7 @@ impl TurnTimingState {
         state.counters.residual_deterministic_generation_count = state
             .counters
             .residual_deterministic_generation_count
-            .saturating_add(1);
+            .map_or(Some(1), |count| Some(count.saturating_add(1)));
     }
 
     pub(crate) fn record_owner_drained_continuation(&self) {
@@ -2475,19 +2489,53 @@ impl TurnTimingState {
         }
     }
 
+    pub(crate) fn record_model_request_diagnostics_unavailable(
+        &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
+    ) {
+        let mut state = self.state();
+        if let Some(request) = state.model_requests.iter_mut().find(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && request.physical_attempt_ids.last().map(String::as_str)
+                    == Some(physical_attempt_id)
+        }) {
+            request.request_diagnostics_status = TurnTimingRequestDiagnosticsStatus::Unavailable;
+        }
+        if state.completed_snapshot.is_some() {
+            tracing::info!(
+                sampling_request_id,
+                physical_attempt_id,
+                request_diagnostics_status = "unavailable",
+                "late model request diagnostics"
+            );
+        }
+        state.refresh_completed_request_diagnostics();
+    }
+
     pub(crate) fn record_model_request_token_categories(
         &self,
         sampling_request_id: &str,
         physical_attempt_id: &str,
         categories: TurnTimingRequestTokenCategories,
     ) {
-        if let Some(request) = self.state().model_requests.iter_mut().find(|request| {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() {
+            tracing::info!(sampling_request_id, physical_attempt_id,
+                request_token_categories = ?categories,
+                "late model request token categories");
+        }
+        if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
                 && request.physical_attempt_ids.last().map(String::as_str)
                     == Some(physical_attempt_id)
         }) {
             request.request_token_categories = Some(categories);
+            if request.fixed_prefix_reuse_eligible.is_some() {
+                request.request_diagnostics_status = TurnTimingRequestDiagnosticsStatus::Complete;
+            }
         }
+        state.refresh_completed_request_diagnostics();
     }
 
     /// Records cache-reuse identity on the logical request once. HTTP retries
@@ -2514,10 +2562,30 @@ impl TurnTimingState {
             return;
         }
         request.fixed_prefix_reuse_eligible = Some(fixed_prefix_reuse_eligible);
+        if request.request_token_categories.is_some() {
+            request.request_diagnostics_status = TurnTimingRequestDiagnosticsStatus::Complete;
+        }
         request.prompt_cache_key_fingerprint = prompt_cache_key.map(|key| {
             let digest = Sha256::digest(key.as_bytes());
             format!("{digest:x}")
         });
+        if state.completed_snapshot.is_some() {
+            if let Some(request) = state
+                .model_requests
+                .iter()
+                .find(|request| request.sampling_request_id.as_deref() == Some(sampling_request_id))
+            {
+                tracing::info!(
+                    sampling_request_id,
+                    physical_attempt_id,
+                    request_diagnostics_status = ?request.request_diagnostics_status,
+                    fixed_prefix_reuse_eligible,
+                    prompt_cache_key_fingerprint = ?request.prompt_cache_key_fingerprint,
+                    "late model request cache identity"
+                );
+            }
+        }
+        state.refresh_completed_request_diagnostics();
     }
 
     pub(crate) fn record_accepted_deterministic_continuation_receipts(
@@ -3296,13 +3364,17 @@ impl TurnTimingStateInner {
         match kind {
             GuardKind::LegacySampling => {
                 if !self.legacy.begin(now_ns, LegacyPhase::Sampling) {
-                    self.invalid_transition();
+                    if self.legacy.active_phase == Some(LegacyPhase::Sampling) {
+                        self.invalid_transition();
+                    }
                     return false;
                 }
             }
             GuardKind::LegacyToolBlocking => {
                 if !self.legacy.begin(now_ns, LegacyPhase::ToolBlocking) {
-                    self.invalid_transition();
+                    if self.legacy.active_phase == Some(LegacyPhase::ToolBlocking) {
+                        self.invalid_transition();
+                    }
                     return false;
                 }
             }
@@ -3627,12 +3699,29 @@ impl TurnTimingStateInner {
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),
             completed_at_unix_secs: started_sample.map(|_| sample.time.wall_unix_ms / 1_000),
             duration_ms: started_sample.map(|_| u128_to_i64_ms(inclusive_duration_ns)),
-            time_to_first_token_ms: self.milestones.first_model_output_ns.map(u128_to_i64_ms),
+            time_to_first_token_ms: self.milestones.first_visible_output_ns.map(u128_to_i64_ms),
             legacy_profile,
             profile,
         };
         self.completed_snapshot = Some(snapshot.clone());
         snapshot
+    }
+
+    fn refresh_completed_request_diagnostics(&mut self) {
+        if let Some(snapshot) = self.completed_snapshot.as_mut() {
+            for request in &mut snapshot.profile.model_requests {
+                if let Some(current) = self.model_requests.iter().find(|current| {
+                    current.sampling_request_id == request.sampling_request_id
+                        && current.physical_attempt_ids == request.physical_attempt_ids
+                }) {
+                    request.request_token_categories = current.request_token_categories.clone();
+                    request.request_diagnostics_status = current.request_diagnostics_status;
+                    request.fixed_prefix_reuse_eligible = current.fixed_prefix_reuse_eligible;
+                    request.prompt_cache_key_fingerprint =
+                        current.prompt_cache_key_fingerprint.clone();
+                }
+            }
+        }
     }
 
     fn elapsed_since_start(&self, observed_now_ns: u128) -> Option<u128> {
@@ -4115,7 +4204,7 @@ fn unique_primary_failure_signature_count(
         .unwrap_or(u32::MAX)
 }
 
-fn exact_repeated_wait_count(requests: &[ModelRequestTiming]) -> u32 {
+fn wait_generations_with_same_revision_count(requests: &[ModelRequestTiming]) -> u32 {
     let mut seen = BTreeSet::new();
     requests
         .iter()

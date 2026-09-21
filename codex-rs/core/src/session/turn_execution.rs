@@ -263,13 +263,37 @@ pub(crate) struct SuppressedFailureGuard {
 #[derive(Clone, Debug)]
 pub(crate) struct SuccessfulReplayGuard {
     response: ResponseInputItem,
+    evidence: SuccessfulReplayEvidence,
+}
+
+#[derive(Clone, Debug)]
+struct SuccessfulReplayEvidence {
     mutation_revision: u64,
-    requires_fresh_observation: bool,
+    workspace_revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    source_paths: Vec<crate::git_workspace::SourcePathChangeObservation>,
 }
 
 impl SuccessfulReplayGuard {
-    pub(crate) fn is_fresh(&self, mutation_revision: u64) -> bool {
-        !self.requires_fresh_observation && self.mutation_revision == mutation_revision
+    pub(crate) fn source_path_observations(
+        &self,
+    ) -> Vec<crate::git_workspace::SourcePathChangeObservation> {
+        self.evidence.source_paths.clone()
+    }
+    pub(crate) fn is_fresh(
+        &self,
+        mutation_revision: u64,
+        cache: &crate::git_workspace::GitWorkspaceCache,
+        workspace_revision: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) -> bool {
+        self.evidence.workspace_revision.as_ref() == workspace_revision
+            && workspace_revision.is_none_or(|revision| !revision.unavailable)
+            && self.evidence.mutation_revision == mutation_revision
+            && !self.evidence.source_paths.is_empty()
+            && self
+                .evidence
+                .source_paths
+                .iter()
+                .all(|path| cache.source_path_change_observation_is_current(path))
     }
 
     pub(crate) fn response_for_call(&self, call_id: &str) -> Option<ResponseInputItem> {
@@ -309,6 +333,7 @@ struct SuccessfulReplayGate {
     state_revision: String,
     action_identity: String,
     response: ResponseInputItem,
+    evidence: SuccessfulReplayEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -373,6 +398,7 @@ struct SamplingRequestSignalState {
     recovery_action_identities: BTreeMap<u64, RecoveryActionIdentity>,
     evidence_items: BTreeMap<u64, String>,
     successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
+    successful_replay_evidence: BTreeMap<u64, SuccessfulReplayEvidence>,
     replayed_ordinals: BTreeSet<u64>,
     validation_ordinals: BTreeSet<u64>,
     validation_proof_ordinals: BTreeSet<u64>,
@@ -576,11 +602,7 @@ impl SamplingRequestSignalCollector {
                             })
                             .map(|gate| SuccessfulReplayGuard {
                                 response: gate.response.clone(),
-                                mutation_revision: self.request_mutation_revision,
-                                // All current replay classes observe mutable source,
-                                // validation, or final-verification state. The ledger
-                                // does not retain their original dependency proof.
-                                requires_fresh_observation: replayable_action,
+                                evidence: gate.evidence.clone(),
                             })
                     });
                 (blocked_wait_guard, suppressed_failure, replayed_success)
@@ -804,6 +826,9 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.code_mode_nested_tool_count = state.code_mode_nested_tool_count.saturating_add(1);
+        if tool_name_matches(tool_name, "write_stdin") {
+            state.process_monitor_ordinals.insert(ordinal);
+        }
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
         state.saw_canonical_artifact_requirement |= canonical_artifact_required;
         state.saw_validation |= validation;
@@ -967,6 +992,39 @@ impl SamplingRequestSignalCollector {
         state.outcomes.push(outcome);
     }
 
+    pub(crate) fn record_replay_dependencies(
+        &self,
+        ordinal: u64,
+        mutation_revision: u64,
+        source_paths: Vec<crate::git_workspace::SourcePathChangeObservation>,
+        workspace_revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Validation and final verification may depend on services, environment,
+        // or Git metadata beyond these paths. A workspace watcher alone is not proof.
+        if mutation_revision != self.request_mutation_revision
+            || source_paths.is_empty()
+            || state.validation_ordinals.contains(&ordinal)
+            || state.final_verification_ordinals.contains(&ordinal)
+        {
+            return;
+        }
+        if state.successful_replay_evidence.len() >= SUCCESSFUL_REPLAY_GATE_LIMIT {
+            state.successful_replay_evidence.pop_first();
+        }
+        state.successful_replay_evidence.insert(
+            ordinal,
+            SuccessfulReplayEvidence {
+                mutation_revision,
+                workspace_revision,
+                source_paths,
+            },
+        );
+    }
+
     pub(crate) fn record_response_result(
         &self,
         ordinal: u64,
@@ -1008,6 +1066,7 @@ impl SamplingRequestSignalCollector {
         if outcome.kind == SamplingToolOutcomeKind::Success
             && (!state.test_validation_ordinals.contains(&ordinal) || outcome.tests_executed)
             && replayable
+            && state.successful_replay_evidence.contains_key(&ordinal)
             && response_has_replayable_call_id(response)
             && response_replay_text_size(response)
                 .is_some_and(|size| size <= SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT)
@@ -1045,7 +1104,9 @@ impl SamplingRequestSignalCollector {
             .insert(ordinal);
     }
 
-    fn successful_replay_candidates(&self) -> Vec<(String, ResponseInputItem)> {
+    fn successful_replay_candidates(
+        &self,
+    ) -> Vec<(String, ResponseInputItem, SuccessfulReplayEvidence)> {
         let state = self
             .state
             .lock()
@@ -1064,10 +1125,11 @@ impl SamplingRequestSignalCollector {
             .iter()
             .filter(|(ordinal, _)| successful.get(ordinal) == Some(&true))
             .filter_map(|(ordinal, response)| {
+                let evidence = state.successful_replay_evidence.get(ordinal)?;
                 state
                     .structured_actions
                     .get(ordinal)
-                    .map(|action| (action.identity.clone(), response.clone()))
+                    .map(|action| (action.identity.clone(), response.clone(), evidence.clone()))
             })
             .collect()
     }
@@ -1328,6 +1390,15 @@ impl SamplingRequestSignalCollector {
         })
     }
 
+    pub(crate) fn observed_yielded_execution(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.kind == SamplingToolOutcomeKind::Yielded)
+    }
+
     #[cfg(test)]
     fn saw_validation(&self) -> bool {
         self.state
@@ -1569,6 +1640,8 @@ impl SamplingRequestSignalCollector {
             Some(TurnTimingGenerationPurpose::Coordination)
         } else if state.registered_count > 0 && state.wait_call_count == state.registered_count {
             Some(TurnTimingGenerationPurpose::Wait)
+        } else if observed_new_failure {
+            Some(TurnTimingGenerationPurpose::FailureDiagnosis)
         } else if state.saw_artifact_read
             || state.saw_canonical_artifact_requirement
             || state
@@ -1577,8 +1650,6 @@ impl SamplingRequestSignalCollector {
                 .any(|action| action.class == StructuredActionClass::BroadSource)
         {
             Some(TurnTimingGenerationPurpose::ArtifactContinuation)
-        } else if observed_new_failure {
-            Some(TurnTimingGenerationPurpose::FailureDiagnosis)
         } else if state.registered_count > 0 {
             // Every successful tool result is new model-visible evidence even
             // when it does not fall into a more specific workflow class.
@@ -2527,6 +2598,7 @@ pub(crate) struct TurnExecutionControl {
     turn_efficiency_tool_calls: usize,
     turn_efficiency_child_runtime_ms: u64,
     unresolved_failures: BTreeSet<Option<RecoveryActionIdentity>>,
+    budget_progress_evidence: BTreeSet<String>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -2563,6 +2635,7 @@ impl TurnExecutionControl {
             turn_efficiency_tool_calls: 0,
             turn_efficiency_child_runtime_ms: 0,
             unresolved_failures: BTreeSet::new(),
+            budget_progress_evidence: BTreeSet::new(),
         }
     }
 
@@ -2578,6 +2651,66 @@ impl TurnExecutionControl {
         }
         self.soft_convergence_issued = true;
         Some(SOFT_CONVERGENCE_DIRECTIVE.to_string())
+    }
+
+    /// Renew the emergency allowance only for new evidence, not new call IDs,
+    /// wrapper formatting, replayed results, or repeated validation failures.
+    pub(crate) fn observe_budget_progress(
+        &mut self,
+        baselines: &SamplingRequestBaselines,
+        signals: &SamplingRequestSignalCollector,
+        settled: &SamplingRequestSettledState,
+    ) -> bool {
+        let state = signals
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut progressed = settled.mutation_revision != baselines.mutation_revision;
+        for outcome in &state.outcomes {
+            if state.replayed_ordinals.contains(&outcome.ordinal)
+                || outcome.failure_diagnosis_reused
+                || (state.code_mode_nested_tool_count > 0 && !outcome.nested_in_code_mode)
+                || matches!(
+                    outcome.kind,
+                    SamplingToolOutcomeKind::Skipped | SamplingToolOutcomeKind::Yielded
+                )
+            {
+                continue;
+            }
+            let evidence = if outcome.is_failure_evidence() {
+                outcome.failure_fingerprint.clone()
+            } else {
+                outcome
+                    .source_evidence
+                    .as_ref()
+                    .and_then(value_evidence_identity)
+                    .or_else(|| {
+                        state
+                            .validation_ordinals
+                            .contains(&outcome.ordinal)
+                            .then(|| state.evidence_items.get(&outcome.ordinal).cloned())
+                            .flatten()
+                    })
+            };
+            if let Some(evidence) = evidence {
+                // Identical bytes from a different source/selector establish
+                // new coverage. Repeating the same action and bytes does not.
+                let evidence = if outcome.is_failure_evidence() {
+                    format!("failure:{evidence}")
+                } else {
+                    format!(
+                        "source:{}:{evidence}",
+                        state
+                            .structured_actions
+                            .get(&outcome.ordinal)
+                            .map(|action| action.identity.as_str())
+                            .unwrap_or_default()
+                    )
+                };
+                progressed |= self.budget_progress_evidence.insert(evidence);
+            }
+        }
+        progressed
     }
 
     #[cfg(test)]
@@ -3090,7 +3223,7 @@ impl TurnExecutionControl {
                 .dispatch_ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (action_identity, response) in replay_candidates {
+            for (action_identity, response, evidence) in replay_candidates {
                 ledger.successful_replay_gates.retain(|gate| {
                     gate.state_revision != state_revision || gate.action_identity != action_identity
                 });
@@ -3100,6 +3233,7 @@ impl TurnExecutionControl {
                         state_revision: state_revision.clone(),
                         action_identity,
                         response,
+                        evidence,
                     });
                 while ledger.successful_replay_gates.len() > SUCCESSFUL_REPLAY_GATE_LIMIT {
                     ledger.successful_replay_gates.pop_front();
@@ -3169,6 +3303,21 @@ mod tests {
         }
     }
 
+    // Retention fixtures cannot authorize reuse: their watcher identity is invalid.
+    // The freshness regression uses a real cache registration instead.
+    fn record_test_replay_dependencies(collector: &SamplingRequestSignalCollector, ordinal: u64) {
+        let evidence = serde_json::from_value(json!({
+            "watcher_epoch": 0, "watcher_generation": 0, "registration_generation": 0,
+            "repo_root": std::env::temp_dir(), "path": std::env::temp_dir().join("replay-source"), "recursive": false,
+        })).unwrap();
+        collector.record_replay_dependencies(
+            ordinal,
+            collector.request_mutation_revision,
+            vec![evidence],
+            None,
+        );
+    }
+
     fn record_invocation_result(
         collector: &SamplingRequestSignalCollector,
         tool_name: ToolName,
@@ -3179,6 +3328,7 @@ mod tests {
         let registration =
             collector.register_deterministic_tool_call(&tool_name, &payload, call_id);
         collector.record_validation_workspace_revision(&tool_name, &payload, 0);
+        record_test_replay_dependencies(collector, registration.ordinal);
         collector.record_response_result(
             registration.ordinal,
             ToolOutputOutcomeContext::new(outcome),
@@ -3272,6 +3422,54 @@ mod tests {
     }
 
     #[test]
+    fn successful_read_without_original_dependencies_is_not_retained() {
+        let collector = SamplingRequestSignalCollector::default();
+        let call = collector.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"),
+            &ToolPayload::Function {
+                arguments: r#"{"cmd":"cat src/lib.rs"}"#.into(),
+            },
+            "read",
+        );
+        collector.record_response_result(
+            call.ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            &successful_tool_response("read", "source"),
+            false,
+        );
+        assert!(collector.successful_replay_candidates().is_empty());
+        assert!(
+            collector
+                .state
+                .lock()
+                .unwrap()
+                .successful_replay_responses
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_artifact_read_requires_failure_diagnosis() {
+        let control = TurnExecutionControl::new();
+        let baseline = control.baselines(0);
+        let collector = control.collector(&baseline);
+        record_invocation_result(
+            &collector,
+            ToolName::plain("read_tool_output"),
+            ToolPayload::Function {
+                arguments: r#"{"artifact_id":"missing"}"#.into(),
+            },
+            "read",
+            ToolOutputOutcome::Failure,
+        );
+        assert_eq!(
+            collector.generation_purpose(&baseline, &settled(0), false, false),
+            Some(TurnTimingGenerationPurpose::FailureDiagnosis)
+        );
+    }
+
+    #[test]
     fn replayed_validation_is_not_new_execution_or_external_progress() {
         let control = TurnExecutionControl::new();
         let baselines = control.baselines(0);
@@ -3291,8 +3489,8 @@ mod tests {
         );
         assert_eq!(
             collector.successful_replay_candidates().len(),
-            1,
-            "retained output stays reusable"
+            0,
+            "validation output without complete dependency evidence cannot authorize replay"
         );
 
         let executed = control.collector(&baselines);
@@ -4161,6 +4359,7 @@ mod tests {
                     _ => {}
                 }
             }
+            record_test_replay_dependencies(&collector, registration.ordinal);
             collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
@@ -4240,8 +4439,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn successful_read_replays_only_for_the_exact_unchanged_state() {
+    #[tokio::test]
+    async fn successful_read_replays_only_for_the_exact_unchanged_state() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source = root.path().join("source.rs");
+        std::fs::write(&source, "original").unwrap();
+        let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+        let observations = cache
+            .begin_source_path_change_observations(root.path(), &[(source, false)])
+            .await
+            .unwrap();
         let mut control = TurnExecutionControl::new();
         settle_plan(&mut control, plan(&[StepStatus::Completed]));
         let payload = ToolPayload::Function {
@@ -4254,12 +4461,18 @@ mod tests {
         };
         let baselines = control.baselines(0);
         let first = control.collector(&baselines);
-        record_invocation_result(
-            &first,
-            ToolName::plain("exec_command"),
-            payload.clone(),
+        let registration = first.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"),
+            &payload,
             "first-read",
-            ToolOutputOutcome::Success,
+        );
+        first.record_replay_dependencies(registration.ordinal, 0, observations, None);
+        first.record_response_result(
+            registration.ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            &successful_tool_response("first-read", r#"{"status":"complete"}"#),
+            false,
         );
         control.settle(&baselines, &first, &settled(0));
 
@@ -4270,9 +4483,17 @@ mod tests {
             &payload,
             "replayed-read",
         );
-        let replayed_response = replay
+        let guard = replay
             .replayed_success
-            .expect("unchanged read should replay")
+            .expect("unchanged read should replay");
+        assert!(guard.is_fresh(0, &cache, None));
+        assert!(!guard.is_fresh(1, &cache, None));
+        cache.note_host_workspace_mutation();
+        assert!(
+            !guard.is_fresh(0, &cache, None),
+            "external changes invalidate the original proof"
+        );
+        let replayed_response = guard
             .response_for_call("replayed-read")
             .expect("replayed response should retain a call id");
         assert!(matches!(
@@ -4321,6 +4542,7 @@ mod tests {
             },
             "oversized",
         );
+        record_test_replay_dependencies(&collector, oversized.ordinal);
         collector.record_response_result(
             oversized.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
@@ -4346,6 +4568,7 @@ mod tests {
             },
             "duplicate",
         );
+        record_test_replay_dependencies(&collector, duplicate.ordinal);
         collector.record_response_result(
             duplicate.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
@@ -4356,13 +4579,13 @@ mod tests {
         collector.record_failure(duplicate.ordinal, "conflicting result", true);
         assert_eq!(
             collector.successful_replay_candidates().len(),
-            SUCCESSFUL_REPLAY_GATE_LIMIT - 1
+            SUCCESSFUL_REPLAY_GATE_LIMIT - 2
         );
         assert!(
             !collector
                 .successful_replay_candidates()
                 .iter()
-                .any(|(_, response)| matches!(response,
+                .any(|(_, response, _)| matches!(response,
             ResponseInputItem::FunctionCallOutput { call_id, .. } if call_id == "duplicate"))
         );
     }
@@ -5646,6 +5869,62 @@ mod tests {
                     .continuation_generation_request(&baselines, &collector, &settled, false);
                 assert!(!completion.terminal_completion_only);
             }
+        }
+    }
+
+    #[test]
+    fn budget_progress_rejects_repeated_and_alternating_failure_evidence() {
+        let mut control = TurnExecutionControl::new();
+        let (baselines, settled) = unchanged_state(&control);
+        for (fingerprint, expected) in [
+            ("first", true),
+            ("second", true),
+            ("first", false),
+            ("second", false),
+        ] {
+            let collector = direct_failure_collector(&control, &baselines, fingerprint);
+            assert_eq!(
+                control.observe_budget_progress(&baselines, &collector, &settled),
+                expected
+            );
+        }
+        let collector = control.collector(&baselines);
+        let changed = SamplingRequestSettledState {
+            mutation_revision: 1,
+            ..settled
+        };
+        assert!(control.observe_budget_progress(&baselines, &collector, &changed));
+    }
+
+    #[test]
+    fn budget_progress_distinguishes_new_source_coverage_from_repeated_reads() {
+        let mut control = TurnExecutionControl::new();
+        let (baselines, settled) = unchanged_state(&control);
+        for (file, expected) in [
+            ("a.txt", true),
+            ("a.txt", false),
+            ("b.txt", true),
+            ("a.txt", false),
+        ] {
+            let collector = control.collector(&baselines);
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain("shell_command"),
+                &ToolPayload::Function {
+                    arguments: json!({"command": format!("cat {file}")}).to_string(),
+                },
+                "read-source",
+            );
+            collector.record_response_result(
+                registration.ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                Some(json!({"semantic_evidence": ["identical file content"]})),
+                &successful_tool_response("read-source", "identical file content"),
+                false,
+            );
+            assert_eq!(
+                control.observe_budget_progress(&baselines, &collector, &settled),
+                expected
+            );
         }
     }
 

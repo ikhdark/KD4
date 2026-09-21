@@ -33,15 +33,25 @@ pub struct CodeModeExecuteHandler {
 /// cooperative yield into a guaranteed hard-timeout failure.
 const NESTED_TOOL_TIMEOUT_GRACE_MS: u64 = 15_000;
 
-/// Hard deadline for a nested tool call that passes no explicit `{timeout_ms}`.
-/// Must exceed the empty-poll ceiling the same cell can request.
-fn default_nested_tool_timeout_ms(background_terminal_max_timeout_ms: u64) -> u64 {
-    background_terminal_max_timeout_ms
+/// Allow a tool-owned long poll or transport timeout to finish before its host deadline.
+fn extended_nested_tool_timeout_ms(tool_timeout_ms: u64) -> u64 {
+    tool_timeout_ms
         .saturating_add(NESTED_TOOL_TIMEOUT_GRACE_MS)
         .clamp(
             codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS,
             codex_code_mode::MAX_TOOL_TIMEOUT_MS,
         )
+}
+
+fn nested_tool_timeout_override(
+    tool: &ToolName,
+    mcp_timeouts: &HashMap<ToolName, u64>,
+    terminal_poll_ms: u64,
+) -> Option<u64> {
+    mcp_timeouts.get(tool).copied().or_else(|| {
+        (tool == &ToolName::plain("write_stdin"))
+            .then(|| extended_nested_tool_timeout_ms(terminal_poll_ms))
+    })
 }
 
 #[derive(Clone)]
@@ -75,25 +85,40 @@ impl CellDispatchLease {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub(super) async fn record_trace(&self, record: impl FnOnce() + Send + 'static) {
-        // Accepted trace work retains the same cleanup owner if its waiter is dropped.
+    pub(super) fn record_trace(&self, record: impl FnOnce() + Send + 'static) {
+        // Queue ordered persistence without gating dispatch or response delivery.
+        // Each accepted write owns cleanup even if its tool caller is cancelled.
         let lease = self.clone();
-        let runtime = tokio::runtime::Handle::current();
-        if let Err(error) = self
+        let (done, tail) = tokio::sync::oneshot::channel();
+        let previous = self
             .state
             .session
-            .terminal_tasks
-            .spawn_blocking_on(
-                move || {
-                    record();
-                    drop(lease);
-                },
-                &runtime,
-            )
-            .await
-        {
-            tracing::warn!(%error, "code mode trace recording task failed");
-        }
+            .services
+            .code_mode_service
+            .trace_tails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.state.cell_id.to_string(), tail);
+        let tasks = self.state.session.terminal_tasks.clone();
+        self.state.session.terminal_tasks.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let runtime = tokio::runtime::Handle::current();
+            if let Err(error) = tasks
+                .spawn_blocking_on(
+                    move || {
+                        record();
+                        let _ = done.send(());
+                        drop(lease);
+                    },
+                    &runtime,
+                )
+                .await
+            {
+                tracing::warn!(%error, "code mode trace recording task failed");
+            }
+        });
     }
 }
 
@@ -161,7 +186,7 @@ impl CodeModeExecuteHandler {
                     .unwrap_or(codex_mcp::DEFAULT_TOOL_TIMEOUT);
                 (
                     tool.canonical_tool_name(),
-                    default_nested_tool_timeout_ms(
+                    extended_nested_tool_timeout_ms(
                         u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
                     ),
                 )
@@ -171,7 +196,14 @@ impl CodeModeExecuteHandler {
         for tool in &mut enabled_tools {
             // MCP owns its transport timeout. Give that call headroom without
             // lengthening ordinary tools or overriding explicit per-call limits.
-            tool.default_timeout_ms = mcp_timeouts.get(&tool.tool_name).copied();
+            tool.default_timeout_ms = nested_tool_timeout_override(
+                &tool.tool_name,
+                &mcp_timeouts,
+                session
+                    .services
+                    .unified_exec_manager
+                    .max_write_stdin_yield_time_ms(),
+            );
         }
         let exec = ExecContext { session, turn };
         let started_at = std::time::Instant::now();
@@ -188,15 +220,7 @@ impl CodeModeExecuteHandler {
                 // material state change without another model-mediated poll.
                 yield_time_ms: None,
                 max_output_tokens: args.max_output_tokens,
-                // A nested `write_stdin` may legitimately wait the whole
-                // background-terminal budget. Keep the runtime's hard deadline
-                // above that so a quiet full-length poll can yield instead.
-                default_tool_timeout_ms: Some(default_nested_tool_timeout_ms(
-                    exec.session
-                        .services
-                        .unified_exec_manager
-                        .max_write_stdin_yield_time_ms(),
-                )),
+                default_tool_timeout_ms: Some(codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS),
             })
             .await
             .map_err(FunctionCallError::RespondToModel)?;
@@ -206,7 +230,7 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .record_cell_parent_call_id(&cell_id, &call_id);
-        // Establish cleanup ownership before the first trace await.
+        // Establish cleanup ownership before queuing trace work.
         let dispatch_lease = CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());
         let trace_enabled = exec.session.services.rollout_thread_trace.is_enabled();
         let code_cell_trace = exec
@@ -218,9 +242,7 @@ impl CodeModeExecuteHandler {
             let trace = code_cell_trace.clone();
             let parent_call_id = call_id.clone();
             let source = args.code.to_owned();
-            dispatch_lease
-                .record_trace(move || trace.record_started(parent_call_id, source))
-                .await;
+            dispatch_lease.record_trace(move || trace.record_started(parent_call_id, source));
         }
         exec.session
             .services
@@ -312,14 +334,10 @@ impl CodeModeExecuteHandler {
             );
         if trace_enabled {
             let traced_response = response.clone();
-            dispatch_lease
-                .record_trace(move || {
-                    code_cell_trace.record_initial_response(
-                        &traced_response,
-                        live_cell && !keep_dispatch_open,
-                    );
-                })
-                .await;
+            dispatch_lease.record_trace(move || {
+                code_cell_trace
+                    .record_initial_response(&traced_response, live_cell && !keep_dispatch_open);
+            });
         }
         exec.session.services.elicitations.wait_until_clear().await;
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
@@ -401,6 +419,27 @@ mod tests {
     use codex_code_mode::CellId;
 
     use super::*;
+
+    #[test]
+    fn long_poll_timeout_does_not_extend_ordinary_nested_tools() {
+        let timeouts = HashMap::from([(ToolName::plain("mcp_test"), 123_000)]);
+        assert_eq!(
+            nested_tool_timeout_override(&ToolName::plain("read_file"), &timeouts, 300_000),
+            None
+        );
+        assert_eq!(
+            nested_tool_timeout_override(&ToolName::plain("read_tool_output"), &timeouts, 300_000),
+            None
+        );
+        assert_eq!(
+            nested_tool_timeout_override(&ToolName::plain("write_stdin"), &timeouts, 300_000),
+            Some(315_000)
+        );
+        assert_eq!(
+            nested_tool_timeout_override(&ToolName::plain("mcp_test"), &timeouts, 300_000),
+            Some(123_000)
+        );
+    }
 
     #[test]
     fn cached_runtime_catalog_drops_schema_trees_after_rendering_descriptions() {
@@ -606,6 +645,9 @@ mod tests {
                 }),
                 "{preview}"
             );
+            session.terminal_tasks.close();
+            session.terminal_tasks.wait().await;
+            session.terminal_tasks.reopen();
             let events = read_events()?;
             let cell_id = events
                 .iter()
@@ -644,6 +686,9 @@ mod tests {
                     assert!(result.result.log_preview().contains("second"));
                 }
             }
+            session.terminal_tasks.close();
+            session.terminal_tasks.wait().await;
+            session.terminal_tasks.reopen();
             assert_eq!(
                 session
                     .services
@@ -750,7 +795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_code_cell_trace_waiter_retains_cleanup_until_write_finishes()
+    async fn queued_code_cell_trace_returns_before_storage_and_retains_ordered_cleanup()
     -> anyhow::Result<()> {
         let (session, _) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
@@ -769,21 +814,23 @@ mod tests {
         let write_path = output_path.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let waiter = tokio::spawn(async move {
-            lease
-                .record_trace(move || {
-                    started_tx.send(()).expect("recording caller still waits");
-                    release_rx
-                        .recv_timeout(std::time::Duration::from_secs(5))
-                        .expect("release writer");
-                    std::fs::write(write_path, "accepted trace write")
-                        .expect("persist actual trace work");
-                })
-                .await;
+        lease.record_trace(move || {
+            started_tx.send(()).expect("recording caller still waits");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("release writer");
+            std::fs::write(write_path, "accepted trace write").expect("persist actual trace work");
         });
+        let second_path = output_path.clone();
+        lease.record_trace(move || {
+            assert_eq!(
+                std::fs::read_to_string(&second_path).unwrap(),
+                "accepted trace write"
+            );
+            std::fs::write(second_path, "ordered second trace").unwrap();
+        });
+        drop(lease);
         tokio::time::timeout(std::time::Duration::from_secs(2), started_rx).await??;
-        waiter.abort();
-        assert!(waiter.await.expect_err("caller canceled").is_cancelled());
         assert_eq!(
             session
                 .services
@@ -809,7 +856,7 @@ mod tests {
         .await?;
         assert_eq!(
             std::fs::read_to_string(output_path)?,
-            "accepted trace write"
+            "ordered second trace"
         );
         assert_eq!(
             session

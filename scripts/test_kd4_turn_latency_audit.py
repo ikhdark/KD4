@@ -10,6 +10,7 @@ from unittest import mock
 from pathlib import Path
 
 from scripts import kd4_turn_latency_audit
+from scripts import kd4_timing_analysis
 
 
 def _event(payload: dict, timestamp: str = "2026-08-17T00:00:00Z") -> str:
@@ -198,6 +199,25 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_unmeasured_residual_and_honest_continuation_metrics(self) -> None:
+        timing = _timing()
+        timing["counters"]["residualDeterministicGenerationCount"] = None
+        timing["counters"]["waitGenerationsWithSameRevisionCount"] = 3
+        timing["modelRequests"] = [{
+            "generationIndex": 0,
+            "generationPurpose": "tool_result_interpretation",
+            "modelStreamWaitNs": 123,
+        }]
+        report = kd4_timing_analysis._population_report(
+            [{"timing": timing, "turn_id": "turn", "status": "completed"}],
+            include_tokens=False,
+        )
+        self.assertIsNone(report["residualDeterministicGenerationCount"])
+        self.assertEqual(report["waitGenerationsWithSameRevisionCount"], 3)
+        self.assertNotIn("exactRepeatedWaitCount", report)
+        self.assertEqual(report["toolResultInterpretationLatency"]["logicalGenerations"], 1)
+        self.assertEqual(report["toolResultInterpretationLatency"]["modelStreamWaitNs"], 123)
+
     @staticmethod
     def startup_event(**overrides):
         fields = {

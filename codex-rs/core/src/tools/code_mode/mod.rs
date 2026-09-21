@@ -75,6 +75,13 @@ pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
     tool_name.namespace.is_none() && tool_name.name == PUBLIC_TOOL_NAME
 }
 
+/// Both entry points orchestrate nested tools, which own their workspace gates
+/// and output projection independently of the outer code-mode packet.
+pub(crate) fn is_orchestration_tool_name(tool_name: &ToolName) -> bool {
+    tool_name.namespace.is_none()
+        && matches!(tool_name.name.as_str(), PUBLIC_TOOL_NAME | WAIT_TOOL_NAME)
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecContext {
     pub(super) session: Arc<Session>,
@@ -87,6 +94,7 @@ pub(crate) struct CodeModeService {
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     packet_admission: Mutex<CodeModePacketAdmission>,
     cell_parent_call_ids: Mutex<HashMap<String, String>>,
+    trace_tails: Mutex<HashMap<String, tokio::sync::oneshot::Receiver<()>>>,
     shutting_down: AtomicBool,
 }
 
@@ -217,6 +225,7 @@ impl CodeModeService {
             dispatch_broker,
             packet_admission: Mutex::new(CodeModePacketAdmission::default()),
             cell_parent_call_ids: Mutex::new(HashMap::new()),
+            trace_tails: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -312,6 +321,10 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
+        self.trace_tails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(cell_id.as_str());
         // Only registration creates packet state. Accepted child operations
         // keep their own cleanup owner, but cannot recreate a closed packet.
         self.packet_admission
@@ -1227,14 +1240,56 @@ async fn call_nested_tool(
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let result_value = result.code_mode_result();
     let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
-    if !output_truncated && let Some(parent_call_id) = parent_tool_call_id.as_ref() {
-        exec.session
-            .register_code_mode_nested_evidence(
-                parent_call_id.clone(),
-                nested_call_id.clone(),
-                retained_output.clone(),
+    if let Some(parent_call_id) = parent_tool_call_id.as_ref()
+        && source_dependencies
+            .as_ref()
+            .is_some_and(|dependencies| !dependencies.is_empty())
+    {
+        let evidence_output = if !output_truncated && retained_output.len() <= 4_096 {
+            Some(retained_output.clone())
+        } else {
+            let canonical = codex_tools::CanonicalToolResult::json(result_value.clone());
+            let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+                &exec.turn.config.codex_home,
+                &exec.session.thread_id.to_string(),
+                &canonical,
             )
             .await;
+            if artifact.complete {
+                if let Some(artifact_id) = artifact.artifact_id() {
+                    exec.session
+                        .register_tool_artifact_origin(
+                            artifact_id.clone(),
+                            nested_call_id.clone(),
+                            canonical.exact_bytes,
+                            canonical.sha256,
+                        )
+                        .await;
+                    Some(
+                        serde_json::json!({
+                            "artifact_id": artifact_id,
+                            "historical_source": true,
+                            "recovery_tool": "read_tool_output",
+                            "selectors": [{"kind": "json_pointer", "pointer": ""}]
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(output) = evidence_output {
+            exec.session
+                .register_code_mode_nested_evidence(
+                    parent_call_id.clone(),
+                    nested_call_id.clone(),
+                    output,
+                )
+                .await;
+        }
     }
     let nested_result = CodeModeNestedResultEvidence {
         failed: !matches!(
@@ -2094,6 +2149,90 @@ mod tests {
         assert_eq!(packet.nested_call_count, 1);
         assert!(packet.first_required_terminal.is_none());
         service.finish_cell_dispatch(&cell_id);
+    }
+
+    #[tokio::test]
+    async fn large_nested_source_read_retains_a_source_scoped_recoverable_artifact() {
+        let shell: Arc<dyn crate::tools::registry::CoreToolRuntime> =
+            Arc::new(crate::tools::handlers::ShellCommandHandler::new(
+                crate::tools::handlers::ShellCommandHandlerOptions {
+                    foreign_environment: false,
+                    allow_login_shell: false,
+                    allow_escalated_sandbox_permissions: false,
+                    exec_permission_approvals_enabled: false,
+                },
+            ));
+        let (session, turn, runtime) = nested_call_fixture(vec![shell]).await;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.txt");
+        let contents = "exact independent source line\n".repeat(300);
+        std::fs::write(&path, &contents).unwrap();
+        let command = if cfg!(windows) {
+            format!("Get-Content -LiteralPath '{}' -Raw", path.display())
+        } else {
+            format!("cat '{}'", path.display())
+        };
+        let cell_id = CellId::new("large-source-cell".into());
+        session
+            .services
+            .code_mode_service
+            .record_cell_parent_call_id(&cell_id, "outer-source");
+        let output = super::call_nested_tool(
+            super::ExecContext {
+                session: Arc::clone(&session),
+                turn: Arc::clone(&turn),
+            },
+            runtime,
+            codex_code_mode::CodeModeNestedToolCall {
+                cell_id: cell_id.clone(),
+                parent_tool_call_id: Some("outer-source".into()),
+                runtime_tool_call_id: "read-source".into(),
+                tool_name: ToolName::plain("shell_command"),
+                tool_kind: CodeModeToolKind::Function,
+                input: Some(json!({"command":command})),
+                nested_deadline: None,
+            },
+            codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        assert!(output.to_string().len() > 4_096);
+        let history = session
+            .lock_history_state_for_test()
+            .await
+            .tool_history_state();
+        let ledger = serde_json::to_value(&history).unwrap();
+        let nested = ledger["code_mode_nested_evidence"]["outer-source"]
+            .as_object()
+            .expect("retain independent source");
+        assert_eq!(nested.len(), 1);
+        let evidence = nested.values().next().unwrap();
+        assert!(
+            !evidence["observation"]["source_dependencies"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let pin: serde_json::Value =
+            serde_json::from_str(evidence["output"].as_str().unwrap()).unwrap();
+        let artifact_id = pin["artifact_id"].as_str().unwrap();
+        assert!(history.artifact_references().contains_key(artifact_id));
+        let exact = crate::tools::command_output_artifact::read_complete_canonical_snapshot(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+            artifact_id,
+            100_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&exact).unwrap(),
+            output
+        );
+        session
+            .services
+            .code_mode_service
+            .finish_cell_dispatch(&cell_id);
     }
 
     #[tokio::test]

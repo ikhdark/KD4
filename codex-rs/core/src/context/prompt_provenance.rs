@@ -530,6 +530,8 @@ impl CategoryAccumulator {
 
 #[derive(Debug, Default)]
 pub(crate) struct PromptContextBreakdown {
+    pub(crate) fixed_prefix_item_count: usize,
+    fixed_contribution_count: usize,
     categories: BTreeMap<PromptContextCategory, CategoryAccumulator>,
 }
 
@@ -545,7 +547,11 @@ impl PromptContextBreakdown {
             let aligned = index
                 .checked_sub(aligned_offset)
                 .and_then(|index| sidecar.aligned_item(index));
+            let before = breakdown.fixed_contribution_count;
             breakdown.record_response_item(item, &serialized_item, sidecar, aligned)?;
+            if breakdown.fixed_contribution_count != before {
+                breakdown.fixed_prefix_item_count = index + 1;
+            }
         }
         // The array envelope grows with the item count. Keep its bytes in the
         // injected category for reconciliation, but leave it out of the
@@ -580,12 +586,17 @@ impl PromptContextBreakdown {
             let serialized_item = raw_item.get().as_bytes();
             if embedded_base_index == Some(index) {
                 breakdown.record_serialized(PromptContextCategory::BaseSystem, serialized_item);
+                breakdown.fixed_prefix_item_count = index + 1;
                 continue;
             }
             let aligned = index
                 .checked_sub(aligned_offset)
                 .and_then(|index| sidecar.aligned_item(index));
+            let before = breakdown.fixed_contribution_count;
             breakdown.record_serialized_response_item(item, serialized_item, raw_item, aligned)?;
+            if breakdown.fixed_contribution_count != before {
+                breakdown.fixed_prefix_item_count = index + 1;
+            }
         }
         breakdown.record_overhead_unhashed(
             PromptContextCategory::OtherInjected,
@@ -826,6 +837,9 @@ impl PromptContextBreakdown {
         estimated_tokens: u64,
         stable_source: &[u8],
     ) {
+        if PromptContextCategory::FIXED_PREFIX.contains(&category) {
+            self.fixed_contribution_count += 1;
+        }
         let entry = self
             .categories
             .entry(category)

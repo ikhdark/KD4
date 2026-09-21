@@ -739,6 +739,74 @@ fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
 }
 
 #[test]
+fn recovered_bytes_survive_missing_producer_provenance() {
+    let output = "exact historical source recovered successfully";
+    let canonical = Arc::from([
+        named_function_call_with_arguments(
+            "recovery",
+            "read_tool_output",
+            serde_json::json!({"artifact_id":"unknown-producer"}),
+        ),
+        text_output("recovery", output.to_string()),
+    ]);
+    let projection = ToolHistoryState::default()
+        .project_with_workspace_identity(canonical, Some(&workspace_identity("current")));
+    let (_, text) = textual_output_identity(&projection.items[1]).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(notice["reason_code"], "missing_observation");
+    assert_eq!(notice["historical_output"], output);
+    assert_eq!(notice["valid_for_current_workspace"], false);
+    assert!(
+        notice["rerun"]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("rereading this immutable artifact cannot establish freshness")
+    );
+}
+
+#[test]
+fn small_budget_excess_compacts_only_oldest_consumed_results() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(60_000);
+    let output = "x ".repeat(1_000);
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    for index in 0..61 {
+        let call_id = format!("call-{index}");
+        let mut record = candidate(&call_id, output.clone());
+        record.artifact_id = format!("00000000-0000-7000-8000-{index:012}");
+        if index < 60 {
+            record.consumed_by_generation = Some(ModelGenerationId {
+                turn_id: "turn".into(),
+                ordinal: 1,
+            });
+        }
+        state.register(record);
+        items.push(function_call(&call_id));
+        items.push(text_output(&call_id, output.clone()));
+    }
+    let projection = state.project(Arc::from(items));
+    let outputs = projection
+        .items
+        .iter()
+        .filter_map(textual_output_identity)
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 61, "all outputs must remain recoverable");
+    let raw_count = outputs.iter().filter(|(_, text)| *text == output).count();
+    assert!(
+        raw_count >= 58,
+        "small excess must not compact all consumed results: {raw_count}"
+    );
+    assert_eq!(outputs.last().unwrap().1, output);
+    assert!(
+        outputs
+            .iter()
+            .map(|(_, text)| approx_token_count(text))
+            .sum::<usize>()
+            <= 60_000
+    );
+}
+
+#[test]
 fn workspace_error_outputs_are_never_stale_masked() {
     let call_id = "failed-workspace-read";
     let dependency = PathBuf::from("/repo/src/foo.rs");
@@ -1192,10 +1260,6 @@ fn file_read_dependencies_require_complete_literal_bounded_scope() {
         ("bash", "cd subdir; cat 'contract.txt'"),
         ("cmd", r#"type "contract.txt" & type "%OTHER_FILE%""#),
         ("cmd", r#"type "contract.txt" & type "!OTHER_FILE!""#),
-        (
-            "bash",
-            "cat a; cat b; cat c; cat d; cat e; cat f; cat g; cat h; cat i",
-        ),
     ] {
         let payload = ToolPayload::Function {
             arguments: serde_json::json!({"cmd": command, "shell": shell}).to_string(),
@@ -1205,6 +1269,36 @@ fn file_read_dependencies_require_complete_literal_bounded_scope() {
         assert!(
             classification.source_dependencies.is_empty(),
             "{shell}: {command}"
+        );
+    }
+}
+
+#[test]
+fn nine_literal_paths_retain_precise_dependencies() {
+    let cwd = Path::new("/repo");
+    let names = (0..9)
+        .map(|index| format!("file-{index}.rs"))
+        .collect::<Vec<_>>();
+    let expected = names
+        .iter()
+        .map(|name| SourceDependencyV1::new(&cwd.join(name), false))
+        .collect::<BTreeSet<_>>();
+    for command in [
+        format!("cat {}", names.join(" ")),
+        names
+            .iter()
+            .map(|name| format!("cat {name}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+        format!("rg needle {}", names.join(" ")),
+    ] {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({"cmd":command,"shell":"bash"}).to_string(),
+        };
+        assert_eq!(
+            classify_workspace_tool_call("exec_command", &payload, cwd).source_dependencies,
+            expected,
+            "{command}"
         );
     }
 }
@@ -1800,7 +1894,9 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
         },
     ));
     assert_eq!(state.consumed_outputs_for_tool("functions.exec").len(), 2);
-    assert_eq!(state.project(canonical).substitutions.len(), 2);
+    let consumed = state.project(canonical);
+    assert_eq!(consumed.substitutions.len(), 1);
+    assert_eq!(consumed.items, projection.items);
 }
 
 #[test]
@@ -2804,6 +2900,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         workspace_evidence: BTreeMap::new(),
         non_workspace_code_mode_calls: BTreeSet::new(),
         code_mode_nested_evidence: BTreeMap::new(),
+        internal_artifact_origins: BTreeMap::new(),
         artifact_call_ids: BTreeMap::new(),
     };
     let mut serialized = serde_json::to_value(&state).expect("serialize ledger state");
@@ -3939,6 +4036,110 @@ fn workspace_dependencies_preserve_powershell_parser_host() {
 }
 
 #[test]
+fn aggregate_budget_preserves_freshness_warning_when_pinning_historical_output() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
+    let mut state = ToolHistoryState::default();
+    state.register(candidate("stale", "old evidence ".repeat(2000)));
+    let notice = serde_json::json!({
+        "stale_workspace_evidence": true,
+        "valid_for_current_workspace": false,
+        "reason_code": "source_dependencies_invalidated",
+        "rerun": { "instruction": "Revalidate the original source, not this immutable artifact." },
+        "historical_output": "old evidence ".repeat(2000),
+    });
+    let mut items = ProjectedResponseItems::Owned(vec![text_output("stale", notice.to_string())]);
+    assert_eq!(state.enforce_tool_result_budget(&mut items).count, 0);
+    let (_, text) = canonical_textual_output_identity(&items[0]).unwrap();
+    let compact: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(compact["kind"], "tool_history_artifact_pin");
+    assert_eq!(compact["stale_workspace_evidence"], true);
+    assert_eq!(compact["valid_for_current_workspace"], false);
+    assert_eq!(compact["reason_code"], notice["reason_code"]);
+    assert_eq!(compact["rerun"], notice["rerun"]);
+    assert!(approx_token_count(&text) <= 700);
+}
+
+#[test]
+fn aggregate_pressure_keeps_fitting_unread_diagnostics_verbatim() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
+    let detail = format!(
+        "write failed: permission denied\n{}",
+        "details ".repeat(150)
+    );
+    let mut failure = text_output("failure", detail.clone());
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut failure {
+        output.success = Some(false);
+    }
+    let mut items =
+        ProjectedResponseItems::Owned(vec![failure, text_output("large", "output ".repeat(2000))]);
+    let state = ToolHistoryState::default();
+    assert_eq!(state.enforce_tool_result_budget(&mut items).count, 0);
+    let (_, actual) = items
+        .iter()
+        .filter_map(canonical_textual_output_identity)
+        .find(|(call_id, _)| *call_id == "failure")
+        .unwrap();
+    assert_eq!(actual, detail);
+    let (_, compact) = items
+        .iter()
+        .filter_map(canonical_textual_output_identity)
+        .find(|(call_id, _)| *call_id == "large")
+        .unwrap();
+    let compact: serde_json::Value = serde_json::from_str(&compact).unwrap();
+    assert_eq!(compact["output_omitted"], true);
+    assert!(
+        items
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .map(|(_, text)| approx_token_count(&text))
+            .sum::<usize>()
+            <= 700
+    );
+}
+
+#[test]
+fn projected_prompt_preserves_fresh_and_recovered_detail_before_consumed_history() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
+    for tool in ["read_file", "read_tool_output"] {
+        let mut state = ToolHistoryState::default();
+        let old_text = "old validation evidence ".repeat(2000);
+        let mut old = candidate("old", old_text.clone());
+        old.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "turn".to_string(),
+            ordinal: 0,
+        });
+        state.register(old);
+        state.register_non_workspace_code_mode_call("old".to_string());
+        let fresh = format!(
+            "{}\nDECISIVE: this entire late diagnostic must reach the model",
+            "detail ".repeat(150)
+        );
+        if tool == "read_file" {
+            state.register(candidate("fresh", fresh.clone()));
+        }
+        state.register_non_workspace_code_mode_call("fresh".to_string());
+        let canonical: Arc<[ResponseItem]> = Arc::from([
+            function_call("old"),
+            text_output("old", old_text),
+            named_function_call_with_arguments("fresh", tool, serde_json::json!({})),
+            text_output("fresh", fresh.clone()),
+        ]);
+        let projection = state.project(canonical);
+        for items in [&projection.items, &projection.unreplaced_items] {
+            let (_, actual) = items
+                .iter()
+                .filter_map(canonical_textual_output_identity)
+                .find(|(call_id, _)| *call_id == "fresh")
+                .expect("fresh result survives prompt projection");
+            assert_eq!(
+                actual, fresh,
+                "{tool}: preserve body, not only outcome or handle"
+            );
+        }
+    }
+}
+
+#[test]
 fn unread_failure_and_live_handle_survive_aggregate_pressure() {
     let _budget = override_model_visible_tool_result_token_budget_for_test(700);
     let state = ToolHistoryState::default();
@@ -4005,12 +4206,15 @@ fn observed_failure_detail_does_not_evict_an_unread_live_handle() {
         ),
     ]);
     let drops = state.enforce_tool_result_budget(&mut items);
-    assert_eq!(drops.count, 1);
-    assert!(
-        items
-            .iter()
-            .all(|item| item_call_id(item) != Some("old-failure"))
-    );
+    assert_eq!(drops.count, 0);
+    let old = items
+        .iter()
+        .find(|item| item_call_id(item) == Some("old-failure"))
+        .expect("the older result can still fit as an exact recovery handle");
+    let (_, old_text) = canonical_textual_output_identity(old).unwrap();
+    let old_pin: serde_json::Value = serde_json::from_str(&old_text).unwrap();
+    assert_eq!(old_pin["artifact_id"], "artifact-1");
+    assert_eq!(old_pin["successful"], false);
     let live = items
         .iter()
         .find(|item| item_call_id(item) == Some("new-live"))
@@ -4023,8 +4227,16 @@ fn observed_failure_detail_does_not_evict_an_unread_live_handle() {
     );
     assert_eq!(
         items.len(),
-        1,
-        "only observed output was dropped; no unresolved overflow"
+        2,
+        "both the live handle and the older recovery handle fit"
+    );
+    assert!(
+        items
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .map(|(_, text)| approx_token_count(&text))
+            .sum::<usize>()
+            <= model_visible_tool_result_token_budget()
     );
 }
 
@@ -4102,4 +4314,70 @@ fn unread_structured_admission_overflow_is_explicit_in_both_projections() {
         assert!(items.iter().any(|item| matches!(item,
             ResponseItem::Message { content, .. } if format!("{content:?}").contains("1 unread outcomes"))));
     }
+}
+
+#[test]
+fn explicit_read_and_search_dependencies_are_not_lost_after_eight_paths() {
+    let cwd = Path::new("/repo");
+    let paths = (0..12)
+        .map(|i| format!("src/file{i}.rs"))
+        .collect::<Vec<_>>();
+    let expected = paths
+        .iter()
+        .map(|path| SourceDependencyV1::new(&cwd.join(path), false))
+        .collect::<BTreeSet<_>>();
+    for program in ["cat", "get-content"] {
+        let mut command = vec![program.to_string()];
+        command.extend(paths.clone());
+        assert_eq!(
+            dependencies_for_read_command(program, &command, cwd),
+            expected
+        );
+    }
+    assert_eq!(dependencies_for_search_scopes(paths, cwd), expected);
+}
+
+#[test]
+fn internal_artifact_provenance_and_protection_survive_resume_and_history_retention() {
+    let mut state = ToolHistoryState::default();
+    let sha = sha256(b"source snapshot");
+    ToolHistoryMutation::RegisterArtifactOrigin {
+        artifact_id: "snapshot-id".into(),
+        call_id: "inventory-producer".into(),
+        bytes: 15,
+        sha256: sha.clone(),
+    }
+    .apply(&mut state);
+    let mut resumed: ToolHistoryState =
+        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    resumed.refresh_derived_and_indexes();
+    resumed.rebuild_artifact_mapping("snapshot-id");
+    let items = vec![
+        named_function_call_with_arguments(
+            "read",
+            "read_tool_output",
+            serde_json::json!({"artifact_id":"snapshot-id"}),
+        ),
+        text_output("read", "exact snapshot".into()),
+    ];
+    resumed.retain_for_history(&items);
+    assert_eq!(
+        resumed
+            .artifact_call_ids
+            .get("snapshot-id")
+            .map(String::as_str),
+        Some("inventory-producer")
+    );
+    assert_eq!(
+        resumed.artifact_references().get("snapshot-id"),
+        Some(&(15, sha))
+    );
+    assert!(
+        resumed
+            .artifact_pin_payload_for_items(&items)
+            .unwrap()
+            .contains("snapshot-id")
+    );
+    resumed.retain_for_history(&[]);
+    assert!(resumed.is_persisted_empty());
 }

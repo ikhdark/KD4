@@ -308,6 +308,7 @@ impl ToolHistoryCandidate {
         Some((rendered, tokens))
     }
 
+    #[cfg(test)]
     fn receipt(&self) -> Option<(&str, &str, u64)> {
         self.render_receipt(
             /*require_consumed*/ true, /*require_savings*/ true,
@@ -547,6 +548,8 @@ pub(crate) struct ToolHistoryState {
     /// Legacy ledgers have no such provenance and continue to fail closed.
     #[serde(default)]
     code_mode_nested_evidence: BTreeMap<String, BTreeMap<String, NestedWorkspaceEvidence>>,
+    #[serde(default)]
+    internal_artifact_origins: BTreeMap<String, (String, u64, String)>,
     #[serde(skip)]
     artifact_call_ids: BTreeMap<String, String>,
 }
@@ -663,6 +666,12 @@ impl WorkspaceEvidenceObservation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolHistoryMutation {
+    RegisterArtifactOrigin {
+        artifact_id: String,
+        call_id: String,
+        bytes: u64,
+        sha256: String,
+    },
     RegisterCandidate {
         candidate: ToolHistoryCandidate,
     },
@@ -691,6 +700,21 @@ pub(crate) enum ToolHistoryMutation {
 impl ToolHistoryMutation {
     pub(crate) fn apply(&self, state: &mut ToolHistoryState) -> bool {
         match self {
+            Self::RegisterArtifactOrigin {
+                artifact_id,
+                call_id,
+                bytes,
+                sha256,
+            } => {
+                state.internal_artifact_origins.insert(
+                    artifact_id.clone(),
+                    (call_id.clone(), *bytes, sha256.clone()),
+                );
+                state
+                    .artifact_call_ids
+                    .insert(artifact_id.clone(), call_id.clone());
+                true
+            }
             Self::RegisterCandidate { candidate } => {
                 state.register(candidate.clone());
                 true
@@ -712,7 +736,8 @@ impl ToolHistoryMutation {
                     return false;
                 };
                 // An opaque command has no independently checkable source scope.
-                // Do not retain partial output or introduce unbounded ledger payloads.
+                // Large results arrive as exact artifact pins, keeping each ledger
+                // entry bounded without discarding independently scoped evidence.
                 if !observation.successful
                     || observation.source_dependencies.is_empty()
                     || output.len() > 4_096
@@ -723,14 +748,7 @@ impl ToolHistoryMutation {
                     .code_mode_nested_evidence
                     .entry(parent_call_id.clone())
                     .or_default();
-                if results.contains_key(call_id)
-                    || results
-                        .values()
-                        .map(|result| result.output.len())
-                        .sum::<usize>()
-                        + output.len()
-                        > 4_096
-                {
+                if results.contains_key(call_id) {
                     return false;
                 }
                 results.insert(
@@ -762,6 +780,7 @@ impl ToolHistoryMutation {
 impl ToolHistoryState {
     fn is_persisted_empty(&self) -> bool {
         self.candidates.is_empty()
+            && self.internal_artifact_origins.is_empty()
             && self.workspace_evidence.is_empty()
             && self.non_workspace_code_mode_calls.is_empty()
             && self.code_mode_nested_evidence.is_empty()
@@ -798,7 +817,11 @@ impl ToolHistoryState {
     }
 
     fn rebuild_artifact_index(&mut self) {
-        self.artifact_call_ids.clear();
+        self.artifact_call_ids = self
+            .internal_artifact_origins
+            .iter()
+            .map(|(id, (call_id, _, _))| (id.clone(), call_id.clone()))
+            .collect();
         for (call_id, candidate) in &self.candidates {
             self.artifact_call_ids
                 .entry(candidate.artifact_id.clone())
@@ -808,11 +831,17 @@ impl ToolHistoryState {
 
     fn rebuild_artifact_mapping(&mut self, artifact_id: &str) {
         self.artifact_call_ids.remove(artifact_id);
-        if let Some((call_id, _)) = self
-            .candidates
-            .iter()
-            .find(|(_, candidate)| candidate.artifact_id == artifact_id)
-        {
+        let origin = self
+            .internal_artifact_origins
+            .get(artifact_id)
+            .map(|(call_id, _, _)| call_id)
+            .or_else(|| {
+                self.candidates
+                    .iter()
+                    .find(|(_, candidate)| candidate.artifact_id == artifact_id)
+                    .map(|(call_id, _)| call_id)
+            });
+        if let Some(call_id) = origin {
             self.artifact_call_ids
                 .insert(artifact_id.to_string(), call_id.clone());
         }
@@ -1147,7 +1176,12 @@ impl ToolHistoryState {
                 (exposed_output_sha256.get(call_id)
                     == Some(&candidate.derived.bounded_model_output_sha256))
                 .then(|| AdmissionCandidate {
-                    priority: admission_priority(candidate, &output),
+                    priority: admission_priority(candidate, &output)
+                        + if candidate.consumed_by_generation.is_some() {
+                            3
+                        } else {
+                            0
+                        },
                     item_index: std::cmp::Reverse(item_index),
                     call_id: call_id.to_string(),
                     structured_tokens: None,
@@ -1402,14 +1436,6 @@ impl ToolHistoryState {
             };
             let non_text_tokens = admission_candidate.non_text_tokens;
             let raw_tokens = approx_token_count(&output).saturating_add(non_text_tokens);
-            let savings_receipt = candidate
-                .receipt()
-                .map(|(receipt_id, text, receipt_tokens)| {
-                    let tokens = usize::try_from(receipt_tokens)
-                        .unwrap_or(usize::MAX)
-                        .saturating_add(non_text_tokens);
-                    (receipt_id, text, tokens)
-                });
             let admission_receipt =
                 candidate
                     .admission_receipt()
@@ -1426,26 +1452,10 @@ impl ToolHistoryState {
             // when its encoded size alone exceeds the shared history budget.
             let preserve_newest_non_text = Some(item_index) == newest_unconsumed_non_text_item;
             let mut decision = if raw_tokens <= remaining_raw_tokens || preserve_newest_non_text {
-                if !raw_results_fit
-                    && candidate.consumed_by_generation.is_some()
-                    && let Some((receipt_id, text, receipt_tokens)) = savings_receipt
-                    && receipt_tokens <= raw_tokens
-                    && receipt_tokens <= remaining_tokens
-                {
-                    remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
-                    AdmissionDecision {
-                        representation: AdmissionRepresentation::Receipt {
-                            receipt_id: receipt_id.to_string(),
-                            text: text.to_string(),
-                        },
-                        retain_raw_fallback: false,
-                    }
-                } else {
-                    remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
-                    AdmissionDecision {
-                        representation: AdmissionRepresentation::Raw,
-                        retain_raw_fallback: false,
-                    }
+                remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
+                AdmissionDecision {
+                    representation: AdmissionRepresentation::Raw,
+                    retain_raw_fallback: false,
                 }
             } else if let Some((receipt_id, text, receipt_tokens)) = admission_receipt
                 && receipt_tokens <= remaining_tokens
@@ -1742,14 +1752,23 @@ impl ToolHistoryState {
                 // They still occupy the model prompt and must share its output budget.
                 // Already-observed detail must not evict a newly returned
                 // outcome or continuation handle before its first exposure.
-                let priority = candidate.map_or(1, |candidate| {
-                    admission_priority(candidate, &output)
-                        + if candidate.consumed_by_generation.is_some() {
-                            3
-                        } else {
+                let priority = candidate.map_or_else(
+                    || {
+                        if response_item_output_success(item) == Some(false) {
                             0
+                        } else {
+                            1
                         }
-                });
+                    },
+                    |candidate| {
+                        admission_priority(candidate, &output)
+                            + if candidate.consumed_by_generation.is_some() {
+                                3
+                            } else {
+                                0
+                            }
+                    },
+                );
                 candidates.push((
                     priority,
                     std::cmp::Reverse(index),
@@ -1780,45 +1799,63 @@ impl ToolHistoryState {
         {
             return ToolOutputBudgetDrops::default();
         }
-        // Reserve compact outcome information before any large output consumes
-        // the aggregate budget. This also covers failures without an artifact.
-        for (priority, index, call_id, cost) in &mut candidates {
-            let candidate = self.candidates.get(call_id);
-            if candidate.is_some_and(|candidate| candidate.consumed_by_generation.is_some()) {
-                continue;
-            }
-            let item = &items[index.0];
-            if non_text_output_token_cost(item) > 0 {
-                continue;
-            }
-            let Some((_, output)) = canonical_textual_output_identity(item) else {
-                continue;
-            };
-            let receipt = candidate.and_then(ToolHistoryCandidate::artifact_pin)
-                .map(|(text, _)| text).unwrap_or_else(|| serde_json::json!({
-                    "kind": "unconsumed_tool_outcome",
-                    "call_id": call_id,
-                    "successful": response_item_output_success(item),
-                    "digest": truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS),
-                    "control": truncate_text_to_token_ceiling(&output.lines().filter(|line| line.contains("session ID") || line.contains("Session ID") || line.contains("session_id") || line.contains("Exit code")).collect::<Vec<_>>().join("\n"), RECEIPT_DIGEST_TARGET_TOKENS),
-                    "output_omitted": true
-                }).to_string());
-            if response_item_output_success(item) == Some(false) {
-                *priority = 0;
-            }
-            let receipt_cost = approx_token_count(&receipt);
-            if receipt_cost < *cost {
-                if let Some((_, body)) = textual_output_body_mut(&mut items.make_owned()[index.0]) {
-                    replace_model_visible_output_text(body, receipt);
-                    *cost = receipt_cost;
-                }
-            }
-        }
         candidates.sort();
         let mut remaining = model_visible_tool_result_token_budget();
         let mut dropped = BTreeSet::new();
         let mut dropped_tokens = 0_u64;
-        for (_, _, call_id, cost) in candidates {
+        for (_, index, call_id, mut cost) in candidates {
+            if cost > remaining && newest_unconsumed_image.as_ref() != Some(&call_id) {
+                let item = &items[index.0];
+                // Preserve full diagnostics whenever they fit. Under pressure,
+                // an unread failure or live handle must survive even when no
+                // artifact was saved; mark its omitted detail explicitly.
+                if non_text_output_token_cost(item) == 0
+                    && let Some((receipt, receipt_cost)) = self.candidates.get(&call_id)
+                        .and_then(ToolHistoryCandidate::artifact_pin)
+                        .or_else(|| {
+                            if self.candidates.get(&call_id).is_some_and(|candidate| candidate.consumed_by_generation.is_some()) {
+                                return None;
+                            }
+                            let (_, output) = canonical_textual_output_identity(item)?;
+                            let receipt = serde_json::json!({
+                                "kind": "unconsumed_tool_outcome",
+                                "call_id": call_id,
+                                "successful": response_item_output_success(item),
+                                "digest": truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS),
+                                "control": truncate_text_to_token_ceiling(&output.lines().filter(|line| line.contains("session ID") || line.contains("Session ID") || line.contains("session_id") || line.contains("Exit code")).collect::<Vec<_>>().join("\n"), RECEIPT_DIGEST_TARGET_TOKENS),
+                                "output_omitted": true
+                            }).to_string();
+                            let cost = approx_token_count(&receipt);
+                            Some((receipt, cost))
+                        })
+                        .map(|(receipt, receipt_cost)| {
+                            let notice = canonical_textual_output_identity(item)
+                                .and_then(|(_, text)| serde_json::from_str::<serde_json::Value>(&text).ok());
+                            if let Some(notice) = notice.filter(|notice| notice["stale_workspace_evidence"] == true)
+                                && let Ok(mut compact) = serde_json::from_str::<serde_json::Value>(&receipt)
+                            {
+                                // Budgeting runs after freshness projection. A
+                                // historical artifact pin must not erase that warning.
+                                for key in ["stale_workspace_evidence", "valid_for_current_workspace", "reason_code", "rerun"] {
+                                    if let Some(value) = notice.get(key) {
+                                        compact[key] = value.clone();
+                                    }
+                                }
+                                let receipt = compact.to_string();
+                                let cost = approx_token_count(&receipt);
+                                (receipt, cost)
+                            } else {
+                                (receipt, receipt_cost)
+                            }
+                        })
+                    && receipt_cost < cost
+                    && receipt_cost <= remaining
+                    && let Some((_, body)) = textual_output_body_mut(&mut items.make_owned()[index.0])
+                {
+                    replace_model_visible_output_text(body, receipt);
+                    cost = receipt_cost;
+                }
+            }
             if cost <= remaining || newest_unconsumed_image.as_ref() == Some(&call_id) {
                 remaining = remaining.saturating_sub(cost);
             } else {
@@ -1970,7 +2007,22 @@ impl ToolHistoryState {
                         truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS)
                     );
                 }
-                if origin_call_id != call_id {
+                if origin_call_id != call_id
+                    || items.iter().any(|item| {
+                        matches!(item,
+                    ResponseItem::FunctionCall { name, call_id: recovery_call_id, .. }
+                    | ResponseItem::CustomToolCall { name, call_id: recovery_call_id, .. }
+                        if name == "read_tool_output" && recovery_call_id == call_id)
+                    })
+                {
+                    if observation.is_none() {
+                        notice["reason"] = serde_json::json!(
+                            "Producer provenance is unavailable; recovered historical bytes remain authenticated, while current workspace freshness is unknown."
+                        );
+                    }
+                    notice["rerun"]["instruction"] = serde_json::json!(
+                        "Recovered bytes are authenticated historical evidence. If current workspace state matters, revalidate the original source; rereading this immutable artifact cannot establish freshness."
+                    );
                     // read_tool_output authenticates retained artifacts before returning
                     // this bounded excerpt. Freshness controls current proof, not access
                     // to historical bytes requested explicitly by the model.
@@ -2106,7 +2158,13 @@ impl ToolHistoryState {
                 None => {
                     // Legacy or missing provenance cannot safely establish that recovered
                     // output was independent of the workspace revision.
-                    requirements.insert(call_id.clone(), call_id.clone());
+                    requirements.insert(
+                        call_id.clone(),
+                        self.artifact_call_ids
+                            .get(&artifact_id)
+                            .cloned()
+                            .unwrap_or_else(|| call_id.clone()),
+                    );
                 }
             };
         }
@@ -2142,6 +2200,21 @@ impl ToolHistoryState {
             }
         }
         live.extend(self.artifact_reference_positions(items).into_keys());
+        let serialized = serde_json::to_string(items).unwrap_or_default();
+        for (artifact_id, (call_id, _, _)) in &self.internal_artifact_origins {
+            if serialized.contains(artifact_id) {
+                live.insert(call_id.clone());
+            }
+        }
+        let nested_calls = self
+            .code_mode_nested_evidence
+            .iter()
+            .filter(|(parent, _)| live.contains(*parent))
+            .flat_map(|(_, results)| results.keys().cloned())
+            .collect::<Vec<_>>();
+        live.extend(nested_calls);
+        self.internal_artifact_origins
+            .retain(|_, (call_id, _, _)| live.contains(call_id));
         self.candidates.retain(|call_id, _| live.contains(call_id));
         self.workspace_evidence
             .retain(|call_id, _| live.contains(call_id));
@@ -2208,6 +2281,11 @@ impl ToolHistoryState {
                     candidate.artifact_reference(),
                 )
             })
+            .chain(
+                self.internal_artifact_origins
+                    .iter()
+                    .map(|(id, (_, bytes, sha))| (id.clone(), (*bytes, sha.clone()))),
+            )
             .collect()
     }
 
@@ -2226,11 +2304,22 @@ impl ToolHistoryState {
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(index, _)| *index);
         let mut seen = BTreeSet::new();
-        let pins = candidates
+        let mut pins = candidates
             .into_iter()
             .filter(|(_, candidate)| seen.insert(candidate.artifact_id.clone()))
             .filter_map(|(_, candidate)| candidate.artifact_pin_value())
             .collect::<Vec<_>>();
+        let serialized = serde_json::to_string(items).ok()?;
+        pins.extend(
+            self.internal_artifact_origins
+                .iter()
+                .filter(|(id, _)| serialized.contains(id.as_str()) && seen.insert((*id).clone()))
+                .map(|(id, (call_id, bytes, sha))| {
+                    serde_json::json!({
+                        "artifact_id": id, "call_id": call_id, "bytes": bytes, "sha256": sha,
+                    })
+                }),
+        );
         let total = pins.len();
         if total == 0 {
             return None;
@@ -2271,6 +2360,10 @@ impl ToolHistoryState {
             live.contains(&candidate.artifact_id)
                 && expected.get(&candidate.artifact_id) == Some(&reference)
         });
+        self.internal_artifact_origins
+            .retain(|id, (_, bytes, sha)| {
+                live.contains(id) && expected.get(id) == Some(&(*bytes, sha.clone()))
+            });
         self.rebuild_artifact_index();
     }
 }
@@ -2719,7 +2812,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
 ) -> (ToolHistoryState, usize) {
     let workspace_evidence = state.workspace_evidence;
     let non_workspace_code_mode_calls = state.non_workspace_code_mode_calls;
-    let code_mode_nested_evidence = state.code_mode_nested_evidence;
+    let mut code_mode_nested_evidence = state.code_mode_nested_evidence;
     let mut reminted_by_identity = BTreeMap::<(String, u64, String), String>::new();
     let mut reminted_candidates = BTreeMap::new();
     let mut dropped_candidates = 0_usize;
@@ -2765,11 +2858,47 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         candidate.refresh_derived();
         reminted_candidates.insert(call_id, candidate);
     }
+    let mut internal_artifact_origins = BTreeMap::new();
+    for (id, (call_id, bytes, sha)) in state.internal_artifact_origins {
+        match remint_tool_history_artifact_for_thread(
+            codex_home,
+            source_thread_id,
+            target_thread_id,
+            &id,
+            bytes,
+            &sha,
+        )
+        .await
+        {
+            Ok(reminted) => {
+                for result in code_mode_nested_evidence
+                    .values_mut()
+                    .flat_map(|results| results.values_mut())
+                {
+                    if let Ok(mut pin) = serde_json::from_str::<serde_json::Value>(&result.output)
+                        && pin["artifact_id"] == id
+                    {
+                        pin["artifact_id"] = serde_json::json!(reminted);
+                        result.output = pin.to_string();
+                    }
+                }
+                internal_artifact_origins.insert(reminted, (call_id, bytes, sha));
+            }
+            Err(err) => {
+                tracing::warn!(%err, "failed to remint internal artifact");
+                dropped_candidates += 1;
+                for results in code_mode_nested_evidence.values_mut() {
+                    results.retain(|_, result| !result.output.contains(&id));
+                }
+            }
+        }
+    }
     let mut reminted_state = ToolHistoryState {
         candidates: reminted_candidates,
         workspace_evidence,
         non_workspace_code_mode_calls,
         code_mode_nested_evidence,
+        internal_artifact_origins,
         artifact_call_ids: BTreeMap::new(),
     };
     reminted_state.rebuild_artifact_index();
@@ -3908,9 +4037,6 @@ fn source_dependencies_from_arguments(
                         return BTreeSet::new();
                     }
                     dependencies.extend(command_dependencies);
-                    if dependencies.len() > 8 {
-                        return BTreeSet::new();
-                    }
                 }
                 return dependencies;
             }
@@ -4616,9 +4742,6 @@ fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDe
     if scopes.is_empty() {
         return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
     }
-    if scopes.len() > 8 {
-        return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
-    }
     scopes
         .into_iter()
         .map(PathBuf::from)
@@ -4637,7 +4760,7 @@ fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDe
 }
 
 fn dependencies_for_search_scopes(scopes: Vec<String>, cwd: &Path) -> BTreeSet<SourceDependencyV1> {
-    if scopes.is_empty() || scopes.len() > 8 {
+    if scopes.is_empty() {
         return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
     }
     scopes
@@ -4703,7 +4826,7 @@ fn dependencies_for_read_command(
         }
         paths.push(arg.as_str());
     }
-    if paths.is_empty() || paths.len() > 8 {
+    if paths.is_empty() {
         return BTreeSet::new();
     }
     paths

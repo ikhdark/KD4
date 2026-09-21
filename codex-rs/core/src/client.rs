@@ -224,6 +224,7 @@ struct ModelRequestMeasurements {
     prompt_context_categories: Vec<PromptContextMeasurement>,
     tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
     full_prompt_estimated_tokens: u64,
+    reusable_prompt_estimated_tokens: Option<u64>,
     fixed_prefix_reuse_eligible: bool,
     /// True once a previous request baseline existed for comparison, so an
     /// ineligible first request is not reported as changed categories.
@@ -244,6 +245,7 @@ struct ModelRequestMeasurements {
     /// The whole-history digest changes on every request by design, so it
     /// cannot tell an append from a rewrite. Per-item digests can.
     input_item_digests: Vec<[u8; 32]>,
+    fixed_prefix_item_count: usize,
     /// Filled by comparison against the preceding request; absent on the first.
     history_divergence: Option<HistoryPrefixDivergence>,
     /// Drops the aggregate output budget made in the representation this
@@ -302,9 +304,29 @@ struct PromptContextBaseline {
     ordered_fixed_hashes: Vec<(&'static str, [u8; 32])>,
     digests: PromptDigests,
     input_item_digests: Vec<[u8; 32]>,
+    fixed_prefix_item_count: usize,
+    full_prompt_estimated_tokens: u64,
 }
 
 impl ModelRequestMeasurements {
+    async fn compare_after_predecessor(
+        &mut self,
+        predecessor: Option<oneshot::Receiver<Option<PromptContextBaseline>>>,
+        initial_baseline: Option<PromptContextBaseline>,
+        prompt_cache_key: Option<&str>,
+        prompt_digests: PromptDigests,
+    ) -> Option<PromptContextBaseline> {
+        let mut baseline = match predecessor {
+            Some(predecessor) => predecessor.await.unwrap_or(None),
+            None => initial_baseline,
+        };
+        if self.prompt_context_categories.is_empty() {
+            return None;
+        }
+        self.compare_and_remember_prompt_context(&mut baseline, prompt_cache_key, prompt_digests);
+        baseline
+    }
+
     fn tokens(&self, category: PromptContextCategory) -> u64 {
         self.prompt_context_categories
             .iter()
@@ -653,6 +675,7 @@ impl ModelRequestMeasurements {
             prompt_context_categories: context.measurements(),
             tool_schema_breakdown,
             full_prompt_estimated_tokens,
+            reusable_prompt_estimated_tokens: None,
             fixed_prefix_reuse_eligible: false,
             prompt_context_baseline_compared: false,
             stable_context_manifest: StableContextManifest::default(),
@@ -666,6 +689,7 @@ impl ModelRequestMeasurements {
             previous_response_id_present: false,
             local_projection_policy_active: false,
             input_item_digests,
+            fixed_prefix_item_count: context.fixed_prefix_item_count,
             history_divergence: None,
             tool_output_budget_drop_count: 0,
             tool_output_budget_dropped_token_count: 0,
@@ -728,13 +752,33 @@ impl ModelRequestMeasurements {
         self.fixed_prefix_reuse_eligible = baseline.as_ref().is_some_and(|previous| {
             previous.prompt_cache_key.as_deref() == prompt_cache_key
                 && previous.ordered_fixed_hashes == ordered_fixed_hashes
+                && previous.fixed_prefix_item_count == self.fixed_prefix_item_count
+                && previous
+                    .input_item_digests
+                    .get(..previous.fixed_prefix_item_count)
+                    == self.input_item_digests.get(..self.fixed_prefix_item_count)
         });
+        self.reusable_prompt_estimated_tokens = baseline
+            .as_ref()
+            .filter(|_| {
+                self.fixed_prefix_reuse_eligible
+                    && self
+                        .history_divergence
+                        .is_some_and(|prefix| prefix.prefix_items_reused == prefix.items_previous)
+            })
+            .map(|previous| {
+                previous
+                    .full_prompt_estimated_tokens
+                    .min(self.full_prompt_estimated_tokens)
+            });
         *baseline = Some(PromptContextBaseline {
             prompt_cache_key: prompt_cache_key.map(str::to_string),
             category_hashes,
             ordered_fixed_hashes,
             digests,
             input_item_digests: self.input_item_digests.clone(),
+            fixed_prefix_item_count: self.fixed_prefix_item_count,
+            full_prompt_estimated_tokens: self.full_prompt_estimated_tokens,
         });
     }
 
@@ -773,6 +817,17 @@ impl ModelRequestMeasurements {
         self.previous_response_id_present = previous_response_id_present;
         self.local_projection_policy_active =
             manifest.projection_enabled() && !manifest.fail_open();
+    }
+
+    fn expected_reusable_input_tokens(&self, input_tokens: Option<i64>) -> Option<i64> {
+        let reusable = self.reusable_prompt_estimated_tokens?;
+        let input = u64::try_from(input_tokens?).ok()?;
+        i64::try_from(
+            input
+                .saturating_mul(reusable)
+                .checked_div(self.full_prompt_estimated_tokens)?,
+        )
+        .ok()
     }
 
     fn matched_task_reuse_eligible(&self) -> bool {
@@ -1386,7 +1441,8 @@ impl ModelAttemptGuard {
         if let Some(cache_coverage_bps) = cache_coverage_below_matched_task_baseline(
             self.measurements.matched_task_reuse_eligible(),
             outcome,
-            input_tokens,
+            self.measurements
+                .expected_reusable_input_tokens(input_tokens),
             cached_input_tokens,
         ) {
             warn!(
@@ -1580,6 +1636,7 @@ enum ModelAttemptState {
 }
 
 struct PendingModelAttempt {
+    turn_timing: Option<Arc<TurnTimingState>>,
     _diagnostic_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     identity: ResponseAttemptIdentity,
     clock: ModelAttemptClock,
@@ -1599,6 +1656,7 @@ impl ModelAttemptState {
         clock: ModelAttemptClock,
         task: tokio::task::JoinHandle<ModelAttemptGuard>,
         measurement_cancellation: CancellationToken,
+        turn_timing: Option<Arc<TurnTimingState>>,
     ) -> Self {
         // Bound optional work retained after provider completion. Saturation
         // cancels detail collection; usage and provider history remain authoritative.
@@ -1609,8 +1667,15 @@ impl ModelAttemptState {
             warn!(sampling_request_id = %identity.sampling_request_id, "model request diagnostics omitted: capacity exhausted");
             measurement_cancellation.cancel();
             task.abort();
+            if let Some(timing) = turn_timing.as_ref() {
+                timing.record_model_request_diagnostics_unavailable(
+                    &identity.sampling_request_id,
+                    &identity.physical_attempt_id,
+                );
+            }
         }
         Self::Pending(PendingModelAttempt {
+            turn_timing,
             _diagnostic_permit: permit,
             identity,
             clock,
@@ -1640,6 +1705,12 @@ impl ModelAttemptState {
                 Ok(attempt) => Some(attempt),
                 Err(err) => {
                     warn!(error = %err, "model attempt diagnostics task failed after dispatch");
+                    if let Some(timing) = pending.turn_timing.as_ref() {
+                        timing.record_model_request_diagnostics_unavailable(
+                            &pending.identity.sampling_request_id,
+                            &pending.identity.physical_attempt_id,
+                        );
+                    }
                     None
                 }
             },
@@ -1657,6 +1728,18 @@ async fn resolve_model_attempt(
     attempt: &mut Option<ModelAttemptState>,
 ) -> Option<ModelAttemptGuard> {
     attempt.take()?.resolve().await
+}
+
+fn finish_failed_model_attempt(attempt: &mut Option<ModelAttemptState>, items: Vec<ResponseItem>) {
+    if let Some(attempt) = attempt.take() {
+        attempt.clock().mark_completed();
+        // Diagnostics own their lifetime, but never delay transport recovery.
+        tokio::spawn(async move {
+            if let Some(mut attempt) = attempt.resolve().await {
+                attempt.finish(ModelAttemptOutcome::Failed, None, None, &items);
+            }
+        });
+    }
 }
 
 fn attempt_offsets_are_nondecreasing(offsets: &ModelAttemptOffsets, completed_us: u64) -> bool {
@@ -1941,6 +2024,7 @@ pub struct ModelClientSession {
     logical_sampling_request_count: u32,
     prompt_context_baseline: Arc<StdMutex<Option<PromptContextBaseline>>>,
     latest_measurement_attempt: Arc<StdMutex<Option<String>>>,
+    measurement_predecessor: Option<oneshot::Receiver<Option<PromptContextBaseline>>>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -2040,6 +2124,7 @@ struct WebsocketSession {
     last_request_history: Option<WebsocketHistoryBaseline>,
     next_history_generation: u64,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+    last_response: Option<LastResponse>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
 }
@@ -2049,7 +2134,6 @@ struct WebsocketSetupFingerprint([u8; 32]);
 
 struct PreparedStartupWebsocketAttempt {
     client_setup: CurrentClientSetup,
-    request: ResponsesApiRequest,
     transport_readiness_guard: Option<TurnTimingGuard>,
     request_transformation_guard: Option<TurnTimingGuard>,
 }
@@ -2183,7 +2267,7 @@ impl WebsocketSession {
         if self.setup_fingerprint != Some(setup_fingerprint)
             || connection.is_closed().await
             || !self.last_response_from_untraced_warmup
-            || self.last_response_rx.is_none()
+            || (self.last_response_rx.is_none() && self.last_response.is_none())
             || baseline.normalization_policy_version
                 != WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION
             || !responses_request_properties_match(previous_request, request)
@@ -2233,6 +2317,7 @@ impl WebsocketSession {
         self.last_request_history = None;
         self.next_history_generation = 0;
         self.last_response_rx = None;
+        self.last_response = None;
         self.last_response_from_untraced_warmup = false;
         self.set_connection_reused(/*connection_reused*/ false);
         self
@@ -2332,6 +2417,7 @@ impl ModelClient {
             websocket_cache_publication: Some(websocket_cache_publication),
             prepared_startup_websocket_attempt: None,
             latest_measurement_attempt: Default::default(),
+            measurement_predecessor: None,
             tool_history_fail_open_pending: false,
             last_stream_was_websocket: false,
             effective_input: None,
@@ -2351,6 +2437,7 @@ impl ModelClient {
             websocket_cache_publication: None,
             prepared_startup_websocket_attempt: None,
             latest_measurement_attempt: Default::default(),
+            measurement_predecessor: None,
             tool_history_fail_open_pending: false,
             last_stream_was_websocket: false,
             effective_input: None,
@@ -3138,7 +3225,6 @@ impl ModelClientSession {
 
         self.prepared_startup_websocket_attempt = Some(PreparedStartupWebsocketAttempt {
             client_setup,
-            request,
             transport_readiness_guard,
             request_transformation_guard,
         });
@@ -3177,6 +3263,7 @@ impl ModelClientSession {
     /// history replacement, and any model-visible state change. Reconnects and
     /// request-property/model changes are also guarded locally below.
     pub(crate) fn invalidate_incremental_history(&mut self, reason: &'static str) {
+        self.prepared_startup_websocket_attempt = None;
         if let Some(baseline) = self.websocket_session.last_request_history.as_ref() {
             trace!(
                 reason,
@@ -3187,6 +3274,7 @@ impl ModelClientSession {
         self.websocket_session.last_request = None;
         self.websocket_session.last_request_history = None;
         self.websocket_session.last_response_rx = None;
+        self.websocket_session.last_response = None;
         self.websocket_session.last_response_from_untraced_warmup = false;
         self.websocket_session.next_history_generation = self
             .websocket_session
@@ -3200,6 +3288,11 @@ impl ModelClientSession {
     /// transport for the next complete request.
     pub(crate) fn invalidate_provider_history_inheritance(&mut self, reason: &'static str) {
         self.invalidate_incremental_history(reason);
+        self.measurement_predecessor = None;
+        *self
+            .latest_measurement_attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self
             .prompt_context_baseline
             .lock()
@@ -3457,14 +3550,17 @@ impl ModelClientSession {
     }
 
     fn get_last_response(&mut self) -> Option<LastResponse> {
-        let response = self
-            .websocket_session
-            .last_response_rx
-            .take()
-            .and_then(|mut receiver| match receiver.try_recv() {
-                Ok(last_response) => Some(last_response),
-                Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => None,
-            });
+        if let Some(receiver) = self.websocket_session.last_response_rx.as_mut() {
+            match receiver.try_recv() {
+                Ok(response) => {
+                    self.websocket_session.last_response = Some(response);
+                    self.websocket_session.last_response_rx = None;
+                }
+                Err(TryRecvError::Closed) => self.websocket_session.last_response_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        let response = self.websocket_session.last_response.clone();
         if response
             .as_ref()
             .is_some_and(|last_response| !last_response.response_id.is_empty())
@@ -3918,6 +4014,8 @@ impl ModelClientSession {
                 .await;
             if stream_result.is_ok() {
                 attempt_clock.mark_stream_established();
+            } else {
+                attempt_clock.mark_completed();
             }
             self.effective_input = Some(Arc::clone(&request.input));
             let prompt_cache_key = request.prompt_cache_key.clone();
@@ -3949,6 +4047,14 @@ impl ModelClientSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(attempt_identity.physical_attempt_id.clone());
             let latest_measurement_attempt = Arc::clone(&self.latest_measurement_attempt);
+            let predecessor = self.measurement_predecessor.take();
+            let initial_baseline = self
+                .prompt_context_baseline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let (baseline_sender, baseline_receiver) = oneshot::channel();
+            self.measurement_predecessor = Some(baseline_receiver);
             let attempt_task_identity = attempt_identity.clone();
             let attempt_task_clock = attempt_clock.clone();
             let attempt_task_telemetry = request_session_telemetry.clone();
@@ -3974,22 +4080,31 @@ impl ModelClientSession {
                     ModelAttemptProviderBaseline::StatelessFull,
                     /*previous_response_id_present*/ false,
                 );
+                // Compare with the dispatched predecessor even when it finishes late.
+                let baseline = measurements
+                    .compare_after_predecessor(
+                        predecessor,
+                        initial_baseline,
+                        prompt_cache_key.as_deref(),
+                        prompt_digests,
+                    )
+                    .await;
                 let latest_attempt = latest_measurement_attempt
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if latest_attempt.as_deref()
                     == Some(attempt_task_identity.physical_attempt_id.as_str())
                 {
-                    measurements.compare_and_remember_prompt_context(
-                        &mut prompt_context_baseline
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        prompt_cache_key.as_deref(),
-                        prompt_digests,
-                    );
+                    *prompt_context_baseline
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = baseline.clone();
                 }
                 drop(latest_attempt);
-                if let Some(timing) = turn_timing.as_ref() {
+                let _ = baseline_sender.send(baseline);
+                if let Some(timing) = turn_timing
+                    .as_ref()
+                    .filter(|_| !measurements.prompt_context_categories.is_empty())
+                {
                     timing.record_model_request_token_categories(
                         &attempt_task_identity.sampling_request_id,
                         &attempt_task_identity.physical_attempt_id,
@@ -4000,6 +4115,14 @@ impl ModelClientSession {
                         &attempt_task_identity.physical_attempt_id,
                         measurements.fixed_prefix_reuse_eligible,
                         prompt_cache_key.as_deref(),
+                    );
+                }
+                if measurements.prompt_context_categories.is_empty()
+                    && let Some(timing) = turn_timing.as_ref()
+                {
+                    timing.record_model_request_diagnostics_unavailable(
+                        &attempt_task_identity.sampling_request_id,
+                        &attempt_task_identity.physical_attempt_id,
                     );
                 }
                 ModelAttemptGuard::new(
@@ -4025,6 +4148,7 @@ impl ModelClientSession {
                 attempt_clock,
                 attempt_task,
                 measurement_cancellation,
+                self.turn_timing.clone(),
             ));
 
             match stream_result {
@@ -4050,9 +4174,7 @@ impl ModelClientSession {
                             /*output_items*/ &[],
                         )
                         .await;
-                    if let Some(mut attempt) = resolve_model_attempt(&mut attempt).await {
-                        attempt.finish(ModelAttemptOutcome::Failed, None, None, &[]);
-                    }
+                    finish_failed_model_attempt(&mut attempt, Vec::new());
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -4076,9 +4198,7 @@ impl ModelClientSession {
                             /*output_items*/ &[],
                         )
                         .await;
-                    if let Some(mut attempt) = resolve_model_attempt(&mut attempt).await {
-                        attempt.finish(ModelAttemptOutcome::Failed, None, None, &[]);
-                    }
+                    finish_failed_model_attempt(&mut attempt, Vec::new());
                     return Err(err);
                 }
             }
@@ -4134,15 +4254,26 @@ impl ModelClientSession {
                 match prepared_attempt {
                     Some(PreparedStartupWebsocketAttempt {
                         client_setup,
-                        request,
                         transport_readiness_guard,
                         request_transformation_guard,
-                    }) => (
-                        client_setup,
-                        request,
-                        transport_readiness_guard,
-                        request_transformation_guard,
-                    ),
+                    }) => {
+                        // Setup is reusable; request inputs may have changed since the claim.
+                        let request = self.client.build_responses_request(
+                            &client_setup.api_provider,
+                            prompt,
+                            model_info,
+                            effort.clone(),
+                            summary,
+                            service_tier.clone(),
+                            responses_metadata,
+                        )?;
+                        (
+                            client_setup,
+                            request,
+                            transport_readiness_guard,
+                            request_transformation_guard,
+                        )
+                    }
                     None => {
                         let transport_readiness_guard = self.turn_timing.as_ref().map(|timing| {
                             timing.begin_local_phase(TurnLocalPhase::TransportReadiness)
@@ -4450,7 +4581,7 @@ impl ModelClientSession {
                         }
                         drop(serialization_timing_guard);
                         drop(transport_readiness_guard);
-                        if let Some(timing) = turn_timing {
+                        if !warmup && let Some(timing) = turn_timing {
                             timing.mark_model_request_dispatched();
                         }
                     },
@@ -4461,6 +4592,11 @@ impl ModelClientSession {
                     },
                 )
                 .await;
+            if stream_result.is_err()
+                && let Some(clock) = attempt_clock.as_ref()
+            {
+                clock.mark_completed();
+            }
             let mut attempt = match (
                 logical_request_for_measurement,
                 attempt_clock,
@@ -4492,6 +4628,14 @@ impl ModelClientSession {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(attempt_identity.physical_attempt_id.clone());
                     let latest_measurement_attempt = Arc::clone(&self.latest_measurement_attempt);
+                    let predecessor = self.measurement_predecessor.take();
+                    let initial_baseline = self
+                        .prompt_context_baseline
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let (baseline_sender, baseline_receiver) = oneshot::channel();
+                    self.measurement_predecessor = Some(baseline_receiver);
                     let attempt_task_identity = attempt_identity.clone();
                     let attempt_task_clock = attempt_clock.clone();
                     let attempt_task_telemetry = request_session_telemetry.clone();
@@ -4517,22 +4661,32 @@ impl ModelClientSession {
                             provider_baseline,
                             previous_response_id_present,
                         );
+                        // Compare with the dispatched predecessor even when it finishes late.
+                        let baseline = measurements
+                            .compare_after_predecessor(
+                                predecessor,
+                                initial_baseline,
+                                prompt_cache_key.as_deref(),
+                                prompt_digests,
+                            )
+                            .await;
                         let latest_attempt = latest_measurement_attempt
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if latest_attempt.as_deref()
                             == Some(attempt_task_identity.physical_attempt_id.as_str())
                         {
-                            measurements.compare_and_remember_prompt_context(
-                                &mut prompt_context_baseline
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                                prompt_cache_key.as_deref(),
-                                prompt_digests,
-                            );
+                            *prompt_context_baseline
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                baseline.clone();
                         }
                         drop(latest_attempt);
-                        if let Some(timing) = turn_timing.as_ref() {
+                        let _ = baseline_sender.send(baseline);
+                        if let Some(timing) = turn_timing
+                            .as_ref()
+                            .filter(|_| !measurements.prompt_context_categories.is_empty())
+                        {
                             timing.record_model_request_token_categories(
                                 &attempt_task_identity.sampling_request_id,
                                 &attempt_task_identity.physical_attempt_id,
@@ -4543,6 +4697,14 @@ impl ModelClientSession {
                                 &attempt_task_identity.physical_attempt_id,
                                 measurements.fixed_prefix_reuse_eligible,
                                 prompt_cache_key.as_deref(),
+                            );
+                        }
+                        if measurements.prompt_context_categories.is_empty()
+                            && let Some(timing) = turn_timing.as_ref()
+                        {
+                            timing.record_model_request_diagnostics_unavailable(
+                                &attempt_task_identity.sampling_request_id,
+                                &attempt_task_identity.physical_attempt_id,
                             );
                         }
                         ModelAttemptGuard::new(
@@ -4564,6 +4726,7 @@ impl ModelClientSession {
                         attempt_clock,
                         attempt_task,
                         measurement_cancellation,
+                        self.turn_timing.clone(),
                     ))
                 }
                 _ => None,
@@ -4581,9 +4744,7 @@ impl ModelClientSession {
                             /*output_items*/ &[],
                         )
                         .await;
-                    if let Some(mut attempt) = resolve_model_attempt(&mut attempt).await {
-                        attempt.finish(ModelAttemptOutcome::Failed, None, None, &[]);
-                    }
+                    finish_failed_model_attempt(&mut attempt, Vec::new());
                     return Err(err);
                 }
             };
@@ -4603,6 +4764,7 @@ impl ModelClientSession {
                 attempt,
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
+            self.websocket_session.last_response = None;
             return Ok(WebsocketStreamOutcome::Stream(stream));
         }
     }
@@ -5107,7 +5269,7 @@ where
     tokio::spawn(async move {
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
-        let (request_start, mut ttft_ms) = (Instant::now(), None);
+        let mut ttft_ms = None;
         let mut api_stream = api_stream;
         let upstream_request_id = upstream_request_id.as_deref();
         if let Some(upstream_request_id) = upstream_request_id {
@@ -5140,6 +5302,20 @@ where
                 clock.mark_first_provider_event();
                 if response_event_records_model_output(response_event) {
                     clock.mark_first_model_output();
+                    ttft_ms.get_or_insert_with(|| {
+                        let offsets = clock
+                            .offsets
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        i64::try_from(
+                            offsets
+                                .first_model_output_us
+                                .unwrap_or_default()
+                                .saturating_sub(offsets.dispatch_ready_us)
+                                / 1_000,
+                        )
+                        .unwrap_or(i64::MAX)
+                    });
                 }
                 if response_event_records_actionable_output(response_event) {
                     clock.mark_first_actionable_output();
@@ -5236,11 +5412,6 @@ where
                     return;
                 }
                 Ok(event) => {
-                    if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {
-                        ttft_ms = Some(
-                            i64::try_from(request_start.elapsed().as_millis()).unwrap_or(i64::MAX),
-                        );
-                    }
                     if tx_event.send(Ok(event)).await.is_err() {
                         inference_trace_attempt
                             .record_cancelled(
@@ -5256,6 +5427,9 @@ where
                     }
                 }
                 Err(err) => {
+                    if let Some(attempt) = attempt.as_ref() {
+                        attempt.clock().mark_completed();
+                    }
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
                     let upstream_request_id =
@@ -5271,12 +5445,14 @@ where
                     if tx_event.send(Err(mapped)).await.is_err() {
                         return;
                     }
-                    if let Some(mut attempt) = resolve_model_attempt(&mut attempt).await {
-                        attempt.finish(ModelAttemptOutcome::Failed, None, None, &items_added);
-                    }
+                    drop(tx_event);
+                    finish_failed_model_attempt(&mut attempt, items_added);
                     return;
                 }
             }
+        }
+        if let Some(attempt) = attempt.as_ref() {
+            attempt.clock().mark_completed();
         }
         let mapped = provider.map_api_error(ApiError::Stream(
             "stream closed before response.completed".to_string(),
@@ -5290,9 +5466,8 @@ where
                 &items_added,
             )
             .await;
-        if let Some(mut attempt) = resolve_model_attempt(&mut attempt).await {
-            attempt.finish(ModelAttemptOutcome::Failed, None, None, &items_added);
-        }
+        drop(tx_event);
+        finish_failed_model_attempt(&mut attempt, items_added);
     });
 
     (

@@ -87,6 +87,8 @@ pub(crate) use read_file::ReadFileHandler;
 pub use read_tool_output::ReadToolOutputHandler;
 #[cfg(test)]
 pub(crate) use read_tool_output::execute_recovery_transaction;
+#[cfg(test)]
+pub(crate) use read_tool_output::execute_recovery_transaction_with_continuations;
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;

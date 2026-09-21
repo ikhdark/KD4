@@ -669,8 +669,26 @@ impl ToolOutput for FunctionToolOutput {
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
         let canonical_body = self.canonical_body.as_ref().unwrap_or(&self.body);
         match canonical_body.as_slice() {
-            [FunctionCallOutputContentItem::InputText { text }] => {
-                Some(CanonicalToolResult::text(text.clone()))
+            items
+                if items.iter().all(|item| {
+                    matches!(item, FunctionCallOutputContentItem::InputText { .. })
+                }) =>
+            {
+                // Keep real line boundaries when command-state receipts or hook
+                // feedback add text items. JSON-encoding the combined string
+                // makes line/search recovery see an escaped one-line wrapper.
+                Some(CanonicalToolResult::text(
+                    items
+                        .iter()
+                        .filter_map(|item| match item {
+                            FunctionCallOutputContentItem::InputText { text } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
             }
             _ => {
                 let canonical_output = Self {

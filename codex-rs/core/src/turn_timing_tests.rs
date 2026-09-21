@@ -511,7 +511,7 @@ fn first_useful_action_and_first_model_output_are_distinct_milestones() {
     );
 
     let snapshot = state.complete_snapshot();
-    assert_eq!(snapshot.time_to_first_token_ms, Some(5));
+    assert_eq!(snapshot.time_to_first_token_ms, Some(20));
     let timing = snapshot.protocol_timing();
     assert_eq!(timing.milestones.user_input_recorded_ms, Some(2));
     assert_eq!(timing.milestones.first_tool_accepted_ms, Some(6));
@@ -1456,7 +1456,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 27);
+    assert_eq!(timing.schema_version, 28);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -2112,7 +2112,7 @@ fn repeated_wait_uses_exact_purpose() {
     drop(state.begin_model_request_wait());
 
     let counters = state.complete_snapshot().protocol_timing().counters;
-    assert_eq!(counters.exact_repeated_wait_count, 1);
+    assert_eq!(counters.wait_generations_with_same_revision_count, 1);
 }
 
 #[test]
@@ -2187,7 +2187,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 27);
+    assert_eq!(profile.schema_version, 28);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -2454,7 +2454,7 @@ fn wait_and_tool_output_counters_are_additive() {
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.wait_only_generation_count, 1);
     assert_eq!(counters.internally_drained_wait_count, 7);
-    assert_eq!(counters.residual_deterministic_generation_count, 1);
+    assert_eq!(counters.residual_deterministic_generation_count, Some(1));
     assert_eq!(counters.owner_drained_continuation_count, 1);
     assert_eq!(counters.executed_validation_count, 1);
     assert_eq!(counters.executed_validation_duration_ns, 125_000_000);
@@ -2941,4 +2941,95 @@ fn prepared_request_is_not_counted_until_dispatched() {
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.model_request_count, 1);
     assert_eq!(counters.attempts_by_kind.primary, 1);
+}
+
+#[test]
+fn completed_snapshot_accepts_keyed_late_diagnostics_without_changing_duration() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("sampling", "physical");
+    clock.set_ms(10);
+    let before = state.complete_snapshot();
+    assert_eq!(
+        before.protocol_timing().model_requests[0].request_diagnostics_status,
+        codex_protocol::protocol::TurnTimingRequestDiagnosticsStatus::Pending
+    );
+    clock.set_ms(100);
+    state.record_model_request_token_categories(
+        "sampling",
+        "physical",
+        codex_protocol::protocol::TurnTimingRequestTokenCategories {
+            logical_total: 123,
+            ..Default::default()
+        },
+    );
+    state.record_model_request_cache_identity("sampling", "physical", true, Some("cache"));
+    let after = state.complete_snapshot();
+    assert_eq!(after.duration_ms, before.duration_ms);
+    let row = &after.protocol_timing().model_requests[0];
+    assert_eq!(
+        row.request_token_categories.as_ref().unwrap().logical_total,
+        123
+    );
+    assert_eq!(row.fixed_prefix_reuse_eligible, Some(true));
+    assert!(row.prompt_cache_key_fingerprint.is_some());
+    assert_eq!(
+        row.request_diagnostics_status,
+        codex_protocol::protocol::TurnTimingRequestDiagnosticsStatus::Complete
+    );
+}
+
+#[test]
+fn late_tool_timing_uses_captured_generation_identity() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+    let original = state.sampling_generation_id();
+    state.begin_model_generation(
+        &mut Some(ContinuationCause::ToolResult),
+        &SessionSource::Cli,
+    );
+    drop(state.begin_model_request_wait());
+    assert_ne!(original, state.sampling_generation_id());
+    state.record_tool_dispatch_timing(
+        "late",
+        "read_file",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage {
+            parent_call_id: None,
+            parent_cell_id: None,
+            runtime_tool_call_id: None,
+        },
+        ToolDispatchTimingSnapshot {
+            sampling_generation_id: codex_protocol::protocol::SamplingGenerationId(
+                original.clone(),
+            ),
+            outcome: Some("success"),
+            ..Default::default()
+        },
+    );
+    let timing = state.complete_snapshot().protocol_timing();
+    let row = &timing.tool_calls[0];
+    assert_eq!(row.sampling_generation_id.0, original);
+    assert_eq!(
+        row.generation_index,
+        Some(timing.model_requests[0].generation_index)
+    );
+}
+
+#[test]
+fn overlapping_legacy_guards_do_not_invalidate_modern_model_tool_overlap() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let sampling = state.begin_sampling();
+    let model = state.begin_model_request_wait();
+    let tool = state.begin_tool_execution();
+    let legacy_tool = state.begin_tool_blocking();
+    clock.set_ms(10);
+    drop((legacy_tool, tool, model, sampling));
+    let profile = state.complete_snapshot().profile;
+    assert!(profile.profile_valid);
+    assert_eq!(profile.counters.invalid_transition_count, 0);
+    assert_eq!(profile.exclusive.model_tool_overlap_ns, 10 * NS_PER_MS);
 }

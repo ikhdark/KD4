@@ -6,6 +6,7 @@ use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorResult;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
+#[cfg(test)]
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -51,11 +52,41 @@ const CODE_MODE_RECOVERY_TOKEN_CEILING: usize =
         .saturating_sub(CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS);
 
 #[derive(Debug)]
-struct DrainedRecoveryTransaction {
-    output: ReadToolOutputResult,
+pub(crate) struct DrainedRecoveryTransaction {
+    pub(crate) output: ReadToolOutputResult,
     reused: bool,
     drained_continuation_pages: u32,
     continuation_stop: Option<RecoveryContinuationStopV1>,
+}
+
+fn recovery_envelope(
+    output: &ReadToolOutputResult,
+    stop: Option<&RecoveryContinuationStopV1>,
+) -> serde_json::Result<Value> {
+    let mut value = serde_json::to_value(output)?;
+    if let (Some(stop), Some(object)) = (stop, value.as_object_mut()) {
+        object.insert("continuation_stop".to_string(), serde_json::to_value(stop)?);
+    }
+    Ok(value)
+}
+
+fn recovery_envelope_fits(
+    output: &ReadToolOutputResult,
+    stop: Option<&RecoveryContinuationStopV1>,
+    ceiling: usize,
+) -> bool {
+    recovery_envelope(output, stop)
+        .and_then(|value| serde_json::to_string(&value))
+        .is_ok_and(|text| codex_utils_string::approx_token_count(&text) <= ceiling)
+}
+
+struct RecoveryCheckpoint {
+    index: usize,
+    selector: ToolOutputSelector,
+    length: usize,
+    complete: bool,
+    continuation: Option<ToolOutputSelector>,
+    owner_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -92,10 +123,12 @@ enum ContinuationStep {
 }
 
 struct RecoveryContinuationState {
+    checkpoints: Vec<RecoveryCheckpoint>,
     initial_result_count: usize,
     output: ReadToolOutputResult,
     reused: bool,
-    followed_selectors: Vec<ToolOutputSelector>,
+    followed_selectors: Vec<(usize, ToolOutputSelector)>,
+    result_owners: Vec<usize>,
     drained_continuation_pages: u32,
     token_ceiling: usize,
     continuation_stop: Option<RecoveryContinuationStopV1>,
@@ -104,7 +137,9 @@ struct RecoveryContinuationState {
 impl RecoveryContinuationState {
     fn new(output: ReadToolOutputResult, reused: bool, token_ceiling: usize) -> Self {
         Self {
+            checkpoints: Vec::new(),
             initial_result_count: output.results.len(),
+            result_owners: (0..output.results.len()).collect(),
             output,
             reused,
             followed_selectors: Vec::new(),
@@ -216,7 +251,10 @@ impl RecoveryContinuationState {
             {
                 continue;
             }
-            if self.followed_selectors.contains(selector) {
+            if self
+                .followed_selectors
+                .contains(&(self.result_owners[result_index], selector.clone()))
+            {
                 return ContinuationStep::Stop(ContinuationStopReason::RepeatedSelector);
             }
             return ContinuationStep::Follow {
@@ -266,6 +304,10 @@ impl RecoveryContinuationState {
         }
         // Keep already-drained pages in traversal order. Inserting every page
         // immediately after the owner reverses multi-page continuations.
+        self.result_owners.extend(std::iter::repeat_n(
+            self.result_owners[result_index],
+            page.results.len(),
+        ));
         self.output.results.extend(page.results);
         self.output.complete = self.output.unavailable_ranges.is_empty()
             && self.output.results.iter().all(|result| {
@@ -273,10 +315,11 @@ impl RecoveryContinuationState {
                     && result.complete
                     && result.continuation.is_none()
             });
-        if !recovery_result_fits_token_ceiling(&self.output, self.token_ceiling) {
+        if !recovery_result_fits_token_ceiling(&self.reconstructed_output(), self.token_ceiling) {
             // Roll back only this page rather than copying every accumulated
             // page for each budget check.
             self.output.results.truncate(previous_length);
+            self.result_owners.truncate(previous_length);
             self.output.complete = previous_complete;
             let predecessor = &mut self.output.results[result_index];
             predecessor.continuation = previous_continuation;
@@ -284,16 +327,24 @@ impl RecoveryContinuationState {
             return Err(ContinuationStopReason::Budget);
         }
 
-        self.followed_selectors.push(selector.clone());
+        self.followed_selectors
+            .push((self.result_owners[result_index], selector.clone()));
+        self.checkpoints.push(RecoveryCheckpoint {
+            index: result_index,
+            selector: selector.clone(),
+            length: previous_length,
+            complete: previous_complete,
+            continuation: previous_continuation,
+            owner_complete: predecessor_was_complete,
+        });
         self.drained_continuation_pages = self.drained_continuation_pages.saturating_add(1);
         Ok(())
     }
 
-    fn finish(mut self) -> DrainedRecoveryTransaction {
+    fn reconstructed_output(&self) -> ReadToolOutputResult {
         // Replace overflow descriptors only after exact, gap-free coverage is
         // proven. Appended byte pages are transport fragments, not extra selections.
-        if self.continuation_stop.is_none()
-            && self.output.unavailable_ranges.is_empty()
+        if self.output.unavailable_ranges.is_empty()
             && self.output.results[..self.initial_result_count]
                 .iter()
                 .any(|owner| owner.status != ToolOutputSelectorStatus::Ok)
@@ -304,9 +355,7 @@ impl RecoveryContinuationState {
                 if owner.status == ToolOutputSelectorStatus::Ok {
                     continue;
                 }
-                if let Some(exact) =
-                    reconstruct_selection(owner, &self.output.results[self.initial_result_count..])
-                {
+                if let Some(exact) = reconstruct_selection(owner, &self.output.results) {
                     recovered_owners.push((exact.selector.clone(), exact.canonical_range));
                     *owner = exact;
                 }
@@ -334,10 +383,90 @@ impl RecoveryContinuationState {
                         && r.complete
                         && r.continuation.is_none()
                 });
-                if recovery_result_fits_token_ceiling(&reconstructed, self.token_ceiling) {
-                    self.output = reconstructed;
-                }
+                return reconstructed;
             }
+        }
+        self.output.clone()
+    }
+
+    // Charge unrelated selections and already accepted payload before reading
+    // another page. The active owner's overflow descriptor and fragment
+    // envelopes will be replaced by its exact selection.
+    fn page_token_ceiling(&self, result_index: usize) -> usize {
+        let owner = self.result_owners[result_index];
+        let occupied = self
+            .output
+            .results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                if self.result_owners[index] != owner {
+                    serde_json::to_string(result).ok()
+                } else if result.status == ToolOutputSelectorStatus::Ok {
+                    // Keep the byte cost already recovered for this owner, while
+                    // crediting the fragment envelope removed by reconstruction.
+                    result
+                        .text
+                        .as_ref()
+                        .or(result.data_base64.as_ref())
+                        .and_then(|text| serde_json::to_string(text).ok())
+                        .or_else(|| {
+                            result
+                                .value
+                                .as_ref()
+                                .and_then(|value| serde_json::to_string(value).ok())
+                        })
+                } else {
+                    None
+                }
+            })
+            .map(|text| codex_utils_string::approx_token_count(&text))
+            .sum::<usize>();
+        self.token_ceiling.saturating_sub(occupied)
+    }
+
+    fn cached_page(&self, selector: &ToolOutputSelector) -> Option<ReadToolOutputResult> {
+        let mut owner = self.output.results.first()?.clone();
+        owner.selector = selector.clone();
+        owner.canonical_range = match selector {
+            ToolOutputSelector::Bytes { start, end } => {
+                Some(codex_tools::CanonicalByteRange::new(*start, *end))
+            }
+            _ => None,
+        };
+        let exact = reconstruct_selection(&owner, &self.output.results)?;
+        let mut page = self.output.clone();
+        page.results = vec![exact];
+        page.complete = true;
+        Some(page)
+    }
+
+    fn finish(mut self) -> DrainedRecoveryTransaction {
+        loop {
+            let reconstructed = self.reconstructed_output();
+            if recovery_envelope_fits(
+                &reconstructed,
+                self.continuation_stop.as_ref(),
+                self.token_ceiling,
+            ) {
+                self.output = reconstructed;
+                break;
+            }
+            let Some(checkpoint) = self.checkpoints.pop() else {
+                // Error text is optional metadata; recovered source bytes remain exact.
+                if let Some(stop) = self.continuation_stop.as_mut() {
+                    stop.message = None;
+                }
+                break;
+            };
+            self.output.results.truncate(checkpoint.length);
+            self.result_owners.truncate(checkpoint.length);
+            self.output.complete = checkpoint.complete;
+            self.output.results[checkpoint.index].continuation = checkpoint.continuation;
+            self.output.results[checkpoint.index].complete = checkpoint.owner_complete;
+            self.followed_selectors.pop();
+            self.drained_continuation_pages = self.drained_continuation_pages.saturating_sub(1);
+            self.record_stop(ContinuationStopReason::Budget, Some(checkpoint.selector));
         }
         DrainedRecoveryTransaction {
             output: self.output,
@@ -366,9 +495,13 @@ fn reconstruct_selection(
         .filter(|page| {
             page.status == ToolOutputSelectorStatus::Ok
                 && page.complete
+                && page.continuation.is_none()
+                // JSON values and search metadata are not canonical byte
+                // fragments, even when their selected ranges overlap.
+                && (page.text.is_some() || page.data_base64.is_some())
                 && page
                     .canonical_range
-                    .is_some_and(|r| range.start <= r.start && r.end <= range.end)
+                    .is_some_and(|r| r.start < range.end && range.start < r.end)
         })
         .collect::<Vec<_>>();
     pages.sort_by_key(|page| page.canonical_range.map(|r| r.start));
@@ -376,7 +509,10 @@ fn reconstruct_selection(
     let mut bytes = Vec::new();
     for page in pages {
         let page_range = page.canonical_range?;
-        if page_range.start != cursor {
+        if page_range.end <= cursor {
+            continue;
+        }
+        if page_range.start > cursor {
             return None;
         }
         let fragment = if let Some(text) = &page.text {
@@ -389,8 +525,12 @@ fn reconstruct_selection(
         if fragment.len() as u64 != page_range.end.checked_sub(page_range.start)? {
             return None;
         }
-        bytes.extend(fragment);
-        cursor = page_range.end;
+        let end = page_range.end.min(range.end);
+        bytes.extend_from_slice(
+            &fragment[usize::try_from(cursor - page_range.start).ok()?
+                ..usize::try_from(end - page_range.start).ok()?],
+        );
+        cursor = end;
     }
     if cursor != range.end || bytes.len() as u64 != range.end.checked_sub(range.start)? {
         return None;
@@ -624,19 +764,9 @@ async fn handle_read_tool_output(
         drained_continuation_pages,
     );
     let semantic_evidence = read_tool_output_semantic_evidence(&output, continuation_stop.as_ref());
-    let mut output = serde_json::to_value(output).map_err(|err| {
+    let output = recovery_envelope(&output, continuation_stop.as_ref()).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
-    if let (Some(stop), Some(object)) = (continuation_stop, output.as_object_mut()) {
-        object.insert(
-            "continuation_stop".to_string(),
-            serde_json::to_value(stop).map_err(|err| {
-                FunctionCallError::RespondToModel(format!(
-                    "failed to serialize recovery continuation stop: {err}"
-                ))
-            })?,
-        );
-    }
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
         inner: JsonToolOutput::new(output),
         exact_recovery: exact_recovery_receipt,
@@ -745,6 +875,7 @@ fn read_tool_output_semantic_evidence(
     )]
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_recovery_transaction(
     codex_home: &Path,
     thread_id: &str,
@@ -766,7 +897,7 @@ pub(crate) async fn execute_recovery_transaction(
     }
 }
 
-async fn execute_recovery_transaction_with_continuations(
+pub(crate) async fn execute_recovery_transaction_with_continuations(
     codex_home: &Path,
     thread_id: &str,
     artifact_id: &str,
@@ -774,19 +905,28 @@ async fn execute_recovery_transaction_with_continuations(
     code_mode_recovery: bool,
     cancellation_token: &CancellationToken,
 ) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
-    let (output, reused) = execute_recovery_transaction(
-        codex_home,
-        thread_id,
-        artifact_id,
-        selectors,
-        code_mode_recovery,
-    )
-    .await?;
     let token_ceiling = if code_mode_recovery {
         CODE_MODE_RECOVERY_TOKEN_CEILING
     } else {
         RECOVERY_AGGREGATE_TOKEN_CEILING
     };
+    // Reserve stop metadata, including caller-supplied selectors. Byte continuations
+    // fit within the fixed allowance; arbitrary error text is checked at finalization.
+    let reserve = selectors
+        .iter()
+        .filter_map(|selector| serde_json::to_string(selector).ok())
+        .map(|text| codex_utils_string::approx_token_count(&text))
+        .max()
+        .unwrap_or_default()
+        .saturating_add(256);
+    let (output, reused) = read_tool_output_selectors_with_ceiling_and_reuse(
+        codex_home,
+        thread_id,
+        artifact_id,
+        selectors,
+        token_ceiling.saturating_sub(reserve),
+    )
+    .await?;
     let mut state = RecoveryContinuationState::new(output, reused, token_ceiling);
     loop {
         let (result_index, selector) = match state.next_step() {
@@ -805,14 +945,23 @@ async fn execute_recovery_transaction_with_continuations(
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
         }
-        let page = execute_recovery_transaction(
-            codex_home,
-            thread_id,
-            artifact_id,
-            vec![selector.clone()],
-            code_mode_recovery,
-        )
-        .await;
+        let page = if let Some(page) = state.cached_page(&selector) {
+            Ok((page, true))
+        } else {
+            let ceiling = state.page_token_ceiling(result_index);
+            if ceiling == 0 {
+                state.record_stop(ContinuationStopReason::Budget, Some(selector));
+                break;
+            }
+            read_tool_output_selectors_with_ceiling_and_reuse(
+                codex_home,
+                thread_id,
+                artifact_id,
+                vec![selector.clone()],
+                ceiling,
+            )
+            .await
+        };
         if cancellation_token.is_cancelled() {
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
@@ -829,7 +978,18 @@ async fn execute_recovery_transaction_with_continuations(
             break;
         }
     }
-    Ok(state.finish())
+    let result = state.finish();
+    if !recovery_envelope_fits(
+        &result.output,
+        result.continuation_stop.as_ref(),
+        token_ceiling,
+    ) {
+        return Err(ReadToolOutputError::InvalidRange(
+            "Recovery metadata exceeds the output budget; request fewer or smaller selectors."
+                .to_string(),
+        ));
+    }
+    Ok(result)
 }
 
 fn recovery_result_fits_token_ceiling(output: &ReadToolOutputResult, token_ceiling: usize) -> bool {
@@ -1190,6 +1350,54 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_json_selection_does_not_block_byte_reconstruction() {
+        let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        owner.selector = ToolOutputSelector::Bytes { start: 0, end: 4 };
+        owner.canonical_range = Some(CanonicalByteRange::new(0, 4));
+        let mut json = selector_result(ToolOutputSelectorStatus::Ok);
+        json.selector = ToolOutputSelector::JsonPointer {
+            pointer: "/flag".into(),
+        };
+        json.canonical_range = owner.canonical_range;
+        json.value = Some(serde_json::json!(true));
+        let mut first =
+            continuation_result(ToolOutputSelector::Bytes { start: 0, end: 2 }, None, "tr");
+        first.canonical_range = Some(CanonicalByteRange::new(0, 2));
+        let mut last =
+            continuation_result(ToolOutputSelector::Bytes { start: 2, end: 4 }, None, "ue");
+        last.canonical_range = Some(CanonicalByteRange::new(2, 4));
+        owner.continuation = Some(first.selector.clone());
+        let mut state = RecoveryContinuationState::new(
+            recovery_output(vec![owner.clone(), json.clone()]),
+            false,
+            usize::MAX,
+        );
+        state
+            .accept_page(
+                0,
+                &first.selector.clone(),
+                recovery_output(vec![first]),
+                false,
+            )
+            .unwrap();
+        state
+            .accept_page(
+                0,
+                &last.selector.clone(),
+                recovery_output(vec![last]),
+                false,
+            )
+            .unwrap();
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+        let transaction = state.finish();
+        assert!(transaction.output.complete);
+        assert_eq!(transaction.output.results.len(), 2);
+        assert_eq!(transaction.output.results[0].selector, owner.selector);
+        assert_eq!(transaction.output.results[0].text.as_deref(), Some("true"));
+        assert_eq!(transaction.output.results[1], json);
+    }
+
+    #[test]
     fn overflow_reconstruction_requires_exact_coverage_and_decodes_original_json() {
         let bytes = br#"{"ok":true}"#;
         let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
@@ -1214,8 +1422,11 @@ mod tests {
         assert_eq!(exact.status, ToolOutputSelectorStatus::Ok);
         assert!(exact.complete);
         assert_eq!(exact.value, Some(serde_json::json!({"ok":true})));
-        assert!(
-            reconstruct_selection(&owner, &[first.clone(), first.clone(), last.clone()]).is_none()
+        assert_eq!(
+            reconstruct_selection(&owner, &[first.clone(), first.clone(), last.clone()])
+                .unwrap()
+                .value,
+            exact.value
         );
 
         owner.continuation = Some(first.selector.clone());
@@ -1263,6 +1474,118 @@ mod tests {
         );
 
         assert_eq!(state.next_step(), ContinuationStep::Complete);
+    }
+
+    #[test]
+    fn stop_envelope_rolls_back_pages_without_clipping_source() {
+        let selector = page_selector(0);
+        let next = page_selector(1);
+        let mut owner = selector_result(ToolOutputSelectorStatus::Ok);
+        owner.continuation = Some(selector.clone());
+        owner.complete = false;
+        let initial = recovery_output(vec![owner]);
+        let mut state = RecoveryContinuationState::new(initial.clone(), false, usize::MAX);
+        let page = continuation_result(
+            selector.clone(),
+            Some(next.clone()),
+            &"exact source".repeat(100),
+        );
+        state
+            .accept_page(0, &selector, recovery_output(vec![page]), false)
+            .unwrap();
+        let payload_tokens = codex_utils_string::approx_token_count(
+            &serde_json::to_string(&state.reconstructed_output()).unwrap(),
+        );
+        state.token_ceiling = payload_tokens;
+        state.record_stop(ContinuationStopReason::Budget, Some(next));
+        assert!(!recovery_envelope_fits(
+            &state.reconstructed_output(),
+            state.continuation_stop.as_ref(),
+            payload_tokens
+        ));
+        let result = state.finish();
+        assert!(recovery_envelope_fits(
+            &result.output,
+            result.continuation_stop.as_ref(),
+            payload_tokens
+        ));
+        assert_eq!(result.output, initial);
+        assert_eq!(result.drained_continuation_pages, 0);
+        let stop = result.continuation_stop.unwrap();
+        assert_eq!(stop.reason, ContinuationStopReason::Budget);
+        assert!(stop.resumable);
+        assert_eq!(stop.selector, Some(selector));
+    }
+
+    #[test]
+    fn final_page_is_budgeted_as_reconstructed_selection() {
+        let selector = ToolOutputSelector::Bytes { start: 0, end: 10 };
+        let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        owner.selector = ToolOutputSelector::Lines { start: 1, end: 1 };
+        owner.canonical_range = Some(CanonicalByteRange { start: 0, end: 10 });
+        owner.continuation = Some(selector.clone());
+        let mut page = continuation_result(selector.clone(), None, "abcdefghij");
+        page.canonical_range = owner.canonical_range;
+        let exact = reconstruct_selection(&owner, &[page.clone()]).unwrap();
+        let ceiling = codex_utils_string::approx_token_count(
+            &serde_json::to_string(&recovery_output(vec![exact])).unwrap(),
+        );
+        assert!(!recovery_result_fits_token_ceiling(
+            &recovery_output(vec![owner.clone(), page.clone()]),
+            ceiling,
+        ));
+        let mut state =
+            RecoveryContinuationState::new(recovery_output(vec![owner]), false, ceiling);
+        assert_eq!(
+            state.accept_page(0, &selector, recovery_output(vec![page]), false),
+            Ok(())
+        );
+        let result = state.finish();
+        assert!(result.output.complete);
+        assert_eq!(result.output.results.len(), 1);
+        assert_eq!(result.output.results[0].text.as_deref(), Some("abcdefghij"));
+        assert!(result.continuation_stop.is_none());
+    }
+
+    #[test]
+    fn overlapping_owners_reuse_a_range_without_becoming_a_cycle() {
+        let selector = ToolOutputSelector::Bytes { start: 0, end: 10 };
+        let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        owner.selector = ToolOutputSelector::Lines { start: 1, end: 1 };
+        owner.canonical_range = Some(CanonicalByteRange { start: 0, end: 10 });
+        owner.continuation = Some(selector.clone());
+        let mut second = owner.clone();
+        second.selector = ToolOutputSelector::Bytes { start: 0, end: 10 };
+        let mut page = continuation_result(selector.clone(), None, "abcdefghij");
+        page.canonical_range = owner.canonical_range;
+        let mut state =
+            RecoveryContinuationState::new(recovery_output(vec![owner, second]), false, usize::MAX);
+        state
+            .accept_page(0, &selector, recovery_output(vec![page]), false)
+            .unwrap();
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Follow {
+                result_index: 1,
+                selector: selector.clone()
+            }
+        );
+        let cached = state
+            .cached_page(&selector)
+            .expect("authenticated range is already available");
+        state.accept_page(1, &selector, cached, true).unwrap();
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+        let result = state.finish();
+        assert!(result.output.complete);
+        assert_eq!(result.output.results.len(), 2);
+        assert!(
+            result
+                .output
+                .results
+                .iter()
+                .all(|r| r.text.as_deref() == Some("abcdefghij"))
+        );
+        assert!(result.continuation_stop.is_none());
     }
 
     #[test]
@@ -1317,6 +1640,80 @@ mod tests {
                 .iter()
                 .all(|result| result.continuation.is_none())
         );
+    }
+
+    #[test]
+    fn final_page_is_admitted_using_exact_reconstruction_and_shared_coverage() {
+        let child = ToolOutputSelector::Bytes { start: 0, end: 12 };
+        let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        owner.selector = ToolOutputSelector::Lines { start: 1, end: 1 };
+        owner.canonical_range = Some(CanonicalByteRange::new(0, 12));
+        owner.continuation = Some(child.clone());
+        owner.message = Some("large descriptor metadata ".repeat(100));
+        let mut page = continuation_result(child.clone(), None, "exact source");
+        page.canonical_range = owner.canonical_range;
+        let exact = reconstruct_selection(&owner, &[page.clone()]).unwrap();
+        let expected = recovery_output(vec![exact.clone(), exact]);
+        let ceiling =
+            codex_utils_string::approx_token_count(&serde_json::to_string(&expected).unwrap()) + 10;
+        let mut state = RecoveryContinuationState::new(
+            recovery_output(vec![owner.clone(), owner]),
+            false,
+            ceiling,
+        );
+        assert_eq!(
+            state.accept_page(0, &child, recovery_output(vec![page]), false),
+            Ok(())
+        );
+        // A different owner may request the same authenticated range.
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Follow {
+                result_index: 1,
+                selector: child.clone()
+            }
+        );
+        let cached = state
+            .cached_page(&child)
+            .expect("reuse identity-checked bytes");
+        assert_eq!(state.accept_page(1, &child, cached, true), Ok(()));
+        let transaction = state.finish();
+        assert!(transaction.output.complete);
+        assert_eq!(transaction.output.results.len(), 2);
+        assert!(
+            transaction
+                .output
+                .results
+                .iter()
+                .all(|result| result.text.as_deref() == Some("exact source"))
+        );
+        assert!(recovery_result_fits_token_ceiling(
+            &transaction.output,
+            ceiling
+        ));
+    }
+
+    #[test]
+    fn recovery_reuses_partially_overlapping_ranges_and_reserves_unrelated_output() {
+        let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        owner.selector = ToolOutputSelector::Bytes { start: 2, end: 8 };
+        owner.canonical_range = Some(CanonicalByteRange::new(2, 8));
+        let mut page = continuation_result(
+            ToolOutputSelector::Bytes { start: 0, end: 10 },
+            None,
+            "0123456789",
+        );
+        page.canonical_range = Some(CanonicalByteRange::new(0, 10));
+        assert_eq!(
+            reconstruct_selection(&owner, &[page.clone()])
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("234567")
+        );
+        let state = RecoveryContinuationState::new(recovery_output(vec![owner, page]), false, 1000);
+        assert!(state.page_token_ceiling(0) < 1000);
+        assert!(state.page_token_ceiling(0) > 0);
     }
 
     #[test]

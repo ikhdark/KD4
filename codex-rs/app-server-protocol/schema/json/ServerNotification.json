@@ -5523,12 +5523,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "exactRepeatedWaitCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "executedValidationCount": {
           "default": 0,
           "description": "Validation commands that executed.",
@@ -5725,11 +5719,14 @@
           "type": "integer"
         },
         "residualDeterministicGenerationCount": {
-          "default": 0,
-          "description": "Residual deterministic generation requests proved by turn execution control, including requests elided before provider dispatch.",
+          "default": null,
+          "description": "Residual deterministic generation requests proved by turn execution. Null means production execution control does not measure this counter.",
           "format": "uint32",
           "minimum": 0.0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "samePurposeContinuationCount": {
           "default": 0,
@@ -5879,6 +5876,13 @@
           "type": "integer"
         },
         "userInputWaitCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "waitGenerationsWithSameRevisionCount": {
+          "default": 0,
+          "description": "Wait generations sharing coarse revisions; this does not establish that the wait action, cursor, or owner state repeated.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -6137,7 +6141,7 @@
         "validation_interpretation",
         "repair",
         "agent_coordination",
-        "deterministic_tool_continuation",
+        "tool_result_interpretation",
         "compaction_recovery",
         "terminal"
       ],
@@ -6744,6 +6748,15 @@
             "null"
           ]
         },
+        "requestDiagnosticsStatus": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingRequestDiagnosticsStatus"
+            }
+          ],
+          "default": "pending",
+          "description": "Optional diagnostics can finish after the turn. Late diagnostic records use sampling_request_id and physical_attempt_id to update this row."
+        },
         "requestTokenCategories": {
           "anyOf": [
             {
@@ -6915,6 +6928,14 @@
         "visibleOutputTokens"
       ],
       "type": "object"
+    },
+    "TurnTimingRequestDiagnosticsStatus": {
+      "enum": [
+        "pending",
+        "complete",
+        "unavailable"
+      ],
+      "type": "string"
     },
     "TurnTimingRequestTokenCategories": {
       "properties": {

@@ -793,6 +793,15 @@ pub(crate) async fn run_turn(
                     });
                 }
                 turn_execution.settle(&request_baselines, &request_signals, &settled_state);
+                logical_generation_budget.observe_progress(
+                    turn_execution.observe_budget_progress(
+                        &request_baselines,
+                        &request_signals,
+                        &settled_state,
+                    ),
+                    request_signals.observed_successful_process_monitor()
+                        || request_signals.observed_yielded_execution(),
+                );
                 if let Some(evidence) = request_signals.completion_evidence_key() {
                     completion_evidence = Some(evidence);
                 }
@@ -820,6 +829,12 @@ pub(crate) async fn run_turn(
                     // it must not reopen this exhausted sampling loop.
                     defer_pending_input = true;
                     needs_follow_up = false;
+                    report_logical_generation_budget_exhausted(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        &mut generation_budget_error_reported,
+                    )
+                    .await;
                 }
                 let progress_kinds =
                     request_signals.progress_kinds(&request_baselines, &settled_state);
@@ -1329,9 +1344,9 @@ fn authoritative_wait_terminal_surface(
     }
 }
 
-// Keep a finite emergency boundary for genuinely non-converging turns while
-// leaving room for legitimate multi-step tool work. Deterministic repeated
-// cycles are handled earlier by the turn execution control.
+// Bound generations without new evidence. Productive work renews this window;
+// executor-owned process monitoring does not consume it. Deterministic repeated
+// cycles are also handled by the turn execution control.
 const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1348,6 +1363,14 @@ pub(crate) struct LogicalGenerationBudget {
 }
 
 impl LogicalGenerationBudget {
+    fn observe_progress(&mut self, new_evidence: bool, successful_process_monitor: bool) {
+        if new_evidence {
+            self.regular_generations = 0;
+        } else if successful_process_monitor {
+            self.regular_generations = self.regular_generations.saturating_sub(1);
+        }
+    }
+
     fn accepted_user_input(&mut self) {
         self.terminal_generation_used = false;
     }
@@ -1413,12 +1436,12 @@ fn completion_pending_input_disposition(
     }
 }
 
-const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The logical generation limit has been reached. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report any remaining work, failed validation, or blocker.";
+const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The turn exhausted its allowance for generations without new evidence. Work is suspended, not completed. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report remaining work, failed validation, running processes, and how to resume.";
 async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &TurnContext) {
     sess.send_event(
         turn_context,
         EventMsg::Warning(WarningEvent {
-            message: format!("This turn reached its limit of {MAX_REGULAR_LOGICAL_GENERATIONS} regular model generations. The assistant will now summarize completed work and report anything unfinished. Send another message to continue the remaining work."),
+            message: format!("This turn reached {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."),
         }),
     )
     .await;
@@ -1465,7 +1488,7 @@ async fn report_logical_generation_budget_exhausted(
     emit_status_affecting_turn_error(
         sess,
         turn_context,
-        format!("This turn reached its generation budget (up to {MAX_REGULAR_LOGICAL_GENERATIONS} regular model generations and one final summary) before all requested work completed. Send another message to continue the remaining work."),
+        format!("This turn exhausted its allowance of {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume."),
     )
     .await;
 }

@@ -35,10 +35,96 @@ fn direct_output_admission_is_not_config_gated() {
 #[test]
 fn direct_code_mode_output_requires_completed_history_admission() {
     let source = ToolCallSource::Direct;
-    let tool_name = ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME);
+    for name in [
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ] {
+        let tool_name = ToolName::plain(name);
+        assert!(projection_admission_required(&source, &tool_name, false));
+        assert!(projection_admission_required(&source, &tool_name, true));
+    }
+}
 
-    assert!(projection_admission_required(&source, &tool_name, false));
-    assert!(projection_admission_required(&source, &tool_name, true));
+#[tokio::test]
+async fn wait_preserves_failed_diagnostic_packet_without_generic_reprojection() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait-diagnostic",
+        ToolName::plain("wait"),
+    );
+    let diagnostic = format!(
+        "{}\nerror[E0308]: decisive diagnostic\nExit code: 1",
+        "compiler detail\n".repeat(2000)
+    );
+    let output = crate::tools::context::FunctionToolOutput::from_content(
+        vec![
+            FunctionCallOutputContentItem::InputText {
+                text: diagnostic.clone(),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: "Nested command states:\n{\"exit_code\":1}".to_string(),
+            },
+        ],
+        Some(false),
+    );
+    let expected_text = format!("{diagnostic}\nNested command states:\n{{\"exit_code\":1}}");
+    let mut result = AnyToolResult {
+        call_id: invocation.call_id.clone(),
+        payload: invocation.payload.clone(),
+        result: Box::new(output),
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+    let input = prepare_model_projection(&invocation, &mut result, None, None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        input.materialization,
+        ProjectionMaterialization::AdmissionOnly
+    );
+    assert!(
+        String::from_utf8_lossy(&input.canonical.bytes)
+            .contains("\nerror[E0308]: decisive diagnostic\n")
+    );
+    let codex_home = input.codex_home.clone();
+    let thread_id = input.thread_id.clone();
+    let projection = project_model_output(input).await.unwrap();
+    let response = projection.response();
+    assert!(
+        consolidated_history_output_text(&response) == expected_text,
+        "wait must preserve all diagnostic and receipt text"
+    );
+    assert!(
+        matches!(response, ResponseInputItem::FunctionCallOutput { output, .. } if output.success == Some(false)),
+        "wait must retain the failed command status"
+    );
+    assert!(
+        projection.candidate.is_some(),
+        "large complete packet remains recoverable from history"
+    );
+    let recovered = crate::tools::handlers::execute_recovery_transaction_with_continuations(
+        &codex_home,
+        &thread_id,
+        &projection.candidate.unwrap().artifact_id,
+        vec![
+            crate::tools::command_output_artifact::ToolOutputSelector::Lines {
+                start: 2002,
+                end: 2002,
+            },
+        ],
+        true,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(recovered.output.complete);
+    assert_eq!(
+        recovered.output.results[0].text.as_deref(),
+        Some("error[E0308]: decisive diagnostic\n")
+    );
 }
 
 #[test]

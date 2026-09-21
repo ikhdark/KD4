@@ -4883,7 +4883,7 @@ class TurnTimingGenerationPurpose(Enum):
     validation_interpretation = "validation_interpretation"
     repair = "repair"
     agent_coordination = "agent_coordination"
-    deterministic_tool_continuation = "deterministic_tool_continuation"
+    tool_result_interpretation = "tool_result_interpretation"
     compaction_recovery = "compaction_recovery"
     terminal = "terminal"
 
@@ -5139,6 +5139,12 @@ class TurnTimingProviderTokenUsage(BaseModel):
     reasoning_tokens: Annotated[int, Field(alias="reasoningTokens", ge=0)]
     total_tokens: Annotated[int, Field(alias="totalTokens", ge=0)]
     visible_output_tokens: Annotated[int, Field(alias="visibleOutputTokens", ge=0)]
+
+
+class TurnTimingRequestDiagnosticsStatus(Enum):
+    pending = "pending"
+    complete = "complete"
+    unavailable = "unavailable"
 
 
 class TurnTimingTerminalization(BaseModel):
@@ -8088,9 +8094,6 @@ class TurnTimingCounters(BaseModel):
         ),
     ] = 0
     clock_regression_count: Annotated[int, Field(alias="clockRegressionCount", ge=0)]
-    exact_repeated_wait_count: Annotated[
-        int | None, Field(alias="exactRepeatedWaitCount", ge=0)
-    ] = 0
     executed_validation_count: Annotated[
         int | None,
         Field(
@@ -8199,10 +8202,10 @@ class TurnTimingCounters(BaseModel):
         int | None,
         Field(
             alias="residualDeterministicGenerationCount",
-            description="Residual deterministic generation requests proved by turn execution control, including requests elided before provider dispatch.",
+            description="Residual deterministic generation requests proved by turn execution. Null means production execution control does not measure this counter.",
             ge=0,
         ),
-    ] = 0
+    ] = None
     same_purpose_continuation_count: Annotated[
         int | None, Field(alias="samePurposeContinuationCount", ge=0)
     ] = 0
@@ -8295,6 +8298,14 @@ class TurnTimingCounters(BaseModel):
         ),
     ] = 0
     user_input_wait_count: Annotated[int, Field(alias="userInputWaitCount", ge=0)]
+    wait_generations_with_same_revision_count: Annotated[
+        int | None,
+        Field(
+            alias="waitGenerationsWithSameRevisionCount",
+            description="Wait generations sharing coarse revisions; this does not establish that the wait action, cursor, or owner state repeated.",
+            ge=0,
+        ),
+    ] = 0
     wait_only_generation_count: Annotated[
         int | None, Field(alias="waitOnlyGenerationCount", ge=0)
     ] = 0
@@ -9522,6 +9533,13 @@ class TurnTimingModelRequest(BaseModel):
             description="A redacted hash of only the structured state relevant to this request.",
         ),
     ] = None
+    request_diagnostics_status: Annotated[
+        TurnTimingRequestDiagnosticsStatus | None,
+        Field(
+            alias="requestDiagnosticsStatus",
+            description="Optional diagnostics can finish after the turn. Late diagnostic records use sampling_request_id and physical_attempt_id to update this row.",
+        ),
+    ] = "pending"
     request_token_categories: Annotated[
         TurnTimingRequestTokenCategories | None,
         Field(

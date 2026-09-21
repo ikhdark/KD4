@@ -165,6 +165,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 .as_ref()
                 .filter(|artifact| artifact.complete)
                 .and_then(|artifact| artifact.artifact_id());
+            if let Some(artifact_id) = &artifact_id {
+                invocation
+                    .session
+                    .register_tool_artifact_origin(
+                        artifact_id.clone(),
+                        invocation.call_id.clone(),
+                        canonical.exact_bytes,
+                        canonical.sha256.clone(),
+                    )
+                    .await;
+            }
             let snapshot_error =
                 artifact
                     .as_ref()
@@ -457,7 +468,8 @@ mod tests {
         let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
             panic!("expected stale read output");
         };
-        let notice: serde_json::Value = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+        let notice: serde_json::Value =
+            serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
         assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
         assert_eq!(notice["rerun"]["tool"], "read_file");
         let retry = notice["rerun"]["arguments"].clone();
@@ -466,16 +478,26 @@ mod tests {
             panic!("expected callable read schema");
         };
         let parameters = serde_json::to_value(spec.parameters).unwrap();
-        assert!(jsonschema::validator_for(&parameters).unwrap().is_valid(&retry));
-        let recovered = runtime.handle_tool_call_with_source(
-            ToolCall {
-                tool_name: ToolName::plain(notice["rerun"]["tool"].as_str().unwrap()),
-                call_id: "recovered-file-read".into(),
-                payload: ToolPayload::Function { arguments: retry.to_string() },
-            },
-            ToolCallSource::Direct,
-            CancellationToken::new(),
-        ).await.unwrap().code_mode_result();
+        assert!(
+            jsonschema::validator_for(&parameters)
+                .unwrap()
+                .is_valid(&retry)
+        );
+        let recovered = runtime
+            .handle_tool_call_with_source(
+                ToolCall {
+                    tool_name: ToolName::plain(notice["rerun"]["tool"].as_str().unwrap()),
+                    call_id: "recovered-file-read".into(),
+                    payload: ToolPayload::Function {
+                        arguments: retry.to_string(),
+                    },
+                },
+                ToolCallSource::Direct,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .code_mode_result();
         assert_eq!(recovered["results"][0]["text"], "changed text\n");
         assert_eq!(recovered["file_complete"], true);
     }
@@ -567,6 +589,24 @@ mod tests {
             .unwrap()
             .code_mode_result(&call.payload);
         let artifact_id = result["artifact_id"].as_str().unwrap();
+        let history = call
+            .session
+            .lock_history_state_for_test()
+            .await
+            .tool_history_state();
+        assert_eq!(
+            history.artifact_references().get(artifact_id),
+            Some(&(
+                original.len() as u64,
+                crate::tool_history::sha256(original.as_bytes())
+            ))
+        );
+        let provenance = serde_json::to_value(history).unwrap();
+        assert_eq!(
+            provenance["internal_artifact_origins"][artifact_id][0],
+            call.call_id
+        );
+
         let mut recovered = result["results"][0]["text"]
             .as_str()
             .unwrap()

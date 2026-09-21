@@ -514,6 +514,7 @@ export type { TurnTimingModelRequest } from "./TurnTimingModelRequest";
 export type { TurnTimingPreFirstModelOutput } from "./TurnTimingPreFirstModelOutput";
 export type { TurnTimingProgressKind } from "./TurnTimingProgressKind";
 export type { TurnTimingProviderTokenUsage } from "./TurnTimingProviderTokenUsage";
+export type { TurnTimingRequestDiagnosticsStatus } from "./TurnTimingRequestDiagnosticsStatus";
 export type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenCategories";
 export type { TurnTimingTerminalization } from "./TurnTimingTerminalization";
 export type { TurnTimingTokenCategoryBasis } from "./TurnTimingTokenCategoryBasis";

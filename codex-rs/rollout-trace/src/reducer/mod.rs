@@ -68,6 +68,29 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
     };
 
     let event_log_path = bundle_dir.join(RAW_EVENT_LOG_FILE_NAME);
+    // Cell lifecycle persistence is queued off the dispatch path. Establish
+    // immutable runtime identities before replay so a nested tool can precede
+    // its cell-start record on disk. The normal pass still validates ownership
+    // and lifecycle, and backfills links when each cell materializes.
+    let identities = File::open(&event_log_path)?;
+    for line in BufReader::new(identities).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: RawTraceEvent = serde_json::from_str(&line)?;
+        if let RawTraceEventPayload::CodeCellStarted {
+            runtime_cell_id,
+            model_visible_call_id,
+            ..
+        } = event.payload
+            && let Some(thread_id) = event.thread_id
+        {
+            let cell_id =
+                reducer.reduced_code_cell_id_for_model_visible_call(&model_visible_call_id);
+            reducer.record_runtime_code_cell_id(&thread_id, &runtime_cell_id, &cell_id)?;
+        }
+    }
     let event_log = File::open(&event_log_path)
         .with_context(|| format!("open trace event log {}", event_log_path.display()))?;
     for (line_index, line) in BufReader::new(event_log).lines().enumerate() {

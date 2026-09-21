@@ -225,9 +225,7 @@ impl CodeModeWaitHandler {
                                 runtime_cell_id.as_str(),
                             );
                         let response = response.clone();
-                        dispatch_lease
-                            .record_trace(move || trace.record_ended(&response))
-                            .await;
+                        dispatch_lease.record_trace(move || trace.record_ended(&response));
                     }
                 }
                 exec.session.services.elicitations.wait_until_clear().await;
@@ -286,9 +284,7 @@ pub(super) async fn terminate_interrupted_cell(
                     .services
                     .rollout_thread_trace
                     .code_cell_trace_context(exec.turn.sub_id.as_str(), cell_id.as_str());
-                dispatch_lease
-                    .record_trace(move || trace.record_ended(&response))
-                    .await;
+                dispatch_lease.record_trace(move || trace.record_ended(&response));
             }
         }
         Ok(Ok(codex_code_mode::WaitOutcome::MissingCell(_))) => {}

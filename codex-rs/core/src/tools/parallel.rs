@@ -926,9 +926,9 @@ fn workspace_tool_may_use_parallel_gate(supports_parallel: bool, workspace_capab
 }
 
 fn bypasses_outer_workspace_gate(tool_name: &codex_tools::ToolName) -> bool {
-    // `exec` is only an orchestration carrier. Its nested calls independently
-    // acquire the ordinary workspace gate through this runtime.
-    crate::tools::code_mode::is_exec_tool_name(tool_name)
+    // Neither entry point may hold a gate while waiting on nested calls that
+    // independently acquire that same gate through this runtime.
+    crate::tools::code_mode::is_orchestration_tool_name(tool_name)
 }
 
 fn workspace_tool_call_classifications_for_dispatch(
@@ -1789,14 +1789,23 @@ impl ToolCallRuntime {
             if !self.session.hooks().has_handler_for(codex_protocol::protocol::HookEventName::PreToolUse)
                 && let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.replayed_success.as_ref()
-                // The replay ledger has no original dependency observations.
-                // A current mutation counter cannot validate old workspace or
-                // validation evidence against external edits/services.
-                && !workspace_call_classification.observes_workspace
             {
-                // Retained non-workspace output does not execute against the workspace.
+                // Revalidate original observations under the existing repository
+                // read lease, excluding writers while allowing other readers.
+                let resource_key = workspace_resource_key_for_admission(
+                    &workspace_call_classification, &self.canonical_workspace_resources, true, true,
+                ).await;
+                let _replay_workspace_guard = acquire_workspace_gate(
+                    Arc::clone(&self.parallel_execution),
+                    Arc::clone(&self.workspace_execution),
+                    resource_key, true, true, true,
+                    &self.step_context.turn.turn_timing_state,
+                ).await;
                 let revision = self.tracker.lock().await.current_mutation_revision();
-                if guard.is_fresh(revision)
+                let workspace_revision = self.session.services.git_workspace.workspace_evidence_for_turn(
+                    &self.step_context.turn, &workspace_call_classification.workspace_cwd,
+                ).await.identity;
+                if guard.is_fresh(revision, self.session.services.git_workspace.as_ref(), workspace_revision.as_ref())
                     && let Some(response) = guard.response_for_call(&call.call_id)
                 {
                     timing.record_outcome("success");
@@ -1816,10 +1825,19 @@ impl ToolCallRuntime {
                     self.session.record_conversation_items(
                         self.step_context.turn.as_ref(), std::slice::from_ref(&replay_notice),
                     ).await?;
+                    let replay_baseline = WorkspaceEvidenceBaseline {
+                        revision: workspace_revision,
+                        cache_hit: false,
+                        timed_out_git_dependencies: Vec::new(),
+                        source_dependencies: workspace_call_classification.source_dependencies.clone(),
+                        // Preserve the original watcher observations. Republishing retained
+                        // bytes must never make their dependencies appear newly observed.
+                        source_path_observations: guard.source_path_observations(),
+                    };
                     Self::register_workspace_evidence_after_call(
                         self.session.as_ref(), self.step_context.turn.as_ref(),
                         WorkspaceEvidenceAfterCall {
-                            response: &response, baseline: None, mutation_advanced: false,
+                            response: &response, baseline: Some(replay_baseline), mutation_advanced: false,
                             source_dependencies_override: None,
                             classification: &workspace_call_classification,
                             workspace_gate_guard: None,
@@ -2036,6 +2054,16 @@ impl ToolCallRuntime {
                             )
                         };
                     let evidence_capture_started = Instant::now();
+                    if !mutation_advanced
+                        && !code_mode_exec
+                        && let (Some(collector), Some(ordinal), Some(baseline), Some(revision)) =
+                            (&signal_collector, signal_ordinal, workspace_revision_before.as_ref(), mutation_revision_before)
+                        && !baseline.source_dependencies.is_empty()
+                        && baseline.source_dependencies.len() == baseline.source_path_observations.len()
+                        && source_dependencies_override.as_ref().is_none_or(|dependencies| dependencies == &baseline.source_dependencies)
+                    {
+                        collector.record_replay_dependencies(ordinal, revision, baseline.source_path_observations.clone(), baseline.revision.clone());
+                    }
                     let workspace_evidence_deferred = dispatch_state.handler_started() && self.register_workspace_evidence_for_response(
                         &response,
                         workspace_revision_before,
@@ -3736,6 +3764,12 @@ mod tests {
         let nested_mutation = codex_tools::ToolName::plain("shell_command");
 
         assert!(bypasses_outer_workspace_gate(&exec));
+        assert!(bypasses_outer_workspace_gate(
+            &codex_tools::ToolName::plain(crate::tools::code_mode::WAIT_TOOL_NAME,)
+        ));
+        assert!(!bypasses_outer_workspace_gate(
+            &codex_tools::ToolName::namespaced("external", "wait")
+        ));
         assert!(!bypasses_outer_workspace_gate(&nested_mutation));
         assert!(!workspace_tool_may_use_parallel_gate(false, true));
     }
@@ -4513,7 +4547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sampled_workspace_reads_execute_again_even_without_tracked_mutations() {
+    async fn sampled_workspace_reads_reuse_only_original_current_dependencies() {
         use crate::session::turn_execution::SamplingRequestSettledState;
         use crate::session::turn_execution::TurnExecutionControl;
         use codex_utils_absolute_path::AbsolutePathBuf;
@@ -4552,7 +4586,7 @@ mod tests {
 
         impl CoreToolRuntime for CountedReadHandler {}
 
-        for workspace_changed in [false, true] {
+        for (external_edit, workspace_changed) in [(false, false), (true, false), (true, true)] {
             let workspace = tempfile::tempdir().expect("workspace");
             assert!(
                 std::process::Command::new("git")
@@ -4628,8 +4662,10 @@ mod tests {
                 .with_sampling_request_signals(collector);
             // An editor or another process can change the workspace without updating
             // this turn's mutation tracker. Such a read is still a new observation.
-            std::fs::write(workspace.path().join("README.md"), "external edit\n")
-                .expect("external workspace edit");
+            if external_edit {
+                std::fs::write(workspace.path().join("README.md"), "external edit\n")
+                    .expect("external workspace edit");
+            }
             let mut competing_lease = Some(
                 acquire_workspace_gate(
                     Arc::clone(&runtime.parallel_execution),
@@ -4667,14 +4703,18 @@ mod tests {
                 .await
                 .expect("replay must overlap readers and resume after writers")
                 .expect("dispatch succeeds");
-            let expected = "external edit\n";
+            let expected = if external_edit {
+                "external edit\n"
+            } else {
+                "initial content\n"
+            };
             assert!(
                 matches!(response, ResponseInputItem::FunctionCallOutput { call_id, output } if call_id == "fresh-read" && output.text_content() == Some(expected))
             );
             assert_eq!(
                 executions.load(Ordering::SeqCst),
-                2,
-                "workspace observations must execute even without a tracked mutation"
+                if external_edit { 2 } else { 1 },
+                "reuse requires the original dependency observations to remain current"
             );
             let history = session.clone_history().await;
             let notices = history.raw_items().iter().filter(|item| {
@@ -4687,8 +4727,9 @@ mod tests {
                     }))
             }).count();
             assert_eq!(
-                notices, 0,
-                "fresh observations must not be labeled as retained evidence"
+                notices,
+                usize::from(!external_edit),
+                "only retained observations should carry a replay notice"
             );
         }
     }
@@ -4883,13 +4924,11 @@ mod tests {
                 .workspace_evidence_identity(workspace.path())
                 .await;
             let history = session.clone_history().await;
-            let projected = history
-                .tool_history_state()
-                .project_with_workspace_cache(
-                    Arc::from(history.raw_items().to_vec()),
-                    identity.as_ref(),
-                    session.services.git_workspace.as_ref(),
-                );
+            let projected = history.tool_history_state().project_with_workspace_cache(
+                Arc::from(history.raw_items().to_vec()),
+                identity.as_ref(),
+                session.services.git_workspace.as_ref(),
+            );
             let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
                 panic!("projected read result");
             };
@@ -5338,71 +5377,88 @@ mod tests {
 
     #[tokio::test]
     async fn kd4_latency_exec_does_not_hold_workspace_gate_around_nested_runtime() {
-        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let turn_context = Arc::new(turn_context);
-        let exec_name = codex_tools::ToolName::plain(crate::tools::code_mode::PUBLIC_TOOL_NAME);
-        let mutation_name = codex_tools::ToolName::plain("shell_command");
-        let (exec_started_tx, exec_started_rx) = oneshot::channel();
-        let release_exec = Arc::new(Notify::new());
-        let handlers = [
-            Arc::new(BlockingHandler {
-                tool_name: exec_name.clone(),
-                started: std::sync::Mutex::new(Some(exec_started_tx)),
-                release: Arc::clone(&release_exec),
-            }) as Arc<dyn CoreToolRuntime>,
-            Arc::new(ImmediateHandler {
-                tool_name: mutation_name.clone(),
-            }) as Arc<dyn CoreToolRuntime>,
-        ];
-        let step_context = StepContext::for_test(Arc::clone(&turn_context));
-        let router = Arc::new(ToolRouter::from_parts(
-            ToolRegistry::from_tools(handlers),
-            Vec::new(),
-        ));
-        let step_context = step_context.with_tool_router_for_test(router);
-        let runtime = ToolCallRuntime::new(
-            session,
-            step_context,
-            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-        );
+        for (outer_name, arguments) in [
+            (crate::tools::code_mode::PUBLIC_TOOL_NAME, "{}"),
+            (
+                crate::tools::code_mode::WAIT_TOOL_NAME,
+                r#"{"cell_id":"1"}"#,
+            ),
+            (
+                crate::tools::code_mode::WAIT_TOOL_NAME,
+                r#"{"cell_id":"1","terminate":true}"#,
+            ),
+        ] {
+            let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+            let session = Arc::new(session);
+            let turn_context = Arc::new(turn_context);
+            let exec_name = codex_tools::ToolName::plain(outer_name);
+            let mutation_name = codex_tools::ToolName::plain("shell_command");
+            let (exec_started_tx, exec_started_rx) = oneshot::channel();
+            let release_exec = Arc::new(Notify::new());
+            let handlers = [
+                Arc::new(BlockingHandler {
+                    tool_name: exec_name.clone(),
+                    started: std::sync::Mutex::new(Some(exec_started_tx)),
+                    release: Arc::clone(&release_exec),
+                }) as Arc<dyn CoreToolRuntime>,
+                Arc::new(ImmediateHandler {
+                    tool_name: mutation_name.clone(),
+                }) as Arc<dyn CoreToolRuntime>,
+            ];
+            let step_context = StepContext::for_test(Arc::clone(&turn_context));
+            let router = Arc::new(ToolRouter::from_parts(
+                ToolRegistry::from_tools(handlers),
+                Vec::new(),
+            ));
+            let step_context = step_context.with_tool_router_for_test(router);
+            let runtime = ToolCallRuntime::new(
+                session,
+                step_context,
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            );
 
-        let exec_task = tokio::spawn(runtime.clone().handle_tool_call(
-            ToolCall {
-                tool_name: exec_name,
-                call_id: "exec-wrapper".to_string(),
-                payload: ToolPayload::Function {
-                    arguments: "{}".to_string(),
-                },
-            },
-            CancellationToken::new(),
-        ));
-        exec_started_rx
-            .await
-            .expect("exec orchestration handler should start");
-
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            runtime.handle_tool_call(
+            let exec_task = tokio::spawn(runtime.clone().handle_tool_call(
                 ToolCall {
-                    tool_name: mutation_name,
-                    call_id: "nested-mutation".to_string(),
+                    tool_name: exec_name,
+                    call_id: "orchestration-wrapper".to_string(),
                     payload: ToolPayload::Function {
-                        arguments: "{}".to_string(),
+                        arguments: arguments.to_string(),
                     },
                 },
                 CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("nested workspace call should not wait for the outer exec wrapper")
-        .expect("nested workspace call should succeed");
+            ));
+            exec_started_rx
+                .await
+                .expect("exec orchestration handler should start");
 
-        release_exec.notify_one();
-        exec_task
+            let nested_result = tokio::time::timeout(
+                Duration::from_secs(10),
+                runtime.handle_tool_call(
+                    ToolCall {
+                        tool_name: mutation_name,
+                        call_id: "nested-mutation".to_string(),
+                        payload: ToolPayload::Function {
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                    CancellationToken::new(),
+                ),
+            )
             .await
-            .expect("exec wrapper task should join")
-            .expect("exec wrapper should succeed");
+            .expect("nested workspace call should not wait for the outer exec wrapper")
+            .expect("nested workspace call should succeed");
+            let ResponseInputItem::FunctionCallOutput { output, .. } = nested_result else {
+                panic!("nested mutation must return its function result");
+            };
+            assert_eq!(output.success, Some(true));
+            assert_eq!(output.body.to_text().as_deref(), Some("ok"));
+
+            release_exec.notify_one();
+            exec_task
+                .await
+                .expect("exec wrapper task should join")
+                .expect("exec wrapper should succeed");
+        }
     }
 
     #[tokio::test]

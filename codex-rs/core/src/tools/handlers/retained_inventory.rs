@@ -23,11 +23,11 @@ use crate::FunctionCallError;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::read_complete_canonical_snapshot;
-use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::read_tool_output::execute_recovery_transaction_with_continuations;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
@@ -203,6 +203,8 @@ enum Args {
         inventory_id: String,
         category: String,
         paths: Vec<String>,
+        #[serde(default = "default_fingerprint_contents")]
+        fingerprint_contents: bool,
         complete: bool,
         unresolved_reason: Option<String>,
     },
@@ -224,6 +226,10 @@ enum Args {
         #[serde(default)]
         classifications: BTreeSet<String>,
     },
+}
+
+fn default_fingerprint_contents() -> bool {
+    true
 }
 
 fn default_limit() -> usize {
@@ -563,6 +569,14 @@ impl Snapshot {
             .filter(|(status, _)| !matches!(status.as_str(), "classified" | "removed"))
             .map(|(_, count)| count)
             .sum::<usize>();
+        let unresolved_required_records = self
+            .profile
+            .required_categories
+            .iter()
+            .filter_map(|category| self.records.get(category))
+            .flat_map(|records| records.values())
+            .filter(|record| !matches!(record.status.as_str(), "classified" | "removed"))
+            .count();
         json!({
             "scope_id": self.scope_id,
             "unique_candidates": unique.len(),
@@ -570,7 +584,9 @@ impl Snapshot {
             "statuses": statuses,
             "unresolved_records": unresolved_records,
             "unresolved_required_categories": unresolved_categories,
-            "complete": unresolved_categories.is_empty() && unresolved_records == 0,
+            "unresolved_required_records": unresolved_required_records,
+            "all_candidates_classified": unresolved_records == 0,
+            "complete": unresolved_categories.is_empty() && unresolved_required_records == 0,
             "freshness": "retained producer snapshot; import fresh enumeration and reclassify changed evidence before claiming current workspace state"
         })
     }
@@ -593,12 +609,13 @@ async fn observe(
     snapshot: &Snapshot,
     category: String,
     paths: Vec<String>,
+    fingerprint_contents: bool,
     complete: bool,
     unresolved_reason: Option<String>,
 ) -> Result<(Enumeration, Evidence), FunctionCallError> {
-    if paths.len() > 1_000 || !snapshot.categories.contains_key(&category) {
+    if paths.len() > MAX_CANDIDATES || !snapshot.categories.contains_key(&category) {
         return Err(invalid(
-            "observe requires a declared category and at most 1000 paths per batch",
+            "observe requires a declared category and at most 10000 paths per enumeration",
         ));
     }
     let environment = resolve_tool_environment(
@@ -695,7 +712,7 @@ async fn observe(
                 _ => "unknown",
             };
             let (exists, revision) = match fs.get_metadata(&path, Some(sandbox)).await {
-                Ok(metadata) if metadata.is_file => {
+                Ok(metadata) if metadata.is_file && fingerprint_contents => {
                     let contents = fs
                         .read_file_bounded(&path, 8 * 1024 * 1024, Some(sandbox))
                         .await
@@ -860,14 +877,17 @@ async fn read_evidence(
             pointer: source.pointer.clone(),
         },
     };
-    let (result, _) = read_tool_output_selectors_with_reuse(
+    let transaction = execute_recovery_transaction_with_continuations(
         &invocation.step_context.turn.config.codex_home,
         &invocation.session.thread_id.to_string(),
         &source.artifact_id,
         vec![selector],
+        false,
+        &invocation.cancellation_token,
     )
     .await
     .map_err(|err| invalid(err.for_model()))?;
+    let result = transaction.output;
     if !result.complete || result.results.len() != 1 || !result.results[0].complete {
         return Err(invalid(
             "evidence is unavailable, invalid, or exceeds exact recovery bounds; select a smaller exact range with read_tool_output",
@@ -1042,10 +1062,11 @@ async fn persist(invocation: &ToolInvocation, value: Value) -> Result<String, Fu
             "inventory exceeds the 4 MiB snapshot limit; divide the selected scope explicitly",
         ));
     }
+    let canonical = CanonicalToolResult::json(value);
     let artifact = create_canonical_output_artifact(
         &invocation.step_context.turn.config.codex_home,
         &invocation.session.thread_id.to_string(),
-        &CanonicalToolResult::json(value),
+        &canonical,
     )
     .await;
     if !artifact.complete {
@@ -1053,9 +1074,19 @@ async fn persist(invocation: &ToolInvocation, value: Value) -> Result<String, Fu
             "inventory snapshot could not be fully retained".to_string()
         })));
     }
-    artifact
+    let artifact_id = artifact
         .artifact_id()
-        .ok_or_else(|| invalid("inventory snapshot has no artifact identity"))
+        .ok_or_else(|| invalid("inventory snapshot has no artifact identity"))?;
+    invocation
+        .session
+        .register_tool_artifact_origin(
+            artifact_id.clone(),
+            invocation.call_id.clone(),
+            canonical.exact_bytes,
+            canonical.sha256,
+        )
+        .await;
+    Ok(artifact_id)
 }
 
 async fn execute(
@@ -1158,6 +1189,7 @@ async fn execute(
         Args::Observe {
             category,
             paths,
+            fingerprint_contents,
             complete,
             unresolved_reason,
             ..
@@ -1167,6 +1199,7 @@ async fn execute(
                 &snapshot,
                 category,
                 paths,
+                fingerprint_contents,
                 complete,
                 unresolved_reason,
             )
@@ -1303,6 +1336,9 @@ async fn execute(
                 "coverage": snapshot.coverage(),
                 "count": identifiers.len(), "identifiers": identifiers});
             let count = rendered["count"].clone();
+            let inline_identifiers =
+                (codex_utils_string::approx_token_count(&rendered.to_string()) <= PAGE_TOKENS)
+                    .then(|| rendered["identifiers"].clone());
             *canonical_render = Some(CanonicalToolResult::json(rendered.clone()));
             let artifact_id = persist(invocation, rendered).await?;
             // Snapshots are capped below the artifact segment size: this file
@@ -1315,12 +1351,14 @@ async fn execute(
                 .join("tool-output")
                 .join(invocation.session.thread_id.to_string())
                 .join(format!("{artifact_id}.log"));
-            return Ok(
-                json!({"inventory_id": id, "rendered_artifact_id": artifact_id, "rendered_path": rendered_path, "count": count,
+            let mut receipt = json!({"inventory_id": id, "rendered_artifact_id": artifact_id, "rendered_path": rendered_path, "count": count,
                 "summary": snapshot.summary(), "classifications": classifications,
                 "coverage_source": {"artifact_id": artifact_id, "pointer": "/coverage"},
-                "identifiers_source": "exact sorted deduplicated retained identifiers; recover /identifiers from rendered_artifact_id"}),
-            );
+                "identifiers_source": "exact sorted deduplicated retained identifiers; recover /identifiers from rendered_artifact_id"});
+            if let Some(identifiers) = inline_identifiers {
+                receipt["identifiers"] = identifiers;
+            }
+            return Ok(receipt);
         }
         Args::Create { .. } => unreachable!(),
     }
@@ -1382,7 +1420,7 @@ impl ToolExecutor<ToolInvocation> for RetainedInventoryHandler {
         let variants = [
             ("create", json!({"scope":{"type":"object","additionalProperties":true},"profile":profile,"environment_id":{"type":"string"}}), vec!["scope","profile"]),
             ("import", json!({"inventory_id":{"type":"string"},"source":source}), vec!["inventory_id","source"]),
-            ("observe", json!({"inventory_id":{"type":"string"},"category":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"maxItems":1000},"complete":{"type":"boolean"},"unresolved_reason":{"type":["string","null"]}}), vec!["inventory_id","category","paths","complete"]),
+            ("observe", json!({"inventory_id":{"type":"string"},"category":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"maxItems":10000},"fingerprint_contents":{"type":"boolean","default":true},"complete":{"type":"boolean"},"unresolved_reason":{"type":["string","null"]}}), vec!["inventory_id","category","paths","complete"]),
             ("classify", json!({"inventory_id":{"type":"string"},"decisions":{"type":"array","items":decision,"minItems":1,"maxItems":100}}), vec!["inventory_id","decisions"]),
             ("read", json!({"inventory_id":{"type":"string"},"unresolved_only":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}), vec!["inventory_id"]),
             ("render", json!({"inventory_id":{"type":"string"},"classifications":strings}), vec!["inventory_id"]),
@@ -1400,7 +1438,7 @@ impl ToolExecutor<ToolInvocation> for RetainedInventoryHandler {
             serde_json::from_value(json!({"oneOf":variants})).expect("inventory tool schema");
         ToolSpec::Function(ResponsesApiTool {
             name: "inventory".to_string(),
-            description: "Retain a generic repository inventory without retranscribing identifiers. create freezes a scope object and a task-supplied profile (categories, classifications, required_categories); returns inventory_id and summary.scope_id. observe checks caller-selected paths in the bound environment, records exact identifiers, existence, Git tracking (unknown when unavailable), and content revisions without copying file bodies. Pass complete=true only for a full category enumeration; incomplete batches require unresolved_reason. Alternatively, use a chosen enumeration command to emit exact JSON {scope_id,category,complete,unresolved_reason,candidates:[{id,exists,tracking,revision}]}, where exists is boolean/null, tracking is tracked/untracked/unknown, and revision is the relevant source hash or null. Import its original raw-output artifact via source {artifact_id,pointer}; pointer defaults to the JSON root. Import deduplicates exact records, rejects conflicting IDs/scope, merges incomplete batches without deletion, and reconciles complete enumerations with explicit added/changed/removed evidence. Classify existing candidates using profile labels and supporting source evidence for that particular claim; an enumeration or file existence does not prove runtime use. Inventory record references resolve to source evidence for the same scope, candidate revision, and classification; bookkeeping-only, cyclic, and mismatched chains are rejected. Mechanical chain validation does not establish semantic support: inspect actual source and consumers before classifying. Evidence references accept a JSON pointer or inclusive 1-based lines [start,end] from a text artifact, including read_file snapshots. read pages bounded records; unresolved_only=true skips classified and removed records, with offsets relative to that filtered snapshot. render produces an exact identifier/count artifact with explicit classification filters and per-category coverage outcomes, reasons, and provenance at /coverage. Update receipts report progress as resolved/reopened records and required categories, not tool-call counts. Always use the returned inventory_id: updates create immutable snapshots, so concurrent updates branch and never overwrite each other. Unchanged imports reuse the prior snapshot. Evidence describes producer snapshots, not automatically fresh filesystem state. Scope, vocabulary, enumeration completeness, and semantic classification remain the caller's decisions; summary.complete covers the declared profile, not an independent check of the user's request.".to_string(),
+            description: "Retain a generic repository inventory without retranscribing identifiers. create freezes a scope object and a task-supplied profile (categories, classifications, required_categories); returns inventory_id and summary.scope_id. observe checks caller-selected paths in the bound environment, records exact identifiers, existence, Git tracking (unknown when unavailable), and content revisions without copying file bodies. Set fingerprint_contents=false for path-only inventories (revision is null; file contents are not read). observe accepts a full enumeration of up to 10000 paths, matching the inventory capacity. Pass complete=true only for a full category enumeration; incomplete batches require unresolved_reason. Alternatively, use a chosen enumeration command to emit exact JSON {scope_id,category,complete,unresolved_reason,candidates:[{id,exists,tracking,revision}]}, where exists is boolean/null, tracking is tracked/untracked/unknown, and revision is the relevant source hash or null. Import its original raw-output artifact via source {artifact_id,pointer}; pointer defaults to the JSON root. Import deduplicates exact records, rejects conflicting IDs/scope, merges incomplete batches without deletion, and reconciles complete enumerations with explicit added/changed/removed evidence. Classify existing candidates using profile labels and supporting source evidence for that particular claim; an enumeration or file existence does not prove runtime use. Inventory record references resolve to source evidence for the same scope, candidate revision, and classification; bookkeeping-only, cyclic, and mismatched chains are rejected. Mechanical chain validation does not establish semantic support: inspect actual source and consumers before classifying. Evidence references accept a JSON pointer or inclusive 1-based lines [start,end] from a text artifact, including read_file snapshots. read pages bounded records; unresolved_only=true skips classified and removed records, with offsets relative to that filtered snapshot. render returns inline identifiers for small results and produces an exact identifier/count artifact with explicit classification filters and per-category coverage outcomes, reasons, and provenance at /coverage. Update receipts report progress as resolved/reopened records and required categories, not tool-call counts. Always use the returned inventory_id: updates create immutable snapshots, so concurrent updates branch and never overwrite each other. Unchanged imports reuse the prior snapshot. Evidence describes producer snapshots, not automatically fresh filesystem state. Scope, vocabulary, enumeration completeness, and semantic classification remain the caller's decisions; summary.complete covers required categories and their records; all_candidates_classified separately reports whether optional records are also resolved, not an independent check of the user's request.".to_string(),
             strict: false, defer_loading: None, parameters, output_schema: None,
         })
     }

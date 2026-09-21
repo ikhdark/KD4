@@ -2339,6 +2339,16 @@ pub struct TurnTimingRequestTokenCategories {
     pub tool_output_budget_dropped_token_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum TurnTimingRequestDiagnosticsStatus {
+    #[default]
+    Pending,
+    Complete,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -2416,6 +2426,10 @@ pub struct TurnTimingModelRequest {
     /// repository paths, tool arguments, or hashes are persisted here.
     #[serde(default)]
     pub request_token_categories: Option<TurnTimingRequestTokenCategories>,
+    /// Optional diagnostics can finish after the turn. Late diagnostic records
+    /// use sampling_request_id and physical_attempt_id to update this row.
+    #[serde(default)]
+    pub request_diagnostics_status: TurnTimingRequestDiagnosticsStatus,
     /// Whether this logical request exactly matched the preceding stable
     /// prompt prefix under the same prompt-cache identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2476,13 +2490,14 @@ pub enum TurnTimingGenerationPurpose {
     #[ts(rename = "agent_coordination")]
     Coordination,
     #[serde(
-        rename = "deterministic_tool_continuation",
+        rename = "tool_result_interpretation",
+        alias = "deterministic_tool_continuation",
         alias = "artifact_continuation",
         alias = "source_interpretation",
         alias = "source_evidence_interpretation",
         alias = "source_discovery"
     )]
-    #[ts(rename = "deterministic_tool_continuation")]
+    #[ts(rename = "tool_result_interpretation")]
     ArtifactContinuation,
     CompactionRecovery,
     #[serde(rename = "terminal", alias = "terminal_completion_reasoning")]
@@ -3044,10 +3059,10 @@ pub struct TurnTimingCounters {
     /// independent of `generations_by_disposition`.
     #[serde(default)]
     pub suppressed_deterministic_continuation_count: u32,
-    /// Residual deterministic generation requests proved by turn execution
-    /// control, including requests elided before provider dispatch.
+    /// Residual deterministic generation requests proved by turn execution.
+    /// Null means production execution control does not measure this counter.
     #[serde(default)]
-    pub residual_deterministic_generation_count: u32,
+    pub residual_deterministic_generation_count: Option<u32>,
     /// Continuations drained and recorded by their code-mode owner.
     #[serde(default)]
     pub owner_drained_continuation_count: u32,
@@ -3077,7 +3092,10 @@ pub struct TurnTimingCounters {
     #[serde(default)]
     pub same_purpose_continuation_count: u32,
     #[serde(default)]
-    pub exact_repeated_wait_count: u32,
+    /// Wait generations sharing coarse revisions; this does not establish that
+    /// the wait action, cursor, or owner state repeated.
+    #[serde(alias = "exactRepeatedWaitCount")]
+    pub wait_generations_with_same_revision_count: u32,
     #[serde(default)]
     pub planning_generation_count: u32,
     #[serde(default)]
@@ -6080,7 +6098,10 @@ mod tests {
         );
         assert_eq!(decoded.counters.wait_only_generation_count, 0);
         assert_eq!(decoded.counters.internally_drained_wait_count, 0);
-        assert_eq!(decoded.counters.residual_deterministic_generation_count, 0);
+        assert_eq!(
+            decoded.counters.residual_deterministic_generation_count,
+            None
+        );
         assert_eq!(decoded.counters.owner_drained_continuation_count, 0);
         assert_eq!(decoded.counters.suppressed_validation_output_count, 0);
         assert_eq!(decoded.counters.ready_startup_prewarm_count, 0);
@@ -6126,6 +6147,39 @@ mod tests {
         assert_eq!(
             decoded.model_requests[0].attempt_kind,
             TurnTimingAttemptKind::Primary
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timing_diagnostics_preserve_legacy_input_and_honest_output() -> Result<()> {
+        let mut legacy = serde_json::to_value(TurnTimingCounters::default())?;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("waitGenerationsWithSameRevisionCount");
+        legacy["exactRepeatedWaitCount"] = json!(3);
+        let counters: TurnTimingCounters = serde_json::from_value(legacy)?;
+        assert_eq!(counters.wait_generations_with_same_revision_count, 3);
+        let output = serde_json::to_value(counters)?;
+        assert_eq!(output["waitGenerationsWithSameRevisionCount"], 3);
+        assert!(output.get("exactRepeatedWaitCount").is_none());
+        assert!(output["residualDeterministicGenerationCount"].is_null());
+        let purpose: TurnTimingGenerationPurpose =
+            serde_json::from_value(json!("deterministic_tool_continuation"))?;
+        assert_eq!(
+            serde_json::to_value(purpose)?,
+            json!("tool_result_interpretation")
+        );
+        let mut legacy = serde_json::to_value(TurnTimingModelRequest::default())?;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("requestDiagnosticsStatus");
+        let request: TurnTimingModelRequest = serde_json::from_value(legacy)?;
+        assert_eq!(
+            request.request_diagnostics_status,
+            TurnTimingRequestDiagnosticsStatus::Pending
         );
         Ok(())
     }
@@ -8100,7 +8154,7 @@ mod tests {
             vec![
                 serde_json::json!("initial"),
                 serde_json::json!("wait"),
-                serde_json::json!("deterministic_tool_continuation"),
+                serde_json::json!("tool_result_interpretation"),
                 serde_json::json!("implementation"),
                 serde_json::json!("validation_interpretation"),
                 serde_json::json!("failure_diagnosis"),

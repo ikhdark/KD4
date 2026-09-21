@@ -2054,6 +2054,113 @@ fn logical_generation_budget_allows_128_regular_and_one_terminal_generation() {
     );
 }
 
+#[test]
+fn productive_work_and_owned_polling_preserve_generation_capacity() {
+    let mut budget = LogicalGenerationBudget::default();
+    for _ in 0..128 {
+        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+    }
+    budget.observe_progress(true, false);
+    for _ in 0..256 {
+        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+        budget.observe_progress(false, true);
+    }
+    for _ in 0..128 {
+        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+        budget.observe_progress(false, false);
+    }
+    assert_eq!(
+        budget.admit(false),
+        LogicalGenerationAdmission::Terminal { forced: true }
+    );
+}
+
+#[test]
+fn validation_failure_at_generation_limit_keeps_repair_tools_available() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "validation_failure_at_generation_limit_keeps_repair_tools_available",
+        validation_failure_at_generation_limit_keeps_repair_tools_available_impl,
+    )
+}
+
+async fn validation_failure_at_generation_limit_keeps_repair_tools_available_impl() -> Result<()> {
+    core_test_support::require_network!();
+    let server = responses::start_mock_server().await;
+    let mut sequence = (0..127)
+        .map(|index| {
+            let mut completed = responses::ev_completed(&format!("thinking-{index}"));
+            completed["response"]["end_turn"] = serde_json::json!(false);
+            responses::sse(vec![completed])
+        })
+        .collect::<Vec<_>>();
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    sequence.push(responses::sse(vec![
+        responses::ev_shell_command_call(
+            "validation-failed",
+            &format!("{python} -c \"raise AssertionError('repair-required')\""),
+        ),
+        responses::ev_completed("failed"),
+    ]));
+    sequence.push(responses::sse(vec![
+        responses::ev_apply_patch_custom_tool_call(
+            "repair",
+            "*** Begin Patch\n*** Add File: repaired.txt\n+fixed\n*** End Patch",
+        ),
+        responses::ev_completed("repaired"),
+    ]));
+    sequence.push(responses::sse(vec![
+        responses::ev_shell_command_call("validated", &format!("{python} -c \"from pathlib import Path; assert Path('repaired.txt').read_text().strip() == 'fixed'; print('validation-passed')\"")),
+        responses::ev_completed("validated"),
+    ]));
+    sequence.push(responses::sse(vec![
+        responses::ev_assistant_message("answer", "Repair validated."),
+        responses::ev_completed("finished"),
+    ]));
+    let requests = responses::mount_sse_sequence(&server, sequence).await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::Kd4Runtime).unwrap();
+            config.features.disable(Feature::CodeModeHost).unwrap();
+            config.features.disable(Feature::UnifiedExec).unwrap();
+            config.model_auto_compact_token_limit = Some(i64::MAX);
+        })
+        .build(&server)
+        .await?;
+    let completion = test
+        .submit_turn_and_capture_completion(
+            "Validate, repair any failure, and validate the repair.",
+        )
+        .await?;
+    assert!(completion.error.is_none(), "{completion:?}");
+    assert_eq!(
+        fs::read_to_string(test.workspace_path("repaired.txt"))?,
+        "fixed\n"
+    );
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("Repair validated.")
+    );
+    let sent = requests.requests();
+    assert_eq!(sent.len(), 131);
+    assert!(
+        sent[128]
+            .function_call_output_text("validation-failed")
+            .unwrap()
+            .contains("repair-required")
+    );
+    assert!(
+        sent[130]
+            .function_call_output_text("validated")
+            .unwrap()
+            .contains("validation-passed")
+    );
+    for request in &sent[128..] {
+        assert!(!request.body_json()["tools"].as_array().unwrap().is_empty());
+        assert!(!request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     let (session, turn_context, events) =
@@ -2079,7 +2186,7 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     .expect("forced-terminal boundary emits a warning");
     assert_eq!(
         warning.message,
-        "This turn reached its limit of 128 regular model generations. The assistant will now summarize completed work and report anything unfinished. Send another message to continue the remaining work."
+        "This turn reached 128 generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."
     );
 }
 
@@ -2447,7 +2554,7 @@ async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
     };
     assert_eq!(
         error.message,
-        "This turn reached its generation budget (up to 128 regular model generations and one final summary) before all requested work completed. Send another message to continue the remaining work."
+        "This turn exhausted its allowance of 128 generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume."
     );
     assert!(error.affects_turn_status());
     assert_eq!(
@@ -3256,21 +3363,18 @@ async fn generation_budget_survives_reentry_and_terminal_directive_is_request_lo
     let mut sequence = (0..126)
         .map(|i| {
             let id = format!("regular-{i}");
-            responses::sse(vec![
-                responses::ev_response_created(&id),
-                responses::ev_function_call(&id, "unknown_test_tool", "{}"),
-                responses::ev_completed(&id),
-            ])
+            let mut completed = responses::ev_completed(&id);
+            completed["response"]["end_turn"] = serde_json::json!(false);
+            responses::sse(vec![responses::ev_response_created(&id), completed])
         })
         .collect::<Vec<_>>();
     sequence.push(responses::sse(vec![
         responses::ev_assistant_message("reentry", "ready for reentry"),
         responses::ev_completed("reentry"),
     ]));
-    sequence.push(responses::sse(vec![
-        responses::ev_function_call("after-reentry", "unknown_test_tool", "{}"),
-        responses::ev_completed("after-reentry"),
-    ]));
+    let mut after_reentry = responses::ev_completed("after-reentry");
+    after_reentry["response"]["end_turn"] = serde_json::json!(false);
+    sequence.push(responses::sse(vec![after_reentry]));
     for id in ["terminal", "next-turn"] {
         sequence.push(responses::sse(vec![
             responses::ev_assistant_message(id, id),
@@ -3381,12 +3485,16 @@ else:
         .await
         .expect("steer input is accepted by the active regular task");
     fs::write(test.codex_home_path().join("reentry.release"), "release")?;
-    let last_message = core_test_support::wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::TurnComplete(event) => Some(event.last_agent_message.clone()),
+    let completion = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.clone()),
         _ => None,
     })
     .await;
-    assert_eq!(last_message.as_deref(), Some("terminal"));
+    assert_eq!(completion.last_agent_message.as_deref(), Some("terminal"));
+    assert!(
+        completion.error.is_some(),
+        "budget suspension must not report success"
+    );
     assert_eq!(
         requests.requests().len(),
         129,
@@ -3406,7 +3514,7 @@ else:
         assert_eq!(
             request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
             terminal,
-            "the terminal instruction must not persist in history or leak into a fresh turn"
+            "the terminal instruction must appear only in request 128, observed request {index}"
         );
         assert_eq!(
             request.body_json()["tools"]
@@ -3554,7 +3662,10 @@ async fn protocol_continuation_runs_required_work_without_new_input_impl() -> Re
         );
         assert_eq!(requests.requests().len(), 3, "{response_kind}");
         let timing = completion.timing.expect("completed turn timing");
-        assert_eq!(timing.counters.residual_deterministic_generation_count, 0);
+        assert_eq!(
+            timing.counters.residual_deterministic_generation_count,
+            None
+        );
     }
     Ok(())
 }

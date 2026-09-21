@@ -614,6 +614,39 @@ fn confirmed_performance_single_text_function_output_uses_direct_canonical_text(
 }
 
 #[test]
+fn multi_text_command_output_retains_line_addressable_canonical_bytes() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let diagnostic = "compiler output\nerror[E0308]: late decisive diagnostic";
+    let receipt = "Nested command states:\n{\"exit_code\":1}";
+    let output = FunctionToolOutput::from_content(
+        vec![
+            FunctionCallOutputContentItem::InputText {
+                text: diagnostic.to_string(),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: receipt.to_string(),
+            },
+        ],
+        Some(false),
+    );
+    let canonical = output.canonical_result(&payload).unwrap();
+    let text = String::from_utf8(canonical.bytes).unwrap();
+    assert_eq!(text, format!("{diagnostic}\n{receipt}"));
+    assert_eq!(
+        text.lines().nth(1),
+        Some("error[E0308]: late decisive diagnostic")
+    );
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    let whitespace = FunctionToolOutput::from_text(" \n\t".to_string(), Some(true));
+    assert_eq!(
+        whitespace.canonical_result(&payload).unwrap().bytes,
+        b" \n\t"
+    );
+}
+
+#[test]
 fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
     let payload = ToolPayload::ToolSearch {
         arguments: SearchToolCallParams {

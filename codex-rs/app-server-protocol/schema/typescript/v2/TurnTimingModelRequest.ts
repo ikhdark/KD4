@@ -7,6 +7,7 @@ import type { TurnTimingGenerationPurpose } from "./TurnTimingGenerationPurpose"
 import type { TurnTimingGenerationReason } from "./TurnTimingGenerationReason";
 import type { TurnTimingProgressKind } from "./TurnTimingProgressKind";
 import type { TurnTimingProviderTokenUsage } from "./TurnTimingProviderTokenUsage";
+import type { TurnTimingRequestDiagnosticsStatus } from "./TurnTimingRequestDiagnosticsStatus";
 import type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenCategories";
 
 export type TurnTimingModelRequest = {
@@ -75,6 +76,11 @@ tokenUsage?: TurnTimingProviderTokenUsage,
  * repository paths, tool arguments, or hashes are persisted here.
  */
 requestTokenCategories: TurnTimingRequestTokenCategories | null,
+/**
+ * Optional diagnostics can finish after the turn. Late diagnostic records
+ * use sampling_request_id and physical_attempt_id to update this row.
+ */
+requestDiagnosticsStatus: TurnTimingRequestDiagnosticsStatus,
 /**
  * Whether this logical request exactly matched the preceding stable
  * prompt prefix under the same prompt-cache identity.

@@ -5357,6 +5357,32 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) async fn register_tool_artifact_origin(
+        &self,
+        artifact_id: String,
+        call_id: String,
+        bytes: u64,
+        sha256: String,
+    ) {
+        let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
+            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+        };
+        let mutation = crate::tool_history::ToolHistoryMutation::RegisterArtifactOrigin {
+            artifact_id,
+            call_id,
+            bytes,
+            sha256,
+        };
+        let mut writer = self.tool_history_persistence.writer().await;
+        self.state
+            .lock()
+            .await
+            .apply_tool_history_mutation(&mutation);
+        if let Err(err) = writer.enqueue_mutation(mutation, "internal artifact provenance") {
+            tracing::warn!("failed to enqueue internal artifact provenance: {err}");
+        }
+    }
+
     pub(crate) async fn register_tool_history_candidate(
         &self,
         candidate: crate::tool_history::ToolHistoryCandidate,

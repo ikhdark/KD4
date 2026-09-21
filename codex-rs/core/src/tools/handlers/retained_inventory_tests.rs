@@ -291,6 +291,128 @@ async fn inventory_cancellation_drops_pending_observations() {
     assert_eq!(fs.reads.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn path_only_inventory_accepts_full_enumeration_without_content_reads() {
+    let cwd = tempfile::tempdir().unwrap();
+    let fs = Arc::new(DelayedObservationFileSystem {
+        block_reads: true,
+        ..Default::default()
+    });
+    let context = observation_context(cwd.path(), Arc::clone(&fs)).await;
+    let initial = create(&context).await;
+    let paths = (0..1_001)
+        .map(|index| format!("file-{index:04}"))
+        .collect::<Vec<_>>();
+    let observed = tokio::time::timeout(
+        Duration::from_secs(10),
+        call_through_registry(
+            &context,
+            json!({"operation":"observe", "inventory_id":initial["inventory_id"],
+            "category":"entrypoint", "paths":paths, "fingerprint_contents":false, "complete":true}),
+        ),
+    )
+    .await
+    .expect("path-only observation must not read contents")
+    .unwrap();
+    assert_eq!(fs.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(observed["summary"]["unique_candidates"], 1_001);
+    let (snapshot, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: observed["inventory_id"].as_str().unwrap().to_string(),
+            pointer: String::new(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot["categories"]["entrypoint"]["complete"], true);
+    let records = snapshot["records"]["entrypoint"].as_object().unwrap();
+    assert_eq!(records.len(), 1_001);
+    assert!(
+        records
+            .values()
+            .all(|record| record["candidate"]["exists"] == true
+                && record["candidate"]["revision"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn optional_candidates_do_not_prevent_required_inventory_completion() {
+    let context = context().await;
+    let initial = call(
+        &context,
+        json!({"operation":"create", "scope":{"root":"src"},
+        "profile":{"categories":["required","optional"], "classifications":["active"],
+        "required_categories":["required"]}}),
+    )
+    .await
+    .unwrap();
+    let required = import(&context, &initial, "required", vec![], true).await;
+    let optional = import(
+        &context,
+        &required,
+        "optional",
+        vec![candidate("fixture.rs", "v1")],
+        false,
+    )
+    .await;
+    assert_eq!(optional["summary"]["complete"], true);
+    assert_eq!(optional["summary"]["unresolved_required_records"], 0);
+    assert_eq!(optional["summary"]["unresolved_records"], 1);
+    assert_eq!(optional["summary"]["all_candidates_classified"], false);
+    let required = import(
+        &context,
+        &optional,
+        "required",
+        vec![candidate("runtime.rs", "v1")],
+        true,
+    )
+    .await;
+    assert_eq!(required["summary"]["complete"], false);
+    assert_eq!(required["summary"]["unresolved_required_records"], 1);
+}
+
+#[tokio::test]
+async fn inventory_evidence_drains_exact_overflow_selection() {
+    let context = context().await;
+    let source_text = "supporting source line\n".repeat(600);
+    let artifact = create_canonical_output_artifact(
+        &context.step_context.turn.config.codex_home,
+        &context.session.thread_id.to_string(),
+        &CanonicalToolResult::text(source_text.clone()),
+    )
+    .await;
+    let source = Source {
+        artifact_id: artifact.artifact_id().unwrap(),
+        pointer: String::new(),
+        lines: Some([1, 600]),
+    };
+    let (first_page, _) =
+        crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse(
+            &context.step_context.turn.config.codex_home,
+            &context.session.thread_id.to_string(),
+            &source.artifact_id,
+            vec![ToolOutputSelector::Lines { start: 1, end: 600 }],
+            1_000,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !first_page.complete,
+        "fixture must require continuation recovery"
+    );
+    let (evidence, link) = read_evidence(&context, source.clone(), true, &mut BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(evidence.source, source);
+    assert_eq!(
+        evidence.sha256,
+        digest(&Value::String(source_text)).unwrap()
+    );
+    assert!(link.is_none());
+}
+
 async fn context() -> ToolInvocation {
     let (session, mut turn) = make_session_and_context().await;
     turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
@@ -711,6 +833,7 @@ async fn inventory_lifecycle_retains_exact_ids_evidence_counts_and_scope() {
     .await
     .unwrap();
     assert_eq!(rendered["count"], 1);
+    assert_eq!(rendered["identifiers"], json!(["src/a space~file.rs"]));
     let file: Value = serde_json::from_slice(
         &std::fs::read(rendered["rendered_path"].as_str().unwrap()).unwrap(),
     )
@@ -1632,4 +1755,46 @@ async fn inventory_partial_observation_preserves_success_and_marks_failed_path_u
             .contains("retry failed paths")
     );
     assert_eq!(fs.reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn inventory_classifies_continued_evidence_and_renders_small_identifiers_inline() {
+    let context = context().await;
+    let initial = create(&context).await;
+    let imported = import(
+        &context,
+        &initial,
+        "entrypoint",
+        vec![candidate("src/runtime.rs", "one")],
+        true,
+    )
+    .await;
+    let source = json!({"source": "fn runtime_entry() { execute(); }\n".repeat(300)});
+    let source_id = artifact(&context, source.clone()).await;
+    let selector = ToolOutputSelector::JsonPointer {
+        pointer: "/source".into(),
+    };
+    let (raw, _) =
+        crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse(
+            &context.step_context.turn.config.codex_home,
+            &context.session.thread_id.to_string(),
+            &source_id,
+            vec![selector],
+            1_000,
+        )
+        .await
+        .unwrap();
+    assert!(!raw.complete, "fixture must require continuation draining");
+    let classified = call(&context, json!({"operation":"classify", "inventory_id":imported["inventory_id"],
+        "decisions":[{"category":"entrypoint","candidate_id":"src/runtime.rs","classification":"active",
+        "evidence":[{"artifact_id":source_id,"pointer":"/source"}]}]})).await.unwrap();
+    assert_eq!(classified["summary"]["statuses"]["classified"], 1);
+    let rendered = call_through_registry(
+        &context,
+        json!({"operation":"render", "inventory_id":classified["inventory_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rendered["identifiers"], json!(["src/runtime.rs"]));
+    assert_eq!(rendered["count"], 1);
 }
