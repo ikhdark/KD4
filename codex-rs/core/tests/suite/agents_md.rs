@@ -44,7 +44,7 @@ const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const PROJECT_INSTRUCTIONS: &str = "project instructions";
 const PROJECT_SEPARATOR: &str = "--- project-doc ---";
 const FRESH_PROVENANCE: &str =
-    "Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.";
+    "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.";
 const SPAWN_CALL_ID: &str = "spawn-global-instructions-child";
 const SPAWN_CHILD_PROMPT: &str = "inspect inherited global instructions";
 const SPAWN_FRESH_PARENT_PROMPT: &str = "spawn a child with fresh context";

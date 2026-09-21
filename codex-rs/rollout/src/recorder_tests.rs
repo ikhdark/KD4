@@ -504,7 +504,7 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
 }
 
 #[tokio::test]
-async fn recorder_barriers_persist_latest_coalesced_token_count() -> std::io::Result<()> {
+async fn recorder_persists_every_sampling_request_token_count() -> std::io::Result<()> {
     for barrier in ["flush", "persist", "shutdown"] {
         let home = TempDir::new()?;
         let recorder = RolloutRecorder::new(
@@ -550,10 +550,6 @@ async fn recorder_barriers_persist_latest_coalesced_token_count() -> std::io::Re
                 },
             ))])
             .await?;
-        assert!(
-            !fs::read_to_string(&rollout_path)?.contains("token_count"),
-            "automatic writes still coalesce counts"
-        );
         match barrier {
             "flush" => recorder.flush().await?,
             "persist" => recorder.persist().await?,
@@ -575,7 +571,11 @@ async fn recorder_barriers_persist_latest_coalesced_token_count() -> std::io::Re
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(counts, vec![20], "barrier: {barrier}");
+        assert_eq!(
+            counts,
+            vec![10, 20],
+            "every sampling request's usage is retained, not just the last (barrier: {barrier})"
+        );
         assert!(
             contents.contains("accepted-marker"),
             "barrier persists all queued records"
@@ -982,7 +982,7 @@ fn writer_state_defines_manifests_once_then_references_them() {
         boundary,
     ]));
 
-    assert_eq!(state.pending_items.len(), 5);
+    assert_eq!(state.pending_items.len(), 6);
     assert!(matches!(
         &state.pending_items[0].item,
         RolloutItem::ToolManifest(item) if item.hash == "already-persisted" && item.is_reference()
@@ -995,15 +995,20 @@ fn writer_state_defines_manifests_once_then_references_them() {
         &state.pending_items[2].item,
         RolloutItem::ToolManifest(item) if item.hash == "new" && item.is_reference()
     ));
+    // Both counts survive in order: manifest de-duplication must not be
+    // mistaken for a licence to drop per-request usage.
     assert!(matches!(
         &state.pending_items[3].item,
         RolloutItem::EventMsg(EventMsg::TokenCount(_))
     ));
     assert!(matches!(
         &state.pending_items[4].item,
+        RolloutItem::EventMsg(EventMsg::TokenCount(_))
+    ));
+    assert!(matches!(
+        &state.pending_items[5].item,
         RolloutItem::EventMsg(EventMsg::TurnStarted(_))
     ));
-    assert!(state.pending_token_count.is_none());
 }
 
 #[tokio::test]

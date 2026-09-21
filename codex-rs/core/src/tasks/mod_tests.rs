@@ -213,7 +213,8 @@ impl SessionTask for IncompleteClosureTask {
                         internal_chat_message_metadata_passthrough: None,
                     }],
                 )
-                .await;
+                .await
+                .unwrap();
             assert!(ctx.tool_call_acceptance.try_accept(|| {
                 ctx.turn_timing_state.try_record_accepted_tool_call(
                     "unresolved-call",
@@ -437,6 +438,41 @@ async fn abort_all_tasks_clears_empty_active_turn() {
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
     assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn targeted_interrupt_leaves_successor_running_and_settles_missing_target() {
+    let (session, turn_context, _events) = make_session_and_context_with_rx().await;
+    let active_id = turn_context.sub_id.clone();
+    session
+        .spawn_task(Arc::clone(&turn_context), Vec::new(), FenceBlockingTask)
+        .await;
+    assert!(
+        !session
+            .abort_turn_if_active("retired-turn", TurnAbortReason::Interrupted)
+            .await
+    );
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .task
+            .is_some()
+    );
+    assert!(
+        session
+            .abort_turn_if_active(&active_id, TurnAbortReason::Interrupted)
+            .await
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(
+        !session
+            .abort_turn_if_active(&active_id, TurnAbortReason::Interrupted)
+            .await
+    );
 }
 
 #[tokio::test]

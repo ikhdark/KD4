@@ -127,6 +127,7 @@ async fn fallback_provider_uses_in_process_session_when_host_is_missing() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "fallback-ready".to_string(),
@@ -196,6 +197,7 @@ async fn synchronous_exit_returns_successfully() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
@@ -230,6 +232,7 @@ text("after await");
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
@@ -265,6 +268,7 @@ async fn timer_throwing_exit_sentinel_remains_an_error() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: Some("__codex_code_mode_exit__".to_string()),
@@ -343,7 +347,7 @@ text("slots released");
     .await;
     assert_eq!(
         result_text(&response),
-        "code mode cell exceeded its limit of 128 pending timers\nslots released"
+        "TypeError: code mode cell exceeded its limit of 128 pending timers\nslots released"
     );
 }
 
@@ -372,6 +376,7 @@ async fn compact_tool_discovery_resolves_one_exact_description() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: r#"{"names":["sample_tool"],"resolved":{"name":"sample_tool","description":"exact schema description"},"missing":true}"#.to_string(),
@@ -418,6 +423,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
     assert_eq!(
         write_response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: None,
@@ -426,6 +432,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
     assert_eq!(
         same_session,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "visible".to_string(),
@@ -436,6 +443,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
     assert_eq!(
         other_session,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "undefined".to_string(),
@@ -482,6 +490,7 @@ async fn oversized_store_rejects_all_writes_from_the_cell() {
     assert_eq!(
         read_response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "undefined".to_string(),
@@ -502,6 +511,7 @@ async fn store_replacement_releases_bytes_in_current_and_later_cells() {
     assert_eq!(
         first,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "small".to_string()
@@ -517,6 +527,7 @@ async fn store_replacement_releases_bytes_in_current_and_later_cells() {
     assert_eq!(
         second,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
@@ -590,6 +601,7 @@ text(String(typeof console.info === "function"));"#
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
@@ -684,6 +696,7 @@ text("second");"#
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
@@ -729,6 +742,7 @@ text(value);
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
@@ -768,6 +782,7 @@ text(formatter.format(new Date("2025-01-02T03:04:05Z")));
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
@@ -788,7 +803,7 @@ async fn bounded_parallel_notify_returns_delivery_promise() {
 const notification = notify("ping");
 const returnsExpectedTypes = [
   text("first") === undefined,
-  image("data:image/png;base64,AAA") === undefined,
+  image("data:image/png;base64,AAAA") === undefined,
   notification instanceof Promise,
 ];
 await notification;
@@ -804,13 +819,14 @@ text(JSON.stringify(returnsExpectedTypes));
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "first".to_string(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,AAA".to_string(),
+                    image_url: "data:image/png;base64,AAAA".to_string(),
                     detail: Some(crate::DEFAULT_IMAGE_DETAIL),
                 },
                 FunctionCallOutputContentItem::InputText {
@@ -847,6 +863,7 @@ image({
     assert_eq!(
             response,
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
@@ -866,7 +883,7 @@ async fn generated_image_helper_appends_image_and_output_hint() {
         ExecuteRequest {
             source: r#"
 generatedImage({
-  image_url: "data:image/png;base64,AAA",
+  image_url: "data:image/png;base64,AAAA",
   output_hint: "generated image save hint",
 });
 "#
@@ -880,10 +897,11 @@ generatedImage({
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,AAA".to_string(),
+                    image_url: "data:image/png;base64,AAAA".to_string(),
                     detail: Some(crate::DEFAULT_IMAGE_DETAIL),
                 },
                 FunctionCallOutputContentItem::InputText {
@@ -905,7 +923,7 @@ async fn image_helper_second_arg_overrides_explicit_object_detail() {
             source: r#"
 image(
   {
-    image_url: "data:image/png;base64,AAA",
+    image_url: "data:image/png;base64,AAAA",
     detail: "high",
   },
   "original",
@@ -921,9 +939,10 @@ image(
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,AAA".to_string(),
+                image_url: "data:image/png;base64,AAAA".to_string(),
                 detail: Some(crate::ImageDetail::Original),
             }],
             error_text: None,
@@ -959,6 +978,7 @@ image(
     assert_eq!(
             response,
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
@@ -978,7 +998,7 @@ async fn image_helper_accepts_low_detail() {
         ExecuteRequest {
             source: r#"
 image({
-  image_url: "data:image/png;base64,AAA",
+  image_url: "data:image/png;base64,AAAA",
   detail: "low",
 });
 "#
@@ -992,9 +1012,10 @@ image({
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,AAA".to_string(),
+                image_url: "data:image/png;base64,AAAA".to_string(),
                 detail: Some(crate::ImageDetail::Low),
             }],
             error_text: None,
@@ -1027,10 +1048,11 @@ async fn image_helpers_reject_remote_urls() {
             assert_eq!(
                     response,
                     RuntimeResponse::Result {
+                        output_loss: None,
                         cell_id: cell_id("1"),
                         content_items: Vec::new(),
                         error_text: Some(
-                            "Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead".to_string(),
+                            "TypeError: Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead\n    at exec_main.mjs:1:1".to_string(),
                         ),
                     }
                 );
@@ -1047,7 +1069,7 @@ async fn image_helper_rejects_unsupported_detail() {
         ExecuteRequest {
             source: r#"
 image({
-  image_url: "data:image/png;base64,AAA",
+  image_url: "data:image/png;base64,AAAA",
   detail: "medium",
 });
 "#
@@ -1061,9 +1083,10 @@ image({
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
-            error_text: Some("image detail must be one of: auto, low, high, original".to_string()),
+            error_text: Some("TypeError: image detail must be one of: auto, low, high, original\n    at exec_main.mjs:2:1".to_string()),
         }
     );
 }
@@ -1098,10 +1121,11 @@ image({
     assert_eq!(
             response,
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: cell_id("1"),
                 content_items: Vec::new(),
                 error_text: Some(
-                    "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block".to_string(),
+                    "TypeError: image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block\n    at exec_main.mjs:2:1".to_string(),
                 ),
             }
         );
@@ -1122,6 +1146,7 @@ async fn wait_reports_missing_cell_separately_from_runtime_results() {
     assert_eq!(
         response,
         WaitOutcome::MissingCell(RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("missing"),
             content_items: Vec::new(),
             error_text: Some("exec cell missing not found".to_string()),

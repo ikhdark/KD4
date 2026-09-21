@@ -13,9 +13,16 @@ pub use codex_protocol::protocol::TruncationPolicy;
 /// Conservative coherent-packet model-projection defaults. Formation happens before token
 /// minimization, and explicit requests remain bounded by the caller-supplied
 /// model hard limit.
-pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 4_000;
+///
+/// Successful output carries the evidence a turn is built on. Repository
+/// discovery routinely produces several hundred lines of it, so the success
+/// budget matches the failure budget rather than sitting below it; a stack
+/// trace is not worth more room than the search results that answer the task.
+pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
 pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
-pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
+/// High-signal diagnostics stay above the ordinary budget: a compiler or test
+/// dump is the one class whose useful part is reliably larger than a packet.
+pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 16_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputOutcome {

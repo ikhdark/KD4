@@ -384,3 +384,24 @@ fn map_api_error_extracts_identity_auth_details_from_headers() {
     );
     assert_eq!(err.identity_error_code.as_deref(), Some("token_expired"));
 }
+
+#[test]
+fn audit_usage_limit_identity_survives_malformed_optional_fields() {
+    for body in [
+        r#"{"error":{"type":"usage_limit_reached","plan_type":{},"resets_at":"bad"}}"#,
+        r#"{"error":{"type":"usage_limit_reached","plan_type":[],"resets_at":{}}}"#,
+    ] {
+        let mapped = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: None,
+            headers: None,
+            body: Some(body.into()),
+        }));
+        assert!(!mapped.is_retryable());
+        let CodexErr::UsageLimitReached(error) = mapped else {
+            panic!("usage limit identity lost");
+        };
+        assert!(error.resets_at.is_none());
+        assert!(error.plan_type.is_none());
+    }
+}

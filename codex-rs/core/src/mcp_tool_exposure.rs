@@ -62,10 +62,7 @@ pub(crate) fn resolve_selected_skill_mcp_exposure(
 
         let declaration = match plugin.tool_exposure.as_ref() {
             None => {
-                result
-                    .selection
-                    .legacy_server_names
-                    .extend(plugin.mcp_servers.keys().cloned());
+                // Undeclared tools remain available through deferred discovery.
                 continue;
             }
             Some(codex_plugin::manifest::PluginToolExposure::Invalid(message)) => {
@@ -76,10 +73,6 @@ pub(crate) fn resolve_selected_skill_mcp_exposure(
             }
             Some(codex_plugin::manifest::PluginToolExposure::Valid(config)) => {
                 let Some(declaration) = config.skills.get(skill_name) else {
-                    result
-                        .selection
-                        .legacy_server_names
-                        .extend(plugin.mcp_servers.keys().cloned());
                     continue;
                 };
                 declaration
@@ -193,9 +186,15 @@ fn filter_codex_apps_mcp_tools(
 ) -> Vec<McpToolInfo> {
     let allowed: HashSet<&str> = connectors
         .iter()
-        .map(|connector| connector.id.as_str())
+        .filter_map(|connector| codex_connectors::canonical_connector_id(&connector.id))
         .collect();
-    let app_tool_policy = AppToolPolicyEvaluator::new(&config.config_layer_stack);
+    let app_tool_policy = match AppToolPolicyEvaluator::new(&config.config_layer_stack) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(%error, "withholding app tools because their policy is invalid");
+            return Vec::new();
+        }
+    };
 
     mcp_tools
         .iter()
@@ -206,7 +205,11 @@ fn filter_codex_apps_mcp_tools(
             if !tool_is_model_visible(tool) {
                 return false;
             }
-            let Some(connector_id) = tool.connector_id.as_deref() else {
+            let Some(connector_id) = tool
+                .connector_id
+                .as_deref()
+                .and_then(codex_connectors::canonical_connector_id)
+            else {
                 return false;
             };
             let annotations = tool.tool.annotations.as_ref();

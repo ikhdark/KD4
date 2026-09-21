@@ -830,7 +830,7 @@ impl MessageProcessor {
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
         session: Arc<ConnectionSessionState>,
-        request_context: RequestContext,
+        mut request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
         if !session.initialized() {
             return Err(invalid_request("Not initialized"));
@@ -840,6 +840,21 @@ impl MessageProcessor {
             && !session.experimental_api_enabled()
         {
             return Err(invalid_request(experimental_required_message(reason)));
+        }
+        let control = matches!(
+            codex_request.serialization_scope(),
+            Some(ClientRequestSerializationScope::ThreadControl { .. })
+        );
+        let estimated_request_bytes = serialized_request_queue_bytes(!control, &codex_request);
+        if !self
+            .outgoing
+            .admit_request_work(&mut request_context, estimated_request_bytes, control)
+            .await
+        {
+            return Err(overloaded_error(
+                OverloadReason::SerializedRequestQueue,
+                "outstanding request budget exhausted; wait for accepted requests to finish",
+            ));
         }
         let connection_id = connection_request_id.connection_id;
         self.initialize_processor.track_initialized_request(
@@ -862,15 +877,6 @@ impl MessageProcessor {
         let handler_rpc_gate = Arc::clone(&rpc_gate);
         let processor = Arc::clone(self);
         let span = request_context.span();
-        // Control traffic is admitted from its own reserved lane and is never charged against
-        // the queued-payload byte budget, so it does not need a size at all.
-        let needs_queue_bytes = matches!(
-            serialization_scope,
-            Some(ref scope)
-                if !matches!(scope, ClientRequestSerializationScope::ThreadControl { .. })
-        );
-        let estimated_request_bytes =
-            serialized_request_queue_bytes(needs_queue_bytes, &codex_request);
         let request = QueuedInitializedRequest::new_with_estimated_bytes(
             rpc_gate,
             estimated_request_bytes,

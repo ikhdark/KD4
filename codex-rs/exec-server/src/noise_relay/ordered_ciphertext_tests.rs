@@ -80,3 +80,19 @@ fn accepts_exact_reorder_window() {
     }
     assert_eq!(frames.push(63, vec![63]).unwrap(), vec![vec![63], vec![64]]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn gap_deadline_is_absolute_and_clears_only_on_recovery() {
+    let mut frames = OrderedCiphertextFrames::default();
+    assert_eq!(frames.gap_deadline(), None);
+    frames.push(1, vec![1]).unwrap();
+    let deadline = frames.gap_deadline().unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    frames.push(3, vec![3]).unwrap();
+    frames.push(1, vec![9]).unwrap();
+    assert_eq!(frames.gap_deadline(), Some(deadline));
+    assert_eq!(frames.push(0, vec![0]).unwrap(), vec![vec![0], vec![1]]);
+    assert_eq!(frames.gap_deadline(), Some(deadline));
+    assert_eq!(frames.push(2, vec![2]).unwrap(), vec![vec![2], vec![3]]);
+    assert_eq!(frames.gap_deadline(), None);
+}

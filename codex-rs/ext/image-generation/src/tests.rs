@@ -30,6 +30,156 @@ use crate::IMAGEGEN_TOOL_NAME;
 
 const RESULT: &str = "cG5n";
 
+const VALID_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+#[derive(Default)]
+struct RecordingImageEmitter(std::sync::Mutex<Vec<codex_extension_api::ExtensionTurnItem>>);
+
+impl codex_extension_api::TurnItemEmitter for RecordingImageEmitter {
+    fn emit_started<'a>(
+        &'a self,
+        _item: codex_extension_api::ExtensionTurnItem,
+    ) -> codex_extension_api::TurnItemEmissionFuture<'a> {
+        Box::pin(async {})
+    }
+
+    fn emit_completed<'a>(
+        &'a self,
+        item: codex_extension_api::ExtensionTurnItem,
+    ) -> codex_extension_api::TurnItemEmissionFuture<'a> {
+        Box::pin(async move {
+            self.0.lock().unwrap().push(item);
+        })
+    }
+}
+
+#[tokio::test]
+async fn image_completion_requires_valid_bytes_regardless_of_save_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = codex_utils_absolute_path::AbsolutePathBuf::try_from(temp.path()).unwrap();
+    let blocked = root.join("blocked");
+    std::fs::write(blocked.as_path(), "not a directory").unwrap();
+    for save_root in [None, Some(&root), Some(&blocked)] {
+        for result in ["", "%%%", RESULT, VALID_PNG] {
+            let emitter = RecordingImageEmitter::default();
+            let output = super::complete_image_generation(
+                "call",
+                &emitter,
+                "prompt".to_string(),
+                result.to_string(),
+                save_root,
+                "thread",
+            )
+            .await;
+            let valid = result == VALID_PNG;
+            assert_eq!(output.is_ok(), valid);
+            let items = emitter.0.lock().unwrap();
+            assert_eq!(items.len(), 1);
+            let codex_extension_items::ExtensionItem::ImageGeneration(item) = &items[0].item else {
+                panic!("image completion")
+            };
+            assert_eq!(item.status, if valid { "completed" } else { "failed" });
+            assert_eq!(item.result.is_empty(), !valid);
+            if let Ok(output) = output {
+                assert_eq!(
+                    output.code_mode_result(&function_payload())["image_url"],
+                    format!("data:image/png;base64,{VALID_PNG}")
+                );
+                if save_root == Some(&blocked) {
+                    assert!(
+                        output.code_mode_result(&function_payload())["output_hint"]
+                            .as_str()
+                            .unwrap()
+                            .contains("saving it on the Codex host failed")
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn referenced_image_reads_are_bounded_without_changing_valid_bytes() {
+    use base64::Engine;
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(temp.path()).unwrap();
+    let path = cwd.join("reference.png");
+    let environment = codex_extension_api::ToolEnvironment {
+        environment_id: "local".to_string(),
+        cwd: codex_utils_path_uri::PathUri::from_abs_path(&cwd),
+        file_system: codex_exec_server::LOCAL_FS.clone(),
+        file_system_sandbox_context:
+            codex_exec_server::FileSystemSandboxContext::from_legacy_sandbox_policy(
+                codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+                codex_utils_path_uri::PathUri::from_abs_path(&cwd),
+            )
+            .unwrap(),
+    };
+    std::fs::write(
+        path.as_path(),
+        super::BASE64_STANDARD.decode(VALID_PNG).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        super::image_url(&path, &environment)
+            .await
+            .unwrap()
+            .image_url,
+        format!("data:image/png;base64,{VALID_PNG}")
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(path.as_path())
+        .unwrap()
+        .set_len(super::MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 + 1)
+        .unwrap();
+    let error = super::image_url(&path, &environment)
+        .await
+        .expect_err("source exceeds read limit");
+    assert!(error.to_string().contains("byte limit"));
+}
+
+#[test]
+fn generated_image_validation_rejects_unusable_provider_results() {
+    use base64::Engine;
+    for invalid in [
+        String::new(),
+        "%%%".to_string(),
+        RESULT.to_string(),
+        super::BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\ntruncated"),
+    ] {
+        assert!(super::validate_generated_image(invalid).is_err());
+    }
+    let (result, bytes) =
+        super::validate_generated_image(format!(" {VALID_PNG}\n")).expect("valid provider PNG");
+    assert_eq!(result, VALID_PNG);
+    assert_eq!(bytes, super::BASE64_STANDARD.decode(VALID_PNG).unwrap());
+}
+
+#[tokio::test]
+async fn generated_image_persistence_reports_each_delivery_outcome() {
+    let (_, bytes) = super::validate_generated_image(VALID_PNG.to_string()).unwrap();
+    let fs = codex_exec_server::LOCAL_FS.as_ref();
+    let (path, hint) =
+        super::persist_generated_image(fs, None, "thread", "call", bytes.clone()).await;
+    assert_eq!(path, None);
+    assert!(hint.contains("not configured"));
+    let temp = tempfile::tempdir().unwrap();
+    let root = codex_utils_absolute_path::AbsolutePathBuf::try_from(temp.path()).unwrap();
+    let (path, hint) =
+        super::persist_generated_image(fs, Some(&root), "thread", "call", bytes.clone()).await;
+    let path = path.expect("saved artifact");
+    assert_eq!(std::fs::read(path.as_path()).unwrap(), bytes);
+    assert!(hint.contains("host filesystem"));
+    let blocked = root.join("blocked");
+    std::fs::write(blocked.as_path(), "not a directory").unwrap();
+    let (path, hint) =
+        super::persist_generated_image(fs, Some(&blocked), "thread", "call", bytes).await;
+    assert_eq!(path, None);
+    assert!(hint.contains("saving it on the Codex host failed"));
+    assert!(hint.contains("returned image remains available"));
+}
+
 #[test]
 fn requests_history_only_for_history_backed_edits() {
     let payload = |num_last_images_to_include| ToolPayload::Function {
@@ -274,7 +424,7 @@ async fn referenced_paths_reject_an_unreadable_primary_environment() {
     .unwrap();
     let environments = [codex_extension_api::ToolEnvironment {
         environment_id: "readable-alternative".to_string(),
-        cwd,
+        cwd: codex_utils_path_uri::PathUri::from_abs_path(&cwd),
         file_system: codex_exec_server::LOCAL_FS.clone(),
         file_system_sandbox_context: sandbox,
     }];

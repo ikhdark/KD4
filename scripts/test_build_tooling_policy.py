@@ -633,14 +633,12 @@ function Get-Command($Name) {
         self.assertNotIn(r"C:\Users\kuh\Desktop\kd4", text)
         self.assertNotIn(r"C:\Users\kuh\Desktop\codexKD`", text)
 
-    def test_agents_bootstraps_bounded_routing_before_broad_source_map(self) -> None:
-        text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    def test_source_map_documents_bounded_routing_before_broad_lookup(self) -> None:
         slice_command = (
             "python scripts/source_owners.py slice --owner <owner-id> "
             '--focus "<task description>" --max-relationships 32'
         )
 
-        self.assertIn("(SOURCEMAP.md#how-to-use-this-map)", text)
         source_map = (REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8")
         section = source_map.split("## How to use this map\n", 1)[1].split("\n## ", 1)[
             0
@@ -1342,6 +1340,37 @@ function Get-Command($Name) {
             "tools/argument-comment-lint/test_wrapper_common.py",
             root_maintenance.python_unittest_targets(),
         )
+
+    def test_windows_nextest_setup_isolates_desktop_codex_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            nextest_env = Path(temp) / "nextest.env"
+            env = {
+                name: value
+                for name, value in os.environ.items()
+                if not name.startswith("CODEX_")
+            }
+            env["NEXTEST_ENV"] = str(nextest_env)
+            env["CODEX_HOME"] = str(Path(temp) / "desktop-home")
+            env["CODEX_PERMISSION_PROFILE"] = ":danger-full-access"
+            env["CODEX_SQLITE_HOME"] = str(Path(temp) / "desktop-sqlite")
+
+            result = subprocess.run(
+                [sys.executable, "codex-rs/scripts/nextest_windows_stack.py"],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                nextest_env.read_text(encoding="utf-8"),
+                "CODEX_HOME=\n"
+                "CODEX_PERMISSION_PROFILE=\n"
+                "CODEX_SQLITE_HOME=\n"
+                "RUST_MIN_STACK=8388608\n",
+            )
 
     def test_root_maintenance_does_not_route_retired_task_continuity_paths(
         self,

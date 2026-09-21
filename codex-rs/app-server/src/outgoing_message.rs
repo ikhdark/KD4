@@ -81,6 +81,7 @@ pub(crate) struct RequestContext {
     request_id: ConnectionRequestId,
     span: Span,
     parent_trace: Option<W3cTraceContext>,
+    work_lease: Option<Arc<RequestWorkLease>>,
 }
 
 impl RequestContext {
@@ -93,6 +94,7 @@ impl RequestContext {
             request_id,
             span,
             parent_trace,
+            work_lease: None,
         }
     }
 
@@ -121,11 +123,24 @@ pub(crate) enum OutgoingEnvelope {
     },
 }
 
+// Shared by the handler and final-response context, including deferred replies.
+struct RequestWorkLease {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _connection: tokio::sync::OwnedSemaphorePermit,
+    _global_bytes: tokio::sync::OwnedSemaphorePermit,
+    _connection_bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Sends messages to the client and manages request callbacks.
 pub(crate) struct OutgoingMessageSender {
+    outstanding: Arc<tokio::sync::Semaphore>,
+    outstanding_control: Arc<tokio::sync::Semaphore>,
+    outstanding_bytes: Arc<tokio::sync::Semaphore>,
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
+    notification_sender: Option<mpsc::Sender<OutgoingEnvelope>>,
     active_connections: Arc<Mutex<HashMap<ConnectionId, ActiveConnection>>>,
+    dynamic_tool_owners: Mutex<HashMap<ThreadId, ConnectionId>>,
     request_id_to_callback: Arc<StdMutex<HashMap<RequestId, PendingCallbackEntry>>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
@@ -139,6 +154,9 @@ pub(crate) struct OutgoingMessageSender {
 }
 
 struct ActiveConnection {
+    outstanding: Arc<tokio::sync::Semaphore>,
+    outstanding_control: Arc<tokio::sync::Semaphore>,
+    outstanding_bytes: Arc<tokio::sync::Semaphore>,
     initialized: Arc<AtomicBool>,
     delivery_failure: CancellationToken,
 }
@@ -204,6 +222,8 @@ impl ComponentNotificationCache {
 }
 
 struct PendingCallbackEntry {
+    // Every terminal removal drops this guard, including cancellation cleanup.
+    _settlement: tokio_util::sync::DropGuard,
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
     request: ServerRequest,
@@ -464,9 +484,14 @@ impl OutgoingMessageSender {
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
+            outstanding: Arc::new(tokio::sync::Semaphore::new(1024)),
+            outstanding_control: Arc::new(tokio::sync::Semaphore::new(64)),
+            outstanding_bytes: Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)),
             next_server_request_id: AtomicI64::new(0),
             sender,
+            notification_sender: None,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
+            dynamic_tool_owners: Mutex::new(HashMap::new()),
             request_id_to_callback: Arc::new(StdMutex::new(HashMap::new())),
             request_contexts: Mutex::new(HashMap::new()),
             component_notification_cache: Mutex::new(ComponentNotificationCache::default()),
@@ -475,6 +500,79 @@ impl OutgoingMessageSender {
             delivery_shutdown: CancellationToken::new(),
             delivery_accepting: Mutex::new(true),
         }
+    }
+
+    pub(crate) fn with_notification_sender(
+        mut self,
+        sender: mpsc::Sender<OutgoingEnvelope>,
+    ) -> Self {
+        self.notification_sender = Some(sender);
+        self
+    }
+
+    fn notification_sender(&self) -> &mpsc::Sender<OutgoingEnvelope> {
+        self.notification_sender.as_ref().unwrap_or(&self.sender)
+    }
+
+    pub(crate) async fn admit_request_work(
+        &self,
+        context: &mut RequestContext,
+        bytes: usize,
+        control: bool,
+    ) -> bool {
+        let Ok(bytes) = u32::try_from(bytes) else {
+            return false;
+        };
+        let connections = self.active_connections.lock().await;
+        let Some(connection) = connections.get(&context.request_id.connection_id) else {
+            return false;
+        };
+        let (global, local) = if control {
+            (&self.outstanding_control, &connection.outstanding_control)
+        } else {
+            (&self.outstanding, &connection.outstanding)
+        };
+        let Ok(global) = Arc::clone(global).try_acquire_owned() else {
+            return false;
+        };
+        let Ok(local) = Arc::clone(local).try_acquire_owned() else {
+            return false;
+        };
+        let Ok(global_bytes) = Arc::clone(&self.outstanding_bytes).try_acquire_many_owned(bytes)
+        else {
+            return false;
+        };
+        let Ok(local_bytes) =
+            Arc::clone(&connection.outstanding_bytes).try_acquire_many_owned(bytes)
+        else {
+            return false;
+        };
+        context.work_lease = Some(Arc::new(RequestWorkLease {
+            _global: global,
+            _connection: local,
+            _global_bytes: global_bytes,
+            _connection_bytes: local_bytes,
+        }));
+        self.request_contexts
+            .lock()
+            .await
+            .insert(context.request_id.clone(), context.clone());
+        true
+    }
+
+    pub(crate) async fn register_dynamic_tool_owner(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) {
+        self.dynamic_tool_owners
+            .lock()
+            .await
+            .insert(thread_id, connection_id);
+    }
+
+    pub(crate) async fn forget_dynamic_tool_owner(&self, thread_id: ThreadId) {
+        self.dynamic_tool_owners.lock().await.remove(&thread_id);
     }
 
     pub(crate) async fn register_request_context(&self, request_context: RequestContext) {
@@ -510,14 +608,25 @@ impl OutgoingMessageSender {
         self.active_connections.lock().await.insert(
             connection_id,
             ActiveConnection {
+                outstanding: Arc::new(tokio::sync::Semaphore::new(64)),
+                outstanding_control: Arc::new(tokio::sync::Semaphore::new(8)),
+                outstanding_bytes: Arc::new(tokio::sync::Semaphore::new(8 * 1024 * 1024)),
                 initialized,
                 delivery_failure,
             },
         );
     }
 
+    pub(crate) async fn fail_all_connection_delivery(&self) {
+        for connection in self.active_connections.lock().await.values() {
+            connection.initialized.store(false, Ordering::Release);
+            connection.delivery_failure.cancel();
+        }
+    }
+
     pub(crate) async fn fail_connection_delivery(&self, connection_id: ConnectionId) {
         if let Some(connection) = self.active_connections.lock().await.get(&connection_id) {
+            connection.initialized.store(false, Ordering::Release);
             connection.delivery_failure.cancel();
         }
     }
@@ -698,12 +807,21 @@ impl OutgoingMessageSender {
             return Ok((outgoing_message_id, rx_approve));
         }
         let request = request.request_with_id(outgoing_message_id.clone());
+        let dynamic_owner = match thread_id {
+            Some(thread_id) => self
+                .dynamic_tool_owners
+                .lock()
+                .await
+                .get(&thread_id)
+                .copied(),
+            None => None,
+        };
         let explicit_recipients = connection_ids.is_some();
         // Keep the active-connection snapshot locked through callback registration.
         // Explicit target sets are only a capability/subscription filter; transport
         // liveness remains authoritative here.
         let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
-        let target_connection_ids = match connection_ids {
+        let mut target_connection_ids = match connection_ids {
             Some(connection_ids) => connection_ids
                 .iter()
                 .copied()
@@ -723,6 +841,17 @@ impl OutgoingMessageSender {
                 })
                 .collect(),
         };
+        if matches!(request, ServerRequest::DynamicToolCall { .. }) {
+            target_connection_ids.sort_unstable_by_key(|id| id.0);
+            target_connection_ids.dedup();
+            if let Some(owner) = dynamic_owner {
+                target_connection_ids.retain(|id| *id == owner);
+            } else if target_connection_ids.len() != 1 {
+                // Legacy/resumed registrations can use a sole eligible client,
+                // but subscription alone cannot choose among several executors.
+                target_connection_ids.clear();
+            }
+        }
         let authorized_connection_ids = target_connection_ids.iter().copied().collect();
 
         let (tx_approve, rx_approve) = oneshot::channel();
@@ -735,6 +864,7 @@ impl OutgoingMessageSender {
             let _ = tx_approve.send(Err(internal_error(message)));
             return Ok((outgoing_message_id, rx_approve));
         }
+        let settlement = CancellationToken::new();
         {
             let mut request_id_to_callback = self
                 .request_id_to_callback
@@ -743,6 +873,7 @@ impl OutgoingMessageSender {
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
+                    _settlement: settlement.clone().drop_guard(),
                     callback: tx_approve,
                     thread_id,
                     request: request.clone(),
@@ -766,6 +897,7 @@ impl OutgoingMessageSender {
         for connection_id in target_connection_ids {
             let permit = tokio::select! {
                 biased;
+                _ = settlement.cancelled() => break,
                 _ = self.delivery_shutdown.cancelled() => {
                     send_error = Some("request delivery was cancelled by shutdown");
                     break;
@@ -847,7 +979,7 @@ impl OutgoingMessageSender {
         &self,
         connection_id: ConnectionId,
         thread_id: ThreadId,
-        experimental_api_enabled: bool,
+        _experimental_api_enabled: bool,
     ) {
         let request_ids = {
             let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
@@ -867,9 +999,9 @@ impl OutgoingMessageSender {
                     if entry.thread_id != Some(thread_id) {
                         return None;
                     }
-                    if matches!(entry.request, ServerRequest::DynamicToolCall { .. })
-                        && !experimental_api_enabled
-                    {
+                    // Execution may already have produced effects. Subscription
+                    // replay supplies no deduplication or result-reuse contract.
+                    if matches!(entry.request, ServerRequest::DynamicToolCall { .. }) {
                         return None;
                     }
                     Some(request_id.clone())
@@ -1300,9 +1432,12 @@ impl OutgoingMessageSender {
 
     pub(crate) fn try_send_server_notification(&self, notification: ServerNotification) -> bool {
         tracing::trace!("app-server event: {notification}");
-        if let Err(err) = self.sender.try_send(OutgoingEnvelope::Broadcast {
-            message: OutgoingMessage::AppServerNotification(notification),
-        }) {
+        if let Err(err) = self
+            .notification_sender()
+            .try_send(OutgoingEnvelope::Broadcast {
+                message: OutgoingMessage::AppServerNotification(notification),
+            })
+        {
             warn!("failed to enqueue server notification to client: {err:?}");
             return false;
         }
@@ -1319,15 +1454,27 @@ impl OutgoingMessageSender {
             "app-server event: {notification}"
         );
         let outgoing_message = OutgoingMessage::AppServerNotification(notification);
+        let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
         if connection_ids.is_empty() {
-            if let Err(err) = self
-                .sender
-                .send(OutgoingEnvelope::Broadcast {
-                    message: outgoing_message,
-                })
+            let targets: Vec<_> = self
+                .active_connections
+                .lock()
                 .await
-            {
-                warn!("failed to send server notification to client: {err:?}");
+                .keys()
+                .copied()
+                .collect();
+            let sent = tokio::select! {
+                biased;
+                _ = self.delivery_shutdown.cancelled() => false,
+                result = tokio::time::timeout_at(delivery_deadline, self.notification_sender().send(OutgoingEnvelope::Broadcast {
+                    message: outgoing_message,
+                })) => matches!(result, Ok(Ok(()))),
+            };
+            if !sent {
+                warn!("server notification delivery failed or exceeded its budget");
+                for target in targets {
+                    self.fail_connection_delivery(target).await;
+                }
             }
             return;
         }
@@ -1339,16 +1486,21 @@ impl OutgoingMessageSender {
                 warn!("targeted notification value was exhausted before fanout completed");
                 break;
             };
-            if let Err(err) = self
-                .sender
-                .send(OutgoingEnvelope::ToConnection {
+            let sent = tokio::select! {
+                biased;
+                _ = self.delivery_shutdown.cancelled() => false,
+                result = tokio::time::timeout_at(delivery_deadline, self.notification_sender().send(OutgoingEnvelope::ToConnection {
                     connection_id: *connection_id,
                     message,
                     write_complete_tx: None,
-                })
-                .await
-            {
-                warn!("failed to send server notification to client: {err:?}");
+                })) => matches!(result, Ok(Ok(()))),
+            };
+            if !sent {
+                warn!(
+                    ?connection_id,
+                    "server notification delivery failed or exceeded its budget"
+                );
+                self.fail_connection_delivery(*connection_id).await;
             }
         }
     }
@@ -1362,11 +1514,13 @@ impl OutgoingMessageSender {
         cancellation: &CancellationToken,
     ) -> bool {
         tracing::trace!(?connection_id, "app-server bounded event: {notification}");
-        let send = self.sender.send(OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: OutgoingMessage::AppServerNotification(notification),
-            write_complete_tx: None,
-        });
+        let send = self
+            .notification_sender()
+            .send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(notification),
+                write_complete_tx: None,
+            });
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return false,
@@ -1417,11 +1571,13 @@ impl OutgoingMessageSender {
 
         for connection_id in target_connection_ids {
             let (write_complete_tx, write_complete_rx) = oneshot::channel();
-            let send = self.sender.send(OutgoingEnvelope::ToConnection {
-                connection_id,
-                message: outgoing_message.clone(),
-                write_complete_tx: Some(write_complete_tx),
-            });
+            let send = self
+                .notification_sender()
+                .send(OutgoingEnvelope::ToConnection {
+                    connection_id,
+                    message: outgoing_message.clone(),
+                    write_complete_tx: Some(write_complete_tx),
+                });
             let send_result = tokio::select! {
                 biased;
                 _ = self.delivery_shutdown.cancelled() => None,
@@ -1523,11 +1679,13 @@ impl OutgoingMessageSender {
         tracing::trace!("app-server event: {notification}");
         let outgoing_message = OutgoingMessage::AppServerNotification(notification.clone());
         let (write_complete_tx, write_complete_rx) = oneshot::channel();
-        let send = self.sender.send(OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: outgoing_message,
-            write_complete_tx: Some(write_complete_tx),
-        });
+        let send = self
+            .notification_sender()
+            .send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: outgoing_message,
+                write_complete_tx: Some(write_complete_tx),
+            });
         match tokio::select! {
             biased;
             _ = self.delivery_shutdown.cancelled() => return,
@@ -3056,8 +3214,187 @@ mod tests {
         assert_eq!(outgoing.pending_callback_count().await, 0);
     }
 
+    fn fanout_test_request(thread_id: ThreadId) -> ServerRequestPayload {
+        ServerRequestPayload::FileChangeRequestApproval(FileChangeRequestApprovalParams {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            started_at_ms: 0,
+            reason: None,
+            grant_root: None,
+        })
+    }
+
     #[tokio::test]
-    async fn dynamic_tool_replay_authorizes_only_active_experimental_connection() {
+    async fn settled_request_wakes_backpressured_fanout() {
+        for cancel in [false, true] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let outgoing = Arc::new(OutgoingMessageSender::new(
+                tx,
+                AnalyticsEventsClient::disabled(),
+            ));
+            let connections = [ConnectionId(1), ConnectionId(2), ConnectionId(3)];
+            for id in connections {
+                outgoing
+                    .connection_opened(id, Arc::new(AtomicBool::new(true)))
+                    .await;
+            }
+            let thread_id = ThreadId::new();
+            let send = tokio::spawn({
+                let outgoing = Arc::clone(&outgoing);
+                async move {
+                    outgoing
+                        .send_request_to_connections(
+                            Some(&connections),
+                            fanout_test_request(thread_id),
+                            Some(thread_id),
+                        )
+                        .await
+                }
+            });
+            let first = rx.recv().await.unwrap();
+            let OutgoingEnvelope::ToConnection {
+                message: OutgoingMessage::Request(request),
+                ..
+            } = first
+            else {
+                panic!("request");
+            };
+            let id = request.id().clone();
+            timeout(Duration::from_secs(1), async {
+                while rx.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!send.is_finished());
+            if cancel {
+                outgoing
+                    .cancel_requests_for_thread(thread_id, Some(internal_error("cancelled")))
+                    .await;
+            } else {
+                outgoing
+                    .notify_client_response(connections[0], id, json!({"decision":"accept"}))
+                    .await;
+            }
+            let (_, result) = timeout(Duration::from_secs(1), send)
+                .await
+                .expect("settlement wakes capacity wait")
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.await.unwrap().is_err(), cancel);
+            assert_eq!(
+                rx.len(),
+                1,
+                "second request remains queued; third is never published"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_notification_timeout_invalidates_the_failed_route() {
+        let (tx, _rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let connection = ConnectionId(1);
+        let failure = CancellationToken::new();
+        outgoing
+            .connection_opened_with_runtime(
+                connection,
+                Arc::new(AtomicBool::new(true)),
+                failure.clone(),
+            )
+            .await;
+        let notification = turn_completed_notification(ThreadId::new(), "turn");
+        outgoing
+            .send_server_notification_to_connections(&[connection], notification.clone())
+            .await;
+        tokio::time::pause();
+        let send = tokio::spawn({
+            let outgoing = Arc::clone(&outgoing);
+            async move {
+                outgoing
+                    .send_server_notification_to_connections(&[connection], notification)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(RESOURCE_DELIVERY_TIMEOUT).await;
+        send.await.unwrap();
+        assert!(
+            failure.is_cancelled(),
+            "failed lifecycle delivery must invalidate its route"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_dispatch_has_one_registered_executor() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let connections = [ConnectionId(1), ConnectionId(2)];
+        for id in connections {
+            outgoing
+                .connection_opened(id, Arc::new(AtomicBool::new(true)))
+                .await;
+        }
+        let thread_id = ThreadId::new();
+        outgoing
+            .register_dynamic_tool_owner(thread_id, connections[1])
+            .await;
+        let (request_id, result) = outgoing
+            .send_request_to_connections(
+                Some(&connections),
+                ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "turn".into(),
+                    call_id: "call".into(),
+                    namespace: None,
+                    tool: "tool".into(),
+                    arguments: json!({}),
+                }),
+                Some(thread_id),
+            )
+            .await
+            .unwrap();
+        let mut executions = 0;
+        while let Ok(envelope) = rx.try_recv() {
+            let OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::Request(_),
+                ..
+            } = envelope
+            else {
+                panic!("request");
+            };
+            assert_eq!(connection_id, connections[1]);
+            executions += 1;
+        }
+        assert_eq!(executions, 1);
+        outgoing
+            .replay_requests_to_connection_for_thread(connections[0], thread_id, true)
+            .await;
+        outgoing
+            .replay_requests_to_connection_for_thread(connections[1], thread_id, true)
+            .await;
+        assert!(rx.try_recv().is_err());
+        outgoing
+            .notify_client_response(
+                connections[1],
+                request_id,
+                json!({"success":true,"contentItems":[]}),
+            )
+            .await;
+        assert!(result.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_replay_never_transfers_execution_authority() {
         let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             tx,
@@ -3120,23 +3457,29 @@ mod tests {
             )
             .await;
 
-        let replay = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("replayed request should arrive before timeout")
-            .expect("outgoing channel should stay open");
-        let OutgoingEnvelope::ToConnection { connection_id, .. } = replay else {
-            panic!("replayed request should use targeted delivery");
-        };
-        assert_eq!(connection_id, resumed_connection);
-        outgoing.connection_closed(original_connection).await;
-        assert_eq!(outgoing.pending_callback_count().await, 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "resuming must not reexecute pending work"
+        );
         let expected_result = json!({"contentItems": [], "success": true});
         outgoing
-            .notify_client_response(resumed_connection, request_id, expected_result.clone())
+            .notify_client_response(
+                resumed_connection,
+                request_id.clone(),
+                expected_result.clone(),
+            )
+            .await;
+        assert_eq!(
+            outgoing.pending_callback_count().await,
+            1,
+            "observer cannot answer"
+        );
+        outgoing
+            .notify_client_response(original_connection, request_id, expected_result.clone())
             .await;
         let result = wait_for_result
             .await
-            .expect("replayed callback sender should remain available");
+            .expect("original callback sender should remain available");
         assert_eq!(result, Ok(expected_result));
         assert_eq!(outgoing.pending_callback_count().await, 0);
     }
@@ -3264,14 +3607,7 @@ mod tests {
                 .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
                 .await;
         }
-        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-            thread_id: ThreadId::new().to_string(),
-            turn_id: "turn-partial".to_string(),
-            call_id: "call-partial".to_string(),
-            namespace: None,
-            tool: "test_tool".to_string(),
-            arguments: json!({}),
-        });
+        let request = fanout_test_request(ThreadId::new());
 
         let send_outgoing = Arc::clone(&outgoing);
         let send_task = tokio::spawn(async move {
@@ -3343,14 +3679,7 @@ mod tests {
                 },
             ))
             .await;
-        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-            thread_id: thread_id.to_string(),
-            turn_id: "turn-initial-delivery".to_string(),
-            call_id: "call-initial-delivery".to_string(),
-            namespace: None,
-            tool: "test_tool".to_string(),
-            arguments: json!({"must_not_be_delivered": true}),
-        });
+        let request = fanout_test_request(ThreadId::new());
         let send_outgoing = Arc::clone(&outgoing);
         let send_task = tokio::spawn(async move {
             send_outgoing
@@ -3420,14 +3749,7 @@ mod tests {
                 .await;
         }
         let thread_id = ThreadId::new();
-        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-            thread_id: thread_id.to_string(),
-            turn_id: "turn-partial-disconnect".to_string(),
-            call_id: "call-partial-disconnect".to_string(),
-            namespace: None,
-            tool: "test_tool".to_string(),
-            arguments: json!({}),
-        });
+        let request = fanout_test_request(ThreadId::new());
         let send_outgoing = Arc::clone(&outgoing);
         let send_task = tokio::spawn(async move {
             send_outgoing
@@ -3491,14 +3813,7 @@ mod tests {
                 .await;
         }
         let thread_id = ThreadId::new();
-        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-            thread_id: thread_id.to_string(),
-            turn_id: "turn-concurrent-replay".to_string(),
-            call_id: "call-concurrent-replay".to_string(),
-            namespace: None,
-            tool: "test_tool".to_string(),
-            arguments: json!({}),
-        });
+        let request = fanout_test_request(ThreadId::new());
         let targets = [first, second, last];
         let mut initial = Box::pin(outgoing.send_request_to_connections(
             Some(&targets),
@@ -3567,14 +3882,7 @@ mod tests {
             let (request_id, result) = outgoing
                 .send_request_to_connections(
                     Some(&[original]),
-                    ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-                        thread_id: thread_id.to_string(),
-                        turn_id: "turn-replay-bounded".to_string(),
-                        call_id: "call-replay-bounded".to_string(),
-                        namespace: None,
-                        tool: "test_tool".to_string(),
-                        arguments: json!({}),
-                    }),
+                    fanout_test_request(ThreadId::new()),
                     Some(thread_id),
                 )
                 .await
@@ -3712,14 +4020,7 @@ mod tests {
         let (request_id, result) = outgoing
             .send_request_to_connections(
                 Some(&[original]),
-                ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-replay-disconnect".to_string(),
-                    call_id: "call-replay-disconnect".to_string(),
-                    namespace: None,
-                    tool: "test_tool".to_string(),
-                    arguments: json!({}),
-                }),
+                fanout_test_request(ThreadId::new()),
                 Some(thread_id),
             )
             .await
@@ -3768,14 +4069,7 @@ mod tests {
                 .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
                 .await;
         }
-        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-            thread_id: ThreadId::new().to_string(),
-            turn_id: "turn-canceled-send".to_string(),
-            call_id: "call-canceled-send".to_string(),
-            namespace: None,
-            tool: "test_tool".to_string(),
-            arguments: json!({}),
-        });
+        let request = fanout_test_request(ThreadId::new());
 
         let send_outgoing = Arc::clone(&outgoing);
         let send_task = tokio::spawn(async move {
@@ -4130,5 +4424,64 @@ mod tests {
             .expect("authorized response should resolve the callback")
             .expect("callback sender should remain available");
         assert_eq!(result, Ok(json!({"answers": {}})));
+    }
+    #[tokio::test]
+    async fn outstanding_request_lease_survives_handler_return_until_response_or_disconnect() {
+        let (sender, mut receiver) = mpsc::channel(128);
+        let outgoing = OutgoingMessageSender::new(sender, AnalyticsEventsClient::disabled());
+        let connection = ConnectionId(701);
+        outgoing
+            .connection_opened(connection, Arc::new(AtomicBool::new(true)))
+            .await;
+        for id in 0..64 {
+            let mut context = RequestContext::new(
+                ConnectionRequestId {
+                    connection_id: connection,
+                    request_id: RequestId::Integer(id),
+                },
+                tracing::Span::none(),
+                None,
+            );
+            assert!(outgoing.admit_request_work(&mut context, 1024, false).await);
+            // The handler drops its copy while an asynchronous completion remains pending.
+        }
+        let mut extra = RequestContext::new(
+            ConnectionRequestId {
+                connection_id: connection,
+                request_id: RequestId::Integer(64),
+            },
+            tracing::Span::none(),
+            None,
+        );
+        assert!(!outgoing.admit_request_work(&mut extra, 1024, false).await);
+        let mut control = RequestContext::new(
+            ConnectionRequestId {
+                connection_id: connection,
+                request_id: RequestId::Integer(65),
+            },
+            tracing::Span::none(),
+            None,
+        );
+        assert!(outgoing.admit_request_work(&mut control, 0, true).await);
+        drop(control);
+        outgoing
+            .send_error(
+                ConnectionRequestId {
+                    connection_id: connection,
+                    request_id: RequestId::Integer(0),
+                },
+                internal_error("finished"),
+            )
+            .await;
+        assert!(receiver.recv().await.is_some());
+        assert!(outgoing.admit_request_work(&mut extra, 1024, false).await);
+        drop(extra);
+        outgoing.connection_closed(connection).await;
+        assert_eq!(outgoing.outstanding.available_permits(), 1024);
+        assert_eq!(outgoing.outstanding_control.available_permits(), 64);
+        assert_eq!(
+            outgoing.outstanding_bytes.available_permits(),
+            32 * 1024 * 1024
+        );
     }
 }

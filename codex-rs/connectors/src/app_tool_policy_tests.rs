@@ -22,6 +22,38 @@ use pretty_assertions::assert_eq;
 use super::*;
 
 #[test]
+fn malformed_policy_and_noncanonical_keys_are_rejected() {
+    for config in [
+        serde_json::json!({"apps": {"calendar": {"enabled": "invalid"}}}),
+        serde_json::json!({"apps": {" calendar ": {"enabled": false}}}),
+        serde_json::json!({"apps": {"": {"enabled": false}}}),
+    ] {
+        let stack = ConfigLayerStack::new(
+            Vec::new(),
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .unwrap();
+        let path = AbsolutePathBuf::try_from(std::env::temp_dir().join(CONFIG_TOML_FILE)).unwrap();
+        let stack = stack.with_user_config(
+            &path,
+            serde_json::from_value::<TomlValue>(config.clone()).unwrap(),
+        );
+        assert!(AppToolPolicyEvaluator::new(&stack).is_err(), "{config}");
+    }
+}
+
+#[test]
+fn padded_connector_id_cannot_bypass_disabled_app_policy() {
+    let requirements = app_enabled_requirement("calendar", false);
+    let evaluator = AppToolPolicyEvaluator::from_parts(None, Some(&requirements));
+    let mut request = input("events/create", None);
+    request.connector_id = Some(" calendar ");
+    assert!(!evaluator.policy(request).enabled);
+    assert!(!evaluator.app_enabled(" calendar "));
+}
+
+#[test]
 fn evaluator_applies_one_config_snapshot_consistently_across_tools() {
     let apps_config = AppsConfigToml {
         default: None,
@@ -802,13 +834,15 @@ fn policy_from_config_parts(
     } else {
         config_layer_stack
     };
-    AppToolPolicyEvaluator::new(&config_layer_stack).policy(AppToolPolicyInput {
-        connector_id,
-        tool_name,
-        tool_title,
-        destructive_hint,
-        open_world_hint,
-    })
+    AppToolPolicyEvaluator::new(&config_layer_stack)
+        .unwrap()
+        .policy(AppToolPolicyInput {
+            connector_id,
+            tool_name,
+            tool_title,
+            destructive_hint,
+            open_world_hint,
+        })
 }
 
 fn app_enabled_requirement(app_id: &str, enabled: bool) -> AppsRequirementsToml {
@@ -856,5 +890,19 @@ fn defaults(
         destructive_enabled,
         open_world_enabled,
         default_tools_approval_mode: None,
+    }
+}
+
+#[test]
+fn invalid_managed_connector_keys_cannot_bypass_disabled_policy() {
+    for id in [" calendar ", ""] {
+        let requirements = ConfigRequirementsToml {
+            apps: Some(app_enabled_requirement(id, false)),
+            ..Default::default()
+        };
+        let stack =
+            ConfigLayerStack::new(Vec::new(), ConfigRequirements::default(), requirements).unwrap();
+        assert!(AppToolPolicyEvaluator::new(&stack).is_err());
+        assert!(apps_config_from_layer_stack(&stack).is_err());
     }
 }

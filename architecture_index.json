@@ -1,7 +1,7 @@
 {
-  "index_sha256": "c0e445478c9dcdd6dae45d2922267e1d2b01be7bfaa3b9aa2e74635aa7e4807d",
+  "index_sha256": "b02a5016ebd3f4f91716408d7a0228b3e8461e8035a0638a695b3d0b4a1f6104",
   "index_version": 1,
-  "manifest_sha256": "c31d8275f8e60255bc52652747398580fa29f7a7ee7f84763bd02f4f881b28c9",
+  "manifest_sha256": "a5c10ba0f395cd85e7b2d5d221cd37406e2af596f5e8b32fe00b6a64a519c5ce",
   "omitted": {
     "relationships": 0
   },
@@ -1960,7 +1960,7 @@
           ],
           "id": "turn-results-survive-compaction-failure",
           "kind": "semantic",
-          "statement": "A regular user turn retains its completed assistant message when follow-up compaction fails; a proposed generation cancelled by deterministic completion causes neither another model request nor a residual-generation timing count.",
+          "statement": "A regular user turn retains its completed assistant message when follow-up compaction fails; server-requested continuation remains executable without new input, and successful validation or repeated tool actions do not establish task completion. Legacy child follow-ups renew their sealed attempt before execution, while cancelled turns leave the prior attempt unchanged.",
           "tests": [
             "codex-rs/core/src/session/turn_tests.rs"
           ]
@@ -4125,7 +4125,19 @@
         },
         {
           "path": "codex-rs/core/src/session/turn_tests.rs",
-          "symbol": "deterministic_protocol_completion_does_not_count_a_cancelled_generation"
+          "symbol": "protocol_continuation_runs_required_work_without_new_input"
+        },
+        {
+          "path": "codex-rs/core/src/session/turn_tests.rs",
+          "symbol": "passing_focused_validation_keeps_the_second_change_executable"
+        },
+        {
+          "path": "codex-rs/core/src/session/turn_tests.rs",
+          "symbol": "repeated_failed_read_preserves_a_different_required_action"
+        },
+        {
+          "path": "codex-rs/core/src/session/turn_tests.rs",
+          "symbol": "legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not"
         }
       ],
       "kind": "validated_by",
@@ -4356,7 +4368,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:c31d8275f8e60255bc52652747398580fa29f7a7ee7f84763bd02f4f881b28c9:sources:25016ed2214c8e6f375b6498aad7658da1338f6f6d11b5d80177e5afc9c6bd5d",
+  "repository_revision": "manifest:a5c10ba0f395cd85e7b2d5d221cd37406e2af596f5e8b32fe00b6a64a519c5ce:sources:8319609a69b0d15b1425b8376610b27e0590deffa31603df1b807c898cb2817e",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

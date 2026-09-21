@@ -204,6 +204,9 @@ pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
 /// Implementations should use these callbacks to seed, observe, or clear
 /// extension-private turn state. The host exposes stable identifiers and
 /// extension stores instead of core runtime objects.
+/// Callbacks must be cancellation safe: the host drops a callback after 30 seconds.
+/// A failed start prevents task execution; failed terminal callbacks do not prevent
+/// terminal recovery. Keep external cleanup independently owned when interrupted.
 pub trait TurnLifecycleContributor: Send + Sync {
     /// Called after turn-scoped extension stores are created, before the task
     /// for the turn starts running.

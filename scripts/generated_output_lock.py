@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
+import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TextIO
-from typing import Iterator
 
 
 class GenerationLockError(RuntimeError):
@@ -27,7 +30,9 @@ def _acquire_nonblocking(handle: TextIO) -> None:
     try:
         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError as error:
-        raise BlockingIOError from error
+        if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            raise BlockingIOError from error
+        raise
 
 
 def _release(handle: TextIO) -> None:
@@ -39,7 +44,11 @@ def _release(handle: TextIO) -> None:
 
 @contextlib.contextmanager
 def repository_lock(
-    lock_path: Path, owner: str, resource: str = "repository resource"
+    lock_path: Path,
+    owner: str,
+    resource: str = "repository resource",
+    *,
+    timeout: float = 0,
 ) -> Iterator[Path]:
     owner = owner.strip()
     if not owner:
@@ -52,18 +61,31 @@ def repository_lock(
         separators=(",", ":"),
     )
     handle = lock_path.open("a+", encoding="utf-8")
+    deadline = time.monotonic() + timeout
+    waiting = False
     try:
-        _acquire_nonblocking(handle)
-    except BlockingIOError as error:
-        try:
-            handle.seek(0)
-            holder = lock_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            holder = "unreadable lock metadata"
-        handle.close()
-        raise GenerationLockError(
-            f"{resource} is already locked at {lock_path}: {holder}"
-        ) from error
+        while True:
+            try:
+                _acquire_nonblocking(handle)
+                break
+            except BlockingIOError as error:
+                try:
+                    holder = lock_path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    holder = "unreadable lock metadata"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    detail = "acquisition timed out" if timeout else "is already locked"
+                    raise GenerationLockError(
+                        f"{resource} {detail} at {lock_path}: {holder}"
+                    ) from error
+                if not waiting:
+                    print(
+                        f"Waiting for {resource} at {lock_path}: {holder}",
+                        file=sys.stderr,
+                    )
+                    waiting = True
+                time.sleep(min(0.05, remaining))
     except BaseException:
         handle.close()
         raise
@@ -84,9 +106,13 @@ def repository_lock(
 
 
 @contextlib.contextmanager
-def generated_output_lock(root: Path, owner: str) -> Iterator[Path]:
+def generated_output_lock(
+    root: Path, owner: str, *, timeout: float = 0
+) -> Iterator[Path]:
     lock_path = root / ".codex" / "locks" / "generated-output.lock"
-    with repository_lock(lock_path, owner, "generated outputs") as acquired:
+    with repository_lock(
+        lock_path, owner, "generated outputs", timeout=timeout
+    ) as acquired:
         yield acquired
 
 

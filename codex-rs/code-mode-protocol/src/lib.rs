@@ -20,6 +20,7 @@ pub use description::is_code_mode_nested_tool;
 pub use description::normalize_code_mode_identifier;
 pub use description::parse_exec_source;
 pub use description::render_code_mode_sample;
+pub use description::render_code_mode_tool_bundle;
 pub use description::render_json_schema_to_typescript;
 
 /// Marks the locally constructed MCP envelope. Its structuredContent schema is
@@ -38,6 +39,7 @@ pub use runtime::MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
 pub use runtime::MAX_TOOL_TIMEOUT_MS;
 pub use runtime::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS;
 pub use runtime::RuntimeResponse;
+pub use runtime::OutputLoss;
 pub use runtime::WaitOutcome;
 pub use runtime::WaitRequest;
 pub use session::CellId;

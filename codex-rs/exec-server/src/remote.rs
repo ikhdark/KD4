@@ -498,9 +498,13 @@ pub async fn run_remote_environment(
         ExecServerError::Protocol(format!("failed to generate Noise relay identity: {error}"))
     })?;
     let mut backoff = Duration::from_secs(1);
-    let mut response = client
-        .register_environment(&config.environment_id, &identity.public_key())
-        .await?;
+    let mut response = register_with_retry(
+        &client,
+        &config.environment_id,
+        &identity.public_key(),
+        &mut backoff,
+    )
+    .await?;
 
     loop {
         match connect_rendezvous(&response.url, &config.telemetry).await {
@@ -542,7 +546,7 @@ pub async fn run_remote_environment(
                 let registration_rejected = matches!(
                     &error,
                     tokio_tungstenite::tungstenite::Error::Http(response)
-                        if response.status().is_client_error()
+                        if matches!(response.status().as_u16(), 401 | 403 | 404 | 410)
                 );
                 warn!(
                     noise_event = "rendezvous_connection",
@@ -553,9 +557,13 @@ pub async fn run_remote_environment(
                 debug!(error = %error, "Noise executor rendezvous connection error");
                 if registration_rejected {
                     config.telemetry.remote_reconnect("registration_rejected");
-                    response = client
-                        .register_environment(&config.environment_id, &identity.public_key())
-                        .await?;
+                    response = register_with_retry(
+                        &client,
+                        &config.environment_id,
+                        &identity.public_key(),
+                        &mut backoff,
+                    )
+                    .await?;
                 } else {
                     config.telemetry.remote_reconnect("connect_failed");
                 }
@@ -564,6 +572,35 @@ pub async fn run_remote_environment(
 
         sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+async fn register_with_retry(
+    client: &EnvironmentRegistryClient,
+    environment_id: &str,
+    public_key: &NoiseChannelPublicKey,
+    backoff: &mut Duration,
+) -> Result<EnvironmentRegistryRegistrationResponse, ExecServerError> {
+    loop {
+        match client
+            .register_environment(environment_id, public_key)
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if matches!(&error,
+                    ExecServerError::EnvironmentRegistryRequest(error) if error.is_connect() || error.is_timeout()
+                ) || matches!(&error,
+                    ExecServerError::EnvironmentRegistryHttp { status, .. }
+                        if status.is_server_error() || matches!(status.as_u16(), 408 | 429)
+                ) =>
+            {
+                warn!("transient environment registration failure; retrying after backoff");
+                sleep(*backoff).await;
+                *backoff = (*backoff * 2).min(Duration::from_secs(30));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -792,6 +829,48 @@ mod tests {
 
     fn static_registry_auth_provider() -> SharedAuthProvider {
         Arc::new(StaticRegistryAuthProvider)
+    }
+
+    #[tokio::test]
+    async fn registration_retries_transient_failures_but_stops_on_auth_failure() {
+        for terminal in [false, true] {
+            let server = MockServer::start().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = Arc::clone(&calls);
+            Mock::given(method("POST"))
+                .and(path("/cloud/environment/test/register"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    let attempt = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if terminal { return ResponseTemplate::new(401); }
+                    if attempt == 0 { return ResponseTemplate::new(503); }
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "environment_id": "test", "url": "wss://rendezvous.test/connection",
+                        "security_profile": "noise_hybrid_ik_v1", "executor_registration_id": "registration-1",
+                    }))
+                }).mount(&server).await;
+            let client =
+                EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
+                    .unwrap();
+            let key = NoiseChannelIdentity::generate().unwrap().public_key();
+            let mut backoff = Duration::from_millis(1);
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                register_with_retry(&client, "test", &key, &mut backoff),
+            )
+            .await
+            .unwrap();
+            if terminal {
+                assert!(matches!(
+                    result,
+                    Err(ExecServerError::EnvironmentRegistryAuth(_))
+                ));
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(result.unwrap().executor_registration_id, "registration-1");
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+                assert_eq!(backoff, Duration::from_millis(2));
+            }
+        }
     }
 
     #[tokio::test]

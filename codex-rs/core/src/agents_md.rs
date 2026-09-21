@@ -99,7 +99,7 @@ impl AgentsMdFreshness {
     pub(crate) const fn model_visible_description(self) -> &'static str {
         match self {
             Self::Refreshed => {
-                "Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step."
+                "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step."
             }
             Self::IncompleteRead => {
                 "Result provenance: direct_file_read; freshness: incomplete_read_may_omit_instructions."

@@ -35,8 +35,9 @@ use crate::fragments::SkillInstructions;
 use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
+use crate::render::MAX_SELECTED_PROMPT_BYTES;
 use crate::render::available_skills_fragment;
-use crate::render::truncate_main_prompt_contents;
+use crate::render::main_prompt_fragment;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::sources::SkillProviders;
 use crate::state::ExecutorSkillsStepState;
@@ -118,6 +119,7 @@ where
             let catalog = self
                 .list_skills(
                     SkillListQuery {
+                        continuation: None,
                         turn_id: thread_store.level_id().to_string(),
                         executor_roots: Vec::new(),
                         host_snapshot: None,
@@ -153,6 +155,7 @@ where
             let catalog = self
                 .list_skills(
                     SkillListQuery {
+                        continuation: None,
                         turn_id: thread_store.level_id().to_string(),
                         executor_roots: Vec::new(),
                         host_snapshot: None,
@@ -194,6 +197,7 @@ where
                 .estimate_executor_catalog_snapshot(
                     &self.providers,
                     SkillListQuery {
+                        continuation: None,
                         turn_id: input.turn_id.to_string(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
                         host_snapshot: None,
@@ -224,6 +228,7 @@ where
                 .executor_catalog_snapshot(
                     &self.providers,
                     SkillListQuery {
+                        continuation: None,
                         turn_id: input.turn_id.to_string(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
                         host_snapshot: None,
@@ -290,6 +295,7 @@ where
             let config = thread_state.config();
             let host_snapshot = turn_store.get::<HostSkillsSnapshot>();
             let query = SkillListQuery {
+                continuation: None,
                 turn_id: input.turn_id.clone(),
                 executor_roots: Vec::new(),
                 host_snapshot: host_snapshot.clone(),
@@ -305,6 +311,7 @@ where
                         .executor_catalog_snapshot(
                             &self.providers,
                             SkillListQuery {
+                                continuation: None,
                                 turn_id: input.turn_id.clone(),
                                 executor_roots: input.ready_selected_capability_roots.clone(),
                                 host_snapshot: None,
@@ -340,14 +347,34 @@ where
             let mut warnings = catalog.warnings.clone();
             let mut main_prompts_injected = false;
             let mut injected_host_skill_prompts = InjectedHostSkillPrompts::default();
-            for entry in &selected_entries {
+            let unavailable = SkillInstructions {
+                name: "Unavailable selected instructions".to_string(),
+                path: String::new(),
+                contents: "Some selected skills could not be included within the instruction budget. Their instructions have not been loaded into context. Use skills.list and skills.read for orchestrator skills, or the listed filesystem resources for host and environment skills, before following them.".to_string(),
+                source_scope: None,
+            };
+            let mut omitted_instructions = false;
+            let mut remaining_prompt_bytes = MAX_SELECTED_PROMPT_BYTES - unavailable.render().len();
+            for (index, entry) in selected_entries.iter().enumerate() {
+                // This extension owns the selected load, including its failure
+                // and budget outcome. Legacy injection must not bypass it.
+                if entry.authority.kind == SkillSourceKind::Host {
+                    injected_host_skill_prompts.suppress_path(entry.main_prompt.as_str());
+                }
+                let budget = remaining_prompt_bytes / (selected_entries.len() - index);
                 match self
                     .read_main_prompt(entry, host_snapshot.clone(), session_store, &thread_state)
                     .await
                 {
                     Ok(read_result) => {
-                        let (contents, truncated) =
-                            truncate_main_prompt_contents(read_result.contents.as_str(), entry);
+                        let Some((fragment, truncated)) =
+                            main_prompt_fragment(read_result.contents.as_str(), entry, budget)
+                        else {
+                            warnings.push(format!("Skill `{}` could not fit its complete recovery identity in the selected-instruction budget.", entry.name));
+                            omitted_instructions = true;
+                            continue;
+                        };
+                        remaining_prompt_bytes -= fragment.render().len();
                         if truncated {
                             let warning = format!(
                                 "Skill `{}` exceeded the main prompt context limit and was truncated.",
@@ -356,12 +383,6 @@ where
                             self.emit_warning(thread_store, &input.turn_id, warning.clone());
                             warnings.push(warning);
                         }
-                        let fragment = SkillInstructions {
-                            name: entry.name.clone(),
-                            path: entry.main_prompt.as_str().to_string(),
-                            contents,
-                            source_scope: entry.source_scope,
-                        };
                         fragments.push(Box::new(fragment));
                         main_prompts_injected = true;
                         if entry.authority.kind == SkillSourceKind::Host {
@@ -372,10 +393,25 @@ where
                         let warning = format!("Failed to load skill `{}`: {message}", entry.name);
                         self.emit_warning(thread_store, &input.turn_id, warning.clone());
                         warnings.push(warning);
+                        let failure = SkillInstructions {
+                            name: entry.name.clone(),
+                            path: entry.main_prompt.as_str().to_string(),
+                            contents: format!("Instructions were not loaded. {message}"),
+                            source_scope: entry.source_scope,
+                        };
+                        if failure.render().len() <= budget {
+                            remaining_prompt_bytes -= failure.render().len();
+                            fragments.push(Box::new(failure));
+                        } else {
+                            omitted_instructions = true;
+                        }
                     }
                 }
             }
 
+            if omitted_instructions {
+                fragments.push(Box::new(unavailable));
+            }
             if let Some(host_snapshot) = &host_snapshot {
                 for entry in selected_entries
                     .iter()
@@ -388,7 +424,7 @@ where
                         .filter(|host_skill| host_skill.name == entry.name)
                     {
                         injected_host_skill_prompts
-                            .insert_path(host_skill.path_to_skills_md.to_string_lossy());
+                            .suppress_path(host_skill.path_to_skills_md.to_string_lossy());
                     }
                 }
             }
@@ -447,7 +483,7 @@ impl<C> SkillsExtension<C> {
         host_snapshot: Option<Arc<HostSkillsSnapshot>>,
         session_store: &ExtensionData,
         thread_state: &SkillsThreadState,
-    ) -> Result<SkillReadResult, String> {
+    ) -> Result<Arc<SkillReadResult>, String> {
         thread_state
             .read_skill(
                 &self.providers,
@@ -460,7 +496,7 @@ impl<C> SkillsExtension<C> {
                 },
             )
             .await
-            .map_err(|err| err.message)
+            .map_err(|err| err.model_message().to_string())
     }
 
     fn emit_warning(&self, thread_store: &ExtensionData, turn_id: &str, message: String) {

@@ -49,7 +49,41 @@ fn renders_full_environment_state() -> Result<()> {
 }
 
 #[test]
-fn renders_only_changed_environments() -> Result<()> {
+fn environment_os_transitions_are_explicit_and_persisted() -> Result<()> {
+    let mut previous = EnvironmentsSnapshot::default();
+    for (os, expected) in [
+        (Some("linux"), "linux"),
+        (Some("windows"), "windows"),
+        (None, "unknown"),
+    ] {
+        let mut environment = available("file:///repo", "sh")?;
+        environment.os = os.map(str::to_string);
+        let state = EnvironmentsState {
+            environments: [(LOCAL_ENVIRONMENT_ID.to_string(), environment)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let rendered =
+            WorldStateSection::render_diff(&state, PreviousSectionState::Known(&previous))
+                .expect("OS transition must be communicated")
+                .render();
+        assert!(
+            rendered.contains(&format!("<os>{expected}</os>")),
+            "{rendered}"
+        );
+        previous =
+            serde_json::from_value(serde_json::to_value(WorldStateSection::snapshot(&state))?)?;
+        assert!(
+            WorldStateSection::render_diff(&state, PreviousSectionState::Known(&previous))
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn changed_environments_keep_unchanged_environments_in_replacement() -> Result<()> {
     let mut previous = WorldState::default();
     previous.add_section(EnvironmentsState {
         environments: [
@@ -79,11 +113,12 @@ fn renders_only_changed_environments() -> Result<()> {
     });
 
     assert_eq!(
-        vec![user_message(
+        vec![replacement_message(
             r#"<environment_context>
   <environments>
     <environment id="devbox">
       <cwd>/workspace</cwd>
+      <status>available</status>
       <shell>powershell</shell>
     </environment>
     <environment id="laptop">
@@ -94,6 +129,10 @@ fn renders_only_changed_environments() -> Result<()> {
     <environment id="remote">
       <cwd>/remote</cwd>
       <status>starting</status>
+    </environment>
+    <environment id="unchanged">
+      <cwd>/same</cwd>
+      <shell>sh</shell>
     </environment>
   </environments>
 </environment_context>"#,
@@ -148,8 +187,10 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
     });
 
     assert_eq!(
-        vec![user_message(
+        vec![replacement_message(
             r#"<environment_context>
+  <cwd>/repo</cwd>
+  <shell>zsh</shell>
   <current_date>2026-06-20</current_date>
   <timezone>America/Los_Angeles</timezone>
   <network enabled="true"><allowed>new.example.com</allowed><denied>blocked.example.com</denied></network>
@@ -181,8 +222,10 @@ fn subagent_only_changes_render_a_diff() {
         .with_subagents("- agent-1: atlas".to_string());
 
     assert_eq!(
-        Some(user_message(
+        Some(replacement_message(
             r#"<environment_context>
+  <network enabled="true"><allowed>example.com</allowed></network>
+  <filesystem><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
   <subagents>
     - agent-1: atlas
   </subagents>
@@ -199,8 +242,10 @@ fn subagent_only_changes_render_a_diff() {
         .clone()
         .with_subagents("- agent-2: nova".to_string());
     assert_eq!(
-        Some(user_message(
+        Some(replacement_message(
             r#"<environment_context>
+  <network enabled="true"><allowed>example.com</allowed></network>
+  <filesystem><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
   <subagents>
     - agent-2: nova
   </subagents>
@@ -214,8 +259,10 @@ fn subagent_only_changes_render_a_diff() {
 
     let previous = WorldStateSection::snapshot(&nova);
     assert_eq!(
-        Some(user_message(
+        Some(replacement_message(
             r#"<environment_context>
+  <network enabled="true"><allowed>example.com</allowed></network>
+  <filesystem><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
   <subagents>
     none
   </subagents>
@@ -291,7 +338,7 @@ fn single_environment_diff_reports_newly_known_shell() -> Result<()> {
     let previous = WorldStateSection::snapshot(&previous);
 
     assert_eq!(
-        Some(user_message(
+        Some(replacement_message(
             "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>zsh</shell>\n</environment_context>"
         )),
         render_fragment(WorldStateSection::render_diff(
@@ -316,7 +363,7 @@ fn removed_legacy_environment_renders_unavailable() -> Result<()> {
     let previous = WorldStateSection::snapshot(&previous);
 
     assert_eq!(
-        Some(user_message(
+        Some(replacement_message(
             r#"<environment_context>
   <environments>
     <environment id="local" status="unavailable" />
@@ -358,15 +405,25 @@ fn known_unknown_and_changed_shell_are_communicated_before_snapshot_advances() -
         (Some("powershell"), "powershell"),
     ] {
         let state = make_state(shell)?;
+        let expected_message = if history.world_state_baseline().is_some() {
+            replacement_message
+        } else {
+            user_message
+        };
         let (fragments, item) = history.update_world_state(&state);
+        let rendered = render_fragments(fragments);
         assert_eq!(
-            render_fragments(fragments),
-            vec![user_message(&format!(
+            rendered,
+            vec![expected_message(&format!(
                 "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>{expected}</shell>\n</environment_context>"
             ))]
         );
         assert!(item.is_some());
-        assert_eq!(history.world_state_baseline(), Some(state.snapshot()));
+        assert_delivered_snapshot(history.world_state_baseline().unwrap(), state.snapshot());
+        history.record_items(
+            &rendered,
+            codex_utils_output_truncation::TruncationPolicy::Bytes(100_000),
+        );
         let (unchanged, item) = history.update_world_state(&state);
         assert!(unchanged.is_empty());
         assert_eq!(item, None);
@@ -394,11 +451,11 @@ fn removed_global_values_are_explicitly_cleared() {
     let (fragments, cleared) = current.render_diff_with_snapshot(&accepted);
     assert_eq!(
         render_fragments(fragments),
-        vec![user_message(
+        vec![replacement_message(
             "<environment_context>\n  <current_date>unknown</current_date>\n  <timezone>unknown</timezone>\n  <network status=\"unspecified\" />\n  <filesystem status=\"unspecified\" />\n  <subagents>\n    none\n  </subagents>\n</environment_context>"
         )]
     );
-    assert_eq!(cleared, current.snapshot());
+    assert_delivered_snapshot(cleared.clone(), current.snapshot());
     assert!(current.render_diff(&cleared).is_empty());
 }
 
@@ -415,7 +472,7 @@ fn unknown_environment_snapshot_is_authoritatively_replaced() {
             "<environment_context>\n  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n</environment_context>"
         )]
     );
-    assert_eq!(accepted, state.snapshot());
+    assert_delivered_snapshot(accepted.clone(), state.snapshot());
     assert!(state.render_diff(&accepted).is_empty());
 
     let legacy = user_message(
@@ -432,7 +489,7 @@ fn unknown_environment_snapshot_is_authoritatively_replaced() {
 }
 
 #[test]
-fn clearing_each_global_field_emits_only_its_clear_and_persists_it() {
+fn clearing_each_global_field_retains_other_fields_and_persists_delivery() {
     let populated = EnvironmentsState {
         current_date: Some("2026-09-13".to_string()),
         timezone: Some("UTC".to_string()),
@@ -471,20 +528,34 @@ fn clearing_each_global_field_emits_only_its_clear_and_persists_it() {
         let mut current = WorldState::default();
         current.add_section(cleared);
         let (fragments, rollout) = history.update_world_state(&current);
+        let retained = [
+            ("current_date", "  <current_date>2026-09-13</current_date>"),
+            ("timezone", "  <timezone>UTC</timezone>"),
+            ("network", "  <network enabled=\"true\"></network>"),
+            (
+                "filesystem",
+                "  <filesystem><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>",
+            ),
+            ("subagents", "  <subagents>\n    agent-1\n  </subagents>"),
+        ];
+        let expected_body = retained
+            .into_iter()
+            .map(|(name, value)| if name == field { expected } else { value })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = render_fragments(fragments);
         assert_eq!(
-            render_fragments(fragments),
-            vec![user_message(&format!(
-                "<environment_context>\n{expected}\n</environment_context>"
-            ))],
-            "clearing {field} must not resend unchanged global fields"
+            rendered,
+            vec![replacement_message(&format!(
+                "<environment_context>\n{expected_body}\n</environment_context>"
+            ))]
         );
-        assert_eq!(
-            rollout,
-            Some(codex_protocol::protocol::WorldStateItem::patch(
-                json!({"environments": {(field): null}})
-            ))
+        assert!(rollout.is_some(), "clear and delivery receipt must persist");
+        assert_delivered_snapshot(history.world_state_baseline().unwrap(), current.snapshot());
+        history.record_items(
+            &rendered,
+            codex_utils_output_truncation::TruncationPolicy::Bytes(100_000),
         );
-        assert_eq!(history.world_state_baseline(), Some(current.snapshot()));
         let (unchanged, rollout) = history.update_world_state(&current);
         assert!(unchanged.is_empty(), "{field} clear should be sent once");
         assert_eq!(rollout, None);
@@ -509,7 +580,7 @@ fn environment_ids_are_escaped_in_current_and_removed_entries() -> Result<()> {
     });
     assert_eq!(
         render_fragments(current.render_diff(&previous.snapshot())),
-        vec![user_message(
+        vec![replacement_message(
             "<environment_context>\n  <environments>\n    <environment id=\"new&quot;&amp;\">\n      <cwd>/new</cwd>\n      <shell>bash</shell>\n    </environment>\n    <environment id=\"old&quot;&amp;\" status=\"unavailable\" />\n  </environments>\n</environment_context>"
         )]
     );
@@ -560,7 +631,7 @@ fn environment_os_survives_snapshot_and_reports_changes() -> Result<()> {
     state.environments.get_mut("remote").unwrap().os = Some("linux<&".into());
     assert_eq!(
         render_fragment(state.render_diff(PreviousSectionState::Known(&previous))),
-        Some(user_message(
+        Some(replacement_message(
             "<environment_context>\n  <cwd>/repo</cwd>\n  <os>linux&lt;&amp;</os>\n  <shell>bash</shell>\n</environment_context>"
         ))
     );
@@ -602,6 +673,14 @@ fn render_fragment(fragment: Option<Box<dyn ContextualUserFragment>>) -> Option<
     fragment.map(ContextualUserFragment::into_boxed_response_item)
 }
 
+fn replacement_message(text: &str) -> ResponseItem {
+    user_message(&text.replacen(
+        "<environment_context>\n",
+        "<environment_context>\n  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n",
+        1,
+    ))
+}
+
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -612,4 +691,18 @@ fn user_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+fn assert_delivered_snapshot(
+    actual: crate::context::world_state::WorldStateSnapshot,
+    expected: crate::context::world_state::WorldStateSnapshot,
+) {
+    let mut actual = serde_json::to_value(actual).unwrap();
+    let receipt = actual["environments"]
+        .as_object_mut()
+        .unwrap()
+        .remove("_retained_delivery")
+        .expect("admitted environment must record its exact rendered delivery");
+    assert_eq!(receipt.as_str().unwrap().len(), 64);
+    assert_eq!(actual, serde_json::to_value(expected).unwrap());
 }

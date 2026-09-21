@@ -665,8 +665,8 @@ class StageNpmPackagesTests(unittest.TestCase):
 
     def test_resolve_github_repo_falls_back_to_current_gh_repo(self) -> None:
         with mock.patch.object(
-            stage.subprocess,
-            "check_output",
+            stage,
+            "check_output_owned",
             return_value="local/fork\n",
         ) as check_output:
             self.assertEqual(stage.resolve_github_repo(None), "local/fork")
@@ -677,8 +677,8 @@ class StageNpmPackagesTests(unittest.TestCase):
         self,
     ) -> None:
         with mock.patch.object(
-            stage.subprocess,
-            "check_output",
+            stage,
+            "check_output_owned",
             side_effect=FileNotFoundError,
         ):
             self.assertEqual(stage.resolve_github_repo(None), stage.DEFAULT_GITHUB_REPO)
@@ -743,8 +743,8 @@ class StageNpmPackagesTests(unittest.TestCase):
 
     def test_release_workflow_lookup_uses_selected_repo_and_workflow(self) -> None:
         with mock.patch.object(
-            stage.subprocess,
-            "check_output",
+            stage,
+            "check_output_owned",
             return_value='{"url":"https://github.com/local/fork/actions/runs/123","headSha":"abc"}',
         ) as check_output:
             workflow = stage.resolve_release_workflow(
@@ -796,8 +796,8 @@ class StageNpmPackagesTests(unittest.TestCase):
 
     def test_list_workflow_artifacts_is_cached_per_repo_and_workflow(self) -> None:
         with mock.patch.object(
-            stage.subprocess,
-            "check_output",
+            stage,
+            "check_output_owned",
             side_effect=[
                 f"{artifact_id}\tx86_64-pc-windows-msvc\t1024\tsha256:{'a' * 64}\n"
                 for artifact_id in (42, 43, 44)
@@ -917,7 +917,7 @@ class StageNpmPackagesTests(unittest.TestCase):
             )
             return mock.Mock(returncode=0)
 
-        with mock.patch.object(stage.subprocess, "run", fake_run):
+        with mock.patch.object(stage, "run_owned", fake_run):
             stage.download_artifacts(
                 "999", "local/fork", self.root / "artifacts", artifacts, 2
             )
@@ -950,7 +950,7 @@ class StageNpmPackagesTests(unittest.TestCase):
             return mock.Mock(returncode=0)
 
         with (
-            mock.patch.object(stage.subprocess, "run", fake_run),
+            mock.patch.object(stage, "run_owned", fake_run),
             self.assertRaisesRegex(RuntimeError, "sha256 mismatch"),
         ):
             stage.download_single_artifact(
@@ -1071,7 +1071,11 @@ class StageNpmPackagesTests(unittest.TestCase):
                             [output / "one.tgz", output / "two.tgz"],
                         )
                 self.assertEqual(
-                    {p.name: p.read_bytes() for p in output.iterdir()},
+                    {
+                        p.name: p.read_bytes()
+                        for p in output.iterdir()
+                        if p.name != ".npm-activation.lock"
+                    },
                     {
                         name: b"old" if fail_second else b"new"
                         for name in ("one.tgz", "two.tgz")
@@ -1267,12 +1271,12 @@ class StageNpmPackagesTests(unittest.TestCase):
         dest = self.root / "out" / "codex"
         observed_output: list[Path] = []
 
-        def fake_check_call(cmd: list[str]) -> None:
+        def fake_check_call(cmd: list[str], **kwargs) -> None:
             output_path = Path(cmd[cmd.index("-o") + 1])
             observed_output.append(output_path)
             output_path.write_text("payload", encoding="utf-8")
 
-        with mock.patch.object(stage.subprocess, "check_call", fake_check_call):
+        with mock.patch("scripts.stage_npm_archives.run_owned", fake_check_call):
             stage.extract_zstd_archive(archive_path, dest)
 
         self.assertEqual(dest.read_text(encoding="utf-8"), "payload")
@@ -1441,8 +1445,8 @@ class StageNpmPackagesTests(unittest.TestCase):
         stderr = io.StringIO()
         with (
             mock.patch.object(
-                stage.subprocess,
-                "check_output",
+                stage,
+                "check_output_owned",
                 side_effect=["current-head\n", b""],
             ),
             mock.patch.object(sys, "stderr", stderr),
@@ -1452,8 +1456,8 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                stage.subprocess,
-                "check_output",
+                stage,
+                "check_output_owned",
                 side_effect=["current-head\n", b"?? dirty\0"],
             ),
             mock.patch.object(sys, "stderr", stderr),
@@ -1466,8 +1470,8 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_source_validation_ignores_only_owned_paths(self) -> None:
         owned = self.root / "dist"
         with mock.patch.object(
-            stage.subprocess,
-            "check_output",
+            stage,
+            "check_output_owned",
             side_effect=["workflow-head\n", b"?? dist/package.tgz\0"],
         ):
             stage.ensure_source_matches_workflow(
@@ -1476,8 +1480,8 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                stage.subprocess,
-                "check_output",
+                stage,
+                "check_output_owned",
                 side_effect=[
                     "workflow-head\n",
                     b"?? dist/package.tgz\0?? unrelated.txt\0",

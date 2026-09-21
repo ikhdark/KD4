@@ -496,6 +496,7 @@ fn immediate_code_cell_completion_reuses_captured_payload() -> anyhow::Result<()
     let cell = thread.start_code_cell_trace("turn-1", "cell-1", "call-1", "text(1)");
     cell.record_initial_response(
         &codex_code_mode::RuntimeResponse::Result {
+            output_loss: None,
             cell_id: codex_code_mode::CellId::new("cell-1".into()),
             content_items: vec![],
             error_text: None,

@@ -69,7 +69,7 @@ pub fn blocking_append_allow_prefix_rule(
     if prefix.is_empty() {
         return Err(AmendError::EmptyPrefix);
     }
-    if prefix.iter().any(|token| token.trim().is_empty()) {
+    if prefix[0].trim().is_empty() {
         return Err(AmendError::EmptyPrefixToken);
     }
 
@@ -224,7 +224,7 @@ fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Resu
         });
     }
 
-    if deduplicate && contents.lines().any(|existing| existing == line) {
+    if deduplicate && contains_literal_rule(&contents, line) {
         return Ok(());
     }
 
@@ -529,4 +529,28 @@ network_rule(host="api.github.com", protocol="https", decision="allow", justific
             "invalid network rule: invalid rule: network_rule host must be a specific host; wildcards are not allowed"
         );
     }
+}
+
+// Only unconditional top-level statements can prove that an amendment exists.
+// Parsing is needed only after the cheap textual candidate check succeeds.
+fn contains_literal_rule(contents: &str, line: &str) -> bool {
+    use starlark::syntax::AstModule;
+    use starlark::syntax::Dialect;
+    use starlark::syntax::ast::Stmt;
+    if !contents.lines().any(|existing| existing == line) {
+        return false;
+    }
+    let mut dialect = Dialect::Extended.clone();
+    dialect.enable_f_strings = true;
+    let Ok(ast) = AstModule::parse("amendment.rules", contents.to_string(), &dialect) else {
+        return false;
+    };
+    let statements = match &ast.statement().node {
+        Stmt::Statements(statements) => statements.as_slice(),
+        _ => std::slice::from_ref(ast.statement()),
+    };
+    statements.iter().any(|statement| {
+        matches!(&statement.node, Stmt::Expression(_))
+            && ast.file_span(statement.span).source_span() == line
+    })
 }

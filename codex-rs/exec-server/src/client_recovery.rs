@@ -24,11 +24,8 @@ use super::is_transport_closed_error;
 use crate::client_transport::ExecServerReconnectStrategy;
 use crate::process::ExecProcessEvent;
 use crate::protocol::EXEC_READ_METHOD;
-use crate::protocol::EXEC_TERMINATE_METHOD;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
-use crate::protocol::TerminateParams;
-use crate::protocol::TerminateResponse;
 use crate::rpc::RpcClient;
 use crate::rpc::RpcClientEvent;
 use crate::rpc::SESSION_ALREADY_ATTACHED_ERROR_CODE;
@@ -90,8 +87,11 @@ impl SessionState {
             );
             let exit_pending = pending_exit.is_some();
             if let Some(pending_sandbox_denied) = pending_exit {
-                *pending_sandbox_denied =
-                    Some(pending_sandbox_denied.unwrap_or(false) || sandbox_denied);
+                *pending_sandbox_denied = if sandbox_denied || closed {
+                    Some(pending_sandbox_denied.unwrap_or(false) || sandbox_denied)
+                } else {
+                    *pending_sandbox_denied
+                };
             }
             let mut exit_known = ordered_events.exit_published || exit_pending;
             if closed
@@ -170,7 +170,7 @@ impl SessionState {
                         .insert_pending(ExecProcessEvent::Exited {
                             seq: next_seq,
                             exit_code,
-                            sandbox_denied: Some(sandbox_denied),
+                            sandbox_denied: (sandbox_denied || closed).then_some(sandbox_denied),
                         })
                         .map_err(ExecServerError::Protocol)?;
                     published_closed |= self.publish_ready(&mut ordered_events);
@@ -191,7 +191,10 @@ impl SessionState {
                 )
             {
                 ordered_events
-                    .insert_pending(ExecProcessEvent::Closed { seq: target_seq })
+                    .insert_pending(ExecProcessEvent::Closed {
+                        seq: target_seq,
+                        sandbox_denied: Some(sandbox_denied),
+                    })
                     .map_err(ExecServerError::Protocol)?;
             }
 
@@ -220,7 +223,7 @@ impl SessionState {
                     .insert_pending(ExecProcessEvent::Exited {
                         seq,
                         exit_code,
-                        sandbox_denied: Some(sandbox_denied),
+                        sandbox_denied: (sandbox_denied || closed).then_some(sandbox_denied),
                     })
                     .map_err(ExecServerError::Protocol)?;
             } else if missing_count != 0 {
@@ -528,33 +531,19 @@ impl Inner {
                 Ok(true) => self.remove_session_if(process_id, session),
                 Ok(false) => {}
                 Err(error) => {
-                    let mut poll_delay = Duration::from_millis(10);
-                    let terminated: Result<TerminateResponse, ExecServerError> = loop {
-                        let result: Result<TerminateResponse, ExecServerError> = rpc_client
-                            .call_for_cleanup(
-                                EXEC_TERMINATE_METHOD,
-                                &TerminateParams {
-                                    process_id: process_id.clone(),
-                                },
-                                SESSION_RECOVERY_TIMEOUT,
-                            )
-                            .await
-                            .map_err(ExecServerError::from);
-                        match result {
-                            Ok(response) if response.running => {
-                                tokio::time::sleep(poll_delay).await;
-                                poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
-                            }
-                            result => break result,
-                        }
-                    };
-                    if let Err(terminate_error) = terminated
-                        && is_transport_closed_error(&terminate_error)
-                    {
-                        return Err(terminate_error);
-                    }
-                    self.remove_session_if(process_id, session);
+                    // Publish the process-local failure now. Retain its identity until
+                    // bounded cleanup completes, so a new start cannot reuse it.
+                    session.recoverable.store(false, Ordering::Release);
                     session.set_failure(format!("failed to recover process {process_id}: {error}"));
+                    let client = ExecServerClient {
+                        inner: Arc::clone(self),
+                        recovery_policy: RecoveryPolicy::Wait,
+                    };
+                    let process_id = process_id.clone();
+                    let session = Arc::clone(session);
+                    tokio::spawn(async move {
+                        super::cleanup_process_start(&client, &process_id, &session).await;
+                    });
                 }
             }
         }
@@ -624,6 +613,7 @@ pub(super) fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
             ExecServerError::WebSocketConnectTimeout { .. }
                 | ExecServerError::WebSocketConnect { .. }
                 | ExecServerError::InitializeTimedOut { .. }
+                | ExecServerError::EnvironmentInfoTimedOut { .. }
         )
         || is_retryable_registry_error(error)
         || matches!(

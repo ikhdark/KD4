@@ -1,7 +1,10 @@
+use futures::FutureExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
@@ -90,8 +93,26 @@ async fn run_connection(
         runtime_paths,
     ));
 
+    let cancelled = CancellationToken::new();
+    let disconnect_cancelled = cancelled.clone();
+    let disconnect_task = tokio::spawn(async move {
+        if !*disconnected_rx.borrow() {
+            let _ = disconnected_rx.changed().await;
+        }
+        disconnect_cancelled.cancel();
+    });
+    let outbound_cancelled = cancelled.clone();
     let outbound_task = tokio::spawn(async move {
-        while let Some(message) = outgoing_rx.recv().await {
+        let _cancel_on_exit = outbound_cancelled.clone().drop_guard();
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = outbound_cancelled.cancelled() => break,
+                message = outgoing_rx.recv() => match message {
+                    Some(message) => message,
+                    None => break,
+                },
+            };
             let json_message = match encode_server_message(message) {
                 Ok(json_message) => json_message,
                 Err(err) => {
@@ -99,19 +120,31 @@ async fn run_connection(
                     break;
                 }
             };
-            if json_outgoing_tx.send(json_message).await.is_err() {
+            if tokio::select! {
+                biased;
+                _ = outbound_cancelled.cancelled() => true,
+                result = json_outgoing_tx.send(json_message) => result.is_err(),
+            } {
                 break;
             }
         }
     });
 
     let mut reads = tokio::task::JoinSet::new();
-    // Preserve handshake and mutation ordering. Reads only snapshot process state
-    // under its lock and can wait independently without blocking later commands.
+    let mut ordered = tokio::task::JoinSet::new();
+    type Completion = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+    let mut last_ordered: Option<Completion> = None;
+    let mut pending_starts: HashMap<String, Completion> = HashMap::new();
+    // Mutations retain wire order. Reads and controls bypass unrelated waits,
+    // but depend on any start already admitted for their process identity.
     loop {
         let event = tokio::select! {
-            _ = disconnected_rx.changed() => break,
+            _ = cancelled.cancelled() => break,
             result = reads.join_next(), if !reads.is_empty() => {
+                if !matches!(result, Some(Ok(true))) { break; }
+                continue;
+            }
+            result = ordered.join_next(), if !ordered.is_empty() => {
                 if !matches!(result, Some(Ok(true))) { break; }
                 continue;
             }
@@ -127,13 +160,16 @@ async fn run_connection(
         match event {
             JsonRpcConnectionEvent::MalformedMessage { reason } => {
                 warn!("ignoring malformed exec-server message: {reason}");
-                if outgoing_tx
-                    .send(RpcServerOutboundMessage::Error {
+                if send_outbound(
+                    &outgoing_tx,
+                    RpcServerOutboundMessage::Error {
                         request_id: codex_exec_server_protocol::RequestId::Integer(-1),
                         error: invalid_request(reason),
-                    })
-                    .await
-                    .is_err()
+                    },
+                    &cancelled,
+                )
+                .await
+                .is_err()
                 {
                     break;
                 }
@@ -142,33 +178,118 @@ async fn run_connection(
                 codex_exec_server_protocol::JSONRPCMessage::Request(request) => {
                     let request_started_at = Instant::now();
                     if let Some((method, route)) = router.request_route(request.method.as_str()) {
-                        let independent_read =
-                            method == crate::protocol::EXEC_READ_METHOD && handler.is_initialized();
-                        if independent_read && reads.len() >= CHANNEL_CAPACITY {
-                            if outgoing_tx
-                                .send(RpcServerOutboundMessage::Error {
+                        let initialized = handler.is_initialized();
+                        let independent_read = initialized
+                            && matches!(
+                                method,
+                                crate::protocol::EXEC_READ_METHOD
+                                    | crate::protocol::EXEC_SIGNAL_METHOD
+                                    | crate::protocol::EXEC_TERMINATE_METHOD
+                                    | crate::protocol::ENVIRONMENT_INFO_METHOD
+                                    | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
+                            );
+                        if initialized
+                            && (if independent_read {
+                                reads.len()
+                            } else {
+                                ordered.len()
+                            }) >= CHANNEL_CAPACITY
+                        {
+                            if send_outbound(
+                                &outgoing_tx,
+                                RpcServerOutboundMessage::Error {
                                     request_id: request.id,
                                     error: invalid_request(
-                                        "too many concurrent process reads".to_string(),
+                                        "too many pending exec-server requests".to_string(),
                                     ),
-                                })
-                                .await
-                                .is_err()
+                                },
+                                &cancelled,
+                            )
+                            .await
+                            .is_err()
                             {
                                 break;
                             }
                             continue;
                         }
+                        // Reserve HTTP identity before queueing: cancellation may
+                        // arrive while this request is still behind ordered work.
+                        if initialized && method == crate::protocol::HTTP_REQUEST_METHOD {
+                            if let Ok(params) =
+                                serde_json::from_value::<crate::protocol::HttpRequestParams>(
+                                    request.params.clone().unwrap_or_default(),
+                                )
+                            {
+                                if params.stream_response {
+                                    if let Err(error) = handler
+                                        .reserve_http_body_stream(&params.request_id, &request.id)
+                                        .await
+                                    {
+                                        if send_outbound(
+                                            &outgoing_tx,
+                                            RpcServerOutboundMessage::Error {
+                                                request_id: request.id,
+                                                error,
+                                            },
+                                            &cancelled,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        pending_starts.retain(|_, completion| completion.peek().is_none());
+                        let process_id = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("processId"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        let predecessor = if independent_read {
+                            process_id
+                                .as_ref()
+                                .and_then(|id| pending_starts.get(id))
+                                .cloned()
+                        } else {
+                            last_ordered.take()
+                        };
+                        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
+                        if initialized && !independent_read {
+                            let completion = async move {
+                                let _ = completion_rx.await;
+                            }
+                            .boxed()
+                            .shared();
+                            last_ordered = Some(completion.clone());
+                            if method == crate::protocol::EXEC_METHOD {
+                                if let Some(process_id) = process_id {
+                                    pending_starts.insert(process_id, completion);
+                                }
+                            }
+                        }
                         let request_span = request_span(method, &request);
                         let response =
                             route(Arc::clone(&handler), request).instrument(request_span.clone());
-                        let mut request_disconnected = disconnected_rx.clone();
+                        let request_cancelled = cancelled.clone();
                         let outgoing_tx = outgoing_tx.clone();
                         let telemetry = telemetry.clone();
                         let operation = async move {
+                            // Dropping the sender also releases successors during cancellation.
+                            let _completion = completion_tx;
+                            if let Some(predecessor) = predecessor {
+                                tokio::select! {
+                                    _ = request_cancelled.cancelled() => return false,
+                                    _ = predecessor => {}
+                                }
+                            }
                             let message = tokio::select! {
                                 message = response => message,
-                                _ = request_disconnected.changed() => {
+                                _ = request_cancelled.cancelled() => {
                                     request_span.record("result", "disconnected");
                                     telemetry.request_completed(method, "disconnected", request_started_at.elapsed());
                                     return false;
@@ -176,7 +297,9 @@ async fn run_connection(
                             };
                             let result = request_result(&message);
                             if let Some(message) = message
-                                && outgoing_tx.send(message).await.is_err()
+                                && send_outbound(&outgoing_tx, message, &request_cancelled)
+                                    .await
+                                    .is_err()
                             {
                                 request_span.record("result", "disconnected");
                                 telemetry.request_completed(
@@ -196,22 +319,27 @@ async fn run_connection(
                         };
                         if independent_read {
                             reads.spawn(operation);
+                        } else if initialized {
+                            ordered.spawn(operation);
                         } else if !operation.await {
                             break;
                         }
                     } else {
                         let method = "unknown";
                         let request_span = request_span(method, &request);
-                        if outgoing_tx
-                            .send(RpcServerOutboundMessage::Error {
+                        if send_outbound(
+                            &outgoing_tx,
+                            RpcServerOutboundMessage::Error {
                                 request_id: request.id,
                                 error: method_not_found(format!(
                                     "exec-server stub does not implement `{}` yet",
                                     request.method
                                 )),
-                            })
-                            .await
-                            .is_err()
+                            },
+                            &cancelled,
+                        )
+                        .await
+                        .is_err()
                         {
                             request_span.record("result", "disconnected");
                             telemetry.request_completed(
@@ -236,7 +364,7 @@ async fn run_connection(
                     };
                     let result = tokio::select! {
                         result = route(Arc::clone(&handler), notification) => result,
-                        _ = disconnected_rx.changed() => {
+                        _ = cancelled.cancelled() => {
                             debug!(
                                 "exec-server transport disconnected while handling notification"
                             );
@@ -272,6 +400,11 @@ async fn run_connection(
         }
     }
 
+    cancelled.cancel();
+    disconnect_task.abort();
+    let _ = disconnect_task.await;
+    ordered.abort_all();
+    while ordered.join_next().await.is_some() {}
     reads.abort_all();
     while reads.join_next().await.is_some() {}
     handler.shutdown().await;
@@ -282,6 +415,18 @@ async fn run_connection(
         let _ = task.await;
     }
     let _ = outbound_task.await;
+}
+
+async fn send_outbound(
+    sender: &mpsc::Sender<RpcServerOutboundMessage>,
+    message: RpcServerOutboundMessage,
+    cancelled: &CancellationToken,
+) -> Result<(), ()> {
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => Err(()),
+        result = sender.send(message) => result.map_err(|_| ()),
+    }
 }
 
 fn request_span(
@@ -502,7 +647,137 @@ mod tests {
         registry.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn slow_http_headers_do_not_block_metadata_or_request_cancellation() {
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+        let (mut writer, mut lines, task) =
+            spawn_test_connection(Arc::clone(&registry), "slow-http");
+        send_request(
+            &mut writer,
+            1,
+            INITIALIZE_METHOD,
+            &InitializeParams {
+                client_name: "test".into(),
+                resume_session_id: None,
+            },
+        )
+        .await;
+        let _: InitializeResponse = read_response(&mut lines, 1).await;
+        send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        send_request(
+            &mut writer,
+            2,
+            crate::protocol::HTTP_REQUEST_METHOD,
+            &crate::protocol::HttpRequestParams {
+                method: "GET".into(),
+                url: format!("http://{}/wait", listener.local_addr().unwrap()),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: Some(10_000),
+                redirect_policy: crate::protocol::HttpRedirectPolicy::Follow,
+                request_id: "pre-header".into(),
+                stream_response: true,
+            },
+        )
+        .await;
+        let (socket, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        send_request(&mut writer, 3, ENVIRONMENT_INFO_METHOD, &()).await;
+        let info: EnvironmentInfo = timeout(Duration::from_secs(1), read_response(&mut lines, 3))
+            .await
+            .unwrap();
+        assert_eq!(info, EnvironmentInfo::local());
+        send_request(
+            &mut writer,
+            4,
+            crate::protocol::HTTP_REQUEST_CANCEL_METHOD,
+            &crate::protocol::HttpRequestCancelParams {
+                request_id: "pre-header".into(),
+            },
+        )
+        .await;
+        let mut cancelled = false;
+        let mut acknowledged = false;
+        timeout(Duration::from_secs(2), async {
+            while !cancelled || !acknowledged {
+                let message: JSONRPCMessage =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                match message {
+                    JSONRPCMessage::Error(error) if error.id == RequestId::Integer(2) => {
+                        assert!(error.error.message.contains("cancelled"));
+                        cancelled = true;
+                    }
+                    JSONRPCMessage::Response(response) if response.id == RequestId::Integer(4) => {
+                        acknowledged = true
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(socket);
+        drop(writer);
+        drop(lines);
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn outbound_failure_or_backpressure_cannot_prevent_disconnect_cleanup() {
+        for writer_failure in [false, true] {
+            let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+            let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(1);
+            let (incoming_tx, incoming_rx) =
+                tokio::sync::mpsc::channel(crate::connection::CHANNEL_CAPACITY * 2);
+            let (disconnected_tx, disconnected_rx) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(run_connection(
+                crate::connection::JsonRpcConnection {
+                    outgoing_tx,
+                    incoming_rx,
+                    disconnected_rx,
+                    task_handles: Vec::new(),
+                    transport: crate::connection::JsonRpcTransport::Plain,
+                },
+                Arc::clone(&registry),
+                test_runtime_paths(),
+                crate::ExecServerTelemetry::default(),
+                crate::telemetry::ConnectionTransport::Stdio,
+            ));
+            for _ in 0..crate::connection::CHANNEL_CAPACITY + 4 {
+                incoming_tx
+                    .try_send(
+                        crate::connection::JsonRpcConnectionEvent::MalformedMessage {
+                            reason: "test".into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            tokio::task::yield_now().await;
+            if writer_failure {
+                drop(outgoing_rx);
+            } else {
+                disconnected_tx.send(true).unwrap();
+            }
+            timeout(Duration::from_secs(1), task)
+                .await
+                .expect("cleanup must not depend on the outbound receiver draining")
+                .unwrap();
+            registry.shutdown().await;
+        }
+    }
+
     #[test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Force client preparation on a current-thread runtime"
+    )]
     fn registered_http_route_bounds_preparation_and_releases_stream_reservation() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -534,6 +809,7 @@ mod tests {
                 let _ = release_rx.recv();
             });
             started_rx.await.expect("worker occupied");
+            let cache_guard = crate::ReqwestHttpClient::block_cache_for_test();
             let mut results = Vec::new();
             // Reusing the streaming request ID must reach preparation again, proving failed
             // preparation released the handler's stream reservation through normal routing.
@@ -559,6 +835,7 @@ mod tests {
                 .await;
                 results.push(timeout(Duration::from_millis(500), lines.next_line()).await);
             }
+            drop(cache_guard);
             release_tx.send(()).expect("release worker");
             blocker.await.expect("worker joined");
             tokio::task::spawn_blocking(|| ())
@@ -858,6 +1135,76 @@ mod tests {
                 .expect("second joined");
             registry.shutdown().await;
         });
+    }
+
+    #[tokio::test]
+    async fn dropping_remote_http_body_stops_producer_and_keeps_connection_usable() {
+        use tokio::io::AsyncReadExt;
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/stream", http.local_addr().unwrap());
+        let producer = tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\ntest\r\n").await.unwrap();
+            let mut byte = [0];
+            // The response never completes normally: consumer abandonment must close it.
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        });
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+        let (client_writer, server_reader) = duplex(1 << 20);
+        let (server_writer, client_reader) = duplex(1 << 20);
+        let server = tokio::spawn(run_connection(
+            JsonRpcConnection::from_stdio(server_reader, server_writer, "cancel-server".into()),
+            registry.clone(),
+            test_runtime_paths(),
+            crate::ExecServerTelemetry::default(),
+            crate::telemetry::ConnectionTransport::Stdio,
+        ));
+        let client = crate::ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(client_reader, client_writer, "cancel-client".into()),
+            crate::ExecServerClientConnectOptions {
+                client_name: "cancel-test".into(),
+                initialize_timeout: Duration::from_secs(5),
+                resume_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, mut body) = client
+            .http_request_stream(crate::protocol::HttpRequestParams {
+                method: "GET".into(),
+                url,
+                headers: vec![],
+                body: None,
+                timeout_ms: None,
+                redirect_policy: Default::default(),
+                request_id: "ignored".into(),
+                stream_response: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), body.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(b"test".to_vec())
+        );
+        drop(body);
+        timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("cancellation must reach the HTTP producer")
+            .unwrap();
+        timeout(Duration::from_secs(5), client.environment_info())
+            .await
+            .unwrap()
+            .expect("unrelated RPC remains usable");
+        drop(client);
+        server.abort();
+        registry.shutdown().await;
     }
 
     fn spawn_test_connection(

@@ -4,6 +4,7 @@ use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::responses_stream::X_CODEX_TURN_STATE_HEADER;
+use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use codex_protocol::models::ResponseItem;
@@ -42,17 +43,25 @@ impl<T: HttpTransport> CompactClient<T> {
         request_timeout: Duration,
         turn_state: Option<&OnceLock<String>>,
     ) -> Result<Vec<ResponseItem>, ApiError> {
+        let body = EncodedJsonBody::encode(&body).map_err(|error| {
+            ApiError::Stream(format!("failed to encode compaction input: {error}"))
+        })?;
+        self.compact_encoded(body, extra_headers, request_timeout, turn_state)
+            .await
+    }
+
+    async fn compact_encoded(
+        &self,
+        body: EncodedJsonBody,
+        extra_headers: HeaderMap,
+        request_timeout: Duration,
+        turn_state: Option<&OnceLock<String>>,
+    ) -> Result<Vec<ResponseItem>, ApiError> {
         let resp = self
             .session
-            .execute_with(
-                Method::POST,
-                Self::path(),
-                extra_headers,
-                Some(body),
-                |req| {
-                    req.timeout = Some(request_timeout);
-                },
-            )
+            .execute_encoded_json_with(Method::POST, Self::path(), extra_headers, body, |req| {
+                req.timeout = Some(request_timeout);
+            })
             .await?;
         if let Some(turn_state) = turn_state
             && let Some(header_value) = resp
@@ -62,8 +71,12 @@ impl<T: HttpTransport> CompactClient<T> {
         {
             let _ = turn_state.set(header_value.to_string());
         }
-        let parsed: CompactHistoryResponse =
-            serde_json::from_slice(&resp.body).map_err(|e| ApiError::Stream(e.to_string()))?;
+        let parsed: CompactHistoryResponse = serde_json::from_slice(&resp.body).map_err(|e| {
+            ApiError::Stream(crate::responses_stream::decode_diagnostic(
+                "failed to parse compaction response",
+                &e,
+            ))
+        })?;
         Ok(parsed.output)
     }
 
@@ -74,9 +87,9 @@ impl<T: HttpTransport> CompactClient<T> {
         request_timeout: Duration,
         turn_state: Option<&OnceLock<String>>,
     ) -> Result<Vec<ResponseItem>, ApiError> {
-        let body = serde_json::to_value(input)
+        let body = EncodedJsonBody::encode(input)
             .map_err(|e| ApiError::Stream(format!("failed to encode compaction input: {e}")))?;
-        self.compact(body, extra_headers, request_timeout, turn_state)
+        self.compact_encoded(body, extra_headers, request_timeout, turn_state)
             .await
     }
 }

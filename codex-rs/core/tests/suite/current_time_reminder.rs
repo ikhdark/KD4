@@ -234,6 +234,11 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
                 ev_assistant_message("msg-2", "continue"),
                 continue_response,
             ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-3", "finished"),
+                ev_completed("resp-3"),
+            ]),
         ],
     )
     .await;
@@ -258,13 +263,16 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
     test.submit_turn("first turn").await?;
 
     let requests = responses.requests();
-    // The tool result gets one shared follow-up. A subsequent end_turn=false
-    // with no new user input, tool output, or mutation is host-completable and
-    // must not trigger a redundant third request.
-    assert_eq!(requests.len(), 2);
+    // The server-requested continuation must run, but assistant-only progress
+    // must not trigger another reminder in AfterUserOrToolOutput mode.
+    assert_eq!(requests.len(), 3);
     assert_eq!(current_time_reminders(&requests[0]), vec![FIRST_REMINDER]);
     assert_eq!(
         current_time_reminders(&requests[1]),
+        vec![FIRST_REMINDER, SECOND_REMINDER]
+    );
+    assert_eq!(
+        current_time_reminders(&requests[2]),
         vec![FIRST_REMINDER, SECOND_REMINDER]
     );
     Ok(())

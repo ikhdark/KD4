@@ -49,7 +49,7 @@ fn renders_full_state_and_omits_unchanged_state() {
 
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nuse the project formatter\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nuse the project formatter\n</INSTRUCTIONS>",
         )],
         render_fragments(state.render_full()),
     );
@@ -60,7 +60,7 @@ fn renders_full_state_and_omits_unchanged_state() {
     assert_eq!(
         state.snapshot().into_value(),
         json!({"agents_md": {
-            "text": "Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nuse the project formatter",
+            "text": "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n\nuse the project formatter",
             "freshness": "refreshed"
         }}),
     );
@@ -79,13 +79,13 @@ fn renders_instruction_markup_as_text_without_changing_snapshot() {
     assert_eq!(
         render_fragments(state.render_full()),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nQuote &lt;/INSTRUCTIONS&gt; & <example>.\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nQuote &lt;/INSTRUCTIONS&gt; & <example>.\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(
         state.snapshot().into_value(),
         json!({"agents_md": {
-            "text": "Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nQuote </INSTRUCTIONS> & <example>.",
+            "text": "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n\nQuote </INSTRUCTIONS> & <example>.",
             "freshness": "refreshed"
         }})
     );
@@ -105,7 +105,7 @@ fn renders_command_templates_and_code_without_xml_encoding() {
     assert_eq!(
         messages,
         vec![user_message(&format!(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{source}\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{source}\n</INSTRUCTIONS>"
         ))]
     );
 }
@@ -121,7 +121,7 @@ fn changed_and_removed_state_supersedes_previous_instructions() {
     current.add_section(AgentsMdState::new(Some(&current_loaded)));
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew instructions\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew instructions\n</INSTRUCTIONS>",
         )],
         render_fragments(current.render_diff(&previous.snapshot())),
     );
@@ -142,7 +142,7 @@ fn unknown_previous_state_is_explicitly_superseded() {
     let current = AgentsMdState::new(Some(&loaded));
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ncurrent instructions\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ncurrent instructions\n</INSTRUCTIONS>",
         )],
         render_fragments(vec![
             WorldStateSection::render_diff(&current, PreviousSectionState::Unknown)
@@ -165,293 +165,174 @@ fn unknown_previous_state_is_explicitly_superseded() {
 }
 
 #[test]
-fn oversized_agents_md_is_admitted_with_truncation() {
-    let loaded = LoadedAgentsMd::from_text_for_testing("x".repeat(50_000));
+fn oversized_instructions_preserve_middle_rules_and_replay_after_loss() {
+    let body = format!(
+        "{}\nREQUIRED: validate the middle rule.\n{}",
+        "x".repeat(25_000),
+        "y".repeat(25_000)
+    );
+    let loaded = LoadedAgentsMd::from_text_for_testing(body.clone());
     let mut state = WorldState::default();
     state.add_section(AgentsMdState::new(Some(&loaded)));
-
-    let (rendered, snapshot) = state.render_full_with_snapshot();
-    let rendered = rendered
-        .into_iter()
-        .map(|fragment| fragment.render())
-        .collect::<Vec<_>>();
-
-    assert_eq!(rendered.len(), 1);
-    assert!(rendered[0].contains("[... context truncated ...]"));
-    assert_ne!(snapshot, state.snapshot());
-    let partial =
-        super::super::partial_delivery(snapshot.section("agents_md").expect("partial state"))
-            .expect("bounded delivery record");
-    assert_eq!(partial.rendered, rendered[0]);
-    assert_eq!(partial.role, "user");
+    let (fragments, snapshot) = state.render_full_with_snapshot();
+    assert_eq!(fragments.len(), 1);
+    assert!(fragments[0].render().contains(&body));
     assert!(
-        partial.rendered.len()
-            <= codex_context_fragments::ModelContextBudget::default().remaining_bytes()
+        !fragments[0]
+            .render()
+            .contains("[... context truncated ...]")
     );
-    assert!(snapshot.section("agents_md").unwrap().get("text").is_none());
-
-    let (rendered_again, next_snapshot) = state.render_diff_with_snapshot(&snapshot);
-    assert!(rendered_again.is_empty());
-    assert_eq!(next_snapshot, snapshot);
-
-    let retained = vec![user_message(&rendered[0])];
-    let restored =
-        serde_json::from_value(snapshot.clone().into_value()).expect("restore partial snapshot");
+    assert_eq!(snapshot, state.snapshot());
+    let retained = render_fragments(fragments);
     assert!(
         state
-            .render_history_diff(Some(&restored), &retained)
+            .render_history_diff(Some(&snapshot), &retained)
             .is_empty()
     );
-    let replay = state.render_history_diff(Some(&restored), &[]);
-    assert_eq!(
-        replay
-            .iter()
-            .map(|fragment| fragment.render())
-            .collect::<Vec<_>>(),
-        rendered
-    );
+    let replay = state.render_history_diff(Some(&snapshot), &[]);
+    assert_eq!(replay.len(), 1);
+    assert!(replay[0].render().contains(&body));
 
-    let mut history = crate::context_manager::ContextManager::new();
-    let (fragments, rollout) = history.update_world_state(&state);
-    assert_eq!(history.world_state_baseline(), Some(snapshot.clone()));
-    assert_eq!(
-        rollout,
-        Some(codex_protocol::protocol::WorldStateItem::full(
-            snapshot.clone().into_value()
-        ))
-    );
-    let items = render_fragments(fragments);
-    history.record_items(
-        &items,
-        codex_utils_output_truncation::TruncationPolicy::Bytes(100_000),
-    );
-    let (fragments, rollout) = history.update_world_state(&state);
-    assert!(fragments.is_empty());
-    assert_eq!(rollout, None);
-    history.replace(Vec::new());
-    let (fragments, rollout) = history.update_world_state(&state);
-    assert_eq!(render_fragments(fragments), items);
-    assert_eq!(
-        rollout,
-        Some(codex_protocol::protocol::WorldStateItem::full(
-            snapshot.into_value()
-        ))
-    );
+    let legacy = serde_json::from_value(json!({"agents_md": {"partial_delivery": {
+        "source_digest": "old", "role": "user", "rendered": "excerpt"
+    }}}))
+    .unwrap();
+    let replay = state.render_history_diff(Some(&legacy), &[user_message("excerpt")]);
+    assert_eq!(replay.len(), 1);
+    assert!(replay[0].render().contains(&body));
 }
 
 #[test]
-fn partial_replacement_does_not_suppress_reversion_or_source_changes() {
-    let world_state = |text: String| {
+fn required_instructions_precede_optional_context_regardless_of_registration_order() {
+    for optional_first in [false, true] {
         let mut state = WorldState::default();
+        let add_optional = |state: &mut WorldState| {
+            state.add_extension_section(codex_extension_api::WorldStateSectionContribution::new(
+                "optional",
+                json!(true),
+                |_| {
+                    Some(codex_extension_api::RenderedWorldStateFragment::new(
+                        "developer",
+                        ("", ""),
+                        "e".repeat(30_000),
+                    ))
+                },
+            ))
+        };
+        if optional_first {
+            add_optional(&mut state);
+        }
+        let body = "instructions ".repeat(2_000);
         state.add_section(AgentsMdState::new(Some(
-            &LoadedAgentsMd::from_text_for_testing(text),
+            &LoadedAgentsMd::from_text_for_testing(body.clone()),
         )));
-        state
-    };
-    let a = world_state("instructions A".to_string());
-    let (_, accepted) = a.render_full_with_snapshot();
-    let b = world_state("B".repeat(50_000));
-    let (bounded, partial) = b.render_diff_with_snapshot(&accepted);
-    assert!(bounded[0].render().contains(REPLACEMENT_NOTICE));
-    assert!(bounded[0].render().contains("[... context truncated ...]"));
-    assert_ne!(partial, accepted);
-    let (reverted, restored) = a.render_diff_with_snapshot(&partial);
-    assert_eq!(
-        render_fragments(reverted),
-        vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ninstructions A\n</INSTRUCTIONS>"
-        )]
-    );
-    assert_eq!(restored, accepted);
-
-    // A change entirely inside the omitted middle still changes source identity.
-    let c = world_state(format!(
-        "{}changed{}",
-        "B".repeat(25_000),
-        "B".repeat(25_000)
-    ));
-    let (changed, next) = c.render_diff_with_snapshot(&partial);
-    assert_eq!(changed.len(), 1);
-    assert!(changed[0].render().contains("[... context truncated ...]"));
-    assert_ne!(next, partial);
+        if !optional_first {
+            add_optional(&mut state);
+        }
+        let (fragments, accepted) = state.render_full_with_snapshot();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].render().contains(&body));
+        assert!(accepted.section("optional").is_none());
+        assert!(accepted.section("agents_md").is_some());
+    }
 }
 
 #[test]
-fn partial_instructions_can_be_delivered_in_full_when_budget_is_available() {
-    let mut state = WorldState::default();
-    state.add_extension_section(codex_extension_api::WorldStateSectionContribution::new(
-        "earlier",
-        json!(true),
-        |previous| match previous {
-            codex_extension_api::PreviousWorldStateSection::Absent => {
-                Some(codex_extension_api::RenderedWorldStateFragment::new(
-                    "developer",
-                    ("", ""),
-                    "e".repeat(30_000),
-                ))
-            }
-            _ => None,
-        },
+fn freshness_notice_alone_does_not_prove_instruction_body_retention() {
+    let loaded = LoadedAgentsMd::from_text_for_testing("binding instruction");
+    let mut refreshed = WorldState::default();
+    refreshed.add_section(AgentsMdState::new(Some(&loaded)));
+    let (body, initial) = refreshed.render_full_with_snapshot();
+    let mut cached = WorldState::default();
+    cached.add_section(AgentsMdState::new_cached(
+        Some(&loaded),
+        None,
+        AgentsMdFreshness::CachedFallback,
     ));
-    state.add_section(AgentsMdState::new(Some(
-        &LoadedAgentsMd::from_text_for_testing("instructions ".repeat(2_000)),
-    )));
-    let (first, partial) = state.render_full_with_snapshot();
-    assert_eq!(first.len(), 2);
-    assert!(first[1].render().contains("[... context truncated ...]"));
-    let (complete, accepted) = state.render_diff_with_snapshot(&partial);
-    assert_eq!(complete.len(), 1);
-    assert!(complete[0].render().contains(REPLACEMENT_NOTICE));
+    let (notice, accepted) = cached.render_diff_with_snapshot(&initial);
+    assert_eq!(notice.len(), 1);
+    assert!(!notice[0].render().contains("binding instruction"));
+    let mut retained = render_fragments(body);
+    let notice = render_fragments(notice);
+    retained.extend(notice.clone());
     assert!(
-        complete[0]
-            .render()
-            .contains(&"instructions ".repeat(2_000))
+        cached
+            .render_history_diff(Some(&accepted), &retained)
+            .is_empty()
     );
-    assert!(!complete[0].render().contains("[... context truncated ...]"));
-    assert_eq!(accepted, state.snapshot());
-    assert!(state.render_diff(&accepted).is_empty());
+    let restored = cached.render_history_diff(Some(&accepted), &notice);
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0].render().contains("binding instruction"));
 }
 
 #[test]
-fn tighter_budget_preserves_partial_delivery_and_admits_later_sections() {
-    let loaded = LoadedAgentsMd::from_text_for_testing("x".repeat(50_000));
-    let mut previous = WorldState::default();
-    previous.add_section(AgentsMdState::new(Some(&loaded)));
-    let (delivered, accepted) = previous.render_full_with_snapshot();
-    let retained = render_fragments(delivered);
-
-    let mut current = WorldState::default();
-    current.add_extension_section(codex_extension_api::WorldStateSectionContribution::new(
-        "earlier",
-        json!(true),
-        |_| {
-            Some(codex_extension_api::RenderedWorldStateFragment::new(
-                "developer",
-                ("", ""),
-                "e".repeat(10_000),
-            ))
-        },
+fn oversized_freshness_updates_do_not_repeat_body_and_middle_changes_do() {
+    let body = "b".repeat(50_000);
+    let loaded = LoadedAgentsMd::from_text_for_testing(body.clone());
+    let mut refreshed = WorldState::default();
+    refreshed.add_section(AgentsMdState::new(Some(&loaded)));
+    let (fragments, accepted) = refreshed.render_full_with_snapshot();
+    let mut cached = WorldState::default();
+    cached.add_section(AgentsMdState::new_cached(
+        Some(&loaded),
+        None,
+        AgentsMdFreshness::CachedFallback,
     ));
-    current.add_section(AgentsMdState::new(Some(&loaded)));
-    current.add_extension_section(codex_extension_api::WorldStateSectionContribution::new(
-        "later",
-        json!(true),
-        |_| {
-            Some(codex_extension_api::RenderedWorldStateFragment::new(
-                "developer",
-                ("", ""),
-                "later guidance",
-            ))
-        },
-    ));
-    let (fragments, next) = current.render_history_diff_with_snapshot(Some(&accepted), &retained);
-    assert_eq!(
-        fragments
-            .iter()
-            .map(|fragment| fragment.render())
-            .collect::<Vec<_>>(),
-        vec!["e".repeat(10_000), "later guidance".to_string()]
-    );
-    assert_eq!(next.section("agents_md"), accepted.section("agents_md"));
-    assert_eq!(next.section("earlier"), Some(&json!(true)));
-    assert_eq!(next.section("later"), Some(&json!(true)));
+    let retained = render_fragments(fragments);
+    let (notice, next) = cached.render_history_diff_with_snapshot(Some(&accepted), &retained);
+    assert_eq!(notice.len(), 1);
+    assert!(notice[0].render().len() < 1000);
+    assert!(!notice[0].render().contains(&body));
+    let mut changed = WorldState::default();
+    let body = format!("{}CHANGED{}", "b".repeat(25_000), "b".repeat(25_000));
+    changed.add_section(AgentsMdState::new(Some(
+        &LoadedAgentsMd::from_text_for_testing(body.clone()),
+    )));
+    let (replacement, _) = changed.render_diff_with_snapshot(&next);
+    assert_eq!(replacement.len(), 1);
+    assert!(replacement[0].render().contains(&body));
 }
 
 #[test]
-fn partial_delivery_requires_the_delivered_text_and_role_in_history() {
-    let loaded = LoadedAgentsMd::from_text_for_testing("x".repeat(50_000));
+fn instruction_retention_requires_user_role_and_complete_body() {
+    let loaded = LoadedAgentsMd::from_text_for_testing("whole body");
     let mut state = WorldState::default();
     state.add_section(AgentsMdState::new(Some(&loaded)));
     let (fragments, accepted) = state.render_full_with_snapshot();
-    let delivered = render_fragments(fragments);
-    let mut wrong_role = delivered[0].clone();
-    if let ResponseItem::Message { role, .. } = &mut wrong_role {
+    let mut retained = render_fragments(fragments);
+    if let ResponseItem::Message { role, .. } = &mut retained[0] {
         *role = "assistant".to_string();
     }
-    let unrelated = user_message(
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nunrelated instructions\n</INSTRUCTIONS>",
-    );
-    for retained in [vec![wrong_role], vec![unrelated]] {
-        let (fragments, next) = state.render_history_diff_with_snapshot(Some(&accepted), &retained);
-        assert_eq!(render_fragments(fragments), delivered);
-        assert_eq!(next, accepted);
-    }
-    let (fragments, next) = state.render_history_diff_with_snapshot(Some(&accepted), &delivered);
-    assert!(fragments.is_empty());
-    assert_eq!(next, accepted);
+    let replay = state.render_history_diff(Some(&accepted), &retained);
+    assert_eq!(replay.len(), 1);
+    assert!(replay[0].render().contains("whole body"));
 }
 
 #[test]
-fn partial_delivery_rollout_patches_replay_replacement_and_removal() {
-    use crate::context::world_state::WorldStateSnapshot;
-    use codex_protocol::protocol::WorldStateItem;
+fn complete_instruction_delivery_survives_rollout_and_history_replacement() {
     use codex_utils_output_truncation::TruncationPolicy;
-
     let mut history = crate::context_manager::ContextManager::new();
-    let mut replay = WorldStateSnapshot::default();
-    for (index, body) in [
-        Some("old body".to_string()),
+    let mut replay = super::super::WorldStateSnapshot::default();
+    for body in [
+        Some("old".to_string()),
         Some("x".repeat(50_000)),
-        Some("new body".to_string()),
+        Some("new".to_string()),
         None,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         let loaded = body.map(LoadedAgentsMd::from_text_for_testing);
         let mut state = WorldState::default();
         state.add_section(AgentsMdState::new(loaded.as_ref()));
         let (fragments, rollout) = history.update_world_state(&state);
         let items = render_fragments(fragments);
         assert_eq!(items.len(), 1);
-        let rollout = rollout.expect("changed delivery must be persisted");
-        if index == 0 {
-            assert_eq!(rollout, WorldStateItem::full(state.snapshot().into_value()));
-            replay = serde_json::from_value(rollout.state).expect("full snapshot");
-        } else {
-            assert_eq!(rollout, WorldStateItem::patch(rollout.state.clone()));
-            replay
-                .apply_merge_patch(&rollout.state)
-                .expect("replay delivery patch");
-        }
-        assert_eq!(history.world_state_baseline(), Some(replay.clone()));
-        if index == 1 {
-            let section = replay.section("agents_md").expect("agents state");
-            assert!(section.get("text").is_none());
-            let partial = super::super::partial_delivery(section).expect("partial delivery");
-            assert_eq!(items, vec![user_message(partial.rendered)]);
-            assert!(partial.rendered.contains("[... context truncated ...]"));
-        } else {
-            assert_eq!(replay, state.snapshot());
-            assert!(
-                replay
-                    .section("agents_md")
-                    .unwrap()
-                    .get("partial_delivery")
-                    .is_none()
-            );
-        }
-        if index == 2 {
-            assert_eq!(
-                items,
-                vec![user_message(
-                    "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew body\n</INSTRUCTIONS>"
-                )]
-            );
-        } else if index == 3 {
-            assert_eq!(
-                items,
-                vec![user_message(
-                    "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>"
-                )]
-            );
-        }
+        replay
+            .apply_merge_patch(&rollout.expect("changed state persisted").state)
+            .unwrap();
+        assert_eq!(replay, state.snapshot());
         history.record_items(&items, TruncationPolicy::Bytes(100_000));
         let (unchanged, rollout) = history.update_world_state(&state);
         assert!(unchanged.is_empty());
-        assert_eq!(rollout, None);
-        // A restored baseline must suppress the same content after each persisted transition.
-        assert!(state.render_history_diff(Some(&replay), &items).is_empty());
+        assert!(rollout.is_none());
     }
 }
 
@@ -481,7 +362,7 @@ fn freshness_only_update_does_not_repeat_the_instruction_body() {
     assert_eq!(
         render_fragments(fragments),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(refreshed, accepted);
@@ -504,7 +385,7 @@ fn freshness_change_with_new_instructions_delivers_the_replacement_body() {
     assert_eq!(
         render_fragments(fragments),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew body\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew body\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(accepted, current.snapshot());
@@ -538,4 +419,51 @@ fn user_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[test]
+fn retention_requires_latest_body_scope_and_revocation() {
+    let make = |directory: &str| {
+        AgentsMdState::from_instructions(
+            Some(UserInstructions {
+                directory: Some(directory.to_string()),
+                text: "same body".to_string(),
+            }),
+            AgentsMdFreshness::Refreshed,
+        )
+    };
+    let old = make("/old");
+    let current = make("/new");
+    let old_items = render_fragments(vec![
+        WorldStateSection::render_diff(&old, PreviousSectionState::Absent).unwrap(),
+    ]);
+    assert!(!AgentsMdState::retained_state_supported(
+        &current.snapshot(),
+        &old_items
+    ));
+    let new_items = render_fragments(vec![
+        WorldStateSection::render_diff(&current, PreviousSectionState::Absent).unwrap(),
+    ]);
+    assert!(AgentsMdState::retained_state_supported(
+        &current.snapshot(),
+        &new_items
+    ));
+    let removed = AgentsMdState::new(None);
+    assert!(!AgentsMdState::retained_state_supported(
+        &removed.snapshot(),
+        &new_items
+    ));
+    let mut history = new_items;
+    history.extend(render_fragments(vec![
+        WorldStateSection::render_diff(&removed, PreviousSectionState::Known(&current.snapshot()))
+            .unwrap(),
+    ]));
+    assert!(AgentsMdState::retained_state_supported(
+        &removed.snapshot(),
+        &history
+    ));
+    assert!(!AgentsMdState::retained_state_supported(
+        &current.snapshot(),
+        &history
+    ));
 }

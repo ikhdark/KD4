@@ -169,6 +169,7 @@ where
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             if let Some(runtime) = goal_runtime_handle(input.thread_store) {
+                runtime.set_enabled(false);
                 self.goal_service.unregister_runtime(&runtime);
             }
         })
@@ -203,6 +204,11 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
+            runtime.start_live_turn(
+                input.turn_id,
+                input.collaboration_mode.mode,
+                input.token_usage_at_turn_start,
+            );
             if !runtime.is_enabled() {
                 return;
             }
@@ -254,6 +260,7 @@ where
                 return;
             };
 
+            runtime.finish_live_turn(input.turn_store.level_id());
             let Ok(_goal_state_permit) = runtime.goal_state_permit().await else {
                 return;
             };
@@ -283,6 +290,7 @@ where
                 return;
             };
 
+            runtime.finish_live_turn(input.turn_store.level_id());
             let Ok(_goal_state_permit) = runtime.goal_state_permit().await else {
                 return;
             };
@@ -348,6 +356,7 @@ where
             let Some(runtime) = goal_runtime_handle(thread_store) else {
                 return;
             };
+            runtime.record_live_usage(turn_store.level_id(), &token_usage.total_token_usage);
             if !runtime.is_enabled() {
                 return;
             }
@@ -378,6 +387,7 @@ where
             let Ok(_goal_state_permit) = runtime.goal_state_permit().await else {
                 return;
             };
+            runtime.retry_goal_steering().await;
             let turn_id = input.turn_id;
             let progress = match runtime
                 .account_active_goal_progress(

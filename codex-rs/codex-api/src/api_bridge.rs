@@ -9,7 +9,6 @@ use crate::responses_stream::REQUEST_ID_HEADER;
 use base64::Engine;
 use chrono::DateTime;
 use chrono::Utc;
-use codex_protocol::auth::PlanType;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::ConnectionFailedError;
 use codex_protocol::error::ResponseStreamFailed;
@@ -26,6 +25,8 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
         ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
+        ApiError::IncompleteResponse(response) => CodexErr::IncompleteResponse(response),
+        ApiError::ProviderFailure { code, message } => CodexErr::ProviderFailure { code, message },
         ApiError::Stream(message) => CodexErr::ResponseStreamFailed(ResponseStreamFailed {
             message,
             status: None,
@@ -56,35 +57,12 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             } => {
                 let body_text = body.unwrap_or_default();
 
-                if let Ok(parsed) = serde_json::from_str::<Value>(&body_text) {
-                    match (
-                        status,
-                        parsed
-                            .get("error")
-                            .and_then(|error| error.get("code"))
-                            .and_then(Value::as_str),
-                    ) {
-                        (http::StatusCode::BAD_REQUEST, Some("context_length_exceeded")) => {
-                            return CodexErr::ContextWindowExceeded;
-                        }
-                        (http::StatusCode::TOO_MANY_REQUESTS, Some("insufficient_quota")) => {
-                            return CodexErr::QuotaExceeded;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if status == http::StatusCode::SERVICE_UNAVAILABLE
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
-                    && matches!(
-                        value
-                            .get("error")
-                            .and_then(|error| error.get("code"))
-                            .and_then(serde_json::Value::as_str),
-                        Some("server_is_overloaded" | "slow_down")
-                    )
+                if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
+                    && let Some(error) = parsed.get("error")
+                    && let Some(classified) =
+                        crate::responses_stream::classify_provider_error(error)
                 {
-                    return CodexErr::ServerOverloaded;
+                    return map_api_error(classified);
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
@@ -122,9 +100,13 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                             let resets_at = err
                                 .error
                                 .resets_at
+                                .and_then(|value| value.as_i64())
                                 .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
                             return CodexErr::UsageLimitReached(UsageLimitReachedError {
-                                plan_type: err.error.plan_type,
+                                plan_type: err
+                                    .error
+                                    .plan_type
+                                    .and_then(|value| serde_json::from_value(value).ok()),
                                 resets_at,
                                 rate_limits: rate_limits.map(Box::new),
                                 promo_message,
@@ -248,6 +230,6 @@ struct UsageErrorResponse {
 struct UsageErrorBody {
     #[serde(rename = "type")]
     error_type: Option<String>,
-    plan_type: Option<PlanType>,
-    resets_at: Option<i64>,
+    plan_type: Option<Value>,
+    resets_at: Option<Value>,
 }

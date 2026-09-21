@@ -108,7 +108,7 @@ impl ListMcpResourcesHandler {
         let truncation_policy = turn.model_info.truncation_policy.into();
         execute_resource_call(
             &session,
-            turn.as_ref(),
+            &turn,
             &call_id,
             invocation,
             cancellation_token,

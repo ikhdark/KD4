@@ -188,12 +188,22 @@ async fn install_planned_mcp_dependencies(
         })?,
     };
     let mut added = Vec::new();
+    let mut setup = Vec::new();
     let mut entries = missing.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(left, _)| *left);
     for (name, server_config) in entries {
-        if servers.contains_key(name) {
+        if let Some(existing) = servers.get(name) {
+            // Only resume the exact approved definition. Never enable a disabled
+            // server or authenticate a concurrently replaced registration.
+            if existing.enabled && existing == server_config {
+                setup.push((name.clone(), existing.clone()));
+            }
             continue;
         }
+        if !server_config.enabled {
+            continue;
+        }
+        setup.push((name.clone(), server_config.clone()));
         servers.insert(name.clone(), server_config.clone());
         added.push((name.clone(), server_config.clone()));
     }
@@ -219,7 +229,7 @@ async fn install_planned_mcp_dependencies(
         }
     }
 
-    for (name, server_config) in &added {
+    for (name, server_config) in &setup {
         let oauth_support = tokio::select! {
             _ = cancellation_token.cancelled() => {
                 return Err("MCP dependency installation was cancelled".to_string());
@@ -235,6 +245,20 @@ async fn install_planned_mcp_dependencies(
                 ));
             }
         };
+        let auth_state = tokio::select! {
+            _ = cancellation_token.cancelled() => return Err("MCP dependency installation was cancelled".to_string()),
+            status = codex_rmcp_client::determine_streamable_http_auth_status(
+                &config.codex_home, name, &oauth_config.url, None,
+                oauth_config.http_headers.clone(), oauth_config.env_http_headers.clone(),
+                config.mcp_oauth_credentials_store_mode, config.auth_keyring_backend_kind(),
+            ) => status.map_err(|error| format!("failed to inspect MCP dependency {name} authentication: {error}"))?,
+        };
+        if matches!(
+            auth_state,
+            codex_rmcp_client::McpAuthState::OAuth | codex_rmcp_client::McpAuthState::BearerToken
+        ) {
+            continue;
+        }
         let resolved_scopes = resolve_oauth_scopes(
             /*explicit_scopes*/ None,
             server_config.scopes.clone(),

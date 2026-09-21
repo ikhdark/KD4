@@ -7,28 +7,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-fn validation_context_schema() -> JsonSchema {
-    let mut schema = JsonSchema::object(
-        BTreeMap::from([(
-            "covered_paths".to_string(),
-            JsonSchema::array(
-                JsonSchema::string(/*description*/ None),
-                Some(
-                    "Non-empty repository-relative scopes attributed to this validation result."
-                        .to_string(),
-                ),
-            ),
-        )]),
-        Some(vec!["covered_paths".to_string()]),
-        Some(false.into()),
-    );
-    schema.description = Some("Optional validation scope metadata.".to_string());
-    schema
-}
-
-const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Shell script to execute in the user's default shell. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, and builtins in script form. On Windows, also keep `.cmd`/`.bat` calls in script form; for complex PowerShell, prefer `kind: \"powershell_script\"`.";
-
-const FORCE_FRESH_DESCRIPTION: &str = "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.";
+const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Shell script to execute in the user's default shell. Prefer this for every command, including pipelines, redirection, shell expansion, compound statements, and builtins.";
 
 fn bounded_integer(description: String, minimum: u64, maximum: u64) -> JsonSchema {
     JsonSchema {
@@ -39,28 +18,15 @@ fn bounded_integer(description: String, minimum: u64, maximum: u64) -> JsonSchem
 }
 
 fn command_parameters_schema(
-    mut properties: BTreeMap<String, JsonSchema>,
+    properties: BTreeMap<String, JsonSchema>,
     script_field: &str,
 ) -> JsonSchema {
-    // The runtime decoder (`CommandInvocation::from_parts`) accepts the
-    // historical untagged script string and infers `argv` or
-    // `powershell_script` from their fields, so the advertised and
-    // preflight-enforced schema must accept that surface. Require a command
-    // field, while leaving conflicting combinations to the decoder's
-    // prescriptive field-level messages.
-    properties.insert(
-        "kind".to_string(),
-        JsonSchema::string_enum(
-            vec![
-                json!("script"),
-                json!("argv"),
-                json!("powershell_script"),
-            ],
-            Some(format!(
-                "Canonical command encoding. `script` explicitly uses `{script_field}`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`. Legacy input remains supported by omitting `kind`; the runtime infers the branch from the single populated command field and normalizes it immediately."
-            )),
-        ),
-    );
+    // The runtime decoder (`CommandInvocation::from_parts`) infers the branch
+    // from whichever command field is populated, so `kind` only ever restates
+    // what the arguments already say. Advertising it made every call carry a
+    // discriminator and a choice the caller does not need to make; the decoder
+    // still accepts it from existing callers. Require a command field, and
+    // leave conflicting combinations to the decoder's field-level messages.
     JsonSchema {
         any_of: Some(
             [script_field, "program", "script_body"]
@@ -116,20 +82,20 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly when `kind` is `argv`.".to_string(),
+                "Executable to launch directly, bypassing the shell. Use only when `cmd` cannot express the command.".to_string(),
             )),
         ),
         (
             "args".to_string(),
             JsonSchema::array(
                 JsonSchema::string(/*description*/ None),
-                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+                Some("Arguments for `program`, excluding the program name.".to_string()),
             ),
         ),
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                "Plain PowerShell script that Codex encodes at runtime. Use only when `cmd` quoting cannot express the script."
                     .to_string(),
             )),
         ),
@@ -162,10 +128,6 @@ pub(crate) fn create_exec_command_tool_for_policy(
                 adaptive_output_budget_description()
             ), 0, usize::MAX as u64),
         ),
-        (
-            "validation".to_string(),
-            validation_context_schema(),
-        ),
     ]);
     if include_shell_parameter {
         properties.insert(
@@ -197,14 +159,10 @@ pub(crate) fn create_exec_command_tool_for_policy(
         options.exec_permission_approvals_enabled,
         allow_escalated_sandbox_permissions,
     ));
-    properties.insert(
-        "force_fresh".to_string(),
-        JsonSchema::boolean(Some(FORCE_FRESH_DESCRIPTION.to_string())),
-    );
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
         description: format!(
-            "Runs a command, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.\n\n{}\n\n{}",
+            "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.\n\n{}\n\n{}",
             rg_search_admission_guidance(),
             filesystem_safety_guidance(),
         ),
@@ -326,20 +284,20 @@ pub(crate) fn create_shell_command_tool_for_policy(
         (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly when `kind` is `argv`.".to_string(),
+                "Executable to launch directly, bypassing the shell. Use only when `cmd` cannot express the command.".to_string(),
             )),
         ),
         (
             "args".to_string(),
             JsonSchema::array(
                 JsonSchema::string(/*description*/ None),
-                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+                Some("Arguments for `program`, excluding the program name.".to_string()),
             ),
         ),
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                "Plain PowerShell script that Codex encodes at runtime. Use only when `cmd` quoting cannot express the script."
                     .to_string(),
             )),
         ),
@@ -366,10 +324,6 @@ pub(crate) fn create_shell_command_tool_for_policy(
                 u64::MAX,
             ),
         ),
-        (
-            "validation".to_string(),
-            validation_context_schema(),
-        ),
     ]);
     if options.allow_login_shell {
         properties.insert(
@@ -384,13 +338,9 @@ pub(crate) fn create_shell_command_tool_for_policy(
         options.exec_permission_approvals_enabled,
         allow_escalated_sandbox_permissions,
     ));
-    properties.insert(
-        "force_fresh".to_string(),
-        JsonSchema::boolean(Some(FORCE_FRESH_DESCRIPTION.to_string())),
-    );
 
     let description = format!(
-        "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Its output budget is policy-controlled; max_output_tokens is not accepted. Use syntax supported by that shell. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics.\n\n{}\n\n{}",
+        "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Its output budget is policy-controlled; max_output_tokens is not accepted. Use syntax supported by that shell.\n\n{}\n\n{}",
         rg_search_admission_guidance(),
         filesystem_safety_guidance(),
     );
@@ -708,7 +658,7 @@ fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
 - Read known files directly. Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. Start unknown-location searches in a likely owning path and expand after a miss. For repository-wide inventories, search the requested scope and preserve the complete matching set; bound displayed evidence without treating truncated results as complete. Exclude the repository's build and dependency output directories when they are outside the requested scope.
 - Search windows locate code. Before editing, read the complete enclosing function, type, or configuration unit and refresh it after intervening writes.
-- Output above the token budget is truncated. For a known source file, request enough `max_output_tokens` to read the needed range in one call."#
+- Output above the tool's output budget is truncated. For a known source file, read a bounded range that fits the tool's advertised output contract."#
 }
 
 #[cfg(test)]

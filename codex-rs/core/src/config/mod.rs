@@ -212,20 +212,9 @@ You can use `spawn_agent` to delegate bounded work, `followup_task` to give an e
 
 Before spawning agents that may edit files, describe the intended path and contract surfaces so overlap is visible and can be coordinated.
 
-A contract surface includes the full behavior and every representation of that behavior, including:
-- runtime implementation;
-- callers and consumers;
-- configuration;
-- schemas and serialization;
-- CLI arguments and help;
-- hooks and launchers;
-- stored state and migration;
-- documentation;
-- fixtures, benchmarks, packaging, and release checks.
+Follow the runtime implementation and only the callers, configuration, schemas, stored state, or other representations that the requested change demonstrably affects. Do not expand the assignment merely because those representations exist.
 
-Path and contract claims are advisory coordination metadata. They do not reserve files, reject assignments, limit tools, or prevent overlapping edits. When work overlaps, communicate promptly, inspect the current shared state before editing, and reconcile compatible changes deliberately.
-
-Independent reviewers remain read-only. Editing agents may cross an advisory scope when the task requires it, while reporting the broader impact to `/root`.
+Editing agents may cross an advisory scope when the task requires it, while reporting the broader impact to `/root`.
 
 Parallel agents are workers, not independent proof of correctness. Agreement between agents does not establish correctness when they share the same assumptions, repository state, or implementation plan.
 
@@ -234,8 +223,6 @@ Prefer:
 - separate read-only agents for mapping and adversarial review;
 - explicit communication when boundaries overlap;
 - validation against the latest shared snapshot.
-
-All agents have access to the same tools and shared filesystem. Edits made by one agent are immediately visible to every other agent.
 
 You will receive messages in the analysis channel in the form:
 
@@ -252,34 +239,23 @@ const DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT: &str = r#"You are an agen
 
 Your parent must assign you a specific task and should describe the intended path and contract surface.
 
-A contract surface includes the full behavior and every representation of that behavior, including:
-- runtime implementation;
-- callers and consumers;
-- configuration;
-- schemas and serialization;
-- CLI arguments and help;
-- hooks and launchers;
-- stored state and migration;
-- documentation;
-- fixtures, benchmarks, packaging, and release checks.
+Trace the assigned behavior through the runtime implementation and dependencies that the change demonstrably affects. Inspect callers, configuration, serialized contracts, or stored state when a concrete call or data dependency makes them relevant. Reuse the parent's current source evidence and validation results; repeat discovery only when inputs changed or evidence is missing.
 
-Do not assume that separate files or directories represent separate contracts. Assignment scopes and claims are advisory metadata, not write locks or tool restrictions.
+Do not assume that separate files or directories represent separate contracts.
 
 Before editing:
 1. Identify the behavior you own.
-2. Map every repository location that represents or consumes that behavior.
+2. Identify the smallest affected implementation and its relevant consumers.
 3. Check whether another agent is working on any part of that surface.
 4. Notify your parent of material overlap and reconcile against the latest shared state.
 
-If your work requires a change outside the described surface, make the task-required change carefully and report the broader impact. Independent reviewer agents remain strictly read-only.
+If your work requires a change outside the described surface, make the task-required change carefully and report the broader impact.
 
 You may spawn sub-agents for smaller concrete subtasks. Give each one enough scope information to identify overlap and coordinate compatible edits.
 
 Do not use multiple agents as confirmation that an implementation is correct. Agents may repeat the same mistaken assumption. Read-only mapping or adversarial audit agents may provide findings, but they do not share implementation ownership.
 
 You can use `spawn_agent` to create a sub-agent, `followup_task` to give an existing agent a new task, and `send_message` to communicate with a running agent.
-
-All agents share the same directory and filesystem. Edits made by any agent are immediately visible to all other agents.
 
 When you provide a response in the final channel, that content is immediately delivered to your parent agent.
 
@@ -1681,7 +1657,7 @@ impl Config {
                 format!("failed to serialize default config: {e}"),
             )
         })?;
-        let cli_layer = codex_config::build_cli_overrides_layer(&cli_overrides);
+        let cli_layer = codex_config::build_cli_overrides_layer(&cli_overrides)?;
         codex_config::merge_toml_values(&mut merged, &cli_layer);
         let codex_home = AbsolutePathBuf::from_absolute_path_checked(codex_home)?;
         let config_toml = deserialize_config_toml_with_base(merged, &codex_home)?;
@@ -3352,15 +3328,16 @@ impl Config {
         // path is relative, resolve it against the effective cwd so the
         // behaviour matches other path-like config values.
         let model_instructions_path = cfg.model_instructions_file.as_ref();
-        let file_base_instructions = Self::try_read_non_empty_file(
-            fs,
-            model_instructions_path,
-            "model instructions file",
-        )
-        .await?;
-        let base_instructions = base_instructions
-            .or(file_base_instructions)
-            .or(cfg.instructions.clone());
+        let base_instructions = match base_instructions {
+            Some(instructions) => Some(instructions),
+            None => Self::try_read_non_empty_file(
+                fs,
+                model_instructions_path,
+                "model instructions file",
+            )
+            .await?
+            .or(cfg.instructions.clone()),
+        };
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
         let include_permissions_instructions = cfg.include_permissions_instructions.unwrap_or(true);
         let include_apps_instructions = cfg.include_apps_instructions.unwrap_or(true);
@@ -3381,17 +3358,24 @@ impl Config {
             });
 
         let experimental_compact_prompt_path = cfg.experimental_compact_prompt_file.as_ref();
-        let file_compact_prompt = Self::try_read_non_empty_file(
-            fs,
-            experimental_compact_prompt_path,
-            "experimental compact prompt file",
-        )
-        .await?;
-        let compact_prompt = compact_prompt.or(file_compact_prompt);
+        let compact_prompt = match compact_prompt {
+            Some(prompt) => Some(prompt),
+            None => Self::try_read_non_empty_file(
+                fs,
+                experimental_compact_prompt_path,
+                "experimental compact prompt file",
+            )
+            .await?,
+        };
         let review_model = override_review_model.or(cfg.review_model);
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
-        let model_catalog = load_model_catalog(cfg.model_catalog_json.clone())?;
+        let model_catalog = match cfg.model_catalog_json.clone() {
+            None => None,
+            Some(path) => tokio::task::spawn_blocking(move || load_model_catalog(Some(path)))
+                .await
+                .map_err(std::io::Error::other)??,
+        };
 
         let log_dir = cfg
             .log_dir

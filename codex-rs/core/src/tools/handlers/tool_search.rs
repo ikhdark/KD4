@@ -916,13 +916,10 @@ impl ToolSearchHandler {
                 "tool search completed"
             );
         }
-        // A result that omitted definitions is a partial answer. Caching it
-        // would keep returning the truncated set for later identical queries,
-        // so the omitted definitions would never be retried. A complete result
-        // is cached even when empty, so an unmatched query is not re-searched.
-        if result.omitted_result_count == 0 {
-            self.cache_search_result(key, &result);
-        }
+        // The inventory and presentation budget are immutable for this handler.
+        // Cache partial receipts as well as complete ones; activation is repeated
+        // for each invocation, so a cache hit cannot suppress capability delivery.
+        self.cache_search_result(key, &result);
         Ok(result)
     }
 
@@ -935,63 +932,70 @@ impl ToolSearchHandler {
         let mut retained = ToolSearchResultBuilder::new();
         let mut activation_tools = Vec::new();
         let mut omitted_result_count = 0usize;
-        let mut retained_result_count = 0usize;
+        let mut selected = HashSet::new();
         for result_id in results {
-            if retained_result_count == limit {
-                break;
-            }
             let result = &result_id.info(&self.search_infos).entry;
             let exact_output_names = exact_query.and_then(|query| {
                 result_id
                     .name_index(&self.name_indexes)
                     .output_names_for(query)
             });
-            let narrowed = exact_output_names.and_then(|names| match &result.output {
-                LoadableToolSpec::Namespace(namespace) => {
-                    Some(LoadableToolSpec::Namespace(ResponsesApiNamespace {
-                        name: namespace.name.clone(),
-                        description: namespace.description.clone(),
-                        tools: namespace
+            // Select callable identities before charging the receipt budget.
+            // A namespace is a container, not one callable.
+            let candidates: Box<dyn Iterator<Item = LoadableToolSpec> + '_> = match &result.output {
+                LoadableToolSpec::Function(_) => {
+                    Box::new(std::iter::once_with(|| result.output.clone()))
+                }
+                LoadableToolSpec::Namespace(namespace) => Box::new(
+                    namespace
+                        .tools
+                        .iter()
+                        .filter(move |tool| {
+                            let ResponsesApiNamespaceTool::Function(tool) = tool;
+                            exact_output_names.is_none_or(|names| names.contains(&tool.name))
+                        })
+                        .map(|tool| {
+                            LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                                name: namespace.name.clone(),
+                                description: namespace.description.clone(),
+                                tools: vec![tool.clone()],
+                            })
+                        }),
+                ),
+            };
+            for candidate in candidates {
+                if selected.len() == limit {
+                    break;
+                }
+                let names = loadable_tool_names(&candidate);
+                if names.iter().all(|name| selected.contains(name)) {
+                    continue;
+                }
+                selected.extend(names.iter().cloned());
+                activation_tools.extend(names);
+                if !retained.try_push(&candidate) {
+                    let local_names = match &candidate {
+                        LoadableToolSpec::Function(tool) => HashSet::from([tool.name.clone()]),
+                        LoadableToolSpec::Namespace(namespace) => namespace
                             .tools
                             .iter()
-                            .filter(|tool| {
+                            .map(|tool| {
                                 let ResponsesApiNamespaceTool::Function(tool) = tool;
-                                names.contains(&tool.name)
+                                tool.name.clone()
                             })
-                            .cloned()
                             .collect(),
-                    }))
-                }
-                LoadableToolSpec::Function(_) => None,
-            });
-            if retained.try_push(narrowed.as_ref().unwrap_or(&result.output)) {
-                retained_result_count += 1;
-            } else if let Some(recovery) = exact_output_names
-                .and_then(|names| compact_exact_match_recovery(&result.output, names))
-            {
-                if !retained.try_push(&recovery) {
-                    activation_tools.extend(loadable_tool_names(&recovery));
-                    omitted_result_count = omitted_result_count.saturating_add(1);
-                } else {
-                    retained_result_count += 1;
-                }
-            } else {
-                // A grouped result can contain both oversized and usable
-                // functions. Retain the definitions that fit, and activate only
-                // those definitions below, while reporting the partial result.
-                if let LoadableToolSpec::Namespace(namespace) = &result.output {
-                    let mut retained_any = false;
-                    for tool in &namespace.tools {
-                        let candidate = LoadableToolSpec::Namespace(ResponsesApiNamespace {
-                            name: namespace.name.clone(),
-                            description: namespace.description.clone(),
-                            tools: vec![tool.clone()],
-                        });
-                        retained_any |= retained.try_push(&candidate);
+                    };
+                    if !compact_exact_match_recovery(&candidate, &local_names)
+                        .is_some_and(|recovery| retained.try_push(&recovery))
+                    {
+                        // The incomplete receipt reports omitted definitions;
+                        // the next request advertises the authoritative contract.
+                        omitted_result_count += 1;
                     }
-                    retained_result_count += usize::from(retained_any);
                 }
-                omitted_result_count = omitted_result_count.saturating_add(1);
+            }
+            if selected.len() == limit {
+                break;
             }
         }
         let (tools, encoded_tools_len) = retained.finish();
@@ -1429,7 +1433,7 @@ mod tests {
             let payload = ToolPayload::ToolSearch {
                 arguments: codex_protocol::models::SearchToolCallParams {
                     query: query.to_string(),
-                    limit: Some(1),
+                    limit: Some(2),
                 },
             };
             let output = handler
@@ -1471,7 +1475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_namespace_member_does_not_hide_or_activate_other_members() {
+    async fn oversized_namespace_member_keeps_rank_and_activates_with_partial_receipt() {
         let mut info = search_info("scheduling mcp__calendar", None, "calendar", "oversized");
         let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
             panic!("expected namespace");
@@ -1485,11 +1489,6 @@ mod tests {
             .tools
             .push(ResponsesApiNamespaceTool::Function(available));
         info.entry.tool_names.push("available".to_string());
-        let mut expected = serde_json::to_value(&info.entry.output).expect("namespace");
-        expected["tools"]
-            .as_array_mut()
-            .expect("functions")
-            .remove(0);
         let handler = ToolSearchHandler::new(vec![info]);
 
         for query in ["scheduling", "mcp__calendar", "scheduling"] {
@@ -1533,7 +1532,7 @@ mod tests {
             else {
                 panic!("expected search response");
             };
-            assert_eq!(tools, vec![expected.clone()], "query: {query}");
+            assert!(tools.is_empty(), "query: {query}");
             assert_eq!(status, "incomplete");
             assert_eq!(omitted_result_count, Some(1));
             assert!(
@@ -1542,7 +1541,7 @@ mod tests {
             );
             assert_eq!(
                 turn.activated_deferred_tools(),
-                [ToolName::namespaced("mcp__calendar", "available")]
+                [ToolName::namespaced("mcp__calendar", "oversized")]
                     .into_iter()
                     .collect(),
             );
@@ -1649,7 +1648,10 @@ mod tests {
             },
         )];
         let turn = Arc::new(turn);
-        let step = session.capture_step_context(Arc::clone(&turn)).await;
+        let step = session
+            .capture_step_context(Arc::clone(&turn))
+            .await
+            .unwrap();
         let cache = Arc::clone(&session.services.tool_search_handler_cache);
         let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2110,7 +2112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_activation_list_is_returned_without_being_cached() {
+    async fn namespace_limit_counts_callables_and_caches_selected_result() {
         let mut info = search_info("calendar", None, "calendar", "create_event");
         let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
             panic!("expected namespace");
@@ -2164,16 +2166,11 @@ mod tests {
         else {
             panic!("expected search output");
         };
-        // The namespace does not fit, so only the definitions that fit are
-        // returned and activated. A partial result must never be cached as if
-        // it were the complete answer.
-        assert!(!tools.is_empty());
+        assert_eq!(tools.len(), 1);
         let activated = turn.activated_deferred_tools();
-        let all_names = names.into_iter().collect::<HashSet<_>>();
-        assert!(!activated.is_empty());
-        assert!(activated.len() < all_names.len());
-        assert!(activated.is_subset(&all_names));
-        assert_eq!(handler.result_cache_len(), 0);
+        assert_eq!(activated.len(), 1);
+        assert!(activated.contains(&names[0]));
+        assert_eq!(handler.result_cache_len(), 1);
     }
 
     #[test]
@@ -2499,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn search_skips_lower_ranked_definitions_that_exceed_the_result_budget() {
+    fn search_compacts_container_descriptions_without_changing_selection() {
         let mut first = search_info("first", None, "first", "run");
         let mut second = search_info("second", None, "second", "run");
         for search_info in [&mut first, &mut second] {
@@ -2515,8 +2512,8 @@ mod tests {
             .search_output_tools(results, None, TOOL_SEARCH_DEFAULT_LIMIT)
             .expect("search results should serialize within the budget");
 
-        assert_eq!(tools.tools.len(), 1);
-        assert_eq!(tools.omitted_result_count, 1);
+        assert_eq!(tools.tools.len(), 2);
+        assert_eq!(tools.omitted_result_count, 0);
         assert!(
             serde_json::to_vec(&tools.tools)
                 .expect("bounded search result should serialize")
@@ -2526,24 +2523,23 @@ mod tests {
     }
 
     #[test]
-    fn search_keeps_later_matches_after_an_oversized_definition() {
+    fn semantic_search_preserves_best_match_when_receipt_requires_compaction() {
         let mut oversized = search_info("capability", None, "oversized", "run");
         let later = search_info("capability extra terms", None, "later", "run");
         let LoadableToolSpec::Namespace(namespace) = &mut oversized.entry.output else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
-        let expected = later.entry.output.clone();
         let handler = ToolSearchHandler::new(vec![oversized, later]);
         let tools = handler
             .search("capability", 1)
             .expect("later search result should fit within the budget");
 
-        assert_eq!(tools.tools, vec![expected]);
-        assert_eq!(tools.omitted_result_count, 1);
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.omitted_result_count, 0);
         assert_eq!(
             tools.activation_tools,
-            vec![ToolName::namespaced("mcp__later", "run")]
+            vec![ToolName::namespaced("mcp__oversized", "run")]
         );
     }
 

@@ -8,15 +8,16 @@ import hashlib
 import json
 import os
 import shlex
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 try:
     from scripts.generated_output_lock import GenerationLockError, generated_output_lock
+    from scripts.process_owner import run_finite
 except ModuleNotFoundError:
     from generated_output_lock import GenerationLockError, generated_output_lock
+    from process_owner import run_finite
 
 
 GENERATED_OUTPUTS = ("codex-rs/app-server-protocol/schema",)
@@ -93,10 +94,19 @@ def repo_root() -> Path:
 def run(args: Sequence[str], *, cwd: Path) -> int:
     print("$ " + shlex.join(str(arg) for arg in args), flush=True)
     try:
-        return subprocess.run(list(args), cwd=cwd).returncode
+        result = run_finite(args, cwd=cwd)
     except OSError as error:
         print(f"Could not run {args[0]}: {error}", file=sys.stderr)
         return 127 if isinstance(error, FileNotFoundError) else 1
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.output_truncated:
+        print("[output truncated; retaining final 65536 bytes]", file=sys.stderr)
+    if result.status == "could_not_start":
+        print(f"Could not run {args[0]}: {result.stdout}", file=sys.stderr)
+    elif result.status not in {"passed", "failed"}:
+        print(f"Command {result.status}: {args[0]}", file=sys.stderr)
+    return result.returncode
 
 
 def hash_file(path: Path) -> str:
@@ -235,28 +245,36 @@ def stable_schema_compatibility_issues(
     return []
 
 
-def load_schema_at_baseline(root: Path, baseline: str) -> object | None:
-    try:
-        completed = subprocess.run(
-            ["git", "show", f"{baseline}:{STABLE_SCHEMA_BUNDLE}"],
-            cwd=root,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-    except OSError as error:
-        print(f"Could not read stable schema at {baseline}: {error}", file=sys.stderr)
-        return None
-    if completed.returncode != 0:
+def resolve_baseline(root: Path, baseline: str) -> str | None:
+    result = run_finite(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{baseline}^{{commit}}"],
+        cwd=root,
+        timeout=30,
+    )
+    if result.returncode or result.output_truncated:
         print(
-            f"Could not read {STABLE_SCHEMA_BUNDLE} at {baseline}.",
+            f"Could not resolve compatibility baseline {baseline!r}: {result.stdout}",
             file=sys.stderr,
         )
-        if completed.stderr:
-            print(completed.stderr, file=sys.stderr, end="")
+        return None
+    commit = result.stdout.strip()
+    print(f"Stable compatibility baseline: {commit}; bundle: {STABLE_SCHEMA_BUNDLE}")
+    return commit
+
+
+def load_schema_at_baseline(root: Path, baseline: str) -> object | None:
+    completed = run_finite(
+        ["git", "show", f"{baseline}:{STABLE_SCHEMA_BUNDLE}"],
+        cwd=root,
+        timeout=30,
+        output_limit=16 * 1024 * 1024,
+    )
+    if completed.returncode or completed.output_truncated:
+        print(
+            f"Could not read complete {STABLE_SCHEMA_BUNDLE} at {baseline}: "
+            f"{completed.status}",
+            file=sys.stderr,
+        )
         return None
     try:
         return json.loads(completed.stdout)
@@ -322,8 +340,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--compatibility-baseline",
-        default="HEAD^",
-        help="Committed schema revision used as the independent stable API baseline.",
+        default=os.environ.get("CODEX_SCHEMA_COMPATIBILITY_BASELINE"),
+        help="Required stable contract revision (or CODEX_SCHEMA_COMPATIBILITY_BASELINE).",
     )
     parser.add_argument(
         "--allow-stable-break",
@@ -341,7 +359,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments forwarded to write_schema_fixtures in force mode.",
     )
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=None,
+        help="Lock wait seconds (check: 60, force: 0; 0 fails immediately).",
+    )
     args = parser.parse_args(argv)
+    if args.lock_timeout is not None and (not 0 <= args.lock_timeout <= 3600):
+        parser.error("--lock-timeout must be between 0 and 3600")
+    lock_timeout = (
+        args.lock_timeout
+        if args.lock_timeout is not None
+        else (60 if args.mode == "check" else 0)
+    )
     generator_args = args.generator_args
     if generator_args[:1] == ["--"]:
         generator_args = generator_args[1:]
@@ -351,10 +382,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("generator arguments are only valid with --mode force")
     if args.mode == "force" and (not args.owner or not args.owner.strip()):
         parser.error("--owner is required with --mode force")
+    stable_lane = "--experimental" not in generator_args
+    baseline = None
+    if stable_lane:
+        if not args.compatibility_baseline or not args.compatibility_baseline.strip():
+            parser.error(
+                "--compatibility-baseline or CODEX_SCHEMA_COMPATIBILITY_BASELINE is required for stable schemas"
+            )
+        baseline = resolve_baseline(root, args.compatibility_baseline)
+        if baseline is None:
+            return 2
     lock_owner = args.owner if args.mode == "force" else f"check:{os.getpid()}"
     generated_changed = False
     try:
-        with generated_output_lock(root, lock_owner):
+        with generated_output_lock(root, lock_owner, timeout=lock_timeout):
             if args.mode == "force":
                 print("Forcing app-server schema regeneration.")
                 if generator_args:
@@ -375,11 +416,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         file=sys.stderr,
                     )
                 return protocol_code
-            stable_lane = "--experimental" not in generator_args
             if stable_lane:
                 compatibility_code = run_stable_compatibility_check(
                     root,
-                    args.compatibility_baseline,
+                    baseline,
                     args.allow_stable_break,
                 )
                 if compatibility_code != 0:

@@ -177,7 +177,16 @@ impl CloudConfigBundleLoadError {
 
 #[derive(Clone)]
 pub struct CloudConfigBundleLoader {
-    fut: Shared<BoxFuture<'static, Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>,
+    state: std::sync::Arc<std::sync::Mutex<BundleLoadState>>,
+    retry_factory: Option<std::sync::Arc<dyn Fn() -> BundleLoadFuture + Send + Sync>>,
+}
+
+type BundleLoadFuture =
+    Shared<BoxFuture<'static, Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>;
+
+struct BundleLoadState {
+    generation: u64,
+    future: Option<BundleLoadFuture>,
 }
 
 impl CloudConfigBundleLoader {
@@ -188,12 +197,76 @@ impl CloudConfigBundleLoader {
             + 'static,
     {
         Self {
-            fut: fut.boxed().shared(),
+            state: std::sync::Arc::new(std::sync::Mutex::new(BundleLoadState {
+                generation: 0,
+                future: Some(fut.boxed().shared()),
+            })),
+            retry_factory: None,
+        }
+    }
+
+    /// Share each bounded fetch attempt and retain successful snapshots. After a
+    /// transient failure, a later caller may start another attempt; this method
+    /// adds no retries inside a configuration load or changes to service budgets.
+    pub fn retryable<F, Fut>(factory: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>
+            + Send
+            + 'static,
+    {
+        let factory: std::sync::Arc<dyn Fn() -> BundleLoadFuture + Send + Sync> =
+            std::sync::Arc::new(move || factory().boxed().shared());
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(BundleLoadState {
+                generation: 0,
+                future: Some(factory()),
+            })),
+            retry_factory: Some(factory),
         }
     }
 
     pub async fn get(&self) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
-        self.fut.clone().await
+        let (generation, future) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let future = state
+                .future
+                .get_or_insert_with(|| {
+                    self.retry_factory
+                        .as_ref()
+                        .expect("only retryable loaders clear failed attempts")(
+                    )
+                })
+                .clone();
+            (state.generation, future)
+        };
+        let result = future.await;
+        let retryable = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| match error.code() {
+                CloudConfigBundleLoadErrorCode::Timeout => true,
+                CloudConfigBundleLoadErrorCode::RequestFailed => {
+                    error.status_code().is_none_or(|status| {
+                        status == 408 || status == 429 || (500..600).contains(&status)
+                    })
+                }
+                _ => false,
+            });
+        if retryable && self.retry_factory.is_some() {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generation == generation {
+                state.generation += 1;
+                state.future = None;
+            }
+        }
+        result
     }
 }
 

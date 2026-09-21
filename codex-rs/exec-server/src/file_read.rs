@@ -6,7 +6,7 @@ use std::sync::Arc;
 use codex_file_system::FILE_READ_CHUNK_SIZE;
 use tokio::sync::Mutex;
 
-const MAX_OPEN_FILE_READS: usize = 128;
+pub(crate) const MAX_OPEN_FILE_READS: usize = 128;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct FileReadBlock {

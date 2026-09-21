@@ -493,22 +493,34 @@ fn accessible_connectors_for_app_list_from_mcp_tools(mcp_tools: &[ToolInfo]) -> 
 }
 
 pub fn with_app_enabled_state(mut connectors: Vec<AppInfo>, config: &Config) -> Vec<AppInfo> {
-    let user_apps_config = apps_config_from_layer_stack(&config.config_layer_stack);
+    let user_apps_config = match apps_config_from_layer_stack(&config.config_layer_stack) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(%error, "disabling app availability because its policy is invalid");
+            for connector in &mut connectors {
+                connector.is_enabled = false;
+            }
+            return connectors;
+        }
+    };
     let requirements_apps_config = config.config_layer_stack.requirements_toml().apps.as_ref();
     if user_apps_config.is_none() && requirements_apps_config.is_none() {
         return connectors;
     }
 
     for connector in &mut connectors {
+        let Some(connector_id) = codex_connectors::canonical_connector_id(&connector.id) else {
+            connector.is_enabled = false;
+            continue;
+        };
         if let Some(apps_config) = user_apps_config.as_ref()
-            && (apps_config.default.is_some()
-                || apps_config.apps.contains_key(connector.id.as_str()))
+            && (apps_config.default.is_some() || apps_config.apps.contains_key(connector_id))
         {
-            connector.is_enabled = app_is_enabled(apps_config, Some(connector.id.as_str()));
+            connector.is_enabled = app_is_enabled(apps_config, Some(connector_id));
         }
 
         if requirements_apps_config
-            .and_then(|apps| apps.apps.get(connector.id.as_str()))
+            .and_then(|apps| apps.apps.get(connector_id))
             .is_some_and(|app| app.enabled == Some(false))
         {
             connector.is_enabled = false;

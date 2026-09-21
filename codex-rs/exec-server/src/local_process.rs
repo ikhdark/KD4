@@ -87,6 +87,7 @@ struct RunningProcess {
     accepted_stdin_write_ids: Arc<Mutex<AcceptedStdinWriteIds>>,
     output: VecDeque<RetainedOutputChunk>,
     retained_bytes: usize,
+    last_evicted_seq: u64,
     next_seq: u64,
     exit_code: Option<i32>,
     wake_tx: watch::Sender<u64>,
@@ -94,6 +95,7 @@ struct RunningProcess {
     output_notify: Arc<Notify>,
     open_streams: usize,
     closed: bool,
+    finalizing: bool,
     metrics: Option<ProcessMetricGuard>,
     termination_requested: bool,
     sandbox: SandboxType,
@@ -364,6 +366,7 @@ impl LocalProcess {
                     ),
                     output: VecDeque::new(),
                     retained_bytes: 0,
+                    last_evicted_seq: 0,
                     next_seq: 1,
                     exit_code: None,
                     wake_tx: wake_tx.clone(),
@@ -371,6 +374,7 @@ impl LocalProcess {
                     output_notify: Arc::clone(&output_notify),
                     open_streams: 2,
                     closed: false,
+                    finalizing: false,
                     metrics: Some(self.inner.telemetry.process_started()),
                     termination_requested: false,
                     sandbox,
@@ -471,7 +475,10 @@ impl LocalProcess {
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
                         closed: process.closed,
-                        failure: None,
+                        failure: (after_seq < process.last_evicted_seq).then(|| format!(
+                            "process output was evicted through sequence {}; requested after {}",
+                            process.last_evicted_seq, after_seq
+                        )),
                         sandbox_denied: process.sandbox_denied,
                     },
                     // Register before releasing the state lock: notify_waiters does
@@ -870,6 +877,7 @@ async fn stream_output(
                 let Some(evicted) = process.output.pop_front() else {
                     break;
                 };
+                process.last_evicted_seq = evicted.seq;
                 process.retained_bytes = process.retained_bytes.saturating_sub(evicted.chunk.len());
             }
             let _ = process.wake_tx.send(seq);
@@ -906,11 +914,10 @@ async fn watch_exit(
     output_notify: Arc<Notify>,
 ) {
     let exit_code = exit_rx.await.unwrap_or(-1);
-    let (output_pending, tty) = {
+    let tty = {
         let mut processes = inner.processes.lock().await;
         match processes.get_mut(&process_id) {
             Some(ProcessEntry::Running(process)) => {
-                let sandboxed = process.sandbox != SandboxType::None;
                 if let Some(metrics) = process.metrics.take() {
                     metrics.finish(if process.termination_requested {
                         "terminated"
@@ -920,13 +927,9 @@ async fn watch_exit(
                         "error"
                     });
                 }
-                (
-                    (sandboxed && process.open_streams != 0)
-                        .then(|| Arc::clone(&output_notify).notified_owned()),
-                    process.tty,
-                )
+                process.tty
             }
-            Some(ProcessEntry::Starting(_)) | None => (None, false),
+            Some(ProcessEntry::Starting(_)) | None => false,
         }
     };
     if tty {
@@ -935,50 +938,23 @@ async fn watch_exit(
             process.session.release_pty_after_exit();
         }
     }
-    if let Some(output_pending) = output_pending {
-        let _ = tokio::time::timeout(Duration::from_millis(20), output_pending).await;
-    }
     let notification = {
         let mut processes = inner.processes.lock().await;
         if let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) {
             let seq = process.next_seq;
             process.next_seq += 1;
             process.exit_code = Some(exit_code);
-            if process.sandbox != SandboxType::None {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                let mut aggregated = Vec::new();
-                for chunk in &process.output {
-                    match chunk.stream {
-                        ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                            stdout.extend_from_slice(&chunk.chunk);
-                        }
-                        ExecOutputStream::Stderr => stderr.extend_from_slice(&chunk.chunk),
-                    }
-                    aggregated.extend_from_slice(&chunk.chunk);
-                }
-                let exec_output = ExecToolCallOutput {
-                    exit_code,
-                    stdout: StreamOutput::new(String::from_utf8_lossy(&stdout).into_owned()),
-                    stderr: StreamOutput::new(String::from_utf8_lossy(&stderr).into_owned()),
-                    aggregated_output: StreamOutput::new(
-                        String::from_utf8_lossy(&aggregated).into_owned(),
-                    ),
-                    ..Default::default()
-                };
-                process.sandbox_denied = is_likely_sandbox_denied(process.sandbox, &exec_output);
-            }
             let _ = process.wake_tx.send(seq);
             process.events.publish(ExecProcessEvent::Exited {
                 seq,
                 exit_code,
-                sandbox_denied: Some(process.sandbox_denied),
+                sandbox_denied: (process.sandbox == SandboxType::None).then_some(false),
             });
             Some(ExecExitedNotification {
                 process_id: process_id.clone(),
                 seq,
                 exit_code,
-                sandbox_denied: Some(process.sandbox_denied),
+                sandbox_denied: (process.sandbox == SandboxType::None).then_some(false),
             })
         } else {
             None
@@ -1012,25 +988,80 @@ async fn finish_output_stream(process_id: ProcessId, inner: Arc<Inner>) {
 }
 
 async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
+    let (sandbox, exit_code, output, identity, complete_output) = {
+        let mut processes = inner.processes.lock().await;
+        let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
+            return;
+        };
+        if process.closed || process.finalizing || process.open_streams != 0 {
+            return;
+        }
+        let Some(exit_code) = process.exit_code else {
+            return;
+        };
+        process.finalizing = true;
+        (
+            process.sandbox,
+            exit_code,
+            process.output.clone(),
+            Arc::clone(&process.output_notify),
+            process.last_evicted_seq == 0,
+        )
+    };
+    // Output-dependent classification belongs after both streams drain, outside
+    // the process-map mutex used by unrelated reads and process controls.
+    let assessment = if sandbox == SandboxType::None {
+        Some(false)
+    } else {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut aggregated = Vec::new();
+        for chunk in output {
+            match chunk.stream {
+                ExecOutputStream::Stdout | ExecOutputStream::Pty => {
+                    stdout.extend_from_slice(&chunk.chunk)
+                }
+                ExecOutputStream::Stderr => stderr.extend_from_slice(&chunk.chunk),
+            }
+            aggregated.extend_from_slice(&chunk.chunk);
+        }
+        let denied = is_likely_sandbox_denied(
+            sandbox,
+            &ExecToolCallOutput {
+                exit_code,
+                stdout: StreamOutput::new(String::from_utf8_lossy(&stdout).into_owned()),
+                stderr: StreamOutput::new(String::from_utf8_lossy(&stderr).into_owned()),
+                aggregated_output: StreamOutput::new(
+                    String::from_utf8_lossy(&aggregated).into_owned(),
+                ),
+                ..Default::default()
+            },
+        );
+        (denied || complete_output).then_some(denied)
+    };
     let (notification, output_notify) = {
         let mut processes = inner.processes.lock().await;
         let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
             return;
         };
 
-        if process.closed || process.open_streams != 0 || process.exit_code.is_none() {
+        if process.closed || !Arc::ptr_eq(&process.output_notify, &identity) {
             return;
         }
-
+        process.sandbox_denied = assessment.unwrap_or(false);
         process.closed = true;
         let seq = process.next_seq;
         process.next_seq += 1;
         let _ = process.wake_tx.send(seq);
-        process.events.publish(ExecProcessEvent::Closed { seq });
+        process.events.publish(ExecProcessEvent::Closed {
+            seq,
+            sandbox_denied: assessment,
+        });
         (
             ExecClosedNotification {
                 process_id: process_id.clone(),
                 seq,
+                sandbox_denied: assessment,
             },
             Arc::clone(&process.output_notify),
         )
@@ -1631,6 +1662,104 @@ mod tests {
         backend.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn evicted_output_is_reported_only_to_cursors_missing_bytes() {
+        let backend = LocalProcess::default();
+        let mut process = spawn_test_process(&backend, "retention-loss").await;
+        process
+            .stdout_tx
+            .send(vec![b'x'; RETAINED_OUTPUT_BYTES_PER_PROCESS])
+            .await
+            .unwrap();
+        read_process_until_change(&backend, &process.process_id, None).await;
+        process.stdout_tx.send(b"tail".to_vec()).await.unwrap();
+        let tail = read_process_until_change(&backend, &process.process_id, Some(1)).await;
+        assert_eq!(tail.chunks[0].chunk.0, b"tail");
+        assert_eq!(tail.failure, None);
+        let lost = backend
+            .exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: Some(0),
+                max_bytes: None,
+                wait_ms: Some(0),
+            })
+            .await
+            .unwrap();
+        assert!(lost.failure.unwrap().contains("evicted through sequence 1"));
+        process.exit(0);
+        drop(process);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sandbox_assessment_waits_for_late_stderr_after_prompt_exit() {
+        let backend = LocalProcess::default();
+        let mut process = spawn_test_process(&backend, "late-sandbox-diagnostic").await;
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap()
+            else {
+                panic!("running");
+            };
+            running.sandbox = SandboxType::WindowsRestrictedToken;
+        }
+        let mut events = {
+            let processes = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(running) = processes.get(&process.process_id).unwrap() else {
+                panic!("running");
+            };
+            running.events.subscribe()
+        };
+        process.exit(1);
+        let event = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            ExecProcessEvent::Exited {
+                sandbox_denied: None,
+                ..
+            }
+        ));
+        process
+            .stdout_tx
+            .send(b"early stdout".to_vec())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        process
+            .stderr_tx
+            .send(b"Access is denied.".to_vec())
+            .await
+            .unwrap();
+        let id = process.process_id.clone();
+        drop(process);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let ExecProcessEvent::Closed { sandbox_denied, .. } =
+                    events.recv().await.unwrap()
+                {
+                    assert_eq!(sandbox_denied, Some(true));
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let read = backend
+            .exec_read(ReadParams {
+                process_id: id,
+                after_seq: None,
+                max_bytes: None,
+                wait_ms: None,
+            })
+            .await
+            .unwrap();
+        assert!(read.closed && read.sandbox_denied);
+        backend.shutdown().await;
+    }
+
     struct TestProcess {
         process_id: ProcessId,
         stdout_tx: mpsc::Sender<Vec<u8>>,
@@ -1670,6 +1799,7 @@ mod tests {
                 accepted_stdin_write_ids: Arc::new(Mutex::new(AcceptedStdinWriteIds::default())),
                 output: VecDeque::new(),
                 retained_bytes: 0,
+                last_evicted_seq: 0,
                 next_seq: 1,
                 exit_code: None,
                 wake_tx: wake_tx.clone(),
@@ -1677,6 +1807,7 @@ mod tests {
                 output_notify: Arc::clone(&output_notify),
                 open_streams: 2,
                 closed: false,
+                finalizing: false,
                 metrics: Some(backend.inner.telemetry.process_started()),
                 termination_requested: false,
                 sandbox: SandboxType::None,

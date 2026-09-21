@@ -42,11 +42,9 @@ class BuildToolingStorageTest(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch.object(
-                    rust_build_status, "maintain_cargo_lanes"
+                    rust_build_status, "request_cargo_lane_maintenance"
                 ) as maintain,
-                mock.patch.object(
-                    rust_build_status.subprocess, "run", side_effect=child
-                ),
+                mock.patch.object(rust_build_status, "run_owned", side_effect=child),
                 mock.patch.object(
                     rust_build_status.time,
                     "perf_counter_ns",
@@ -109,7 +107,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                     "reserve_cargo_lane",
                     side_effect=RuntimeError("busy"),
                 ),
-                mock.patch.object(rust_build_status.subprocess, "run") as child,
+                mock.patch.object(rust_build_status, "run_owned") as child,
                 mock.patch.object(
                     rust_build_status.time,
                     "perf_counter_ns",
@@ -149,7 +147,7 @@ class BuildToolingStorageTest(unittest.TestCase):
             self.assertIsNone(record["exitCode"])
             # Reusing the path must preserve earlier evidence and prevent a build.
             with (
-                mock.patch.object(rust_build_status.subprocess, "run") as child,
+                mock.patch.object(rust_build_status, "run_owned") as child,
                 contextlib.redirect_stderr(io.StringIO()),
             ):
                 self.assertEqual(
@@ -210,7 +208,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                 )
                 with (
                     mock.patch.dict(os.environ, env, clear=True),
-                    mock.patch.object(rust_build_status.subprocess, "run") as child,
+                    mock.patch.object(rust_build_status, "run_owned") as child,
                     contextlib.redirect_stderr(io.StringIO()),
                 ):
                     arguments = ["run-lane", "--repo-root", str(repo), "--lane", "unit"]
@@ -354,6 +352,7 @@ class BuildToolingStorageTest(unittest.TestCase):
             self.assertIsNotNone(lock)
             with (
                 lock,
+                mock.patch.dict(os.environ, {"CODEX_CARGO_LANE_MAINTENANCE_SYNC": "1"}),
                 mock.patch.object(rust_build_status, "prune_stale_lanes") as prune,
             ):
                 result = rust_build_status.run_in_cargo_lane(
@@ -431,6 +430,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                 "p=pathlib.Path(sys.argv[2]); p.mkdir(); os.utime(p,(1,1)); sys.exit(7)"
             )
             with (
+                mock.patch.dict(os.environ, {"CODEX_CARGO_LANE_MAINTENANCE_SYNC": "1"}),
                 mock.patch.object(
                     rust_build_status, "active_rust_processes", return_value=[]
                 ),
@@ -736,7 +736,9 @@ class BuildToolingStorageTest(unittest.TestCase):
 
     def test_run_lane_directly_launches_known_nextest_recipe_with_argv(self) -> None:
         target = Path("C:/target path/lane")
-        maintenance = mock.patch.object(rust_build_status, "maintain_cargo_lanes")
+        maintenance = mock.patch.object(
+            rust_build_status, "request_cargo_lane_maintenance"
+        )
         maintenance.start()
         self.addCleanup(maintenance.stop)
         command = [
@@ -759,8 +761,8 @@ class BuildToolingStorageTest(unittest.TestCase):
                 return_value=None,
             ),
             mock.patch.object(
-                rust_build_status.subprocess,
-                "run",
+                rust_build_status,
+                "run_owned",
                 return_value=completed,
             ) as run,
         ):
@@ -820,9 +822,9 @@ class BuildToolingStorageTest(unittest.TestCase):
                             ("unit", Path("C:/target/lane"))
                         ),
                     ),
-                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                    mock.patch.object(rust_build_status, "run_owned") as run,
                     mock.patch.object(
-                        rust_build_status, "maintain_cargo_lanes"
+                        rust_build_status, "request_cargo_lane_maintenance"
                     ) as maintain,
                     self.assertRaises(ValueError),
                 ):
@@ -901,12 +903,12 @@ class BuildToolingStorageTest(unittest.TestCase):
                 with (
                     self.subTest(selection=selection),
                     mock.patch.object(
-                        rust_build_status, "maintain_cargo_lanes"
+                        rust_build_status, "request_cargo_lane_maintenance"
                     ) as maintain,
                     mock.patch.object(
                         rust_build_status.shutil, "which", return_value=None
                     ),
-                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                    mock.patch.object(rust_build_status, "run_owned") as run,
                 ):
                     run.return_value.returncode = 0
                     self.assertEqual(
@@ -942,11 +944,13 @@ class BuildToolingStorageTest(unittest.TestCase):
             ):
                 with (
                     self.subTest(selection=selection),
-                    mock.patch.object(rust_build_status, "maintain_cargo_lanes"),
+                    mock.patch.object(
+                        rust_build_status, "request_cargo_lane_maintenance"
+                    ),
                     mock.patch.object(
                         rust_build_status.shutil, "which", return_value=None
                     ),
-                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                    mock.patch.object(rust_build_status, "run_owned") as run,
                 ):
                     run.return_value.returncode = 0
                     self.assertEqual(
@@ -1007,8 +1011,10 @@ class BuildToolingStorageTest(unittest.TestCase):
             for arguments, expected, profile in cases:
                 with (
                     self.subTest(arguments=arguments),
-                    mock.patch.object(rust_build_status, "maintain_cargo_lanes"),
-                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                    mock.patch.object(
+                        rust_build_status, "request_cargo_lane_maintenance"
+                    ),
+                    mock.patch.object(rust_build_status, "run_owned") as run,
                 ):
 
                     def child(command, *, env, check):
@@ -1638,7 +1644,7 @@ class BuildToolingStorageTest(unittest.TestCase):
             remove_tree.assert_not_called()
             self.assertTrue(stray.exists())
 
-    def test_prune_stale_lanes_keeps_two_lowest_ranked_warm_lanes_per_base(
+    def test_prune_stale_lanes_keeps_two_most_recent_warm_lanes_per_base(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1661,10 +1667,10 @@ class BuildToolingStorageTest(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual([path.name for path in removed], ["codex-core-3"])
-            self.assertFalse(newest.exists())
+            self.assertEqual([path.name for path in removed], ["codex-core"])
+            self.assertTrue(newest.exists())
             self.assertTrue(middle.exists())
-            self.assertTrue(oldest.exists())
+            self.assertFalse(oldest.exists())
 
     def test_prune_stale_lanes_removes_timestamped_lanes_even_with_warm_budget(
         self,
@@ -1734,6 +1740,8 @@ class BuildToolingStorageTest(unittest.TestCase):
                 processes=[],
                 keep_warm_per_base=1,
                 max_lane_bytes=1,
+                lane_mtime=lambda _path: 1.0,
+                now_timestamp=1.0,
                 lane_size=lane_size,
             )
 

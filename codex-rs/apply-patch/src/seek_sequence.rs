@@ -7,7 +7,7 @@
 /// and must still begin at or after `start`.
 ///
 /// Special cases handled defensively:
-///  • Empty `pattern` → returns `Some(start)` (no-op match)
+///  • Empty `pattern` → matches at `start` (or EOF), unless `start` is past EOF
 ///  • `pattern.len() > lines.len()` → returns `None` (cannot match, avoids
 ///    out‑of‑bounds panic that occurred pre‑2025‑04‑12)
 pub(crate) fn seek_sequence(
@@ -17,7 +17,7 @@ pub(crate) fn seek_sequence(
     eof: bool,
 ) -> Result<Option<usize>, AmbiguousMatch> {
     if pattern.is_empty() {
-        return Ok(Some(start));
+        return Ok((start <= lines.len()).then_some(if eof { lines.len() } else { start }));
     }
 
     // When the pattern is longer than the available input there is no possible

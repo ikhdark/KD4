@@ -1,0 +1,34 @@
+{
+  "attachment": "New Text Document (26).txt",
+  "distinctTests": 304,
+  "passed": 303,
+  "skipped": 1,
+  "failedRemaining": 0,
+  "lintPassed": [
+    "process_owner.py",
+    "format.py",
+    "app_server_schema_runtime_check.py",
+    "config_schema_check.py",
+    "generated_output_lock.py",
+    "check_kd4_features.py"
+  ],
+  "broaderLint": "Unrelated style findings retained; see logs and verification document.",
+  "sources": {
+    "scripts/app_server_schema_runtime_check.py": "3f081b45694af5ee3e6a21d3326764892d332580db8d8b5b7680ce6332125375",
+    "scripts/config_schema_check.py": "d0ed4692d39d89221520b1149ff1ec6b95dd64a3963c732cb8fb6543bc620148",
+    "scripts/generated_output_lock.py": "e4a87cbef4d0cdd2a8320204919e4d186f284397cfb7b343d19f112fa645003c",
+    "scripts/format.py": "8d927316f4d0d62d28bbebf7ff73e5e7acecd0c71692ecd6931ca6fb9edbf68d",
+    "scripts/process_owner.py": "5409f2993cb4838b8072bcc694c3fbda467fafeefb7b1296b7979d6079797ca1",
+    "scripts/check_kd4_features.py": "8a2ac3998aeb64d703f83b1541cac815a567b9a764c148d8eed119c113f90312",
+    "scripts/common-rust-env.ps1": "4a8d3ac0eb51d924f8cbacc98849a7547e40edd8c4b6e13f29f84b0c47d5f7b8",
+    "scripts/cargo-lane.ps1": "4d92b4f863caad8497290e7395779871d71670089d3fce36f97014b1b2383b19",
+    "scripts/cargo-lane-trash-cleanup.ps1": "cc92d6dceed146fce850e01356c075df52839641350c8c8f477e6ef72a62ef55",
+    "scripts/rust_build_status.py": "06fa21335882f37a6c23aae00d3c1830f6ae601bc8e99bafd92728ae8718ff44",
+    "scripts/test_cargo_lane.py": "10ebf05bdc18aa059a647fae457a51def9f4fa803d8e6139173761e5108712a1",
+    "scripts/test_report_script_regressions.py": "7733365230c3facbc2b3c8cc945d6ea5ca3e6e87c3557fbbb7d561976caede38",
+    "scripts/test_build_tooling.py": "de5785bb070696a015e21d5bdb7102e53e9f9d0f0437198de4bf1de20973a436",
+    "scripts/test_dev_environment.py": "3062d119b506c3c90c58888306ea1ad628d7a4295416a4eb1c4a80711ad00193",
+    "scripts/test_check_kd4_features.py": "3c157f1e1db7c863cb9dea33c5bf03886546aa539ddec78543b6880f6bdf7913",
+    "scripts/test_build_tooling_storage.py": "835cf205df260fde8d3c7ab1c8cf6eacb3667fc7c73d9c919a62a88b4420b7ba"
+  }
+}

@@ -161,27 +161,30 @@ async fn process_sse_with_metadata(
 
         received_events = received_events.saturating_add(1);
         received_payload_bytes = received_payload_bytes.saturating_add(sse.data.len());
-        trace!(event = %sse.event, payload_bytes = sse.data.len(), "SSE event");
+        let event_name = sse.event.chars().take(128).collect::<String>();
+        trace!(event = %event_name, payload_bytes = sse.data.len(), "SSE event");
 
         let events = match interpreter.process_payload(&sse.data) {
             Ok(events) => {
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_event(&sse.event, start.elapsed(), None);
+                    t.on_sse_event(&event_name, start.elapsed(), None);
                 }
                 events
             }
             Err(ResponsesEventError::Parse(error)) => {
-                if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
-                }
-                debug!(event = %sse.event, payload_bytes = sse.data.len(), %error, "Failed to parse SSE event");
-                let event_name = sse.event.chars().take(128).collect::<String>();
-                let _ = tx_event
-                    .send(Err(ApiError::Stream(format!(
-                        "failed to parse SSE event {event_name:?} ({} payload bytes): {error}",
+                let diagnostic = crate::responses_stream::decode_diagnostic(
+                    &format!(
+                        "failed to parse SSE event {event_name:?} ({} payload bytes)",
                         sse.data.len()
-                    ))))
-                    .await;
+                    ),
+                    &error,
+                );
+                let safe_error = ApiError::Stream(diagnostic);
+                if let Some((t, start)) = telemetry.as_ref().zip(start) {
+                    t.on_sse_event(&event_name, start.elapsed(), Some(&safe_error));
+                }
+                debug!(event = %event_name, payload_bytes = sse.data.len(), error = %safe_error, "Failed to parse SSE event");
+                let _ = tx_event.send(Err(safe_error)).await;
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::ProtocolError, start.elapsed());
                 }
@@ -189,7 +192,7 @@ async fn process_sse_with_metadata(
             }
             Err(ResponsesEventError::Api(error)) => {
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
+                    t.on_sse_event(&event_name, start.elapsed(), Some(&error));
                 }
                 let _ = tx_event.send(Err(error)).await;
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
@@ -441,7 +444,7 @@ mod tests {
                     if case == "malformed json" {
                         assert!(message.contains("SSE event \"response.output_item.done\""));
                         assert!(message.contains(&format!("({} payload bytes)", payload.len())));
-                        assert!(message.contains("EOF while parsing an object at line 1 column"));
+                        assert!(message.contains("Eof at line 1 column"));
                     }
                 }
                 other => panic!("unexpected event for {case}: {other:?}"),

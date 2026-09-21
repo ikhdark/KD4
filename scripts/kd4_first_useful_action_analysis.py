@@ -177,6 +177,7 @@ def analyze_records(
     }
     legacy_rows: list[dict[str, float]] = []
     canonical_rows: list[dict[str, float]] = []
+    independent_rows: list[dict[str, float]] = []
     snapshot_metadata: list[dict[str, str | int]] = []
     completed_turns = 0
     record_count = 0
@@ -230,6 +231,20 @@ def analyze_records(
             completed_turns += 1
             timing = payload.get("timing")
             milestones = canonical_milestones(timing)
+            if (
+                isinstance(timing, dict)
+                and type(timing.get("schemaVersion")) is int
+                and timing["schemaVersion"] >= CANONICAL_TIMING_SCHEMA_VERSION
+            ):
+                independent_rows.append(
+                    {
+                        key: value
+                        for key, value in (timing.get("milestones") or {}).items()
+                        if type(value) in (int, float)
+                        and math.isfinite(value)
+                        and value >= 0
+                    }
+                )
             schema_version = (
                 timing.get("schemaVersion") if isinstance(timing, dict) else None
             )
@@ -351,7 +366,7 @@ def analyze_records(
         ("startToFirstAgentMessageMs", "firstAgentMessageMs"),
     ):
         canonical_metrics[metric] = _summary(
-            row[key] for row in canonical_rows if key in row
+            row[key] for row in independent_rows if key in row
         )
     for metrics in (canonical_metrics, legacy_metrics):
         for summary in metrics.values():

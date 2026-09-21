@@ -83,6 +83,7 @@ async fn reports_cell_actor_panics_to_the_owner() {
     assert_eq!(
         started.initial_event().await,
         Ok(CellEvent::Completed {
+            output_loss: None,
             content_items: vec![OutputItem::Text {
                 text: "done".to_string(),
             }],
@@ -107,6 +108,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
         cell_permit: Mutex::new(None),
     };
     let completion = CellEvent::Completed {
+        output_loss: None,
         content_items: vec![OutputItem::Text {
             text: "uncommitted output".to_string(),
         }],
@@ -163,6 +165,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     assert_eq!(
         reader.initial_event().await,
         Ok(CellEvent::Completed {
+            output_loss: None,
             content_items: vec![OutputItem::Text {
                 text: "undefined".to_string(),
             }],
@@ -194,6 +197,7 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
         host.commit_completion(
             writes,
             CellEvent::Completed {
+                output_loss: None,
                 content_items: Vec::new(),
                 error_text: None,
             },
@@ -300,6 +304,7 @@ async fn ninth_cell_is_rejected_until_a_terminal_cell_releases_its_permit() {
     assert_eq!(
         next.initial_event().await,
         Ok(CellEvent::Completed {
+            output_loss: None,
             content_items: vec![OutputItem::Text {
                 text: "true".to_string()
             }],

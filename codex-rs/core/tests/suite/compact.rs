@@ -333,7 +333,7 @@ fn user_texts_without_task_model_guidance(request: &responses::ResponsesRequest)
 
 fn expected_instruction_fragment(contents: &str) -> String {
     format!(
-        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
     )
 }
 
@@ -5097,7 +5097,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
     let replacement_fragment = format!(
-        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}\n</INSTRUCTIONS>"
     );
     assert_eq!(
         instruction_fragments(&requests[3]),

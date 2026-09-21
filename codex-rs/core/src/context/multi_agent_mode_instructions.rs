@@ -4,7 +4,6 @@ use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 
 const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
-const ROOT_ORCHESTRATION_TEXT: &str = include_str!("../../templates/agents/root_orchestration.md");
 
 #[cfg(test)]
 mod tests {
@@ -13,38 +12,6 @@ mod tests {
     use super::MultiAgentModeInstructions;
     use crate::context::ContextualUserFragment;
     use codex_protocol::config_types::MultiAgentMode;
-
-    #[test]
-    fn root_orchestration_renders_only_the_bounded_runtime_policy() {
-        let fragment = super::RootOrchestrationInstructions;
-        let rendered = fragment.render();
-        assert_eq!(fragment.role(), "developer");
-        assert!(
-            rendered.starts_with(
-                "<root_orchestration_instructions>When several independent tool calls"
-            )
-        );
-        assert!(rendered.contains("Do not run shared-state mutations concurrently."));
-        assert!(rendered.contains("query ownership when it resolves a task uncertainty"));
-        assert!(rendered.contains("Fix affected callers"));
-        assert!(rendered.contains("Reuse passing validation"));
-        assert!(rendered.contains("Use owner-required checks"));
-        assert!(!rendered.contains("before broad inventory"));
-        assert!(
-            rendered
-                .contains("Continue yielded commands through their existing wait or session path")
-        );
-        assert!(
-            rendered
-                .ends_with("scope clippy to changed packages.</root_orchestration_instructions>")
-        );
-        assert!(!rendered.contains("<!--"));
-        assert!(
-            rendered.len() <= 1_200,
-            "runtime policy grew to {} bytes",
-            rendered.len()
-        );
-    }
 
     #[test]
     fn effective_modes_only_persist_and_render_current_policies() {
@@ -80,30 +47,6 @@ impl EffectiveMultiAgentMode {
             Self::Custom(hint_text) => MultiAgentMode::Custom(hint_text.clone()),
             Self::ExplicitRequestOnly => MultiAgentMode::ExplicitRequestOnly,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RootOrchestrationInstructions;
-
-impl ContextualUserFragment for RootOrchestrationInstructions {
-    fn role(&self) -> &'static str {
-        "developer"
-    }
-
-    fn markers(&self) -> (&'static str, &'static str) {
-        Self::type_markers()
-    }
-
-    fn type_markers() -> (&'static str, &'static str) {
-        (
-            "<root_orchestration_instructions>",
-            "</root_orchestration_instructions>",
-        )
-    }
-
-    fn body(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Borrowed(ROOT_ORCHESTRATION_TEXT.trim())
     }
 }
 

@@ -828,8 +828,8 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     let env_text = env_contexts[0];
     let expected_cwd = new_cwd.path().display().to_string();
     assert_env_context_location(env_text, &expected_cwd);
-    assert!(!env_text.contains("<current_date>"));
-    assert!(!env_text.contains("<timezone>"));
+    assert!(env_text.contains("<current_date>"));
+    assert!(env_text.contains("<timezone>"));
     let second_user_texts = message_texts(&body2, "user");
     assert!(second_user_texts.contains(&"hello 1"));
     assert!(second_user_texts.contains(&"hello 2"));

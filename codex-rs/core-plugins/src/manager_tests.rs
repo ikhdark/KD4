@@ -5706,6 +5706,21 @@ plugins = true
     )];
     let loaded_plugins = manager.plugins_for_config(&config).await;
 
+    assert_eq!(
+        manager.cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+            plugins_config: &config,
+            loaded_plugins: &loaded_plugins,
+            auth: Some(&auth),
+            disabled_tools: &disabled_tools,
+            app_server_client_name: None,
+        }),
+        None
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "ordinary preparation must not fetch a cold advisory catalog"
+    );
+
     let candidates = manager
         .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
             plugins_config: &config,
@@ -5727,6 +5742,27 @@ plugins = true
             mcp_server_names: Vec::new(),
             app_connector_ids: Vec::new(),
         })])
+    );
+    assert_eq!(
+        manager.cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+            plugins_config: &config,
+            loaded_plugins: &loaded_plugins,
+            auth: Some(&auth),
+            disabled_tools: &disabled_tools,
+            app_server_client_name: None,
+        }),
+        candidates
+    );
+    manager.clear_recommended_plugins_cache();
+    assert_eq!(
+        manager.cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+            plugins_config: &config,
+            loaded_plugins: &loaded_plugins,
+            auth: Some(&auth),
+            disabled_tools: &disabled_tools,
+            app_server_client_name: None,
+        }),
+        None
     );
 }
 

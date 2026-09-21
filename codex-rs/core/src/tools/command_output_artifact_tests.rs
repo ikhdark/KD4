@@ -849,10 +849,23 @@ async fn aggregate_recovery_reserves_space_for_later_ranges_and_returns_continua
     assert!(!omitted.child_selectors.is_empty());
     assert_eq!(
         omitted.continuation.as_ref(),
-        omitted.child_selectors.first(),
-        "aggregate overflow must advertise the first deterministic byte child",
+        selectors.get(2),
+        "an undelivered selector must resume at that selector, not its next page",
     );
     assert!(response_fits_recovery_ceiling(&recovered));
+
+    let resumed = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![omitted.continuation.clone().expect("omitted continuation")],
+    )
+    .await
+    .expect("recover the previously omitted selector");
+    assert!(resumed.complete);
+    assert_eq!(resumed.results.len(), 1);
+    assert_eq!(resumed.results[0].status, ToolOutputSelectorStatus::Ok);
+    assert_eq!(resumed.results[0].text, Some(format!("{line}\n")));
 }
 
 #[tokio::test]
@@ -3894,4 +3907,41 @@ async fn remint_protection_failure_cleans_target_and_preserves_source_for_retry(
         tokio::fs::read(&marker).await.expect("retry valid marker"),
         ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
     );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn audit_search_oversized_context_delivers_coordinates_without_skipping_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let content = format!("needle{}\nneedle short\n", "x".repeat(100_000));
+    let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &content).await;
+    let selector = ToolOutputSelector::Search {
+        query: "needle".into(),
+        start_byte: 0,
+        max_results: 20,
+        context_lines: 0,
+    };
+    let first = search_logical_artifact(&metadata, &snapshot, selector, 1024);
+    assert_eq!(first.status, ToolOutputSelectorStatus::Ok);
+    assert_eq!(first.value.as_ref().unwrap()["matches_returned"], 1);
+    assert_eq!(first.value.as_ref().unwrap()["matches"][0]["start_byte"], 0);
+    assert!(
+        first.value.as_ref().unwrap()["hydrated_ranges"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!first.child_selectors.is_empty());
+    let second = search_logical_artifact(
+        &metadata,
+        &snapshot,
+        first.continuation.clone().unwrap(),
+        1024,
+    );
+    assert_eq!(second.value.as_ref().unwrap()["matches_returned"], 1);
+    assert_eq!(
+        second.value.as_ref().unwrap()["matches"][0]["start_byte"],
+        100_007
+    );
+    assert!(second.complete);
 }

@@ -117,41 +117,92 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
             '"' | '`' => true,
             _ => false,
         });
-    if clause.is_empty() || clause.contains('?') || contains_quote {
+    if clause.is_empty() || contains_quote {
         return None;
     }
     let normalized = clause.strip_prefix("please ").unwrap_or(&clause).trim();
+    // Only direct requests are permission directives. Incidental discussion of
+    // delegation (including negated explanations) must never grant authority.
+    let normalized = normalized
+        .strip_prefix("can you ")
+        .or_else(|| normalized.strip_prefix("could you "))
+        .or_else(|| normalized.strip_prefix("would you "))
+        .unwrap_or(normalized);
+    let normalized = normalized.trim_end_matches('?');
     let (denied, body) = if let Some(body) = normalized
         .strip_prefix("do not ")
         .or_else(|| normalized.strip_prefix("don't "))
         .or_else(|| normalized.strip_prefix("dont "))
         .or_else(|| normalized.strip_prefix("never "))
+        .or_else(|| normalized.strip_prefix("i do not want you to "))
+        .or_else(|| normalized.strip_prefix("i don't want you to "))
     {
         (true, body)
     } else {
         (false, normalized)
     };
-    let agent_target = body.contains("agent")
-        || body.contains("sub-agent")
-        || body.contains("subagent")
-        || body.contains("child")
-        || body.contains("delegat");
-    if !agent_target {
-        return None;
-    }
-    let explicit_action = body.starts_with("spawn ")
-        || body.starts_with("use ")
-        || body.starts_with("delegate ")
-        || body.starts_with("parallelize ")
-        || body.starts_with("parallelise ")
-        || body.starts_with("work with ")
-        || body.contains(" spawn ")
-        || body.contains(" delegate ")
-        || body.contains("use subagent")
-        || body.contains("use sub-agent")
-        || body.contains("use agent")
-        || body.contains("use multi-agent")
-        || body.contains("use multi agent");
+    let target = [
+        "spawn ",
+        "use ",
+        "work with ",
+        "parallelize with ",
+        "parallelise with ",
+    ]
+    .into_iter()
+    .find_map(|prefix| body.strip_prefix(prefix));
+    let agent_target = target.is_some_and(|target| {
+        let mut words = target.split_whitespace();
+        let noun = words.find(|word| {
+            !matches!(
+                *word,
+                "a" | "an"
+                    | "the"
+                    | "one"
+                    | "two"
+                    | "three"
+                    | "another"
+                    | "first"
+                    | "second"
+                    | "multiple"
+                    | "several"
+                    | "some"
+                    | "parallel"
+            ) && !word.chars().all(|c| c.is_ascii_digit())
+        });
+        if matches!(noun, Some("child" | "children"))
+            && matches!(words.next(), Some("process" | "processes"))
+        {
+            return false;
+        }
+        matches!(
+            noun,
+            Some(
+                "agent"
+                    | "agents"
+                    | "subagent"
+                    | "subagents"
+                    | "sub-agent"
+                    | "sub-agents"
+                    | "child"
+                    | "children"
+            )
+        )
+    });
+    let explicit_action = agent_target
+        || [
+            "delegate this work to agents",
+            "delegate to agents",
+            "delegate this task to agents",
+            "delegate work to agents",
+            "delegate to subagents",
+        ]
+        .into_iter()
+        .any(|directive| {
+            body == directive
+                || body
+                    .strip_prefix(directive)
+                    .is_some_and(|tail| tail.starts_with(' '))
+        });
     explicit_action.then_some(if denied {
         SpawnAuthorizationDirective::Deny
     } else {
@@ -175,6 +226,7 @@ mod tests {
             "Delegate this work to agents",
             "Parallelize with multiple agents",
             "Use subagents to inspect the user's code",
+            "Can you use subagents?",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),
@@ -189,6 +241,11 @@ mod tests {
         for request in [
             "Audit multi-agent spawning behavior",
             "Explain how spawn authorization works",
+            "Explain why we should not use agents",
+            "Use regex to explain why not use agents",
+            "Use agents.md to document the policy",
+            "Spawn a process that checks agent configuration",
+            "I want an explanation of when to use subagents",
             "Find checks that affect agents",
             "'Use subagents'",
             "\"Use subagents\"",
@@ -205,11 +262,26 @@ mod tests {
     }
 
     #[test]
+    fn child_process_requests_do_not_authorize_agents() {
+        for request in [
+            "Spawn a child process",
+            "Use child processes to run the build",
+        ] {
+            assert_eq!(
+                parse_spawn_authorization_directive(request),
+                None,
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_denial_revokes_spawn_authority() {
         for request in [
             "Do not use subagents for this task",
             "Don't use subagents for this task",
             "Please don't use subagents for the user's task",
+            "I do not want you to use subagents",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),

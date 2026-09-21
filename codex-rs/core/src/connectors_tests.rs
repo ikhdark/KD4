@@ -511,3 +511,12 @@ apps = true
         ))]
     );
 }
+
+#[tokio::test]
+async fn padded_connector_availability_respects_disabled_policy() {
+    let mut config = crate::config::test_config().await;
+    let path = codex_config::AbsolutePathBuf::try_from(std::env::temp_dir().join("config.toml")).unwrap();
+    config.config_layer_stack = config.config_layer_stack.with_user_config(&path, serde_json::from_value(serde_json::json!({"apps": {"calendar": {"enabled": false}}})).unwrap()).into();
+    let result = with_app_enabled_state(vec![app(" calendar ")], &config);
+    assert!(!result[0].is_enabled);
+}

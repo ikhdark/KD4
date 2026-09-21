@@ -42,8 +42,19 @@ pub(crate) enum RuntimeCommand {
     ToolError { id: String, error_text: String },
     NotificationResponse { id: String },
     NotificationError { id: String, error_text: String },
-    TimeoutFired { id: u64 },
+    TimersReady,
+    #[cfg(test)]
+    InspectForTest { response: tokio::sync::oneshot::Sender<RuntimeInspection> },
     Terminate,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct RuntimeInspection {
+    heap_bytes: usize,
+    completion_collections: usize,
+    stored_payload_address: usize,
+    rust_conversion_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -69,6 +80,7 @@ pub(crate) enum RuntimeEvent {
     Result {
         stored_value_writes: HashMap<String, JsonValue>,
         error_text: Option<String>,
+        output_loss: Option<codex_code_mode_protocol::OutputLoss>,
     },
     ThreadPanicked,
 }
@@ -82,6 +94,7 @@ pub(crate) struct OutputAdmission {
 struct OutputAdmissionState {
     admitted_bytes: usize,
     overflow_reported: bool,
+    output_loss: codex_code_mode_protocol::OutputLoss,
 }
 
 impl OutputAdmission {
@@ -90,6 +103,7 @@ impl OutputAdmission {
             state: Mutex::new(OutputAdmissionState {
                 admitted_bytes: 0,
                 overflow_reported: false,
+                output_loss: codex_code_mode_protocol::OutputLoss::default(),
             }),
             max_bytes,
             yield_pending: AtomicBool::new(false),
@@ -124,6 +138,12 @@ impl OutputAdmission {
             });
         }
 
+        Self::record_loss(&mut state, admitted_bytes.saturating_sub(std::mem::size_of::<FunctionCallOutputContentItem>()))
+    }
+
+    fn record_loss(state: &mut OutputAdmissionState, bytes: usize) -> Option<RuntimeEvent> {
+        state.output_loss.discarded_items = state.output_loss.discarded_items.saturating_add(1);
+        state.output_loss.discarded_bytes_lower_bound = state.output_loss.discarded_bytes_lower_bound.saturating_add(bytes as u64);
         if !state.overflow_reported {
             state.overflow_reported = true;
             return Some(RuntimeEvent::ContentItem {
@@ -134,6 +154,18 @@ impl OutputAdmission {
             });
         }
         None
+    }
+
+    pub(super) fn reject_before_conversion(&self, bytes: usize) -> Option<Option<RuntimeEvent>> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let required = bytes.saturating_add(std::mem::size_of::<FunctionCallOutputContentItem>());
+        if required <= self.max_bytes.saturating_sub(state.admitted_bytes) { return None; }
+        Some(Self::record_loss(&mut state, bytes))
+    }
+
+    fn output_loss(&self) -> Option<codex_code_mode_protocol::OutputLoss> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.output_loss.discarded_items > 0).then(|| state.output_loss.clone())
     }
 
     pub(crate) fn release(&self, released_bytes: usize) {
@@ -187,7 +219,7 @@ pub(crate) async fn spawn_runtime(
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     output_admission: Arc<OutputAdmission>,
     task_failure_handler: Option<TaskFailureHandler>,
-) -> Result<(std_mpsc::Sender<RuntimeCommand>, v8::IsolateHandle), String> {
+) -> Result<(std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle), String> {
     let (command_tx, command_rx) = std_mpsc::channel();
     let runtime_command_tx = command_tx.clone();
     let (isolate_handle_tx, isolate_handle_rx) = tokio::sync::oneshot::channel();
@@ -251,23 +283,34 @@ pub(crate) async fn spawn_runtime(
 
 // If startup times out or its caller is cancelled after the runtime sends a handle,
 // dropping the unclaimed message must stop user code on that runtime thread.
-struct StartupIsolateHandle(Option<v8::IsolateHandle>);
+struct StartupIsolateHandle(Option<RuntimeTerminationHandle>);
+
+pub(crate) struct RuntimeTerminationHandle {
+    isolate: v8::IsolateHandle,
+    command_tx: std_mpsc::Sender<RuntimeCommand>,
+}
+
+impl RuntimeTerminationHandle {
+    pub(crate) fn terminate_execution(&self) -> bool {
+        let terminated = self.isolate.terminate_execution();
+        let _ = self.command_tx.send(RuntimeCommand::Terminate);
+        terminated
+    }
+}
 
 impl StartupIsolateHandle {
     #[expect(
         clippy::expect_used,
         reason = "the private startup handle is consumed exactly once"
     )]
-    fn into_inner(mut self) -> v8::IsolateHandle {
+    fn into_inner(mut self) -> RuntimeTerminationHandle {
         self.0.take().expect("startup isolate handle")
     }
 }
 
-impl Drop for StartupIsolateHandle {
+impl Drop for RuntimeTerminationHandle {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.terminate_execution();
-        }
+        self.terminate_execution();
     }
 }
 
@@ -359,11 +402,17 @@ pub(super) struct RuntimeState {
     pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_notifications: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
+    unhandled_rejections: Vec<v8::Global<v8::Promise>>,
+    rejection_tracking_overflow: bool,
     stored_values: HashMap<String, JsonValue>,
     stored_value_bytes: HashMap<String, usize>,
     total_stored_value_bytes: usize,
     stored_value_writes: HashMap<String, JsonValue>,
     stored_value_limit_error: Option<String>,
+    #[cfg(test)]
+    completion_collections: usize,
+    #[cfg(test)]
+    rust_conversion_bytes: usize,
     enabled_tools: Arc<EnabledToolCatalog>,
     next_tool_call_id: u64,
     next_notification_id: u64,
@@ -447,10 +496,12 @@ impl RuntimeState {
         }
     }
 
-    pub(super) fn stored_value_completion(&self) -> (HashMap<String, JsonValue>, Option<String>) {
+    pub(super) fn stored_value_completion(&mut self) -> (HashMap<String, JsonValue>, Option<String>) {
+        #[cfg(test)]
+        { self.completion_collections += 1; }
         match self.stored_value_limit_error.as_ref() {
             Some(error) => (HashMap::new(), Some(error.clone())),
-            None => (self.stored_value_writes.clone(), None),
+            None => (std::mem::take(&mut self.stored_value_writes), None),
         }
     }
 }
@@ -476,12 +527,16 @@ fn run_runtime(
     let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
     let isolate_handle = isolate.thread_safe_handle();
     if isolate_handle_tx
-        .send(Ok(StartupIsolateHandle(Some(isolate_handle))))
+        .send(Ok(StartupIsolateHandle(Some(RuntimeTerminationHandle {
+            isolate: isolate_handle,
+            command_tx: runtime_command_tx.clone(),
+        }))))
         .is_err()
     {
         return;
     }
     isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import_callback);
+    isolate.set_promise_reject_callback(module_loader::promise_rejected);
 
     v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
@@ -501,11 +556,17 @@ fn run_runtime(
         pending_tool_calls: HashMap::new(),
         pending_notifications: HashMap::new(),
         pending_timeouts: HashMap::new(),
+        unhandled_rejections: Vec::new(),
+        rejection_tracking_overflow: false,
         stored_values: config.stored_values,
         stored_value_bytes,
         total_stored_value_bytes,
         stored_value_writes: HashMap::new(),
         stored_value_limit_error: None,
+        #[cfg(test)]
+        completion_collections: 0,
+        #[cfg(test)]
+        rust_conversion_bytes: 0,
         enabled_tools: config.enabled_tools,
         next_tool_call_id: 1,
         next_notification_id: 1,
@@ -518,13 +579,16 @@ fn run_runtime(
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
-        send_result(&event_tx, HashMap::new(), Some(error_text));
+        send_result(scope, &event_tx, HashMap::new(), Some(error_text));
         return;
     }
 
     let _ = event_tx.send(RuntimeEvent::Started);
 
-    let pending_promise = match module_loader::evaluate_main_module(scope, &config.source) {
+    let pending_promise = match {
+        v8::scope!(let scope, scope);
+        module_loader::evaluate_main_module(scope, &config.source)
+    } {
         Ok(pending_promise) => pending_promise,
         Err(error_text) => {
             capture_scope_send_error(scope, &event_tx, Some(error_text));
@@ -537,7 +601,7 @@ fn run_runtime(
             stored_value_writes,
             error_text,
         } => {
-            send_result(&event_tx, stored_value_writes, error_text);
+            send_result(scope, &event_tx, stored_value_writes, error_text);
             return;
         }
         CompletionState::Pending => {}
@@ -545,8 +609,22 @@ fn run_runtime(
 
     let mut pending_promise = pending_promise;
     while let Ok(command) = command_rx.recv() {
+        v8::scope!(let scope, scope);
         match command {
             RuntimeCommand::Terminate => break,
+            #[cfg(test)]
+            RuntimeCommand::InspectForTest { response } => {
+                scope.low_memory_notification();
+                let heap_bytes = scope.get_heap_statistics().used_heap_size();
+                let state = scope.get_slot::<RuntimeState>().unwrap();
+                let _ = response.send(RuntimeInspection {
+                    heap_bytes,
+                    completion_collections: state.completion_collections,
+                    rust_conversion_bytes: state.rust_conversion_bytes,
+                    stored_payload_address: state.stored_value_writes.get("payload")
+                        .and_then(JsonValue::as_str).map(|value| value.as_ptr() as usize).unwrap_or(0),
+                });
+            }
             RuntimeCommand::ToolResponse { id, result } => {
                 if let Err(error_text) =
                     module_loader::resolve_tool_response(scope, &id, Ok(result))
@@ -579,17 +657,22 @@ fn run_runtime(
                     return;
                 }
             }
-            RuntimeCommand::TimeoutFired { id } => {
-                match timers::invoke_timeout_callback(scope, id) {
-                    Ok(ControlFlow::Continue(())) => {}
-                    Ok(ControlFlow::Break(())) => {
-                        capture_scope_send_error(scope, &event_tx, None);
-                        return;
+            RuntimeCommand::TimersReady => {
+                let fired = scope.get_slot::<RuntimeState>()
+                    .map(|state| state.timer_scheduler.take_fired()).unwrap_or_default();
+                for id in fired {
+                    match timers::invoke_timeout_callback(scope, id) {
+                        Ok(ControlFlow::Continue(())) => {}
+                        Ok(ControlFlow::Break(())) => {
+                            capture_scope_send_error(scope, &event_tx, None);
+                            return;
+                        }
+                        Err(runtime_error) => {
+                            capture_scope_send_error(scope, &event_tx, Some(runtime_error));
+                            return;
+                        }
                     }
-                    Err(runtime_error) => {
-                        capture_scope_send_error(scope, &event_tx, Some(runtime_error));
-                        return;
-                    }
+                    scope.perform_microtask_checkpoint();
                 }
             }
         }
@@ -600,7 +683,7 @@ fn run_runtime(
                 stored_value_writes,
                 error_text,
             } => {
-                send_result(&event_tx, stored_value_writes, error_text);
+                send_result(scope, &event_tx, stored_value_writes, error_text);
                 return;
             }
             CompletionState::Pending => {}
@@ -621,11 +704,12 @@ fn capture_scope_send_error(
     error_text: Option<String>,
 ) {
     let (stored_value_writes, stored_value_limit_error) = scope
-        .get_slot::<RuntimeState>()
+        .get_slot_mut::<RuntimeState>()
         .map(RuntimeState::stored_value_completion)
         .unwrap_or_default();
 
     send_result(
+        scope,
         event_tx,
         stored_value_writes,
         stored_value_limit_error.or(error_text),
@@ -633,12 +717,14 @@ fn capture_scope_send_error(
 }
 
 fn send_result(
+    scope: &v8::PinScope<'_, '_>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     stored_value_writes: HashMap<String, JsonValue>,
     error_text: Option<String>,
 ) {
     let _ = event_tx.send(RuntimeEvent::Result {
         stored_value_writes,
+        output_loss: scope.get_slot::<RuntimeState>().and_then(|state| state.output_admission.output_loss()),
         error_text: error_text.map(|mut text| {
             if text.len() > MAX_ERROR_TEXT_BYTES {
                 let mut end = MAX_ERROR_TEXT_BYTES - ERROR_TRUNCATION_SUFFIX.len();
@@ -949,8 +1035,11 @@ mod tests {
                         overflow_count += 1;
                     }
                 }
-                RuntimeEvent::Result { error_text, .. } => {
+                RuntimeEvent::Result { error_text, output_loss, .. } => {
                     assert_eq!(error_text, None);
+                    let loss = output_loss.expect("discarded output must be reported structurally");
+                    assert_eq!(loss.discarded_items, (1_000 - (content_count - overflow_count)) as u64);
+                    assert_eq!(loss.discarded_bytes_lower_bound, loss.discarded_items * 32);
                     break;
                 }
                 RuntimeEvent::Started => {}
@@ -995,3 +1084,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod regression_tests;

@@ -4,11 +4,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import tempfile
 import uuid
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextvars import ContextVar
+from scripts.process_owner import OwnedThreadPoolExecutor as ThreadPoolExecutor
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from time import perf_counter
 
@@ -17,6 +19,8 @@ from .archive import package_entries
 from .archive import resolve_zstd_command
 from .archive import validate_archive_output
 from .archive import write_archive
+from scripts.stage_npm_archives import exclusive_file_lock
+from .cargo import package_build_lease
 from .cargo import SourceBuildOutputs
 from .cargo import build_source_binaries
 from .cargo import cargo_package_target_dir
@@ -33,6 +37,7 @@ from .layout import validate_package_input_roles
 from .layout import sha256_file
 from .ripgrep import resolve_rg_bin
 from .targets import PACKAGE_VARIANTS
+from .targets import REPO_ROOT
 from .targets import SUPPORTED_TARGETS
 from .targets import SUPPORTED_VARIANTS
 from .targets import TARGET_SPECS
@@ -217,65 +222,168 @@ def main() -> int:
     )
     validate_cli_request(args, spec, package_dir)
 
-    timings = getattr(args, "timings", False)
-    with timed_step("inputs", timings):
-        version, inputs = resolve_package_inputs(args, spec, variant)
-        validate_package_input_roles(inputs)
-    reuse_package_dir = getattr(args, "reuse_package_dir", False)
-    with staged_package_destination(
-        package_dir, reuse_existing=reuse_package_dir, force=args.force
-    ) as staged_package_dir:
-        with timed_step("package-dir", timings):
-            prepare_package_dir(
-                staged_package_dir,
-                force=True,
-                reuse=reuse_package_dir,
-            )
-            build_identity = {
-                "packagingSource": source_tree_fingerprint(),
-            }
-            build_package_dir(
-                staged_package_dir,
-                version,
-                variant,
-                spec,
-                inputs,
-                build_identity=build_identity,
-            )
-        if not getattr(args, "skip_validate", False):
-            with timed_step("validate", timings):
-                validate_package_dir(
+    output_paths = [package_dir, *(path.resolve() for path in args.archive_output)]
+    if release_dir is not None:
+        output_paths += [
+            release_dir.resolve() / f"codex-package_{spec.target}_PROVENANCE.json",
+            release_dir.resolve() / "codex-package_SHA256SUMS",
+        ]
+    with (
+        publication_transaction(output_paths),
+        package_build_lease(spec, args.cargo_profile),
+    ):
+        timings = getattr(args, "timings", False)
+        with timed_step("inputs", timings):
+            version, inputs = resolve_package_inputs(args, spec, variant)
+            validate_package_input_roles(inputs)
+        reuse_package_dir = getattr(args, "reuse_package_dir", False)
+        with staged_package_destination(
+            package_dir, reuse_existing=reuse_package_dir, force=args.force
+        ) as staged_package_dir:
+            with timed_step("package-dir", timings):
+                prepare_package_dir(
                     staged_package_dir,
+                    force=True,
+                    reuse=reuse_package_dir,
+                )
+                build_identity = {
+                    "packagingSource": source_tree_fingerprint(),
+                }
+                build_package_dir(
+                    staged_package_dir,
+                    version,
                     variant,
                     spec,
-                    expected_version=version,
+                    inputs,
+                    build_identity=build_identity,
+                )
+            if not getattr(args, "skip_validate", False):
+                with timed_step("validate", timings):
+                    validate_package_dir(
+                        staged_package_dir,
+                        variant,
+                        spec,
+                        expected_version=version,
+                    )
+
+            archive_entries = None
+            if args.archive_output:
+                with timed_step("archive-entries", timings):
+                    archive_entries = package_entries(staged_package_dir)
+            archive_paths = [output.resolve() for output in args.archive_output]
+            if archive_paths:
+                with timed_step("archives", timings):
+                    write_archives_atomically(
+                        staged_package_dir,
+                        archive_paths,
+                        force=args.force,
+                        entries=archive_entries,
+                        compression=getattr(args, "archive_compression", "default"),
+                    )
+            for archive_path in archive_paths:
+                print(f"Built Codex package archive at {archive_path}")
+            if release_dir is not None:
+                write_release_manifests(
+                    release_dir.resolve(),
+                    staged_package_dir,
+                    [
+                        path
+                        for path in archive_paths
+                        if path.parent == release_dir.resolve()
+                    ],
                 )
 
-    archive_entries = None
-    if args.archive_output:
-        with timed_step("archive-entries", timings):
-            archive_entries = package_entries(package_dir)
-    archive_paths = [output.resolve() for output in args.archive_output]
-    if archive_paths:
-        with timed_step("archives", timings):
-            write_archives_atomically(
-                package_dir,
-                archive_paths,
-                force=args.force,
-                entries=archive_entries,
-                compression=getattr(args, "archive_compression", "default"),
-            )
-    for archive_path in archive_paths:
-        print(f"Built Codex package archive at {archive_path}")
-    if release_dir is not None:
-        write_release_manifests(
-            release_dir.resolve(),
-            package_dir,
-            [path for path in archive_paths if path.parent == release_dir.resolve()],
-        )
+        print(f"Built Codex package directory at {package_dir}")
+        return 0
 
-    print(f"Built Codex package directory at {package_dir}")
-    return 0
+
+def pe_machine_for_target(spec):
+    return 0xAA64 if spec.target.startswith("aarch64") else 0x8664
+
+
+
+_publication = ContextVar("package_publication", default=None)
+
+
+def _remove_output(path):
+    if path.is_dir() and not path.is_symlink():
+        remove_tree_allow_readonly(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+class Publication:
+    def __init__(self, paths):
+        self.paths = set(paths)
+        self.backups = {}
+
+    def activate(self, source, destination, *, force):
+        destination = destination.resolve()
+        if destination not in self.paths or destination in self.backups:
+            raise RuntimeError(f"unexpected publication destination: {destination}")
+        backup = None
+        if destination.exists():
+            if not force and not (
+                destination.is_dir() and not any(destination.iterdir())
+            ):
+                raise RuntimeError(f"output already exists: {destination}")
+            backup = destination.with_name(
+                f".{destination.name}.backup-{uuid.uuid4().hex}"
+            )
+        # Register before mutation, including an interrupt between rename and activation.
+        self.backups[destination] = backup
+        if backup is not None:
+            destination.replace(backup)
+        if source.is_dir():
+            source.rename(destination)
+        else:
+            activate_archive(source, destination, force=force)
+
+    def rollback(self):
+        for destination, backup in reversed(list(self.backups.items())):
+            if backup is None:
+                _remove_output(destination)
+            elif backup.exists():
+                _remove_output(destination)
+                backup.replace(destination)
+            # A missing backup means the original rename never completed.
+
+    def discard_backups(self):
+        for backup in self.backups.values():
+            if backup is not None and backup.exists():
+                try:
+                    _remove_output(backup)
+                except OSError as error:
+                    print(
+                        f"warning: committed output backup retained at {backup}: {error}"
+                    )
+
+
+@contextmanager
+def publication_transaction(paths):
+    paths = sorted(set(path.resolve() for path in paths), key=str)
+    current = _publication.get()
+    if current is not None:
+        if not set(paths).issubset(current.paths):
+            raise RuntimeError("nested publication must use the owned output set")
+        yield current
+        return
+    with ExitStack() as stack:
+        for path in paths:
+            stack.enter_context(
+                exclusive_file_lock(path.with_name("." + path.name + ".publish.lock"))
+            )
+        current = Publication(paths)
+        token = _publication.set(current)
+        try:
+            yield current
+        except BaseException:
+            current.rollback()
+            raise
+        else:
+            current.discard_backups()
+        finally:
+            _publication.reset(token)
 
 
 @contextmanager
@@ -294,6 +402,12 @@ def staged_package_destination(
         yield staged_dir
 
         validate_package_dir_destination(package_dir, force=force, reuse=reuse_existing)
+        if _publication.get() is not None:
+            _publication.get().activate(
+                staged_dir, package_dir, force=force or reuse_existing
+            )
+            committed = True
+            return
         if not (force or reuse_existing):
             # rmdir fails if another writer populated the previously empty directory.
             if package_dir.exists():
@@ -340,6 +454,7 @@ def write_archives_atomically(
     compression: str,
 ) -> None:
     """Generate every archive before replacing any requested destination."""
+    encoded = {}
     staged: list[tuple[Path, Path, Path]] = []
     backups: list[tuple[Path, Path]] = []
     activated: list[tuple[Path, Path]] = []
@@ -353,14 +468,26 @@ def write_archives_atomically(
             )
             staged_path = staging_root / archive_path.name
             staged.append((archive_path, staged_path, staging_root))
-            write_archive(
-                package_dir,
-                staged_path,
-                force=True,
-                entries=entries,
-                compression=compression,
+            _, _, kind = validate_archive_output(
+                package_dir, staged_path, force=True, compression=compression
             )
+            key = (kind, compression)
+            if key in encoded:
+                shutil.copyfile(encoded[key], staged_path)
+            else:
+                write_archive(
+                    package_dir,
+                    staged_path,
+                    force=True,
+                    entries=entries,
+                    compression=compression,
+                )
+                encoded[key] = staged_path
 
+        if _publication.get() is not None:
+            for archive_path, staged_path, _ in staged:
+                _publication.get().activate(staged_path, archive_path, force=force)
+            return
         for archive_path, staged_path, _ in staged:
             if archive_path.exists():
                 if not force:
@@ -408,14 +535,22 @@ def resolve_package_inputs(
     version = getattr(args, "release_version", None) or read_workspace_version()
     # Validate explicit local inputs before starting the expensive source build.
     rg_bin = resolve_rg_bin(spec, args.rg_bin) if args.rg_bin is not None else None
+    if rg_bin is not None:
+        from .layout import pe_machine
+
+        machine = pe_machine(rg_bin)
+        if machine is not None and machine != pe_machine_for_target(spec):
+            raise RuntimeError(
+                "ripgrep executable architecture does not match package target"
+            )
     with ThreadPoolExecutor(max_workers=2) as executor:
-        source_outputs_future = executor.submit(
-            resolve_source_outputs, args, spec, variant
-        )
+        # Copy context includes the held build lease; the owner waits for every
+        # worker to stop before releasing it or removing staging files.
+        source_future = executor.submit(resolve_source_outputs, args, spec, variant)
         rg_future = (
             executor.submit(resolve_rg_bin, spec, None) if rg_bin is None else None
         )
-        source_outputs = source_outputs_future.result()
+        source_outputs = source_future.result()
         if rg_future is not None:
             rg_bin = rg_future.result()
     return (
@@ -494,6 +629,14 @@ def validate_cli_request(
         raise RuntimeError("Distributable archives require --release-version")
     if (
         getattr(args, "archive_output", [])
+        and spec.target != default_target()
+        and getattr(args, "entrypoint_bin", None) is not None
+    ):
+        raise RuntimeError(
+            "Cross-target prebuilt entrypoints have no verifiable release-version evidence; build the distributable from source"
+        )
+    if (
+        getattr(args, "archive_output", [])
         and getattr(args, "cargo_profile", "release") != "release"
     ):
         raise RuntimeError("Distributable archives require --cargo-profile release")
@@ -514,6 +657,9 @@ def validate_cli_request(
         needs_zstd |= archive_format == "tar.zst"
     if needs_zstd:
         resolve_zstd_command()
+    for name in ("LICENSE", "NOTICE"):
+        if not (REPO_ROOT / name).is_file():
+            raise RuntimeError(f"Required package input is missing: {name}")
 
 
 def resolve_source_outputs(
@@ -572,7 +718,19 @@ def resolve_source_outputs(
     )
 
 
-def write_release_manifests(
+def write_release_manifests(release_dir, package_dir, archive_paths):
+    metadata = json.loads(
+        (package_dir / "codex-package.json").read_text(encoding="utf-8")
+    )
+    paths = [
+        release_dir / "codex-package_SHA256SUMS",
+        release_dir / f"codex-package_{metadata['target']}_PROVENANCE.json",
+    ]
+    with publication_transaction(paths):
+        _write_release_manifests(release_dir, package_dir, archive_paths)
+
+
+def _write_release_manifests(
     release_dir: Path, package_dir: Path, archive_paths: list[Path]
 ) -> None:
     release_dir.mkdir(parents=True, exist_ok=True)
@@ -622,7 +780,10 @@ def write_text_atomically(path: Path, contents: str) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(contents, encoding="utf-8", newline="\n")
-        os.replace(temporary, path)
+        if _publication.get() is not None:
+            _publication.get().activate(temporary, path, force=True)
+        else:
+            os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 

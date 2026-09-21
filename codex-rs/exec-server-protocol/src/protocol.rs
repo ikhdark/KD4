@@ -38,6 +38,8 @@ pub const FS_REMOVE_METHOD: &str = "fs/remove";
 pub const FS_COPY_METHOD: &str = "fs/copy";
 /// JSON-RPC request method for executor-side HTTP requests.
 pub const HTTP_REQUEST_METHOD: &str = "http/request";
+/// Idempotently abandon a streaming body; older peers return method-not-found.
+pub const HTTP_REQUEST_CANCEL_METHOD: &str = "http/request/cancel";
 /// JSON-RPC notification method for streamed executor HTTP response bodies.
 pub const HTTP_REQUEST_BODY_DELTA_METHOD: &str = "http/request/bodyDelta";
 
@@ -193,6 +195,8 @@ pub struct ReadResponse {
     pub closed: bool,
     pub failure: Option<String>,
     /// Whether the executor classified the process failure as a sandbox denial.
+    /// A false value while output is still open is provisional. A failed read
+    /// does not establish a complete negative assessment of discarded output.
     #[serde(default)]
     pub sandbox_denied: bool,
 }
@@ -476,6 +480,12 @@ pub struct HttpRequestParams {
     pub stream_response: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpRequestCancelParams {
+    pub request_id: String,
+}
+
 /// HTTP response envelope returned from an executor `http/request` call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -543,6 +553,9 @@ pub struct ExecExitedNotification {
 pub struct ExecClosedNotification {
     pub process_id: ProcessId,
     pub seq: u64,
+    /// Final output assessment; absent when diagnostics were incomplete or the peer is legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_denied: Option<bool>,
 }
 
 mod base64_bytes {

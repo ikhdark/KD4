@@ -17,7 +17,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::info;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::ExecServerError;
@@ -29,7 +28,6 @@ use crate::connection::WEBSOCKET_KEEPALIVE_INTERVAL;
 use crate::noise_channel::InitiatorHandshake;
 use crate::noise_channel::NoiseChannelIdentity;
 use crate::noise_channel::NoiseChannelPublicKey;
-use crate::noise_channel::NoiseTransport;
 use crate::noise_channel::noise_channel_prologue;
 use crate::noise_relay::message_framing::JsonRpcMessageDecoder;
 use crate::noise_relay::message_framing::NOISE_RECORD_PLAINTEXT_LEN;
@@ -39,7 +37,6 @@ use crate::noise_relay::take_next_sequence;
 use crate::relay::RelayFrameBodyKind;
 use crate::relay::decode_relay_message_frame;
 use crate::relay::encode_relay_message_frame;
-use crate::relay_proto::RelayData;
 use crate::relay_proto::RelayMessageFrame;
 use crate::websocket_pong_watchdog::WEBSOCKET_PONG_TIMEOUT;
 use crate::websocket_pong_watchdog::WEBSOCKET_PONG_TIMEOUT_REASON;
@@ -257,10 +254,14 @@ where
             }
         };
 
-        // After the handshake, each relay sequence maps to exactly one Noise
-        // transport record. Outbound records are encrypted once; inbound
-        // records are reordered and deduplicated before decryption.
-        let mut websocket = websocket.peekable();
+        // Keep socket reads, the single ordered write, and application delivery
+        // independently pollable in one owner. Noise state never crosses an await.
+        let (sink, reader) = websocket.split();
+        let mut sink = Some(sink);
+        let mut reader = reader.peekable();
+        let mut writing = None;
+        let mut ping_in_flight = false;
+        let mut pong_during_ping = false;
         let mut next_outbound_seq = 0u32;
         let mut inbound_ciphertexts = OrderedCiphertextFrames::default();
         let mut inbound_decoder = JsonRpcMessageDecoder::default();
@@ -270,240 +271,145 @@ where
         );
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut pong_watchdog = WebSocketPongWatchdog::new(WEBSOCKET_PONG_TIMEOUT);
-        let pong_deadline = tokio::time::sleep(WEBSOCKET_PONG_TIMEOUT);
-        tokio::pin!(pong_deadline);
-        // Keep one framed message as a cursor. Sending one Noise record per loop
-        // creates a scheduling point for keepalive and inbound control frames
-        // without splitting the WebSocket reader and writer.
         let mut pending_outbound: Option<(Vec<u8>, usize)> = None;
-        let mut force_incoming = false;
+        let mut delivery = std::collections::VecDeque::new();
+        let mut delivery_deadline = None;
         let mut frames_drained_after_pong_deadline = 0usize;
         'relay: loop {
-            // Consume a due tick before the always-ready record arm below can win
-            // another select iteration and postpone the keepalive.
-            if pong_watchdog.deadline().is_none()
-                && keepalive.tick().now_or_never().is_some()
-            {
-                if let Err(error) = send_keepalive_ping(
-                    &mut websocket,
-                    &mut pong_watchdog,
-                    pong_deadline.as_mut(),
-                )
-                .await
-                {
-                    warn!("failed to write Noise relay keepalive ping: {error}");
-                    break;
-                }
-                frames_drained_after_pong_deadline = 0;
-                continue;
+            let now = tokio::time::Instant::now();
+            let gap_deadline = inbound_ciphertexts.gap_deadline();
+            if gap_deadline.is_some_and(|deadline| deadline <= now) {
+                send_disconnected(&incoming_tx, &disconnected_tx,
+                    super::ordered_ciphertext::CIPHERTEXT_GAP_TIMEOUT_REASON.into());
+                return;
             }
-
-            let pong_deadline_expired = pong_watchdog
-                .deadline()
-                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
-            // After expiry, inspect only frames already queued. Forcing the peeked
-            // item through next() makes the 32-frame grace deterministic.
-            if pong_deadline_expired && !force_incoming {
-                if frames_drained_after_pong_deadline
-                    < MAX_FRAMES_DRAINED_AFTER_PONG_DEADLINE
-                    && std::pin::Pin::new(&mut websocket)
-                        .peek()
-                        .now_or_never()
-                        .is_some()
-                {
-                    force_incoming = true;
-                } else {
-                    warn!(
-                        noise_reason = WEBSOCKET_PONG_TIMEOUT_REASON,
-                        "Noise harness rendezvous websocket disconnected"
-                    );
-                    send_disconnected(
-                        &incoming_tx,
-                        &disconnected_tx,
-                        WEBSOCKET_PONG_TIMEOUT_REASON.to_string(),
-                    );
-                    return;
-                }
+            if delivery_deadline.is_some_and(|deadline| deadline <= now) {
+                send_disconnected(&incoming_tx, &disconnected_tx, "application_backpressure".into());
+                return;
             }
-
-            // While a Pong is outstanding, drain already-queued inbound traffic
-            // before the next fragment so a queued Pong cannot sit behind writes.
-            if !force_incoming
-                && pong_watchdog.deadline().is_some()
-                && pending_outbound.is_some()
-                && std::pin::Pin::new(&mut websocket)
-                    .peek()
-                    .now_or_never()
-                    .is_some()
-            {
-                force_incoming = true;
+            let pong_expired = pong_watchdog.deadline().is_some_and(|deadline| deadline <= now);
+            if pong_expired && (frames_drained_after_pong_deadline >= MAX_FRAMES_DRAINED_AFTER_PONG_DEADLINE
+                || std::pin::Pin::new(&mut reader).peek().now_or_never().is_none()) {
+                send_disconnected(&incoming_tx, &disconnected_tx, WEBSOCKET_PONG_TIMEOUT_REASON.into());
+                return;
             }
-
+            // Give due keepalives priority over another data fragment.
+            if sink.is_some() && pong_watchdog.deadline().is_none() && keepalive.tick().now_or_never().is_some() {
+                writing = sink.take().map(|sink| Box::pin(write_owned(sink, Message::Ping(Vec::new().into()), true)));
+                ping_in_flight = true;
+                pong_during_ping = false;
+            }
+            let next_deadline = [gap_deadline, delivery_deadline, pong_watchdog.deadline()]
+                .into_iter().flatten().min();
             tokio::select! {
-                maybe_message = outgoing_rx.recv(), if pending_outbound.is_none() && !force_incoming && !pong_deadline_expired => {
-                    let Some(message) = maybe_message else {
-                        break;
-                    };
+                _ = async {
+                    match next_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !pong_expired => {}
+                result = async {
+                    match writing.as_mut() {
+                        Some(write) => write.await,
+                        None => std::future::pending().await,
+                    }
+                }, if writing.is_some() => {
+                    let (returned_sink, result, ping) = result;
+                    writing = None;
+                    sink = Some(returned_sink);
+                    if let Err(reason) = result {
+                        send_disconnected(&incoming_tx, &disconnected_tx, reason);
+                        return;
+                    }
+                    if ping {
+                        // The peer's response clock starts only after the Ping flushes.
+                        ping_in_flight = false;
+                        if !pong_during_ping { pong_watchdog.ping_sent(tokio::time::Instant::now()); }
+                        frames_drained_after_pong_deadline = 0;
+                    }
+                }
+                permit = incoming_tx.reserve(), if !delivery.is_empty() => {
+                    let Ok(permit) = permit else { break; };
+                    if let Some(event) = delivery.pop_front() { permit.send(event); }
+                    delivery_deadline = (!delivery.is_empty()).then(|| tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT);
+                }
+                _ = keepalive.tick(), if sink.is_some() && pong_watchdog.deadline().is_none() => {
+                    writing = sink.take().map(|sink| Box::pin(write_owned(sink, Message::Ping(Vec::new().into()), true)));
+                ping_in_flight = true;
+                pong_during_ping = false;
+                }
+                message = outgoing_rx.recv(), if pending_outbound.is_none() && !pong_expired => {
+                    let Some(message) = message else { break; };
                     pending_outbound = Some(match frame_jsonrpc_message(&message) {
-                        Ok(framed) => (framed, 0),
-                        Err(error) => {
-                            warn!("failed to frame JSON-RPC payload for Noise relay: {error}");
-                            break;
-                        }
+                        Ok(frame) => (frame, 0),
+                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
                     });
                 }
-                _ = std::future::ready(()), if pending_outbound.is_some() && !force_incoming && !pong_deadline_expired => {
+                _ = std::future::ready(()), if pending_outbound.is_some() && sink.is_some() && !pong_expired => {
                     let seq = match take_next_sequence(&mut next_outbound_seq) {
                         Ok(seq) => seq,
-                        Err(error) => {
-                            warn!("Noise relay sequence exhausted: {error}");
-                            break 'relay;
-                        }
+                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
                     };
-                    let (ciphertext, next_offset, message_complete) = {
-                        let Some((framed, offset)) = pending_outbound.as_ref() else {
-                            continue;
-                        };
-                        let next_offset = (*offset + NOISE_RECORD_PLAINTEXT_LEN).min(framed.len());
-                        let ciphertext = match transport.encrypt(&framed[*offset..next_offset]) {
-                            Ok(ciphertext) => ciphertext,
-                            Err(error) => {
-                                warn!("failed to encrypt JSON-RPC payload for Noise relay: {error}");
-                                break 'relay;
-                            }
-                        };
-                        (ciphertext, next_offset, next_offset == framed.len())
+                    let Some((frame, offset)) = pending_outbound.as_mut() else { continue; };
+                    let end = (*offset + NOISE_RECORD_PLAINTEXT_LEN).min(frame.len());
+                    let encrypted = match transport.encrypt(&frame[*offset..end]) {
+                        Ok(encrypted) => encrypted,
+                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
                     };
-                    let frame = RelayMessageFrame::data(stream_id.clone(), seq, ciphertext);
-                    // A Pong can arrive after the readiness check while this write owns the
-                    // combined sink and stream. A single bounded record can therefore hit the
-                    // deadline and disconnect with that Pong queued. Treat that as write
-                    // backpressure; this loop yields only between records.
-                    if let Err(error) = send_websocket_message(
-                        &mut websocket,
-                        Message::Binary(encode_relay_message_frame(&frame).into()),
-                        pong_watchdog.write_deadline(tokio::time::Instant::now()),
-                    )
-                    .await
-                    {
-                        warn!("failed to write Noise relay websocket: {error}");
-                        break 'relay;
-                    }
-                    if message_complete {
-                        pending_outbound = None;
-                    } else if let Some((_framed, offset)) = pending_outbound.as_mut() {
-                        *offset = next_offset;
-                    }
+                    *offset = end;
+                    if end == frame.len() { pending_outbound = None; }
+                    let frame = RelayMessageFrame::data(stream_id.clone(), seq, encrypted);
+                    let message = Message::Binary(encode_relay_message_frame(&frame).into());
+                    writing = sink.take().map(|sink| Box::pin(write_owned(sink, message, false)));
                 }
-                _ = &mut pong_deadline, if pong_watchdog.deadline().is_some() && !force_incoming => {
-                    continue;
-                }
-                _ = keepalive.tick(), if pong_watchdog.deadline().is_none() => {
-                    if let Err(error) = send_keepalive_ping(
-                        &mut websocket,
-                        &mut pong_watchdog,
-                        pong_deadline.as_mut(),
-                    )
-                    .await
-                    {
-                        warn!("failed to write Noise relay keepalive ping: {error}");
-                        break;
-                    }
-                    frames_drained_after_pong_deadline = 0;
-                }
-                incoming_message = websocket.next() => {
-                    force_incoming = false;
-                    let Some(incoming_message) = incoming_message else {
-                        break;
-                    };
-                    // Count each completed read after expiry. If only the deadline arm
-                    // advanced this counter, reads won by a simultaneously ready incoming
-                    // arm would not count toward the 32-frame cap.
-                    if pong_watchdog
-                        .deadline()
-                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                    {
+                incoming = reader.next() => {
+                    // The deadline may have elapsed while select was waiting, even
+                    // if the socket branch wins over the timer in this poll.
+                    if pong_watchdog.deadline().is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
                         frames_drained_after_pong_deadline += 1;
                     }
-                    match incoming_message {
-                        Ok(Message::Binary(payload)) => {
-                            let frame = match decode_relay_message_frame(payload.as_ref()) {
+                    match incoming {
+                        Some(Ok(Message::Binary(payload))) => {
+                            let frame = match decode_relay_message_frame(&payload) {
                                 Ok(frame) => frame,
-                                Err(error) => {
-                                    send_malformed(&incoming_tx, error.to_string());
-                                    break;
-                                }
+                                Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
                             };
-                            if frame.stream_id != stream_id {
-                                continue;
-                            }
+                            if frame.stream_id != stream_id { continue; }
                             match frame.validate() {
                                 Ok(RelayFrameBodyKind::Data) => {
-                                    let data = match frame.into_data() {
-                                        Ok(data) => data,
-                                        Err(error) => {
-                                            send_malformed(&incoming_tx, error.to_string());
-                                            break;
+                                    let result = frame.into_data().and_then(|data| {
+                                        for ciphertext in inbound_ciphertexts.push(data.seq, data.payload)? {
+                                            let plaintext = transport.decrypt(&ciphertext).map_err(|error|
+                                                ExecServerError::Protocol(format!("Noise relay decryption failed: {error}")))?;
+                                            for message in inbound_decoder.push(&plaintext)? {
+                                                if delivery.len() >= CHANNEL_CAPACITY {
+                                                    return Err(ExecServerError::Protocol("Noise relay application staging queue is full".into()));
+                                                }
+                                                delivery.push_back(JsonRpcConnectionEvent::Message(message));
+                                            }
                                         }
-                                    };
-                                    if let Err(error) = receive_data(
-                                        &mut inbound_ciphertexts,
-                                        &mut transport,
-                                        &mut inbound_decoder,
-                                        data,
-                                        pong_watchdog.write_deadline(tokio::time::Instant::now()),
-                                        &incoming_tx,
-                                    )
-                                    .await
-                                    {
-                                        if matches!(error, ExecServerError::Closed) {
-                                            break;
-                                        }
-                                        send_malformed(&incoming_tx, error.to_string());
-                                        break;
-                                    }
+                                        Ok(())
+                                    });
+                                    if let Err(error) = result { send_malformed(&incoming_tx, error.to_string()); break 'relay; }
+                                    if !delivery.is_empty() { delivery_deadline.get_or_insert_with(|| tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT); }
                                 }
                                 Ok(RelayFrameBodyKind::Reset) => {
-                                    let _ = incoming_tx.try_send(
-                                        JsonRpcConnectionEvent::Disconnected {
-                                            reason: Some(
-                                                NOISE_RELAY_RESET_DISCONNECT_REASON.to_string(),
-                                            ),
-                                        },
-                                    );
-                                    break;
+                                    send_disconnected(&incoming_tx, &disconnected_tx, NOISE_RELAY_RESET_DISCONNECT_REASON.into());
+                                    return;
                                 }
-                                Ok(
-                                    RelayFrameBodyKind::Ack
-                                    | RelayFrameBodyKind::Resume
-                                    | RelayFrameBodyKind::Heartbeat,
-                                ) => {}
-                                Ok(RelayFrameBodyKind::Handshake) | Err(_) => {
-                                    send_malformed(
-                                        &incoming_tx,
-                                        "Noise relay received invalid post-handshake frame".to_string(),
-                                    );
-                                    break;
-                                }
+                                Ok(RelayFrameBodyKind::Ack | RelayFrameBodyKind::Resume | RelayFrameBodyKind::Heartbeat) => {}
+                                _ => { send_malformed(&incoming_tx, "Noise relay received invalid post-handshake frame".into()); break; }
                             }
                         }
-                        Ok(Message::Close(_)) => break,
-                        Ok(Message::Pong(_)) => {
+                        Some(Ok(Message::Pong(_))) => {
+                            if ping_in_flight { pong_during_ping = true; }
                             pong_watchdog.received_pong();
                             frames_drained_after_pong_deadline = 0;
                         }
-                        Ok(Message::Ping(_) | Message::Frame(_)) => {}
-                        Ok(Message::Text(_)) => {
-                            send_malformed(
-                                &incoming_tx,
-                                "Noise relay transport expects binary protobuf frames".to_string(),
-                            );
-                            break;
-                        }
-                        Err(error) => {
-                            debug!("Noise relay websocket read failed: {error}");
-                            break;
-                        }
+                        Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
+                        Some(Ok(Message::Text(_))) => { send_malformed(&incoming_tx, "Noise relay transport expects binary protobuf frames".into()); break; }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Err(error)) => { debug!("Noise relay websocket read failed: {error}"); break; }
                     }
                 }
             }
@@ -521,6 +427,24 @@ where
     }
 }
 
+async fn write_owned<T, E>(
+    mut sink: T,
+    message: Message,
+    ping: bool,
+) -> (T, Result<(), String>, bool)
+where
+    T: Sink<Message, Error = E> + Unpin,
+    E: std::fmt::Display,
+{
+    let result = send_websocket_message(
+        &mut sink,
+        message,
+        tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT,
+    )
+    .await;
+    (sink, result, ping)
+}
+
 async fn send_websocket_message<T, E>(
     websocket: &mut T,
     message: Message,
@@ -534,81 +458,6 @@ where
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("websocket write timed out".to_string()),
-    }
-}
-
-async fn send_keepalive_ping<T, E>(
-    websocket: &mut T,
-    pong_watchdog: &mut WebSocketPongWatchdog,
-    pong_deadline: std::pin::Pin<&mut tokio::time::Sleep>,
-) -> Result<(), String>
-where
-    T: Sink<Message, Error = E> + Unpin,
-    E: std::fmt::Display,
-{
-    send_websocket_message(
-        websocket,
-        Message::Ping(Vec::new().into()),
-        pong_watchdog.write_deadline(tokio::time::Instant::now()),
-    )
-    .await?;
-    // Start the response clock after the Ping flushes; waiting for sink capacity
-    // is governed by the write deadline above.
-    pong_watchdog.ping_sent(tokio::time::Instant::now());
-    if let Some(deadline) = pong_watchdog.deadline() {
-        pong_deadline.reset(deadline);
-    }
-    Ok(())
-}
-
-/// Order and decrypt one relay frame, then emit any complete JSON-RPC messages.
-/// Relay records and JSON-RPC messages do not share boundaries, so reassembly
-/// happens after decryption.
-async fn receive_data(
-    inbound_ciphertexts: &mut OrderedCiphertextFrames,
-    transport: &mut NoiseTransport,
-    decoder: &mut JsonRpcMessageDecoder,
-    data: RelayData,
-    delivery_deadline: tokio::time::Instant,
-    incoming_tx: &mpsc::Sender<JsonRpcConnectionEvent>,
-) -> Result<(), ExecServerError> {
-    // Ordering must happen before decryption because Noise transport nonces are
-    // implicit. A future or duplicate ciphertext passed directly to Clatter
-    // would desynchronize the channel.
-    for ciphertext in inbound_ciphertexts.push(data.seq, data.payload)? {
-        let plaintext = transport.decrypt(&ciphertext).map_err(|error| {
-            ExecServerError::Protocol(format!("Noise relay decryption failed: {error}"))
-        })?;
-
-        // The authenticated byte stream can carry partial or multiple JSON-RPC
-        // messages; emit only complete, successfully parsed messages.
-        for message in decoder.push(&plaintext)? {
-            send_incoming_event(
-                incoming_tx,
-                JsonRpcConnectionEvent::Message(message),
-                delivery_deadline,
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn send_incoming_event(
-    incoming_tx: &mpsc::Sender<JsonRpcConnectionEvent>,
-    event: JsonRpcConnectionEvent,
-    deadline: tokio::time::Instant,
-) -> Result<(), ExecServerError> {
-    match tokio::time::timeout_at(deadline, incoming_tx.send(event)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(ExecServerError::Closed),
-        Err(_) => {
-            warn!(
-                noise_reason = "application_backpressure",
-                "Noise harness application event delivery timed out"
-            );
-            Err(ExecServerError::Closed)
-        }
     }
 }
 

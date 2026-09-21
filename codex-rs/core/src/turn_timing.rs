@@ -940,7 +940,7 @@ struct TurnTimingStateInner {
     tool_calls: Vec<TurnTimingToolCall>,
     tool_call_timing_overflow: u32,
     tool_closure: ToolClosureLedger,
-    queued_durable_tool_result_call_ids: BTreeSet<String>,
+    queued_durable_tool_result_execution_ids: BTreeSet<ToolExecutionId>,
     tool_result_persistence_barrier_failed: bool,
     tool_call_acceptance_sealed: bool,
     background_tool_process_exits: BTreeMap<(String, ToolExecutionId), ToolDispatchTimingSnapshot>,
@@ -1090,23 +1090,22 @@ impl ToolClosureLedger {
         }
     }
 
-    fn record_persisted_by_call_id(&mut self, call_id: &str) {
-        let identities = self
+    fn record_persisted_execution(&mut self, execution_id: &ToolExecutionId) {
+        let Some(identity) = self
             .entries
-            .values()
+            .get(execution_id)
             .filter(|entry| {
-                entry.identity.call_id == call_id
-                    && entry.identity.source == TurnTimingToolCallSource::Direct
-                    && !entry.persisted
+                entry.identity.source == TurnTimingToolCallSource::Direct && !entry.persisted
             })
             .map(|entry| entry.identity.clone())
-            .collect::<Vec<_>>();
-        for identity in identities {
-            let parent_call_id = identity.call_id.clone();
-            let sampling_generation_id = identity.sampling_generation_id.clone();
-            self.record_persisted(identity);
-            self.record_nested_projection_persisted(&parent_call_id, &sampling_generation_id);
-        }
+        else {
+            return;
+        };
+        self.record_nested_projection_persisted(
+            &identity.call_id,
+            &identity.sampling_generation_id,
+        );
+        self.record_persisted(identity);
     }
 
     fn repair_persisted_terminal_entries_missing_timing(&mut self) -> u32 {
@@ -1379,8 +1378,17 @@ impl TurnTimingState {
     pub(crate) fn monotonic_offset_ms(&self) -> u64 {
         let state = self.state();
         let sample = self.clock.sample();
+        let now = if state.completed_snapshot.is_some() {
+            state.last_monotonic_ns.unwrap_or(sample.time.monotonic_ns)
+        } else {
+            sample
+                .time
+                .monotonic_ns
+                .max(state.last_monotonic_ns.unwrap_or(0))
+        };
         state
-            .elapsed_since_start(sample.time.monotonic_ns)
+            .started_sample
+            .map(|start| now.saturating_sub(start.time.monotonic_ns))
             .map(u128_to_u64_ms)
             .unwrap_or(0)
     }
@@ -1514,41 +1522,8 @@ impl TurnTimingState {
     ) {
         let mut state = self.state();
         let sample = self.clock.sample();
-        let lifecycle_context = self.lifecycle_context();
         state.advance(sample.time.monotonic_ns);
         let cause = pending.take();
-        if matches!(cause, Some(ContinuationCause::ToolResult))
-            && let Some(model_resumed_at_ms) = state
-                .elapsed_since_start(sample.time.monotonic_ns)
-                .map(u128_to_u64_ms)
-        {
-            for tool_call in state.tool_calls.iter_mut().rev() {
-                if tool_call.model_resumed_at_ms.is_some() {
-                    break;
-                }
-                if tool_call.output_model_visible_at_ms.is_some()
-                    || tool_call.delivered_at_ms.is_some()
-                {
-                    tool_call.model_resumed_at_ms = Some(model_resumed_at_ms);
-                    if !tool_call
-                        .lifecycle_events
-                        .iter()
-                        .any(|event| event.boundary == ToolLifecycleBoundary::NextModelSampleStart)
-                    {
-                        tool_call.lifecycle_events.push(
-                            codex_protocol::protocol::TurnTimingToolLifecycleEvent {
-                                boundary: ToolLifecycleBoundary::NextModelSampleStart,
-                                at_ms: model_resumed_at_ms,
-                                context: lifecycle_context,
-                                retry_count: tool_call.retry_count,
-                                reentry_count: tool_call.reentry_count,
-                            },
-                        );
-                    }
-                    tool_call.next_sample_block_reason = NextSampleBlockReason::ReadyToSample;
-                }
-            }
-        }
         if let Some(cause) = cause {
             state.legacy.record_continuation(cause);
         }
@@ -1719,7 +1694,7 @@ impl TurnTimingState {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
-        if state.completed_snapshot.is_some() {
+        if state.completed_snapshot.is_some() || state.tool_call_acceptance_sealed {
             state.invalid_transition();
             return false;
         }
@@ -2211,38 +2186,88 @@ impl TurnTimingState {
         }
     }
 
-    /// Attests that the canonical projection containing a direct result and
-    /// its nested CodeMode results crossed the durable rollout barrier.
-    pub(crate) fn record_tool_result_persisted(&self, call_id: &str) {
+    /// Resolve wire IDs while their producing generation is still current, before
+    /// yielding to persistence. A later generation may reuse the same wire ID.
+    pub(crate) fn tool_result_execution_id(&self, call_id: &str) -> Option<ToolExecutionId> {
+        let state = self.state();
+        let generation = state
+            .current_generation_index
+            .map(|index| format!("generation-{index}"))
+            .unwrap_or_else(|| "generation-pending".to_string());
+        state
+            .tool_closure
+            .entries
+            .values()
+            .find(|entry| {
+                entry.identity.call_id == call_id
+                    && entry.identity.source == TurnTimingToolCallSource::Direct
+                    && entry.identity.sampling_generation_id.0 == generation
+            })
+            .map(|entry| entry.identity.execution_id.clone())
+    }
+
+    pub(crate) fn record_tool_result_executions_persisted(&self, executions: &[ToolExecutionId]) {
         let mut state = self.state();
-        let sample = self.clock.sample();
-        state.advance(sample.time.monotonic_ns);
         if state.completed_snapshot.is_some() {
             state.invalid_transition();
             return;
         }
-        state.queued_durable_tool_result_call_ids.remove(call_id);
-        state.tool_closure.record_persisted_by_call_id(call_id);
+        for execution in executions {
+            state
+                .queued_durable_tool_result_execution_ids
+                .remove(execution);
+            state.tool_closure.record_persisted_execution(execution);
+        }
+        // An empty flush or another call's successful write cannot repair an
+        // earlier failed append. Keep waiters released until every accepted
+        // result has actually crossed the durability boundary.
+        if state
+            .tool_closure
+            .entries
+            .values()
+            .all(|entry| entry.persisted)
+        {
+            state.tool_result_persistence_barrier_failed = false;
+        }
         drop(state);
         self.signal_tool_closure_changed();
     }
 
-    /// Records an ordered canonical result that has been accepted by the rollout writer but has
-    /// not yet crossed its durability barrier.
-    pub(crate) fn record_tool_result_persistence_queued(&self, call_id: &str) {
+    pub(crate) fn record_tool_result_executions_queued(&self, executions: &[ToolExecutionId]) {
         let mut state = self.state();
         if state.completed_snapshot.is_some() {
             state.invalid_transition();
             return;
         }
         state
-            .queued_durable_tool_result_call_ids
-            .insert(call_id.to_string());
+            .queued_durable_tool_result_execution_ids
+            .extend(executions.iter().cloned());
+    }
+
+    pub(crate) fn queued_tool_result_executions(&self) -> Vec<ToolExecutionId> {
+        self.state()
+            .queued_durable_tool_result_execution_ids
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_tool_result_persisted(&self, call_id: &str) {
+        if let Some(execution) = self.tool_result_execution_id(call_id) {
+            self.record_tool_result_executions_persisted(&[execution]);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_tool_result_persistence_queued(&self, call_id: &str) {
+        if let Some(execution) = self.tool_result_execution_id(call_id) {
+            self.record_tool_result_executions_queued(&[execution]);
+        }
     }
 
     /// Records that the terminal rollout barrier failed. This releases closure waiters without
     /// attesting that any queued result crossed the durability boundary.
-    #[cfg(test)]
     pub(crate) fn record_tool_result_persistence_barrier_failed(&self) {
         let mut state = self.state();
         if state.completed_snapshot.is_some() {
@@ -2254,20 +2279,9 @@ impl TurnTimingState {
         self.signal_tool_closure_changed();
     }
 
-    /// Promotes every queued result only after the owning rollout barrier succeeds.
+    #[cfg(test)]
     pub(crate) fn record_queued_tool_results_persisted(&self) {
-        let mut state = self.state();
-        if state.completed_snapshot.is_some() {
-            state.invalid_transition();
-            return;
-        }
-        state.tool_result_persistence_barrier_failed = false;
-        let queued = std::mem::take(&mut state.queued_durable_tool_result_call_ids);
-        for call_id in queued {
-            state.tool_closure.record_persisted_by_call_id(&call_id);
-        }
-        drop(state);
-        self.signal_tool_closure_changed();
+        self.record_tool_result_executions_persisted(&self.queued_tool_result_executions());
     }
 
     /// Persists a background process exit into the turn record even when the
@@ -2362,6 +2376,7 @@ impl TurnTimingState {
             .saturating_add(count);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_residual_deterministic_generation(&self) {
         let mut state = self.state();
         state.counters.residual_deterministic_generation_count = state
@@ -2462,9 +2477,15 @@ impl TurnTimingState {
 
     pub(crate) fn record_model_request_token_categories(
         &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
         categories: TurnTimingRequestTokenCategories,
     ) {
-        if let Some(request) = self.state().model_requests.last_mut() {
+        if let Some(request) = self.state().model_requests.iter_mut().find(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && request.physical_attempt_ids.last().map(String::as_str)
+                    == Some(physical_attempt_id)
+        }) {
             request.request_token_categories = Some(categories);
         }
     }
@@ -2476,11 +2497,17 @@ impl TurnTimingState {
     /// supply an override containing private session metadata.
     pub(crate) fn record_model_request_cache_identity(
         &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
         fixed_prefix_reuse_eligible: bool,
         prompt_cache_key: Option<&str>,
     ) {
         let mut state = self.state();
-        let Some(request) = state.model_requests.last_mut() else {
+        let Some(request) = state.model_requests.iter_mut().find(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && request.physical_attempt_ids.first().map(String::as_str)
+                    == Some(physical_attempt_id)
+        }) else {
             return;
         };
         if request.fixed_prefix_reuse_eligible.is_some() {
@@ -2577,6 +2604,13 @@ impl TurnTimingState {
 
     /// Keep contended source-dependency bookkeeping off the tool-dispatch worker.
     pub(crate) async fn record_projection_source_dependencies_reuse_async(self: &Arc<Self>) {
+        if let Ok(mut state) = self.state.try_lock() {
+            state.counters.projection_source_dependencies_reuse_count = state
+                .counters
+                .projection_source_dependencies_reuse_count
+                .saturating_add(1);
+            return;
+        }
         let timing = Arc::clone(self);
         if let Err(error) = tokio::task::spawn_blocking(move || {
             timing.record_projection_source_dependencies_reuse();
@@ -2588,6 +2622,13 @@ impl TurnTimingState {
     }
 
     pub(crate) async fn record_projection_source_dependencies_fallback_async(self: &Arc<Self>) {
+        if let Ok(mut state) = self.state.try_lock() {
+            state.counters.projection_source_dependencies_fallback_count = state
+                .counters
+                .projection_source_dependencies_fallback_count
+                .saturating_add(1);
+            return;
+        }
         let timing = Arc::clone(self);
         if let Err(error) = tokio::task::spawn_blocking(move || {
             timing.record_projection_source_dependencies_fallback();
@@ -2611,7 +2652,33 @@ impl TurnTimingState {
         omitted_sections: u64,
         provider_visible: bool,
     ) {
-        let mut state = self.state();
+        Self::record_tool_output_projection_facts_locked(
+            &mut self.state(),
+            canonical_bytes,
+            canonical_tokens,
+            model_bytes,
+            model_tokens,
+            artifact_created,
+            artifact_reused,
+            projection_truncated,
+            omitted_sections,
+            provider_visible,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_tool_output_projection_facts_locked(
+        state: &mut TurnTimingStateInner,
+        canonical_bytes: u64,
+        canonical_tokens: u64,
+        model_bytes: u64,
+        model_tokens: u64,
+        artifact_created: bool,
+        artifact_reused: bool,
+        projection_truncated: bool,
+        omitted_sections: u64,
+        provider_visible: bool,
+    ) {
         state.counters.tool_output_truncation_count = state
             .counters
             .tool_output_truncation_count
@@ -2671,6 +2738,21 @@ impl TurnTimingState {
         omitted_sections: u64,
         provider_visible: bool,
     ) {
+        if let Ok(mut state) = self.state.try_lock() {
+            Self::record_tool_output_projection_facts_locked(
+                &mut state,
+                canonical_bytes,
+                canonical_tokens,
+                model_bytes,
+                model_tokens,
+                artifact_created,
+                artifact_reused,
+                projection_truncated,
+                omitted_sections,
+                provider_visible,
+            );
+            return;
+        }
         let timing = Arc::clone(self);
         if let Err(error) = tokio::task::spawn_blocking(move || {
             timing.record_tool_output_projection_facts(
@@ -2760,22 +2842,6 @@ impl TurnTimingState {
                 is_continuation,
                 ..Default::default()
             });
-            match attempt_kind {
-                TurnTimingAttemptKind::Primary => {
-                    state.counters.attempts_by_kind.primary =
-                        state.counters.attempts_by_kind.primary.saturating_add(1);
-                }
-                TurnTimingAttemptKind::Retry => {
-                    state.counters.attempts_by_kind.retry =
-                        state.counters.attempts_by_kind.retry.saturating_add(1);
-                }
-                TurnTimingAttemptKind::Fallback => {
-                    state.counters.attempts_by_kind.fallback =
-                        state.counters.attempts_by_kind.fallback.saturating_add(1);
-                }
-            }
-            state.counters.model_request_count =
-                state.counters.model_request_count.saturating_add(1);
         }
         self.begin_guard(GuardKind::ModelRequestWait)
     }
@@ -2963,6 +3029,38 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns);
+        let lifecycle_context = self.lifecycle_context();
+        if let Some(model_resumed_at_ms) = state
+            .elapsed_since_start(sample.time.monotonic_ns)
+            .map(u128_to_u64_ms)
+        {
+            for tool_call in state.tool_calls.iter_mut().rev() {
+                if tool_call.model_resumed_at_ms.is_some() {
+                    break;
+                }
+                if tool_call.output_model_visible_at_ms.is_some()
+                    || tool_call.delivered_at_ms.is_some()
+                {
+                    tool_call.model_resumed_at_ms = Some(model_resumed_at_ms);
+                    if !tool_call
+                        .lifecycle_events
+                        .iter()
+                        .any(|event| event.boundary == ToolLifecycleBoundary::NextModelSampleStart)
+                    {
+                        tool_call.lifecycle_events.push(
+                            codex_protocol::protocol::TurnTimingToolLifecycleEvent {
+                                boundary: ToolLifecycleBoundary::NextModelSampleStart,
+                                at_ms: model_resumed_at_ms,
+                                context: lifecycle_context,
+                                retry_count: tool_call.retry_count,
+                                reentry_count: tool_call.reentry_count,
+                            },
+                        );
+                    }
+                    tool_call.next_sample_block_reason = NextSampleBlockReason::ReadyToSample;
+                }
+            }
+        }
         if state.dispatch_ready_snapshot.is_none()
             && let Some(elapsed_ns) = elapsed_ns
         {
@@ -2994,6 +3092,23 @@ impl TurnTimingState {
             && request.dispatch_ns.is_none()
         {
             request.dispatch_ns = Some(elapsed_ns);
+            let attempt_kind = request.attempt_kind;
+            match attempt_kind {
+                TurnTimingAttemptKind::Primary => {
+                    state.counters.attempts_by_kind.primary =
+                        state.counters.attempts_by_kind.primary.saturating_add(1);
+                }
+                TurnTimingAttemptKind::Retry => {
+                    state.counters.attempts_by_kind.retry =
+                        state.counters.attempts_by_kind.retry.saturating_add(1);
+                }
+                TurnTimingAttemptKind::Fallback => {
+                    state.counters.attempts_by_kind.fallback =
+                        state.counters.attempts_by_kind.fallback.saturating_add(1);
+                }
+            }
+            state.counters.model_request_count =
+                state.counters.model_request_count.saturating_add(1);
         }
     }
 

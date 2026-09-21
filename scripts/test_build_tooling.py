@@ -69,11 +69,21 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         ):
             with self.subTest(check=check, code=first_code):
                 with mock.patch.object(
-                    formatter.subprocess,
-                    "run",
+                    formatter,
+                    "run_finite",
                     side_effect=[
-                        subprocess.CompletedProcess([], first_code, "lint changes\n"),
-                        subprocess.CompletedProcess([], 0, "format checked\n"),
+                        mock.Mock(
+                            returncode=first_code,
+                            stdout="lint changes\n",
+                            status="failed",
+                            output_truncated=False,
+                        ),
+                        mock.Mock(
+                            returncode=0,
+                            stdout="format checked\n",
+                            status="passed",
+                            output_truncated=False,
+                        ),
                     ],
                 ) as run:
                     result = formatter.run_formatter_group(
@@ -668,7 +678,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             stderr = io.StringIO()
             with mock.patch.object(just_shell.time, "time", return_value=1000):
                 self.assertTrue(just_shell.read_cached_tool_run(command, cache_dir))
-                just_shell.warn_once("fixture", "needs setup", cache_dir=cache_dir, stderr=stderr)
+                just_shell.warn_once(
+                    "fixture", "needs setup", cache_dir=cache_dir, stderr=stderr
+                )
             self.assertEqual(stderr.getvalue(), "")
 
     def test_local_just_shell_reprobes_future_dated_cache(self) -> None:
@@ -1076,9 +1088,11 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         format_script = load_format_module()
         with (
             mock.patch.object(
-                format_script.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0, stdout=""),
+                format_script,
+                "run_finite",
+                return_value=mock.Mock(
+                    returncode=0, stdout="", status="passed", output_truncated=False
+                ),
             ) as run,
             mock.patch("sys.stdout", io.StringIO()) as output,
         ):
@@ -1130,9 +1144,11 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             format_script = load_format_module()
             with (
                 mock.patch.object(
-                    format_script.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess([], 0, stdout=""),
+                    format_script,
+                    "run_finite",
+                    return_value=mock.Mock(
+                        returncode=0, stdout="", status="passed", output_truncated=False
+                    ),
                 ) as run,
                 mock.patch("sys.stdout", io.StringIO()),
             ):

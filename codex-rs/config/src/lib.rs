@@ -158,6 +158,7 @@ pub use mcp_types::McpServerTransportConfig;
 pub use mcp_types::RawMcpServerConfig;
 pub use merge::merge_toml_values;
 pub use overrides::build_cli_overrides_layer;
+pub use overrides::parse_override_key;
 pub use plugin_edit::PluginConfigEdit;
 pub use plugin_edit::apply_user_plugin_config_edits;
 pub use plugin_edit::apply_user_plugin_config_edits_blocking;

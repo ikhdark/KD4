@@ -34,6 +34,63 @@ fn go_and_pytest_failures_survive_passing_output_afterward() {
 }
 
 #[test]
+fn a_successful_flat_list_is_truncated_rather_than_summarized() {
+    // `git status --short` over a large working tree: hundreds of uniform
+    // lines, no diagnostics. Head/tail selection would drop the middle for no
+    // reason, and the result would read as a summary rather than a truncation.
+    let output = (0..600)
+        .map(|index| format!(" M codex-rs/crate{index:04}/src/lib.rs"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(Some("git status --short"), None));
+
+    assert_eq!(
+        summary, None,
+        "a successful flat list must fall through to ordinary truncation"
+    );
+}
+
+#[test]
+fn a_successful_run_with_diagnostics_is_still_summarized() {
+    // The same shape, but one warning makes ranking meaningful again. Without
+    // this the guard above would disable summarization for every exit-zero run.
+    let mut lines = (0..600)
+        .map(|index| format!("compiling crate{index:04}"))
+        .collect::<Vec<_>>();
+    lines[300] = "warning: unused variable `handle`".into();
+    let output = lines.join("\n");
+
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(Some("cargo build"), None))
+            .expect("diagnostic output must still be summarized");
+
+    assert!(
+        summary.contains("warning: unused variable `handle`"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn a_failing_flat_list_is_still_summarized() {
+    // A non-zero exit is itself the signal; the tail matters even when no line
+    // matches a diagnostic pattern.
+    let output = (0..600)
+        .map(|index| format!("processed item {index:04}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let summary =
+        summarize_shell_output_for_model(&output, 1, false, options(Some("custom-command"), None));
+
+    assert!(
+        summary.is_some(),
+        "a failing command must keep its focused summary"
+    );
+}
+
+#[test]
 fn small_output_is_unchanged() {
     let output = "ok\n";
 
@@ -112,10 +169,9 @@ fn validation_output_uses_structured_wrapper_classification() {
         0,
         false,
         options(Some("printf 'cargo test'"), None),
-    )
-    .unwrap();
-    assert_ne!(
-        prose, direct,
+    );
+    assert_eq!(
+        prose, None,
         "a string argument is not a validation invocation"
     );
 }
@@ -200,11 +256,11 @@ fn oversized_first_line_reserves_room_for_the_tail() {
     let mut lines = vec![String::new(); 700];
     lines[0] = "x".repeat(SUMMARY_MAX_BYTES);
     let probe =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None)).unwrap();
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000))).unwrap();
     let prefix_bytes = probe.find("    1: ").unwrap() + "    1: ".len();
     lines[0] = "x".repeat(SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes);
     let summary =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None)).unwrap();
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000))).unwrap();
     assert!(summary.ends_with("[summary capped]"), "{summary}");
     assert!(summary.contains("- emitted_source_lines: 88\n"));
     // A final empty line is not a source line according to str::lines().
@@ -220,7 +276,7 @@ fn summary_reports_gap_sizes_and_source_line_counts() {
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, None)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, Some(1_000))).unwrap();
     assert!(summary.contains("... [612 lines omitted]"));
     assert!(summary.contains("- emitted_source_lines: 88\n"));
     assert!(summary.ends_with("- omitted_source_lines: 612"));
@@ -231,7 +287,7 @@ fn summary_reports_gap_sizes_and_source_line_counts() {
 fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
     let mut lines = vec!["ordinary".to_string(); 700];
     lines[0] = "x".repeat(SUMMARY_MAX_BYTES);
-    let probe = summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+    let probe = summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000)))
         .expect("large output summary");
     let prefix_bytes = probe.find("    1: ").expect("first source line") + "    1: ".len();
     let following_head_bytes = (SUCCESS_HEAD_LINES - 1) * "\n    2: ordinary".len();
@@ -241,7 +297,7 @@ fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
     );
 
     let summary =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000)))
             .expect("large output summary");
     let (body, _) = summary
         .split_once("\n- emitted_source_lines:")
@@ -651,7 +707,7 @@ fn disabled_summarizer_returns_unchanged_signal() {
 fn oversized_single_line_retains_bounded_head_and_tail() {
     let output = format!("HEAD{}TAIL", "x".repeat(DEFAULT_SUMMARY_AFTER_BYTES + 1024));
 
-    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, None)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, Some(4_000))).unwrap();
 
     assert!(summary.contains("HEAD"));
     assert!(summary.contains("TAIL"));

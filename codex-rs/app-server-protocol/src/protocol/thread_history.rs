@@ -212,6 +212,9 @@ pub struct ThreadHistoryBuilder {
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
     pending_agent_message_mirror: Option<ThreadItem>,
+    // Remember only removed wait identities so end-only legacy compatibility
+    // cannot resurrect an operation that an explicit rollback discarded.
+    rolled_back_wait_ids: std::collections::HashSet<String>,
     current_rollout_index: usize,
     next_rollout_index: usize,
     active_change_set: Option<ThreadHistoryChangeAccumulator>,
@@ -230,6 +233,7 @@ impl ThreadHistoryBuilder {
             current_turn: None,
             next_item_index: 1,
             pending_agent_message_mirror: None,
+            rolled_back_wait_ids: std::collections::HashSet::new(),
             current_rollout_index: 0,
             next_rollout_index: 0,
             active_change_set: None,
@@ -479,7 +483,7 @@ impl ThreadHistoryBuilder {
             return;
         };
 
-        self.push_item_in_current_turn(ThreadItem::HookPrompt {
+        self.upsert_item_in_current_turn(ThreadItem::HookPrompt {
             id: hook_prompt.id,
             fragments: hook_prompt
                 .fragments
@@ -1006,17 +1010,43 @@ impl ThreadHistoryBuilder {
         // Modern item events carry an explicit terminal outcome that this legacy
         // event cannot represent (for example, a failed wait with no receivers).
         // A terminal snapshot also covers waits reconciled by TurnAborted.
-        if self.current_turn.as_ref().is_some_and(|turn| {
-            turn.item_indexes
-                .get(&payload.call_id)
-                .is_some_and(|&index| {
-                    matches!(
-                        &turn.items[index],
-                        ThreadItem::CollabAgentToolCall { tool: CollabAgentTool::Wait, status, .. }
-                            if *status != CollabAgentToolCallStatus::InProgress
-                    )
-                })
-        }) {
+        let wait_status = |item: &ThreadItem| match item {
+            ThreadItem::CollabAgentToolCall {
+                id,
+                tool: CollabAgentTool::Wait,
+                status,
+                ..
+            } if id == &payload.call_id => Some(status.clone()),
+            _ => None,
+        };
+        let current_owner = self.current_turn.as_ref().and_then(|turn| {
+            turn.item_indexes.get(&payload.call_id).and_then(|&index| {
+                wait_status(&turn.items[index]).map(|status| (turn.id.clone(), status))
+            })
+        });
+        let owner = if current_owner.is_some() {
+            current_owner
+        } else {
+            let mut owners = self.turns.iter().filter_map(|turn| {
+                turn.items
+                    .iter()
+                    .find_map(&wait_status)
+                    .map(|status| (turn.id.clone(), status))
+            });
+            let first = owners.next();
+            // An unscoped legacy event cannot disambiguate reused historical IDs.
+            if owners.next().is_some() {
+                return;
+            }
+            first
+        };
+        if owner.is_none() && self.rolled_back_wait_ids.contains(&payload.call_id) {
+            return;
+        }
+        if owner
+            .as_ref()
+            .is_some_and(|(_, status)| *status != CollabAgentToolCallStatus::InProgress)
+        {
             return;
         }
         let status = if payload
@@ -1036,7 +1066,7 @@ impl ThreadHistoryBuilder {
             .iter()
             .map(|(id, status)| (id.to_string(), CollabAgentState::from(status.clone())))
             .collect();
-        self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
+        let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::Wait,
             status,
@@ -1046,7 +1076,12 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states,
-        });
+        };
+        if let Some((turn_id, _)) = owner {
+            self.upsert_item_in_turn_id(&turn_id, item);
+        } else {
+            self.upsert_item_in_current_turn(item);
+        }
     }
 
     fn handle_collab_close_begin(
@@ -1382,6 +1417,19 @@ impl ThreadHistoryBuilder {
 
         let n = usize::try_from(payload.num_turns).unwrap_or(usize::MAX);
         let retained_len = self.turns.len().saturating_sub(n);
+        self.rolled_back_wait_ids.extend(
+            self.turns[retained_len..]
+                .iter()
+                .flat_map(|turn| &turn.items)
+                .filter_map(|item| match item {
+                    ThreadItem::CollabAgentToolCall {
+                        id,
+                        tool: CollabAgentTool::Wait,
+                        ..
+                    } => Some(id.clone()),
+                    _ => None,
+                }),
+        );
         if let Some(changes) = self.active_change_set.as_mut() {
             changes.removed_turn_ids.extend(
                 self.turns[retained_len..]
@@ -4621,6 +4669,102 @@ mod tests {
     }
 
     #[test]
+    fn hook_prompt_raw_and_canonical_mirrors_are_idempotent() {
+        for raw_first in [false, true] {
+            let raw = build_hook_prompt_message(&[CoreHookPromptFragment::from_single_hook(
+                "feedback", "hook",
+            )])
+            .unwrap();
+            let codex_protocol::models::ResponseItem::Message { id, content, .. } = &raw else {
+                panic!("message");
+            };
+            let parsed = parse_hook_prompt_message(id.as_deref(), content).unwrap();
+            let canonical = CoreTurnItem::HookPrompt(parsed);
+            let mut builder = ThreadHistoryBuilder::new();
+            wait_history_test_start_turn(&mut builder, "owner");
+            if raw_first {
+                builder.handle_response_item(&raw);
+            }
+            builder.handle_event(&EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "owner".into(),
+                item: canonical.clone(),
+                completed_at_ms: 0,
+            }));
+            builder.handle_response_item(&raw);
+            builder.handle_response_item(&raw);
+            assert_eq!(
+                builder.active_turn_snapshot().unwrap().items,
+                vec![ThreadItem::from(canonical)]
+            );
+            let distinct = build_hook_prompt_message(&[CoreHookPromptFragment::from_single_hook(
+                "feedback", "hook",
+            )])
+            .unwrap();
+            builder.handle_response_item(&distinct);
+            assert_eq!(builder.active_turn_snapshot().unwrap().items.len(), 2);
+        }
+    }
+
+    #[test]
+    fn rolled_back_wait_end_cannot_resurrect_but_legacy_end_only_still_works() {
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+        let mut builder = ThreadHistoryBuilder::new();
+        wait_history_test_start_turn(&mut builder, "removed");
+        builder.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id: ThreadId::new(),
+            turn_id: "removed".into(),
+            item: wait_history_test_item("removed-wait", CoreWaitStatus::InProgress),
+            started_at_ms: 0,
+        }));
+        builder.handle_thread_rollback(&ThreadRolledBackEvent { num_turns: 1 });
+        wait_history_test_start_turn(&mut builder, "current");
+        let mut end = codex_protocol::protocol::CollabWaitingEndEvent {
+            call_id: "removed-wait".into(),
+            sender_thread_id: ThreadId::new(),
+            statuses: HashMap::new(),
+            completed_at_ms: 0,
+            agent_statuses: Vec::new(),
+        };
+        builder.handle_collab_waiting_end(&end);
+        assert!(builder.active_turn_snapshot().unwrap().items.is_empty());
+        end.call_id = "legacy-only".into();
+        builder.handle_collab_waiting_end(&end);
+        assert_eq!(
+            builder.active_turn_snapshot().unwrap().items[0].id(),
+            "legacy-only"
+        );
+        builder.reset();
+        end.call_id = "removed-wait".into();
+        builder.handle_collab_waiting_end(&end);
+        assert_eq!(builder.finish()[0].items[0].id(), "removed-wait");
+    }
+
+    #[test]
+    fn ambiguous_retained_wait_ids_do_not_create_a_new_wait() {
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+        let mut builder = ThreadHistoryBuilder::new();
+        for turn in ["a", "b"] {
+            wait_history_test_start_turn(&mut builder, turn);
+            builder.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: turn.into(),
+                item: wait_history_test_item("same", CoreWaitStatus::InProgress),
+                started_at_ms: 0,
+            }));
+        }
+        wait_history_test_start_turn(&mut builder, "current");
+        builder.handle_collab_waiting_end(&codex_protocol::protocol::CollabWaitingEndEvent {
+            call_id: "same".into(),
+            sender_thread_id: ThreadId::new(),
+            statuses: HashMap::new(),
+            completed_at_ms: 0,
+            agent_statuses: Vec::new(),
+        });
+        assert!(builder.active_turn_snapshot().unwrap().items.is_empty());
+    }
+
+    #[test]
     fn canonical_hook_prompt_completion_updates_turn_history() {
         let hook_prompt = CoreTurnItem::HookPrompt(codex_protocol::items::HookPromptItem {
             id: "hook-prompt-1".into(),
@@ -5279,6 +5423,117 @@ mod tests {
             model_context_window: None,
             collaboration_mode_kind: Default::default(),
         }));
+    }
+
+    #[test]
+    fn late_wait_completion_keeps_its_retained_owner() {
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+        use codex_protocol::protocol::HasLegacyEvent;
+
+        for canonical in [false, true] {
+            let mut builder = ThreadHistoryBuilder::new();
+            wait_history_test_start_turn(&mut builder, "owner");
+            builder.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "owner".to_string(),
+                item: wait_history_test_item("wait", CoreWaitStatus::InProgress),
+                started_at_ms: 1,
+            }));
+            wait_history_test_start_turn(&mut builder, "new-turn");
+            let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "owner".to_string(),
+                item: wait_history_test_item("wait", CoreWaitStatus::Failed),
+                completed_at_ms: 2,
+            });
+            if canonical {
+                builder.handle_event(&completed);
+            }
+            for legacy in completed.as_legacy_events(false) {
+                builder.handle_event(&legacy);
+            }
+            let turns = builder.finish();
+            let owner = turns.iter().find(|turn| turn.id == "owner").expect("owner");
+            assert_eq!(owner.items.len(), 1);
+            let ThreadItem::CollabAgentToolCall { status, .. } = &owner.items[0] else {
+                panic!("wait");
+            };
+            assert_eq!(
+                *status,
+                if canonical {
+                    CollabAgentToolCallStatus::Failed
+                } else {
+                    CollabAgentToolCallStatus::Completed
+                }
+            );
+            assert!(
+                turns
+                    .iter()
+                    .filter(|turn| turn.id != "owner")
+                    .all(|turn| turn.items.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_notifications_use_explicit_owner_and_legacy_fallback() {
+        use crate::protocol::common::ServerNotification;
+        use crate::protocol::event_mapping::item_event_to_server_notification;
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+        for owner in ["owner", ""] {
+            let expected = if owner.is_empty() { "current" } else { owner };
+            let events = [
+                EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: wait_history_test_thread_id(),
+                    turn_id: owner.to_string(),
+                    item: wait_history_test_item("wait", CoreWaitStatus::InProgress),
+                    started_at_ms: 1,
+                }),
+                EventMsg::ItemCompleted(ItemCompletedEvent {
+                    thread_id: wait_history_test_thread_id(),
+                    turn_id: owner.to_string(),
+                    item: wait_history_test_item("wait", CoreWaitStatus::Failed),
+                    completed_at_ms: 2,
+                }),
+                EventMsg::ExecCommandBegin(codex_protocol::protocol::ExecCommandBeginEvent {
+                    call_id: "exec".into(),
+                    process_id: None,
+                    turn_id: owner.into(),
+                    started_at_ms: 1,
+                    command: vec!["echo".into()],
+                    cwd: test_path_buf("/tmp").abs().into(),
+                    parsed_cmd: Vec::new(),
+                    source: ExecCommandSource::Agent,
+                    interaction_input: None,
+                }),
+                EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                    call_id: "exec".into(),
+                    process_id: None,
+                    turn_id: owner.into(),
+                    completed_at_ms: 2,
+                    command: vec!["echo".into()],
+                    cwd: test_path_buf("/tmp").abs().into(),
+                    parsed_cmd: Vec::new(),
+                    source: ExecCommandSource::Agent,
+                    interaction_input: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    aggregated_output: String::new(),
+                    exit_code: 0,
+                    duration: Duration::from_millis(1),
+                    formatted_output: String::new(),
+                    status: CoreExecCommandStatus::Completed,
+                }),
+            ];
+            for event in events {
+                let actual = match item_event_to_server_notification(event, "thread", "current") {
+                    ServerNotification::ItemStarted(event) => event.turn_id,
+                    ServerNotification::ItemCompleted(event) => event.turn_id,
+                    _ => panic!("lifecycle notification"),
+                };
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]

@@ -165,18 +165,7 @@ def script_inventory() -> tuple[
         if path.suffix.lower() == ".py":
             python_sources.append(target)
             if path.name.lower().startswith("test_"):
-                if SCRIPTS_ROOT in path.parents:
-                    unittest_targets.append(
-                        path.relative_to(REPO_ROOT)
-                        .with_suffix("")
-                        .as_posix()
-                        .replace("/", ".")
-                    )
-                else:
-                    # unittest accepts repository-relative file paths. Keep
-                    # tests below non-package script roots discoverable even
-                    # when a path segment cannot be a Python identifier.
-                    unittest_targets.append(target)
+                unittest_targets.append(python_test_target(path.relative_to(REPO_ROOT)))
         kind = script_kind_for_path(path)
         if kind is not None:
             script_kinds.append((target, kind))
@@ -337,6 +326,7 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.test_publish_local_codex_freshness",
     ),
     "scripts/root_maintenance.py": ("scripts.test_build_tooling_policy",),
+    "scripts/process_owner.py": ("scripts.test_report_script_regressions",),
     "scripts/rust_build_status.py": ("scripts.test_build_tooling_storage",),
     "scripts/rust_build_status_support.py": ("scripts.test_build_tooling_storage",),
     "scripts/rust_packages.py": ("scripts.test_build_tooling_policy",),
@@ -355,7 +345,25 @@ def repository_relative_path(path_text: str) -> Path | None:
             path = path.relative_to(REPO_ROOT)
         except ValueError:
             return None
-    path = Path(*(part.lower() for part in path.parts))
+    if ".." in path.parts:
+        return None
+    # Resolve existing spelling on case-insensitive filesystems without
+    # lowercasing legitimate mixed-case modules on case-sensitive hosts.
+    if os.name == "nt" and (REPO_ROOT / path).exists():
+        current = REPO_ROOT
+        parts = []
+        for part in path.parts:
+            actual = next(
+                (
+                    item.name
+                    for item in current.iterdir()
+                    if item.name.casefold() == part.casefold()
+                ),
+                part,
+            )
+            parts.append(actual)
+            current = current / actual
+        path = Path(*parts)
     return path
 
 
@@ -363,10 +371,20 @@ def script_python_path(path_text: str) -> Path | None:
     path = repository_relative_path(path_text)
     if path is None:
         return None
-    first_part = path.parts[0] if path.parts else ""
-    if first_part == "scripts" and path.suffix.lower() == ".py":
+    absolute = REPO_ROOT / path
+    if (
+        path.suffix.lower() == ".py"
+        and not any(part in {".venv", "__pycache__"} for part in path.parts)
+        and any(root in absolute.parents for root in SCRIPT_AUDIT_ROOTS)
+    ):
         return path
     return None
+
+
+def python_test_target(path: Path) -> str:
+    if SCRIPTS_ROOT in (REPO_ROOT / path).parents:
+        return path.with_suffix("").as_posix().replace("/", ".")
+    return path.as_posix()
 
 
 def python_lint_targets(changed: Sequence[str]) -> list[str]:
@@ -465,19 +483,18 @@ def test_modules_for_changed_path(path_text: str) -> tuple[str, ...]:
     raw_path = repository_relative_path(path_text)
     if raw_path is None:
         return ()
-    path_key = raw_path.as_posix()
+    path_key = raw_path.as_posix().lower()
 
     selected = list(SCRIPT_TEST_MODULES.get(path_key, ()))
     path = script_python_path(path_text)
     if path is None:
         return tuple(selected)
-    module = path.with_suffix("").as_posix().replace("/", ".")
     if path.name.lower().startswith("test_"):
-        selected.append(module)
+        selected.append(python_test_target(path))
     else:
-        test_module = ".".join((*path.parts[:-1], f"test_{path.stem}"))
-        if (REPO_ROOT / path.with_name(f"test_{path.stem}.py")).is_file():
-            selected.append(test_module)
+        adjacent = path.with_name(f"test_{path.stem}.py")
+        if (REPO_ROOT / adjacent).is_file():
+            selected.append(python_test_target(adjacent))
     return tuple(dict.fromkeys(selected))
 
 

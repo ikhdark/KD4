@@ -20,18 +20,14 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         scenario = kd4_perf_snapshot.Scenario(
             "timeout", (sys.executable,), Path.cwd(), 2, "test"
         )
-        process = mock.MagicMock()
-        process.__enter__.return_value = process
-        process.pid = 12345
-        process.wait.side_effect = [subprocess.TimeoutExpired(scenario.command, 1), 0]
-        with (
-            mock.patch.object(subprocess, "Popen", return_value=process) as launch,
-            mock.patch.object(subprocess, "run", side_effect=OSError("cleanup failed")),
-        ):
+        with mock.patch.object(
+            kd4_perf_snapshot,
+            "owned_process",
+            side_effect=kd4_perf_snapshot.CleanupFailed("cleanup failed"),
+        ) as launch:
             with self.assertRaisesRegex(RuntimeError, "remaining measurements aborted"):
                 kd4_perf_snapshot.measure_scenario(scenario, timeout_seconds=1)
         self.assertEqual(launch.call_count, 1)
-        process.kill.assert_called_once_with()
 
     def test_timeout_stops_descendants_before_another_measurement(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

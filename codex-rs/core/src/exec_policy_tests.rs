@@ -371,7 +371,7 @@ async fn merges_requirements_exec_policy_network_rules() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn malformed_custom_rules_preserve_requirements_exec_policy() -> anyhow::Result<()> {
+async fn malformed_custom_rules_cannot_activate_a_partial_policy() -> anyhow::Result<()> {
     let temp_dir = tempdir()?;
     let policy_dir = temp_dir.path().join(RULES_DIR_NAME);
     fs::create_dir_all(&policy_dir)?;
@@ -394,15 +394,11 @@ async fn malformed_custom_rules_preserve_requirements_exec_policy() -> anyhow::R
     let config_stack =
         ConfigLayerStack::new(vec![layer], requirements, ConfigRequirementsToml::default())?;
 
-    let (policy, warning) = load_exec_policy_with_warning(&config_stack).await?;
-
-    assert!(matches!(warning, Some(ExecPolicyError::ParsePolicy { .. })));
-    assert_eq!(
-        policy
-            .check_multiple([vec!["rm".to_string()]].iter(), &|_| Decision::Allow)
-            .decision,
-        Decision::Forbidden
-    );
+    assert!(matches!(
+        load_exec_policy_with_warning(&config_stack).await,
+        Err(ExecPolicyError::ParsePolicy { .. })
+    ));
+    assert!(ExecPolicyManager::load(&config_stack).await.is_err());
     Ok(())
 }
 

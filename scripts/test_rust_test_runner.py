@@ -208,7 +208,7 @@ class FakeExecutor:
             return nextest_list_payload(self._listing_for(args))
         if args[:3] == ["cargo", "nextest", "run"]:
             return "\n".join(
-                f"{'SKIP' if ignored else 'PASS'} [ 0.001s] fixture {test}"
+                f"{'SKIP' if ignored else 'PASS'} [ 0.001s] {args[args.index('-p') + 1]}{'::' + self._selector_for(args) if '--test' in args else '::bin/' + args[args.index('--bin') + 1] if '--bin' in args else ''} {test}"
                 for test, ignored in self._listing_for(args).items()
             )
         if args[:2] == ["cargo", "build"]:
@@ -381,7 +381,7 @@ class RealExecutorTest(RunnerTestCase):
                 command = [
                     sys.executable,
                     "-c",
-                    f"print('PASS [0.1s] core mod::tests::alpha\\n' * {count}); print('x' * 2000000)",
+                    f"print('PASS [0.1s] codex-core mod::tests::alpha\\n' * {count}); print('x' * 2000000)",
                 ]
                 with mock.patch.object(
                     runner, "_gate_run_command", return_value=command
@@ -1336,9 +1336,7 @@ class RunGateTest(RunnerTestCase):
             captures,
             {
                 ("nextest", "list"): rust_test_runner.CAPTURE_STDOUT,
-                ("build", "--message-format=json-render-diagnostics"): (
-                    rust_test_runner.CAPTURE_STDOUT
-                ),
+                ("build", "--locked"): (rust_test_runner.CAPTURE_STDOUT),
                 # Gate completion evidence is parsed out of the run's own
                 # status lines, so this one stream stays captured.
                 ("nextest", "run"): rust_test_runner.CAPTURE_BOTH,

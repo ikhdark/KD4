@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
+use codex_code_mode_protocol::NestedCancellation;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::DelegateRequest;
@@ -18,7 +19,6 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
-use codex_code_mode_protocol::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::HostPeer;
@@ -55,6 +55,7 @@ async fn revoked_callback_after_cell_closure_does_not_recreate_route() {
                 cell_id: cell.clone(),
                 content_items: Vec::new(),
                 error_text: None,
+                output_loss: None,
             })
             .expect("response receiver");
         initial.await.expect("initial response");
@@ -95,12 +96,16 @@ async fn early_closure_wait_releases_route_and_permit_on_disconnect() {
     let (_response_tx, response_rx) = oneshot::channel();
     let (initial_tx, mut initial_rx) = oneshot::channel();
     let permits = Arc::new(Semaphore::new(1));
-    let (messages_tx, messages_rx) = mpsc::channel(1);
-    assert!(messages_tx.try_send(super::CellMessage::Closed).is_ok());
-    peer.cell_routes
+    let messages_rx = Arc::new(super::CellQueue::default());
+    messages_rx
+        .messages
         .lock()
-        .expect("routes")
-        .insert(key.clone(), super::CellRoute::Active(messages_tx));
+        .unwrap()
+        .push_back(super::CellMessage::Closed);
+    peer.cell_routes.lock().expect("routes").insert(
+        key.clone(),
+        super::CellRoute::Active(Arc::clone(&messages_rx)),
+    );
     let mut forwarding = Box::pin(super::drive_cell(
         Arc::clone(&peer),
         key,
@@ -149,7 +154,7 @@ fn outgoing_overflow_records_failure() {
 }
 
 #[test]
-fn cell_queue_overflow_records_failure() {
+fn cell_closure_has_reserved_capacity() {
     let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
     let peer = HostPeer::new(outgoing_tx);
     let cell = CellId::new("pending-cell".to_string());
@@ -175,11 +180,13 @@ fn cell_queue_overflow_records_failure() {
     }
     assert!(!peer.is_disconnected());
     peer.close_cell(key.0, cell);
-    assert!(peer.is_disconnected());
-    assert_eq!(
-        peer.failure(),
-        Some("code-mode cell message queue is full".to_string())
-    );
+    assert!(!peer.is_disconnected());
+    let routes = peer.cell_routes.lock().unwrap();
+    let super::CellRoute::Pending(messages) = routes.values().next().unwrap() else {
+        panic!("pending cell")
+    };
+    assert_eq!(messages.len(), super::CELL_MESSAGE_CAPACITY + 1);
+    assert!(matches!(messages.back(), Some(super::CellMessage::Closed)));
 }
 
 #[tokio::test]
@@ -258,6 +265,51 @@ async fn activation_preserves_buffered_delegate_order() {
     .expect("ordered delegates must complete");
 }
 
+#[tokio::test]
+async fn cancelled_queued_calls_release_payloads_and_capacity_before_forwarding() {
+    for active in [false, true] {
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);
+        let peer = Arc::new(HostPeer::new(outgoing_tx));
+        let cell = CellId::new("cancel-storm".to_string());
+        let key = (session_id("session"), cell.clone());
+        if active {
+            peer.cell_routes.lock().unwrap().insert(
+                key.clone(),
+                super::CellRoute::Active(Arc::new(super::CellQueue::default())),
+            );
+        }
+        for _ in 0..super::CELL_MESSAGE_CAPACITY * 2 {
+            let mut call = Box::pin(peer.call(
+                key.0.clone(),
+                DelegateRequest::Notify {
+                    call_id: "notify".to_string(),
+                    cell_id: cell.clone().into(),
+                    text: "x".repeat(4096),
+                },
+                NestedCancellation::new(CancellationToken::new()),
+            ));
+            assert!(
+                call.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(call);
+            let routes = peer.cell_routes.lock().unwrap();
+            let len = match routes.get(&key).unwrap() {
+                super::CellRoute::Pending(messages) => messages.len(),
+                super::CellRoute::Active(queue) => queue.messages.lock().unwrap().len(),
+            };
+            assert_eq!(len, 0);
+            assert_eq!(
+                peer.delegate_permits.available_permits(),
+                MAX_PENDING_DELEGATE_CALLS
+            );
+        }
+        peer.close_cell(key.0, cell);
+        assert!(!peer.is_disconnected());
+    }
+}
+
 #[test]
 fn route_rechecks_revocation_before_buffering() {
     let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
@@ -316,6 +368,7 @@ async fn start_cell_reports_when_initial_response_is_enqueued() {
             cell_id: cell_id.clone(),
             content_items: Vec::new(),
             error_text: None,
+            output_loss: None,
         })
         .expect("initial response receiver");
     initial_response_sent

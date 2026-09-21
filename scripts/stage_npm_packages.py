@@ -3,7 +3,7 @@
 
 import argparse
 import errno
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -31,6 +31,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.atomic_json import write_json_atomic  # noqa: E402
+from scripts.process_owner import (  # noqa: E402
+    run_owned,
+    check_output_owned,
+    OwnedThreadPoolExecutor as ThreadPoolExecutor,
+    operation,
+)
 from scripts.codex_package.targets import BINARY_TARGETS  # noqa: E402
 
 from scripts.stage_npm_archives import (  # noqa: E402
@@ -247,7 +254,7 @@ def resolve_github_repo(override: str | None) -> str:
     if override:
         return override
     try:
-        repo = subprocess.check_output(
+        repo = check_output_owned(
             ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
             cwd=REPO_ROOT,
             text=True,
@@ -371,7 +378,7 @@ def expand_packages(packages: list[str]) -> list[str]:
 def resolve_release_workflow(
     version: str, github_repo: str, workflow_name: str
 ) -> dict:
-    stdout = subprocess.check_output(
+    stdout = check_output_owned(
         [
             "gh",
             "run",
@@ -403,7 +410,7 @@ def resolve_workflow_url(
 ) -> tuple[str, str | None]:
     if override:
         reference = parse_workflow_run_url(override)
-        stdout = subprocess.check_output(
+        stdout = check_output_owned(
             [
                 "gh",
                 "run",
@@ -446,10 +453,10 @@ def ensure_source_matches_workflow(
     allow_mismatch: bool = False,
     owned_paths: Sequence[Path] = (),
 ) -> None:
-    current_head_sha = subprocess.check_output(
+    current_head_sha = check_output_owned(
         ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
     ).strip()
-    dirty_output = subprocess.check_output(
+    dirty_output = check_output_owned(
         ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
         cwd=repo_root,
     )
@@ -514,7 +521,7 @@ def parse_porcelain_v1_z(output: bytes) -> list[tuple[Path, ...]]:
 def list_workflow_artifacts(
     workflow_id: str, github_repo: str
 ) -> tuple[WorkflowArtifact, ...]:
-    stdout = subprocess.check_output(
+    stdout = check_output_owned(
         [
             "gh",
             "api",
@@ -724,7 +731,7 @@ def download_single_artifact(
             )
             try:
                 with archive_path.open("wb") as archive_handle:
-                    subprocess.run(
+                    run_owned(
                         [
                             "gh",
                             "api",
@@ -924,14 +931,14 @@ def format_command(cmd: list[str]) -> str:
 
 def run_command(cmd: list[str]) -> None:
     print(format_command(cmd), flush=True)
-    subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+    run_owned(cmd, cwd=REPO_ROOT, check=True)
 
 
 def run_command_capture(cmd: list[str]) -> str:
-    with tempfile.TemporaryFile() as output:
-        result = subprocess.run(
-            cmd, cwd=REPO_ROOT, stdout=output, stderr=subprocess.STDOUT
-        )
+    with tempfile.NamedTemporaryFile(
+        prefix="npm-stage-", suffix=".log", delete=False
+    ) as output:
+        result = run_owned(cmd, cwd=REPO_ROOT, stdout=output, stderr=subprocess.STDOUT)
         size = output.tell()
         output.seek(0)
         if size <= MAX_CAPTURED_LOG_CHARS:
@@ -942,7 +949,7 @@ def run_command_capture(cmd: list[str]) -> str:
             output.seek(-half, os.SEEK_END)
             tail = output.read(half).decode("utf-8", errors="replace")
             captured = f"{prefix}\n...[truncated {size - 2 * half} bytes]...\n{tail}"
-    log = format_command(cmd) + "\n" + captured
+    log = format_command(cmd) + "\n" + captured + f"\nFull log: {output.name}"
     if result.returncode != 0:
         raise RuntimeError(
             f"Command failed with exit code {result.returncode}:\n{log.rstrip()}"
@@ -1106,55 +1113,108 @@ def replace_package_file(source: Path, destination: Path) -> None:
         # The staging directory's owner removes this source after activation.
 
 
+def recover_package_activation(output_dir: Path) -> None:
+    journal = output_dir / ".npm-activation.json"
+    if not journal.exists():
+        return
+    state = json.loads(journal.read_text(encoding="utf-8"))
+    if state.get("version") != 1 or state.get("phase") not in {
+        "preparing",
+        "committed",
+    }:
+        raise ValueError("invalid npm activation journal")
+    entries = state.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("invalid npm activation entries")
+    seen = set()
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("name"), str)
+            or not entry["name"].endswith(".tgz")
+            or entry["name"] in seen
+            or not isinstance(entry.get("backup"), str)
+            or not re.fullmatch(
+                re.escape("." + entry["name"] + ".") + r"[0-9a-f]{32}\.old",
+                entry["backup"],
+            )
+        ):
+            raise ValueError("invalid npm activation filenames")
+        seen.add(entry["name"])
+    for entry in reversed(entries):
+        for key in ("name", "backup"):
+            if Path(entry[key]).name != entry[key] or entry[key] in {".", ".."}:
+                raise ValueError("npm recovery path must be an output filename")
+        destination, backup = output_dir / entry["name"], output_dir / entry["backup"]
+        if destination.is_symlink() or backup.is_symlink():
+            raise ValueError("npm recovery refuses indirect outputs")
+        current = file_sha256(destination) if destination.exists() else None
+        if current not in {None, entry["old"], entry["new"]}:
+            raise ValueError(f"npm recovery found external edits: {destination}")
+        if backup.exists() and file_sha256(backup) != entry["old"]:
+            raise ValueError(f"npm backup changed: {backup}")
+        if state["phase"] == "committed":
+            if current != entry["new"]:
+                raise ValueError(
+                    f"committed npm output is missing or changed: {destination}"
+                )
+        elif backup.exists():
+            if file_sha256(backup) != entry["old"]:
+                raise ValueError(f"npm backup changed: {backup}")
+            backup.replace(destination)
+        elif entry["old"] is None:
+            destination.unlink(missing_ok=True)
+        elif current != entry["old"]:
+            raise ValueError(f"npm previous generation unavailable: {destination}")
+        backup.unlink(missing_ok=True)
+    journal.unlink()
+
+
 def commit_staged_packages(
     results: Sequence[StagePackageResult], output_dir: Path
 ) -> list[StagePackageResult]:
+    output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    committed: list[tuple[Path, Path | None, Path]] = []
-    try:
+    with exclusive_file_lock(output_dir / ".npm-activation.lock"):
+        recover_package_activation(output_dir)
+        entries = []
         for result in results:
-            source = result.pack_output
-            destination = output_dir / source.name
-            backup = output_dir / f".{source.name}.{uuid.uuid4().hex}.old"
-            existing_backup: Path | None = None
-            if destination.exists():
-                destination.replace(backup)
-                existing_backup = backup
-            try:
-                replace_package_file(source, destination)
-            except Exception:
-                if existing_backup is not None and not destination.exists():
-                    existing_backup.replace(destination)
-                raise
-            committed.append((destination, existing_backup, source))
-    except Exception:
-        for destination, backup, source in reversed(committed):
-            if destination.exists():
-                replace_package_file(destination, source)
-                destination.unlink(missing_ok=True)
-            if backup is not None and backup.exists():
-                backup.replace(destination)
-        raise
-
-    for _destination, backup, _source in committed:
-        if backup is None or not backup.exists():
-            continue
-        try:
-            backup.unlink()
-        except OSError as error:
-            print(
-                f"warning: package activation succeeded, but backup cleanup failed "
-                f"for {backup}: {error}",
-                file=sys.stderr,
+            destination = output_dir / result.pack_output.name
+            if destination.is_symlink() or destination.resolve().parent != output_dir:
+                raise ValueError("npm output escapes destination")
+            entries.append(
+                {
+                    "name": destination.name,
+                    "backup": f".{destination.name}.{uuid.uuid4().hex}.old",
+                    "old": file_sha256(destination) if destination.exists() else None,
+                    "new": file_sha256(result.pack_output),
+                }
             )
-
-    destinations = {
-        destination.name: destination for destination, _backup, _source in committed
-    }
+        if len({entry["name"] for entry in entries}) != len(entries):
+            raise ValueError("duplicate npm output filenames")
+        journal = output_dir / ".npm-activation.json"
+        state = {"version": 1, "phase": "preparing", "entries": entries}
+        write_json_atomic(journal, state)
+        try:
+            for result, entry in zip(results, entries):
+                destination = output_dir / entry["name"]
+                if destination.exists():
+                    destination.replace(output_dir / entry["backup"])
+                replace_package_file(result.pack_output, destination)
+                if file_sha256(destination) != entry["new"]:
+                    raise ValueError(
+                        f"npm output changed during activation: {destination}"
+                    )
+            state["phase"] = "committed"
+            write_json_atomic(journal, state)
+        except BaseException:
+            recover_package_activation(output_dir)
+            raise
+        recover_package_activation(output_dir)
     return [
         StagePackageResult(
             package=result.package,
-            pack_output=destinations[result.pack_output.name],
+            pack_output=output_dir / result.pack_output.name,
             log=result.log,
         )
         for result in results
@@ -1162,6 +1222,11 @@ def commit_staged_packages(
 
 
 def main() -> int:
+    with operation(float(os.environ.get("CODEX_NPM_STAGE_TIMEOUT_SECONDS", "3600"))):
+        return _main()
+
+
+def _main() -> int:
     args = parse_args()
     vendor_src_arg = getattr(args, "vendor_src", None)
 

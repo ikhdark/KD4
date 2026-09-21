@@ -88,6 +88,7 @@ impl SkillProvider for HostSkillProvider {
 
 fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
     let mut catalog = SkillCatalog {
+        continuation: None,
         entries: Vec::new(),
         warnings: outcome
             .errors

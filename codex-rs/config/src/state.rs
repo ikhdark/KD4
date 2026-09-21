@@ -115,7 +115,7 @@ pub struct ConfigLayerEntry {
 
 #[derive(Debug, Clone, PartialEq)]
 struct RawTomlLayer {
-    contents: String,
+    contents: std::sync::Arc<str>,
     base_dir: AbsolutePathBuf,
 }
 
@@ -145,7 +145,7 @@ impl ConfigLayerEntry {
             version,
             disabled_reason: None,
             raw_toml: Some(RawTomlLayer {
-                contents: raw_toml,
+                contents: raw_toml.into(),
                 base_dir: raw_toml_base_dir,
             }),
             hooks_config_folder_override: None,
@@ -172,10 +172,18 @@ impl ConfigLayerEntry {
         self.disabled_reason.is_some()
     }
 
+    pub(crate) fn with_raw_toml(mut self, contents: String, base_dir: AbsolutePathBuf) -> Self {
+        self.raw_toml = Some(RawTomlLayer {
+            contents: contents.into(),
+            base_dir,
+        });
+        self
+    }
+
     pub fn raw_toml(&self) -> Option<&str> {
         self.raw_toml
             .as_ref()
-            .map(|raw_toml| raw_toml.contents.as_str())
+            .map(|raw_toml| raw_toml.contents.as_ref())
     }
 
     pub fn raw_toml_base_dir(&self) -> Option<&AbsolutePathBuf> {

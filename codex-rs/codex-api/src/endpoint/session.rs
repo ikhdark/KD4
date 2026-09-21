@@ -146,7 +146,48 @@ impl<T: HttpTransport> EndpointSession<T> {
     where
         C: Fn(&mut Request),
     {
-        let body = body.map(RequestBody::Json);
+        self.execute_body_with(
+            method,
+            path,
+            extra_headers,
+            body.map(RequestBody::Json),
+            configure,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_encoded_json_with<C>(
+        &self,
+        method: Method,
+        path: &str,
+        extra_headers: HeaderMap,
+        body: EncodedJsonBody,
+        configure: C,
+    ) -> Result<Response, ApiError>
+    where
+        C: Fn(&mut Request),
+    {
+        self.execute_body_with(
+            method,
+            path,
+            extra_headers,
+            Some(RequestBody::EncodedJson(body)),
+            configure,
+        )
+        .await
+    }
+
+    async fn execute_body_with<C>(
+        &self,
+        method: Method,
+        path: &str,
+        extra_headers: HeaderMap,
+        body: Option<RequestBody>,
+        configure: C,
+    ) -> Result<Response, ApiError>
+    where
+        C: Fn(&mut Request),
+    {
         let mut request = self.make_request(&method, path, &extra_headers, body);
         configure(&mut request);
         let request = prepare_request(request).await?;

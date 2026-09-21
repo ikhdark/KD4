@@ -15,6 +15,7 @@ use toml::Value as TomlValue;
 #[derive(Debug, Clone)]
 pub(super) struct MangedConfigFromFile {
     pub managed_config: TomlValue,
+    pub raw_toml: String,
     pub file: AbsolutePathBuf,
 }
 
@@ -54,8 +55,9 @@ pub(super) async fn load_config_layers_internal(
         strict_config,
     )
     .await?
-    .map(|loaded| MangedConfigFromFile {
+    .map(|(loaded, raw_toml)| MangedConfigFromFile {
         managed_config: loaded,
+        raw_toml,
         file: managed_config_path.clone(),
     });
 
@@ -72,7 +74,7 @@ pub(super) async fn read_config_from_path(
     path: &AbsolutePathBuf,
     log_missing_as_info: bool,
     strict_config: bool,
-) -> io::Result<Option<TomlValue>> {
+) -> io::Result<Option<(TomlValue, String)>> {
     let path_uri = PathUri::from_abs_path(path);
     match fs.read_file_text(&path_uri, /*sandbox*/ None).await {
         Ok(contents) => match toml::from_str::<TomlValue>(&contents) {
@@ -81,7 +83,7 @@ pub(super) async fn read_config_from_path(
                 if strict_config {
                     validate_config_toml_strictly(path, &contents, &value)?;
                 }
-                Ok(Some(value))
+                Ok(Some((value, contents)))
             }
             Err(err) => {
                 tracing::error!("Failed to parse {}: {err}", path.as_path().display());

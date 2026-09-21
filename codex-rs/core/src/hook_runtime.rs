@@ -171,17 +171,18 @@ pub(crate) async fn run_pre_tool_use_hooks(
         updated_input,
     } = hooks.run_pre_tool_use(request).await;
     emit_hook_completed_events(sess, turn_context, hook_events).await;
-    record_additional_contexts(sess, turn_context, additional_contexts).await;
+    if let Err(error) = record_additional_contexts(sess, turn_context, additional_contexts).await {
+        return PreToolUseHookResult::Blocked(format!("Could not record hook context: {error}"));
+    }
 
     if !should_block {
         return PreToolUseHookResult::Continue { updated_input };
     }
 
-    let Some(reason) = block_reason else {
-        return PreToolUseHookResult::Continue {
-            updated_input: None,
-        };
-    };
+    let reason = block_reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or("no reason was provided by the hook");
 
     if (tool_name.name() == "Bash" || tool_name.name() == "apply_patch")
         && let Some(command) = tool_input.get("command").and_then(Value::as_str)
@@ -615,26 +616,22 @@ pub(crate) async fn record_pending_input(
     turn_context: &Arc<TurnContext>,
     pending_input: TurnInput,
     additional_contexts: Vec<String>,
-) {
+) -> std::io::Result<()> {
     match pending_input {
         TurnInput::UserInput { content, client_id } => {
-            sess.record_user_prompt_and_emit_turn_item(
-                turn_context.as_ref(),
-                content.as_slice(),
-                client_id,
-            )
-            .await;
+            sess.record_user_prompt_and_emit_turn_item(turn_context, content.as_slice(), client_id)
+                .await?;
         }
         TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                .await;
+            sess.record_conversation_items_ordered(turn_context, std::slice::from_ref(&item))
+                .await?;
         }
         TurnInput::InterAgentCommunication(communication) => {
             sess.record_inter_agent_communication(turn_context, communication)
-                .await;
+                .await?;
         }
     }
-    record_additional_contexts(sess, turn_context, additional_contexts).await;
+    record_additional_contexts(sess, turn_context, additional_contexts).await
 }
 
 async fn run_context_injecting_hook<Fut>(
@@ -668,8 +665,20 @@ impl HookRuntimeOutcome {
         sess: &Arc<Session>,
         turn_context: &Arc<TurnContext>,
     ) -> bool {
-        record_session_start_additional_contexts(sess, turn_context, self.additional_contexts)
+        if let Err(error) =
+            record_session_start_additional_contexts(sess, turn_context, self.additional_contexts)
+                .await
+        {
+            sess.send_event(
+                turn_context,
+                EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: format!("Could not record SessionStart hook context: {error}"),
+                    codex_error_info: None,
+                }),
+            )
             .await;
+            return true;
+        }
 
         if self.should_stop {
             emit_hook_stop_reason(
@@ -707,42 +716,46 @@ pub(crate) async fn record_additional_contexts(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
-) {
+) -> std::io::Result<()> {
     let developer_messages =
         prepare_additional_context_items(sess, turn_context, additional_contexts).await;
     if developer_messages.is_empty() {
-        return;
+        return Ok(());
     }
 
-    sess.record_conversation_items(turn_context, developer_messages.as_slice())
-        .await;
+    sess.record_conversation_items_ordered(turn_context, developer_messages.as_slice())
+        .await
 }
 
 async fn record_session_start_additional_contexts(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
-) {
-    let developer_messages =
-        prepare_additional_context_items(sess, turn_context, additional_contexts).await;
+) -> std::io::Result<()> {
+    // Compare original rendered contributions before spending the turn budget.
+    let candidates = additional_contexts
+        .into_iter()
+        .map(|text| ContextualUserFragment::into(HookAdditionalContext::new(text)))
+        .collect();
+    let candidates = sess.dedupe_existing_developer_contexts(candidates).await;
+    let contexts = candidates
+        .iter()
+        .filter_map(single_developer_input_text)
+        .map(str::to_owned)
+        .collect();
+    let developer_messages = prepare_additional_context_items(sess, turn_context, contexts).await;
     if developer_messages.is_empty() {
-        return;
+        return Ok(());
     }
-    let developer_messages = sess
-        .dedupe_existing_developer_contexts(developer_messages)
-        .await;
-    if developer_messages.is_empty() {
-        return;
-    }
-    sess.record_conversation_items(turn_context, developer_messages.as_slice())
-        .await;
+    sess.record_conversation_items_ordered(turn_context, developer_messages.as_slice())
+        .await
 }
 
 pub(crate) fn dedupe_existing_developer_contexts(
     existing: &[ResponseItem],
     candidates: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
-    let existing_text = existing
+    let mut existing_text = existing
         .iter()
         .filter_map(|item| match item {
             ResponseItem::Message { role, content, .. } if role == "developer" => Some(content),
@@ -750,14 +763,15 @@ pub(crate) fn dedupe_existing_developer_contexts(
         })
         .flatten()
         .filter_map(|item| match item {
-            codex_protocol::models::ContentItem::InputText { text } => Some(text.as_str()),
+            codex_protocol::models::ContentItem::InputText { text } => Some(text.clone()),
             _ => None,
         })
         .collect::<HashSet<_>>();
     candidates
         .into_iter()
         .filter(|candidate| {
-            single_developer_input_text(candidate).is_none_or(|text| !existing_text.contains(text))
+            single_developer_input_text(candidate)
+                .is_none_or(|text| existing_text.insert(text.to_owned()))
         })
         .collect()
 }
@@ -784,7 +798,10 @@ pub(crate) async fn prepare_additional_context_items(
         return Vec::new();
     }
     let total = additional_contexts.len();
-    let messages = additional_context_messages(additional_contexts);
+    let messages = {
+        let mut budget = turn_context.hook_context_budget.lock().await;
+        additional_context_messages_with_budget(additional_contexts, &mut budget)
+    };
     let omitted = total - messages.len();
     if omitted > 0 {
         sess.send_event(
@@ -800,8 +817,15 @@ pub(crate) async fn prepare_additional_context_items(
     messages
 }
 
+#[cfg(test)]
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {
-    let mut budget = ModelContextBudget::default();
+    additional_context_messages_with_budget(additional_contexts, &mut ModelContextBudget::default())
+}
+
+fn additional_context_messages_with_budget(
+    additional_contexts: Vec<String>,
+    budget: &mut ModelContextBudget,
+) -> Vec<ResponseItem> {
     additional_contexts
         .into_iter()
         .map(HookAdditionalContext::new)
@@ -961,6 +985,8 @@ mod tests {
     use super::hook_run_metric_tags;
     use super::prepare_additional_context_items;
     use crate::session::tests::make_session_and_context;
+    use codex_context_fragments::ModelContextBudget;
+    use codex_protocol::protocol::EventMsg;
 
     #[tokio::test]
     async fn legacy_after_agent_failure_warns_and_allows_completion() {
@@ -1127,15 +1153,14 @@ mod tests {
         let messages =
             prepare_additional_context_items(&session, &turn, vec!["small context".to_string()])
                 .await;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            super::single_developer_input_text(&messages[0]),
-            Some("small context")
-        );
         assert!(
-            events.try_recv().is_err(),
-            "fully admitted context needs no warning"
+            messages.is_empty(),
+            "later contributions share the turn allowance"
         );
+        assert!(matches!(
+            events.try_recv().expect("budget warning").msg,
+            EventMsg::Warning(_)
+        ));
     }
 
     #[tokio::test]
@@ -1221,13 +1246,15 @@ mod tests {
         };
         session
             .record_conversation_items(&turn, std::slice::from_ref(&existing))
-            .await;
+            .await
+            .unwrap();
         super::record_session_start_additional_contexts(
             &session,
             &turn,
             vec!["second context".to_string(), "new context".to_string()],
         )
-        .await;
+        .await
+        .unwrap();
         let history = session.clone_history().await;
         let developer_contents = history
             .raw_items()
@@ -1351,5 +1378,33 @@ mod tests {
             duration_ms: Some(27),
             entries: Vec::new(),
         }
+    }
+    #[tokio::test]
+    async fn audit_startup_duplicates_do_not_displace_new_context() {
+        let (session, turn) = make_session_and_context().await;
+        let session = std::sync::Arc::new(session);
+        let turn = std::sync::Arc::new(turn);
+        let existing = "a".repeat(ModelContextBudget::default().remaining_bytes());
+        session
+            .record_conversation_items(&turn, &additional_context_messages(vec![existing.clone()]))
+            .await
+            .unwrap();
+        super::record_session_start_additional_contexts(
+            &session,
+            &turn,
+            vec![existing, "new context".into(), "new context".into()],
+        )
+        .await
+        .unwrap();
+        let candidates = session
+            .dedupe_existing_developer_contexts(additional_context_messages(vec![
+                "new context".into(),
+            ]))
+            .await;
+        assert!(candidates.is_empty(), "new context must have been recorded");
+        assert_eq!(
+            turn.hook_context_budget.lock().await.remaining_bytes(),
+            ModelContextBudget::default().remaining_bytes() - "new context".len()
+        );
     }
 }

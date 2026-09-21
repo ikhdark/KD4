@@ -1,6 +1,7 @@
 use super::input_queue::TurnInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
+use crate::codex_thread::InjectResponseItemsError;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::state::ActiveTurn;
@@ -20,13 +21,13 @@ impl Session {
     pub async fn inject_if_running(
         &self,
         input: Vec<ResponseItem>,
-    ) -> Result<(), Vec<ResponseItem>> {
+    ) -> Result<(), InjectResponseItemsError> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             // Terminalization has detached the worker and may already have drained its queue.
             // Let the caller record late context in history instead of losing it on detach.
             Some(active_turn) if active_turn.task.is_none() && active_turn.terminal.is_some() => {
-                Err(input)
+                Err(InjectResponseItemsError::NoActiveTurn(input))
             }
             Some(active_turn) => {
                 let pending_input = input
@@ -40,10 +41,16 @@ impl Session {
                         &pending_input,
                     )
                     .await
-                    .map_err(|_| input)?;
+                    .map_err(
+                        |error| InjectResponseItemsError::PendingInputLimitExceeded {
+                            input,
+                            max_items: error.max_items,
+                            max_bytes: error.max_bytes,
+                        },
+                    )?;
                 Ok(())
             }
-            None => Err(input),
+            None => Err(InjectResponseItemsError::NoActiveTurn(input)),
         }
     }
 
@@ -56,13 +63,13 @@ impl Session {
     async fn inject_internal_if_running(
         &self,
         input: Vec<ResponseItem>,
-    ) -> Result<(), Vec<ResponseItem>> {
+    ) -> Result<(), InjectResponseItemsError> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             // Terminalization has detached the worker and may already have drained its queue.
             // Let the caller record late context in history instead of losing it on detach.
             Some(active_turn) if active_turn.task.is_none() && active_turn.terminal.is_some() => {
-                Err(input)
+                Err(InjectResponseItemsError::NoActiveTurn(input))
             }
             Some(active_turn) => {
                 let pending_input = input
@@ -76,10 +83,16 @@ impl Session {
                         &pending_input,
                     )
                     .await
-                    .map_err(|_| input)?;
+                    .map_err(
+                        |error| InjectResponseItemsError::PendingInputLimitExceeded {
+                            input,
+                            max_items: error.max_items,
+                            max_bytes: error.max_bytes,
+                        },
+                    )?;
                 Ok(())
             }
-            None => Err(input),
+            None => Err(InjectResponseItemsError::NoActiveTurn(input)),
         }
     }
 
@@ -97,9 +110,9 @@ impl Session {
         if input.is_empty() {
             return Ok(());
         }
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
+        if self.input_queue.has_pending_turn_start_work().await {
             return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                TryStartTurnIfIdleRejectionReason::PendingTurnStartWork,
                 input,
             ));
         }
@@ -113,11 +126,11 @@ impl Session {
         let Ok(task_start_permit) = self.task_start_gate.acquire().await else {
             unreachable!("session-owned task-start semaphore is never closed");
         };
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
+        if self.input_queue.has_pending_turn_start_work().await {
             drop(task_start_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                TryStartTurnIfIdleRejectionReason::PendingTurnStartWork,
                 input,
             ));
         }
@@ -141,12 +154,12 @@ impl Session {
         };
         let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
 
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
+        if self.input_queue.has_pending_turn_start_work().await {
             self.clear_reserved_idle_turn(&turn_state).await;
             drop(task_start_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                TryStartTurnIfIdleRejectionReason::PendingTurnStartWork,
                 input,
             ));
         }
@@ -165,12 +178,12 @@ impl Session {
         }
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
+        if self.input_queue.has_pending_turn_start_work().await {
             self.clear_reserved_idle_turn(&turn_state).await;
             drop(task_start_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                TryStartTurnIfIdleRejectionReason::PendingTurnStartWork,
                 input,
             ));
         }
@@ -235,9 +248,15 @@ impl Session {
         &self,
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
-    ) {
-        let Err(items) = self.inject_if_running(items).await else {
-            return;
+    ) -> codex_protocol::error::Result<()> {
+        let items = match self.inject_if_running(items).await {
+            Ok(()) => return Ok(()),
+            Err(InjectResponseItemsError::NoActiveTurn(items)) => items,
+            Err(error) => {
+                return Err(codex_protocol::error::CodexErr::InvalidRequest(
+                    error.to_string(),
+                ));
+            }
         };
         let default_turn_context;
         let turn_context = match current_turn_context {
@@ -247,7 +266,8 @@ impl Session {
                 default_turn_context.as_ref()
             }
         };
-        self.record_conversation_items(turn_context, &items).await;
+        self.record_conversation_items(turn_context, &items).await?;
+        Ok(())
     }
 
     /// Injects internal runtime context into active work, or records it without
@@ -258,8 +278,10 @@ impl Session {
         items: Vec<ResponseItem>,
         current_turn_context: Option<&Arc<TurnContext>>,
     ) -> std::io::Result<()> {
-        let Err(items) = self.inject_internal_if_running(items).await else {
-            return Ok(());
+        let items = match self.inject_internal_if_running(items).await {
+            Ok(()) => return Ok(()),
+            Err(InjectResponseItemsError::NoActiveTurn(items)) => items,
+            Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, error)),
         };
         let default_turn_context;
         let turn_context = match current_turn_context {
@@ -300,6 +322,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_start_yields_to_recovered_user_input() {
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let input = TurnInput::UserInput {
+            content: vec![codex_protocol::user_input::UserInput::Text {
+                text: "accepted user work".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        };
+        session
+            .input_queue
+            .restore_transferred_startup_input(vec![input.clone()])
+            .await;
+        let automatic = objective_update_item();
+        let error = session
+            .try_start_turn_if_idle(vec![automatic.clone()])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.reason(),
+            TryStartTurnIfIdleRejectionReason::PendingTurnStartWork
+        );
+        assert_eq!(error.into_input(), vec![automatic]);
+        assert!(session.active_turn.lock().await.is_none());
+        assert_eq!(
+            session
+                .input_queue
+                .get_pending_input(&session.active_turn)
+                .await,
+            vec![input]
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_injection_never_falls_back_to_history() {
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let active = ActiveTurn::default();
+        let turn_state = Arc::clone(&active.turn_state);
+        *session.active_turn.lock().await = Some(active);
+        let internal = vec![TurnInput::InternalResponseItem(ResponseItem::Other); 1024];
+        session
+            .input_queue
+            .extend_pending_input_for_turn_state(&turn_state, &internal)
+            .await
+            .unwrap();
+        let item = objective_update_item();
+        let rejected = session
+            .inject_if_running(vec![item.clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(rejected, InjectResponseItemsError::PendingInputLimitExceeded { input, .. } if input == vec![item.clone()])
+        );
+        assert!(
+            session
+                .inject_no_new_turn(vec![item.clone()], None)
+                .await
+                .is_err()
+        );
+        let error = session
+            .inject_internal_no_new_turn(vec![item.clone()], None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(session.clone_history().await.raw_items().is_empty());
+        assert_eq!(
+            session
+                .input_queue
+                .pending_activity(Some(&turn_state), false)
+                .await,
+            None
+        );
+        assert_eq!(
+            session
+                .input_queue
+                .take_pending_input_for_turn_state(&turn_state)
+                .await,
+            internal
+        );
+        session.inject_if_running(vec![item.clone()]).await.unwrap();
+        assert_eq!(
+            session
+                .input_queue
+                .pending_activity(Some(&turn_state), false)
+                .await,
+            Some(InputQueueActivity::Steer)
+        );
+        assert_eq!(
+            session
+                .input_queue
+                .take_pending_input_for_turn_state(&turn_state)
+                .await,
+            vec![TurnInput::ResponseItem(item)]
+        );
+    }
+
+    #[tokio::test]
     async fn late_notifications_are_recorded_after_finalizer_detaches_worker() {
         for internal in [false, true] {
             let (session, turn_context) = crate::session::tests::make_session_and_context().await;
@@ -323,7 +444,8 @@ mod tests {
             } else {
                 session
                     .inject_no_new_turn(vec![objective_update_item()], None)
-                    .await;
+                    .await
+                    .expect("late context recorded");
             }
 
             assert!(

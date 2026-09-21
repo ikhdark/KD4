@@ -151,6 +151,11 @@ impl ShellSnapshot {
     ) -> Option<Arc<ShellSnapshotFile>> {
         let config = self.config.as_ref()?;
         let shell = environment.shell.clone()?;
+        // Recreating function text loses variables and module session state.
+        // Let execution use its configured profile until replay can preserve it.
+        if shell.shell_type == ShellType::PowerShell {
+            return None;
+        }
         if environment.environment.is_remote() {
             Self::build_for_remote_environment(
                 Arc::clone(config),
@@ -375,23 +380,32 @@ impl ShellSnapshot {
                 return Err("write_failed");
             }
         };
-        if let Err(err) = filesystem
-            .write_file(&path, contents.as_bytes().to_vec(), None)
-            .await
-        {
-            tracing::warn!("Failed to write remote shell snapshot: {err:?}");
-            return Err("write_failed");
-        }
-        // Own the published file before validation can yield or be cancelled.
+        // The write and its cleanup owner share one tracked task. Dropping the
+        // caller cannot race deletion against an unacknowledged file creation.
         let snapshot = ShellSnapshotFile {
             location: ShellSnapshotLocation::Remote {
                 path: path.clone(),
-                filesystem,
+                filesystem: Arc::clone(&filesystem),
                 tasks: config.tasks.clone(),
                 runtime: tokio::runtime::Handle::current(),
             },
             contents,
         };
+        let write_path = path.clone();
+        let snapshot = config
+            .tasks
+            .spawn(async move {
+                if let Err(err) = filesystem
+                    .write_file(&write_path, snapshot.contents.as_bytes().to_vec(), None)
+                    .await
+                {
+                    tracing::warn!("Failed to write remote shell snapshot: {err:?}");
+                    return Err("write_failed");
+                }
+                Ok(snapshot)
+            })
+            .await
+            .map_err(|_| "write_failed")??;
         if let Err(err) = validate_snapshot_remote(
             shell,
             &path,
@@ -915,26 +929,18 @@ async fn run_script_with_timeout_with_args(
     let output = timeout_at(timeout_deadline, async {
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
-        let (status, stdout_read, stderr_read) = tokio::join!(
+        let (status, (), ()) = tokio::try_join!(
             child.wait(),
             read_snapshot_output_bounded(&mut stdout, &mut stdout_bytes),
             read_snapshot_output_bounded(&mut stderr, &mut stderr_bytes),
-        );
-        let status = status.with_context(|| format!("Failed to execute {shell_name}"))?;
-        let stdout_overflow = stdout_read.context("Failed to read snapshot command stdout")?;
-        let stderr_overflow = stderr_read.context("Failed to read snapshot command stderr")?;
-        if stdout_overflow || stderr_overflow {
-            bail!(
-                "Snapshot command output exceeded the {SNAPSHOT_OUTPUT_LIMIT_BYTES} byte per-stream limit"
-            );
-        }
+        )?;
         Ok::<_, anyhow::Error>((status, stdout_bytes, stderr_bytes))
     })
     .await;
 
     let (status, stdout, stderr) = match output {
-        Ok(output) => output?,
-        Err(_) => {
+        Ok(Ok(output)) => output,
+        failure => {
             if let Err(job_err) = managed.terminate() {
                 tracing::warn!("Failed to kill timed-out snapshot process tree: {job_err:?}");
                 if let Err(err) = child.start_kill()
@@ -955,7 +961,11 @@ async fn run_script_with_timeout_with_args(
                     tracing::warn!("Timed out reaping killed snapshot shell");
                 }
             }
-            return Err(anyhow!("Snapshot command timed out for {shell_name}"));
+            return match failure {
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(anyhow!("Snapshot command timed out for {shell_name}")),
+                Ok(Ok(_)) => unreachable!(),
+            };
         }
     };
 
@@ -1115,23 +1125,26 @@ pub(crate) async fn run_remote_snapshot_process_before(
 
 const SNAPSHOT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
-/// Retains at most the configured limit while continuing to drain the pipe so
-/// a verbose child cannot deadlock waiting for its reader.
+/// Reject overflow immediately; the process owner terminates and reaps the child
+/// when any reader fails, so no stopped reader can leave a blocked child alive.
 async fn read_snapshot_output_bounded<R: AsyncRead + Unpin>(
     reader: &mut R,
     retained: &mut Vec<u8>,
-) -> std::io::Result<bool> {
-    let mut overflow = false;
+) -> std::io::Result<()> {
     let mut buffer = [0u8; 8192];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
-            return Ok(overflow);
+            return Ok(());
         }
         let remaining = SNAPSHOT_OUTPUT_LIMIT_BYTES.saturating_sub(retained.len());
         let keep = remaining.min(read);
         retained.extend_from_slice(&buffer[..keep]);
-        overflow |= keep < read;
+        if keep < read {
+            return Err(std::io::Error::other(format!(
+                "Snapshot command output exceeded the {SNAPSHOT_OUTPUT_LIMIT_BYTES} byte per-stream limit"
+            )));
+        }
     }
 }
 

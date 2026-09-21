@@ -175,6 +175,7 @@ impl AppsRequestProcessor {
                 &config.config_layer_stack,
                 tools.iter().map(connector_runtime_tool),
             )
+            .map_err(|error| internal_error(format!("invalid installed app policy: {error}")))?
             .into_iter()
             .map(|app| InstalledApp {
                 id: app.id,

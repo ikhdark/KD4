@@ -57,6 +57,26 @@ fn capability(value: &str) -> Capability {
     Capability::new(value).expect("valid capability")
 }
 
+#[test]
+fn terminal_output_loss_survives_wire_conversion_and_legacy_omission() {
+    let expected = crate::RuntimeResponse::Result {
+        cell_id: crate::CellId::new("loss".to_string()),
+        content_items: Vec::new(),
+        error_text: None,
+        output_loss: Some(crate::OutputLoss { discarded_items: 3, discarded_bytes_lower_bound: 8192 }),
+    };
+    let wire = WireRuntimeResponse::from(expected.clone());
+    let mut encoded = serde_json::to_value(wire).unwrap();
+    assert_eq!(encoded["Result"]["output_loss"], json!({ "discarded_items": 3, "discarded_bytes_lower_bound": 8192 }));
+    let decoded: WireRuntimeResponse = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(crate::RuntimeResponse::from(decoded), expected);
+    encoded["Result"].as_object_mut().unwrap().remove("output_loss");
+    let legacy: WireRuntimeResponse = serde_json::from_value(encoded).unwrap();
+    assert_eq!(crate::RuntimeResponse::from(legacy), crate::RuntimeResponse::Result {
+        cell_id: crate::CellId::new("loss".to_string()), content_items: Vec::new(), error_text: None, output_loss: None,
+    });
+}
+
 fn supported_versions() -> SupportedProtocolVersions {
     SupportedProtocolVersions::try_new([ProtocolVersion::V1])
         .expect("nonempty unique protocol versions")
@@ -423,6 +443,7 @@ fn host_to_client_v1_variants_are_pinned() {
             request_id(/*value*/ 4),
             HostResponse::WaitCompleted {
                 outcome: WireWaitOutcome::MissingCell(WireRuntimeResponse::Result {
+                    output_loss: None,
                     cell_id: cell_id("missing-cell"),
                     content_items: Vec::new(),
                     error_text: Some("cell not found".to_string()),
@@ -701,11 +722,13 @@ fn runtime_response_conversions_preserve_variants_and_payloads() {
         ),
         (
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: domain_cell.clone(),
                 content_items: domain_items.clone(),
                 error_text: Some("runtime error".to_string()),
             },
             WireRuntimeResponse::Result {
+                output_loss: None,
                 cell_id: wire_cell.clone(),
                 content_items: wire_items.clone(),
                 error_text: Some("runtime error".to_string()),
@@ -713,11 +736,19 @@ fn runtime_response_conversions_preserve_variants_and_payloads() {
         ),
         (
             RuntimeResponse::Result {
+                output_loss: Some(crate::OutputLoss {
+                    discarded_items: 2,
+                    discarded_bytes_lower_bound: 4096,
+                }),
                 cell_id: domain_cell,
                 content_items: domain_items,
                 error_text: None,
             },
             WireRuntimeResponse::Result {
+                output_loss: Some(crate::OutputLoss {
+                    discarded_items: 2,
+                    discarded_bytes_lower_bound: 4096,
+                }),
                 cell_id: wire_cell,
                 content_items: wire_items,
                 error_text: None,

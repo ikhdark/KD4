@@ -27,7 +27,7 @@ use crate::sources::SkillProviders;
 use crate::state::SkillsThreadState;
 
 mod list;
-mod read;
+pub(crate) mod read;
 mod schema;
 
 const SKILLS_NAMESPACE: &str = "skills";
@@ -59,6 +59,25 @@ struct SkillToolContext {
 }
 
 impl SkillToolContext {
+    async fn continue_catalog(&self, turn_id: &str, expected_len: usize) -> SkillCatalog {
+        self.thread_state
+            .continue_orchestrator_catalog(
+                &self.providers,
+                SkillListQuery {
+                    continuation: None,
+                    turn_id: turn_id.to_string(),
+                    executor_roots: Vec::new(),
+                    host_snapshot: None,
+                    include_host_skills: false,
+                    include_bundled_skills: false,
+                    include_orchestrator_skills: true,
+                    mcp_resources: self.mcp_resources.clone(),
+                },
+                expected_len,
+            )
+            .await
+    }
+
     async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> SkillCatalog {
         match authority {
             SkillToolAuthority::Orchestrator => {
@@ -66,6 +85,7 @@ impl SkillToolContext {
                     .orchestrator_catalog_snapshot(
                         self.mcp_resources.as_deref(),
                         self.providers.list_orchestrator_for_turn(SkillListQuery {
+                            continuation: None,
                             turn_id: turn_id.to_string(),
                             executor_roots: Vec::new(),
                             host_snapshot: None,

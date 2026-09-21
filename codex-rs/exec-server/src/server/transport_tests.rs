@@ -162,3 +162,20 @@ fn test_runtime_paths() -> ExecServerRuntimePaths {
     ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
         .expect("runtime paths")
 }
+
+#[tokio::test]
+async fn plain_websocket_rejects_non_loopback_before_listening() {
+    for address in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0"] {
+        let error = super::run_websocket_listener(
+            address.parse().unwrap(),
+            test_runtime_paths(),
+            crate::ExecServerTelemetry::default(),
+        )
+        .await
+        .expect_err("unauthenticated remote listener must fail closed");
+        assert!(
+            error.to_string().contains("requires a loopback address"),
+            "{error}"
+        );
+    }
+}

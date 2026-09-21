@@ -1129,6 +1129,16 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
         while let Some(event) = stream.next().await {
             event?;
         }
+        // Provider completion does not join optional diagnostics. This test
+        // compares two fully measured requests, so wait for the measurement
+        // task to release its session identity before starting the next one.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&session.latest_measurement_attempt) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request diagnostics should finish without blocking provider completion");
     }
 
     let protocol = timing.complete_snapshot().protocol_timing();
@@ -1406,6 +1416,15 @@ async fn turn_timing_carries_prefix_divergence_and_selected_budget_drops() -> an
         while let Some(event) = stream.next().await {
             event?;
         }
+        // This test needs fully measured requests; provider completion no longer
+        // joins optional diagnostics, and the next request can supersede them.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&session.latest_measurement_attempt) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request diagnostics should finish");
     }
 
     let protocol = timing.complete_snapshot().protocol_timing();
@@ -1513,6 +1532,7 @@ fn model_attempt_offsets_require_monotonic_elapsed_values_and_allow_nulls() {
         first_actionable_output_us: Some(35),
         first_model_output_us: Some(40),
         first_visible_output_us: Some(50),
+        completed_us: Some(60),
     };
     assert!(attempt_offsets_are_nondecreasing(&ordered, 60));
     assert_eq!(model_attempt_phase_durations(&ordered), (6, 4, Some(10)));
@@ -1835,7 +1855,7 @@ fn websocket_exact_stable_prefix_inherits_existing_response_id() {
 }
 
 #[test]
-fn remote_compaction_rebase_preserves_response_lineage_for_next_tail() {
+fn remote_compaction_replays_the_complete_locally_installed_checkpoint() {
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let compaction_request = history_test_request(vec![history_test_item("pre-compact", None)]);
@@ -1851,9 +1871,10 @@ fn remote_compaction_rebase_preserves_response_lineage_for_next_tail() {
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
     let stable_prefix = history_test_item("stable prefix", Some("original-turn"));
-    session.rebase_remote_compaction_history(std::slice::from_ref(&stable_prefix), [9; 32]);
+    session.invalidate_provider_history_inheritance("installed remote checkpoint");
     let delta = history_test_item("next tool result", None);
-    let current = history_test_request(vec![stable_prefix, compacted, delta.clone()]);
+    let artifact_pins = history_test_item("local artifact pins after compaction", None);
+    let current = history_test_request(vec![stable_prefix, compacted, artifact_pins, delta]);
 
     let (prepared, _, _, _) = session
         .prepare_websocket_request(
@@ -1866,11 +1887,8 @@ fn remote_compaction_rebase_preserves_response_lineage_for_next_tail() {
         .expect("websocket request should prepare");
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
 
-    assert_eq!(
-        prepared.previous_response_id.as_deref(),
-        Some("response-compact")
-    );
-    assert_eq!(prepared.input.as_ref(), &[delta]);
+    assert_eq!(prepared.previous_response_id, None);
+    assert_eq!(prepared.input.as_ref(), current.input.as_ref());
 }
 
 #[test]
@@ -1950,6 +1968,46 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
     let ResponsesWsRequest::ResponseCreate(retry) = retry;
     assert!(retry.previous_response_id.is_none());
     assert_eq!(retry.input, current.input);
+}
+
+#[test]
+fn tool_history_canonical_fallback_reuses_exact_provider_prefix() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let original = history_test_request(vec![history_test_tool_output("call", "bounded")]);
+    session.remember_request_history(&original, [7; 32]);
+    session.websocket_session.last_request = Some(original.clone());
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(LastResponse {
+            response_id: "response".to_string(),
+            items_added: Vec::new(),
+        })
+        .expect("receiver");
+    session.websocket_session.last_response_rx = Some(receiver);
+    let current = history_test_request(vec![history_test_tool_output("call", "receipt")]);
+    let substitutions = [ToolHistorySubstitution {
+        item_index: 0,
+        call_id: "call".to_string(),
+        bounded_output_sha256: crate::tool_history::sha256(b"bounded"),
+        receipt_id: "receipt".to_string(),
+        substituted_output_sha256: crate::tool_history::sha256(b"receipt"),
+    }];
+    let (prepared, _, effective, proof) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [7; 32],
+            &substitutions,
+            Some(Box::new(|| Ok(original.clone()))),
+        )
+        .expect("fallback");
+    let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+    assert_eq!(prepared.previous_response_id.as_deref(), Some("response"));
+    assert!(prepared.input.is_empty());
+    assert_eq!(effective.expect("effective history").input, original.input);
+    assert!(proof.is_some());
+    assert!(session.websocket_session.last_request.is_some());
 }
 
 #[test]
@@ -3205,7 +3263,7 @@ async fn response_stream_does_not_wait_for_and_cancels_pending_request_measureme
 }
 
 #[tokio::test]
-async fn response_completed_waits_for_pending_request_measurements() {
+async fn response_completed_does_not_wait_for_pending_request_measurements() {
     let measurement_gate = Arc::new(Notify::new());
     let measurement_cancellation = tokio_util::sync::CancellationToken::new();
     let identity = new_attempt_identity(&new_sampling_request_id());
@@ -3256,18 +3314,9 @@ async fn response_completed_waits_for_pending_request_measurements() {
     assert!(
         matches!(stream.next().await, Some(Ok(ResponseEvent::OutputItemDone(item))) if item == output)
     );
-    let mut completion = Box::pin(stream.next());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut completion)
-            .await
-            .is_err(),
-        "response completion must wait for pending request diagnostics"
-    );
-
-    measurement_gate.notify_one();
-    let event = tokio::time::timeout(Duration::from_millis(250), completion)
+    let event = tokio::time::timeout(Duration::from_millis(250), stream.next())
         .await
-        .expect("completion should resume after request diagnostics")
+        .expect("provider completion must not wait for optional diagnostics")
         .expect("mapped stream should yield completion")
         .expect("completion should remain successful");
     assert!(matches!(event, ResponseEvent::Completed { .. }));
@@ -3282,6 +3331,7 @@ async fn response_completed_waits_for_pending_request_measurements() {
             .expect("completed mapper must release an open upstream")
             .is_none()
     );
+    measurement_gate.notify_one();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3355,25 +3405,36 @@ async fn completed_response_trace_write_keeps_runtime_responsive() -> anyhow::Re
         None,
     );
     terminal_seen_rx.await?;
-    let _ = runtime_progress_tx.send(());
     assert!(matches!(
         stream.next().await.transpose()?,
         Some(ResponseEvent::OutputItemDone(_))
     ));
     assert!(matches!(
-        stream.next().await.transpose()?,
+        tokio::time::timeout(Duration::from_secs(1), stream.next()).await.expect("provider completion must bypass the blocked trace writer").transpose()?,
         Some(ResponseEvent::Completed { response_id, .. }) if response_id == "response-traced"
     ));
     assert!(stream.next().await.is_none());
+    let _ = runtime_progress_tx.send(());
     assert!(
         release_thread.join().expect("release thread"),
         "trace writes must let the current-thread runtime progress while the writer is busy"
     );
     writer_thread.join().expect("writer thread")?;
 
-    // Completion is exposed only after the payload and terminal event are on
-    // disk. Immediate replay must contain the response, without polling.
-    let rollout = replay_bundle(temp.path())?;
+    let rollout = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let rollout = replay_bundle(temp.path())?;
+            if rollout
+                .inference_calls
+                .values()
+                .any(|call| call.execution.status == ExecutionStatus::Completed)
+            {
+                break anyhow::Ok(rollout);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
     let inference = rollout
         .inference_calls
         .values()
@@ -3698,4 +3759,59 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn audit_reports_17_19_stream_has_exactly_one_terminal_outcome() {
+    for scenario in [
+        "eof",
+        "partial_eof",
+        "error_eof",
+        "error_completed",
+        "completed_eof",
+    ] {
+        let mut events = Vec::new();
+        if scenario == "partial_eof" {
+            events.push(Ok(ResponseEvent::OutputItemDone(history_test_item(
+                "partial", None,
+            ))));
+        }
+        if scenario.starts_with("error") {
+            events.push(Err(ApiError::Stream("injected failure".to_string())));
+        }
+        if scenario.contains("completed") {
+            events.push(Ok(ResponseEvent::Completed {
+                response_id: "terminal-response".to_string(),
+                token_usage: None,
+                end_turn: Some(true),
+            }));
+        }
+        let (stream, last_response) = super::map_response_events(
+            None,
+            futures::stream::iter(events),
+            test_session_telemetry(),
+            InferenceTraceAttempt::disabled(),
+            test_model_provider(),
+            None,
+        );
+        let results: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+            .await
+            .unwrap();
+        let errors = results.iter().filter(|event| event.is_err()).count();
+        let completions = results
+            .iter()
+            .filter(|event| matches!(event, Ok(ResponseEvent::Completed { .. })))
+            .count();
+        assert_eq!(errors + completions, 1, "{scenario}");
+        assert_eq!(
+            completions,
+            usize::from(scenario == "completed_eof"),
+            "{scenario}"
+        );
+        assert_eq!(
+            last_response.await.is_ok(),
+            scenario == "completed_eof",
+            "{scenario}"
+        );
+    }
 }

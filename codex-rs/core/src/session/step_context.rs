@@ -15,8 +15,9 @@ use codex_mcp::ToolInfo;
 use codex_utils_path_uri::PathUri;
 use tokio::sync::OnceCell;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct McpToolSnapshot {
+    pub(crate) temporarily_unavailable: bool,
     pub(crate) revision: u64,
     pub(crate) tools: Arc<Vec<ToolInfo>>,
     pub(crate) resources_available: bool,
@@ -35,6 +36,7 @@ async fn bounded_mcp_snapshot(
             // This distinct identity prevents reuse of a router from a real catalog.
             // The next step gets a new capture attempt.
             McpToolSnapshot {
+                temporarily_unavailable: true,
                 revision: u64::MAX,
                 tools: Arc::new(Vec::new()),
                 resources_available: false,
@@ -44,6 +46,7 @@ async fn bounded_mcp_snapshot(
 }
 
 /// Request-scoped state that may change between model sampling requests.
+#[derive(Clone)]
 pub(crate) struct StepContext {
     pub(crate) turn: Arc<TurnContext>,
     pub(crate) environments: TurnEnvironmentSnapshot,
@@ -67,6 +70,14 @@ pub(crate) struct StepContext {
 }
 
 impl StepContext {
+    /// Keep the advertised capabilities but retire the previous attempt's ledger.
+    pub(crate) fn for_retry_attempt(&self) -> Self {
+        Self {
+            workspace_evidence_generation_batch: Arc::new(WorkspaceEvidenceGenerationBatch::new()),
+            ..self.clone()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         turn: Arc<TurnContext>,
@@ -124,6 +135,7 @@ impl StepContext {
                         );
                         if revision == self.mcp.manager().tool_catalog_revision() {
                             return McpToolSnapshot {
+                                temporarily_unavailable: false,
                                 revision,
                                 tools,
                                 resources_available,
@@ -167,6 +179,7 @@ impl StepContext {
     ) {
         self.mcp_tool_snapshot
             .set(McpToolSnapshot {
+                temporarily_unavailable: false,
                 revision,
                 tools: Arc::new(tools),
                 resources_available,
@@ -178,6 +191,42 @@ impl StepContext {
 #[cfg(test)]
 mod snapshot_deadline_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retry_attempt_replaces_sealed_evidence_but_preserves_capabilities() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let step = session.capture_step_context(turn).await.unwrap();
+        let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
+            crate::tools::registry::ToolRegistry::from_tools(Vec::new()),
+            Vec::new(),
+        ));
+        assert!(step.set_tool_router(Arc::clone(&router)).is_ok());
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        ));
+        let runtime =
+            crate::tools::parallel::ToolCallRuntime::new(session, Arc::clone(&step), tracker);
+        runtime.flush_workspace_evidence_generation().await.unwrap();
+        let retry = step.for_retry_attempt();
+        assert!(
+            !step
+                .workspace_evidence_generation_batch
+                .register_call("late-old-call")
+        );
+        assert!(
+            retry
+                .workspace_evidence_generation_batch
+                .register_call("retry-call")
+        );
+        assert!(Arc::ptr_eq(&step.mcp, &retry.mcp));
+        assert!(Arc::ptr_eq(retry.tool_router().unwrap(), &router));
+        assert!(!Arc::ptr_eq(
+            &step.workspace_evidence_generation_batch,
+            &retry.workspace_evidence_generation_batch
+        ));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools() {
@@ -198,6 +247,7 @@ mod snapshot_deadline_tests {
         assert_eq!(start.elapsed(), MCP_SNAPSHOT_DEADLINE);
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(snapshot.tools.is_empty());
+        assert!(snapshot.temporarily_unavailable);
         assert!(!snapshot.resources_available);
         assert_eq!(snapshot.revision, u64::MAX);
     }
@@ -206,6 +256,7 @@ mod snapshot_deadline_tests {
     async fn stable_catalog_keeps_its_identity_and_resource_capability() {
         let snapshot = bounded_mcp_snapshot(async {
             McpToolSnapshot {
+                temporarily_unavailable: false,
                 revision: 17,
                 tools: Arc::new(Vec::new()),
                 resources_available: true,
@@ -213,6 +264,7 @@ mod snapshot_deadline_tests {
         })
         .await;
         assert_eq!(snapshot.revision, 17);
+        assert!(!snapshot.temporarily_unavailable);
         assert!(snapshot.resources_available);
     }
 }

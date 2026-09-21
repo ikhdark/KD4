@@ -6,6 +6,7 @@ use crate::session::InputQueueActivity;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
 use codex_agent_task_store::AgentTask;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::MAX_WAKE_EVENTS_PER_READ;
@@ -159,7 +160,7 @@ impl Handler {
                 .get_agent_path()
                 .unwrap_or_else(AgentPath::root)
                 .to_string();
-            let mut cursor = match (explicit_cursor, store.as_ref(), root_session_id.as_deref()) {
+            let cursor = match (explicit_cursor, store.as_ref(), root_session_id.as_deref()) {
                 (false, Some(store), Some(root_session_id)) => store
                     .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone())
                     .await
@@ -480,40 +481,11 @@ impl Handler {
                         .map_err(FunctionCallError::RespondToModel)?;
                 }
 
-                let next_cursor = drain.cursor().ok_or_else(|| {
+                drain.cursor().ok_or_else(|| {
                     FunctionCallError::RespondToModel(
                         "wait_agent durable wake omitted its cursor revision".to_string(),
                     )
                 })?;
-                if !explicit_cursor {
-                    let advanced = store
-                        .compare_and_swap_automatic_wake_cursor(
-                            root_session_id.to_string(),
-                            consuming_agent_path.clone(),
-                            cursor,
-                            next_cursor,
-                        )
-                        .await
-                        .map_err(|error| {
-                            FunctionCallError::RespondToModel(format!(
-                                "wait_agent could not advance its automatic cursor: {error}"
-                            ))
-                        })?;
-                    if !advanced {
-                        cursor = store
-                            .automatic_wake_cursor(
-                                root_session_id.to_string(),
-                                consuming_agent_path.clone(),
-                            )
-                            .await
-                            .map_err(|error| {
-                                FunctionCallError::RespondToModel(format!(
-                                    "wait_agent could not reread its automatic cursor: {error}"
-                                ))
-                            })?;
-                        continue 'wait_owner;
-                    }
-                }
                 drained_event_pages =
                     u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX);
                 let (wake_read, hydrated_assignments) = drain.finish();
@@ -651,6 +623,41 @@ impl Handler {
                 &[],
             );
 
+            // Finish every fallible hydration before acknowledgment. Retain the
+            // exact prepared result before atomically publishing its cursor and
+            // recovery receipt. A lost/interrupted response remains addressable
+            // from the next ordinary wait, including after a restart.
+            if !explicit_cursor
+                && let (Some(store), Some(root)) = (store.as_ref(), root_session_id.as_deref())
+            {
+                result.previous_delivery = store.automatic_wake_delivery(root.to_string(), consuming_agent_path.clone())
+                    .await.map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent could not recover its prior delivery: {error}")))?
+                    .map(|value| serde_json::from_str(&value)).transpose()
+                    .map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent prior delivery is invalid: {error}")))?;
+                if let Some(next) = result.cursor.as_deref().map(WakeEventId::parse).transpose()
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                    && Some(next) != cursor
+                {
+                    // Keep the preceding artifact pointer in this retained result.
+                    // It is a bounded receipt, not an embedded result, and preserves
+                    // recovery across multiple interrupted responses.
+                    let retained = serde_json::to_value(&result).map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+                        &turn.config.codex_home, &session.thread_id.to_string(),
+                        &codex_tools::CanonicalToolResult::json(retained),
+                    ).await;
+                    if !artifact.complete {
+                        return Err(FunctionCallError::RespondToModel("wait_agent could not retain its delivery; cursor unchanged".to_string()));
+                    }
+                    let artifact_id = artifact.artifact_id().ok_or_else(|| FunctionCallError::RespondToModel("wait_agent retained delivery has no identity".to_string()))?;
+                    let receipt = json!({"cursor": result.cursor, "artifact_id": artifact_id, "thread_id": session.thread_id, "recovery_tool": "read_tool_output"});
+                    let published = store.publish_automatic_wake_delivery(root.to_string(), consuming_agent_path.clone(), cursor, next, receipt.to_string())
+                        .await.map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent could not publish its retained delivery: {error}")))?;
+                    if !published {
+                        return Err(FunctionCallError::RespondToModel("wait_agent concurrent consumer advanced the cursor; call wait_agent again to recover its retained delivery".to_string()));
+                    }
+                }
+            }
             Ok(boxed_tool_output(result))
         }
         .await;
@@ -971,7 +978,7 @@ async fn hydrate_wait_owner_assignments(
 fn wait_owner_is_settled(assignments: &HydratedAssignments) -> bool {
     !assignments.tasks.is_empty()
         && assignments.tasks.values().all(|task| {
-            task.workspace_status.pending_gates.is_empty()
+            !has_pending_required_gates(task)
                 && matches!(
                     task.current_attempt.state,
                     AttemptState::Completed
@@ -980,6 +987,13 @@ fn wait_owner_is_settled(assignments: &HydratedAssignments) -> bool {
                         | AttemptState::NeedsMain
                 )
         })
+}
+
+fn has_pending_required_gates(task: &AgentTask) -> bool {
+    matches!(
+        task.assignment.admission_origin,
+        AssignmentAdmissionOrigin::Typed
+    ) && !task.workspace_status.pending_gates.is_empty()
 }
 
 enum BacklogPageRead {
@@ -1051,6 +1065,22 @@ fn take_pending_activity(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retained_delivery_recovery_receipt_survives_projection() {
+        use crate::tools::context::ToolOutput;
+        let receipt = serde_json::json!({"artifact_id":"prior-result", "thread_id":"prior-thread", "cursor":"123", "recovery_tool":"read_tool_output"});
+        let result = super::WaitAgentResult {
+            previous_delivery: Some(receipt.clone()),
+            typed_deltas: vec![serde_json::json!({"large_detail": "x".repeat(100_000)})],
+            ..Default::default()
+        };
+        let projected = result.projection_metadata().unwrap();
+        assert_eq!(projected.essential_inline["previous_delivery"], receipt);
+        assert!(projected.essential_inline.to_string().len() < 1024);
+        let retained = serde_json::to_value(&result).unwrap();
+        assert_eq!(retained["previous_delivery"], receipt);
+    }
     use super::*;
 
     #[tokio::test]
@@ -1457,8 +1487,38 @@ mod tests {
         assignments.tasks.insert(assignment_id, task.clone());
         assert!(
             !wait_owner_is_settled(&assignments),
-            "pending gates keep a terminal attempt unsettled"
+            "required gates keep a typed terminal attempt unsettled"
         );
+        let typed_state = authoritative_wait_state(
+            &task,
+            agent_task_revision(&task).expect("typed task serializes"),
+        );
+        assert!(authoritative_wait_signal(Some("root"), "/root", &[typed_state], None).is_none());
+
+        task.assignment.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+            parent_assignment_id: None,
+        };
+        assignments.tasks.insert(assignment_id, task.clone());
+        assert!(
+            wait_owner_is_settled(&assignments),
+            "advisory gates cannot keep a completed ordinary child waiting"
+        );
+        let legacy_state = authoritative_wait_state(
+            &task,
+            agent_task_revision(&task).expect("ordinary task serializes"),
+        );
+        let signal = authoritative_wait_signal(Some("root"), "/root", &[legacy_state], None)
+            .expect("ordinary completion retains its authoritative terminal signal");
+        assert_eq!(
+            signal["authoritative_wait_owner_v1"]["disposition"],
+            "terminal"
+        );
+        task.current_attempt.state = AttemptState::Active;
+        assignments.tasks.insert(assignment_id, task.clone());
+        assert!(!wait_owner_is_settled(&assignments));
+
+        task.current_attempt.state = AttemptState::Completed;
+        task.assignment.admission_origin = AssignmentAdmissionOrigin::Typed;
         task.workspace_status.pending_gates.clear();
         assignments.tasks.insert(assignment_id, task);
         assert!(wait_owner_is_settled(&assignments));
@@ -1854,6 +1914,8 @@ pub(crate) struct WaitAgentResult {
     pub(crate) message: String,
     pub(crate) timed_out: bool,
     pub(crate) cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_delivery: Option<JsonValue>,
     pub(crate) typed_deltas: Vec<JsonValue>,
     pub(crate) truncated_count: u64,
     pub(crate) nudged_assignment_ids: Vec<String>,
@@ -1893,6 +1955,7 @@ impl WaitAgentResult {
             message,
             timed_out: outcome == WaitOutcome::TimedOut,
             cursor,
+            previous_delivery: None,
             typed_deltas,
             truncated_count,
             nudged_assignment_ids,
@@ -1937,7 +2000,7 @@ fn authoritative_wait_state(task: &AgentTask, task_revision: String) -> Authorit
         epoch: task.workspace_status.epoch,
         next_required_action: task.workspace_status.next_required_action.clone(),
         receipt_available: task.receipt.is_some(),
-        has_pending_gates: !task.workspace_status.pending_gates.is_empty(),
+        has_pending_gates: has_pending_required_gates(task),
         task_revision,
     }
 }
@@ -2241,7 +2304,11 @@ impl ToolOutput for WaitAgentResult {
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
-        crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)
+        let mut metadata = crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)?;
+        if let Some(receipt) = &self.previous_delivery {
+            metadata.essential_inline["previous_delivery"] = receipt.clone();
+        }
+        Some(metadata)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

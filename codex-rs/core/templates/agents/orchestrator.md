@@ -1,8 +1,9 @@
 # Orchestration instruction sources
 
 This file is a maintainer reference, not a model prompt. Runtime assembly is in
-`core/src/context/multi_agent_mode_instructions.rs`; it includes
-`core/templates/agents/root_orchestration.md` for root coordination.
+`core/src/context/multi_agent_mode_instructions.rs`. There is deliberately no
+separate root-coordination policy block: a root session receives the same
+orchestration rules as any other session, from the owning surfaces below.
 
 Keep rules in their active owning surfaces:
 

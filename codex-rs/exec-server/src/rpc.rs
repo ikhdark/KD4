@@ -282,6 +282,23 @@ impl RpcClient {
                         if let Err(err) =
                             handle_server_message(&pending_for_reader, &event_tx, message).await
                         {
+                            // Preserve responses already received before terminating an
+                            // overloaded notification stream. Missing notifications are
+                            // recovered by the session protocol after reconnecting.
+                            while let Ok(event) = incoming_rx.try_recv() {
+                                if let JsonRpcConnectionEvent::Message(
+                                    message @ (JSONRPCMessage::Response(_)
+                                    | JSONRPCMessage::Error(_)),
+                                ) = event
+                                {
+                                    let _ = handle_server_message(
+                                        &pending_for_reader,
+                                        &event_tx,
+                                        message,
+                                    )
+                                    .await;
+                                }
+                            }
                             break Some(err);
                         }
                     }
@@ -665,9 +682,14 @@ async fn handle_server_message(
             }
         }
         JSONRPCMessage::Notification(notification) => {
-            let _ = event_tx
-                .send(RpcClientEvent::Notification(notification))
-                .await;
+            event_tx
+                .try_send(RpcClientEvent::Notification(notification))
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) =>
+                        "exec-server notification backlog exceeded capacity; session replay required".to_string(),
+                    mpsc::error::TrySendError::Closed(_) =>
+                        "exec-server notification consumer closed".to_string(),
+                })?;
         }
         JSONRPCMessage::Request(request) => {
             return Err(format!(
@@ -1357,6 +1379,58 @@ mod tests {
                 other => panic!("expected disconnect with reason, got {other:?}"),
             }
         }).await.expect("shutdown must not wait for event capacity");
+    }
+
+    #[tokio::test]
+    async fn notification_capacity_plus_one_does_not_strand_queued_response() {
+        let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(256);
+        let (_disconnected_tx, disconnected_rx) = tokio::sync::watch::channel(false);
+        let (client, mut events_rx) = RpcClient::new(JsonRpcConnection {
+            outgoing_tx,
+            incoming_rx,
+            disconnected_rx,
+            task_handles: Vec::new(),
+            transport: JsonRpcTransport::Plain,
+        });
+        let params = serde_json::json!({});
+        let mut call = Box::pin(client.call::<_, serde_json::Value>("pending", &params));
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        let JSONRPCMessage::Request(request) = outgoing_rx.recv().await.unwrap() else {
+            panic!("request");
+        };
+        // No await between enqueues: all messages precede the overflow decision.
+        for _ in 0..=events_rx.max_capacity() {
+            incoming_tx
+                .try_send(JsonRpcConnectionEvent::Message(
+                    JSONRPCMessage::Notification(JSONRPCNotification {
+                        method: "queued".into(),
+                        params: None,
+                    }),
+                ))
+                .unwrap();
+        }
+        incoming_tx
+            .try_send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(
+                JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({"complete": true}),
+                },
+            )))
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), call)
+                .await
+                .unwrap()
+                .unwrap(),
+            serde_json::json!({"complete": true})
+        );
+        assert_eq!(client.pending_request_count().await, 0);
+        for _ in 0..events_rx.max_capacity() {
+            assert!(events_rx.recv().await.is_some());
+        }
+        assert!(matches!(events_rx.recv().await,
+            Some(super::RpcClientEvent::Disconnected { reason: Some(reason) }) if reason.contains("session replay required")));
     }
 
     #[tokio::test]

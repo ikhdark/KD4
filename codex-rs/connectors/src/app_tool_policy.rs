@@ -40,13 +40,14 @@ pub struct AppToolPolicyEvaluator<'a> {
 }
 
 impl<'a> AppToolPolicyEvaluator<'a> {
-    pub fn new(config_layer_stack: &'a ConfigLayerStack) -> Self {
-        let apps_config = apps_config_from_layer_stack(config_layer_stack);
+    pub fn new(config_layer_stack: &'a ConfigLayerStack) -> anyhow::Result<Self> {
+        let apps_config = apps_config_from_layer_stack(config_layer_stack)?;
         let requirements_apps_config = config_layer_stack.requirements_toml().apps.as_ref();
-        Self::from_parts(apps_config, requirements_apps_config)
+        Ok(Self::from_parts(apps_config, requirements_apps_config))
     }
 
-    pub fn policy(&self, input: AppToolPolicyInput<'_>) -> AppToolPolicy {
+    pub fn policy(&self, mut input: AppToolPolicyInput<'_>) -> AppToolPolicy {
+        input.connector_id = input.connector_id.and_then(crate::canonical_connector_id);
         let managed_approval = managed_app_tool_approval(
             self.requirements_apps_config,
             input.connector_id,
@@ -77,17 +78,36 @@ impl<'a> AppToolPolicyEvaluator<'a> {
 /// Reads the merged, unmanaged Apps configuration from a config-layer stack.
 pub fn apps_config_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
-) -> Option<AppsConfigToml> {
+) -> anyhow::Result<Option<AppsConfigToml>> {
+    if let Some(requirements) = &config_layer_stack.requirements_toml().apps {
+        for id in requirements.apps.keys() {
+            anyhow::ensure!(
+                crate::canonical_connector_id(id) == Some(id.as_str()),
+                "invalid managed apps policy connector ID {id:?}: use a nonempty ID without surrounding whitespace"
+            );
+        }
+    }
     if !config_layer_stack.enabled_layers_contain_top_level_key("apps") {
-        return None;
+        return Ok(None);
     }
 
-    config_layer_stack
+    let config = config_layer_stack
         .effective_config()
         .as_table()
         .and_then(|table| table.get("apps"))
         .cloned()
-        .and_then(|value| AppsConfigToml::deserialize(value).ok())
+        .map(AppsConfigToml::deserialize)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid apps policy: {error}"))?;
+    if let Some(config) = &config {
+        for id in config.apps.keys() {
+            anyhow::ensure!(
+                crate::canonical_connector_id(id) == Some(id.as_str()),
+                "invalid apps policy connector ID {id:?}: use a nonempty ID without surrounding whitespace"
+            );
+        }
+    }
+    Ok(config)
 }
 
 pub fn app_is_enabled(apps_config: &AppsConfigToml, connector_id: Option<&str>) -> bool {
@@ -98,6 +118,7 @@ pub fn app_is_enabled(apps_config: &AppsConfigToml, connector_id: Option<&str>) 
         .unwrap_or(true);
 
     connector_id
+        .and_then(crate::canonical_connector_id)
         .and_then(|connector_id| apps_config.apps.get(connector_id))
         .map(|app| app.enabled)
         .unwrap_or(default_enabled)

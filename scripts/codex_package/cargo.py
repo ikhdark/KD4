@@ -1,6 +1,9 @@
 """Cargo builds for source-built Codex package artifacts."""
 
 import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 import json
 import os
 import shutil
@@ -12,9 +15,12 @@ from pathlib import Path
 
 try:
     from scripts import rust_tool_env as shared_rust_tool_env
+    from scripts.generated_output_lock import repository_lock
 except ImportError:
     import rust_tool_env as shared_rust_tool_env
+    from generated_output_lock import repository_lock
 
+from scripts.process_owner import run_owned
 from .layout import pe_machine
 from .targets import REPO_ROOT
 from .targets import PackageVariant
@@ -41,6 +47,38 @@ class SourceBuildOutputs:
     codex_windows_sandbox_setup_bin: Path | None
 
 
+_build_leases = ContextVar("package_build_leases", default=frozenset())
+
+
+@contextmanager
+def package_build_lease(spec, profile):
+    target = cargo_package_target_dir(spec, profile).resolve()
+    held = _build_leases.get()
+    if target in held:
+        yield target
+        return
+    with repository_lock(
+        target.with_name(target.name + ".build.lock"),
+        "package builder",
+        "package build target",
+    ):
+        token = _build_leases.set(held | {target})
+        try:
+            yield target
+        finally:
+            _build_leases.reset(token)
+
+
+def _leased_build(function):
+    @wraps(function)
+    def wrapped(spec, variant, **kwargs):
+        with package_build_lease(spec, kwargs["profile"]):
+            return function(spec, variant, **kwargs)
+
+    return wrapped
+
+
+@_leased_build
 def build_source_binaries(
     spec: TargetSpec,
     variant: PackageVariant,
@@ -207,7 +245,7 @@ def run_cargo_build(
     print("+", " ".join(cmd))
     start = time.perf_counter()
     try:
-        subprocess.run(
+        run_owned(
             cmd,
             cwd=CODEX_RS_ROOT,
             check=True,
@@ -365,16 +403,57 @@ def cargo_profile_output_dir(
 
 
 def cargo_package_target_dir(spec: TargetSpec, profile: str) -> Path:
-    package_target_dir = os.environ.get(PACKAGE_TARGET_DIR_ENV)
-    if package_target_dir is not None:
-        return resolve_cargo_target_dir(package_target_dir)
-
-    return (
-        CODEX_RS_ROOT
-        / "target"
-        / "package"
-        / f"{spec.target}-{cargo_profile_dirname(profile)}"
+    explicit = os.environ.get(PACKAGE_TARGET_DIR_ENV)
+    base = (
+        resolve_cargo_target_dir(explicit)
+        if explicit is not None
+        else (
+            CODEX_RS_ROOT
+            / "target"
+            / "package"
+            / f"{spec.target}-{cargo_profile_dirname(profile)}"
+        )
     )
+    env = cargo_build_env(spec, profile, target_dir=base)
+    identity = effective_tool_contents(spec, env)
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
+    return base / f"toolchain-{key}"
+
+
+def effective_tool_contents(spec, env):
+    commands = {"rustc": env.get("RUSTC", "rustc")}
+    commands.update(
+        {
+            name: value
+            for name, value in env.items()
+            if value
+            and (
+                name in {"RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"}
+                or name.endswith("_LINKER")
+            )
+        }
+    )
+    import tomllib
+
+    for path in cargo_config_paths(env):
+        if not path.is_file():
+            continue
+        try:
+            config = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            commands[str(path)] = "<unresolved-config>"
+            continue
+        build = config.get("build", {})
+        for name in ("rustc", "rustc-wrapper", "rustc-workspace-wrapper"):
+            if build.get(name):
+                commands[f"{path}:{name}"] = build[name]
+        for target, values in config.get("target", {}).items():
+            if isinstance(values, dict) and isinstance(values.get("linker"), str):
+                commands[f"{path}:{target}:linker"] = values["linker"]
+    return {
+        name: executable_content_identity(command, env)
+        for name, command in commands.items()
+    }
 
 
 def cargo_target_dir() -> Path:
@@ -644,8 +723,12 @@ def write_source_build_stamp(
     if source_before is not None and (
         source_before.get("status") != "ok"
         or any(
-            stamp["build_recipe"][tool].get("status") == "unavailable"
-            for tool in ("cargo", "rustc")
+            value.get("status") == "unavailable"
+            for value in (
+                stamp["build_recipe"]["cargo"],
+                stamp["build_recipe"]["rustc"],
+                *stamp["build_recipe"].get("tools", {}).values(),
+            )
         )
     ):
         path.unlink(missing_ok=True)
@@ -732,6 +815,10 @@ def source_build_stamp_metadata_matches(
     )
     return (
         all(recipe[tool].get("status") != "unavailable" for tool in ("cargo", "rustc"))
+        and all(
+            tool.get("status") != "unavailable"
+            for tool in recipe.get("tools", {}).values()
+        )
         and stamp.get("build_recipe") == recipe
     )
 
@@ -778,11 +865,12 @@ def build_recipe_fingerprint(
     ]
 
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "target": spec.target,
         "profile": profile,
         "cargo": command_identity(cargo, "--version", "--verbose", env=effective_env),
         "rustc": command_identity(rustc, "-Vv", env=effective_env),
+        "tools": effective_tool_contents(spec, effective_env),
         "environment": environment,
         "effective_command_sha256": hashlib.sha256(
             "\0".join(effective_command).encode("utf-8")
@@ -874,7 +962,20 @@ def command_identity(
     return {
         "path": str(Path(executable).resolve()),
         "version": completed.stdout.strip(),
+        **executable_content_identity(
+            executable, env or dict(os.environ), resolved=True
+        ),
     }
+
+
+def executable_content_identity(command, env, *, resolved=False):
+    executable = command if resolved else resolve_command(command, env=env)
+    if executable is None or not Path(executable).is_file():
+        return {"status": "unavailable", "path": command}
+    path = Path(executable)
+    with path.open("rb") as handle:
+        content = hashlib.file_digest(handle, "sha256").hexdigest()
+    return {"path": str(path.resolve()), "sha256": content}
 
 
 def files_fingerprint(paths: tuple[Path, ...]) -> dict[str, object]:

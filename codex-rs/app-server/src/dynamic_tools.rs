@@ -24,11 +24,16 @@ pub(crate) async fn on_call_response(
         Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
             error!("request failed with client error: {err:?}");
-            fallback_response("dynamic tool request failed")
+            fallback_response(&format!(
+                "dynamic tool client error (code {}); execution outcome unknown. Check the operation's state before retrying.",
+                err.code
+            ))
         }
         Err(err) => {
             error!("request failed: {err:?}");
-            fallback_response("dynamic tool request failed")
+            fallback_response(
+                "dynamic tool reply lost; execution outcome unknown. Check the operation's state before retrying.",
+            )
         }
     };
 
@@ -60,25 +65,36 @@ fn into_core_response(response: DynamicToolCallResponse) -> CoreDynamicToolRespo
 
 fn decode_response(value: serde_json::Value) -> (DynamicToolCallResponse, Option<String>) {
     match serde_json::from_value::<DynamicToolCallResponse>(value) {
-        Ok(response)
-            if response.content_items.iter().any(|item| {
-                matches!(
-                    item,
-                    DynamicToolCallOutputContentItem::InputImage { image_url }
-                        if is_remote_image_url(image_url)
-                )
-            }) =>
-        {
-            error!(
-                message = REMOTE_IMAGE_URL_ERROR,
-                "dynamic tool response was invalid"
+        Ok(mut response) => {
+            let mut omitted = 0;
+            response.content_items.retain(|item| {
+                let invalid = matches!(item, DynamicToolCallOutputContentItem::InputImage { image_url } if is_remote_image_url(image_url));
+                omitted += usize::from(invalid);
+                !invalid
+            });
+            if omitted == 0 {
+                return (response, None);
+            }
+            let message = format!(
+                "Partial dynamic tool output: omitted {omitted} unsupported image item(s). {REMOTE_IMAGE_URL_ERROR}. The success flag describes the client's reported execution outcome; output delivery is incomplete."
             );
-            fallback_response(REMOTE_IMAGE_URL_ERROR)
+            response
+                .content_items
+                .push(DynamicToolCallOutputContentItem::InputText {
+                    text: message.clone(),
+                });
+            (response, Some(message))
         }
-        Ok(response) => (response, None),
         Err(err) => {
             error!("failed to deserialize DynamicToolCallResponse: {err}");
-            fallback_response("dynamic tool response was invalid")
+            // serde errors can embed arbitrary payload values. Expose location and
+            // category without copying untrusted response contents into the error.
+            fallback_response(&format!(
+                "dynamic tool response schema invalid ({:?}, line {}, column {}); execution outcome unknown",
+                err.classify(),
+                err.line(),
+                err.column()
+            ))
         }
     }
 }
@@ -123,5 +139,31 @@ mod tests {
             text_ptr,
             "the protocol conversion should move owned response strings",
         );
+    }
+    #[test]
+    fn mixed_dynamic_output_preserves_text_and_reports_incomplete_delivery() {
+        let (response, diagnostic) = decode_response(serde_json::json!({
+            "success": true,
+            "contentItems": [
+                {"type":"inputText", "text":"operation receipt 123"},
+                {"type":"inputImage", "imageUrl":"https://example.com/image.png"}
+            ]
+        }));
+        assert!(response.success);
+        assert_eq!(response.content_items.len(), 2);
+        assert!(
+            matches!(&response.content_items[0], DynamicToolCallOutputContentItem::InputText { text } if text == "operation receipt 123")
+        );
+        assert!(diagnostic.unwrap().contains("Partial dynamic tool output"));
+    }
+
+    #[test]
+    fn malformed_dynamic_output_does_not_disclose_payload_values() {
+        let (response, diagnostic) =
+            decode_response(serde_json::json!({"success":"private-token", "contentItems":[]}));
+        assert!(!response.success);
+        let diagnostic = diagnostic.unwrap();
+        assert!(diagnostic.contains("schema invalid"));
+        assert!(!diagnostic.contains("private-token"));
     }
 }

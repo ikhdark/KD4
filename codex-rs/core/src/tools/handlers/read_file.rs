@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::FunctionCallError;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
-use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
+use crate::tools::command_output_artifact::select_file_snapshot;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -43,12 +43,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to select the whole file within the output budget. Oversized selections return child_selectors for the retained snapshot.".to_string()));
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Explicit selectors are exact; oversized selections return child_selectors for the retained snapshot.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
         output["properties"]["path"] = json!({"type": "string"});
         output["properties"]["total_lines"] = json!({"type": "integer", "minimum": 0});
+        output["properties"]["artifact_id"] = json!({"type": ["string", "null"], "description": "Immutable snapshot identity when retained; null for complete inline reads or unavailable storage."});
+        output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned default page contains the entire file. Explicit selectors do not imply whole-file coverage."});
+        output["properties"]["continuation"] =
+            serde_json::to_value(file_selector_schema()).unwrap_or_default();
+        output["properties"]["snapshot_error"] = json!({"type": "string", "description": "Snapshot storage failed; inline evidence is still valid, but no recovery handle or continuation is available."});
         #[expect(
             clippy::expect_used,
             reason = "read_tool_output_output_schema constructs an object with a required array"
@@ -56,10 +61,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         output["required"]
             .as_array_mut()
             .expect("object schema")
-            .extend([json!("path"), json!("total_lines")]);
+            .extend([json!("path"), json!("total_lines"), json!("file_complete")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: format!("Read a UTF-8 file without shell quoting. Pass path alone to select the whole file, or use lines selectors (for example start 40, end 90), bytes, or fixed-string search with context. Before editing, read the complete enclosing function, type, or configuration unit. Files may be up to {MAX_FILE_MIB} MiB, subject to filesystem permissions. Returns path, total_lines, content hash, and an immutable artifact_id. Large selections return child_selectors or continuation instead of full text; check complete and each results[] status, then use read_tool_output with the artifact_id to finish the snapshot. Workspace file results are freshness-tracked; artifact recovery returns the original snapshot. A new read_file call reads current disk contents. Pass a skill: locator from the catalog to read its SKILL.md; omit environment_id for host-owned skills."),
+            description: format!("Read a UTF-8 file without shell quoting. Path alone returns useful text immediately: the whole file if it fits, otherwise its first page plus continuation. Use read_tool_output with the artifact_id and continuation for the remaining immutable snapshot. complete describes delivery of the requested page or explicit selectors; file_complete describes whole-file coverage. Explicit lines (for example start 40, end 90), bytes, or fixed-string search selectors remain exact; check each results[] status. Before editing, read the complete enclosing function, type, or configuration unit. Files may be up to {MAX_FILE_MIB} MiB. Complete inline reads need no artifact. Snapshot storage failure preserves inline evidence and reports snapshot_error without a recovery handle. Workspace results are freshness-tracked; a new read_file call reads current disk contents. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -126,44 +131,74 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             }
             let thread_id = invocation.session.thread_id.to_string();
             let total_lines = contents.lines().count();
-            let selectors = args.selectors.unwrap_or_else(|| {
-                vec![ToolOutputSelector::Bytes {
-                    start: 0,
-                    end: contents.len() as u64,
-                }]
-            });
-            let artifact = create_canonical_output_artifact(
-                &turn.config.codex_home,
-                &thread_id,
-                &CanonicalToolResult::text(contents),
-            )
-            .await;
-            if !artifact.complete {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "unable to retain file snapshot: {}",
-                    artifact.error.unwrap_or_default()
-                )));
-            }
-            let artifact_id = artifact
-                .id
-                .ok_or_else(|| {
-                    FunctionCallError::RespondToModel(
-                        "file snapshot has no artifact identity".to_string(),
-                    )
+            let explicit_selection = args.selectors.is_some();
+            let (canonical, mut result, mut continuation) =
+                tokio::task::spawn_blocking(move || {
+                    let canonical = CanonicalToolResult::text(contents);
+                    select_file_snapshot(&canonical, args.selectors)
+                        .map(|(result, continuation)| (canonical, result, continuation))
+                })
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "file selection worker failed: {err}"
+                    ))
                 })?
-                .to_string();
-            let (result, _) = read_tool_output_selectors_with_reuse(
-                &turn.config.codex_home,
-                &thread_id,
-                &artifact_id,
-                selectors,
-            )
-            .await
-            .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+                .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+            let file_complete = !explicit_selection && continuation.is_none();
+            // Explicit selections retain the existing immutable-snapshot contract.
+            // Complete default reads stay inline; omitted bytes need one durable
+            // snapshot, but selecting them never rereads the file just written.
+            let artifact = if explicit_selection || continuation.is_some() {
+                Some(
+                    create_canonical_output_artifact(
+                        &turn.config.codex_home,
+                        &thread_id,
+                        &canonical,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            let artifact_id = artifact
+                .as_ref()
+                .filter(|artifact| artifact.complete)
+                .and_then(|artifact| artifact.artifact_id());
+            let snapshot_error =
+                artifact
+                    .as_ref()
+                    .filter(|_| artifact_id.is_none())
+                    .map(|artifact| {
+                        artifact.error.clone().unwrap_or_else(|| {
+                            "unable to retain the complete file snapshot".to_string()
+                        })
+                    });
+            if artifact_id.is_none() {
+                result.retained_bytes = 0;
+                continuation = None;
+                for selected in &mut result.results {
+                    selected.child_selectors.clear();
+                    selected.continuation = None;
+                    selected.subdivision_plan = None;
+                    if !selected.complete {
+                        selected.message = Some("Selection is incomplete and snapshot recovery is unavailable; use read_file to read current file contents.".to_string());
+                    }
+                }
+            }
             let mut output = serde_json::to_value(result)
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+            output["artifact_id"] = json!(artifact_id);
+            output["retained_artifact_complete"] = json!(artifact_id.is_some());
             output["path"] = json!(resolved_path);
             output["total_lines"] = json!(total_lines);
+            output["file_complete"] = json!(file_complete);
+            if let Some(continuation) = continuation {
+                output["continuation"] = json!(continuation);
+            }
+            if let Some(error) = snapshot_error {
+                output["snapshot_error"] = json!(error);
+            }
             Ok(boxed_tool_output(JsonToolOutput::new(output)))
         })
     }
@@ -280,7 +315,9 @@ mod tests {
     use super::*;
     use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
+    use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
     use crate::tools::context::ToolCallSource;
+    use crate::tools::handlers::ReadToolOutputHandler;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::models::PermissionProfile;
     use pretty_assertions::assert_eq;
@@ -359,10 +396,9 @@ mod tests {
             step,
             Arc::new(Mutex::new(TurnDiffTracker::new())),
         );
-        let arguments =
-            json!({"path": "file.txt", "selectors": [{"kind": "lines", "start": 1, "end": 1}]})
-                .to_string();
+        let arguments = json!({"path": "file.txt"}).to_string();
         let result = runtime
+            .clone()
             .handle_tool_call_with_source(
                 ToolCall {
                     tool_name: ToolName::plain("read_file"),
@@ -397,10 +433,11 @@ mod tests {
             },
             ResponseItem::from(result.response()),
         ]);
-        assert_eq!(
-            result.code_mode_result()["results"][0]["text"],
-            "current text\n"
-        );
+        // `code_mode_result` consumes the result, so project it once.
+        let code_mode_result = result.code_mode_result();
+        assert_eq!(code_mode_result["results"][0]["text"], "current text\n");
+        assert_eq!(code_mode_result["file_complete"], true);
+        assert_eq!(code_mode_result["artifact_id"], serde_json::Value::Null);
         let mut history = session.clone_history().await.tool_history_state();
         let revision = history
             .workspace_evidence_revision_for_test("registered-file-read")
@@ -417,13 +454,34 @@ mod tests {
                 .invalidate_source_dependencies(Some(&BTreeSet::from([path])), revision.as_ref())
         );
         let projected = history.project_with_workspace_identity(canonical, revision.as_ref());
-        let output = serde_json::to_string(&projected.items[1]).unwrap();
-        assert!(output.contains("source_dependency_changed"), "{output}");
-        assert!(output.contains("read_file"), "{output}");
+        let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
+            panic!("expected stale read output");
+        };
+        let notice: serde_json::Value = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+        assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
+        assert_eq!(notice["rerun"]["tool"], "read_file");
+        let retry = notice["rerun"]["arguments"].clone();
+        assert_eq!(retry, json!({"path": "file.txt"}));
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
+            panic!("expected callable read schema");
+        };
+        let parameters = serde_json::to_value(spec.parameters).unwrap();
+        assert!(jsonschema::validator_for(&parameters).unwrap().is_valid(&retry));
+        let recovered = runtime.handle_tool_call_with_source(
+            ToolCall {
+                tool_name: ToolName::plain(notice["rerun"]["tool"].as_str().unwrap()),
+                call_id: "recovered-file-read".into(),
+                payload: ToolPayload::Function { arguments: retry.to_string() },
+            },
+            ToolCallSource::Direct,
+            CancellationToken::new(),
+        ).await.unwrap().code_mode_result();
+        assert_eq!(recovered["results"][0]["text"], "changed text\n");
+        assert_eq!(recovered["file_complete"], true);
     }
 
     #[tokio::test]
-    async fn omitted_selectors_read_whole_files_and_report_oversized_snapshots() {
+    async fn omitted_selectors_deliver_text_before_recovery_and_skip_unneeded_storage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("whole.txt");
         let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
@@ -443,6 +501,13 @@ mod tests {
             call.payload = ToolPayload::Function {
                 arguments: arguments.to_string(),
             };
+            let artifact_directory = call
+                .step_context
+                .turn
+                .config
+                .codex_home
+                .join("tool-output")
+                .join(call.session.thread_id.to_string());
             let payload = call.payload.clone();
             let result = ReadFileHandler
                 .handle(call)
@@ -451,21 +516,30 @@ mod tests {
                 .code_mode_result(&payload);
             assert_eq!(result["canonical_bytes"], text.len());
             assert_eq!(result["total_lines"], text.lines().count());
+            let delivered = result["results"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with(delivered));
+            assert_eq!(result["complete"], true);
+            assert_eq!(result["results"][0]["status"], "ok");
             assert_eq!(
                 result["results"][0]["selector"],
-                json!({"kind": "bytes", "start": 0, "end": text.len()})
+                json!({"kind": "bytes", "start": 0, "end": delivered.len()})
             );
             if text.len() < 100 {
-                assert_eq!(result["complete"], true);
-                assert_eq!(result["results"][0]["text"], text);
-            } else {
-                assert_eq!(result["complete"], false);
-                assert_eq!(result["results"][0]["status"], "selector_too_large");
+                assert_eq!(delivered, text);
+                assert_eq!(result["file_complete"], true);
+                assert!(result["artifact_id"].is_null());
+                assert_eq!(result["retained_artifact_complete"], false);
                 assert!(
-                    !result["results"][0]["child_selectors"]
-                        .as_array()
-                        .unwrap()
-                        .is_empty()
+                    !artifact_directory.exists(),
+                    "inline reads must not write snapshots"
+                );
+            } else {
+                assert!(!delivered.is_empty());
+                assert!(delivered.len() < text.len());
+                assert_eq!(result["file_complete"], false);
+                assert_eq!(
+                    result["continuation"],
+                    json!({"kind": "bytes", "start": delivered.len(), "end": text.len()})
                 );
                 assert!(result["artifact_id"].as_str().is_some());
             }
@@ -475,6 +549,132 @@ mod tests {
                 .unwrap();
         }
         assert!(!validator.is_valid(&json!({"path": path, "selectors": []})));
+    }
+
+    #[tokio::test]
+    async fn default_page_continuation_recovers_utf8_crlf_snapshot_after_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.txt");
+        let original = "λ first\r\n😀 second\r\n".repeat(6_000);
+        std::fs::write(&path, &original).unwrap();
+        let mut call = invocation(&path, json!([]), false).await;
+        call.payload = ToolPayload::Function {
+            arguments: json!({"path": path}).to_string(),
+        };
+        let result = ReadFileHandler
+            .handle(call.clone())
+            .await
+            .unwrap()
+            .code_mode_result(&call.payload);
+        let artifact_id = result["artifact_id"].as_str().unwrap();
+        let mut recovered = result["results"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let mut selector = result["continuation"].clone();
+        assert!(!recovered.is_empty());
+        assert!(original.as_bytes().starts_with(&recovered));
+        std::fs::write(&path, "changed after the first page\n").unwrap();
+        for _ in 0..100 {
+            if selector.is_null() {
+                break;
+            }
+            let mut recovery_call = call.clone();
+            recovery_call.tool_name = ToolName::plain("read_tool_output");
+            recovery_call.payload = ToolPayload::Function {
+                arguments: json!({"artifact_id": artifact_id, "selectors": [selector]}).to_string(),
+            };
+            let output = ReadToolOutputHandler
+                .handle(recovery_call.clone())
+                .await
+                .unwrap()
+                .code_mode_result(&recovery_call.payload);
+            assert_eq!(output["canonical_sha256"], result["canonical_sha256"]);
+            let before = recovered.len();
+            for fragment in output["results"].as_array().unwrap() {
+                let bytes = if let Some(text) = fragment["text"].as_str() {
+                    Some(text.as_bytes().to_vec())
+                } else {
+                    use base64::Engine;
+                    fragment["data_base64"].as_str().map(|data| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .unwrap()
+                    })
+                };
+                if let Some(bytes) = bytes {
+                    assert_eq!(
+                        fragment["canonical_range"]["start"].as_u64(),
+                        Some(recovered.len() as u64)
+                    );
+                    recovered.extend_from_slice(&bytes);
+                    assert_eq!(
+                        fragment["canonical_range"]["end"].as_u64(),
+                        Some(recovered.len() as u64)
+                    );
+                }
+            }
+            assert!(
+                recovered.len() > before,
+                "every recovery must deliver new source bytes: {output}"
+            );
+            selector = output["continuation_stop"]["selector"].clone();
+        }
+        assert!(selector.is_null(), "recovery must terminate");
+        assert_eq!(
+            recovered.len(),
+            original.len(),
+            "recovery must retain the entire suffix"
+        );
+        assert_eq!(String::from_utf8(recovered).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn snapshot_storage_failure_preserves_inline_evidence_without_dangling_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        let text = "readable source\n".repeat(10_000);
+        std::fs::write(&path, &text).unwrap();
+        let blocked_home = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_home, "blocked").unwrap();
+        for selectors in [None, Some(json!([{"kind": "lines", "start": 1, "end": 1}]))] {
+            let mut call = invocation(&path, json!([]), false).await;
+            let step = Arc::get_mut(&mut call.step_context).unwrap();
+            let turn = Arc::get_mut(&mut step.turn).unwrap();
+            Arc::make_mut(&mut turn.config).codex_home =
+                codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&blocked_home)
+                    .unwrap();
+            let mut args = json!({"path": path});
+            if let Some(selectors) = selectors {
+                args["selectors"] = selectors;
+            }
+            call.payload = ToolPayload::Function {
+                arguments: args.to_string(),
+            };
+            let result = ReadFileHandler
+                .handle(call.clone())
+                .await
+                .unwrap()
+                .code_mode_result(&call.payload);
+            let delivered = result["results"][0]["text"].as_str().unwrap();
+            assert!(!delivered.is_empty());
+            assert!(text.starts_with(delivered));
+            assert_eq!(result["complete"], true);
+            assert_eq!(result["file_complete"], false);
+            assert!(result["artifact_id"].is_null());
+            assert!(result["snapshot_error"].as_str().is_some());
+            assert!(result["continuation"].is_null());
+            assert_eq!(result["retained_bytes"], 0);
+            assert_eq!(result["retained_artifact_complete"], false);
+            let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
+                panic!("function tool")
+            };
+            jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+                .unwrap()
+                .validate(&result)
+                .unwrap();
+        }
     }
 
     #[tokio::test]

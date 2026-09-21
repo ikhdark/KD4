@@ -268,7 +268,7 @@ pub(crate) async fn run_compact_task(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, start_event).await;
-    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await?;
     let world_state = Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
     run_compact_task_inner(
         sess.clone(),
@@ -486,7 +486,7 @@ async fn run_compact_task_inner_impl(
                         Ok(summary_text) => {
                             // Model output is tentative until its checkpoint is semantically valid.
                             sess.record_conversation_items(turn_context.as_ref(), &output.items)
-                                .await;
+                                .await?;
                             break Ok(summary_text);
                         }
                         Err(error) if !retried_invalid_summary => {
@@ -1350,8 +1350,16 @@ fn compaction_image_omission_marker(count: usize) -> String {
     format!("{COMPACT_IMAGE_OMISSION_MARKER} Omitted image count: {count}.")
 }
 
+#[cfg(test)]
 pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<ResponseItem>, usize) {
-    let (mut history, retained_image_count, omitted_image_count, _, _) =
+    let (history, retained_images, _) = build_unresolved_input_checkpoint(items);
+    (history, retained_images)
+}
+
+pub(crate) fn build_unresolved_input_checkpoint(
+    items: &[ResponseItem],
+) -> (Vec<ResponseItem>, usize, bool) {
+    let (mut history, retained_image_count, omitted_image_count, omitted_text, _) =
         build_bounded_unresolved_input_history(items);
     if omitted_image_count > 0 {
         history.push(ResponseItem::Message {
@@ -1364,7 +1372,7 @@ pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<Resp
             internal_chat_message_metadata_passthrough: None,
         });
     }
-    (history, retained_image_count)
+    (history, retained_image_count, omitted_text)
 }
 
 fn build_bounded_unresolved_input_history(
@@ -1611,7 +1619,7 @@ fn compaction_text_omission_receipt(
     }
 }
 
-async fn persist_compaction_text_recovery(
+pub(crate) async fn persist_compaction_text_recovery(
     sess: &Session,
     source_items: &[ResponseItem],
     omitted_text: bool,

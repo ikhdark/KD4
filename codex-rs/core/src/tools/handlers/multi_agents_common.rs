@@ -274,7 +274,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
 /// Provider catalogs may qualify the built-in model slug, so default resolution accepts a
 /// provider prefix while explicit model
 /// overrides continue to require an exact advertised model name. Role-locked values take
-/// precedence; every unlocked reasoning effort defaults independently to `high`.
+/// precedence; omitted settings fall back to the effective provider catalog and supported effort.
 pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     session: &Session,
     turn: &TurnContext,
@@ -303,19 +303,21 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
             Some(requested_model) => {
                 find_spawn_agent_model_name(&available_models, requested_model)?
             }
-            None => find_default_spawn_agent_model_name(&available_models)?,
+            None => {
+                find_default_spawn_agent_model_name(&available_models, config.model.as_deref())?
+            }
         }
     };
 
     config.model = Some(selected_model_name.clone());
-    let reasoning_effort = if role_locks.reasoning_effort {
-        config.model_reasoning_effort.clone().ok_or_else(|| {
+    let explicit_reasoning_effort = if role_locks.reasoning_effort {
+        Some(config.model_reasoning_effort.clone().ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "spawn_agent role did not resolve its configured reasoning effort".to_string(),
             )
-        })?
+        })?)
     } else {
-        requested_reasoning_effort.unwrap_or(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
+        requested_reasoning_effort
     };
     let selected_model_info = models_manager
         .get_model_info(&selected_model_name, &config.to_models_manager_config())
@@ -324,16 +326,25 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     // reject a selection that would already exhaust the child's usable context window.
     config.model_context_window = selected_model_info.resolved_context_window();
     config.model_auto_compact_token_limit = selected_model_info.auto_compact_token_limit();
+    let reasoning_effort = explicit_reasoning_effort.or_else(|| {
+        default_spawn_reasoning_effort(
+            &selected_model_info.supported_reasoning_levels,
+            selected_model_info.default_reasoning_level.clone(),
+        )
+    });
+
     // Fallback metadata has no authoritative effort list. Preserve an explicit role-owned effort
     // for custom models while still validating every catalog-backed final pair.
-    if !role_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata {
+    if let Some(reasoning_effort) = reasoning_effort.as_ref()
+        && (!role_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata)
+    {
         validate_spawn_agent_reasoning_effort(
             &selected_model_name,
             &selected_model_info.supported_reasoning_levels,
-            &reasoning_effort,
+            reasoning_effort,
         )?;
     }
-    config.model_reasoning_effort = Some(reasoning_effort);
+    config.model_reasoning_effort = reasoning_effort;
 
     Ok(())
 }
@@ -433,6 +444,7 @@ fn find_spawn_agent_model_name(
 
 fn find_default_spawn_agent_model_name(
     available_models: &[codex_protocol::openai_models::ModelPreset],
+    effective_model: Option<&str>,
 ) -> Result<String, FunctionCallError> {
     if let Some(model) = available_models
         .iter()
@@ -453,7 +465,28 @@ fn find_default_spawn_agent_model_name(
         return Ok(model.model.clone());
     }
 
-    find_spawn_agent_model_name(available_models, DEFAULT_SPAWN_AGENT_MODEL)
+    available_models
+        .iter()
+        .find(|model| Some(model.model.as_str()) == effective_model)
+        .or_else(|| available_models.iter().find(|model| model.is_default))
+        .or_else(|| available_models.first())
+        .map(|model| model.model.clone())
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent has no models in the effective provider catalog".to_string(),
+            )
+        })
+}
+
+fn default_spawn_reasoning_effort(
+    supported: &[ReasoningEffortPreset],
+    default: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    [Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT), default]
+        .into_iter()
+        .flatten()
+        .find(|effort| supported.iter().any(|preset| &preset.effort == effort))
+        .or_else(|| supported.first().map(|preset| preset.effort.clone()))
 }
 
 fn validate_spawn_agent_reasoning_effort(
@@ -476,4 +509,43 @@ fn validate_spawn_agent_reasoning_effort(
     Err(FunctionCallError::RespondToModel(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
+}
+
+#[cfg(test)]
+mod compatible_defaults_tests {
+    use super::*;
+    #[test]
+    fn omitted_effort_falls_back_but_explicit_effort_stays_strict() {
+        let supported = vec![ReasoningEffortPreset {
+            effort: ReasoningEffort::Low,
+            description: "low only".into(),
+        }];
+        assert_eq!(
+            default_spawn_reasoning_effort(&supported, Some(ReasoningEffort::Low)),
+            Some(ReasoningEffort::Low)
+        );
+        assert!(
+            validate_spawn_agent_reasoning_effort("local", &supported, &ReasoningEffort::High)
+                .is_err()
+        );
+        assert_eq!(default_spawn_reasoning_effort(&[], None), None);
+    }
+    #[test]
+    fn omitted_model_uses_effective_catalog_without_relaxing_explicit_names() {
+        let preset: codex_protocol::openai_models::ModelPreset = serde_json::from_value(serde_json::json!({
+            "id":"local", "model":"local-model", "display_name":"Local", "description":"Local model",
+            "default_reasoning_effort":"low", "supported_reasoning_efforts":[], "is_default":true,
+            "show_in_picker":true, "supported_in_api":true
+        })).unwrap();
+        let catalog = vec![preset];
+        assert_eq!(
+            find_default_spawn_agent_model_name(&catalog, Some("local-model")).unwrap(),
+            "local-model"
+        );
+        assert_eq!(
+            find_default_spawn_agent_model_name(&catalog, None).unwrap(),
+            "local-model"
+        );
+        assert!(find_spawn_agent_model_name(&catalog, DEFAULT_SPAWN_AGENT_MODEL).is_err());
+    }
 }

@@ -20,6 +20,7 @@ pub use metadata::enabled_tool_metadata;
 pub use metadata::is_code_mode_nested_tool;
 pub use metadata::normalize_code_mode_identifier;
 pub use metadata::render_code_mode_sample;
+pub use metadata::render_code_mode_tool_bundle;
 pub use pragma::CODE_MODE_PRAGMA_PREFIX;
 pub use pragma::parse_exec_source;
 pub use schema_ts::render_json_schema_to_typescript;
@@ -110,6 +111,120 @@ mod tests {
             description.contains(
                 "hidden_dynamic_tool(args: { city: string; }, options?: { timeout_ms?: number }): Promise<{ ok: boolean; }>;"
             )
+        );
+    }
+
+    #[test]
+    fn repeated_shapes_are_declared_once_and_referenced_by_name() {
+        // One selector shape reached from four properties, as the retained-output
+        // tools do. Re-rendering it at every site is the projector's default.
+        let selector = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "bytes"},
+                        "start": {"type": "integer", "description": "Zero-based start byte."},
+                        "end": {"type": "integer", "description": "Exclusive end byte."}
+                    },
+                    "required": ["kind", "start", "end"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "lines"},
+                        "start": {"type": "integer", "description": "One-based first line."},
+                        "end": {"type": "integer", "description": "Inclusive last line."}
+                    },
+                    "required": ["kind", "start", "end"]
+                }
+            ]
+        });
+        let definition = ToolDefinition {
+            name: "read_retained".to_string(),
+            tool_name: ToolName::plain("read_retained"),
+            description: "Read retained output.".to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(json!({
+                "$defs": {"selector": selector},
+                "type": "object",
+                "properties": {"selectors": {"type": "array", "items": {"$ref": "#/$defs/selector"}}},
+                "required": ["selectors"]
+            })),
+            default_timeout_ms: None,
+            output_schema: Some(json!({
+                "$defs": {"selector": selector},
+                "type": "object",
+                "properties": {
+                    "selector": {"$ref": "#/$defs/selector"},
+                    "continuation": {"$ref": "#/$defs/selector"},
+                    "child_selectors": {"type": "array", "items": {"$ref": "#/$defs/selector"}}
+                },
+                "required": ["selector", "continuation", "child_selectors"]
+            })),
+        };
+
+        let description = augment_tool_definition(definition).description;
+        // The shape is declared once, under the name its reference supplies.
+        assert_eq!(
+            description.matches("type CodeModeSelector = ").count(),
+            1,
+            "the shared shape must be declared exactly once: {description}"
+        );
+        // Every use site refers to the alias rather than repeating the shape.
+        assert_eq!(
+            description.matches("Zero-based start byte.").count(),
+            1,
+            "the shape body must not be repeated at use sites: {description}"
+        );
+        for use_site in [
+            "selectors: Array<CodeModeSelector>",
+            "selector: CodeModeSelector;",
+            "continuation: CodeModeSelector;",
+            "child_selectors: Array<CodeModeSelector>",
+        ] {
+            assert!(
+                description.contains(use_site),
+                "missing `{use_site}` in: {description}"
+            );
+        }
+        // The alias is declared before the declaration that consumes it.
+        let alias_at = description
+            .find("type CodeModeSelector = ")
+            .expect("alias must be present");
+        let declaration_at = description
+            .find("declare const tools")
+            .expect("declaration must be present");
+        assert!(alias_at < declaration_at, "alias must precede its use");
+    }
+
+    #[test]
+    fn single_use_shapes_are_not_given_names() {
+        let definition = ToolDefinition {
+            name: "single_use".to_string(),
+            tool_name: ToolName::plain("single_use"),
+            description: "One shape, one site.".to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {"only": {
+                    "type": "object",
+                    "properties": {
+                        "alpha": {"type": "string", "description": "A description long enough to pass the hoist threshold on its own."},
+                        "beta": {"type": "string", "description": "A second description long enough to pass the hoist threshold."}
+                    },
+                    "required": ["alpha", "beta"]
+                }},
+                "required": ["only"]
+            })),
+            default_timeout_ms: None,
+            output_schema: None,
+        };
+
+        let description = augment_tool_definition(definition).description;
+        assert!(
+            !description.contains("type CodeMode"),
+            "a shape used once must stay inline: {description}"
         );
     }
 
@@ -455,7 +570,7 @@ mod tests {
                 &format!(
                     "({{ cmd: string; }}) & (string | number | boolean | null | unknown[] | {{ timeout?: number; }}){}",
                     if keyword == "oneOf" {
-                        " /* oneOf: exactly one branch must match; consult JSON Schema */"
+                        " /* oneOf: exactly one branch must match */"
                     } else {
                         ""
                     }
@@ -560,7 +675,7 @@ mod tests {
                 "type": "object", "required": ["path"], "additionalProperties": false,
                 "patternProperties": {"^path$": {"type": "string"}}
             }),
-            "{ path: unknown; [key: string]: unknown; /* patternProperties not projected; consult JSON Schema */ }",
+            "{ path: unknown; [key: string]: unknown; /* patternProperties not projected */ }",
         );
     }
 
@@ -638,7 +753,7 @@ mod tests {
                 }}),
             );
         }
-        let incomplete = "unknown /* schema projection incomplete: rendering limit reached; consult the tool's JSON Schema */";
+        let incomplete = "unknown /* schema projection incomplete: rendering limit reached */";
         assert_input_declaration(json!({"$defs": defs, "$ref": "#/$defs/L20"}), incomplete);
         assert_input_declaration(json!({"const": "x".repeat(200_000)}), incomplete);
         let mut deep = json!({"type": "string"});
@@ -683,11 +798,11 @@ mod tests {
             ),
             (
                 json!({"oneOf": [{"type": "number"}, {"type": "number"}]}),
-                "number | number /* oneOf: exactly one branch must match; consult JSON Schema */",
+                "number | number /* oneOf: exactly one branch must match */",
             ),
             (
                 json!({"type": "number", "not": {"const": 0}}),
-                "number /* unprojected keyword: not; consult JSON Schema */",
+                "number /* unprojected keyword: not */",
             ),
         ] {
             assert_input_declaration(schema, expected);
@@ -700,7 +815,8 @@ mod tests {
             "$id": "https://example.invalid/inner", "$defs": {"Value": {"type": "integer"}},
             "$ref": "#/$defs/Value", "properties": {"value": {"$ref": "#/$defs/Value"}}
         });
-        let incomplete = "unknown /* schema projection incomplete: nested $id resource not projected; consult JSON Schema */";
+        let incomplete =
+            "unknown /* schema projection incomplete: nested $id resource not projected */";
         for reference in ["#/$defs/inner", "#/$defs/inner/properties/value"] {
             assert_input_declaration(
                 json!({
@@ -720,7 +836,7 @@ mod tests {
 
     #[test]
     fn declarations_bound_reference_work_and_programmatically_constructed_literals() {
-        let incomplete = "unknown /* schema projection incomplete: rendering limit reached; consult the tool's JSON Schema */";
+        let incomplete = "unknown /* schema projection incomplete: rendering limit reached */";
         assert_input_declaration(
             json!({"$ref": format!("#/{}", "x".repeat(200_000))}),
             incomplete,

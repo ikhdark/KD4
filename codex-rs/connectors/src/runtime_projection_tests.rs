@@ -29,7 +29,8 @@ fn projection_deduplicates_apps_and_ignores_non_runtime_tools() {
             tool(Some(" "), Some("Empty"), "empty"),
             tool(/*connector_id*/ None, Some("Missing"), "missing"),
         ],
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         apps,
@@ -68,7 +69,8 @@ fn projection_applies_managed_app_policy_and_model_visibility() {
             },
             tool(Some("callable"), Some("Callable"), "callable/tool"),
         ],
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         apps,
@@ -146,7 +148,7 @@ fn projection_keeps_any_callable_tool_and_later_names_in_either_order() {
                 tools.reverse();
             }
             assert_eq!(
-                installed_connector_runtime(&config, tools),
+                installed_connector_runtime(&config, tools).unwrap(),
                 vec![InstalledConnectorRuntime {
                     id: "drive".to_string(),
                     runtime_name: Some("Drive".to_string()),
@@ -157,7 +159,8 @@ fn projection_keeps_any_callable_tool_and_later_names_in_either_order() {
         }
     }
     assert_eq!(
-        installed_connector_runtime(&config, [tool(Some("drive"), None, "blocked")])[0].callable,
+        installed_connector_runtime(&config, [tool(Some("drive"), None, "blocked")]).unwrap()[0]
+            .callable,
         false
     );
 }

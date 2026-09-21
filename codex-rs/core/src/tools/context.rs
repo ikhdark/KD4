@@ -42,6 +42,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -76,6 +77,7 @@ pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
 #[derive(Debug)]
 pub(crate) struct ToolDispatchState {
     state: AtomicU8,
+    handler_started: AtomicBool,
     trace: std::sync::OnceLock<ToolDispatchTrace>,
 }
 
@@ -100,6 +102,7 @@ impl ToolDispatchState {
     pub(crate) fn new() -> Self {
         Self {
             state: AtomicU8::new(ToolDispatchPhase::WaitingForAdmission as u8),
+            handler_started: AtomicBool::new(false),
             trace: std::sync::OnceLock::new(),
         }
     }
@@ -168,6 +171,14 @@ impl ToolDispatchState {
                 return outcome;
             }
         }
+    }
+
+    pub(crate) fn mark_handler_started(&self) {
+        self.handler_started.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn handler_started(&self) -> bool {
+        self.handler_started.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
@@ -247,8 +258,6 @@ impl ToolCallSource {
 pub(crate) enum RequiredToolTerminalCause {
     Blocked,
     Failure,
-    TimedOut,
-    RecoverableCancellation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1667,6 +1676,7 @@ impl ExecCommandToolOutput {
                 format!("Process state unavailable; wall time: {wall_time_seconds:.4} seconds")
             }
         };
+        let mandatory_status = process_status.clone();
         sections.push(process_status);
         if let Some(capabilities) = self.session_capabilities {
             sections.push(format!(
@@ -1704,7 +1714,8 @@ impl ExecCommandToolOutput {
 
         let response = sections.join("\n");
         let Some(Some(notice)) = reduction_notice else {
-            return truncate_text_to_token_ceiling(&response, max_tokens);
+            let budget = max_tokens.max(codex_utils_string::approx_token_count(&mandatory_status));
+            return truncate_text_to_token_ceiling(&response, budget);
         };
         // The notice carries its own identifier and selector. Remove the
         // redundant header so recovery still fits a small output budget.
@@ -1715,13 +1726,16 @@ impl ExecCommandToolOutput {
         };
         let notice = notice.to_string();
         let notice_tokens = codex_utils_string::approx_token_count(&notice);
-        if notice_tokens > max_tokens {
-            // An exceptionally small caller budget cannot fit the complete
-            // recovery pair. Keep its identifier without a dangling instruction.
-            return truncate_text_to_token_ceiling(&artifact_header, max_tokens);
-        }
-        if notice_tokens == max_tokens {
-            return notice;
+        let status_tokens = codex_utils_string::approx_token_count(&mandatory_status);
+        if notice_tokens.saturating_add(status_tokens + 1) >= max_tokens {
+            // Execution controls have priority over optional recovery prose.
+            let locator_budget = max_tokens.saturating_sub(status_tokens + 1);
+            let locator = truncate_text_to_token_ceiling(&artifact_header, locator_budget);
+            return if locator.is_empty() {
+                mandatory_status
+            } else {
+                format!("{mandatory_status}\n{locator}")
+            };
         }
         let response = sections.join("\n");
         let mut response_budget = max_tokens.saturating_sub(notice_tokens + 1);

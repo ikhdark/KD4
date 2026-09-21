@@ -805,23 +805,215 @@ async fn audit_workspace_git_capture_includes_tracked_generated_named_paths() {
 }
 
 #[tokio::test]
-async fn audit_workspace_fallback_is_incomplete_and_rejected_for_validation() {
+async fn unborn_repository_capture_includes_index_and_excludes_ignored_files() {
     let fixture = Fixture::new().await;
     std::fs::write(fixture.repo.path().join("input.txt"), "input").expect("fallback input");
     run_git(fixture.repo.path(), &["init", "--quiet"]);
-    // An unborn HEAD makes overlay discovery fail despite a real Git repository.
+    std::fs::write(fixture.repo.path().join(".gitignore"), "target/\n").unwrap();
+    std::fs::create_dir(fixture.repo.path().join("target")).unwrap();
+    std::fs::write(fixture.repo.path().join("target/artifact"), "ignored").unwrap();
+    run_git(fixture.repo.path(), &["add", "input.txt"]);
     let revision = fixture
         .store
         .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
         .await
-        .expect("fallback captures diagnostically");
-    assert_eq!(
-        revision.capture_mode,
-        WorkspaceCaptureMode::FilesystemFallback
+        .expect("unborn repository captures");
+    assert_eq!(revision.capture_mode, WorkspaceCaptureMode::GitOverlay);
+    assert!(revision.complete);
+    assert!(revision.discovery_errors.is_empty());
+    assert!(crate::local::require_complete_workspace_capture(&revision).is_ok());
+    assert!(revision.files.iter().any(|entry| entry.path == "input.txt"));
+    assert!(
+        !revision
+            .files
+            .iter()
+            .any(|entry| entry.path.starts_with("target/"))
     );
-    assert!(!revision.complete);
-    assert!(!revision.discovery_errors.is_empty());
-    assert!(crate::local::require_complete_workspace_capture(&revision).is_err());
+    assert!(
+        revision
+            .files
+            .iter()
+            .any(|entry| entry.path == REPOSITORY_WIDE_PATH && !entry.existed)
+    );
+}
+
+#[tokio::test]
+async fn validation_changed_during_execution_cannot_be_current_proof() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "focused validation";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("during-validation", "src/lib.rs", command),
+        )
+        .await
+        .unwrap();
+    // An edit before launch must be part of the recorded input revision.
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before launch\n").unwrap();
+    let call =
+        start_focused_validation(&fixture.store, attempt.attempt_id, "during-call", command).await;
+    let revision = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(call.evidence.start_epoch, revision.epoch);
+    std::fs::write(
+        fixture.repo.path().join("src/lib.rs"),
+        "after inputs consumed\n",
+    )
+    .unwrap();
+    let terminal = finish_focused_validation(&fixture.store, call).await;
+    assert_ne!(
+        terminal.evidence.end_epoch,
+        Some(terminal.evidence.start_epoch)
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .submit_agent_receipt(
+                attempt.attempt_id,
+                completed_receipt(vec![terminal.call_id])
+            )
+            .await,
+        Err(StoreError::ValidationCallStatusInvalid { .. })
+    ));
+}
+
+#[tokio::test]
+async fn late_validation_settles_after_abandonment_without_creating_proof() {
+    let fixture = Fixture::new().await;
+    let command = "focused validation";
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("late-validation", "src", command),
+        )
+        .await
+        .unwrap();
+    let call =
+        start_focused_validation(&fixture.store, attempt.attempt_id, "late-call", command).await;
+    fixture
+        .store
+        .abandon_agent_task(
+            TaskActor::Root,
+            assignment.assignment_id,
+            "stop".to_string(),
+        )
+        .await
+        .unwrap();
+    let terminal = finish_focused_validation(&fixture.store, call).await;
+    assert_eq!(terminal.status, ValidationCallStatus::Succeeded);
+    assert_eq!(terminal.evidence.end_epoch, None);
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_ne!(task.current_attempt.state, AttemptState::Active);
+    assert!(task.current_attempt.sealed_at.is_some());
+    let pool = coordination_pool(&fixture).await;
+    let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM validation_calls WHERE call_id = 'late-call' AND status = '\"running\"'").fetch_one(&pool).await.unwrap();
+    assert_eq!(running, 0);
+}
+
+#[tokio::test]
+async fn successful_process_settles_when_terminal_evidence_capture_fails() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "focused validation";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("capture-failed", "src", command),
+        )
+        .await
+        .unwrap();
+    let call = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "capture-failed-call",
+        command,
+    )
+    .await;
+    std::fs::write(fixture.repo.path().join(".git/HEAD"), "invalid head\n").unwrap();
+    let terminal = finish_focused_validation(&fixture.store, call).await;
+    assert_eq!(terminal.status, ValidationCallStatus::Succeeded);
+    assert_eq!(terminal.evidence.end_epoch, None);
+    assert!(
+        terminal
+            .evidence
+            .output_summary
+            .unwrap()
+            .contains("evidence is unavailable")
+    );
+}
+
+#[tokio::test]
+async fn failed_capture_rolls_back_before_settling_validation() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "focused validation";
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("capture-rollback", "src", command),
+        )
+        .await
+        .unwrap();
+    let call =
+        start_focused_validation(&fixture.store, attempt.attempt_id, "rollback-call", command)
+            .await;
+    let pool = coordination_pool(&fixture).await;
+    let before: i64 =
+        sqlx::query_scalar("SELECT epoch FROM workspace_repositories WHERE workspace_id = ?")
+            .bind(&assignment.workspace_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // Reject publication after capture has obtained the writer. Without the
+    // savepoint, reconciliation could leak a partial epoch into the outer commit.
+    sqlx::query("CREATE TRIGGER reject_capture BEFORE UPDATE OF epoch ON workspace_repositories WHEN NEW.epoch <> OLD.epoch BEGIN SELECT RAISE(FAIL, 'injected capture publication failure'); END")
+        .execute(&pool).await.unwrap();
+    std::fs::write(
+        fixture.repo.path().join("src/lib.rs"),
+        "changed before completion\n",
+    )
+    .unwrap();
+    let terminal = finish_focused_validation(&fixture.store, call).await;
+    assert_eq!(terminal.status, ValidationCallStatus::Succeeded);
+    assert_eq!(terminal.evidence.end_epoch, None);
+    assert!(
+        terminal
+            .evidence
+            .output_summary
+            .unwrap()
+            .contains("injected capture publication failure")
+    );
+    let after: i64 =
+        sqlx::query_scalar("SELECT epoch FROM workspace_repositories WHERE workspace_id = ?")
+            .bind(&assignment.workspace_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before);
+    let leaked_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_events WHERE workspace_id = ? AND epoch > ?",
+    )
+    .bind(&assignment.workspace_id)
+    .bind(before)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        leaked_events, 0,
+        "failed publication must roll back its event too"
+    );
 }
 
 fn create_audit_symlink(target: &std::path::Path, link: &std::path::Path) {
@@ -2310,6 +2502,44 @@ async fn selective_admission_keeps_overlapping_claims_as_metadata() {
 }
 
 #[tokio::test]
+async fn plain_message_admission_does_not_require_typed_proof_obligation() {
+    let fixture = Fixture::new().await;
+    let mut draft = selective_worker_draft("plain-admission-root", ".", &[]);
+    draft.required_evidence.clear();
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    assert!(matches!(
+        fixture.store.create_admitted_assignment(fixture.repo.path(), draft.clone(), true).await,
+        Err(StoreError::InvalidAssignment(message)) if message.contains("proof obligation")
+    ));
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    let admitted = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), draft, true)
+        .await
+        .expect("ordinary message admits without a typed proof obligation");
+    assert!(admitted.assignment.required_evidence.is_empty());
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            admitted.attempt.attempt_id,
+            AgentStatusClaim::Completed,
+            "ordinary final".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, AgentStatusClaim::Completed);
+    assert!(receipt.validation_call_ids.is_empty());
+    assert!(
+        receipt
+            .criterion_results
+            .iter()
+            .all(|result| result.status == CriterionStatus::NotRun)
+    );
+}
+
+#[tokio::test]
 async fn repository_root_scope_allows_nested_writer_metadata() {
     let fixture = Fixture::new().await;
     let root_session_id = "repository-root-overlap";
@@ -2941,6 +3171,392 @@ async fn missing_evidence_is_rebuilt_from_current_calls_on_every_submission() {
         .await
         .expect("the gate rebuild sees both current successful results");
     assert_eq!(receipt.status, AgentStatusClaim::Completed);
+}
+
+#[tokio::test]
+async fn host_legacy_outcome_persists_final_response_without_fabricating_evidence() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("plain-message-root", ".");
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    // Older persisted plain-message tasks used this synthetic, non-command obligation.
+    draft.required_evidence = vec!["task result reported to the parent agent".to_string()];
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("plain-message assignment creates");
+    controlled_write(
+        &fixture.store,
+        fixture.repo.path(),
+        "plain-message-root",
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "result.txt",
+        "changed",
+    )
+    .await;
+    fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Root,
+            assignment.assignment_id,
+            GateKind::Verification,
+            GateStatus::Pending,
+            "advisory verification not run".to_string(),
+        )
+        .await
+        .unwrap();
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            attempt.attempt_id,
+            AgentStatusClaim::Completed,
+            "Implemented the requested change; tests were not run.".to_string(),
+        )
+        .await
+        .expect("host-observed final response seals ordinary task");
+    assert_eq!(receipt.status, AgentStatusClaim::Completed);
+    assert_eq!(receipt.criterion_results.len(), 1);
+    assert_eq!(receipt.criterion_results[0].status, CriterionStatus::NotRun);
+    assert_eq!(receipt.criterion_results[0].evidence, None);
+    assert_eq!(receipt.criterion_results[0].evidence_ref, None);
+    assert!(receipt.validation_call_ids.is_empty());
+    assert_eq!(receipt.declared_changes.len(), 1);
+    assert_eq!(receipt.declared_changes[0].path, "result.txt");
+    assert!(receipt.declared_changes[0].summary.contains("unverified"));
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("host outcome reloads");
+    assert_eq!(task.current_attempt.state, AttemptState::Completed);
+    assert_eq!(
+        task.workspace_status.pending_gates,
+        vec![GateKind::Verification]
+    );
+    assert_eq!(task.workspace_status.next_required_action, None);
+    assert_eq!(task.receipt, Some(receipt));
+    assert!(matches!(
+        fixture
+            .store
+            .record_legacy_agent_outcome(
+                attempt.attempt_id,
+                AgentStatusClaim::Completed,
+                "second final response".to_string(),
+            )
+            .await,
+        Err(StoreError::AttemptSealed(_))
+    ));
+}
+
+#[tokio::test]
+async fn host_legacy_outcome_cannot_bypass_explicit_typed_receipt() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("typed-root", "src"))
+        .await
+        .expect("typed assignment creates");
+    assert!(matches!(
+        fixture
+            .store
+            .record_legacy_agent_outcome(
+                attempt.attempt_id,
+                AgentStatusClaim::Completed,
+                "done".to_string(),
+            )
+            .await,
+        Err(StoreError::InvalidAssignment(_))
+    ));
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("rejected completion leaves task readable");
+    assert_eq!(task.current_attempt.state, AttemptState::Active);
+    assert!(task.receipt.is_none());
+    let mut unsupported = completed_receipt(Vec::new());
+    unsupported.criterion_results[0].status = CriterionStatus::NotRun;
+    assert!(matches!(
+        fixture
+            .store
+            .submit_agent_receipt(attempt.attempt_id, unsupported)
+            .await,
+        Err(StoreError::CriterionResultsInvalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn host_legacy_outcome_retains_unfinalized_mutation_risk() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("plain-pending-root", ".");
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("plain-message assignment creates");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "plain-pending-root",
+    )
+    .await;
+    fixture
+        .store
+        .begin_mutation(
+            attempt.attempt_id,
+            fixture.repo.path(),
+            "pending.txt".to_string(),
+            AttributionConfidence::Definitive,
+        )
+        .await
+        .expect("mutation begins");
+    std::fs::write(fixture.repo.path().join("pending.txt"), "pending").unwrap();
+    // Completion can still be delivered if mutation finalization was unavailable,
+    // but the host must not turn pending records into finalized change evidence.
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            attempt.attempt_id,
+            AgentStatusClaim::Completed,
+            "Final response".to_string(),
+        )
+        .await
+        .expect("host result persists with incomplete attribution");
+    assert_eq!(receipt.status, AgentStatusClaim::Completed);
+    assert!(receipt.declared_changes.is_empty());
+    assert!(receipt.validation_call_ids.is_empty());
+    assert_eq!(
+        receipt.risks,
+        vec!["1 recorded mutations were not finalized; change attribution is incomplete"]
+    );
+}
+
+#[tokio::test]
+async fn host_legacy_outcome_waits_for_running_validation() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("plain-validation-root", ".");
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    draft.required_evidence = vec!["cargo test -p plain".to_string()];
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("plain-message assignment creates");
+    let running = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "plain-running-check",
+        "cargo test -p plain",
+    )
+    .await;
+    assert!(matches!(
+        fixture.store.record_legacy_agent_outcome(
+            attempt.attempt_id, AgentStatusClaim::Completed, "done".to_string(),
+        ).await,
+        Err(StoreError::ValidationCallStatusInvalid { call_ids })
+            if call_ids == vec![running.call_id.clone()]
+    ));
+    assert!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap()
+            .receipt
+            .is_none()
+    );
+    finish_focused_validation(&fixture.store, running).await;
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            attempt.attempt_id,
+            AgentStatusClaim::Completed,
+            "done".to_string(),
+        )
+        .await
+        .expect("settled validation allows host outcome");
+    assert!(
+        receipt.validation_call_ids.is_empty(),
+        "host must not infer which behavior a completed validation proved"
+    );
+}
+
+#[tokio::test]
+async fn host_legacy_followup_renews_each_completed_turn_and_its_binding() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("plain-followup-root", ".");
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    draft.required_evidence.clear();
+    let (assignment, mut attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .unwrap();
+    let original_binding = bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "plain-followup-root",
+    )
+    .await;
+    let mut prior_attempts = Vec::new();
+    for ordinal in 0..3 {
+        assert_eq!(attempt.ordinal, ordinal);
+        // A follow-up queued while this turn is active must not retire its tools or receipt.
+        assert_eq!(
+            fixture
+                .store
+                .begin_legacy_agent_turn(assignment.assignment_id)
+                .await
+                .unwrap(),
+            attempt
+        );
+        let summary = format!("completed turn {ordinal}");
+        fixture
+            .store
+            .record_legacy_agent_outcome(
+                attempt.attempt_id,
+                AgentStatusClaim::Completed,
+                summary.clone(),
+            )
+            .await
+            .unwrap();
+        let completed = fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(completed.receipt.unwrap().summary, summary);
+        prior_attempts.push(attempt.attempt_id);
+        attempt = fixture
+            .store
+            .begin_legacy_agent_turn(assignment.assignment_id)
+            .await
+            .unwrap();
+        assert_eq!(attempt.ordinal, ordinal + 1);
+        let binding = fixture
+            .store
+            .get_agent_task_binding(assignment.assignment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.attempt_id, attempt.attempt_id);
+        assert_eq!(binding.thread_id, original_binding.thread_id);
+        assert_eq!(binding.agent_path, original_binding.agent_path);
+        let active = fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(active.current_attempt.state, AttemptState::Active);
+        assert!(active.receipt.is_none());
+        assert!(active.validation_calls.is_empty());
+    }
+    // This agent already has a stable path and thread binding. A follow-up must
+    // attribute new writes to the renewed attempt without rebinding its identity.
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["followup.txt".to_string()])
+        .await
+        .unwrap();
+    fixture
+        .store
+        .begin_mutation(
+            attempt.attempt_id,
+            fixture.repo.path(),
+            "followup.txt".to_string(),
+            AttributionConfidence::Definitive,
+        )
+        .await
+        .unwrap();
+    std::fs::write(fixture.repo.path().join("followup.txt"), "latest turn").unwrap();
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["followup.txt".to_string()])
+        .await
+        .unwrap();
+    let mutation = fixture
+        .store
+        .finalize_mutation(
+            attempt.attempt_id,
+            fixture.repo.path(),
+            "followup.txt".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mutation.attempt_id, attempt.attempt_id);
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            attempt.attempt_id,
+            AgentStatusClaim::Completed,
+            "latest result".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.declared_changes[0].path, "followup.txt");
+    assert!(receipt.validation_call_ids.is_empty());
+    for old_attempt in prior_attempts {
+        assert!(matches!(
+            fixture
+                .store
+                .record_legacy_agent_outcome(
+                    old_attempt,
+                    AgentStatusClaim::Completed,
+                    "stale result".to_string()
+                )
+                .await,
+            Err(StoreError::AttemptSealed(_))
+        ));
+    }
+    let latest = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(latest.receipt.unwrap().summary, "latest result");
+}
+
+#[tokio::test]
+async fn host_legacy_followup_cannot_renew_typed_assignments() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("typed-followup-root", "src"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .begin_legacy_agent_turn(assignment.assignment_id)
+            .await,
+        Err(StoreError::InvalidAssignment(_))
+    ));
+    let unchanged = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(unchanged.current_attempt.attempt_id, attempt.attempt_id);
+    assert_eq!(unchanged.current_attempt.state, AttemptState::Active);
 }
 
 #[tokio::test]
@@ -6865,4 +7481,226 @@ async fn malformed_git_lineage_metadata_rejects_assignment_without_persisting_fa
             "Git lineage must not fall back to checkout identity"
         );
     }
+}
+
+#[tokio::test]
+async fn attempt_ordinal_migration_initializes_fresh_and_upgrades_existing_stores() {
+    for predecessor in [false, true] {
+        let mut prior_attempt_triggers = Vec::new();
+        let codex_home = TempDir::new().expect("codex home tempdir");
+        let repo = TempDir::new().expect("repository tempdir");
+        let state =
+            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .expect("state initializes");
+        let coordination_root = state.codex_home().join("agent-task-coordination");
+        tokio::fs::create_dir_all(&coordination_root)
+            .await
+            .expect("coordination directory creates");
+        if predecessor {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(coordination_root.join("agent_tasks.sqlite"))
+                        .create_if_missing(true)
+                        .foreign_keys(true),
+                )
+                .await
+                .expect("predecessor database opens");
+            task_store_migrator_through(18)
+                .run(&pool)
+                .await
+                .expect("prior schema applies");
+            prior_attempt_triggers = sqlx::query_as::<_, (String, String)>(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'attempts' ORDER BY name",
+            ).fetch_all(&pool).await.unwrap();
+            // These opaque payloads must survive byte-for-byte. No migration
+            // may reinterpret a sealed receipt or a prior amendment.
+            sqlx::raw_sql(
+                "INSERT INTO assignments VALUES ('prior-assignment', 'prior-root', '{}', 'created');
+                 INSERT INTO attempts VALUES
+                   ('prior-zero', 'prior-assignment', 0, NULL, 'completed', 'created-zero', 'sealed-zero'),
+                   ('prior-one', 'prior-assignment', 1, '{\"reason\":\"retained\"}', 'completed', 'created-one', 'sealed-one');
+                 INSERT INTO receipts VALUES
+                   ('prior-zero', 'prior-assignment', 'completed', '{\"summary\":\"original\"}', 'sealed-zero');
+                 INSERT INTO agent_task_bindings VALUES
+                   ('prior-assignment', 'prior-one', 'prior-root', '/root/prior', 'prior', 'prior-thread', 'bound', 'updated');",
+            )
+            .execute(&pool)
+            .await
+            .expect("predecessor attempts, receipt, and binding seed");
+            assert!(
+                sqlx::query("INSERT INTO attempts VALUES ('too-early', 'prior-assignment', 2, NULL, 'active', 'created', NULL)")
+                    .execute(&pool)
+                    .await
+                    .is_err(),
+                "the predecessor must reproduce the ordinal constraint"
+            );
+            pool.close().await;
+        }
+        // Exercise the normal startup path and its embedded migration set.
+        let store = LocalAgentTaskStore::initialize(&state)
+            .await
+            .expect("normal initialization applies the ordinal migration");
+        let fixture = Fixture {
+            _codex_home: codex_home,
+            repo,
+            state,
+            store,
+        };
+        let pool = coordination_pool(&fixture).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 19 AND success = 1"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        if predecessor {
+            assert_eq!(
+                sqlx::query_as::<_, (String, String)>(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'attempts' ORDER BY name",
+                ).fetch_all(&pool).await.unwrap(),
+                prior_attempt_triggers,
+                "the migration preserves every live attempts trigger"
+            );
+            let attempts =
+                sqlx::query_as::<_, (String, i64, Option<String>, String, String, Option<String>)>(
+                    "SELECT attempt_id, ordinal, amendment_json, state, created_at, sealed_at
+                 FROM attempts WHERE assignment_id = 'prior-assignment' ORDER BY ordinal",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                attempts,
+                vec![
+                    (
+                        "prior-zero".into(),
+                        0,
+                        None,
+                        "completed".into(),
+                        "created-zero".into(),
+                        Some("sealed-zero".into())
+                    ),
+                    (
+                        "prior-one".into(),
+                        1,
+                        Some("{\"reason\":\"retained\"}".into()),
+                        "completed".into(),
+                        "created-one".into(),
+                        Some("sealed-one".into())
+                    ),
+                ]
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (String, String, String)>("SELECT attempt_id, body_json, sealed_at FROM receipts WHERE assignment_id = 'prior-assignment'")
+                    .fetch_one(&pool).await.unwrap(),
+                ("prior-zero".into(), "{\"summary\":\"original\"}".into(), "sealed-zero".into())
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (String, String, String, String, String)>("SELECT attempt_id, agent_path, thread_id, bound_at, updated_at FROM agent_task_bindings WHERE assignment_id = 'prior-assignment'")
+                    .fetch_one(&pool).await.unwrap(),
+                ("prior-one".into(), "/root/prior".into(), "prior-thread".into(), "bound".into(), "updated".into())
+            );
+        }
+        let (assignment, _) = fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                worker_draft("post-migration-root", "src"),
+            )
+            .await
+            .expect("normal assignment creation still works");
+        for ordinal in [1, 2, 255] {
+            sqlx::query("INSERT INTO attempts VALUES (?, ?, ?, NULL, 'active', 'created', NULL)")
+                .bind(format!("supported-{ordinal}"))
+                .bind(assignment.assignment_id.to_string())
+                .bind(ordinal)
+                .execute(&pool)
+                .await
+                .expect("supported ordinal inserts");
+        }
+        for ordinal in [-1, 256] {
+            let error = sqlx::query(
+                "INSERT INTO attempts VALUES (?, ?, ?, NULL, 'active', 'created', NULL)",
+            )
+            .bind(format!("unsupported-{ordinal}"))
+            .bind(assignment.assignment_id.to_string())
+            .bind(ordinal)
+            .execute(&pool)
+            .await
+            .expect_err("out-of-range ordinals stay rejected");
+            assert!(
+                error.to_string().contains("CHECK constraint failed"),
+                "{error}"
+            );
+        }
+        assert!(
+            sqlx::query(
+                "INSERT INTO attempts VALUES ('duplicate', ?, 2, NULL, 'active', 'created', NULL)"
+            )
+            .bind(assignment.assignment_id.to_string())
+            .execute(&pool)
+            .await
+            .is_err(),
+            "assignment ordinals remain unique"
+        );
+        assert!(sqlx::query("INSERT INTO attempts VALUES ('fractional', ?, 2.5, NULL, 'active', 'created', NULL)")
+            .bind(assignment.assignment_id.to_string()).execute(&pool).await.is_err(), "ordinals remain integers");
+        assert!(sqlx::query("INSERT INTO attempts VALUES ('orphan', 'missing-assignment', 2, NULL, 'active', 'created', NULL)")
+            .execute(&pool).await.is_err(), "attempt ownership still requires a parent");
+        assert!(
+            sqlx::query("UPDATE attempts SET ordinal = 3 WHERE attempt_id = 'supported-2'")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "amendment immutability remains enforced"
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'attempts_assignment_ordinal_idx'")
+            .fetch_one(&pool).await.unwrap(), 1);
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pool.close().await;
+        fixture.store.close().await;
+    }
+}
+
+#[tokio::test]
+async fn automatic_wake_delivery_is_atomic_with_cursor_and_survives_losing_publish() {
+    let fixture = Fixture::new().await;
+    let root = "delivery-root".to_string();
+    let consumer = "/root/consumer".to_string();
+    let (_, attempt) = fixture.store.create_assignment(fixture.repo.path(), worker_draft(&root, "src")).await.unwrap();
+    let cursor = fixture.store.automatic_wake_cursor(root.clone(), consumer.clone()).await.unwrap();
+    fixture.store.append_observation(attempt.attempt_id, ObservationKind::Reading, "ready".to_string(), None).await.unwrap();
+    let batch = fixture.store.read_wake_events(root.clone(), cursor).await.unwrap();
+    let next = batch.latest_event_id.unwrap();
+    assert!(fixture.store.automatic_wake_delivery(root.clone(), consumer.clone()).await.unwrap().is_none());
+    let receipt = r#"{"artifact_id":"retained-output","cursor":1}"#.to_string();
+    assert!(fixture.store.publish_automatic_wake_delivery(root.clone(), consumer.clone(), cursor, next, receipt.clone()).await.unwrap());
+    assert!(!fixture.store.publish_automatic_wake_delivery(root.clone(), consumer.clone(), cursor, next, "losing-output".to_string()).await.unwrap());
+    assert_eq!(fixture.store.automatic_wake_cursor(root.clone(), consumer.clone()).await.unwrap(), Some(next));
+    assert_eq!(fixture.store.automatic_wake_delivery(root, consumer).await.unwrap(), Some(receipt));
+}
+
+#[tokio::test]
+async fn reusable_explorer_lookup_matches_admission_without_creating_work() {
+    let fixture = Fixture::new().await;
+    let draft = explorer_draft("early-reuse-root", "src/file.rs", "trace parser ownership");
+    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft.clone()).await.unwrap().is_none());
+    let admitted = fixture.store.create_admitted_assignment(fixture.repo.path(), draft.clone(), true).await.unwrap();
+    assert_eq!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft.clone()).await.unwrap(), Some(admitted.assignment.assignment_id));
+    let distinct = explorer_draft("early-reuse-root", "src/file.rs", "trace serializer ownership");
+    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), distinct).await.unwrap().is_none());
+    fixture.store.submit_agent_receipt(admitted.attempt.attempt_id, completed_receipt(Vec::new())).await.unwrap();
+    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft).await.unwrap().is_none());
 }

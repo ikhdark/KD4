@@ -20,7 +20,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::handlers::apply_granted_turn_permissions;
+use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 
@@ -157,27 +157,27 @@ async fn to_extension_call(
     let mut environments =
         Vec::with_capacity(invocation.step_context.environments.turn_environments.len());
     for environment in &invocation.step_context.environments.turn_environments {
-        // TODO(anp): Migrate extension ToolEnvironment and granted-permission lookup to PathUri
-        // so extensions can receive foreign environment cwd values.
-        let Ok(native_cwd) = environment.cwd().to_abs_path() else {
-            continue;
-        };
-        let additional_permissions = apply_granted_turn_permissions(
+        let additional_permissions = apply_granted_turn_permissions_uri(
             invocation.session.as_ref(),
             environment.environment.approval_scope_id(),
-            native_cwd.as_path(),
+            environment.cwd(),
             SandboxPermissions::UseDefault,
             /*additional_permissions*/ None,
         )
         .await
-        .additional_permissions;
-        let file_system_sandbox_context = invocation
+        .additional_permissions_uri;
+        let mut file_system_sandbox_context = invocation
             .step_context
             .turn
-            .file_system_sandbox_context(additional_permissions, environment.cwd());
+            .file_system_sandbox_context(None, environment.cwd());
+        file_system_sandbox_context.permissions =
+            codex_sandboxing::policy_transforms::effective_permission_profile_uri(
+                &invocation.step_context.turn.permission_profile(),
+                additional_permissions.as_ref(),
+            );
         environments.push(ToolEnvironment {
             environment_id: environment.environment_id.clone(),
-            cwd: native_cwd,
+            cwd: environment.cwd().clone(),
             file_system: environment.environment.get_filesystem(),
             file_system_sandbox_context,
         });
@@ -532,7 +532,8 @@ mod tests {
         };
         session
             .record_conversation_items(&turn, std::slice::from_ref(&history_item))
-            .await;
+            .await
+            .expect("extension test history should persist");
         let mut expected_history_item = history_item.clone();
         expected_history_item.set_turn_id_if_missing(&turn_id);
         let raw_history_event = rx.recv().await.expect("history raw response item event");
@@ -664,7 +665,8 @@ mod tests {
                     internal_chat_message_metadata_passthrough: None,
                 }],
             )
-            .await;
+            .await
+            .expect("extension test history should persist");
         let invocation = ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -747,7 +749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skipped_foreign_primary_environment_is_not_rebound_to_secondary() {
+    async fn foreign_primary_environment_remains_resolvable_without_local_fallback() {
         let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let native_secondary = turn.environments.turn_environments[0].clone();
         let native_secondary_id = native_secondary.environment_id.clone();
@@ -789,11 +791,21 @@ mod tests {
                 .iter()
                 .map(|environment| environment.environment_id.clone())
                 .collect::<Vec<_>>(),
-            vec![native_secondary_id]
+            vec!["foreign-primary".to_string(), native_secondary_id]
         );
-        assert!(!call.environments.iter().any(|environment| {
+        assert!(call.environments.iter().any(|environment| {
             call.primary_environment_id.as_deref() == Some(environment.environment_id.as_str())
         }));
+        assert_eq!(
+            call.environments[0].cwd.as_str(),
+            "file:///tmp/foreign-primary"
+        );
+        assert!(Arc::ptr_eq(
+            &call.environments[0].file_system,
+            &invocation.step_context.environments.turn_environments[0]
+                .environment
+                .get_filesystem()
+        ));
     }
 
     #[tokio::test]

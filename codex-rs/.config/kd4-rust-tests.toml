@@ -248,13 +248,17 @@ tests = ["tools::handlers::command_preflight::command_preflight_tests::never_rep
 helpers = []
 
 [gates.capability-kd4-turn-execution]
-description = "Turn convergence, deterministic continuation, and configured effort preservation."
+description = "Required continuation survives successful validation and repeated actions while preserving configured effort."
 [[gates.capability-kd4-turn-execution.steps]]
 target = "core_lib"
-tests = [
-    "session::turn_execution::tests::protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged",
-]
 helpers = []
+tests = [
+    "session::turn_execution::tests::protocol_continuation_preserves_sampling_without_new_tool_or_state_evidence",
+    "session::turn::tests::protocol_continuation_runs_required_work_without_new_input",
+    "session::turn::tests::passing_focused_validation_keeps_the_second_change_executable",
+    "session::turn::tests::repeated_failed_read_preserves_a_different_required_action",
+    "session::turn::tests::legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not",
+]
 [[gates.capability-kd4-turn-execution.steps]]
 target = "core_transport_telemetry"
 tests = [
@@ -377,6 +381,38 @@ helpers = []
 [targets.app_server_lib]
 package = "codex-app-server"
 lib = true
+helpers = []
+
+[targets.image_generation_lib]
+package = "codex-image-generation-extension"
+lib = true
+helpers = []
+
+[gates.attached-image-runtime-reliability]
+description = "Verified image/runtime report regressions: retries, interruption, context admission, and goal finalization."
+
+[[gates.attached-image-runtime-reliability.steps]]
+target = "core_lib"
+tests = [
+  "session::step_context::snapshot_deadline_tests::retry_attempt_replaces_sealed_evidence_but_preserves_capabilities",
+  "tasks::tests::targeted_interrupt_leaves_successor_running_and_settles_missing_target",
+  "tools::parallel::tests::audit_reports_17_19_direct_and_nested_validation_capture_revision",
+  "tools::parallel::tests::audit_reports_17_19_baselines_are_independent_by_workspace",
+]
+helpers = []
+
+[[gates.attached-image-runtime-reliability.steps]]
+target = "app_server_lib"
+tests = [
+  "request_processors::turn_processor::tests::additional_context_raw_budget_counts_all_utf8_bytes_and_keys",
+  "request_processors::turn_processor::tests::map_additional_context_rejects_aggregate_rendered_size",
+  "request_processors::turn_processor::tests::additional_context_estimate_caps_escaped_utf8_values",
+  "request_processors::turn_processor::tests::steering_errors_preserve_recovery_details",
+  "request_processors::turn_processor::tests::interrupt_acknowledgements_are_targeted_and_claimed_once",
+  "request_processors::thread_goal_processor::resume_finalization_tests::backpressured_snapshot_still_finalizes_after_caller_is_dropped",
+  "request_processors::thread_goal_processor::resume_finalization_tests::healthy_snapshot_precedes_continuation",
+  "message_processor::message_processor_tracing_tests::interrupt_request_cancellation_releases_reservation_before_terminal",
+]
 helpers = []
 
 [targets.app_server_schema_fixtures]
@@ -641,3 +677,34 @@ tests = [
   "session::step_context::snapshot_deadline_tests::unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools",
   "session::step_context::snapshot_deadline_tests::stable_catalog_keeps_its_identity_and_resource_capability",
 ]
+
+# Audit unit regressions use in-process fixtures and no child CLI helpers.
+[targets.audit_docs_26_30_lib]
+package = "codex-core"
+lib = true
+helpers = []
+
+[gates.audit-docs-26-30-integration]
+description = "Failure continuation, restored-tool quarantine, and single review projection."
+[[gates.audit-docs-26-30-integration.steps]]
+target = "core_exec_permissions"
+helpers = []
+tests = ["suite::unified_exec::exec_command_fast_success_and_failure_lifecycles_finish_inline"]
+[[gates.audit-docs-26-30-integration.steps]]
+target = "core_thread_state"
+helpers = []
+tests = ["suite::sqlite_state::resume_quarantines_invalid_dynamic_tools_from_rollout"]
+[[gates.audit-docs-26-30-integration.steps]]
+target = "core_agents_review"
+helpers = []
+tests = ["suite::review::review_history_surfaces_in_parent_session", "suite::review::review_op_emits_lifecycle_and_review_output"]
+
+[targets.goal_extension_backend]
+package = "codex-goal-extension"
+test = "goal_extension_backend"
+helpers = []
+
+[targets.goal_accounting]
+package = "codex-goal-extension"
+test = "accounting"
+helpers = []

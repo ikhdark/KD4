@@ -50,6 +50,7 @@ pub(crate) enum CellEvent {
     Completed {
         content_items: Vec<OutputItem>,
         error_text: Option<String>,
+        output_loss: Option<codex_code_mode_protocol::OutputLoss>,
     },
     Terminated {
         content_items: Vec<OutputItem>,

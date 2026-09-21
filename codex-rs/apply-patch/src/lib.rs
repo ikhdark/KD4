@@ -96,6 +96,7 @@ pub struct PatchContextMismatch {
     pub chunk_ordinal: usize,
     pub canonical_path: String,
     pub current_content_sha256: String,
+    /// Zero when no safe diagnostic excerpt is available.
     pub current_line_start: usize,
     pub current_line_end: usize,
     pub current_excerpt: String,
@@ -104,6 +105,17 @@ pub struct PatchContextMismatch {
 
 impl fmt::Display for PatchContextMismatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.current_line_start == 0 {
+            return write!(
+                formatter,
+                "PatchContextMismatch: {}\nFile: {}\nHunk {}, chunk {} (sha256: {}). Current excerpt unavailable; read the target region before retrying.",
+                self.message,
+                self.canonical_path,
+                self.hunk_ordinal,
+                self.chunk_ordinal,
+                self.current_content_sha256
+            );
+        }
         write!(
             formatter,
             "PatchContextMismatch: {}\nFile: {}\nHunk {}, chunk {}. Current lines {}-{} (sha256: {}):\n{}",
@@ -969,44 +981,25 @@ fn compute_replacements(
             } else {
                 original_lines.len()
             };
+            if chunk.is_end_of_file && insertion_idx != original_lines.len() {
+                return Err(patch_context_mismatch(
+                    source(),
+                    chunk_index + 1,
+                    chunk,
+                    PatchContextMismatchKind::ExpectedLinesNotFound,
+                    format!("End-of-file insertion anchor is not at the end of {path}"),
+                ));
+            }
             replacements.push((insertion_idx, 0, chunk.new_lines.clone()));
             continue;
         }
 
-        // Otherwise, try to match the existing lines in the file with the old lines
-        // from the chunk. If found, schedule that region for replacement.
-        // Attempt to locate the `old_lines` verbatim within the file.  In many
-        // real‑world diffs the last element of `old_lines` is an *empty* string
-        // representing the terminating newline of the region being replaced.
-        // This sentinel is not present in `original_lines` because we strip the
-        // trailing empty slice emitted by `split('\n')`.  If a direct search
-        // fails and the pattern ends with an empty string, retry without that
-        // final element so that modifications touching the end‑of‑file can be
-        // located reliably.
-
-        let mut pattern: &[String] = &chunk.old_lines;
-        let mut found =
+        // Parsed blank lines are source preconditions, not newline sentinels.
+        let pattern: &[String] = &chunk.old_lines;
+        let found =
             seek_sequence::seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file)
                 .map_err(ambiguous_match)?;
-
-        let mut new_slice: &[String] = &chunk.new_lines;
-
-        if found.is_none() && pattern.last().is_some_and(String::is_empty) {
-            // Retry without the trailing empty line which represents the final
-            // newline in the file.
-            pattern = &pattern[..pattern.len() - 1];
-            if new_slice.last().is_some_and(String::is_empty) {
-                new_slice = &new_slice[..new_slice.len() - 1];
-            }
-
-            found = seek_sequence::seek_sequence(
-                original_lines,
-                pattern,
-                line_index,
-                chunk.is_end_of_file,
-            )
-            .map_err(ambiguous_match)?;
-        }
+        let new_slice: &[String] = &chunk.new_lines;
 
         if let Some(start_idx) = found {
             for operation in
@@ -1031,7 +1024,7 @@ fn compute_replacements(
                             chunk_index + 1,
                             PatchContextMismatchKind::IndentationMismatch,
                             format!(
-                                "Indentation differs on removed line {} in {path}; reread the file and use its exact indentation.",
+                                "Indentation differs on removed line {} in {path}; use the exact indentation in the current source excerpt.",
                                 line + 1
                             ),
                             bounded_source_excerpt(original_lines, line, line + 1),
@@ -1127,9 +1120,7 @@ fn located_patch_mismatch(
     let Some(hunk_ordinal) = source.hunk_ordinal else {
         return ApplyPatchError::ComputeReplacements(message);
     };
-    let Some((current_line_start, current_line_end, current_excerpt)) = excerpt else {
-        return ApplyPatchError::ComputeReplacements(message);
-    };
+    let (current_line_start, current_line_end, current_excerpt) = excerpt.unwrap_or_default();
     let current_content_sha256 =
         format!("{:x}", Sha256::digest(source.original_contents.as_bytes()));
     ApplyPatchError::PatchContextMismatch(PatchContextMismatch {
@@ -1152,42 +1143,41 @@ fn bounded_patch_mismatch_excerpt(
     if original_lines.is_empty() {
         return None;
     }
-    let mut expected = Vec::new();
-    if let Some(context) = chunk
-        .change_context
-        .as_ref()
-        .filter(|line| !line.is_empty())
-    {
-        expected.push(context.as_str());
-    }
-    expected.extend(
-        chunk
-            .old_lines
-            .iter()
-            .map(String::as_str)
-            .filter(|line| !line.is_empty()),
-    );
-    if expected.is_empty() {
-        return None;
-    }
-
+    // The @@ anchor need not be adjacent to the old block. Only old-line
+    // offsets describe contiguous source; blank lines still occupy an offset.
+    let expected = if chunk.old_lines.is_empty() {
+        std::slice::from_ref(chunk.change_context.as_ref()?)
+    } else {
+        chunk.old_lines.as_slice()
+    };
+    let mut comparisons = 64 * 1024usize;
+    let mut examined_bytes = 4 * 1024 * 1024usize;
+    let mut equal = |left: &str, right: &str| -> Option<bool> {
+        comparisons = comparisons.checked_sub(1)?;
+        examined_bytes = examined_bytes.checked_sub(left.len().max(right.len()))?;
+        Some(left == right)
+    };
     let mut candidate_scores = BTreeMap::<usize, usize>::new();
     for (expected_offset, expected_line) in expected.iter().enumerate() {
-        for (current_index, current_line) in original_lines.iter().enumerate() {
-            if current_line == expected_line && current_index >= expected_offset {
-                let start = current_index - expected_offset;
-                candidate_scores.entry(start).or_insert_with(|| {
-                    expected
-                        .iter()
-                        .enumerate()
-                        .filter(|(offset, line)| {
-                            original_lines
-                                .get(start + offset)
-                                .is_some_and(|current| current == **line)
-                        })
-                        .count()
-                });
+        if expected_line.is_empty() {
+            continue;
+        }
+        for (current_index, current_line) in original_lines.iter().enumerate().skip(expected_offset)
+        {
+            if !equal(current_line, expected_line)? {
+                continue;
             }
+            let start = current_index - expected_offset;
+            if candidate_scores.contains_key(&start) {
+                continue;
+            }
+            let mut score = 0;
+            for (offset, line) in expected.iter().enumerate() {
+                if let Some(current) = original_lines.get(start + offset) {
+                    score += usize::from(equal(current, line)?);
+                }
+            }
+            candidate_scores.insert(start, score);
         }
     }
     let best_score = candidate_scores.values().copied().max()?;
@@ -1198,11 +1188,16 @@ fn bounded_patch_mismatch_excerpt(
     if best.next().is_some() {
         return None;
     }
-
-    let expected_end = candidate_start
-        .saturating_add(expected.len())
-        .min(original_lines.len());
-    bounded_source_excerpt(original_lines, candidate_start, expected_end)
+    let mismatch = expected
+        .iter()
+        .enumerate()
+        .find_map(|(offset, line)| {
+            (original_lines.get(candidate_start + offset) != Some(line))
+                .then_some(candidate_start + offset)
+        })
+        .unwrap_or(candidate_start)
+        .min(original_lines.len() - 1);
+    bounded_source_excerpt(original_lines, mismatch, mismatch + 1)
 }
 
 fn bounded_source_excerpt(
@@ -1356,6 +1351,55 @@ mod tests {
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    #[tokio::test]
+    async fn blank_source_lines_and_eof_are_literal_preconditions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        for (contents, body) in [
+            ("alpha\nbeta\n", "@@\n-\n+replacement"),
+            ("alpha\nbeta\n", "@@\n-"),
+            ("alpha\nbeta\n", "@@\n-\n+replacement\n*** End of File"),
+            ("alpha\n\n", "@@\n-\n-\n+replacement"),
+            ("alpha\nbeta\n", "@@ alpha\n+replacement\n*** End of File"),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let failure = apply_patch(
+                &wrap_patch(&format!("*** Update File: sample.txt\n{body}")),
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(failure.delta().is_empty());
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        }
+        for (contents, body, expected) in [
+            ("alpha\n\n", "@@\n-\n+replacement", "alpha\nreplacement\n"),
+            (
+                "alpha\nbeta\n",
+                "@@ beta\n+replacement\n*** End of File",
+                "alpha\nbeta\nreplacement\n",
+            ),
+        ] {
+            fs::write(&path, contents).unwrap();
+            apply_patch(
+                &wrap_patch(&format!("*** Update File: sample.txt\n{body}")),
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
     }
 
     #[tokio::test]
@@ -1577,10 +1621,15 @@ mod tests {
             .unwrap_err();
             assert!(failure.delta().is_empty());
             let (error, _) = failure.into_parts();
-            let ApplyPatchError::ComputeReplacements(message) = error else {
+            let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
                 panic!("{error:?}")
             };
-            let (_, excerpt) = message.split_once(":\n").unwrap();
+            assert_eq!(
+                mismatch.kind,
+                PatchContextMismatchKind::ExpectedLinesNotFound
+            );
+            assert_eq!(mismatch.current_line_start, 0);
+            let (_, excerpt) = mismatch.message.split_once(":\n").unwrap();
             assert!(excerpt.len() <= PATCH_MISMATCH_MAX_BYTES);
             assert!(excerpt.lines().count() <= PATCH_MISMATCH_MAX_LINES + 1);
             assert!(excerpt.ends_with("[expected lines truncated; reread the full target region]"));
@@ -1690,6 +1739,68 @@ mod tests {
         };
 
         assert_eq!(bounded_patch_mismatch_excerpt(&lines, &chunk), None);
+    }
+
+    #[test]
+    fn mismatch_excerpt_preserves_blank_offsets_and_shows_late_discrepancy() {
+        for mut lines in [
+            vec!["anchor".to_string(), String::new(), "old".to_string()],
+            (0..40).map(|index| format!("line-{index}")).collect(),
+        ] {
+            let expected = lines.clone();
+            let changed = lines.len() - 2;
+            lines[changed] = "actual-discrepancy".to_string();
+            let chunk = UpdateFileChunk {
+                change_context: None,
+                old_lines: expected,
+                new_lines: vec![],
+                is_end_of_file: false,
+            };
+            let (start, end, excerpt) = bounded_patch_mismatch_excerpt(&lines, &chunk).unwrap();
+            assert!(start <= changed + 1 && end > changed);
+            assert!(excerpt.contains("actual-discrepancy"));
+        }
+    }
+
+    #[test]
+    fn unavailable_excerpt_preserves_failure_identity() {
+        let lines = vec!["unrelated".repeat(4 * 1024 * 1024)];
+        let path =
+            PathUri::from_host_native_path(std::env::current_dir().unwrap().join("file.txt"))
+                .unwrap();
+        let chunk = UpdateFileChunk {
+            change_context: None,
+            old_lines: vec!["missing".to_string()],
+            new_lines: vec![],
+            is_end_of_file: false,
+        };
+        assert!(bounded_patch_mismatch_excerpt(&lines, &chunk).is_none());
+        let error = patch_context_mismatch(
+            PatchMismatchSource {
+                original_lines: &lines,
+                original_contents: &lines[0],
+                path: &path,
+                hunk_ordinal: Some(2),
+            },
+            3,
+            &chunk,
+            PatchContextMismatchKind::ExpectedLinesNotFound,
+            "missing source".to_string(),
+        );
+        let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+            panic!("lost failure identity")
+        };
+        assert_eq!(mismatch.hunk_ordinal, 2);
+        assert_eq!(mismatch.chunk_ordinal, 3);
+        assert_eq!(
+            mismatch.kind,
+            PatchContextMismatchKind::ExpectedLinesNotFound
+        );
+        assert_eq!(
+            mismatch.current_content_sha256,
+            format!("{:x}", Sha256::digest(lines[0].as_bytes()))
+        );
+        assert!(mismatch.to_string().contains("excerpt unavailable"));
     }
 
     #[test]
@@ -2324,8 +2435,7 @@ mod tests {
 @@
 -foo
 +FOO
- bar
-"#,
+ bar"#,
             path.display()
         ));
 
@@ -2370,8 +2480,7 @@ mod tests {
  foo
  bar
 -baz
-+BAZ
-"#,
++BAZ"#,
             path.display()
         ));
 

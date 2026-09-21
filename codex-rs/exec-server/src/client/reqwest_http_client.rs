@@ -67,7 +67,21 @@ struct ReqwestHttpClients {
 static HTTP_CLIENTS: LazyLock<Mutex<ReqwestHttpClients>> =
     LazyLock::new(|| Mutex::new(ReqwestHttpClients::default()));
 
+#[cfg(test)]
+static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 impl ReqwestHttpClient {
+    #[cfg(test)]
+    pub(crate) fn block_cache_for_test() -> (impl Drop, impl Drop) {
+        let test_guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache_guard = HTTP_CLIENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (test_guard, cache_guard)
+    }
+
     fn cached_client(redirect_policy: HttpRedirectPolicy) -> Option<Arc<SharedHttpClient>> {
         // Cold construction holds this mutex while loading certificates. Never wait
         // for it on an async worker.
@@ -418,7 +432,6 @@ mod tests {
 
     // These tests deliberately occupy the global cache or blocking pool. Keep
     // those manipulations separate when run with Cargo's in-process test runner.
-    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     #[expect(

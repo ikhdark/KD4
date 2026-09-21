@@ -340,7 +340,8 @@ fn map_additional_context_rejects_too_many_entries() {
 
 #[test]
 fn map_additional_context_rejects_aggregate_rendered_size() {
-    let value = "v".repeat(MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES);
+    // Escaping exceeds the render budget while the raw bytes remain admissible.
+    let value = "&".repeat(MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES / 5 + 1);
     let entry_count = MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES
         / (MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES
             + ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES)
@@ -366,6 +367,109 @@ fn map_additional_context_rejects_aggregate_rendered_size() {
         "unexpected error: {}",
         error.message
     );
+}
+
+#[test]
+fn additional_context_raw_budget_counts_all_utf8_bytes_and_keys() {
+    let limit = MAX_ADDITIONAL_CONTEXT_AGGREGATE_RAW_BYTES;
+    for value in ["v".repeat(limit), "é".repeat(limit / 2)] {
+        let error = map_additional_context(Some(IndexMap::from([(
+            "s".to_string(),
+            additional_context_entry(value),
+        )])))
+        .expect_err("the full original value must be counted");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "reason": "additionalContextTooLarge", "maxBytes": limit, "actualBytes": limit + 1,
+            }))
+        );
+    }
+    let value = "v".repeat(limit - 1);
+    let mapped = map_additional_context(Some(IndexMap::from([(
+        "s".to_string(),
+        additional_context_entry(value.clone()),
+    )])))
+    .expect("exact raw boundary is allowed");
+    assert_eq!(mapped["s"].value, value);
+    let error = map_additional_context(Some(IndexMap::from([
+        (
+            "a".to_string(),
+            additional_context_entry("x".repeat(limit / 2)),
+        ),
+        (
+            "b".to_string(),
+            additional_context_entry("x".repeat(limit / 2)),
+        ),
+    ])))
+    .expect_err("aggregate budget includes both keys and values");
+    assert_eq!(error.data.unwrap()["actualBytes"], limit + 2);
+}
+
+#[test]
+fn steering_errors_preserve_recovery_details() {
+    for (input, expected) in [
+        (
+            SteerInputError::NoActiveTurn(Vec::new()),
+            serde_json::json!({"reason":"noActiveTurn"}),
+        ),
+        (
+            SteerInputError::EmptyInput,
+            serde_json::json!({"reason":"emptyInput"}),
+        ),
+        (
+            SteerInputError::ExpectedTurnMismatch {
+                expected: "A".into(),
+                actual: "B".into(),
+            },
+            serde_json::json!({"reason":"expectedTurnMismatch","expectedTurnId":"A","actualTurnId":"B"}),
+        ),
+        (
+            SteerInputError::PendingInputLimitExceeded {
+                max_items: 32,
+                max_bytes: 4096,
+            },
+            serde_json::json!({"reason":"pendingInputLimitExceeded","maxItems":32,"maxBytes":4096}),
+        ),
+    ] {
+        let (error, _) = steer_input_error(input);
+        assert_eq!(error.code, -32600);
+        assert_eq!(error.data, Some(expected));
+    }
+    for kind in [
+        codex_protocol::protocol::NonSteerableTurnKind::Review,
+        codex_protocol::protocol::NonSteerableTurnKind::Compact,
+    ] {
+        let (error, _) =
+            steer_input_error(SteerInputError::ActiveTurnNotSteerable { turn_kind: kind });
+        let data: TurnError = serde_json::from_value(error.data.unwrap()).unwrap();
+        assert_eq!(
+            data.codex_error_info,
+            Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                turn_kind: kind.into()
+            })
+        );
+    }
+}
+
+#[test]
+fn interrupt_acknowledgements_are_targeted_and_claimed_once() {
+    let mut state = crate::thread_state::ThreadState::default();
+    let request = ConnectionRequestId {
+        connection_id: crate::outgoing_message::ConnectionId(1),
+        request_id: RequestId::Integer(1),
+    };
+    let duplicate = ConnectionRequestId {
+        connection_id: request.connection_id,
+        request_id: RequestId::Integer(2),
+    };
+    let _first = state.reserve_interrupt(request.clone(), "A".to_string());
+    let _second = state.reserve_interrupt(duplicate.clone(), "A".to_string());
+    assert!(state.take_pending_interrupts("B").is_empty());
+    assert!(state.finish_interrupt(&request));
+    assert!(!state.finish_interrupt(&request));
+    assert_eq!(state.take_pending_interrupts("A"), vec![duplicate.clone()]);
+    assert!(!state.finish_interrupt(&duplicate));
 }
 
 #[test]

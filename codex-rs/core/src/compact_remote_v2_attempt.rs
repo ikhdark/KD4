@@ -25,7 +25,6 @@ pub(super) struct RemoteCompactV2Attempt {
     pub(super) prompt_input: Vec<ResponseItem>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
-    pub(super) stable_context_fingerprint: [u8; 32],
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
     pub(super) owned_client_session: Option<ModelClientSession>,
 }
@@ -54,12 +53,26 @@ pub(super) async fn run_remote_compact_v2_attempt(
         sess.services.git_workspace.as_ref(),
     )
     .await;
+    let mut prompt = build_projected_prompt(
+        sess.as_ref(),
+        &prepared,
+        &tool_router,
+        step_context.as_ref(),
+        base_instructions.clone(),
+    );
+    prompt.output_schema = None;
+    prompt.output_schema_strict = true;
+    append_compaction_trigger(&mut prompt);
+    let measured_input = largest_compaction_request_input(&prompt);
+    let tool_tokens =
+        i64::try_from(prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window_for_prompt(
             &mut history,
             turn_context.as_ref(),
             &base_instructions,
-            Some(prepared.items()),
+            Some(&measured_input),
+            tool_tokens,
         );
     if rewritten_outputs > 0 {
         info!(
@@ -73,6 +86,16 @@ pub(super) async fn run_remote_compact_v2_attempt(
             sess.services.git_workspace.as_ref(),
         )
         .await;
+        prompt = build_projected_prompt(
+            sess.as_ref(),
+            &prepared,
+            &tool_router,
+            step_context.as_ref(),
+            base_instructions,
+        );
+        prompt.output_schema = None;
+        prompt.output_schema_strict = true;
+        append_compaction_trigger(&mut prompt);
     }
     if estimated_deleted_tokens > 0 {
         let max_local_deleted_tokens = sess
@@ -89,17 +112,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().to_vec());
-    let mut prompt = build_projected_prompt(
-        sess.as_ref(),
-        &prepared,
-        &tool_router,
-        step_context.as_ref(),
-        base_instructions,
-    );
-    prompt.output_schema = None;
-    prompt.output_schema_strict = true;
-    append_compaction_trigger(&mut prompt);
-    let stable_context_fingerprint = prompt.stable_context_manifest.fingerprint();
 
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
@@ -130,9 +142,28 @@ pub(super) async fn run_remote_compact_v2_attempt(
         prompt_input,
         compaction_output,
         token_usage,
-        stable_context_fingerprint,
         owned_client_session,
     })
+}
+
+fn largest_compaction_request_input(prompt: &Prompt) -> Arc<[ResponseItem]> {
+    // Transport selection can fall back after this fitting boundary. Include the
+    // largest complete representation, including the trigger, in the estimate.
+    [
+        &prompt.input,
+        &prompt.stable_context_fallback_input,
+        &prompt.tool_history_fallback_input,
+        &prompt.stable_context_tool_history_fallback_input,
+    ]
+    .into_iter()
+    .max_by_key(|items| {
+        items
+            .iter()
+            .map(crate::context_manager::estimate_item_token_count)
+            .fold(0_i64, i64::saturating_add)
+    })
+    .cloned()
+    .expect("four request representations")
 }
 
 fn append_compaction_trigger(prompt: &mut Prompt) {

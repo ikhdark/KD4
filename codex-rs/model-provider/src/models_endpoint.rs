@@ -46,6 +46,7 @@ const MODELS_ENDPOINT: &str = "/models";
 /// Provider-owned OpenAI-compatible `/models` endpoint.
 #[derive(Debug)]
 pub(crate) struct OpenAiModelsEndpoint {
+    model_provider_id: String,
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
@@ -61,10 +62,12 @@ struct CachedModelsTransport {
 
 impl OpenAiModelsEndpoint {
     pub(crate) fn new(
+        model_provider_id: String,
         provider_info: ModelProviderInfo,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
         Self {
+            model_provider_id,
             provider_info,
             auth_manager,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
@@ -108,6 +111,17 @@ impl OpenAiModelsEndpoint {
         http_client_factory: HttpClientFactory,
         etag: Option<&str>,
     ) -> CoreResult<ModelsFetchResult> {
+        self.list_models_for_identity(client_version, http_client_factory, etag, None)
+            .await
+    }
+
+    async fn list_models_for_identity(
+        &self,
+        client_version: &str,
+        http_client_factory: HttpClientFactory,
+        etag: Option<&str>,
+        expected_identity: Option<&str>,
+    ) -> CoreResult<ModelsFetchResult> {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let mut headers = HeaderMap::new();
@@ -120,6 +134,19 @@ impl OpenAiModelsEndpoint {
             );
         }
         let auth = self.auth().await;
+        let request_identity = crate::provider::model_provider_cache_identity_for_auth_identity(
+            &self.model_provider_id,
+            &self.provider_info,
+            crate::auth::provider_cache_auth_identity_for_auth(
+                auth.as_ref(),
+                self.auth_manager.as_deref(),
+            ),
+        );
+        if expected_identity.is_some_and(|expected| expected != request_identity) {
+            return Err(CodexErr::InvalidRequest(
+                "model catalog authentication changed before dispatch".into(),
+            ));
+        }
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let api_provider = self.provider_info.to_api_provider(auth_mode)?;
         let api_auth = resolve_provider_auth(auth.as_ref(), &self.provider_info)?;
@@ -245,6 +272,21 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
             client_version,
             http_client_factory,
             etag,
+        ))
+    }
+    fn list_models_for_identity<'a>(
+        &'a self,
+        client_version: &'a str,
+        http_client_factory: HttpClientFactory,
+        etag: Option<&'a str>,
+        expected_identity: &'a str,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsFetchResult>> {
+        Box::pin(OpenAiModelsEndpoint::list_models_for_identity(
+            self,
+            client_version,
+            http_client_factory,
+            etag,
+            Some(expected_identity),
         ))
     }
 }
@@ -444,9 +486,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn audit_catalog_request_rejects_mismatched_frozen_auth_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = ModelProviderInfo::create_openai_provider(Some(server.uri()));
+        let endpoint = OpenAiModelsEndpoint::new("test".into(), provider.clone(), None);
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let result = endpoint
+            .list_models_for_identity(
+                "0.0.0",
+                factory.clone(),
+                Some("etag-a"),
+                Some("wrong-scope"),
+            )
+            .await;
+        assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let identity = crate::provider::model_provider_cache_identity_for_auth_identity(
+            "test",
+            &provider,
+            crate::auth::provider_cache_auth_identity_for_auth(None, None),
+        );
+        assert!(matches!(
+            endpoint
+                .list_models_for_identity("0.0.0", factory, Some("etag-a"), Some(&identity))
+                .await
+                .unwrap(),
+            ModelsFetchResult::NotModified
+        ));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers[IF_NONE_MATCH], "etag-a");
+    }
+
     #[test]
     fn command_auth_provider_reports_command_auth_without_cached_auth() {
         let endpoint = OpenAiModelsEndpoint::new(
+            "test".into(),
             provider_info_with_command_auth(),
             /*auth_manager*/ None,
         );
@@ -457,6 +538,7 @@ mod tests {
     #[test]
     fn provider_without_command_auth_reports_no_command_auth() {
         let endpoint = OpenAiModelsEndpoint::new(
+            "test".into(),
             ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             /*auth_manager*/ None,
         );
@@ -479,6 +561,7 @@ mod tests {
 
         let observed_request = Arc::new(Mutex::new(None));
         let endpoint = OpenAiModelsEndpoint {
+            model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
@@ -522,6 +605,7 @@ mod tests {
 
         let build_count = Arc::new(AtomicUsize::new(0));
         let endpoint = OpenAiModelsEndpoint {
+            model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
@@ -548,6 +632,7 @@ mod tests {
     async fn model_transport_cache_is_keyed_by_factory_and_exact_url() {
         let build_count = Arc::new(AtomicUsize::new(0));
         let endpoint = OpenAiModelsEndpoint {
+            model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
@@ -603,6 +688,7 @@ mod tests {
             .await;
 
         let endpoint = OpenAiModelsEndpoint {
+            model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
@@ -629,6 +715,7 @@ mod tests {
             .mount(&server)
             .await;
         let endpoint = OpenAiModelsEndpoint::new(
+            "test".into(),
             ModelProviderInfo::create_openai_provider(Some(server.uri())),
             None,
         );
@@ -648,6 +735,7 @@ mod tests {
     async fn invalid_etag_does_not_build_transport() {
         let build_count = Arc::new(AtomicUsize::new(0));
         let endpoint = OpenAiModelsEndpoint {
+            model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(None),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {

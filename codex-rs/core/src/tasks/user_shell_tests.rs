@@ -81,6 +81,7 @@ struct RetryingTerminationProcess {
     process_id: ProcessId,
     termination_attempts: AtomicUsize,
     allow_confirmation: Arc<Notify>,
+    stall_first: bool,
 }
 
 impl ExecProcess for RetryingTerminationProcess {
@@ -118,6 +119,9 @@ impl ExecProcess for RetryingTerminationProcess {
         let attempt = self.termination_attempts.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if attempt == 0 {
+                if self.stall_first {
+                    std::future::pending::<()>().await;
+                }
                 return Err(ExecServerError::Protocol(
                     "injected termination failure".to_string(),
                 ));
@@ -135,6 +139,7 @@ async fn remote_user_shell_termination_failure_is_not_reported_terminal_without_
         process_id: ProcessId::new("retrying-process"),
         termination_attempts: AtomicUsize::new(0),
         allow_confirmation: Arc::clone(&allow_confirmation),
+        stall_first: false,
     });
     let weak_process = Arc::downgrade(&process);
     let exec_process: Arc<dyn ExecProcess> = process.clone();
@@ -167,4 +172,42 @@ async fn remote_user_shell_termination_failure_is_not_reported_terminal_without_
         .await
         .expect("cleanup owner should observe confirmed termination");
     assert!(weak_process.upgrade().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_termination_caller_keeps_cleanup_owner_through_first_deadline() {
+    let process = Arc::new(RetryingTerminationProcess {
+        process_id: ProcessId::new("stalled-termination"),
+        termination_attempts: AtomicUsize::new(0),
+        allow_confirmation: Arc::new(Notify::new()),
+        stall_first: true,
+    });
+    let tasks = tokio_util::task::TaskTracker::new();
+    let owned_tasks = tasks.clone();
+    let owned_process: Arc<dyn ExecProcess> = process.clone();
+    let caller = tokio::spawn(async move {
+        terminate_remote_process_after_error(
+            &owned_tasks,
+            owned_process,
+            Err(UserShellExecError::Cancelled),
+        )
+        .await
+    });
+    while process.termination_attempts.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    caller.abort();
+    assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    while process.termination_attempts.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        Arc::strong_count(&process) > 1,
+        "session cleanup retains the process"
+    );
+    process.allow_confirmation.notify_one();
+    tasks.close();
+    timeout(Duration::from_secs(2), tasks.wait()).await.unwrap();
+    assert_eq!(Arc::strong_count(&process), 1);
 }

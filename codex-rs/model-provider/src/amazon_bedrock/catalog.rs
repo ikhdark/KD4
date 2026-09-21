@@ -59,6 +59,7 @@ pub(crate) fn static_model_catalog() -> ModelsResponse {
 
 pub(crate) fn with_default_only_service_tier(mut catalog: ModelsResponse) -> ModelsResponse {
     for model in &mut catalog.models {
+        normalize_bedrock_model(model);
         // Amazon Bedrock currently only supports the implicit "default" tier for GPT models.
         model.additional_speed_tiers.clear();
         model.service_tiers.clear();
@@ -73,6 +74,11 @@ fn astra_bedrock_model(mut model: ModelInfo) -> ModelInfo {
     model.slug = AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID.to_string();
     model.display_name = "GPT-6 Astra".to_string();
     model.priority = -1;
+    normalize_bedrock_model(&mut model);
+    model
+}
+
+fn normalize_bedrock_model(model: &mut ModelInfo) {
     // Bedrock uses Responses and direct tools, without Codex-only Ultra effort.
     model.use_responses_lite = false;
     model.tool_mode = None;
@@ -93,7 +99,6 @@ fn astra_bedrock_model(mut model: ModelInfo) -> ModelInfo {
             .first()
             .map(|level| level.effort.clone());
     }
-    model
 }
 
 fn gpt_5_bedrock_model(
@@ -149,6 +154,41 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn configured_catalog_enforces_compatibility_without_replacing_identity() {
+        let mut model = bundled_openai_model(&bundled_models_response().unwrap(), "gpt-6-astra");
+        model.slug = "custom-model".into();
+        model.default_reasoning_level = Some(ReasoningEffort::Ultra);
+        model.use_responses_lite = true;
+        let instructions = model.base_instructions.clone();
+        let window = model.context_window;
+        let catalog = with_default_only_service_tier(ModelsResponse {
+            models: vec![model],
+        });
+        let model = &catalog.models[0];
+        assert_eq!(model.slug, "custom-model");
+        assert_eq!(model.base_instructions, instructions);
+        assert_eq!(model.context_window, window);
+        assert!(!model.use_responses_lite);
+        assert_eq!(model.tool_mode, None);
+        assert_eq!(
+            model.multi_agent_version,
+            Some(codex_protocol::protocol::MultiAgentVersion::V1)
+        );
+        assert!(
+            !model
+                .supported_reasoning_levels
+                .iter()
+                .any(|level| level.effort == ReasoningEffort::Ultra)
+        );
+        assert!(
+            model
+                .supported_reasoning_levels
+                .iter()
+                .any(|level| Some(&level.effort) == model.default_reasoning_level.as_ref())
+        );
+    }
 
     #[test]
     fn adapted_templates_handle_existing_max_and_filtered_default() {

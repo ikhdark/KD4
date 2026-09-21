@@ -644,7 +644,21 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
         ));
     }
     first_response.push(ev_completed("fast-lifecycle-response"));
-    let response_mock = mount_sse_sequence(&server, vec![sse(first_response)]).await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(first_response),
+            sse(vec![
+                ev_response_created("recovered-response"),
+                ev_assistant_message(
+                    "recovered-message",
+                    "The command exited with code 7; its failure remains available for repair.",
+                ),
+                ev_completed("recovered-response"),
+            ]),
+        ],
+    )
+    .await;
 
     submit_unified_exec_turn(
         &test,
@@ -693,20 +707,24 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
             _ => {}
         }
     }
-    let completed = completed.expect("required command failure should complete the turn");
-    assert_eq!(
-        response_mock.requests().len(),
-        1,
-        "required command failure must stop before another provider request"
-    );
+    let completed = completed.expect("recoverable command failure should allow continuation");
+    assert_eq!(response_mock.requests().len(), 2);
     assert!(
-        !errors.is_empty(),
-        "required command failure must emit an error"
+        errors.is_empty(),
+        "ordinary command failure is tool evidence: {errors:?}"
     );
-    let error_message = errors[0].message.as_str();
-    assert_eq!(
-        completed.error.as_ref().map(|error| error.message.as_str()),
-        Some(error_message)
+    assert!(completed.error.is_none());
+    let continuation = response_mock.requests()[1].body_json();
+    assert!(
+        continuation["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["type"] == "function_call_output"
+                    && item["call_id"] == "lifecycle-fast-failure"
+            }),
+        "the model must receive the failed command result"
     );
     let timing = completed
         .timing

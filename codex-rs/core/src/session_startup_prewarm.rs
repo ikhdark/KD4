@@ -315,7 +315,13 @@ impl Session {
         let session_telemetry = self.services.session_telemetry.clone();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
-        let startup_transport = self.take_session_startup_transport().await;
+        // HTTP authentication remains session-owned until shutdown. Preparing a
+        // router must neither wait for it nor abort it by dropping its handle.
+        let startup_transport = if self.services.model_client.startup_websocket_enabled() {
+            self.take_session_startup_transport().await
+        } else {
+            None
+        };
         let startup_prewarm = tokio::spawn(async move {
             let result = schedule_startup_prewarm_inner(
                 startup_prewarm_session,
@@ -453,6 +459,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_router_completion_preserves_pending_auth_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let (session, _, _) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |config| config.model_provider.supports_websockets = false,
+            )
+            .await;
+        let task = tokio::spawn(std::future::pending::<CodexResult<ModelClientSession>>());
+        let abort = task.abort_handle();
+        session
+            .set_session_startup_transport(SessionStartupTransportHandle::new(task))
+            .await;
+        session
+            .schedule_startup_prewarm("instructions".into())
+            .await;
+        let prewarm = session.take_session_startup_prewarm().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), prewarm.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !abort.is_finished(),
+            "router publication must not discard auth work"
+        );
+        assert!(
+            session
+                .startup_prepared_router
+                .take_for_first_turn()
+                .await
+                .is_some()
+        );
+        session
+            .take_session_startup_transport()
+            .await
+            .expect("session retains auth ownership")
+            .abort()
+            .await;
+        assert!(
+            abort.is_finished(),
+            "shutdown can still drain the auth owner"
+        );
+    }
+
+    #[tokio::test]
     async fn prewarm_publishes_router_while_transport_is_pending() {
         let home = tempfile::tempdir().expect("temporary codex home");
         let (session, _, _events) =
@@ -569,7 +623,7 @@ async fn schedule_startup_prewarm_inner(
     // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
     let step_context = session
         .capture_step_context(Arc::clone(&startup_turn_context))
-        .await;
+        .await?;
     let startup_router = built_tools(
         session.as_ref(),
         &step_context,

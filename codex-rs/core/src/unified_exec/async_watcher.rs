@@ -76,7 +76,7 @@ impl Drop for OutputDrainedGuard {
 }
 
 /// Spawn a background task that continuously reads from the PTY, appends to the
-/// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
+/// shared transcript, and emits ExecCommandOutputDelta events on UTFâ€‘8
 /// boundaries.
 // Preserve the shared unified-exec error shape at this process boundary.
 #[allow(clippy::result_large_err)]
@@ -404,6 +404,16 @@ pub(crate) fn spawn_exit_watcher(
         );
         let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         wait_for_sticky_lifecycle_signal(&exit_token).await;
+        // An observation-channel failure wakes cleanup but is not exit evidence.
+        if !process.has_exited() {
+            if let Err(error) = process.terminate_confirmed().await {
+                terminal_completion.send_replace(Some(Err(format!(
+                    "process observation failed and termination was not confirmed: {error}"
+                ))));
+                // The manager retains the process owner for subsequent cleanup.
+                return;
+            }
+        }
         let exit_observed_at = Instant::now();
         let duration = exit_observed_at.saturating_duration_since(started_at);
         if let Err(message) =
@@ -606,6 +616,15 @@ pub(crate) fn spawn_exit_watcher(
                 .services
                 .command_execution
                 .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
+                .await;
+        }
+        if terminal_result.is_err() {
+            // Fatal completion cannot return an output acknowledgement to the
+            // caller. Release this exact exited owner before publishing failure.
+            session_ref
+                .services
+                .unified_exec_manager
+                .release_failed_completion(process_id, &process)
                 .await;
         }
         let previous_completion = terminal_completion.send_replace(Some(terminal_result));

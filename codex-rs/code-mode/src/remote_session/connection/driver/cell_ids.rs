@@ -82,10 +82,12 @@ pub(super) fn public_runtime_response(
             cell_id,
             content_items,
             error_text,
+            output_loss,
         } => RuntimeResponse::Result {
             cell_id: public_cell_id_from_protocol(generation, &cell_id),
             content_items,
             error_text,
+            output_loss,
         },
     }
 }
@@ -115,5 +117,38 @@ pub(super) fn wait_outcome_cell_id(outcome: &WireWaitOutcome) -> &WireCellId {
         WireWaitOutcome::LiveCell(response) | WireWaitOutcome::MissingCell(response) => {
             runtime_response_cell_id(response)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_code_mode_protocol::OutputLoss;
+
+    use super::*;
+
+    #[test]
+    fn public_result_preserves_output_loss_while_rewriting_cell_id() {
+        let output_loss = OutputLoss {
+            discarded_items: 2,
+            discarded_bytes_lower_bound: 4096,
+        };
+
+        assert_eq!(
+            public_runtime_response(
+                2,
+                RuntimeResponse::Result {
+                    cell_id: CellId::new("7".to_string()),
+                    content_items: Vec::new(),
+                    error_text: None,
+                    output_loss: Some(output_loss.clone()),
+                },
+            ),
+            RuntimeResponse::Result {
+                cell_id: CellId::new("g2:7".to_string()),
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: Some(output_loss),
+            }
+        );
     }
 }

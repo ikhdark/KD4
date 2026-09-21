@@ -214,12 +214,12 @@ category = "tests_contracts"
 kind = "validated_by"
 target = "path:codex-rs/core/src/session/turn_tests.rs"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/src/session/turn_tests.rs", symbol = "mid_turn_compaction_failure_preserves_completed_message" }, { path = "codex-rs/core/src/session/turn_tests.rs", symbol = "deterministic_protocol_completion_does_not_count_a_cancelled_generation" }]
+evidence = [{ path = "codex-rs/core/src/session/turn_tests.rs", symbol = "mid_turn_compaction_failure_preserves_completed_message" }, { path = "codex-rs/core/src/session/turn_tests.rs", symbol = "protocol_continuation_runs_required_work_without_new_input" }, { path = "codex-rs/core/src/session/turn_tests.rs", symbol = "passing_focused_validation_keeps_the_second_change_executable" }, { path = "codex-rs/core/src/session/turn_tests.rs", symbol = "repeated_failed_read_preserves_a_different_required_action" }, { path = "codex-rs/core/src/session/turn_tests.rs", symbol = "legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not" }]
 
 [[owners.invariants]]
 id = "turn-results-survive-compaction-failure"
 kind = "semantic"
-statement = "A regular user turn retains its completed assistant message when follow-up compaction fails; a proposed generation cancelled by deterministic completion causes neither another model request nor a residual-generation timing count."
+statement = "A regular user turn retains its completed assistant message when follow-up compaction fails; server-requested continuation remains executable without new input, and successful validation or repeated tool actions do not establish task completion. Legacy child follow-ups renew their sealed attempt before execution, while cancelled turns leave the prior attempt unchanged."
 evidence = [{ path = "codex-rs/core/src/session/turn.rs", symbol = "run_turn" }]
 tests = ["codex-rs/core/src/session/turn_tests.rs"]
 

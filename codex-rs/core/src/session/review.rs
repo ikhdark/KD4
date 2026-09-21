@@ -107,6 +107,7 @@ pub(super) async fn spawn_review_thread(
     extension_data.insert(parent_turn_context.turn_skills.snapshot.clone());
 
     let review_turn_context = TurnContext {
+        hook_context_budget: Default::default(),
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
         config: per_turn_config,
@@ -139,6 +140,7 @@ pub(super) async fn spawn_review_thread(
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
         final_output_json_schema: None,
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),
+        workspace_execution_coordinator: Arc::default(),
         deferred_tool_activations: Arc::new(std::sync::RwLock::new(
             crate::session::turn_context::DeferredToolActivationState::default(),
         )),
@@ -151,6 +153,7 @@ pub(super) async fn spawn_review_thread(
         tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),
         durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
         terminal_error: Arc::new(Mutex::new(None)),
+        agent_task_binding: Arc::new(std::sync::OnceLock::new()),
         server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),
         memory_pollution_signal_claimed: AtomicBool::new(false),

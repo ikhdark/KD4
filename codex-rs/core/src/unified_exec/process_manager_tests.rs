@@ -315,9 +315,9 @@ async fn dropped_process_id_reservation_is_released_before_store_transfer() {
 fn coherent_packet_budget_uses_bounded_defaults_and_honors_override() {
     const HARD_LIMIT: usize = 20_000;
 
-    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 4_000);
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
-    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 16_000);
     assert_eq!(
         resolve_output_limits(
             None,
@@ -334,7 +334,7 @@ fn coherent_packet_budget_uses_bounded_defaults_and_honors_override() {
             None,
             OutputOutcome::Failure,
             Some("custom-command"),
-            "failed",
+            "unsuccessful",
             HARD_LIMIT,
         )
         .applied_limit,
@@ -2726,7 +2726,6 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
     .await
     .expect("actual process exits");
     let receipt = process.register_terminal_completion();
-    drop(receipt);
     let response = ExecCommandToolOutput {
         validation: None,
         event_call_id: "completed-without-watcher".to_string(),
@@ -2735,7 +2734,7 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
         raw_output: b"completed".to_vec(),
         truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(100),
         max_output_tokens: None,
-        process_id: None,
+        process_id: Some(42),
         session_capabilities: None,
         exit_code: Some(0),
         process_exited: true,
@@ -2747,9 +2746,32 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        finish_exited_process_result(
+            Some(&process),
+            Ok(response),
+            Duration::from_millis(1),
+            Some(Instant::now()),
+        ),
+    )
+    .await
+    .expect("pending bookkeeping respects the nested bound")
+    .unwrap();
+    assert_eq!(response.process_id, Some(42));
+    assert_eq!(response.exit_code, Some(0));
+    assert_eq!(response.raw_output, b"completed");
+    assert!(
+        response
+            .repair_notice
+            .as_ref()
+            .unwrap()
+            .contains("do not rerun")
+    );
+    drop(receipt);
     let result = tokio::time::timeout(
         Duration::from_secs(1),
-        finish_exited_process_result(Some(&process), Ok(response), Duration::from_millis(1)),
+        finish_exited_process_result(Some(&process), Ok(response), Duration::from_millis(1), None),
     )
     .await
     .expect("closed receipt must not hang");
@@ -3835,4 +3857,76 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
             drop(server);
         }).expect("test thread").join().expect("normal remote retirement cancellation behavior");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_cancelled_collection_preserves_pending_bytes_and_loss_markers() {
+    let buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(8)));
+    buffer.lock().await.push_chunk(b"0123456789abcdef");
+    let notify = Arc::new(Notify::new());
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_notify = Arc::new(Notify::new());
+    let cancel = CancellationToken::new();
+    let mut handoff = None;
+    let mut future = Box::pin(
+        UnifiedExecProcessManager::collect_output_until_deadline_with_quiet_yield(
+            &buffer,
+            &notify,
+            &closed,
+            &closed_notify,
+            &cancel,
+            None,
+            Instant::now() + Duration::from_secs(60),
+            None,
+            None,
+            &mut handoff,
+        ),
+    );
+    assert!(futures::poll!(&mut future).is_pending());
+    assert!(buffer.lock().await.pending_output().is_some());
+    drop(future);
+    let output = UnifiedExecProcessManager::collect_output_until_deadline(
+        &buffer,
+        &notify,
+        &closed,
+        &closed_notify,
+        &cancel,
+        None,
+        Instant::now(),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        format!(
+            "0123{}cdef",
+            String::from_utf8(omitted_output_marker(8)).unwrap()
+        )
+    );
+    assert!(!buffer.lock().await.has_unreported_output());
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_pause_cannot_extend_nested_hard_deadline() {
+    let buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+    let notify = Arc::new(Notify::new());
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_notify = Arc::new(Notify::new());
+    let cancel = CancellationToken::new();
+    let (_pause, receiver) = watch::channel(true);
+    let started = Instant::now();
+    let result = UnifiedExecProcessManager::collect_output_until_deadline_with_quiet_yield(
+        &buffer,
+        &notify,
+        &closed,
+        &closed_notify,
+        &cancel,
+        Some(receiver),
+        started + Duration::from_secs(30),
+        Some(started + Duration::from_secs(1)),
+        None,
+        &mut None,
+    )
+    .await;
+    assert_eq!(result.wake_reason, ToolLifecycleWakeReason::Timeout);
+    assert_eq!(Instant::now() - started, Duration::from_secs(1));
 }

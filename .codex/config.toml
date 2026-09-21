@@ -6,6 +6,8 @@ allow_login_shell = false
 background_terminal_max_timeout = 300000
 
 
+model_verbosity = "low"
+model_reasoning_summary = "auto"
 [agents]
 max_depth = 1
 

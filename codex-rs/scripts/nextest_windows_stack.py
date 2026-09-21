@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Give Windows libtest worker threads the repository's linked stack size."""
+"""Set the isolated environment required by Windows nextest workers."""
 
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ def main() -> int:
     if not nextest_env:
         raise SystemExit("NEXTEST_ENV is required")
     with Path(nextest_env).open("a", encoding="utf-8", newline="\n") as env_file:
+        # Desktop exports process-scoped CODEX_* state (homes, permission
+        # profiles, helper paths, task IDs, and app pipes). Repository tests
+        # must start clean; fixtures that exercise an override set it explicitly.
+        for name in sorted(name for name in os.environ if name.startswith("CODEX_")):
+            env_file.write(f"{name}=\n")
         env_file.write("RUST_MIN_STACK=8388608\n")
     return 0
 

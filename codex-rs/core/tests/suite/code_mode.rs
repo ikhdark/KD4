@@ -257,7 +257,7 @@ fn wait_for_file_source(path: &Path) -> Result<String> {
         format!("if (Test-Path -LiteralPath '{quoted_path}') {{ [Console]::Out.Write('ready') }}");
     Ok(format!(
         r#"while (true) {{
-  const result = await tools.exec_command({{ kind: "script", cmd: {command:?} }});
+  const result = await tools.exec_command({{ cmd: {command:?} }});
   if (result.output === "ready") {{
     break;
   }}
@@ -411,7 +411,7 @@ async fn predetermined_command_drains_complete_in_one_cell_without_lost_chunks()
         r#"// @exec: {{"yield_time_ms": 5}}
 const deadline = Date.now() + 10000;
 const chunks = [];
-let result = await tools.exec_command({{kind:"script",cmd:{command:?},yield_time_ms:250,max_output_tokens:1000}});
+let result = await tools.exec_command({{cmd:{command:?},yield_time_ms:250,max_output_tokens:1000}});
 chunks.push(result.output ?? "");
 let polls = 0;
 while (result.session_id && result.execution_state === "running" && Date.now() < deadline && polls < 4) {{
@@ -558,7 +558,7 @@ async fn retained_inventory_runs_through_code_mode_and_renders_exact_identifiers
     let test = builder.build(&server).await?;
     fs::write(
         test.cwd_path().join("inventory-component.txt"),
-        "component evidence\n",
+        "component evidence\ninventory-missing.txt is excluded from this inventory\n",
     )?;
     let script = r#"
 const initial = await tools.inventory({operation:"create",scope:{roots:["."],purpose:"component inventory"},
@@ -567,9 +567,10 @@ const observed = await tools.inventory({operation:"observe",inventory_id:initial
   category:"components",paths:["inventory-component.txt","inventory-component.txt","inventory-missing.txt"],complete:true});
 const page = await tools.inventory({operation:"read",inventory_id:observed.inventory_id});
 const source = await tools.read_file({path:"inventory-component.txt",selectors:[{kind:"lines",start:1,end:1}]});
+const exclusion = await tools.read_file({path:"inventory-component.txt",selectors:[{kind:"lines",start:2,end:2}]});
 const decisions = page.records.map(row => ({category:"components",candidate_id:row.candidate.id,
   classification:row.candidate.exists ? "included" : "excluded",
-  evidence:row.candidate.exists ? [{artifact_id:source.artifact_id,lines:[1,1]}] : [row.record]}));
+  evidence:row.candidate.exists ? [{artifact_id:source.artifact_id,lines:[1,1]}] : [{artifact_id:exclusion.artifact_id,lines:[2,2]}]}));
 const classified = await tools.inventory({operation:"classify",inventory_id:observed.inventory_id,decisions});
 const rendered = await tools.inventory({operation:"render",inventory_id:classified.inventory_id,classifications:["included"]});
 text(JSON.stringify({rendered,observed:observed.summary,ids:page.records.map(row => row.candidate.id)}));
@@ -1048,7 +1049,7 @@ async fn code_mode_preserves_read_history_until_its_source_changes() -> Result<(
     let scripts = [
         format!(
             r#"const reads = await Promise.allSettled({read_commands:?}.map(async cmd => {{
-let result = await tools.exec_command({{kind: "script", cmd, max_output_tokens: 5000, yield_time_ms: 30000}});
+let result = await tools.exec_command({{cmd, max_output_tokens: 5000, yield_time_ms: 30000}});
 let output = result.original_token_count > 0 ? (result.result?.selected_text ?? result.output) : "";
 while (result.session_id) {{
   result = await tools.write_stdin({{session_id: result.session_id, chars: "", max_output_tokens: 5000, yield_time_ms: 30000}});
@@ -1164,9 +1165,7 @@ async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads
     } else {
         "cat source.txt"
     };
-    let read = format!(
-        "await tools.exec_command({{kind: 'script', cmd: {read_command:?}, yield_time_ms: 30000}})"
-    );
+    let read = format!("await tools.exec_command({{cmd: {read_command:?}, yield_time_ms: 30000}})");
     let patch =
         "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch\n";
     let later_patch =
@@ -1177,7 +1176,7 @@ async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads
     let scripts = [
         format!("text({read});"),
         format!(
-            "text(await tools.apply_patch({patch:?})); text(await tools.exec_command({{kind: 'script', cmd: {validation:?}, yield_time_ms: 30000}}));"
+            "text(await tools.apply_patch({patch:?})); text(await tools.exec_command({{cmd: {validation:?}, yield_time_ms: 30000}}));"
         ),
         format!(
             "const earlier = {read}; await tools.apply_patch({later_patch:?}); text({read}); text(earlier);"
@@ -1255,12 +1254,12 @@ async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads
 #[test_case::test_case("completed", true, false, false, false; "failed first suite")]
 #[test_case::test_case("completed", false, false, true, false; "edit after validation")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_terminal_prompt_requires_fresh_suites_and_completed_work(
+async fn code_mode_validation_preserves_tools_for_remaining_work(
     plan_status: &str,
     fail: bool,
     mask_failure: bool,
     later_edit: bool,
-    terminal: bool,
+    expect_fresh_evidence: bool,
 ) -> Result<()> {
     require_network!();
     let server = responses::start_mock_server().await;
@@ -1323,13 +1322,11 @@ async fn code_mode_terminal_prompt_requires_fresh_suites_and_completed_work(
     let final_request = final_request.single_request();
     let final_body = final_request.body_json();
     assert!(!initial["tools"].as_array().unwrap().is_empty());
-    assert_eq!(
-        final_body["tools"].as_array().unwrap().is_empty(),
-        terminal,
-        "{final_body}"
+    assert!(
+        !final_body["tools"].as_array().unwrap().is_empty(),
+        "validation must leave tools available for remaining work: {final_body}"
     );
-    if terminal {
-        assert_eq!(final_body["parallel_tool_calls"], false);
+    if expect_fresh_evidence {
         let evidence = custom_tool_output_last_non_empty_text(&final_request, "validate").unwrap();
         assert!(evidence.contains("OK"), "{evidence}");
         assert!(!evidence.contains("stale_workspace_evidence"), "{evidence}");
@@ -1634,7 +1631,7 @@ async fn output_only_preserves_running_command_and_recovers_middle(
         powershell_single_quoted_path(&source),
     );
     let code = format!(
-        "// @exec: {{\"max_output_tokens\": {budget}}}\nconst r = await tools.exec_command({{kind: 'script', cmd: {command:?}, yield_time_ms: 1000, max_output_tokens: {budget}}}); text(r.output);",
+        "// @exec: {{\"max_output_tokens\": {budget}}}\nconst r = await tools.exec_command({{cmd: {command:?}, yield_time_ms: 1000, max_output_tokens: {budget}}}); text(r.output);",
         budget = if zero_budget { 0 } else { 256 },
     );
     let (test, observed) = run_code_mode_turn_with_config(
@@ -1758,7 +1755,7 @@ async fn code_mode_can_return_exec_command_output() -> Result<()> {
         &server,
         "use exec to run exec_command",
         r#"
-let result = await tools.exec_command({ kind: "script", cmd: "[Console]::Out.Write('code_mode_exec_marker')" });
+let result = await tools.exec_command({ cmd: "[Console]::Out.Write('code_mode_exec_marker')" });
 while (result.session_id) {
   result = await tools.write_stdin({
     session_id: result.session_id,
@@ -1817,9 +1814,9 @@ async fn code_mode_preserves_nested_result_evidence_without_injecting_advice() -
     fs::write(test.cwd_path().join("small.txt"), small)?;
     fs::write(test.cwd_path().join("large.txt"), &large)?;
     let small_command = if cfg!(windows) {
-        serde_json::json!({"kind": "script", "cmd": "Get-Content -Raw -Encoding utf8 small.txt", "yield_time_ms": 30000})
+        serde_json::json!({"cmd": "Get-Content -Raw -Encoding utf8 small.txt", "yield_time_ms": 30000})
     } else {
-        serde_json::json!({"kind": "argv", "program": "cat", "args": ["small.txt"], "yield_time_ms": 30000})
+        serde_json::json!({"cmd": "cat small.txt", "yield_time_ms": 30000})
     };
     let read_small = format!(
         r#"const result = await tools.exec_command({small_command});
@@ -1833,7 +1830,7 @@ text(result.result?.selected_text ?? result.output);"#
     };
     let scripts = [
         read_small.clone(),
-        format!(r#"const result = await tools.exec_command({{kind: "script", cmd: {large_command:?}, max_output_tokens: 6000, yield_time_ms: 30000}});
+        format!(r#"const result = await tools.exec_command({{cmd: {large_command:?}, max_output_tokens: 6000, yield_time_ms: 30000}});
 if (result.session_id) throw new Error('expected completed read');
 store('large', result);"#),
         read_small.replace(
@@ -2413,7 +2410,7 @@ async fn code_mode_only_can_call_nested_tools() -> Result<()> {
                 "call-1",
                 "exec",
                 r#"
-const output = await tools.exec_command({ kind: "script", cmd: "[Console]::Out.Write('code_mode_only_nested_tool_marker')" });
+const output = await tools.exec_command({ cmd: "[Console]::Out.Write('code_mode_only_nested_tool_marker')" });
 text(output.output);
 "#,
             ),
@@ -2638,7 +2635,6 @@ async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> 
         "use exec_command from code mode",
         r#"
 let result = await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')",
   max_output_tokens: 5
 });
@@ -2697,7 +2693,6 @@ async fn code_mode_exec_nested_limit_preserves_result_variable_before_default_hi
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('x' * 50000)",
   max_output_tokens: 20000,
   yield_time_ms: 30_000
@@ -2730,7 +2725,6 @@ async fn code_mode_exec_nested_limit_truncates_result_variable_when_exceeded() -
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 25000}
 const result = await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('A' * 90000)",
   max_output_tokens: 20000,
   yield_time_ms: 30_000
@@ -2773,7 +2767,6 @@ async fn code_mode_exec_nested_limit_preserves_result_variable_before_configured
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('x' * 50000)",
   max_output_tokens: 20000,
   yield_time_ms: 30_000
@@ -2827,7 +2820,6 @@ async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_de
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('x' * 50000)",
   yield_time_ms: 30_000
 });
@@ -2860,7 +2852,6 @@ async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_co
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('x' * 50000)",
   yield_time_ms: 30_000
 });
@@ -2914,7 +2905,6 @@ async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 5}
 const result = await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')"
 });
 text(result.result?.selected_text ?? result.output);
@@ -4168,7 +4158,7 @@ async fn code_mode_background_keeps_running_on_later_turn_without_wait() -> Resu
         r#"
 text("before yield");
 yield_control();
-await tools.exec_command({{ kind: "script", cmd: {write_file_command:?} }});
+await tools.exec_command({{ cmd: {write_file_command:?} }});
 text("after yield");
 "#
     );
@@ -4545,7 +4535,7 @@ async fn code_mode_replaces_malformed_image() -> Result<()> {
     let (_test, second_mock) = run_code_mode_turn(
         &server,
         "use exec to return an image",
-        r#"image("data:image/png;base64,AAA");"#,
+        r#"image("data:image/png;base64,AAAA");"#,
     )
     .await?;
 
@@ -4651,8 +4641,9 @@ async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
         text_item(&items, /*index*/ 1),
         concat!(
             "Script error:\n",
-            "Tool call failed: remote image URLs are not supported in tool outputs. ",
-            "Pass a base64 data URI instead"
+            "TypeError: Tool call failed: remote image URLs are not supported in tool outputs. ",
+            "Pass a base64 data URI instead\n",
+            "    at exec_main.mjs:1:1"
         )
     );
 
@@ -4718,19 +4709,18 @@ image(out);
         Some(false),
         "code_mode view_image call failed unexpectedly"
     );
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(
+        items[1].get("type").and_then(Value::as_str),
+        Some("input_image"),
+        "{items:?}"
+    );
     assert_regex_match(
         concat!(
             r"(?s)\A",
             r"Script (?:completed|running) with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
-    );
-
-    assert_eq!(
-        items[1].get("type").and_then(Value::as_str),
-        Some("input_image"),
-        "{items:?}"
     );
 
     let emitted_image_url = items[1]
@@ -4843,12 +4833,13 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
                 .unwrap();
         let direct = tools.iter().find(|tool| tool["name"] == "apply_patch");
         assert_eq!(direct.is_none(), code_mode_only);
-        assert!(exec_description.contains(declaration));
+        assert_eq!(exec_description.matches("declare const tools:").count(), 1);
+        assert!(exec_description.contains("apply_patch(input: string"));
         if let Some(direct) = direct {
             assert_eq!(direct["description"], description);
             assert!(!exec_description.contains(description));
         } else {
-            assert!(exec_description.contains(runtime_description));
+            assert!(exec_description.contains(description));
         }
         assert_eq!(output["result"]["success"], true);
         assert_eq!(output["result"]["changes_exact"], true);

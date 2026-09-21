@@ -393,6 +393,49 @@ fn trimmed_nonempty_tool_search_becomes_a_structured_nonempty_receipt() {
 }
 
 #[tokio::test]
+async fn request_schema_overhead_can_require_compaction_output_rewriting() {
+    let (_, mut turn) = make_session_and_context().await;
+    let mut items = tool_search_group("schema-pressure");
+    let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] else {
+        unreachable!()
+    };
+    tools[0]["description"] = serde_json::Value::String("schema detail ".repeat(2_000));
+    items.push(ResponseItem::CompactionTrigger {});
+    let base = BaseInstructions {
+        text: String::new(),
+    };
+    let item_tokens = items.iter().map(estimate_item_token_count).sum::<i64>();
+    turn.model_info.context_window = Some(item_tokens + REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS);
+    turn.model_info.effective_context_window_percent = 100;
+    let mut history = ContextManager::new();
+    history.replace(items.clone());
+    assert_eq!(
+        trim_function_call_history_to_fit_context_window_for_prompt(
+            &mut history,
+            &turn,
+            &base,
+            Some(&items),
+            0
+        )
+        .0,
+        0
+    );
+    let (rewritten, savings) = trim_function_call_history_to_fit_context_window_for_prompt(
+        &mut history,
+        &turn,
+        &base,
+        Some(&items),
+        2_000,
+    );
+    assert_eq!(rewritten, 1);
+    assert!(savings > 2_000);
+    assert!(matches!(
+        history.raw_items().last(),
+        Some(ResponseItem::CompactionTrigger {})
+    ));
+}
+
+#[tokio::test]
 async fn prepared_prompt_size_does_not_rewrite_an_output_already_absent_from_projection() {
     let (_session, mut turn_context) = make_session_and_context().await;
     let base_instructions = BaseInstructions {
@@ -418,6 +461,7 @@ async fn prepared_prompt_size_does_not_rewrite_an_output_already_absent_from_pro
         &turn_context,
         &base_instructions,
         Some(&[prefix]),
+        0,
     );
 
     assert_eq!(rewritten, 0);

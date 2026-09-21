@@ -21,9 +21,6 @@ pub enum PatternToken {
 impl PatternToken {
     pub fn single(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        if value.trim().is_empty() {
-            return Err(Error::InvalidPattern("token cannot be empty".to_string()));
-        }
         Ok(Self::Single(value))
     }
 
@@ -33,16 +30,20 @@ impl PatternToken {
                 "pattern alternatives cannot be empty".to_string(),
             )),
             [single] => Self::single(single.clone()),
-            _ if alternatives
-                .iter()
-                .any(|alternative| alternative.trim().is_empty()) =>
-            {
-                Err(Error::InvalidPattern(
-                    "pattern alternatives cannot include empty tokens".to_string(),
-                ))
-            }
             _ => Ok(Self::Alts(alternatives)),
         }
+    }
+
+    /// Validate a token used in executable position; blank argument tokens are valid.
+    pub fn validate_program(&self) -> Result<()> {
+        if self
+            .alternatives()
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(Error::InvalidPattern("token cannot be empty".to_string()));
+        }
+        Ok(())
     }
 
     fn matches(&self, token: &str) -> bool {
@@ -69,6 +70,15 @@ pub struct PrefixPattern {
 }
 
 impl PrefixPattern {
+    pub(crate) fn matches_args(&self, args: &[String]) -> bool {
+        args.len() >= self.rest.len()
+            && self
+                .rest
+                .iter()
+                .zip(args)
+                .all(|(pattern, arg)| pattern.matches(arg))
+    }
+
     pub fn matches_prefix(&self, cmd: &[String]) -> Option<Vec<String>> {
         let pattern_length = self.rest.len() + 1;
         if cmd.len() < pattern_length || cmd[0] != self.first.as_ref() {
@@ -143,6 +153,22 @@ pub struct PrefixRule {
 impl PrefixRule {
     pub fn program(&self) -> &str {
         self.pattern.first.as_ref()
+    }
+
+    pub(crate) fn materialize_match(
+        &self,
+        cmd: &[String],
+        resolved: Option<&AbsolutePathBuf>,
+    ) -> RuleMatch {
+        let mut matched_prefix = Vec::with_capacity(self.pattern.rest.len() + 1);
+        matched_prefix.push(self.program().to_string());
+        matched_prefix.extend_from_slice(&cmd[1..=self.pattern.rest.len()]);
+        RuleMatch::PrefixRuleMatch {
+            matched_prefix,
+            decision: self.decision,
+            resolved_program: resolved.cloned(),
+            justification: self.justification.clone(),
+        }
     }
 
     pub fn matches(&self, cmd: &[String]) -> Option<RuleMatch> {
@@ -310,10 +336,7 @@ pub(crate) fn validate_match_examples(
     };
 
     for example in matches {
-        if !policy
-            .matches_for_command_with_options(example, /*heuristics_fallback*/ None, &options)
-            .is_empty()
-        {
+        if policy.visit_matches(example, &options, |_, _| true) {
             continue;
         }
 
@@ -345,10 +368,12 @@ pub(crate) fn validate_not_match_examples(
     };
 
     for example in not_matches {
-        if let Some(rule) = policy
-            .matches_for_command_with_options(example, /*heuristics_fallback*/ None, &options)
-            .first()
-        {
+        let mut first = None;
+        policy.visit_matches(example, &options, |rule, resolved| {
+            first = Some(rule.materialize_match(example, resolved));
+            true
+        });
+        if let Some(rule) = first {
             return Err(Error::ExampleDidMatch {
                 rule: format!("{rule:?}"),
                 example: try_join(example.iter().map(String::as_str))

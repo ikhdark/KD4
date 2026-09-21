@@ -411,7 +411,7 @@ async fn capture_remote_workspace_evidence(
         };
         // The filesystem protocol cannot read symlink targets without following them.
         // Never publish a complete identity when that evidence is unavailable.
-        if metadata.is_symlink || (!metadata.is_file && !metadata.is_directory) {
+        if metadata.is_symlink || !metadata.is_file {
             return None;
         }
         manifest.extend_from_slice(observation.path.as_bytes());
@@ -775,6 +775,11 @@ async fn capture_workspace_metadata(
                 }
                 _ => return None,
             };
+            // Git reports dirty submodules as directories, without identifying
+            // their contents. Such an entry cannot certify workspace freshness.
+            if !metadata.is_file() && !metadata.file_type().is_symlink() {
+                return None;
+            }
             let declared_bytes = if metadata.is_file() { metadata.len() } else { 0 };
             let remaining = WORKSPACE_GENERATION_MAX_DECLARED_BYTES.checked_sub(observed_bytes)?;
             if declared_bytes > remaining { return None; }
@@ -1501,10 +1506,11 @@ impl GitWorkspaceCache {
                     .await
                     .identity
             }
-            _ => match cwd.to_abs_path() {
+            Some(_) => match cwd.to_abs_path() {
                 Ok(cwd) => self.workspace_evidence_identity(cwd.as_path()).await,
                 Err(_) => Some(WorkspaceEvidenceIdentity::unavailable(None)),
             },
+            None => Some(WorkspaceEvidenceIdentity::unavailable(None)),
         }
     }
 
@@ -2133,15 +2139,17 @@ impl GitWorkspaceCache {
         if changed_paths.as_ref().is_some_and(Vec::is_empty) {
             return self.source_watcher_generation.load(Ordering::Acquire);
         }
-        let generation = self
-            .source_watcher_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
         let mut journal = self
             .source_change_journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = self
+            .source_watcher_generation
+            .load(Ordering::Acquire)
+            .saturating_add(1);
         journal.record(generation, changed_paths);
+        self.source_watcher_generation
+            .store(generation, Ordering::Release);
         generation
     }
 
@@ -2171,7 +2179,11 @@ impl GitWorkspaceCache {
         repo_root: &Path,
         paths: &[(PathBuf, bool)],
     ) -> Option<Vec<SourcePathChangeObservation>> {
-        if !self.source_watcher_reliable.load(Ordering::Acquire) {
+        if !self.source_watcher_reliable.load(Ordering::Acquire)
+            || paths
+                .iter()
+                .any(|(path, _)| is_generated_codex_eval_path(path))
+        {
             return None;
         }
         let repo_root = repo_root.to_path_buf();
@@ -2266,6 +2278,7 @@ impl GitWorkspaceCache {
         observation: &SourcePathChangeObservation,
     ) -> bool {
         if observation.watcher_epoch != self.watcher_epoch
+            || is_generated_codex_eval_path(&observation.path)
             || !path_is_same_or_descendant(&observation.path, &observation.repo_root)
         {
             return false;

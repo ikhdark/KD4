@@ -358,10 +358,12 @@ fn runtime_response(
         runtime::CellEvent::Completed {
             content_items,
             error_text,
+            output_loss,
         } => Ok(RuntimeResponse::Result {
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
             error_text,
+            output_loss,
         }),
         runtime::CellEvent::Terminated { content_items } => Ok(RuntimeResponse::Terminated {
             cell_id: cell_id.clone(),
@@ -390,6 +392,7 @@ fn output_item(item: runtime::OutputItem) -> FunctionCallOutputContentItem {
 fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
     RuntimeResponse::Result {
         error_text: Some(format!("exec cell {cell_id} not found")),
+        output_loss: None,
         cell_id,
         content_items: Vec::new(),
     }

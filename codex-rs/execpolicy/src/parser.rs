@@ -124,7 +124,7 @@ impl PolicyParser {
 struct PolicyBuilder {
     rules_by_program: MultiMap<String, RuleRef>,
     network_rules: Vec<NetworkRule>,
-    host_executables_by_name: HashMap<String, Arc<[AbsolutePathBuf]>>,
+    host_executables_by_name: Arc<HashMap<String, Arc<[AbsolutePathBuf]>>>,
     pending_example_validations: Vec<PendingExampleValidation>,
 }
 
@@ -133,7 +133,7 @@ impl PolicyBuilder {
         Self {
             rules_by_program: MultiMap::new(),
             network_rules: Vec::new(),
-            host_executables_by_name: HashMap::new(),
+            host_executables_by_name: Arc::new(HashMap::new()),
             pending_example_validations: Vec::new(),
         }
     }
@@ -148,7 +148,7 @@ impl PolicyBuilder {
     }
 
     fn add_host_executable(&mut self, name: String, paths: Vec<AbsolutePathBuf>) {
-        self.host_executables_by_name.insert(name, paths.into());
+        Arc::make_mut(&mut self.host_executables_by_name).insert(name, paths.into());
     }
 
     fn add_pending_example_validation(
@@ -174,7 +174,7 @@ impl PolicyBuilder {
                 rules_by_program.insert(rule.program().to_string(), rule.clone());
             }
 
-            let policy = crate::policy::Policy::from_parts(
+            let policy = crate::policy::Policy::from_shared_parts(
                 rules_by_program,
                 Vec::new(),
                 self.host_executables_by_name.clone(),
@@ -189,7 +189,7 @@ impl PolicyBuilder {
     }
 
     fn build(self) -> crate::policy::Policy {
-        crate::policy::Policy::from_parts(
+        crate::policy::Policy::from_shared_parts(
             self.rules_by_program,
             self.network_rules,
             self.host_executables_by_name,
@@ -214,6 +214,7 @@ fn parse_pattern<'v>(pattern: UnpackList<Value<'v>>) -> Result<Vec<PatternToken>
     if tokens.is_empty() {
         Err(Error::InvalidPattern("pattern cannot be empty".to_string()))
     } else {
+        tokens[0].validate_program()?;
         Ok(tokens)
     }
 }

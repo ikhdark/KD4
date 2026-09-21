@@ -63,7 +63,6 @@ use codex_git_utils::RepositoryContext;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION;
-use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ResumedHistory;
@@ -1808,7 +1807,6 @@ struct RolloutWriterState {
     last_logged_error: Option<String>,
     retry_blocked_error: Option<String>,
     tool_manifests: crate::ToolManifestDictionary,
-    pending_token_count: Option<CapturedRolloutItem>,
 }
 
 impl RolloutWriterState {
@@ -1832,7 +1830,6 @@ impl RolloutWriterState {
             last_logged_error: None,
             retry_blocked_error: None,
             tool_manifests,
-            pending_token_count: None,
         }
     }
 
@@ -1858,19 +1855,11 @@ impl RolloutWriterState {
                     self.pending_items
                         .push(captured.with_item(RolloutItem::ToolManifest(encoded)));
                 }
-                RolloutItem::EventMsg(EventMsg::TokenCount(_)) => {
-                    self.pending_token_count = Some(captured);
-                }
-                RolloutItem::EventMsg(
-                    EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::TurnStarted(_),
-                ) => {
-                    // A coalesced token count keeps its own capture time even
-                    // though a later record is what released it.
-                    if let Some(token_count) = self.pending_token_count.take() {
-                        self.pending_items.push(token_count);
-                    }
-                    self.pending_items.push(captured);
-                }
+                // Every sampling request's usage is retained. One record per
+                // turn cannot show which request grew the prefix, what each
+                // request's cache hit rate was, or where context was spent, so
+                // coalescing them removes the primary signal this fork is
+                // optimized against.
                 _ => self.pending_items.push(captured),
             }
         }
@@ -1880,26 +1869,16 @@ impl RolloutWriterState {
         if self.is_deferred() {
             return;
         }
-        // Automatic writes retain coalesced token counts until a turn boundary
-        // or an explicit write-completion barrier.
         if let Err(err) = self.write_pending_with_recovery("record").await {
             self.enter_recovery_mode(&err);
         }
     }
 
-    fn drain_pending_token_count(&mut self) {
-        if let Some(token_count) = self.pending_token_count.take() {
-            self.pending_items.push(token_count);
-        }
-    }
-
     async fn persist(&mut self) -> std::io::Result<()> {
-        self.drain_pending_token_count();
         self.write_pending_with_recovery("persist").await
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
-        self.drain_pending_token_count();
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
@@ -1907,7 +1886,6 @@ impl RolloutWriterState {
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        self.drain_pending_token_count();
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
@@ -2154,8 +2132,7 @@ async fn rollout_writer(
             }
         }
         if let Some(message) = state.retry_blocked_error.as_ref() {
-            let pending_records =
-                state.pending_items.len() + usize::from(state.pending_token_count.is_some());
+            let pending_records = state.pending_items.len();
             let err = IoError::other(format!(
                 "{message}; {pending_records} buffered rollout records could not be confirmed persisted"
             ));

@@ -123,9 +123,9 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
     turn_context: &TurnContext,
     item: &ResponseItem,
     finalized_facts: Option<&FinalizedTurnItemFacts>,
-) {
+) -> std::io::Result<()> {
     sess.record_conversation_items(turn_context, std::slice::from_ref(item))
-        .await;
+        .await?;
     let defers_mailbox_delivery = finalized_facts.map_or_else(
         || {
             completed_item_defers_mailbox_delivery_to_next_turn(
@@ -157,6 +157,7 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
         sess.record_memory_citation_for_turn(&turn_context.sub_id)
             .await;
     }
+    Ok(())
 }
 
 fn response_item_may_include_external_context(item: &ResponseItem) -> bool {
@@ -319,7 +320,7 @@ pub(crate) struct HandleOutputCtx {
     pub response_item_recorder: OrderedResponseItemRecorder,
 }
 
-type ResponseItemPersistenceBarrier = Shared<BoxFuture<'static, ()>>;
+type ResponseItemPersistenceBarrier = Shared<BoxFuture<'static, std::result::Result<(), String>>>;
 
 #[derive(Default)]
 struct OrderedResponseItemRecorderState {
@@ -351,7 +352,7 @@ impl OrderedResponseItemRecorder {
             .insert(call.call_id.clone(), call);
     }
 
-    async fn enqueue(
+    pub(crate) async fn enqueue(
         &self,
         sess: Arc<Session>,
         turn_context: Arc<TurnContext>,
@@ -367,23 +368,24 @@ impl OrderedResponseItemRecorder {
         let required_turn_context = Arc::clone(&turn_context);
         let required_barrier = async move {
             if let Some(preceding) = preceding_required {
-                preceding.await;
+                preceding.await?;
             }
             let mut items = Vec::with_capacity(1 + following_items.len());
             items.push(item);
             items.extend(following_items);
             required_sess
-                .record_conversation_items(&required_turn_context, &items)
-                .await;
+                .record_conversation_items_ordered(&required_turn_context, &items)
+                .await
+                .map_err(|error| error.to_string())
         }
         .boxed()
         .shared();
         let required_for_auxiliary = required_barrier.clone();
         let auxiliary_barrier = async move {
             if let Some(preceding) = preceding_auxiliary {
-                preceding.await;
+                preceding.await?;
             }
-            required_for_auxiliary.await;
+            required_for_auxiliary.await?;
             let defers_mailbox_delivery = finalized_facts.as_ref().map_or_else(
                 || {
                     completed_item_defers_mailbox_delivery_to_next_turn(
@@ -424,6 +426,7 @@ impl OrderedResponseItemRecorder {
                 sess.record_memory_citation_for_turn(&turn_context.sub_id)
                     .await;
             }
+            Ok(())
         }
         .boxed()
         .shared();
@@ -434,11 +437,12 @@ impl OrderedResponseItemRecorder {
         required_barrier
     }
 
-    pub(crate) async fn flush(&self) {
+    pub(crate) async fn flush(&self) -> codex_protocol::error::Result<()> {
         let tail = self.state.lock().await.auxiliary_tail.clone();
         if let Some(tail) = tail {
-            tail.await;
+            tail.await.map_err(CodexErr::Fatal)?;
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -448,6 +452,7 @@ impl OrderedResponseItemRecorder {
     ) {
         let barrier = async move {
             let _ = release.await;
+            Ok(())
         }
         .boxed()
         .shared();
@@ -461,6 +466,7 @@ impl OrderedResponseItemRecorder {
     ) {
         let barrier = async move {
             let _ = release.await;
+            Ok(())
         }
         .boxed()
         .shared();
@@ -559,6 +565,9 @@ pub(crate) async fn handle_output_item_done(
     match ToolRouter::build_tool_call(&item) {
         // The model emitted a tool call; admit it, persist it, and queue the tool execution.
         Ok(Some(call)) => {
+            ctx.tool_runtime
+                .ensure_execution_allowed()
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
             ctx.turn_context
                 .turn_timing_state
                 .record_model_emitted_tool_call();
@@ -652,7 +661,7 @@ pub(crate) async fn handle_output_item_done(
             // do not construct the runtime dispatch task until the response
             // tail has completed.
             let completion = async move {
-                persistence_barrier.await;
+                persistence_barrier.await.map_err(CodexErr::Fatal)?;
                 tool_runtime
                     .handle_model_tool_call_with_trace(call, cancellation_token, future_timing)
                     .await
@@ -717,7 +726,11 @@ pub(crate) async fn handle_output_item_done(
             output.last_agent_message = finalized_facts.and_then(|facts| facts.last_agent_message);
         }
         // Preserve the tool-search response shape and call ID when argument parsing fails.
-        Err(ToolCallBuildError::ToolSearchArguments { call_id, .. }) => {
+        Err(ToolCallBuildError::ToolSearchArguments { call_id, message }) => {
+            let failure_detail = ToolCallRuntime::search_failure_detail_for_call_id(
+                &call_id,
+                &crate::FunctionCallError::RespondToModel(message),
+            );
             let response = ResponseInputItem::ToolSearchOutput {
                 call_id,
                 status: "incomplete".to_string(),
@@ -730,6 +743,7 @@ pub(crate) async fn handle_output_item_done(
             *earlier_tool_calls_eligible = false;
             let following_items = response_input_to_response_item(&response)
                 .into_iter()
+                .chain(std::iter::once(failure_detail))
                 .collect();
             drop(
                 ctx.response_item_recorder

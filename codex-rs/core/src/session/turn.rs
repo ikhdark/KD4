@@ -43,7 +43,7 @@ use crate::context_manager::compact_acknowledged_tool_search_outputs;
 use crate::feedback_tags;
 use crate::hook_runtime::emit_hook_stop_reason;
 use crate::hook_runtime::inspect_pending_input;
-use crate::hook_runtime::record_additional_contexts;
+use crate::hook_runtime::prepare_additional_context_items;
 use crate::hook_runtime::record_pending_input;
 use crate::hook_runtime::run_legacy_after_agent_hook;
 use crate::hook_runtime::run_pending_session_start_hooks;
@@ -190,7 +190,6 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_tools::DiscoverableTool;
 use codex_tools::ToolName;
-use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_tools::request_user_input_available_modes;
 use codex_utils_stream_parser::AssistantTextChunk;
 use codex_utils_stream_parser::AssistantTextStreamParser;
@@ -339,7 +338,54 @@ pub(crate) async fn run_turn(
     logical_generation_budget: &mut LogicalGenerationBudget,
     cancellation_token: CancellationToken,
 ) -> CodexResult<TurnTaskResult> {
-    let mut mutating_finalizer_ran = false;
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
+    let agent_turn_preparation = sess
+        .services
+        .agent_control
+        .task_coordinator()
+        .prepare_legacy_agent_turn(&turn_context.session_source, sess.thread_id)
+        .await;
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
+    if let Err(error) = agent_turn_preparation {
+        let err = CodexErr::Fatal(format!(
+            "Failed to prepare the agent's follow-up task: {error}"
+        ));
+        sess.emit_turn_error_lifecycle(turn_context.as_ref(), err.to_codex_protocol_error())
+            .await;
+        sess.track_turn_codex_error(turn_context.as_ref(), &err);
+        sess.send_event(
+            turn_context.as_ref(),
+            EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+        )
+        .await;
+        return Err(err);
+    }
+    turn_context.agent_task_binding.get_or_init(|| {
+        sess.services
+            .agent_control
+            .task_coordinator()
+            .binding_for_source(&turn_context.session_source)
+            .filter(|binding| {
+                binding.thread_id.as_deref() == Some(sess.thread_id.to_string().as_str())
+            })
+    });
+    let mut finalized_mutation_revision = None;
+    let mut last_stop_repair = None;
+    let mut completion_evidence = None;
+    let mut provider_overflow_recovery_attempted = false;
+    if run_pending_session_start_hooks(&sess, &turn_context).await {
+        return Ok(finish_stopped_session_start(&sess, input).await);
+    }
+    let inspected = inspect_inputs(&sess, &turn_context, &input).await;
+    let input = inspected.items;
+    if inspected.outcome.should_stop {
+        record_inspected_inputs(&sess, &turn_context, &input).await?;
+        return Ok(TurnTaskResult::default());
+    }
     let mut preparation_timing_guard = None;
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
@@ -376,6 +422,10 @@ pub(crate) async fn run_turn(
             ),
             turn_diff_display_roots(sess.as_ref(), turn_context.as_ref()),
         );
+        let world_state = match world_state {
+            Ok(world_state) => world_state,
+            Err(error) => break Err(CodexErr::from(error)),
+        };
         let Some(world_state) = world_state else {
             turn_context
                 .turn_timing_state
@@ -405,13 +455,8 @@ pub(crate) async fn run_turn(
     // Pending-turn planning is stable and compare-and-commit has atomically
     // begun persistence under the session-state owner.
 
-    if run_pending_session_start_hooks(&sess, &turn_context).await {
-        return Ok(finish_stopped_session_start(&sess, input).await);
-    }
     let mut can_drain_pending_input = input.is_empty();
-    if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
-        return Ok(TurnTaskResult::default());
-    }
+    record_inspected_inputs(&sess, &turn_context, &input).await?;
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
         .await;
@@ -422,7 +467,7 @@ pub(crate) async fn run_turn(
     .await;
     if !injection_items.is_empty() {
         sess.record_conversation_items(&turn_context, &injection_items)
-            .await;
+            .await?;
     }
 
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
@@ -456,18 +501,25 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
+    let mut initial_mailbox_pending = true;
     let mut first_router = Some(first_router);
     // The turn owns its fully rendered instructions; the scaffold clones the
     // text only on a cache miss.
     let base_instructions = Arc::clone(&turn_context.base_instructions);
     'sampling_loop: loop {
+        let draining_initial_mailbox = !can_drain_pending_input && initial_mailbox_pending;
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
         let Some(pending_input) =
             drain_pending_input_if_generation_available(logical_generation_budget, async {
                 if can_drain_pending_input {
+                    initial_mailbox_pending = false;
                     sess.input_queue.get_pending_input(&sess.active_turn).await
+                } else if std::mem::take(&mut initial_mailbox_pending) {
+                    sess.input_queue
+                        .take_mailbox_for_initial_input(&sess.active_turn, &input)
+                        .await
                 } else {
                     Vec::new()
                 }
@@ -484,11 +536,17 @@ pub(crate) async fn run_turn(
             break 'sampling_loop;
         };
 
-        let recorded_input =
-            run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await;
+        let recorded_input = if draining_initial_mailbox {
+            record_initial_mailbox_owned(&sess, &turn_context, pending_input).await?
+        } else {
+            run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await?
+        };
         if recorded_input.accepted_context_input {
             prefetched_workspace_identity = None;
-            mutating_finalizer_ran = false;
+            finalized_mutation_revision = None;
+            last_stop_repair = None;
+            completion_evidence = None;
+            provider_overflow_recovery_attempted = false;
             turn_execution.accepted_user_input();
             logical_generation_budget.accepted_user_input();
         }
@@ -506,7 +564,7 @@ pub(crate) async fn run_turn(
         // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
             Some(step_context) => step_context,
-            None => sess.capture_step_context(Arc::clone(&turn_context)).await,
+            None => sess.capture_step_context(Arc::clone(&turn_context)).await?,
         };
         let request_baselines = {
             let tracker = turn_diff_tracker.lock().await;
@@ -581,6 +639,15 @@ pub(crate) async fn run_turn(
         if budget_forced_terminal {
             record_forced_terminal_budget_boundary(sess.as_ref(), turn_context.as_ref()).await;
         }
+        if kd4_runtime {
+            record_soft_convergence_directive(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &mut turn_execution,
+                has_started_generation,
+            )
+            .await?;
+        }
         has_started_generation = true;
         let generation_id = ModelGenerationId {
             turn_id: turn_context.sub_id.clone(),
@@ -595,15 +662,9 @@ pub(crate) async fn run_turn(
             )
             .await?;
 
-            if turn_context
-                .config
-                .features
-                .enabled(Feature::DeferredExecutor)
-            {
-                world_state = sess
-                    .record_step_world_state_if_changed(&world_state, step_context.as_ref())
-                    .await;
-            }
+            world_state = sess
+                .record_step_world_state_if_changed(&world_state, step_context.as_ref())
+                .await?;
 
             // Request preparation begins with the history snapshot. Pending-turn
             // planning, hooks, input recording, and analytics above remain owned
@@ -620,6 +681,20 @@ pub(crate) async fn run_turn(
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::HistorySnapshot);
                 let mut history = sess.clone_history().await;
+                if step_context.mcp_tool_snapshot().await.temporarily_unavailable {
+                    history.record_items(
+                        &[ResponseItem::Message {
+                            id: None,
+                            role: "developer".to_string(),
+                            content: vec![ContentItem::InputText {
+                                text: "The MCP tool catalog is temporarily unavailable for this request. This does not mean that no MCP tools are configured. Continue independent local work; if this task requires MCP, retry discovery on a subsequent step or report the unavailable capability.".to_string(),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        }],
+                        turn_context.model_info.truncation_policy.into(),
+                    );
+                }
                 if budget_forced_terminal {
                     history.record_items(
                         std::slice::from_ref(&forced_terminal_budget_directive()),
@@ -657,11 +732,6 @@ pub(crate) async fn run_turn(
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
-            if generation_request.sampling.is_residual_deterministic() {
-                turn_context
-                    .turn_timing_state
-                    .record_residual_deterministic_generation();
-            }
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
@@ -723,6 +793,9 @@ pub(crate) async fn run_turn(
                     });
                 }
                 turn_execution.settle(&request_baselines, &request_signals, &settled_state);
+                if let Some(evidence) = request_signals.completion_evidence_key() {
+                    completion_evidence = Some(evidence);
+                }
                 can_drain_pending_input = true;
                 let (has_pending_input, token_status) = collect_post_sampling_state(
                     sess.input_queue.has_pending_input(&sess.active_turn),
@@ -733,9 +806,9 @@ pub(crate) async fn run_turn(
                 )
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
-                // A proven loop receives one final, tool-free generation. Once
-                // that generation returns, only newly queued user input may
-                // keep the turn alive.
+                // Explicit owner completion and the emergency generation budget
+                // may request one final tool-free response. Repeated actions and
+                // passing validation do not establish completion of the task.
                 let mut needs_follow_up = generation_needs_follow_up(
                     &generation_request,
                     model_needs_follow_up,
@@ -770,32 +843,17 @@ pub(crate) async fn run_turn(
                 if authoritative_wait_terminal_surface.is_some() {
                     needs_follow_up = false;
                 }
-                let server_resample_eligible =
-                    server_end_turn_false && !tool_result_continuation && !has_pending_input;
                 let mut next_generation_request = needs_follow_up.then(|| {
                     turn_execution.continuation_generation_request(
                         &request_baselines,
                         &request_signals,
                         &settled_state,
                         has_pending_input,
-                        kd4_runtime && server_resample_eligible,
                     )
                 });
                 if terminal_completion_required {
                     next_generation_request = next_generation_request
                         .map(GenerationRequestDisposition::require_terminal_completion);
-                }
-                if next_generation_request
-                    .as_ref()
-                    .is_some_and(
-                        super::turn_execution::GenerationRequestDisposition::completes_protocol_turn_deterministically,
-                    )
-                {
-                    // The only remaining action is host-owned protocol
-                    // completion. Sampling here would spend an entire model
-                    // generation to rediscover an already-proved action.
-                    needs_follow_up = false;
-                    next_generation_request = None;
                 }
                 if needs_follow_up
                     && generation_budget_blocks_follow_up(
@@ -867,7 +925,7 @@ pub(crate) async fn run_turn(
                         turn_context.as_ref(),
                         convergence_decision.as_mut(),
                     )
-                    .await;
+                    .await?;
                     if let Err(err) = run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
@@ -892,7 +950,7 @@ pub(crate) async fn run_turn(
                         defer_pending_input |= has_pending_input;
                         break 'sampling_loop;
                     }
-                    can_drain_pending_input = !model_needs_follow_up;
+                    can_drain_pending_input = true;
                     pending_continuation_cause = Some(ContinuationCause::Compaction);
                     continue;
                 }
@@ -910,20 +968,47 @@ pub(crate) async fn run_turn(
                     let mutating_finalizer_aborted = if matches!(
                         turn_context.config.after_agent_policy,
                         AfterAgentPolicy::MutatingFinalizer
-                    ) && !mutating_finalizer_ran
-                    {
-                        mutating_finalizer_ran = true;
-                        let after_agent_outcome = run_legacy_after_agent_hook(
-                            &sess,
-                            &turn_context,
-                            &sampling_request_input,
-                            last_agent_message.clone(),
-                        )
-                        .await;
-                        after_agent_outcome.aborted
+                    ) {
+                        if finalized_mutation_revision
+                            .is_some_and(|revision| revision != settled_state.mutation_revision)
+                        {
+                            emit_status_affecting_turn_error(
+                                sess.as_ref(), turn_context.as_ref(),
+                                "The workspace changed after the mutating finalizer ran. Completion requires finalization of the repaired state; the finalizer was not replayed because it has no repeat-safety contract.",
+                            ).await;
+                            return Ok(after_agent_abort_result(
+                                last_agent_message,
+                                surfaced_result,
+                                defer_pending_input,
+                            ));
+                        }
+                        if finalized_mutation_revision.is_none() {
+                            let after_agent_outcome = run_legacy_after_agent_hook(
+                                &sess,
+                                &turn_context,
+                                &sampling_request_input,
+                                last_agent_message.clone(),
+                            )
+                            .await;
+                            // Finalizers can partially mutate even when they fail.
+                            let mut tracker = turn_diff_tracker.lock().await;
+                            tracker.record_unknown_mutation();
+                            finalized_mutation_revision = Some(tracker.current_mutation_revision());
+                            prefetched_workspace_identity = None;
+                            after_agent_outcome.aborted
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };
+                    if mutating_finalizer_aborted {
+                        return Ok(after_agent_abort_result(
+                            last_agent_message,
+                            surfaced_result,
+                            defer_pending_input,
+                        ));
+                    }
                     let completion_stop_report = run_completion_stop_hook(
                         &sess,
                         &turn_context,
@@ -931,24 +1016,58 @@ pub(crate) async fn run_turn(
                         last_agent_message.clone(),
                     )
                     .await;
-                    if let Some(hook_prompt_message) = completion_stop_report.continuation_prompt
-                        && admit_regular_follow_up(
+                    if let Some(hook_prompt_message) = completion_stop_report.continuation_prompt {
+                        let mut repair_state = settled_state.clone();
+                        repair_state.mutation_revision =
+                            turn_diff_tracker.lock().await.current_mutation_revision();
+                        let repair = (
+                            completion_stop_report.continuation_feedback,
+                            turn_execution.settled_revision_key(&repair_state),
+                            completion_evidence.clone(),
+                        );
+                        if last_stop_repair.as_ref() == Some(&repair) {
+                            emit_status_affecting_turn_error(
+                                sess.as_ref(), turn_context.as_ref(),
+                                "Stop hook repeated the same blocking feedback without changed state or evidence after a repair attempt.",
+                            ).await;
+                            return Ok(after_agent_abort_result(
+                                last_agent_message,
+                                surfaced_result,
+                                defer_pending_input,
+                            ));
+                        }
+                        last_stop_repair = Some(repair);
+                        if admit_regular_follow_up(
                             sess.as_ref(),
                             turn_context.as_ref(),
                             logical_generation_budget,
                             &mut generation_budget_error_reported,
                         )
                         .await
-                    {
-                        sess.record_response_item_and_emit_turn_item(
-                            &turn_context,
-                            hook_prompt_message,
+                        {
+                            sess.record_response_item_and_emit_turn_item(
+                                &turn_context,
+                                hook_prompt_message,
+                            )
+                            .await?;
+                            stop_hook_active = true;
+                            pending_generation_request = None;
+                            pending_continuation_cause = Some(ContinuationCause::StopHook);
+                            continue 'sampling_loop;
+                        }
+                    }
+                    if completion_stop_report.should_block {
+                        emit_status_affecting_turn_error(
+                            sess.as_ref(),
+                            turn_context.as_ref(),
+                            "Stop hook blocked completion; no actionable repair could be admitted.",
                         )
                         .await;
-                        stop_hook_active = true;
-                        pending_generation_request = None;
-                        pending_continuation_cause = Some(ContinuationCause::StopHook);
-                        continue 'sampling_loop;
+                        return Ok(after_agent_abort_result(
+                            last_agent_message,
+                            surfaced_result,
+                            defer_pending_input,
+                        ));
                     }
                     if completion_stop_report.should_stop {
                         if mutating_finalizer_aborted {
@@ -1014,12 +1133,53 @@ pub(crate) async fn run_turn(
                     turn_context.as_ref(),
                     convergence_decision.as_mut(),
                 )
-                .await;
+                .await?;
                 debug_assert!(pending_continuation_cause.is_some());
                 continue;
             }
             Err(err @ CodexErr::TurnAborted) => {
                 return Err(err);
+            }
+            Err(CodexErr::ContextWindowExceeded) if !provider_overflow_recovery_attempted => {
+                provider_overflow_recovery_attempted = true;
+                if !admit_regular_follow_up(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    logical_generation_budget,
+                    &mut generation_budget_error_reported,
+                )
+                .await
+                {
+                    break;
+                }
+                if let Err(err) = run_auto_compact(
+                    &sess,
+                    Arc::clone(&step_context),
+                    None,
+                    &mut client_session,
+                    prefetched_workspace_identity.as_ref(),
+                    Some(Arc::clone(&world_state)),
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                    &cancellation_token,
+                )
+                .await
+                {
+                    if matches!(err, CodexErr::TurnAborted) {
+                        return Err(err);
+                    }
+                    sess.emit_turn_error_lifecycle(
+                        turn_context.as_ref(),
+                        err.to_codex_protocol_error(),
+                    )
+                    .await;
+                    sess.send_event(&turn_context, EventMsg::Error(err.to_error_event(None)))
+                        .await;
+                    break;
+                }
+                pending_generation_request = None;
+                pending_continuation_cause = Some(ContinuationCause::Compaction);
+                continue;
             }
             Err(codex_error @ CodexErr::InvalidImageRequest()) => {
                 let sanitized = {
@@ -1113,7 +1273,7 @@ async fn finish_pending_turn_planning_failure(
     input: &[TurnInput],
     err: CodexErr,
 ) -> CodexResult<TurnTaskResult> {
-    run_hooks_and_record_inputs(sess, turn_context, input).await;
+    record_inspected_inputs(sess, turn_context, input).await?;
     if matches!(err, CodexErr::TurnAborted) {
         return Err(err);
     }
@@ -1372,11 +1532,27 @@ fn take_convergence_observation(
         .unwrap_or_default()
 }
 
+async fn record_soft_convergence_directive(
+    sess: &Session,
+    turn_context: &TurnContext,
+    turn_execution: &mut TurnExecutionControl,
+    is_continuation: bool,
+) -> std::io::Result<()> {
+    if let Some(directive) = turn_execution.take_soft_convergence_directive(is_continuation) {
+        let mut decision = SamplingConvergenceDecision {
+            directive: Some(directive),
+            ..SamplingConvergenceDecision::default()
+        };
+        record_convergence_decision(sess, turn_context, Some(&mut decision)).await?;
+    }
+    Ok(())
+}
+
 async fn record_convergence_decision(
     sess: &Session,
     turn_context: &TurnContext,
     decision: Option<&mut SamplingConvergenceDecision>,
-) {
+) -> std::io::Result<()> {
     let (proven_loop_activated, directive) = take_convergence_observation(decision);
     if proven_loop_activated {
         turn_context
@@ -1385,13 +1561,13 @@ async fn record_convergence_decision(
         sess.send_event(
             turn_context,
             EventMsg::Warning(WarningEvent {
-                message: "This turn's tools were stopped after a repeated action/result cycle without state progress. The assistant will summarize the available evidence and report anything unfinished.".to_string(),
+                message: "A repeated action/result cycle was detected. Existing results will be reused where possible; other actions remain available to complete the task.".to_string(),
             }),
         )
         .await;
     }
     let Some(directive) = directive else {
-        return;
+        return Ok(());
     };
     turn_context
         .turn_timing_state
@@ -1403,12 +1579,19 @@ async fn record_convergence_decision(
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
-    sess.record_conversation_items(turn_context, std::slice::from_ref(&directive_item))
+    let items = sess
+        .dedupe_existing_developer_contexts(vec![directive_item])
         .await;
+    if !items.is_empty() {
+        sess.record_conversation_items(turn_context, &items).await?;
+    }
+    Ok(())
 }
 
 struct CompletionStopHookReport {
+    should_block: bool,
     continuation_prompt: Option<ResponseItem>,
+    continuation_feedback: Vec<String>,
     should_stop: bool,
     stop_reason: Option<String>,
 }
@@ -1437,14 +1620,20 @@ async fn run_completion_stop_hook(
             turn_context,
             EventMsg::Warning(WarningEvent {
                 message: format!(
-                    "Stop hook requested continuation without a prompt{reason}; ignoring the block."
+                    "Stop hook blocked completion without actionable feedback{reason}."
                 ),
             }),
         )
         .await;
     }
     CompletionStopHookReport {
+        should_block: stop.should_block,
         continuation_prompt,
+        continuation_feedback: stop
+            .continuation_fragments
+            .iter()
+            .map(|fragment| fragment.text.clone())
+            .collect(),
         should_stop: stop.should_stop,
         stop_reason: stop.stop_reason,
     }
@@ -1462,20 +1651,48 @@ async fn turn_diff_display_roots(
         .display_roots()
 }
 
-#[instrument(level = "trace", skip_all)]
-pub(crate) async fn run_hooks_and_record_inputs(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    input: &[TurnInput],
-) -> bool {
-    run_hooks_and_record_inputs_detailed(sess, turn_context, input)
-        .await
-        .should_stop
-}
-
 struct RecordedInputOutcome {
     should_stop: bool,
     accepted_context_input: bool,
+}
+
+async fn record_initial_mailbox_owned(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: Vec<TurnInput>,
+) -> CodexResult<RecordedInputOutcome> {
+    // Queue removal transfers ownership to a tracked task before another await.
+    // Cancellation of the generation waiter must not discard accepted mail.
+    let owner = Arc::clone(sess);
+    let turn = Arc::clone(turn_context);
+    sess.terminal_tasks
+        .spawn(async move {
+            let mut accepted_context_input = false;
+            for (index, item) in input.iter().enumerate() {
+                match run_hooks_and_record_inputs_detailed(
+                    &owner,
+                    &turn,
+                    std::slice::from_ref(item),
+                )
+                .await
+                {
+                    Ok(outcome) => accepted_context_input |= outcome.accepted_context_input,
+                    Err(error) => {
+                        owner
+                            .input_queue
+                            .restore_transferred_startup_input(input[index..].to_vec())
+                            .await;
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(RecordedInputOutcome {
+                should_stop: false,
+                accepted_context_input,
+            })
+        })
+        .await
+        .map_err(|error| CodexErr::Fatal(format!("initial mailbox recording failed: {error}")))?
 }
 
 fn resets_turn_execution(input: &TurnInput) -> bool {
@@ -1490,7 +1707,34 @@ async fn run_hooks_and_record_inputs_detailed(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     input: &[TurnInput],
-) -> RecordedInputOutcome {
+) -> CodexResult<RecordedInputOutcome> {
+    let inspected = inspect_inputs(sess, turn_context, input).await;
+    record_inspected_inputs(sess, turn_context, &inspected.items).await?;
+    Ok(inspected.outcome)
+}
+
+struct InspectedInputs {
+    items: Vec<TurnInput>,
+    outcome: RecordedInputOutcome,
+}
+
+async fn record_inspected_inputs(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: &[TurnInput],
+) -> CodexResult<()> {
+    for item in input {
+        record_pending_input(sess, turn_context, item.clone(), Vec::new()).await?;
+    }
+    Ok(())
+}
+
+async fn inspect_inputs(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: &[TurnInput],
+) -> InspectedInputs {
+    let mut items = Vec::new();
     let mut blocked_input = false;
     let mut accepted_context_input = false;
     for input_item in input {
@@ -1504,23 +1748,25 @@ async fn run_hooks_and_record_inputs_detailed(
                 hook_outcome.stop_reason.as_deref(),
             )
             .await;
-            record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
             if resets_turn_execution(input_item) {
                 accepted_context_input = true;
             }
-            record_pending_input(
-                sess,
-                turn_context,
-                input_item.clone(),
-                hook_outcome.additional_contexts,
-            )
-            .await;
+            items.push(input_item.clone());
         }
+        items.extend(
+            prepare_additional_context_items(sess, turn_context, hook_outcome.additional_contexts)
+                .await
+                .into_iter()
+                .map(TurnInput::InternalResponseItem),
+        );
     }
-    RecordedInputOutcome {
-        should_stop: blocked_input && !accepted_context_input,
-        accepted_context_input,
+    InspectedInputs {
+        items,
+        outcome: RecordedInputOutcome {
+            should_stop: blocked_input && !accepted_context_input,
+            accepted_context_input,
+        },
     }
 }
 
@@ -1670,14 +1916,13 @@ async fn build_recommended_plugin_items(
     let Some(candidates) = sess
         .services
         .plugins_manager
-        .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+        .cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
             plugins_config,
             loaded_plugins,
             auth: auth.as_ref(),
             disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
             app_server_client_name: turn_context.app_server_client_name.as_deref(),
         })
-        .await
     else {
         return Vec::new();
     };
@@ -1981,7 +2226,7 @@ async fn stabilize_pending_turn_plan(
         }
         // Capturing a step can publish an MCP manager. Let that resource-owning
         // operation finish; the pure build below checks cancellation again.
-        let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
+        let step_context = sess.capture_step_context(Arc::clone(turn_context)).await?;
         let plan_build = build_pure_pending_turn_plan(
             sess,
             step_context,
@@ -2167,27 +2412,25 @@ async fn commit_pending_turn_plan_effects(
     }
 
     if !plan.mentioned_plugins.is_empty() {
+        // Observational enrichment must not delay sampling or retain an
+        // unbounded number of plugin inventories under blocking-pool pressure.
+        static ENRICHMENT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+        let Ok(permit) = ENRICHMENT_SLOTS.try_acquire() else {
+            warn!("plugin mention telemetry enrichment capacity exhausted");
+            return;
+        };
         let plugins_manager = Arc::clone(&sess.services.plugins_manager);
         let mentioned_plugins = plan.mentioned_plugins.clone();
-        let metadata = tokio::task::spawn_blocking(move || {
-            mentioned_plugins
-                .iter()
-                .filter_map(|summary| {
-                    plugins_manager.telemetry_metadata_for_capability_summary(summary)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await;
-        match metadata {
-            Ok(plugins) => {
-                for plugin in plugins {
-                    sess.services
-                        .analytics_events_client
-                        .track_plugin_used(plan.tracking.clone(), plugin);
-                }
+        let analytics = sess.services.analytics_events_client.clone();
+        let tracking = plan.tracking.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            for plugin in mentioned_plugins.iter().filter_map(|summary| {
+                plugins_manager.telemetry_metadata_for_capability_summary(summary)
+            }) {
+                analytics.track_plugin_used(tracking.clone(), plugin);
             }
-            Err(error) => warn!(%error, "plugin mention telemetry metadata task failed"),
-        }
+        });
         turn_context
             .turn_timing_state
             .record_planning_semantic_effect();
@@ -2213,55 +2456,6 @@ struct PendingTokenEstimate {
     resolves_active_reasoning: bool,
 }
 
-#[derive(Default)]
-struct SerializedByteCounter {
-    bytes: usize,
-}
-
-impl std::io::Write for SerializedByteCounter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.bytes = self.bytes.saturating_add(buf.len());
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn serialized_json_len<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<usize> {
-    let mut counter = SerializedByteCounter::default();
-    serde_json::to_writer(&mut counter, value)?;
-    Ok(counter.bytes)
-}
-
-fn injection_serialized_lengths(
-    injection_items: &[ResponseItem],
-) -> serde_json::Result<(usize, usize)> {
-    let mut item_bytes = 0usize;
-    let mut body_item_bytes = 0usize;
-    for item in injection_items {
-        let serialized_len = serialized_json_len(item)?;
-        item_bytes = item_bytes.saturating_add(serialized_len);
-        let is_stable_startup_item = matches!(
-            item,
-            ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && !content.is_empty()
-                    && content.iter().all(is_startup_contextual_user_fragment)
-        );
-        if !is_stable_startup_item {
-            body_item_bytes = body_item_bytes.saturating_add(serialized_len);
-        }
-    }
-    let array_delimiters_and_commas =
-        2usize.saturating_add(injection_items.len().saturating_sub(1));
-    Ok((
-        item_bytes.saturating_add(array_delimiters_and_commas),
-        body_item_bytes,
-    ))
-}
-
 fn estimate_pending_tokens(
     input: &[TurnInput],
     injection_items: &[ResponseItem],
@@ -2269,38 +2463,70 @@ fn estimate_pending_tokens(
     router: &ToolRouter,
     initial_context: bool,
 ) -> PendingTokenEstimate {
-    let input_bytes = input.iter().fold(0usize, |bytes, item| {
-        let item_bytes = match item {
-            TurnInput::UserInput { content, .. } => serialized_json_len(content),
+    use crate::context_manager::estimate_item_token_count;
+    let input_tokens = input.iter().fold(0i64, |tokens, item| {
+        let item_tokens = match item {
+            TurnInput::UserInput { content, .. } => {
+                // Estimate local images without doing filesystem/image processing during
+                // admission. Inline images retain their metadata for the shared estimator.
+                let content: Vec<UserInput> = content
+                    .iter()
+                    .map(|item| match item {
+                        UserInput::LocalImage { detail, .. } => UserInput::Image {
+                            image_url: "data:image/png;base64,".to_string(),
+                            detail: *detail,
+                        },
+                        item => item.clone(),
+                    })
+                    .collect();
+                estimate_item_token_count(&ResponseItem::from(
+                    codex_protocol::models::ResponseInputItem::from(content),
+                ))
+            }
             TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
-                serialized_json_len(item)
+                estimate_item_token_count(item)
             }
             TurnInput::InterAgentCommunication(communication) => {
-                serialized_json_len(&communication.to_model_input_item())
+                estimate_item_token_count(&communication.to_model_input_item())
             }
-        }
-        .unwrap_or_default();
-        bytes.saturating_add(item_bytes)
+        };
+        tokens.saturating_add(item_tokens)
     });
-    let (injection_bytes, body_injection_bytes) =
-        injection_serialized_lengths(injection_items).unwrap_or_default();
-    let context_update_bytes = serialized_json_len(context_update_items).unwrap_or_default();
-    let tool_bytes = router.model_visible_schemas().serialized().len();
-    let total_bytes = input_bytes
-        .saturating_add(injection_bytes)
-        .saturating_add(context_update_bytes)
-        .saturating_add(tool_bytes);
-    let context_growth_bytes = if initial_context {
-        0
-    } else {
-        context_update_bytes
-    };
-    let body_growth_bytes = input_bytes
-        .saturating_add(body_injection_bytes)
-        .saturating_add(context_growth_bytes);
+    let mut injection_tokens = 0i64;
+    let mut body_injection_tokens = 0i64;
+    for item in injection_items {
+        let tokens = estimate_item_token_count(item);
+        injection_tokens = injection_tokens.saturating_add(tokens);
+        let stable = matches!(item, ResponseItem::Message { role, content, .. }
+            if role == "user" && !content.is_empty()
+            && content.iter().all(is_startup_contextual_user_fragment));
+        if !stable {
+            body_injection_tokens = body_injection_tokens.saturating_add(tokens);
+        }
+    }
+    let context_update_tokens = context_update_items.iter().fold(0i64, |tokens, item| {
+        tokens.saturating_add(estimate_item_token_count(item))
+    });
+    let tool_tokens = i64::try_from(
+        router
+            .model_visible_schemas()
+            .serialized()
+            .len()
+            .div_ceil(4),
+    )
+    .unwrap_or(i64::MAX);
     PendingTokenEstimate {
-        total_tokens: i64::try_from(total_bytes.div_ceil(4)).unwrap_or(i64::MAX),
-        body_growth_tokens: i64::try_from(body_growth_bytes.div_ceil(4)).unwrap_or(i64::MAX),
+        total_tokens: input_tokens
+            .saturating_add(injection_tokens)
+            .saturating_add(context_update_tokens)
+            .saturating_add(tool_tokens),
+        body_growth_tokens: input_tokens
+            .saturating_add(body_injection_tokens)
+            .saturating_add(if initial_context {
+                0
+            } else {
+                context_update_tokens
+            }),
         resolves_active_reasoning: input.iter().any(|item| match item {
             TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => true,
             TurnInput::ResponseItem(item) => crate::context_manager::is_user_turn_boundary(item),
@@ -2650,7 +2876,9 @@ async fn capture_current_model_fallback_step_context(
     {
         return None;
     }
-    Some(sess.capture_step_context(Arc::clone(turn_context)).await)
+    sess.capture_step_context(Arc::clone(turn_context))
+        .await
+        .ok()
 }
 
 /// Runs pre-sampling compaction against the previous model when its compaction compatibility
@@ -2683,7 +2911,7 @@ async fn maybe_run_previous_model_inline_compact(
     if should_compact_for_comp_hash_change {
         let step_context = sess
             .capture_step_context(Arc::clone(&previous_model_turn_context))
-            .await;
+            .await?;
         let fallback_step_context = capture_current_model_fallback_step_context(
             sess,
             turn_context,
@@ -2732,7 +2960,7 @@ async fn maybe_run_previous_model_inline_compact(
     if should_run {
         let step_context = sess
             .capture_step_context(Arc::clone(&previous_model_turn_context))
-            .await;
+            .await?;
         let fallback_step_context = capture_current_model_fallback_step_context(
             sess,
             turn_context,
@@ -3470,7 +3698,7 @@ fn build_projected_prompt_from_scaffold(
 )]
 async fn run_sampling_request(
     sess: Arc<Session>,
-    step_context: Arc<StepContext>,
+    mut step_context: Arc<StepContext>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
@@ -3498,7 +3726,7 @@ async fn run_sampling_request(
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::RouterBuild);
     let cached_router = prebuilt_router.take();
-    let router = match cached_router {
+    let mut router = match cached_router {
         Some(router) if terminal_completion_only => {
             // A terminal continuation advertises no tools, so exposure drift
             // cannot affect this request. Reuse the already-finalized router
@@ -3553,7 +3781,7 @@ async fn run_sampling_request(
     let scaffold_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::RequestTransformation);
-    let request_scaffold = sess
+    let mut request_scaffold = sess
         .request_scaffold_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3582,18 +3810,19 @@ async fn run_sampling_request(
     let worker_preparation_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::ExecutorReadinessWait);
-    let tool_runtime = ToolCallRuntime::new(
+    let mut tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     )
-    .with_sampling_request_signals(request_signals.clone());
-    let _code_mode_worker = (!terminal_completion_only).then(|| {
+    .with_sampling_request_signals(request_signals.clone())
+    .with_terminal_completion_only(terminal_completion_only);
+    let mut _code_mode_worker = (!terminal_completion_only).then(|| {
         sess.services.code_mode_service.start_turn_worker(
             &sess,
             Arc::clone(&step_context),
             Arc::clone(&turn_diff_tracker),
-            request_signals,
+            request_signals.clone(),
         )
     });
     drop(worker_preparation_guard);
@@ -3609,7 +3838,6 @@ async fn run_sampling_request(
         &request_scaffold,
     );
     enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
-    let mut accepted_prompt_fingerprint = prepared_input.fingerprint();
     drop(prompt_construction_guard);
     turn_context
         .turn_timing_state
@@ -3682,20 +3910,82 @@ async fn run_sampling_request(
                 sess.services.git_workspace.as_ref(),
             )
             .await;
-            let retry_fingerprint = retry_input.fingerprint();
-            let prompt_is_proven_unchanged = accepted_prompt_fingerprint.is_some()
-                && retry_fingerprint == accepted_prompt_fingerprint;
-            if !prompt_is_proven_unchanged {
-                accepted_attempt_input = retry_input.shared_items();
-                prompt = build_projected_prompt_from_scaffold(
-                    &retry_input,
+            // Accepted output has changed authoritative state. Revalidate the
+            // whole request snapshot while retaining this recovery episode's budget.
+            step_context = sess.capture_step_context(Arc::clone(&turn_context)).await?;
+            if !terminal_completion_only
+                && !finalized_router_matches_current_exposure(
+                    sess.as_ref(),
                     step_context.as_ref(),
-                    &request_scaffold,
-                );
-                enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
-                accepted_prompt_fingerprint = retry_fingerprint;
+                    router.as_ref(),
+                )
+                .await
+            {
+                router = built_tools(
+                    sess.as_ref(),
+                    &step_context,
+                    selected_skill_invocations,
+                    &cancellation_token,
+                )
+                .await?;
             }
+            step_context
+                .set_tool_router(Arc::clone(&router))
+                .map_err(|_| {
+                    CodexErr::Fatal("recovery step router was already finalized".to_string())
+                })?;
+            *prebuilt_router = Some(Arc::clone(&router));
+            request_scaffold = sess
+                .request_scaffold_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resolve(
+                    &retry_input,
+                    sess.as_ref(),
+                    &router,
+                    step_context.as_ref(),
+                    base_instructions,
+                    terminal_completion_only,
+                );
+            *pending_tool_manifest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = if terminal_completion_only {
+                None
+            } else {
+                let previous = sess
+                    .queued_tool_manifest_hash
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                Some(router.tool_manifest_for_rollout(turn_context.as_ref(), previous.as_deref()))
+            };
+            accepted_attempt_input = retry_input.shared_items();
+            prompt = build_projected_prompt_from_scaffold(
+                &retry_input,
+                step_context.as_ref(),
+                &request_scaffold,
+            );
+            enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
+        } else {
+            // Even a stream with no completed output seals its evidence batch
+            // during cleanup. Reusing the prompt must not reuse that retired batch.
+            step_context = Arc::new(step_context.for_retry_attempt());
         }
+        tool_runtime = ToolCallRuntime::new(
+            Arc::clone(&sess),
+            Arc::clone(&step_context),
+            Arc::clone(&turn_diff_tracker),
+        )
+        .with_sampling_request_signals(request_signals.clone())
+        .with_terminal_completion_only(terminal_completion_only);
+        _code_mode_worker = (!terminal_completion_only).then(|| {
+            sess.services.code_mode_service.start_turn_worker(
+                &sess,
+                Arc::clone(&step_context),
+                Arc::clone(&turn_diff_tracker),
+                request_signals.clone(),
+            )
+        });
     }
 }
 
@@ -3949,10 +4239,6 @@ pub(crate) async fn built_tools(
     let apps_enabled = turn_context.apps_enabled();
     let accessible_connectors =
         apps_enabled.then(|| connectors::accessible_connectors_from_mcp_tools(all_mcp_tools));
-    let accessible_connectors_with_enabled_state =
-        accessible_connectors.as_ref().map(|connectors| {
-            connectors::with_app_enabled_state(connectors.clone(), &turn_context.config)
-        });
     let connectors = if apps_enabled {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
             connector_snapshot
@@ -3978,68 +4264,21 @@ pub(crate) async fn built_tools(
         let plugins_config = turn_context.config.plugins_config_input();
         sess.services
             .plugins_manager
-            .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+            .cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
                 plugins_config: &plugins_config,
                 loaded_plugins: &loaded_plugins,
                 auth: auth.as_ref(),
                 disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
                 app_server_client_name: turn_context.app_server_client_name.as_deref(),
             })
-            .await
     } else {
         None
     };
     let tool_suggest_candidates =
-        if let Some(recommended_plugin_candidates) = endpoint_recommended_plugin_candidates {
-            Some(ToolSuggestCandidates {
-                tools: recommended_plugin_candidates,
-                presentation: ToolSuggestPresentation::RecommendationContext,
-            })
-        } else {
-            let loaded_plugin_app_connector_ids = connector_snapshot
-                .connector_ids()
-                .iter()
-                .map(|connector_id| connector_id.0.clone())
-                .collect::<Vec<_>>();
-            async {
-                if apps_enabled && tool_suggest_is_enabled {
-                    if let Some(accessible_connectors) =
-                        accessible_connectors_with_enabled_state.as_ref()
-                    {
-                        match connectors::list_tool_suggest_discoverable_tools_with_auth(
-                            &turn_context.config,
-                            sess.services.plugins_manager.as_ref(),
-                            auth.as_ref(),
-                            accessible_connectors.as_slice(),
-                            &loaded_plugin_app_connector_ids,
-                        )
-                        .await
-                        .map(|discoverable_tools| {
-                            filter_request_plugin_install_discoverable_tools_for_client(
-                                discoverable_tools,
-                                turn_context.app_server_client_name.as_deref(),
-                            )
-                        }) {
-                            Ok(discoverable_tools) if discoverable_tools.is_empty() => None,
-                            Ok(discoverable_tools) => Some(ToolSuggestCandidates {
-                                tools: discoverable_tools,
-                                presentation: ToolSuggestPresentation::ListTool,
-                            }),
-                            Err(err) => {
-                                warn!("failed to load discoverable tool suggestions: {err:#}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            .instrument(trace_span!("built_tools.load_discoverable_tools"))
-            .await
-        };
+        endpoint_recommended_plugin_candidates.map(|tools| ToolSuggestCandidates {
+            tools,
+            presentation: ToolSuggestPresentation::RecommendationContext,
+        });
     let mcp_tool_exposure = build_mcp_tool_exposure(
         all_mcp_tools,
         connectors.as_deref(),
@@ -4832,7 +5071,7 @@ async fn handle_assistant_item_done_in_plan_mode(
     state: &mut PlanModeStreamState,
     previously_active_item: Option<&TurnItem>,
     last_agent_message: &mut Option<String>,
-) -> bool {
+) -> std::io::Result<bool> {
     if let ResponseItem::Message { role, .. } = item
         && role == "assistant"
     {
@@ -4867,13 +5106,13 @@ async fn handle_assistant_item_done_in_plan_mode(
             item,
             finalized_facts.as_ref(),
         )
-        .await;
+        .await?;
         if let Some(agent_message) = final_last_agent_message {
             *last_agent_message = Some(agent_message);
         }
-        return true;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -4936,27 +5175,34 @@ async fn drain_in_flight_with_buffer(
                 &expected_execution_id,
                 completion.timing.snapshot(tokio::time::Instant::now()),
             );
-        let (response_input, required_terminal, completion_error) = match stale_relay_error {
-            Some(err) => {
-                let response_input = ToolCallRuntime::failure_response_for_message(
-                    &completion.call,
-                    err.to_string(),
-                );
-                (response_input, None, Some(err))
-            }
-            None => match completion.result {
-                Ok(completion) => (completion.response, completion.required_terminal, None),
-                Err(err) => {
-                    error!("in-flight tool future failed during drain: {err}");
+        let (response_input, required_terminal, completion_error, failure_detail) =
+            match stale_relay_error {
+                Some(err) => {
                     let response_input = ToolCallRuntime::failure_response_for_message(
                         &completion.call,
                         err.to_string(),
                     );
-                    (response_input, None, Some(err))
+                    (response_input, None, Some(err), None)
                 }
-            },
-        };
-        let response_items = vec![response_input.into()];
+                None => match completion.result {
+                    Ok(completion) => (
+                        completion.response,
+                        completion.required_terminal,
+                        None,
+                        completion.failure_detail,
+                    ),
+                    Err(err) => {
+                        error!("in-flight tool future failed during drain: {err}");
+                        let response_input = ToolCallRuntime::failure_response_for_message(
+                            &completion.call,
+                            err.to_string(),
+                        );
+                        (response_input, None, Some(err), None)
+                    }
+                },
+            };
+        let mut response_items = vec![response_input.into()];
+        response_items.extend(failure_detail);
         if let Err(err) = sess
             .record_tool_completion_ordered(&turn_context, &completion.call_id, &response_items)
             .await
@@ -5230,6 +5476,20 @@ fn assign_missing_streamed_response_item_id(
         .filter(|item_id| !item_id.is_empty());
     item.set_id(active_item_id);
     Session::assign_missing_response_item_id(item);
+}
+
+async fn close_response_tail_after_persistence(
+    recorder: &OrderedResponseItemRecorder,
+    tail: &ResponseTailSignal,
+    outcome: ResponseTailOutcome,
+) -> CodexResult<()> {
+    let persistence = recorder.flush().await;
+    tail.close(if persistence.is_ok() {
+        outcome
+    } else {
+        ResponseTailOutcome::TerminalError
+    });
+    persistence
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5624,7 +5884,20 @@ async fn try_run_sampling_request(
 
         let event = match event {
             Some(Ok(event)) => event,
-            Some(Err(err)) => break Err(err),
+            Some(Err(err)) => {
+                if let CodexErr::IncompleteResponse(response) = &err {
+                    turn_context
+                        .turn_timing_state
+                        .record_generation_token_usage(response.token_usage.as_ref());
+                    if let Err(accounting_error) = sess
+                        .update_token_usage_info(&turn_context, response.token_usage.as_ref())
+                        .await
+                    {
+                        break Err(accounting_error);
+                    }
+                }
+                break Err(err);
+            }
             None => {
                 break Err(CodexErr::Stream(
                     "stream closed before response.completed".into(),
@@ -5716,8 +5989,8 @@ async fn try_run_sampling_request(
                     )
                     .await;
                 }
-                if let Some(state) = plan_mode_state.as_mut()
-                    && handle_assistant_item_done_in_plan_mode(
+                if let Some(state) = plan_mode_state.as_mut() {
+                    match handle_assistant_item_done_in_plan_mode(
                         &sess,
                         &turn_context,
                         turn_store.as_ref(),
@@ -5727,8 +6000,11 @@ async fn try_run_sampling_request(
                         &mut last_agent_message,
                     )
                     .await
-                {
-                    continue;
+                    {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(err) => break Err(CodexErr::Io(err)),
+                    }
                 }
 
                 let mut ctx = HandleOutputCtx {
@@ -5896,7 +6172,7 @@ async fn try_run_sampling_request(
             } => {
                 sess.mark_tool_history_consumed(
                     &turn_context,
-                    &prompt.input,
+                    client_session.effective_input().unwrap_or(&prompt.input),
                     generation_id.clone(),
                 )
                 .await;
@@ -6131,7 +6407,6 @@ async fn try_run_sampling_request(
         Err(CodexErr::TurnAborted | CodexErr::Interrupted) => ResponseTailOutcome::Cancelled,
         Err(_) => ResponseTailOutcome::TerminalError,
     };
-    response_tail.close(tail_outcome);
     drop(sampling_timing_guard);
 
     let remaining_deltas = flush_assistant_text_segments_all(
@@ -6159,7 +6434,12 @@ async fn try_run_sampling_request(
     {
         sess.emit_turn_item_completed(&turn_context, item).await;
     }
-    response_item_recorder.flush().await;
+    let response_persistence = close_response_tail_after_persistence(
+        &response_item_recorder,
+        &response_tail,
+        tail_outcome,
+    )
+    .await;
 
     let tool_blocking_timing_guard = if in_flight.is_empty() && completed_in_flight.is_empty() {
         None
@@ -6174,6 +6454,7 @@ async fn try_run_sampling_request(
     )
     .await;
     drop(tool_blocking_timing_guard);
+    response_persistence?;
     let generation_workspace_evidence = tool_runtime.flush_workspace_evidence_generation().await?;
     let required_tool_terminal = required_tool_terminal?;
 

@@ -1476,10 +1476,37 @@ impl PluginsManager {
         &self,
         input: RecommendedPluginCandidatesInput<'_>,
     ) -> Option<Vec<DiscoverableTool>> {
-        let RecommendedPluginsMode::Endpoint { plugins } = self
+        let mode = self
             .recommended_plugins_mode_for_config(input.plugins_config, input.auth)
-            .await
-        else {
+            .await;
+        self.recommended_candidates_from_mode(input, mode)
+    }
+
+    /// Read advisory recommendations without making model readiness depend on a fetch.
+    pub fn cached_recommended_plugin_candidates_for_config(
+        &self,
+        input: RecommendedPluginCandidatesInput<'_>,
+    ) -> Option<Vec<DiscoverableTool>> {
+        if !input.plugins_config.plugins_enabled
+            || !input.plugins_config.remote_plugin_enabled
+            || !input.auth.is_some_and(CodexAuth::uses_codex_backend)
+        {
+            return None;
+        }
+        let generation = self
+            .recommended_plugins_cache_generation
+            .load(Ordering::Acquire);
+        let key = recommended_plugins_cache_key(input.plugins_config, input.auth, generation);
+        let mode = self.cached_recommended_plugins_mode(&key)?;
+        self.recommended_candidates_from_mode(input, mode)
+    }
+
+    fn recommended_candidates_from_mode(
+        &self,
+        input: RecommendedPluginCandidatesInput<'_>,
+        mode: RecommendedPluginsMode,
+    ) -> Option<Vec<DiscoverableTool>> {
+        let RecommendedPluginsMode::Endpoint { plugins } = mode else {
             return None;
         };
         if plugins.is_empty() {

@@ -304,10 +304,7 @@ impl ExecPolicyManager {
 
     #[instrument(level = "info", skip_all)]
     pub(crate) async fn load(config_stack: &ConfigLayerStack) -> Result<Self, ExecPolicyError> {
-        let (policy, warning) = load_exec_policy_with_warning(config_stack).await?;
-        if let Some(err) = warning.as_ref() {
-            tracing::warn!("failed to parse rules: {err}");
-        }
+        let policy = load_exec_policy(config_stack).await?;
         Ok(Self::new(Arc::new(policy)))
     }
 
@@ -598,8 +595,11 @@ impl Default for ExecPolicyManager {
 pub async fn check_execpolicy_for_warnings(
     config_stack: &ConfigLayerStack,
 ) -> Result<Option<ExecPolicyError>, ExecPolicyError> {
-    let (_, warning) = load_exec_policy_with_warning(config_stack).await?;
-    Ok(warning)
+    match load_exec_policy(config_stack).await {
+        Ok(_) => Ok(None),
+        Err(error @ ExecPolicyError::ParsePolicy { .. }) => Ok(Some(error)),
+        Err(error) => Err(error),
+    }
 }
 
 fn exec_policy_message_for_display(source: &codex_execpolicy::Error) -> String {
@@ -676,18 +676,9 @@ pub fn format_exec_policy_error_with_source(error: &ExecPolicyError) -> String {
 pub(crate) async fn load_exec_policy_with_warning(
     config_stack: &ConfigLayerStack,
 ) -> Result<(Policy, Option<ExecPolicyError>), ExecPolicyError> {
-    match load_exec_policy(config_stack).await {
-        Ok(policy) => Ok((policy, None)),
-        Err(err @ ExecPolicyError::ParsePolicy { .. }) => {
-            let policy = config_stack
-                .requirements()
-                .exec_policy
-                .as_deref()
-                .map_or_else(Policy::empty, |policy| policy.as_ref().clone());
-            Ok((policy, Some(err)))
-        }
-        Err(err) => Err(err),
-    }
+    load_exec_policy(config_stack)
+        .await
+        .map(|policy| (policy, None))
 }
 
 pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy, ExecPolicyError> {

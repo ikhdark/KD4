@@ -24,7 +24,7 @@ impl ContextualUserFragment for ModelSwitchInstructions {
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(
-            "\nThe user was previously using a different model. Continue following the session's existing base instructions. Adapt only to the capabilities and tools available in the current request.\n",
+            "\nThe user was previously using a different model. Use the active instructions and tool declarations in this request. Preserve the task state and applicable user constraints.\n",
         )
     }
 }

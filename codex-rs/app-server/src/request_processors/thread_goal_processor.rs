@@ -73,10 +73,16 @@ impl ThreadGoalRequestProcessor {
         if !self.config.features.enabled(Feature::Goals) {
             return;
         }
-        self.emit_thread_goal_snapshot(thread_id).await;
-        // App-server owns resume response and snapshot ordering, so wait until
-        // those are sent before letting extensions react to the idle thread.
-        thread.emit_thread_idle_lifecycle_if_idle().await;
+        finish_resume_goal(
+            thread_id,
+            self.emit_thread_goal_snapshot(thread_id),
+            async {
+                if !matches!(thread.agent_status().await, AgentStatus::Shutdown) {
+                    thread.emit_thread_idle_lifecycle_if_idle().await;
+                }
+            },
+        )
+        .await;
     }
 
     pub(crate) async fn pending_resume_goal_state(
@@ -417,6 +423,67 @@ impl ThreadGoalRequestProcessor {
                 },
             ))
             .await;
+    }
+}
+
+async fn finish_resume_goal(
+    thread_id: ThreadId,
+    delivery: impl std::future::Future<Output = ()>,
+    continuation: impl std::future::Future<Output = ()>,
+) {
+    if tokio::time::timeout(crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT, delivery)
+        .await
+        .is_err()
+    {
+        warn!(
+            "timed out delivering goal resume snapshot for {thread_id}; clients can resynchronize with thread/goal/get"
+        );
+    }
+    continuation.await;
+}
+
+#[cfg(test)]
+mod resume_finalization_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn backpressured_snapshot_still_finalizes_after_caller_is_dropped() {
+        let tracker = TaskTracker::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let start = tokio::time::Instant::now();
+        let task = tracker.spawn(finish_resume_goal(
+            ThreadId::new(),
+            std::future::pending(),
+            async move {
+                done_tx.send(()).unwrap();
+            },
+        ));
+        drop(task);
+        done_rx
+            .await
+            .expect("owned finalization survives caller loss");
+        assert_eq!(
+            start.elapsed(),
+            crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn healthy_snapshot_precedes_continuation() {
+        let order = std::sync::Mutex::new(Vec::new());
+        finish_resume_goal(
+            ThreadId::new(),
+            async {
+                order.lock().unwrap().push("snapshot");
+            },
+            async {
+                order.lock().unwrap().push("idle");
+            },
+        )
+        .await;
+        assert_eq!(*order.lock().unwrap(), vec!["snapshot", "idle"]);
     }
 }
 

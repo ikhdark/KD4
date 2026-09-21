@@ -59,6 +59,13 @@ impl ExecutorFileSystem for DelayedObservationFileSystem {
     ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
         Box::pin(async move {
             assert!(sandbox.is_some());
+            if path.to_string().ends_with("file-bad") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected observation failure",
+                )
+                .into());
+            }
             self.delay(
                 false,
                 if path.to_string().ends_with("file-00") {
@@ -959,6 +966,267 @@ async fn inventory_evidence_accepts_exact_small_ranges_and_rejects_truncation_or
 }
 
 #[tokio::test]
+async fn inventory_classification_resolves_source_chains_and_rejects_bookkeeping() {
+    let context = context().await;
+    let created = call(&context, json!({
+        "operation":"create", "scope":{"root":"/repo"},
+        "profile":{"categories":["entrypoint"],"classifications":["included","excluded"],"required_categories":["entrypoint"]}
+    })).await.unwrap();
+    let producer = artifact(
+        &context,
+        json!({
+            "scope_id":created["summary"]["scope_id"], "category":"entrypoint", "complete":true,
+            "candidates":[{"id":"/repo/a","exists":true,"tracking":"tracked","revision":"one"}]
+        }),
+    )
+    .await;
+    let imported = call(&context, json!({"operation":"import", "inventory_id":created["inventory_id"], "source":{"artifact_id":producer}})).await.unwrap();
+    let id = imported["inventory_id"].as_str().unwrap();
+    let pointer = "/records/entrypoint/~1repo~1a";
+    for source in [
+        json!({"artifact_id":producer}),
+        json!({"artifact_id":id}),
+        json!({"artifact_id":id,"pointer":pointer}),
+        json!({"artifact_id":id,"pointer":format!("{pointer}/candidate/id")}),
+        json!({"artifact_id":id,"lines":[1,1]}),
+    ] {
+        let error = call(&context, json!({"operation":"classify", "inventory_id":id,
+            "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included","evidence":[source]}]
+        })).await.unwrap_err();
+        assert!(
+            error.to_string().contains("bookkeeping")
+                || error.to_string().contains("classified record"),
+            "{error}"
+        );
+    }
+    let source = artifact(
+        &context,
+        json!({"source":"fn main() { run_prompt(include_str!(\"a\")); }"}),
+    )
+    .await;
+    let leaf = json!({"artifact_id":source,"pointer":"/source"});
+    let classified = call(&context, json!({"operation":"classify","inventory_id":id,
+        "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included","evidence":[leaf]}]
+    })).await.unwrap();
+    let classified_id = classified["inventory_id"].as_str().unwrap();
+    let (mut intermediate, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: classified_id.into(),
+            pointer: String::new(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    let record_digest = digest(intermediate.pointer(pointer).unwrap()).unwrap();
+    intermediate.pointer_mut(pointer).unwrap()["evidence"] = json!([{
+        "source":{"artifact_id":classified_id,"pointer":pointer}, "sha256":record_digest
+    }]);
+    let intermediate_id = artifact(&context, intermediate.clone()).await;
+    let resolved = call(&context, json!({"operation":"classify","inventory_id":id,
+        "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included",
+            "evidence":[{"artifact_id":intermediate_id,"pointer":pointer}]}]
+    })).await.unwrap();
+    let output = call(
+        &context,
+        json!({"operation":"read","inventory_id":resolved["inventory_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output["records"][0]["status"], "classified");
+    assert_eq!(output["records"][0]["classification"], "included");
+    let (supporting_record, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: resolved["inventory_id"].as_str().unwrap().into(),
+            pointer: pointer.into(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        supporting_record["evidence"][0]["source"]["artifact_id"],
+        source
+    );
+    assert_eq!(
+        supporting_record["evidence"][0]["source"]["pointer"],
+        "/source"
+    );
+    assert_eq!(supporting_record["evidence"].as_array().unwrap().len(), 1);
+
+    // A page or standalone record is a valid link only when it resolves to
+    // supporting source evidence, rather than to another bookkeeping dead end.
+    for (record_document, record_pointer) in [
+        (output.clone(), "/records/0"),
+        (supporting_record.clone(), ""),
+    ] {
+        let record_artifact = artifact(&context, record_document).await;
+        let linked = call(&context, json!({"operation":"classify","inventory_id":id,
+            "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included",
+                "evidence":[{"artifact_id":record_artifact,"pointer":record_pointer}]}]
+        })).await.unwrap();
+        let (linked_record, _) = read_source(
+            &context,
+            &Source {
+                artifact_id: linked["inventory_id"].as_str().unwrap().into(),
+                pointer: pointer.into(),
+                lines: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(linked_record["evidence"], supporting_record["evidence"]);
+    }
+
+    for (field, value) in [
+        ("classification", json!("excluded")),
+        ("scope", json!("other")),
+        (
+            "candidate",
+            json!({"id":"/repo/a","exists":true,"tracking":"tracked","revision":"two"}),
+        ),
+        ("evidence", json!([{"source":leaf,"sha256":"wrong"}])),
+    ] {
+        let mut invalid_chain = intermediate.clone();
+        invalid_chain.pointer_mut(pointer).unwrap()[field] = value;
+        let bad_id = artifact(&context, invalid_chain).await;
+        let error = call(&context, json!({"operation":"classify","inventory_id":id,
+            "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included",
+                "evidence":[{"artifact_id":bad_id,"pointer":pointer}]}]
+        })).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different candidate or classification")
+                || error.to_string().contains("digest"),
+            "{error}"
+        );
+    }
+    let unresolved = call(&context, json!({"operation":"classify","inventory_id":id,
+        "decisions":[{"category":"entrypoint","candidate_id":"/repo/a",
+            "unresolved_reason":"An enumeration does not establish runtime use.","evidence":[{"artifact_id":producer}]}]
+    })).await.unwrap();
+    let unresolved_records = call(
+        &context,
+        json!({"operation":"read","inventory_id":unresolved["inventory_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unresolved_records["records"][0]["status"], "unresolved");
+    assert_eq!(
+        unresolved_records["records"][0]["classification"],
+        Value::Null
+    );
+    assert_eq!(unresolved_records["summary"]["unresolved_records"], 1);
+    let rejected = call(&context, json!({"operation":"classify","inventory_id":id,
+        "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included",
+            "evidence":[{"artifact_id":unresolved["inventory_id"],"pointer":pointer}]}]
+    })).await.unwrap_err();
+    assert!(rejected.to_string().contains("classified record"));
+    let mut chain = leaf.clone();
+    for _ in 0..63 {
+        let link_id = artifact(&context, chain).await;
+        chain = json!({"artifact_id":link_id});
+    }
+    let at_limit = call(&context, json!({"operation":"classify","inventory_id":id,
+        "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included","evidence":[chain]}]
+    })).await.unwrap();
+    let (at_limit_record, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: at_limit["inventory_id"].as_str().unwrap().into(),
+            pointer: pointer.into(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(at_limit_record["evidence"], supporting_record["evidence"]);
+    let over_limit = artifact(&context, chain).await;
+    let rejected = call(&context, json!({"operation":"classify","inventory_id":id,
+        "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included","evidence":[{"artifact_id":over_limit}]}]
+    })).await.unwrap_err();
+    assert!(rejected.to_string().contains("exceeds 64 references"));
+    let unchanged = call(&context, json!({"operation":"read","inventory_id":id}))
+        .await
+        .unwrap();
+    assert_eq!(unchanged["summary"]["statuses"]["unclassified"], 1);
+    assert_eq!(unchanged["records"][0]["classification"], Value::Null);
+    let (unchanged_record, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: id.into(),
+            pointer: pointer.into(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(unchanged_record["evidence"], json!([]));
+}
+
+#[tokio::test]
+async fn inventory_classification_rejects_direct_and_indirect_cycles() {
+    let context = context().await;
+    let created = call(&context, json!({"operation":"create","scope":{"root":"/repo"},
+        "profile":{"categories":["entrypoint"],"classifications":["included"],"required_categories":["entrypoint"]}
+    })).await.unwrap();
+    let producer = artifact(
+        &context,
+        json!({"scope_id":created["summary"]["scope_id"],"category":"entrypoint","complete":true,
+        "candidates":[{"id":"/repo/a","exists":true,"tracking":"tracked","revision":"one"}]}),
+    )
+    .await;
+    let imported = call(&context, json!({"operation":"import","inventory_id":created["inventory_id"],"source":{"artifact_id":producer}})).await.unwrap();
+    let pointer = "/records/entrypoint/~1repo~1a";
+    for indirect in [false, true] {
+        let a = uuid::Uuid::now_v7().to_string();
+        let b = uuid::Uuid::now_v7().to_string();
+        let links = if indirect {
+            vec![(&a, &b), (&b, &a)]
+        } else {
+            vec![(&a, &a)]
+        };
+        for (id, target) in links {
+            let retained =
+                crate::tools::command_output_artifact::create_canonical_output_artifact_with_id(
+                    &context.step_context.turn.config.codex_home,
+                    &context.session.thread_id.to_string(),
+                    &CanonicalToolResult::json(json!({"artifact_id":target})),
+                    id.parse().unwrap(),
+                )
+                .await;
+            assert!(retained.complete);
+            assert_eq!(retained.artifact_id().as_deref(), Some(id.as_str()));
+        }
+        let error = call(&context, json!({"operation":"classify","inventory_id":imported["inventory_id"],
+            "decisions":[{"category":"entrypoint","candidate_id":"/repo/a","classification":"included","evidence":[{"artifact_id":a}]}]
+        })).await.unwrap_err();
+        assert!(error.to_string().contains("cyclic"), "{error}");
+    }
+    let unchanged = call(
+        &context,
+        json!({"operation":"read","inventory_id":imported["inventory_id"]}),
+    )
+    .await
+    .unwrap();
+    let (unchanged_record, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: imported["inventory_id"].as_str().unwrap().into(),
+            pointer: pointer.into(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(unchanged_record["evidence"], json!([]));
+    assert_eq!(unchanged["summary"]["statuses"]["unclassified"], 1);
+}
+
+#[tokio::test]
 async fn inventory_rejects_mixed_scope_conflicts_missing_evidence_and_cancellation() {
     let context = context().await;
     let initial = create(&context).await;
@@ -1080,6 +1348,13 @@ fn inventory_schema_accepts_operations_and_rejects_unknown_fields() {
     let schema = serde_json::to_value(spec.parameters).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     assert!(validator.is_valid(&json!({"operation":"read","inventory_id":"id","limit":20})));
+    assert!(
+        validator.is_valid(&json!({"operation":"read","inventory_id":"id","unresolved_only":true}))
+    );
+    assert!(
+        !validator
+            .is_valid(&json!({"operation":"read","inventory_id":"id","unresolved_only":"true"}))
+    );
     assert!(validator.is_valid(&json!({"operation":"classify","inventory_id":"id","decisions":[
         {"category":"a","candidate_id":"x","classification":"active","evidence":[{"artifact_id":"id","lines":[2,4]}]}
     ]})));
@@ -1087,4 +1362,274 @@ fn inventory_schema_accepts_operations_and_rejects_unknown_fields() {
         !validator.is_valid(&json!({"operation":"read","inventory_id":"id","scope":"different"}))
     );
     assert!(!validator.is_valid(&json!({"operation":"read","inventory_id":"id","limit":0})));
+}
+
+#[tokio::test]
+async fn inventory_repair_pages_and_progress_follow_retained_state() {
+    let context = context().await;
+    let initial = create(&context).await;
+    let imported = import(
+        &context,
+        &initial,
+        "entrypoint",
+        ["a", "b", "c", "d", "e"]
+            .map(|id| candidate(id, "one"))
+            .to_vec(),
+        true,
+    )
+    .await;
+    assert_eq!(
+        imported["progress"],
+        json!({
+            "required_categories_completed": 1, "required_categories_reopened": 0,
+            "records_resolved": 0, "records_reopened": 0,
+        })
+    );
+    let evidence = artifact(&context, json!({"observed":"active"})).await;
+    let mut decisions: Vec<Value> = ["a", "c", "d"]
+        .into_iter()
+        .map(|id| {
+            json!({
+                "category":"entrypoint", "candidate_id":id, "classification":"active",
+                "evidence":[{"artifact_id":evidence}],
+            })
+        })
+        .collect();
+    decisions.push(json!({"category":"entrypoint", "candidate_id":"b",
+        "unresolved_reason":"dispatch consumer not verified", "evidence":[{"artifact_id":evidence}]}));
+    let classified = call_through_registry(
+        &context,
+        json!({
+            "operation":"classify", "inventory_id":imported["inventory_id"], "decisions":decisions,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(classified["progress"]["records_resolved"], 3);
+    let repeated = call_through_registry(&context, json!({
+        "operation":"classify", "inventory_id":classified["inventory_id"], "decisions":decisions,
+    })).await.unwrap();
+    assert_eq!(repeated["inventory_id"], classified["inventory_id"]);
+    assert_eq!(repeated["reused"], true);
+    assert_eq!(
+        repeated["progress"],
+        json!({
+            "required_categories_completed": 0, "required_categories_reopened": 0,
+            "records_resolved": 0, "records_reopened": 0,
+        })
+    );
+    let refreshed = import(
+        &context,
+        &classified,
+        "entrypoint",
+        vec![
+            candidate("a", "one"),
+            candidate("b", "one"),
+            candidate("c", "two"),
+            candidate("e", "one"),
+        ],
+        true,
+    )
+    .await;
+    assert_eq!(refreshed["changes"]["counts"]["removed"], 1);
+    assert_eq!(refreshed["progress"]["records_reopened"], 1);
+    assert_eq!(refreshed["progress"]["records_resolved"], 0);
+    let page = call_through_registry(&context, json!({
+        "operation":"read", "inventory_id":refreshed["inventory_id"], "unresolved_only":true, "limit":1,
+    })).await.unwrap();
+    assert_eq!(page["unresolved_only"], true);
+    assert_eq!(page["matching_records"], 3);
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert_eq!(page["records"][0]["candidate"]["id"], "b");
+    assert_eq!(
+        page["records"][0]["unresolved_reason"],
+        "dispatch consumer not verified"
+    );
+    assert_eq!(page["page_complete"], false);
+    assert_eq!(page["next_offset"], 1);
+    assert_eq!(page["summary"], refreshed["summary"]);
+    let rest = call_through_registry(
+        &context,
+        json!({
+            "operation":"read", "inventory_id":refreshed["inventory_id"], "unresolved_only":true,
+            "offset":page["next_offset"],
+        }),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = rest["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["candidate"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["c", "e"]);
+    assert_eq!(rest["records"][0]["status"], "stale");
+    assert_eq!(rest["records"][1]["status"], "unclassified");
+    assert_eq!(rest["page_complete"], true);
+    assert_eq!(rest["next_offset"], Value::Null);
+    assert!(call(&context, json!({
+        "operation":"read", "inventory_id":refreshed["inventory_id"], "unresolved_only":true, "offset":4,
+    })).await.is_err());
+    let all = call(
+        &context,
+        json!({"operation":"read", "inventory_id":refreshed["inventory_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(all["matching_records"], 5);
+    assert_eq!(all["records"][0]["status"], "classified");
+    assert_eq!(all["records"][3]["status"], "removed");
+    assert_eq!(all["summary"], refreshed["summary"]);
+    let incomplete = import(&context, &refreshed, "entrypoint", vec![], false).await;
+    assert_eq!(incomplete["progress"]["required_categories_reopened"], 1);
+    assert_eq!(incomplete["progress"]["records_resolved"], 0);
+    assert_eq!(incomplete["summary"]["complete"], false);
+}
+
+#[tokio::test]
+async fn inventory_coverage_distinguishes_failed_discovery_from_scoped_absence() {
+    let context = context().await;
+    let mut inventory = create(&context).await;
+    for expected in ["not_enumerated", "incomplete", "complete_empty"] {
+        if expected != "not_enumerated" {
+            inventory = import(
+                &context,
+                &inventory,
+                "entrypoint",
+                vec![],
+                expected == "complete_empty",
+            )
+            .await;
+        }
+        let rendered = call_through_registry(
+            &context,
+            json!({
+                "operation":"render", "inventory_id":inventory["inventory_id"],
+            }),
+        )
+        .await
+        .unwrap();
+        let file: Value = serde_json::from_slice(
+            &std::fs::read(rendered["rendered_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rendered["count"], 0);
+        assert_eq!(file["identifiers"], json!([]));
+        assert_eq!(file["summary"]["complete"], false);
+        assert_eq!(file["coverage"]["entrypoint"]["outcome"], expected);
+        assert_eq!(file["coverage"]["entrypoint"]["candidate_count"], 0);
+        assert_eq!(
+            file["coverage"]["configuration"]["outcome"],
+            "not_enumerated"
+        );
+        assert_eq!(file["coverage"]["configuration"]["required"], true);
+        assert_eq!(
+            rendered["coverage_source"],
+            json!({
+                "artifact_id":rendered["rendered_artifact_id"], "pointer":"/coverage",
+            })
+        );
+        if expected == "incomplete" {
+            assert_eq!(
+                file["coverage"]["entrypoint"]["unresolved_reason"],
+                "query coverage incomplete"
+            );
+            let source = &file["coverage"]["entrypoint"]["provenance"]["source"]["artifact_id"];
+            assert!(source.as_str().is_some_and(|id| !id.is_empty()));
+        }
+    }
+    inventory = import(&context, &inventory, "configuration", vec![], true).await;
+    let complete = call(
+        &context,
+        json!({"operation":"render", "inventory_id":inventory["inventory_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(complete["summary"]["complete"], true);
+    assert_eq!(complete["count"], 0);
+    let imported = import(
+        &context,
+        &inventory,
+        "entrypoint",
+        vec![candidate("excluded", "one")],
+        true,
+    )
+    .await;
+    let evidence = artifact(&context, json!({"observed":"excluded"})).await;
+    let classified = call(&context, json!({
+        "operation":"classify", "inventory_id":imported["inventory_id"],
+        "decisions":[{"category":"entrypoint", "candidate_id":"excluded", "classification":"excluded",
+            "evidence":[{"artifact_id":evidence}]}],
+    })).await.unwrap();
+    let rendered = call_through_registry(&context, json!({
+        "operation":"render", "inventory_id":classified["inventory_id"], "classifications":["active"],
+    })).await.unwrap();
+    let file: Value = serde_json::from_slice(
+        &std::fs::read(rendered["rendered_path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file["count"], 0);
+    assert_eq!(file["summary"]["complete"], true);
+    assert_eq!(
+        file["coverage"]["entrypoint"]["outcome"],
+        "complete_with_candidates"
+    );
+    assert_eq!(file["coverage"]["entrypoint"]["candidate_count"], 1);
+    assert_eq!(
+        file["coverage"]["configuration"]["outcome"],
+        "complete_empty"
+    );
+}
+
+#[tokio::test]
+async fn inventory_partial_observation_preserves_success_and_marks_failed_path_unknown() {
+    let cwd = tempfile::tempdir().unwrap();
+    let fs = Arc::new(DelayedObservationFileSystem::default());
+    let context = observation_context(cwd.path(), Arc::clone(&fs)).await;
+    let initial = create(&context).await;
+    let observed = call(&context, json!({"operation":"observe", "inventory_id":initial["inventory_id"], "category":"entrypoint", "paths":["file-good","file-bad"], "complete":true})).await.unwrap();
+    let page = call(
+        &context,
+        json!({"operation":"read", "inventory_id":observed["inventory_id"], "offset":0,"limit":50}),
+    )
+    .await
+    .unwrap();
+    let records = page["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    let good = records
+        .iter()
+        .find(|r| {
+            r["candidate"]["id"]
+                .as_str()
+                .unwrap()
+                .ends_with("file-good")
+        })
+        .unwrap();
+    let bad = records
+        .iter()
+        .find(|r| r["candidate"]["id"].as_str().unwrap().ends_with("file-bad"))
+        .unwrap();
+    assert_eq!(good["candidate"]["exists"], true);
+    assert!(good["candidate"]["revision"].is_string());
+    assert!(bad["candidate"]["exists"].is_null());
+    assert!(bad["candidate"]["revision"].is_null());
+    let (snapshot, _) = read_source(
+        &context,
+        &Source {
+            artifact_id: observed["inventory_id"].as_str().unwrap().to_string(),
+            pointer: String::new(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot["categories"]["entrypoint"]["complete"], false);
+    assert!(
+        snapshot["categories"]["entrypoint"]["unresolved_reason"]
+            .as_str()
+            .unwrap()
+            .contains("retry failed paths")
+    );
+    assert_eq!(fs.reads.load(Ordering::SeqCst), 1);
 }

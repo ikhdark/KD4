@@ -104,35 +104,7 @@ fn command_declarations_preserve_input_alternatives_and_return_contracts() {
 }
 
 #[test]
-fn command_validation_context_is_lean_and_strict() {
-    for tool in [
-        create_exec_command_tool(CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        }),
-        create_shell_command_tool(CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        }),
-    ] {
-        let tool = serde_json::to_value(tool).expect("serialize command tool");
-        let validation = &tool["parameters"]["properties"]["validation"];
-        assert_eq!(
-            validation["properties"]
-                .as_object()
-                .expect("validation properties")
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["covered_paths"]
-        );
-        assert_eq!(validation["required"], serde_json::json!(["covered_paths"]));
-        assert_eq!(validation["additionalProperties"], serde_json::json!(false));
-    }
-}
-
-#[test]
-fn command_tools_allow_batched_inspection_and_optional_validation_metadata() {
+fn command_tools_steer_to_the_script_field_without_round_tripping_metadata() {
     for tool in [
         create_exec_command_tool(CommandToolOptions {
             allow_login_shell: true,
@@ -158,10 +130,25 @@ fn command_tools_allow_batched_inspection_and_optional_validation_metadata() {
             .as_str()
             .expect("script description");
         assert!(!script_description.contains("Issue independent read-only commands"));
-        assert!(script_description.contains("you may use `kind: \"argv\"`"));
+        // The script field is the default route. Steering callers toward argv
+        // and powershell_script made them spend far more output tokens per
+        // call decomposing commands the shell would have parsed.
+        assert!(
+            script_description.contains("Prefer this for every command"),
+            "{script_description}"
+        );
+        for steered in ["kind: \"argv\"", "powershell_script"] {
+            assert!(
+                !script_description.contains(steered),
+                "script description must not steer to {steered}: {script_description}"
+            );
+        }
+        // `validation.covered_paths` was declared by the caller and echoed back
+        // as `coverage_status: "unverified"`. Nothing consumed it, so it cost
+        // schema, argument, and result tokens to return the caller's own input.
         assert_eq!(
-            tool["parameters"]["properties"]["validation"]["description"],
-            "Optional validation scope metadata."
+            tool["parameters"]["properties"]["validation"],
+            serde_json::Value::Null
         );
         let validator =
             jsonschema::validator_for(&tool["parameters"]).expect("command schema should compile");
@@ -169,7 +156,7 @@ fn command_tools_allow_batched_inspection_and_optional_validation_metadata() {
         arguments[script_field] = json!("python -m unittest -q");
         assert!(validator.is_valid(&arguments));
         arguments["validation"] = json!({"covered_paths": ["src"]});
-        assert!(validator.is_valid(&arguments));
+        assert!(!validator.is_valid(&arguments));
     }
 }
 
@@ -181,7 +168,7 @@ fn exec_command_tool_matches_expected_spec() {
     });
 
     let description = format!(
-        "Runs a command, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
+        "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.{}",
         exec_command_guidance_description()
     );
 
@@ -189,37 +176,27 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "cmd".to_string(),
             JsonSchema::string(Some(
-                "Shell script to execute in the user's default shell. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, and builtins in script form. On Windows, also keep `.cmd`/`.bat` calls in script form; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                "Shell script to execute in the user's default shell. Prefer this for every command, including pipelines, redirection, shell expansion, compound statements, and builtins."
                     .to_string(),
             )),
         ),
         (
-            "kind".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("script"), json!("argv"), json!("powershell_script")],
-                Some(
-                    "Canonical command encoding. `script` explicitly uses `cmd`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`. Legacy input remains supported by omitting `kind`; the runtime infers the branch from the single populated command field and normalizes it immediately."
-                        .to_string(),
-                ),
-            ),
-        ),
-        (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly when `kind` is `argv`.".to_string(),
+                "Executable to launch directly, bypassing the shell. Use only when `cmd` cannot express the command.".to_string(),
             )),
         ),
         (
             "args".to_string(),
             JsonSchema::array(
                 JsonSchema::string(/*description*/ None),
-                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+                Some("Arguments for `program`, excluding the program name.".to_string()),
             ),
         ),
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                "Plain PowerShell script that Codex encodes at runtime. Use only when `cmd` quoting cannot express the script."
                     .to_string(),
             )),
         ),
@@ -264,18 +241,11 @@ fn exec_command_tool_matches_expected_spec() {
                     "True runs the shell with -l/-i semantics; false disables them. Defaults to true.".to_string(),
                 )),
         ),
-        ("validation".to_string(), validation_context_schema()),
     ]);
     properties.extend(create_approval_parameters(
         /*exec_permission_approvals_enabled*/ false,
         /*allow_escalated_sandbox_permissions*/ true,
     ));
-    properties.insert(
-        "force_fresh".to_string(),
-        JsonSchema::boolean(Some(
-            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
-        )),
-    );
     assert_eq!(
         tool,
         ToolSpec::Function(ResponsesApiTool {
@@ -451,44 +421,34 @@ fn shell_command_tool_matches_expected_spec() {
         exec_permission_approvals_enabled: false,
     });
 
-    let description = "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Its output budget is policy-controlled; max_output_tokens is not accepted. Use syntax supported by that shell. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics.".to_string()
+    let description = "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Its output budget is policy-controlled; max_output_tokens is not accepted. Use syntax supported by that shell.".to_string()
         + &shell_command_guidance_description();
 
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Shell script to execute in the user's default shell. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, and builtins in script form. On Windows, also keep `.cmd`/`.bat` calls in script form; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                "Shell script to execute in the user's default shell. Prefer this for every command, including pipelines, redirection, shell expansion, compound statements, and builtins."
                     .to_string(),
             )),
         ),
         (
-            "kind".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("script"), json!("argv"), json!("powershell_script")],
-                Some(
-                    "Canonical command encoding. `script` explicitly uses `command`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`. Legacy input remains supported by omitting `kind`; the runtime infers the branch from the single populated command field and normalizes it immediately."
-                        .to_string(),
-                ),
-            ),
-        ),
-        (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly when `kind` is `argv`.".to_string(),
+                "Executable to launch directly, bypassing the shell. Use only when `cmd` cannot express the command.".to_string(),
             )),
         ),
         (
             "args".to_string(),
             JsonSchema::array(
                 JsonSchema::string(/*description*/ None),
-                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+                Some("Arguments for `program`, excluding the program name.".to_string()),
             ),
         ),
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                "Plain PowerShell script that Codex encodes at runtime. Use only when `cmd` quoting cannot express the script."
                     .to_string(),
             )),
         ),
@@ -515,7 +475,6 @@ fn shell_command_tool_matches_expected_spec() {
                 u64::MAX,
             ),
         ),
-        ("validation".to_string(), validation_context_schema()),
         (
             "login".to_string(),
             JsonSchema::boolean(Some(
@@ -528,13 +487,6 @@ fn shell_command_tool_matches_expected_spec() {
         /*exec_permission_approvals_enabled*/ false,
         /*allow_escalated_sandbox_permissions*/ true,
     ));
-    properties.insert(
-        "force_fresh".to_string(),
-        JsonSchema::boolean(Some(
-            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
-        )),
-    );
-
     assert_eq!(
         tool,
         ToolSpec::Function(ResponsesApiTool {
@@ -568,39 +520,32 @@ fn command_tools_accept_legacy_untagged_and_canonical_kind_forms() {
     ] {
         let tool = serde_json::to_value(tool).expect("serialize command tool");
         let parameters = &tool["parameters"];
-        // The advertised schema must match the runtime decoder's surface: one
-        // flat object whose `kind` is optional and canonical. Field
-        // combination rules belong to `CommandInvocation::from_parts`, which
-        // reports violations with prescriptive field-level messages.
+        // The advertised schema is one flat object with a required command
+        // field. `kind` is gone: the decoder infers the branch from whichever
+        // command field is populated, so advertising a discriminator only made
+        // every call carry a redundant field and a redundant decision.
         assert!(parameters.get("oneOf").is_none());
         assert!(parameters.get("$defs").is_none());
         assert_eq!(parameters["required"], serde_json::Value::Null);
-        assert_eq!(
-            parameters["properties"]["kind"]["enum"],
-            json!(["script", "argv", "powershell_script"])
-        );
+        for withdrawn in ["kind", "validation", "force_fresh"] {
+            assert_eq!(
+                parameters["properties"][withdrawn],
+                serde_json::Value::Null,
+                "{withdrawn} must not be advertised"
+            );
+        }
 
         let validator =
             jsonschema::validator_for(parameters).expect("command schema should compile");
-        let mut legacy_untagged = json!({});
-        legacy_untagged[script_field] = json!("git status --short");
-        let mut explicit_script = json!({
-            "kind": "script",
-            "workdir": "repo",
-            "validation": {"covered_paths": ["src"]}
-        });
-        explicit_script[script_field] = json!("git status --short");
+        let mut untagged_script = json!({});
+        untagged_script[script_field] = json!("git status --short");
+        let mut script_with_workdir = json!({"workdir": "repo"});
+        script_with_workdir[script_field] = json!("git status --short");
         let accepted = [
-            legacy_untagged,
-            explicit_script,
-            json!({
-                "kind": "argv",
-                "program": "git",
-                "args": ["status", "--short"],
-                "force_fresh": true
-            }),
-            json!({"program": "git", "args": ["status"]}),
-            json!({"kind": "powershell_script", "script_body": "Get-ChildItem"}),
+            untagged_script,
+            script_with_workdir,
+            json!({"program": "git", "args": ["status", "--short"]}),
+            json!({"script_body": "Get-ChildItem"}),
         ];
         for arguments in accepted {
             assert!(
@@ -611,15 +556,15 @@ fn command_tools_accept_legacy_untagged_and_canonical_kind_forms() {
 
         let rejected = [
             json!({}),
-            json!({"kind": "script"}),
             json!({"args": ["status"]}),
-            json!({"kind": "argv", "program": "git", "unknown": true}),
-            json!({"kind": "argv", "program": "git", "workdir": 42}),
-            json!({
-                "kind": "argv",
-                "program": "git",
-                "validation": {"covered_paths": "src"}
-            }),
+            json!({"program": "git", "unknown": true}),
+            json!({"program": "git", "workdir": 42}),
+            // Withdrawn fields are rejected rather than silently ignored, so a
+            // caller still sending them gets a schema error instead of a
+            // request that quietly does something else.
+            json!({"program": "git", "kind": "argv"}),
+            json!({"program": "git", "force_fresh": true}),
+            json!({"program": "git", "validation": {"covered_paths": ["src"]}}),
         ];
         for arguments in rejected {
             assert!(

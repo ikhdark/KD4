@@ -158,7 +158,7 @@ pub enum ExecCapturePolicy {
     #[default]
     ShellTool,
     /// Trusted internal helpers can buffer the full child output in memory
-    /// without the shell-oriented output cap or exec-expiration behavior.
+    /// without the shell-oriented output cap. Expiration remains independent.
     FullBuffer,
 }
 
@@ -356,13 +356,6 @@ impl ExecCapturePolicy {
 
     fn io_drain_timeout(self) -> Duration {
         Duration::from_millis(IO_DRAIN_TIMEOUT_MS)
-    }
-
-    fn uses_expiration(self) -> bool {
-        match self {
-            Self::ShellTool => true,
-            Self::FullBuffer => false,
-        }
     }
 }
 
@@ -759,7 +752,7 @@ async fn exec_windows_sandbox(
     }
 
     // Windows sandbox capture still receives timeout and cancellation separately.
-    let (cancellation, timeout_ms) = if capture_policy.uses_expiration() {
+    let (cancellation, timeout_ms) = {
         let cancellations = expiration.cancellation_tokens();
         let cancellation = (!cancellations.is_empty()).then(|| {
             codex_windows_sandbox::WindowsSandboxCancellationToken::new(move || {
@@ -767,8 +760,6 @@ async fn exec_windows_sandbox(
             })
         });
         (cancellation, expiration.timeout_ms())
-    } else {
-        (None, None)
     };
 
     let workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
@@ -1216,13 +1207,9 @@ async fn consume_output(
         output_delta_limiter,
     ));
 
-    let expiration_wait = async {
-        if capture_policy.uses_expiration() {
-            Some(expiration.wait_with_outcome().await)
-        } else {
-            std::future::pending::<Option<ExecExpirationOutcome>>().await
-        }
-    };
+    let stdout_handle = tokio_util::task::AbortOnDropHandle::new(stdout_handle);
+    let stderr_handle = tokio_util::task::AbortOnDropHandle::new(stderr_handle);
+    let expiration_wait = expiration.wait_with_outcome();
     tokio::pin!(expiration_wait);
     let (exit_status, timed_out, cancelled) = tokio::select! {
         status_result = child.wait() => {
@@ -1236,7 +1223,7 @@ async fn consume_output(
         }
         outcome = &mut expiration_wait => {
             match outcome {
-                Some(ExecExpirationOutcome::TimedOut) => {
+                ExecExpirationOutcome::TimedOut => {
                     terminate_and_reap_child_process_tree(
                         child,
                         managed_root,
@@ -1247,19 +1234,18 @@ async fn consume_output(
                         false,
                     )
                 }
-                Some(ExecExpirationOutcome::Cancelled) => {
+                ExecExpirationOutcome::Cancelled => {
                     terminate_and_reap_child_process_tree(child, managed_root).await?;
                     (synthetic_exit_status_for_code(/*code*/ 130), false, true)
                 }
-                None => unreachable!("expiration wait only resolves while expiration is active"),
             }
         }
     };
 
     let drain_deadline = tokio::time::Instant::now() + capture_policy.io_drain_timeout();
     let (stdout, mut stderr) = await_captured_output_until_deadline(
-        stdout_handle,
-        stderr_handle,
+        stdout_handle.detach(),
+        stderr_handle.detach(),
         Arc::clone(&stdout_capture),
         Arc::clone(&stderr_capture),
         Arc::clone(&aggregate_capture),
@@ -1293,24 +1279,39 @@ async fn consume_output(
 }
 
 async fn await_captured_output_until_deadline(
-    mut stdout_handle: tokio::task::JoinHandle<io::Result<()>>,
-    mut stderr_handle: tokio::task::JoinHandle<io::Result<()>>,
+    stdout_handle: tokio::task::JoinHandle<io::Result<()>>,
+    stderr_handle: tokio::task::JoinHandle<io::Result<()>>,
     stdout_capture: SharedOutputCapture,
     stderr_capture: SharedOutputCapture,
     aggregate_capture: SharedOutputCapture,
     deadline: tokio::time::Instant,
 ) -> io::Result<(StreamOutput<Vec<u8>>, StreamOutput<Vec<u8>>)> {
+    let mut stdout_handle = tokio_util::task::AbortOnDropHandle::new(stdout_handle);
+    let mut stderr_handle = tokio_util::task::AbortOnDropHandle::new(stderr_handle);
     async fn await_output(
-        handle: &mut tokio::task::JoinHandle<io::Result<()>>,
+        handle: &mut tokio_util::task::AbortOnDropHandle<io::Result<()>>,
         capture: &SharedOutputCapture,
         aggregate_capture: &SharedOutputCapture,
         deadline: tokio::time::Instant,
     ) -> io::Result<StreamOutput<Vec<u8>>> {
         match tokio::time::timeout_at(deadline, &mut *handle).await {
-            Ok(join_result) => match join_result {
-                Ok(result) => result?,
-                Err(join_error) => return Err(io::Error::other(join_error)),
-            },
+            Ok(join_result) => {
+                let failure = match join_result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                };
+                if let Some(error) = failure {
+                    let notice = format!("\n[output capture incomplete: {error}]\n");
+                    for retained in [capture, aggregate_capture] {
+                        let mut retained = retained
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        retained.truncated = true;
+                        retained.append(notice.as_bytes());
+                    }
+                }
+            }
             Err(_) => {
                 handle.abort();
                 let _ = handle.await;

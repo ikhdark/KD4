@@ -158,7 +158,6 @@ async fn code_mode_holds_yielded_result_during_command_approval() -> Result<()> 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
 await tools.exec_command({
-  kind: "script",
   cmd: "[Console]::Out.Write('code_mode_approval_marker')",
   sandbox_permissions: "require_escalated",
   justification: "test command approval",
@@ -676,7 +675,6 @@ async fn code_mode_nested_nonzero_returns_to_model_for_repair() -> Result<()> {
 
     let harness = CodeModeElicitationHarness::start(
         r#"await tools.exec_command({
-  kind: "script",
   cmd: "exit 7",
   yield_time_ms: 30_000
 });"#,

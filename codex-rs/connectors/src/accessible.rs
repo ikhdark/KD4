@@ -18,7 +18,11 @@ where
 {
     let mut connectors: HashMap<String, (AppInfo, BTreeSet<String>)> = HashMap::new();
     for tool in tools {
-        let connector_id = tool.connector_id;
+        let Some(connector_id) =
+            crate::canonical_connector_id(&tool.connector_id).map(str::to_string)
+        else {
+            continue;
+        };
         if let Some((existing, existing_plugin_display_names)) = connectors.get_mut(&connector_id) {
             if existing.name == connector_id
                 && let Some(connector_name) =

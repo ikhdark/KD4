@@ -988,7 +988,7 @@ async fn structured_projection_artifact_recovers_original_bytes() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
     let thread_id = "structured-projection-thread";
     let full_output = format!(
-        "first line\n{}\nfinal status: failed\n",
+        "first line\n{}\nerror: focused failure\nuncertainty: dependency coverage not established\nremaining coverage: integration tests\nfinal status: failed\n",
         "context that must remain recoverable ".repeat(200),
     );
     let fragments = vec![
@@ -1008,8 +1008,8 @@ async fn structured_projection_artifact_recovers_original_bytes() {
 
     let projection = project_model_output(ModelProjectionInput {
         spillable_text: full_output.clone(),
-        outcome: ToolOutputOutcome::Success,
-        essential_inline: serde_json::json!({}),
+        outcome: ToolOutputOutcome::Failure,
+        essential_inline: serde_json::json!({"coverage_status": "partial"}),
         origin_call_id: "structured-call".to_string(),
         selection_facts,
         applied_token_limit: 200,
@@ -1040,16 +1040,23 @@ async fn structured_projection_artifact_recovers_original_bytes() {
     .expect("structured projection");
     assert!(projection.artifact_created);
     assert!(!projection.artifact_reused);
-    let artifact_id = projection
-        .candidate
-        .as_ref()
-        .expect("canonical artifact candidate")
-        .artifact_id
-        .clone();
+    let ResponseInputItem::FunctionCallOutput { output, .. } = projection.response() else {
+        panic!("expected model-facing function output");
+    };
+    let rendered = output.text_content().expect("rendered projection");
+    assert!(rendered.len() < full_output.len());
+    assert!(!rendered.contains("remaining coverage: integration tests"));
+    let (header, _) = model_projection_parts(rendered);
+    assert_eq!(header["outcome"], "failure");
+    assert_eq!(header["essential"]["coverage_status"], "partial");
+    assert_eq!(header["canonical_complete"], true);
+    let artifact_id = header["artifact_id"]
+        .as_str()
+        .expect("recovery handle must be visible to the model");
     let recovered = crate::tools::command_output_artifact::read_tool_output_artifact(
         temp.path(),
         thread_id,
-        &artifact_id,
+        artifact_id,
         1,
         100,
         16_384,
@@ -3960,4 +3967,98 @@ async fn admission_only_projection_preserves_original_response_when_artifact_sto
     assert_eq!(projection.response(), original_response);
     assert!(projection.candidate.is_none());
     assert!(!projection.artifact_created);
+}
+
+#[test]
+fn final_envelope_fitting_revokes_complete_fragment_inclusion() {
+    let output = "distinct evidence ".repeat(100);
+    let envelope = ToolProjectionV1 {
+        version: 1,
+        tool: "test".into(),
+        outcome: "success".into(),
+        canonical_sha256: "hash".into(),
+        canonical_bytes: output.len() as u64,
+        canonical_approximate_tokens: approx_token_count(&output) as u64,
+        canonical_complete: true,
+        model_bytes: 0,
+        model_approximate_tokens: 0,
+        artifact_id: Some("artifact".into()),
+        sections: vec![ToolProjectionSection {
+            id: "evidence".into(),
+            value: None,
+            exact_bytes: output.len() as u64,
+            inclusion: ToolProjectionInclusion::Included,
+            canonical_range: Some(CanonicalByteRange::new(0, output.len() as u64)),
+            children: Vec::new(),
+            recovery_chunk_bytes: None,
+        }],
+        omitted_sections: Vec::new(),
+        result: serde_json::json!({"selection":{"selected_ids":["evidence"],"partial_ids":[],"omitted_inline_ids":[]}}),
+    };
+    let bounded =
+        serialize_projection_with_limit(envelope, &output, approx_token_count(&output)).unwrap();
+    assert!(approx_token_count(bounded.rendered()) <= approx_token_count(&output));
+    let envelope = bounded.envelope().unwrap();
+    assert_ne!(envelope.result["selected_text"], output);
+    assert_eq!(
+        envelope.sections[0].inclusion,
+        ToolProjectionInclusion::Omitted
+    );
+    assert_eq!(envelope.omitted_sections, vec!["evidence"]);
+    assert_eq!(
+        envelope.result["selection"]["partial_ids"],
+        serde_json::json!(["evidence"])
+    );
+}
+
+#[tokio::test]
+async fn disabled_history_projection_skips_artifacts_for_complete_inline_results() {
+    for enabled in [false, true] {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        Arc::make_mut(&mut turn.config).completed_tool_history_projection = enabled;
+        let invocation = test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "inline",
+            ToolName::plain("echo"),
+        );
+        let output = "retained diagnostic line\n".repeat(200);
+        let mut result = AnyToolResult {
+            call_id: invocation.call_id.clone(),
+            payload: invocation.payload.clone(),
+            result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
+                output.clone(),
+                Some(true),
+            )),
+            model_projection: None,
+            source_dependencies: None,
+            code_mode_feedback: Vec::new(),
+        };
+        let input =
+            prepare_model_projection(&invocation, &mut result, None, None, false, true).await;
+        assert_eq!(
+            input.is_some(),
+            enabled,
+            "history-only materialization follows its consumer"
+        );
+        if let Some(input) = input {
+            assert_eq!(
+                input.materialization,
+                ProjectionMaterialization::AdmissionOnly
+            );
+            let projection = project_model_output(input)
+                .await
+                .expect("history projection");
+            assert!(projection.artifact_created);
+            assert!(projection.candidate.is_some());
+        } else {
+            assert_eq!(
+                result
+                    .result
+                    .to_response_item(&result.call_id, &result.payload),
+                crate::tools::context::FunctionToolOutput::from_text(output, Some(true))
+                    .to_response_item(&result.call_id, &result.payload)
+            );
+        }
+    }
 }

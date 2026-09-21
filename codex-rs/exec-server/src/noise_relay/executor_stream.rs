@@ -72,6 +72,9 @@ impl Drop for NoiseVirtualStream {
 }
 
 impl NoiseVirtualStream {
+    pub(crate) fn gap_deadline(&self) -> Option<tokio::time::Instant> {
+        self.inbound_ciphertexts.gap_deadline()
+    }
     pub(crate) fn disconnect(self, reason: Option<String>) {
         let _ = self.disconnected_tx.send(true);
         let _ = self

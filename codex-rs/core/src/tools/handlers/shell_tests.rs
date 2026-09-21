@@ -1647,3 +1647,19 @@ async fn registered_shell_declared_validation_preserves_scope_without_proof() {
         }
     }
 }
+
+#[test]
+fn oversized_validation_diagnostic_projection_is_bounded_and_recoverable() {
+    let canonical = format!("error: {}", "\u{754c}".repeat(30000)).into_bytes();
+    let output = super::LegacyShellToolOutput {
+        validation: None, inner: FunctionToolOutput::from_text("command failed".to_string(), Some(false)),
+        canonical_output: Some(canonical.clone()), exit_code: Some(1), call_id: "failure".to_string(), validation_failure: true,
+    };
+    let metadata = output.projection_metadata().expect("projection");
+    let diagnostic = metadata.fragments.iter().find(|fragment| fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary).expect("diagnostic");
+    assert!(diagnostic.text.len() <= 12 * 1024);
+    assert!(diagnostic.text.starts_with("error:"));
+    assert!(diagnostic.text.contains("truncated"));
+    assert!(metadata.predetermined_ranges.is_empty(), "partial lines are not exact ranges");
+    assert_eq!(output.canonical_output, Some(canonical));
+}

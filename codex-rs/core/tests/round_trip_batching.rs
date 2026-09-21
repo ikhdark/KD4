@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+// Scripted protocol/accounting regression tests. Request-count differences
+// reflect the mock workflows, not model behavior or fork/upstream performance.
+
 use codex_protocol::protocol::TurnTiming;
 use core_test_support::require_network;
 use core_test_support::responses::ResponseMock;
@@ -20,7 +23,12 @@ const EDIT_ARGS: &str = r#"{"sleep_before_ms":1}"#;
 const VALIDATE_TEST_ARGS: &str = r#"{"sleep_before_ms":2}"#;
 const VALIDATE_FORMAT_ARGS: &str = r#"{"sleep_before_ms":3}"#;
 const GIT_DIFF_ARGS: &str = r#"{"sleep_before_ms":4}"#;
-const FAILING_CHECK_ARGS: &str = r#"{"sleep_after_ms":1}"#;
+#[cfg(windows)]
+const FAILING_CHECK_ARGS: &str = r#"{"cmd":"echo controlled-check-diagnostic & exit /b 17","yield_time_ms":10000,"max_output_tokens":1024}"#;
+#[cfg(not(windows))]
+const FAILING_CHECK_ARGS: &str = r#"{"cmd":"printf 'controlled-check-diagnostic\n'; exit 17","yield_time_ms":10000,"max_output_tokens":1024}"#;
+const PARALLEL_ARGS: &str =
+    r#"{"barrier":{"id":"round-trip-overlap","participants":3,"timeout_ms":5000}}"#;
 const DIAGNOSE_ARGS: &str = r#"{"sleep_after_ms":2}"#;
 const TARGETED_VALIDATION_ARGS: &str = r#"{"sleep_after_ms":3}"#;
 
@@ -66,31 +74,30 @@ fn request_tool_transcript(
 
 async fn mount_semantically_gated_sequence(
     server: &MockServer,
-    steps: Vec<(Vec<(&'static str, &'static str)>, String)>,
+    steps: Vec<(Vec<ExpectedCall>, String)>,
 ) -> Vec<ResponseMock> {
     let mut mocks = Vec::with_capacity(steps.len());
     for (expected_calls, response) in steps {
-        let expected_transcript = (
-            expected_calls
-                .iter()
-                .map(|(call_id, arguments)| {
-                    (
-                        (*call_id).to_string(),
-                        "test_sync_tool".to_string(),
-                        (*arguments).to_string(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            expected_calls
-                .into_iter()
-                .map(|(call_id, _)| (call_id.to_string(), "ok".to_string()))
-                .collect::<Vec<_>>(),
-        );
         mocks.push(
             mount_sse_once_match(
                 server,
                 move |request: &wiremock::Request| {
-                    request_tool_transcript(request).as_ref() == Some(&expected_transcript)
+                    let Some((calls, outputs)) = request_tool_transcript(request) else {
+                        return false;
+                    };
+                    calls.len() == expected_calls.len()
+                        && outputs.len() == expected_calls.len()
+                        && expected_calls.iter().zip(calls).zip(outputs).all(
+                            |((expected, call), output)| {
+                                call == (
+                                    expected.id.to_string(),
+                                    expected.tool.to_string(),
+                                    expected.arguments.to_string(),
+                                ) && output.0 == expected.id
+                                    && expected.output.iter().all(|part| output.1.contains(part))
+                                    && (expected.tool != "test_sync_tool" || output.1 == "ok")
+                            },
+                        )
                 },
                 response,
             )
@@ -100,8 +107,33 @@ async fn mount_semantically_gated_sequence(
     mocks
 }
 
-fn calls(entries: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
-    entries.to_vec()
+struct ExpectedCall {
+    id: &'static str,
+    tool: &'static str,
+    arguments: &'static str,
+    output: Vec<&'static str>,
+}
+
+fn calls(entries: &[(&'static str, &'static str)]) -> Vec<ExpectedCall> {
+    entries
+        .iter()
+        .map(|&(id, arguments)| ExpectedCall {
+            id,
+            arguments,
+            tool: "test_sync_tool",
+            output: vec!["ok"],
+        })
+        .collect()
+}
+
+fn diagnosis_calls(entries: &[(&'static str, &'static str)]) -> Vec<ExpectedCall> {
+    let mut expected = calls(entries);
+    let failed = expected
+        .first_mut()
+        .expect("diagnostic sequence starts with failed check");
+    failed.tool = "exec_command";
+    failed.output = vec!["Process exited with code 17", "controlled-check-diagnostic"];
+    expected
 }
 
 fn requests_for_sequence(
@@ -328,9 +360,9 @@ async fn identical_parallel_tool_calls_reach_immediate_continuation() -> anyhow:
         vec![
             sse(vec![
                 ev_response_created("parallel"),
-                ev_function_call("parallel-1", "test_sync_tool", EDIT_ARGS),
-                ev_function_call("parallel-2", "test_sync_tool", EDIT_ARGS),
-                ev_function_call("parallel-3", "test_sync_tool", EDIT_ARGS),
+                ev_function_call("parallel-1", "test_sync_tool", PARALLEL_ARGS),
+                ev_function_call("parallel-2", "test_sync_tool", PARALLEL_ARGS),
+                ev_function_call("parallel-3", "test_sync_tool", PARALLEL_ARGS),
                 ev_completed("parallel"),
             ]),
             sse(vec![
@@ -399,17 +431,17 @@ async fn identical_parallel_tool_calls_reach_immediate_continuation() -> anyhow:
             (
                 "parallel-1".to_string(),
                 "test_sync_tool".to_string(),
-                EDIT_ARGS.to_string(),
+                PARALLEL_ARGS.to_string(),
             ),
             (
                 "parallel-2".to_string(),
                 "test_sync_tool".to_string(),
-                EDIT_ARGS.to_string(),
+                PARALLEL_ARGS.to_string(),
             ),
             (
                 "parallel-3".to_string(),
                 "test_sync_tool".to_string(),
-                EDIT_ARGS.to_string(),
+                PARALLEL_ARGS.to_string(),
             ),
         ]
     );
@@ -429,12 +461,12 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
                 vec![],
                 sse(vec![
                     ev_response_created("1"),
-                    ev_function_call("failing-check", "test_sync_tool", FAILING_CHECK_ARGS),
+                    ev_function_call("failing-check", "exec_command", FAILING_CHECK_ARGS),
                     ev_completed("failed"),
                 ]),
             ),
             (
-                calls(&[("failing-check", FAILING_CHECK_ARGS)]),
+                diagnosis_calls(&[("failing-check", FAILING_CHECK_ARGS)]),
                 sse(vec![
                     ev_response_created("2"),
                     ev_function_call("diagnose", "test_sync_tool", DIAGNOSE_ARGS),
@@ -442,7 +474,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
                 ]),
             ),
             (
-                calls(&[
+                diagnosis_calls(&[
                     ("failing-check", FAILING_CHECK_ARGS),
                     ("diagnose", DIAGNOSE_ARGS),
                 ]),
@@ -457,7 +489,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
                 ]),
             ),
             (
-                calls(&[
+                diagnosis_calls(&[
                     ("failing-check", FAILING_CHECK_ARGS),
                     ("diagnose", DIAGNOSE_ARGS),
                     ("targeted-validation", TARGETED_VALIDATION_ARGS),
@@ -470,10 +502,14 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
         ],
     )
     .await;
-    let test = test_codex()
+    let mut builder = test_codex()
         .with_model("test-gpt-5.1-codex")
-        .build(&server)
-        .await?;
+        .with_raw_response_items();
+    #[cfg(windows)]
+    {
+        builder = builder.with_windows_cmd_shell();
+    }
+    let test = builder.build(&server).await?;
 
     let completion = test
         .submit_turn_and_capture_completion("diagnose the failure, then select validation")
@@ -506,8 +542,11 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
     Ok(())
 }
 
+/// Each orchestration rule reaches a root request from exactly one surface. A
+/// second copy at a different authority level is not redundant safety: the
+/// model has to reconcile the two wordings on every generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn root_production_request_contains_bounded_orchestration_guidance() -> anyhow::Result<()> {
+async fn root_production_request_states_each_orchestration_rule_once() -> anyhow::Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
@@ -530,32 +569,34 @@ async fn root_production_request_contains_bounded_orchestration_guidance() -> an
     let requests = responses.requests();
     assert_eq!(requests.len(), 1);
     let developer_text = requests[0].message_input_texts("developer").join("\n\n");
-    let open = "<root_orchestration_instructions>";
-    let close = "</root_orchestration_instructions>";
-    let guidance = developer_text
-        .split_once(open)
-        .and_then(|(_, suffix)| suffix.split_once(close).map(|(body, _)| body))
-        .expect("normal root request should contain registered orchestration guidance");
-    let guidance = guidance.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(guidance.contains("For implementation tasks: Fix affected callers"));
-    assert!(guidance.contains("request them together using the available parallel tools"));
-    assert!(guidance.contains("parallel tools or execution wrapper"));
-    assert!(guidance.contains("Do not run shared-state mutations concurrently"));
-    assert!(guidance.contains("Keep predetermined dependent calls in one packet when supported"));
-    assert!(guidance.contains("prerequisite results meet expected conditions"));
-    assert!(guidance.contains("Stop on unexpected results"));
-    assert!(guidance.contains("split only for approvals, output bounds"));
-    assert!(guidance.contains("substantive judgment about the next action"));
-    assert!(guidance.contains("existing wait or session path"));
     assert!(
-        guidance
-            .contains("Reuse passing validation if relevant inputs and environment are unchanged")
+        !developer_text.contains("<root_orchestration_instructions>"),
+        "the root orchestration policy block must not be reintroduced"
     );
-    assert!(guidance.contains("Use owner-required checks; when required and coverage permits, scope clippy to changed packages."));
-    assert!(!guidance.contains("no cargo check before clippy"));
-    assert!(
-        codex_utils_output_truncation::approx_token_count(&guidance) <= 256,
-        "registered orchestration guidance exceeded its per-request token budget"
+
+    // The surviving rules live in the base instructions, which own them for
+    // roots and workers alike.
+    let instructions = requests[0].instructions_text();
+    for rule in [
+        "Sequence dependencies: finish edits before checks that validate them.",
+        "Serialize conflicting work",
+        "Resume the existing process or cell; do not launch a duplicate.",
+        "Reuse successful checks of the final source state",
+        "When clippy is required, omit a preceding cargo check only if",
+    ] {
+        assert_eq!(
+            instructions.matches(rule).count(),
+            1,
+            "base instructions must state this rule exactly once: {rule}"
+        );
+    }
+
+    assert_eq!(
+        instructions
+            .matches("Batch independent calls using the available tool-native")
+            .count(),
+        1,
+        "base instructions must state the batching policy exactly once"
     );
 
     Ok(())

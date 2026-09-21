@@ -126,6 +126,17 @@ def build_package_dir(
     build_identity: dict[str, object] | None = None,
 ) -> None:
     validate_package_input_roles(inputs)
+    input_digests = {
+        role: sha256_file(path)
+        for role, path in (
+            ("entrypoint", inputs.entrypoint_bin),
+            ("code-mode-host", inputs.code_mode_host_bin),
+            ("ripgrep", inputs.rg_bin),
+            ("command-runner", inputs.codex_command_runner_bin),
+            ("sandbox-setup", inputs.codex_windows_sandbox_setup_bin),
+        )
+        if path is not None
+    }
     bin_dir = package_dir / "bin"
     resources_dir = package_dir / "codex-resources"
     path_dir = package_dir / "codex-path"
@@ -169,6 +180,12 @@ def build_package_dir(
     shutil.copyfile(REPO_ROOT / "NOTICE", package_dir / "NOTICE")
 
     files = package_file_inventory(package_dir, variant=variant, spec=spec)
+    for entry in files:
+        if (
+            entry["role"] in input_digests
+            and entry["sha256"] != input_digests[entry["role"]]
+        ):
+            raise RuntimeError(f"Package input changed during staging: {entry['role']}")
     if build_identity is not None:
         build_identity = {
             **build_identity,

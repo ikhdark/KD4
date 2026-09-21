@@ -36,7 +36,7 @@ fn output_projection_borrows_normal_content_and_preserves_timeout_notice() {
 
 #[test]
 fn shell_projection_uses_shared_success_default_and_reports_reduction() {
-    let body = "x".repeat(20_000);
+    let body = "x".repeat(48_000);
     let output = ExecToolCallOutput {
         aggregated_output: StreamOutput::new(body),
         ..ExecToolCallOutput::default()
@@ -49,7 +49,7 @@ fn shell_projection_uses_shared_success_default_and_reports_reduction() {
         Some("echo ok"),
     );
     assert!(projected.reduced);
-    assert!(projected.text.contains("Warning: truncated output"));
+    assert!(projected.text.contains("[line truncated]"));
     assert!(
         approx_token_count(&projected.text)
             <= codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS

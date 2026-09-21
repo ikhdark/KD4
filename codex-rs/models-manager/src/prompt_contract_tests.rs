@@ -59,6 +59,17 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "without weakening required invariants or assertions",
             "match every explicit requirement, prohibition, and preserved invariant to current evidence",
             "Ending a turn or exhausting a budget does not prove completion.",
+            "distinguish missing capability, failure to follow existing guidance, and interface friction",
+            "supported reuse path supplies valid evidence more easily and cheaply than repeating the work",
+            "Failed, interrupted, budget-exhausted, or truncated discovery is not a negative finding.",
+            "Measure useful progress by new evidence, resolved requirements, and validated outcomes, not tool-call counts or batching.",
+            "bounded unresolved-only pages",
+            "Ground this completion check in the original request and subsequent corrections, not only the agent's checklist or declared inventory profile.",
+            "Respect an explicit limit such as \"three options\"",
+            "a request for all material recommendations must not become an arbitrary short list.",
+            "Repair only identified omissions using retained evidence and bounded, targeted follow-up.",
+            "Do not start an automatic review loop or repeat unchanged discovery",
+            "report a truthful partial outcome and the specific remaining gap.",
         ],
     },
     PromptContract {
@@ -76,9 +87,33 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Preserve required updates and disclosures.",
             "Use final for a self-contained handoff:",
             "Summarize validation once at completion rather than recounting each test run.",
-            "expand when the user requests it",
             "Do not claim actions or tests that did not occur.",
         ],
+    },
+    PromptContract {
+        id: "complete-substance-with-concise-wording",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "Conciseness limits wording, not substance.",
+            "Address every requested part and include all material findings, recommendations, tradeoffs, and caveats within scope in the current response.",
+            "Do not omit requested substance to satisfy a brevity or low-verbosity preference",
+            "Do not defer requested content behind follow-up offers or make the user ask repeatedly for the rest.",
+            "Treat \"what else?\" as a request to consolidate all remaining material points within the existing scope, not another partial batch.",
+            "respect explicit user limits without silently claiming broader coverage",
+            "Before finalizing, compare the answer with the request and include missing material substance using the evidence already available",
+            "this does not require an extra tool call or separate review pass.",
+            "Do not invent additions or expand scope to appear exhaustive.",
+            "Explain each material point once at the depth needed for the request, correctness, or a user decision.",
+            "Avoid redundant summaries, filler, and elaborate background that adds no necessary substance",
+            "do not compress away requested detail or material caveats.",
+        ],
+    },
+    PromptContract {
+        id: "no-deferred-answer-expansion",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::None,
+        anchors: &["expand when the user requests it"],
     },
     PromptContract {
         id: "avoid-overengineering",
@@ -159,6 +194,15 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "Match tool work to the complexity of the user's request",
             "inspect the smallest likely source first",
+            "Before additional discovery, planning, or optional validation, identify the unresolved requirement or uncertainty it can resolve and how the result could change the answer or next action.",
+            "If neither applies, skip it.",
+            "not a requirement for another plan, tool call, or narrated justification",
+            "never skip required validation to save time.",
+            "Bound tool output to the evidence needed for the current decision while retaining complete results when coverage requires them.",
+            "Recover needed retained output instead of repeating its producer",
+            "do not trade oversized output for repeated tiny reads when one bounded read suffices.",
+            "A bounded projection must expose a usable recovery route to everything omitted, including failures, uncertainty, and remaining coverage",
+            "disclose retention failures rather than implying completeness.",
             "For a claim about omitted content in the original snapshot, use `read_tool_output` with the advertised artifact ID",
             "For a question about current source, prefer a narrower fresh read when it can answer the question.",
             "a fresh read can support only a current-source claim.",
@@ -183,6 +227,14 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "Batch independent calls using the available tool-native concurrency mechanism when their contracts and execution resources permit it",
             "wait for every started call and inspect every result and exit status",
+            "keep concurrency bounded",
+            "Independence permits overlap, not unlimited simultaneous launch.",
+            "based on shared resources and required consistency, not entire categories such as all writes or all builds.",
+            "Change locking only with evidence of an actual conflict or unnecessary exclusion.",
+            "Use existing code mode first",
+            "prefer a small extension to the owning handler over a second scheduler",
+            "Do not serialize independent operations merely to inspect them one at a time",
+            "or speculate on dependent calls before their prerequisites are resolved.",
             "finish edits before checks that validate them",
             "Stop investigating when the available evidence is sufficient.",
         ],
@@ -244,6 +296,12 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Do not substitute compilation, formatting, linting, static analysis, code inspection, or unrelated passing tests for behavior validation.",
             "Run those only when required by the user, repository instructions, or the changed code's normal required validation.",
             "For documentation changes, verify factual claims against the implementation or referenced source and run documentation validation required by the repository.",
+            "distinguish deterministic mechanism proof from model-driven task outcomes.",
+            "Replay must supply usable, still-valid evidence without executing the producer",
+            "replay after a model-generated call saves execution, not that model request.",
+            "Measure complete-turn elapsed time, model handoffs, total output and recovery cost, cancellation responsiveness, and task success before claiming user-visible improvement.",
+            "Prompt contract tests establish guidance delivery, not model compliance",
+            "shorter output is an improvement only when requested substance is preserved.",
             "Preserve any diagnosis the user requested.",
             "the validation run for each changed behavior;",
             "what each validation proved;",
@@ -379,6 +437,36 @@ fn resolved_prompts_satisfy_named_contract_registry() {
                     })
                     .collect::<Vec<_>>()
             );
+        }
+    }
+}
+
+#[test]
+fn resolved_prompts_prioritize_complete_answers() {
+    let response = crate::bundled_models_response().expect("bundled models.json should parse");
+    for id in [
+        "complete-substance-with-concise-wording",
+        "no-deferred-answer-expansion",
+    ] {
+        let contract = PROMPT_CONTRACTS
+            .iter()
+            .find(|contract| contract.id == id)
+            .expect("answer completeness contract should be registered");
+        let prompts = prompts_for_scope(contract.scope, &response);
+        assert!(!prompts.is_empty());
+        for (label, prompt) in prompts {
+            for anchor in contract.anchors {
+                let expected = match contract.expectation {
+                    AnchorExpectation::All => true,
+                    AnchorExpectation::None => false,
+                    AnchorExpectation::Any => panic!("completeness requires every anchor"),
+                };
+                assert_eq!(
+                    prompt.contains(anchor),
+                    expected,
+                    "prompt {label} violated contract {id}: {anchor}"
+                );
+            }
         }
     }
 }

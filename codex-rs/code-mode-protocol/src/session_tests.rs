@@ -10,6 +10,7 @@ use crate::RuntimeResponse;
 async fn started_cell_preserves_successful_initial_responses() {
     let cell_id = CellId::new("cell-success".to_string());
     let expected = RuntimeResponse::Result {
+        output_loss: None,
         cell_id: cell_id.clone(),
         content_items: vec![FunctionCallOutputContentItem::InputText {
             text: "delivered output".to_string(),

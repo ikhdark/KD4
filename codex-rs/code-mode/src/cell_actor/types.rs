@@ -436,11 +436,13 @@ fn prepend_initial_yield(
         CellEvent::Completed {
             mut content_items,
             error_text,
+            output_loss,
         } => {
             pending_initial_yield_items.append(&mut content_items);
             CellEvent::Completed {
                 content_items: pending_initial_yield_items,
                 error_text,
+                output_loss,
             }
         }
         CellEvent::Terminated { mut content_items } => {

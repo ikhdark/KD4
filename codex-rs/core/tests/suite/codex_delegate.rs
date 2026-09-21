@@ -139,11 +139,26 @@ async fn codex_delegate_review_rejects_patch_without_parent_approval() {
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
         &server,
-        vec![sse(vec![
-            ev_response_created("resp-1"),
-            ev_apply_patch_custom_tool_call(call_id, patch),
-            ev_completed("resp-1"),
-        ])],
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_apply_patch_custom_tool_call(call_id, patch),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message(
+                    "msg-1",
+                    &serde_json::json!({
+                        "findings": [], "overall_correctness": "patch is correct",
+                        "overall_explanation": "patch denied; review completed",
+                        "overall_confidence_score": 0.5
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-2"),
+            ]),
+        ],
     )
     .await;
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
@@ -165,16 +180,32 @@ async fn codex_delegate_review_rejects_patch_without_parent_approval() {
         })
         .await
         .expect("submit review");
-    assert_review_completes_without_approval(
-        &test.codex,
-        Err("Review did not return a valid structured result"),
-    )
-    .await;
+    assert_review_completes_without_approval(&test.codex, Ok("patch denied; review completed"))
+        .await;
     let requests = responses.requests();
     assert_eq!(
         requests.len(),
-        1,
-        "required mutation denial ends the review without another model call"
+        2,
+        "read-only review continues after a prohibited tool choice"
+    );
+    assert!(
+        requests[0]
+            .tool_by_name("functions", "apply_patch")
+            .is_none()
+    );
+    assert!(
+        requests[0].body_json()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != "apply_patch")
+    );
+    let denial = requests[1].custom_tool_call_output(call_id);
+    assert!(
+        denial
+            .to_string()
+            .to_lowercase()
+            .contains("no tool was run")
     );
     assert!(!test.cwd.path().join("delegated.txt").exists());
 }

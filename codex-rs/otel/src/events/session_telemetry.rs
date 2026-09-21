@@ -60,12 +60,41 @@ const SSE_UNKNOWN_KIND: &str = "unknown";
 const WEBSOCKET_UNKNOWN_KIND: &str = "unknown";
 const RESPONSES_WEBSOCKET_TIMING_KIND: &str = "responsesapi.websocket_timing";
 const RESPONSES_WEBSOCKET_TIMING_METRICS_FIELD: &str = "timing_metrics";
-const RESPONSES_API_OVERHEAD_FIELD: &str = "responses_duration_excl_engine_and_client_tool_time_ms";
-const RESPONSES_API_INFERENCE_FIELD: &str = "engine_service_total_ms";
-const RESPONSES_API_ENGINE_IAPI_TTFT_FIELD: &str = "engine_iapi_ttft_total_ms";
-const RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD: &str = "engine_service_ttft_total_ms";
-const RESPONSES_API_ENGINE_IAPI_TBT_FIELD: &str = "engine_iapi_tbt_across_engine_calls_ms";
-const RESPONSES_API_ENGINE_SERVICE_TBT_FIELD: &str = "engine_service_tbt_across_engine_calls_ms";
+pub(super) const RESPONSES_API_OVERHEAD_FIELD: &str =
+    "responses_duration_excl_engine_and_client_tool_time_ms";
+pub(super) const RESPONSES_API_INFERENCE_FIELD: &str = "engine_service_total_ms";
+pub(super) const RESPONSES_API_ENGINE_IAPI_TTFT_FIELD: &str = "engine_iapi_ttft_total_ms";
+pub(super) const RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD: &str = "engine_service_ttft_total_ms";
+pub(super) const RESPONSES_API_ENGINE_IAPI_TBT_FIELD: &str =
+    "engine_iapi_tbt_across_engine_calls_ms";
+pub(super) const RESPONSES_API_ENGINE_SERVICE_TBT_FIELD: &str =
+    "engine_service_tbt_across_engine_calls_ms";
+
+struct PendingObservation<F: FnOnce(Duration)> {
+    started: Instant,
+    abandoned: Option<F>,
+}
+
+impl<F: FnOnce(Duration)> PendingObservation<F> {
+    fn new(abandoned: F) -> Self {
+        Self {
+            started: Instant::now(),
+            abandoned: Some(abandoned),
+        }
+    }
+    fn finish(mut self) -> Duration {
+        self.abandoned = None;
+        self.started.elapsed()
+    }
+}
+
+impl<F: FnOnce(Duration)> Drop for PendingObservation<F> {
+    fn drop(&mut self) {
+        if let Some(abandoned) = self.abandoned.take() {
+            abandoned(self.started.elapsed());
+        }
+    }
+}
 
 fn trace_field_value<'a>(fields: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
     fields
@@ -814,9 +843,17 @@ impl SessionTelemetry {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<HttpResponse, HttpError>>,
     {
-        let start = Instant::now();
+        let observation = PendingObservation::new(|duration| {
+            self.record_count_and_duration(
+                API_CALL_COUNT_METRIC,
+                API_CALL_DURATION_METRIC,
+                1,
+                duration,
+                &[("outcome", "abandoned"), ("success", "unknown")],
+            );
+        });
         let response = f().await;
-        let duration = start.elapsed();
+        let duration = observation.finish();
 
         let (status, error) = match &response {
             Ok(response) => (Some(response.status().as_u16()), None),
@@ -1144,7 +1181,7 @@ impl SessionTelemetry {
         match result {
             Ok(Some(Ok(message))) => match message {
                 tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    match serde_json::from_str::<serde_json::Value>(text) {
+                    match super::websocket_telemetry::parse(text) {
                         Ok(value) => {
                             kind = value
                                 .get("type")
@@ -1566,9 +1603,23 @@ impl SessionTelemetry {
         Describe: FnOnce(&T) -> String,
         E: std::fmt::Display,
     {
-        let start = Instant::now();
+        let observation = PendingObservation::new(|duration| {
+            let mut tags = extra_tags.to_vec();
+            tags.extend([
+                ("tool", tool_name),
+                ("outcome", "abandoned"),
+                ("success", "unknown"),
+            ]);
+            self.record_count_and_duration(
+                TOOL_CALL_COUNT_METRIC,
+                TOOL_CALL_DURATION_METRIC,
+                1,
+                duration,
+                &tags,
+            );
+        });
         let result = f().await;
-        let duration = start.elapsed();
+        let duration = observation.finish();
 
         let success = match &result {
             Ok(value) => is_success(value),

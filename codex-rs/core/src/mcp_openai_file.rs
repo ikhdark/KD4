@@ -63,110 +63,191 @@ impl OpenAiFileStagingBudget {
     }
 }
 
-pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
+pub(crate) struct PreparedOpenAiArguments {
+    pub(crate) arguments: Option<JsonValue>,
+    cleanup: Option<OpenAiUploadCleanup>,
+}
+
+impl PreparedOpenAiArguments {
+    pub(crate) fn dispatched(mut self) -> Option<JsonValue> {
+        if let Some(mut cleanup) = self.cleanup.take() {
+            cleanup.file_ids.clear();
+        }
+        self.arguments.take()
+    }
+}
+
+struct OpenAiUploadCleanup {
+    tasks: tokio_util::task::TaskTracker,
+    base_url: String,
+    auth: codex_api::SharedAuthProvider,
+    clients: codex_http_client::RouteAwareClientPool,
+    file_ids: Vec<String>,
+}
+
+impl OpenAiUploadCleanup {
+    async fn rollback(&mut self) {
+        while let Some(file_id) = self.file_ids.last() {
+            if let Err(error) = delete_openai_file_with_pool(
+                &self.base_url,
+                self.auth.as_ref(),
+                &self.clients,
+                file_id,
+            )
+            .await
+            {
+                tracing::warn!(%error, "uploaded file cleanup failed; retaining cleanup ownership");
+                return;
+            }
+            self.file_ids.pop();
+        }
+    }
+}
+
+impl Drop for OpenAiUploadCleanup {
+    fn drop(&mut self) {
+        if self.file_ids.is_empty() {
+            return;
+        }
+        let mut owner = Self {
+            tasks: self.tasks.clone(),
+            base_url: self.base_url.clone(),
+            auth: self.auth.clone(),
+            clients: self.clients.clone(),
+            file_ids: std::mem::take(&mut self.file_ids),
+        };
+        self.tasks.spawn(async move {
+            // Each HTTP request already has a deadline. Keep retries bounded;
+            // surface unresolved cleanup rather than silently treating it as done.
+            for _ in 0..3 {
+                owner.rollback().await;
+                if owner.file_ids.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            tracing::warn!(
+                remaining = owner.file_ids.len(),
+                "uploaded file cleanup remains unconfirmed"
+            );
+            owner.file_ids.clear();
+        });
+    }
+}
+
+pub(crate) async fn prepare_mcp_tool_arguments_for_openai_files(
     sess: &Session,
     step_context: &StepContext,
     arguments_value: Option<JsonValue>,
     openai_file_input_params: Option<&[String]>,
-) -> Result<Option<JsonValue>, String> {
-    let Some(openai_file_input_params) = openai_file_input_params else {
-        return Ok(arguments_value);
+) -> Result<PreparedOpenAiArguments, String> {
+    let passthrough = |arguments| PreparedOpenAiArguments {
+        arguments,
+        cleanup: None,
     };
-
-    let Some(arguments_value) = arguments_value else {
-        return Ok(None);
+    let Some(params) = openai_file_input_params else {
+        return Ok(passthrough(arguments_value));
     };
-    let Some(arguments) = arguments_value.as_object() else {
-        return Ok(Some(arguments_value));
+    let Some(arguments) = arguments_value.as_ref().and_then(JsonValue::as_object) else {
+        return Ok(passthrough(arguments_value));
     };
-    let mut staged_arguments = Vec::new();
-    let mut staging_budget = OpenAiFileStagingBudget::default();
-    for field_name in openai_file_input_params {
-        let Some(value) = arguments.get(field_name) else {
-            continue;
-        };
-        let Some(staged_value) = stage_argument_value_for_openai_files(
-            step_context,
-            field_name,
-            value,
-            &mut staging_budget,
-        )
-        .await?
-        else {
-            continue;
-        };
-        staged_arguments.push((field_name.clone(), staged_value));
+    let requires_upload = params
+        .iter()
+        .filter_map(|key| arguments.get(key))
+        .any(|value| {
+            value.is_string()
+                || value.as_array().is_some_and(|values| {
+                    !values.is_empty() && values.iter().all(JsonValue::is_string)
+                })
+        });
+    if !requires_upload {
+        return Ok(passthrough(arguments_value));
     }
-    if staged_arguments.is_empty() {
-        return Ok(Some(arguments_value));
-    }
-
+    // Authentication failure must not first stage local file contents.
     let auth = sess.services.auth_manager.auth().await;
     let Some(auth) = auth.as_ref().filter(|auth| auth.uses_codex_backend()) else {
         return Err("ChatGPT auth is required to upload files for Codex Apps tools".to_string());
     };
-    let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
-    let turn_context = step_context.turn.as_ref();
-    let http_client_factory = turn_context.config.http_client_factory();
-    let http_clients = openai_file_http_client_pool(&http_client_factory);
-    let base_url = &turn_context.config.chatgpt_base_url;
-    let mut uploaded_file_ids = Vec::new();
-    let mut rewritten_arguments = arguments.clone();
-
-    for (field_name, staged_argument) in staged_arguments {
-        let staged_files = match staged_argument {
-            StagedOpenAiArgument::Single(staged) => vec![staged],
-            StagedOpenAiArgument::Array(staged) => staged,
-        };
-        let is_array = matches!(
-            arguments.get(field_name.as_str()),
-            Some(JsonValue::Array(_))
-        );
-        let mut rewritten_values = Vec::with_capacity(staged_files.len());
-        for staged in staged_files {
-            match upload_staged_openai_file(base_url, upload_auth.as_ref(), &http_clients, staged)
-                .await
-            {
-                Ok((rewritten, file_id)) => {
-                    uploaded_file_ids.push(file_id);
-                    rewritten_values.push(rewritten);
-                }
-                Err(error) => {
-                    let mut rollback_errors = Vec::new();
-                    for file_id in uploaded_file_ids.iter().rev() {
-                        if let Err(rollback_error) = delete_openai_file_with_pool(
-                            base_url,
-                            upload_auth.as_ref(),
-                            &http_clients,
-                            file_id,
-                        )
-                        .await
-                        {
-                            rollback_errors.push(format!("{file_id}: {rollback_error}"));
-                        }
-                    }
-                    if rollback_errors.is_empty() {
-                        return Err(error);
-                    }
-                    return Err(format!(
-                        "{error}; rollback also failed for {}",
-                        rollback_errors.join(", ")
-                    ));
-                }
-            }
+    let mut staged_arguments = Vec::new();
+    let mut staging_budget = OpenAiFileStagingBudget::default();
+    for field_name in params {
+        if let Some(value) = arguments.get(field_name)
+            && let Some(staged) = stage_argument_value_for_openai_files(
+                step_context,
+                field_name,
+                value,
+                &mut staging_budget,
+            )
+            .await?
+        {
+            staged_arguments.push((field_name.clone(), staged));
         }
-        let rewritten = if is_array {
-            JsonValue::Array(rewritten_values)
-        } else {
-            rewritten_values
-                .into_iter()
-                .next()
-                .ok_or_else(|| format!("no staged value was produced for `{field_name}`"))?
-        };
-        rewritten_arguments.insert(field_name, rewritten);
     }
+    let mut owner = OpenAiUploadCleanup {
+        tasks: sess.terminal_tasks.clone(),
+        base_url: step_context.turn.config.chatgpt_base_url.clone(),
+        auth: codex_model_provider::auth_provider_from_auth(auth),
+        clients: openai_file_http_client_pool(&step_context.turn.config.http_client_factory()),
+        file_ids: Vec::new(),
+    };
+    let mut rewritten_arguments = arguments.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sess.terminal_tasks.spawn(async move {
+        let result = async {
+            for (field_name, staged_argument) in staged_arguments {
+                let (files, is_array) = match staged_argument {
+                    StagedOpenAiArgument::Single(file) => (vec![file], false),
+                    StagedOpenAiArgument::Array(files) => (files, true),
+                };
+                let mut values = Vec::new();
+                for staged in files {
+                    if tx.is_closed() {
+                        return Err("file preparation cancelled before MCP dispatch".to_string());
+                    }
+                    let (value, file_id) = upload_staged_openai_file(
+                        &owner.base_url,
+                        owner.auth.as_ref(),
+                        &owner.clients,
+                        staged,
+                    )
+                    .await?;
+                    owner.file_ids.push(file_id);
+                    values.push(value);
+                }
+                let value = if is_array {
+                    JsonValue::Array(values)
+                } else {
+                    values.remove(0)
+                };
+                rewritten_arguments.insert(field_name, value);
+            }
+            Ok::<_, String>(Some(JsonValue::Object(rewritten_arguments)))
+        }
+        .await;
+        if result.is_err() {
+            owner.rollback().await;
+        }
+        let result = result.map(|arguments| PreparedOpenAiArguments {
+            arguments,
+            cleanup: Some(owner),
+        });
+        // A cancelled receiver drops the prepared guard, which owns rollback.
+        let _ = tx.send(result);
+    });
+    rx.await
+        .map_err(|error| format!("file preparation worker failed: {error}"))?
+}
 
-    Ok(Some(JsonValue::Object(rewritten_arguments)))
+#[cfg(test)]
+async fn rewrite_mcp_tool_arguments_for_openai_files(
+    sess: &Session,
+    step_context: &StepContext,
+    arguments: Option<JsonValue>,
+    params: Option<&[String]>,
+) -> Result<Option<JsonValue>, String> {
+    prepare_mcp_tool_arguments_for_openai_files(sess, step_context, arguments, params)
+        .await
+        .map(PreparedOpenAiArguments::dispatched)
 }
 
 async fn stage_argument_value_for_openai_files(
@@ -663,6 +744,115 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_file_preparation_rolls_back_late_upload() {
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::body_json;
+        use wiremock::matchers::header;
+        use wiremock::matchers::method;
+        use wiremock::matchers::path;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .and(header("chatgpt-account-id", "account_id"))
+            .and(body_json(serde_json::json!({
+                "file_name": "file_report.csv",
+                "file_size": 5,
+                "use_case": "codex",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_123",
+                "upload_url": format!("{}/upload/file_123", server.uri()),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/file_123"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files/file_123/uploaded"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(200))
+                    .set_body_json(serde_json::json!({
+                        "status": "success",
+                        "download_url": format!("{}/download/file_123", server.uri()),
+                        "file_name": "file_report.csv",
+                        "mime_type": "text/csv",
+                        "file_size_bytes": 5,
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        );
+        let dir = tempdir().expect("temp dir");
+        let local_path = dir.path().join("file_report.csv");
+        tokio::fs::write(&local_path, b"hello")
+            .await
+            .expect("write local file");
+        set_primary_environment_cwd(&mut turn_context, dir.path());
+
+        let mut config = (*turn_context.config).clone();
+        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+        turn_context.config = Arc::new(config);
+        let step_context = StepContext::for_test(Arc::new(turn_context));
+        Mock::given(method("DELETE"))
+            .and(path("/backend-api/files/file_123"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = Arc::new(session);
+        let upload_session = Arc::clone(&session);
+        let task = tokio::spawn(async move {
+            prepare_mcp_tool_arguments_for_openai_files(
+                &upload_session,
+                &step_context,
+                Some(serde_json::json!({"file":"file_report.csv"})),
+                Some(&["file".to_string()]),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().ends_with("/uploaded"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("upload enters delayed acknowledgement");
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        session.terminal_tasks.close();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.terminal_tasks.wait(),
+        )
+        .await
+        .expect("late upload cleanup finishes");
+        server.verify().await;
     }
 
     #[tokio::test]

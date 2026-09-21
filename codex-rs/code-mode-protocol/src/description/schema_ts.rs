@@ -1,17 +1,314 @@
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 
 use super::metadata::normalize_code_mode_identifier;
 
+/// Smallest rendered shape worth replacing with a named alias. Below this the
+/// alias name and its declaration cost more than the repetition they remove.
+const FRAGMENT_HOIST_MIN_BYTES: usize = 160;
+
 pub fn render_json_schema_to_typescript(schema: &JsonValue) -> String {
-    render_json_schema_to_typescript_inner(schema, schema, &mut RenderBudget::default())
-        .unwrap_or_else(|()| "unknown /* schema projection incomplete: rendering limit reached; consult the tool's JSON Schema */".to_string())
+    render_json_schema_to_typescript_recording(schema).0
+}
+
+/// Renders the schema and reports the shapes rendered along the way.
+///
+/// A `$ref` target is re-rendered at every use site, and generated schemas also
+/// inline the same shape at several sites without a reference. Reporting the
+/// rendered shapes lets the declaration builder describe a repeated shape once
+/// through [`hoist_shared_fragments`] instead of repeating it verbatim.
+pub fn render_json_schema_to_typescript_recording(schema: &JsonValue) -> (String, SharedFragments) {
+    let mut budget = RenderBudget::default();
+    let rendered = render_json_schema_to_typescript_inner(schema, schema, &mut budget)
+        .unwrap_or_else(|()| {
+            "unknown /* schema projection incomplete: rendering limit reached */".to_string()
+        });
+    (
+        rendered,
+        SharedFragments {
+            candidates: std::mem::take(&mut budget.fragments),
+        },
+    )
+}
+
+/// Rendered shapes observed while projecting one schema, with any name hint
+/// recovered from the reference that produced them.
+#[derive(Default)]
+pub struct SharedFragments {
+    candidates: Vec<(Option<String>, String)>,
+}
+
+/// Replaces shapes that occur more than once across `types` with named aliases.
+///
+/// Returns alias declarations for the caller to emit before its tool contracts.
+/// Recompute savings after each substitution so nested shapes can share aliases.
+pub fn hoist_shared_fragments(
+    fragments: &[&SharedFragments],
+    types: &mut [&mut String],
+) -> Vec<String> {
+    let mut hints: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    for fragment in fragments {
+        for (hint, rendered) in &fragment.candidates {
+            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES {
+                continue;
+            }
+            let slot = hints.entry(rendered.as_str()).or_default();
+            if slot.is_none() {
+                *slot = hint.as_deref();
+            }
+        }
+    }
+    let mut remaining: Vec<(String, Option<String>)> = hints
+        .into_iter()
+        .map(|(rendered, hint)| (rendered.to_string(), hint.map(str::to_string)))
+        .collect();
+    let mut used: HashSet<String> = HashSet::from(["CodeModeToolSearchResult".to_string()]);
+    let mut declarations: Vec<(String, String)> = Vec::new();
+
+    // Shapes nest, so the best choice is not the largest one: naming a small
+    // shape used at four sites removes more text than naming the container that
+    // holds it at two. Take the largest saving available, apply it everywhere,
+    // then re-count, because that substitution changes what the rest are worth.
+    loop {
+        let best = remaining
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (rendered, hint))| {
+                let occurrences: usize = types
+                    .iter()
+                    .map(|text| type_fragment_offsets(text, rendered).len())
+                    .chain(
+                        declarations
+                            .iter()
+                            .filter(|(_, body)| body != rendered)
+                            .map(|(_, body)| type_fragment_offsets(body, rendered).len()),
+                    )
+                    .sum();
+                let name = alias_name(hint.as_deref(), declarations.len(), &mut used.clone());
+                // Include every reference and the alias declaration itself.
+                let removed = occurrences.saturating_sub(1) * rendered.len();
+                let added = (occurrences + 1) * name.len() + 10;
+                removed
+                    .checked_sub(added)
+                    .filter(|saving| *saving > 0)
+                    .map(|saving| (saving, index, name))
+            })
+            .max_by_key(|(saving, _, _)| *saving);
+        let Some((_, index, name)) = best else {
+            break;
+        };
+        let (rendered, _) = remaining.swap_remove(index);
+        used.insert(name.clone());
+        for text in types.iter_mut() {
+            **text = replace_type_fragment(text, &rendered, &name);
+        }
+        for (_, body) in declarations.iter_mut() {
+            if body != &rendered {
+                *body = replace_type_fragment(body, &rendered, &name);
+            }
+        }
+        // A nested substitution changes every enclosing candidate too. Keeping
+        // the original candidate text loses those later sharing opportunities.
+        for (candidate, _) in &mut remaining {
+            *candidate = replace_type_fragment(candidate, &rendered, &name);
+        }
+        declarations.push((name, rendered));
+    }
+
+    // Sharing a parent can reduce its children's reference counts. Inline any
+    // aliases that no longer pay for themselves in the final graph.
+    loop {
+        let redundant = declarations.iter().position(|(name, body)| {
+            let occurrences: usize = types
+                .iter()
+                .map(|text| type_fragment_offsets(text, name).len())
+                .chain(
+                    declarations
+                        .iter()
+                        .filter(|(other, _)| other != name)
+                        .map(|(_, text)| type_fragment_offsets(text, name).len()),
+                )
+                .sum();
+            occurrences * body.len() <= body.len() + (occurrences + 1) * name.len() + 10
+        });
+        let Some(index) = redundant else {
+            break;
+        };
+        let (name, body) = declarations.remove(index);
+        for text in types.iter_mut() {
+            **text = replace_type_fragment(text, &name, &body);
+        }
+        for (_, text) in &mut declarations {
+            *text = replace_type_fragment(text, &name, &body);
+        }
+    }
+
+    declarations
+        .into_iter()
+        .map(|(name, body)| format!("type {name} = {body};"))
+        .collect()
+}
+
+// Generated types can contain arbitrary schema descriptions and string literals.
+// A repeated shape inside either is data, not a type reference to substitute.
+fn type_fragment_offsets(text: &str, fragment: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut offsets = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tail = &bytes[offset..];
+        if tail.starts_with(b"//") {
+            offset += tail
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(tail.len());
+        } else if tail.starts_with(b"/*") {
+            offset += tail
+                .windows(2)
+                .position(|pair| pair == b"*/")
+                .map_or(tail.len(), |end| end + 2);
+        } else if tail.starts_with(fragment.as_bytes())
+            && !(fragment.as_bytes().first().is_some_and(|byte| is_identifier_byte(*byte))
+                && offset > 0 && is_identifier_byte(bytes[offset - 1]))
+            && !(fragment.as_bytes().last().is_some_and(|byte| is_identifier_byte(*byte))
+                && bytes.get(offset + fragment.len()).is_some_and(|byte| is_identifier_byte(*byte)))
+            // A quoted property name is not a type use, even if the schema also
+            // returns that same long string as an enum or constant.
+            && !((fragment.starts_with('"') || fragment.bytes().all(is_identifier_byte))
+                && {
+                    let after = text[offset + fragment.len()..].trim_start();
+                    after.starts_with(':') || after.starts_with("?:")
+                })
+        {
+            offsets.push(offset);
+            offset += fragment.len();
+        } else if matches!(bytes[offset], b'"' | b'\'' | b'`') {
+            let quote = bytes[offset];
+            offset += 1;
+            while offset < bytes.len() {
+                if bytes[offset] == b'\\' {
+                    offset = (offset + 2).min(bytes.len());
+                } else if bytes[offset] == quote {
+                    offset += 1;
+                    break;
+                } else {
+                    offset += 1;
+                }
+            }
+        } else {
+            offset += 1;
+        }
+    }
+    offsets
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn replace_type_fragment(text: &str, fragment: &str, alias: &str) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    let mut start = 0;
+    for offset in type_fragment_offsets(text, fragment) {
+        rendered.push_str(&text[start..offset]);
+        rendered.push_str(alias);
+        start = offset + fragment.len();
+    }
+    rendered.push_str(&text[start..]);
+    rendered
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+
+    #[test]
+    fn nested_shape_factoring_recounts_candidates_and_pays_alias_overhead() {
+        let leaf = format!("{{ value: string; /* {} */ }}", "a".repeat(180));
+        let container = format!("{{ child: {leaf}; sibling: {leaf}; marker: number; }}");
+        let mut rendered = format!("{{ first: {container}; second: {container};");
+        for index in 0..20 {
+            rendered.push_str(&format!(" item{index}: {leaf};"));
+        }
+        rendered.push_str(" }");
+        let fragments = SharedFragments {
+            candidates: vec![
+                (Some("leaf".to_string()), leaf.clone()),
+                (Some("container".to_string()), container),
+            ],
+        };
+        let aliases = hoist_shared_fragments(&[&fragments], &mut [&mut rendered]).join("\n");
+        assert!(
+            aliases
+                .contains("type CodeModeContainer = { child: CodeModeLeaf; sibling: CodeModeLeaf;"),
+            "{aliases}"
+        );
+        assert!(rendered.contains("first: CodeModeContainer; second: CodeModeContainer;"));
+        assert_eq!(aliases.matches(&"a".repeat(180)).count(), 1);
+
+        let mut expensive = format!("{{ first: {leaf}; second: {leaf}; }}");
+        let original = expensive.clone();
+        let fragments = SharedFragments {
+            candidates: vec![(Some("x".repeat(500)), leaf)],
+        };
+        assert!(hoist_shared_fragments(&[&fragments], &mut [&mut expensive]).is_empty());
+        assert_eq!(
+            expensive, original,
+            "a longer alias must not enlarge the contract"
+        );
+    }
+
+    #[test]
+    fn replacing_type_shapes_preserves_comments_literals_and_property_names() {
+        let shape = "{ field: string; }";
+        let source = format!(
+            "{{ /* {shape} */ a: {shape}; // {shape}\n b: {shape}; literal: \"{shape}\"; }}"
+        );
+        assert_eq!(type_fragment_offsets(&source, shape).len(), 2);
+        assert_eq!(
+            replace_type_fragment(&source, shape, "Shared"),
+            format!("{{ /* {shape} */ a: Shared; // {shape}\n b: Shared; literal: \"{shape}\"; }}")
+        );
+        assert_eq!(
+            replace_type_fragment("{ \"long key\": \"long key\"; }", "\"long key\"", "Literal"),
+            "{ \"long key\": Literal; }"
+        );
+        assert_eq!(
+            replace_type_fragment(
+                "{ \"long key\"?: \"long key\"; }",
+                "\"long key\"",
+                "Literal"
+            ),
+            "{ \"long key\"?: Literal; }"
+        );
+    }
+}
+
+fn alias_name(hint: Option<&str>, index: usize, used: &mut HashSet<String>) -> String {
+    let base = hint
+        .map(normalize_code_mode_identifier)
+        .filter(|hint| hint.chars().next().is_some_and(char::is_alphabetic))
+        .map(|hint| {
+            let mut chars = hint.chars();
+            let first = chars.next().unwrap_or('T').to_ascii_uppercase();
+            format!("CodeMode{first}{}", chars.as_str())
+        })
+        .unwrap_or_else(|| format!("CodeModeShape{}", index + 1));
+    let mut name = base.clone();
+    let mut suffix = 2;
+    while !used.insert(name.clone()) {
+        name = format!("{base}{suffix}");
+        suffix += 1;
+    }
+    name
 }
 
 // Bound traversal before expanding references, and account for intermediate strings
 // as well as the final output. A DAG can expand exponentially without any cycles.
 struct RenderBudget {
     active_refs: HashSet<String>,
+    fragments: Vec<(Option<String>, String)>,
     nodes: usize,
     depth: usize,
     bytes: usize,
@@ -21,6 +318,7 @@ impl Default for RenderBudget {
     fn default() -> Self {
         Self {
             active_refs: HashSet::new(),
+            fragments: Vec::new(),
             nodes: 1024,
             depth: 0,
             bytes: 128 * 1024,
@@ -37,7 +335,8 @@ impl RenderBudget {
 
 type Rendered = Result<String, ()>;
 
-const NESTED_RESOURCE_UNKNOWN: &str = "unknown /* schema projection incomplete: nested $id resource not projected; consult JSON Schema */";
+const NESTED_RESOURCE_UNKNOWN: &str =
+    "unknown /* schema projection incomplete: nested $id resource not projected */";
 
 fn render_json_schema_to_typescript_inner(
     schema: &JsonValue,
@@ -53,6 +352,9 @@ fn render_json_schema_to_typescript_inner(
     budget.depth -= 1;
     let rendered = rendered?;
     budget.spend(rendered.len())?;
+    if rendered.len() >= FRAGMENT_HOIST_MIN_BYTES {
+        budget.fragments.push((None, rendered.clone()));
+    }
     Ok(rendered)
 }
 
@@ -260,6 +562,16 @@ fn render_local_schema_ref(
     }
     let rendered = render_json_schema_to_typescript_inner(target, root, budget);
     budget.active_refs.remove(&pointer);
+    // The reference name is the only human-meaningful label available for a
+    // shape that will be described once and used from several sites.
+    if let Ok(rendered) = &rendered
+        && rendered.len() >= FRAGMENT_HOIST_MIN_BYTES
+        && let Some(name) = pointer.rsplit('/').next().filter(|name| !name.is_empty())
+    {
+        budget
+            .fragments
+            .push((Some(name.to_string()), rendered.clone()));
+    }
     rendered
 }
 
@@ -291,13 +603,11 @@ fn annotate_schema_constraints(
         }
     }
     if map.contains_key("oneOf") {
-        annotations.push("oneOf: exactly one branch must match; consult JSON Schema".to_string());
+        annotations.push("oneOf: exactly one branch must match".to_string());
     }
     for keyword in ["not", "if", "then", "else", "$dynamicRef", "$recursiveRef"] {
         if map.contains_key(keyword) {
-            annotations.push(format!(
-                "unprojected keyword: {keyword}; consult JSON Schema"
-            ));
+            annotations.push(format!("unprojected keyword: {keyword}"));
         }
     }
     Ok(if annotations.is_empty() {
@@ -497,10 +807,7 @@ fn render_json_schema_object(
         lines.push(format!("{property_name}{optional}: {property_type};"));
     }
     if has_patterns {
-        lines.push(
-            "[key: string]: unknown; /* patternProperties not projected; consult JSON Schema */"
-                .to_string(),
-        );
+        lines.push("[key: string]: unknown; /* patternProperties not projected */".to_string());
     } else if additional != &JsonValue::Bool(false)
         && (map.contains_key("additionalProperties") || properties.is_empty())
     {
@@ -617,7 +924,7 @@ mod tests {
                 format!(
                     "({{ id: string; }}) & (string | number | boolean | null | unknown[] | {{ left: unknown; [key: string]: unknown; }} | string | number | boolean | null | unknown[] | {{ right: unknown; [key: string]: unknown; }}){}",
                     if keyword == "oneOf" {
-                        " /* oneOf: exactly one branch must match; consult JSON Schema */"
+                        " /* oneOf: exactly one branch must match */"
                     } else {
                         ""
                     }
@@ -826,6 +1133,7 @@ mod tests {
         ] {
             let mut budget = RenderBudget {
                 active_refs: HashSet::new(),
+                fragments: Vec::new(),
                 nodes,
                 depth,
                 bytes,

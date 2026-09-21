@@ -128,15 +128,14 @@ impl Session {
         turn_context: &TurnContext,
         environments: &TurnEnvironmentSnapshot,
         selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
-    ) -> Arc<McpRuntimeSnapshot> {
+    ) -> codex_protocol::error::Result<Arc<McpRuntimeSnapshot>> {
         let available_environment_ids =
             Self::available_selected_environment_ids(selected_capability_roots);
         loop {
             let expected_runtime = self.services.latest_mcp_runtime();
             if expected_runtime.available_environment_ids() == available_environment_ids {
-                return expected_runtime;
+                return Ok(expected_runtime);
             }
-
             let mcp_projection = self
                 .services
                 .mcp_manager
@@ -154,7 +153,7 @@ impl Session {
                 };
                 let current = self.services.latest_mcp_runtime();
                 if current.available_environment_ids() == available_environment_ids {
-                    return current;
+                    return Ok(current);
                 }
                 if !Arc::ptr_eq(&current, &expected_runtime) {
                     continue;
@@ -183,17 +182,28 @@ impl Session {
                     // but the projected servers and connectors do not, advance the input key without
                     // replacing the live manager and restarting its processes.
                     let mut state_owner = self.state.lock().await;
-                    return self.services.publish_mcp_runtime_reusing_manager(
+                    return Ok(self.services.publish_mcp_runtime_reusing_manager(
                         &mut state_owner,
                         Arc::new(current.config().clone()),
                         mcp_projection.plugins_available,
                         current.runtime_context().clone(),
                         available_environment_ids,
                         current.as_ref(),
-                    );
+                    ));
                 }
                 current
             };
+            // Cancellation only blocks a refresh that must start a new manager.
+            // Environment-only changes above can still reuse a coherent manager.
+            if self
+                .services
+                .mcp_startup_cancellation_token
+                .lock()
+                .await
+                .is_cancelled()
+            {
+                return Err(codex_protocol::error::CodexErr::TurnAborted);
+            }
             let runtime = self
                 .refresh_mcp_servers_inner(
                     turn_context,
@@ -204,7 +214,7 @@ impl Session {
                 )
                 .await;
             if runtime.available_environment_ids() == available_environment_ids {
-                return runtime;
+                return Ok(runtime);
             }
             // A concurrent refresh published a projection for a different environment while this
             // candidate was starting. Rebuild from that publication instead of returning an MCP

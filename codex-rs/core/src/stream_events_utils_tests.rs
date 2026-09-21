@@ -435,7 +435,7 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
 
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());
-    ctx.response_item_recorder.flush().await;
+    ctx.response_item_recorder.flush().await.unwrap();
     let history = session.clone_history().await;
     let [
         ResponseItem::ToolSearchCall {
@@ -449,6 +449,7 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
             tools,
             ..
         },
+        failure_detail,
     ] = history.raw_items()
     else {
         panic!("expected a tool_search call followed by its failure output")
@@ -457,6 +458,18 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     assert_eq!(output_call_id, request_call_id);
     assert_eq!(status, "incomplete");
     assert_eq!(execution, "client");
+    assert!(crate::parse_turn_item(failure_detail).is_none());
+    let ResponseItem::Message { role, content, .. } = failure_detail else {
+        panic!("expected recovery context alongside the native failure output");
+    };
+    assert_eq!(role, "user");
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("expected a bounded failure explanation");
+    };
+    assert!(text.contains("search-malformed"));
+    assert!(text.contains("failed to parse tool_search arguments"));
+    assert!(text.contains("expected a string"));
+    assert!(text.contains("kind=\"untrusted\""));
     assert!(
         tools.is_empty(),
         "failed searches must not publish invalid tool declarations"
@@ -714,7 +727,67 @@ async fn completed_tool_call_auxiliary_persistence_does_not_block_dispatch() {
     release_auxiliary
         .send(())
         .expect("auxiliary persistence blocker should still be active");
-    flush.await;
+    flush.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_required_publication_prevents_tool_execution() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session.close_durable_history_commit_gate_for_test();
+    let started = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(PersistenceProbeHandler {
+        started: Arc::clone(&started),
+    }) as Arc<dyn CoreToolRuntime>;
+    let router = Arc::new(ToolRouter::from_parts(
+        ToolRegistry::from_tools([handler]),
+        Vec::new(),
+    ));
+    let step = StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router);
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn),
+        turn_store: Arc::new(ExtensionData::new(turn.sub_id.clone())),
+        tool_runtime: ToolCallRuntime::new(
+            Arc::clone(&session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        ),
+        cancellation_token: CancellationToken::new(),
+        response_item_recorder: OrderedResponseItemRecorder::default(),
+    };
+    let mut eager_prefix_open = true;
+    let output = handle_output_item_done(
+        &mut ctx,
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "persistence_probe".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "rejected-publication".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        None,
+        &mut eager_prefix_open,
+    )
+    .await
+    .unwrap();
+    let result = output
+        .tool_future
+        .expect("tool future")
+        .into_future()
+        .await
+        .result;
+    assert!(
+        matches!(result, Err(CodexErr::Fatal(message)) if message.contains("commit gate is closed"))
+    );
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "history rejection must prevent the actual handler from running"
+    );
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(ctx.response_item_recorder.flush().await.is_err());
 }
 
 #[tokio::test]
@@ -808,7 +881,7 @@ async fn exact_tool_call_replay_is_deduplicated_but_conflicting_reuse_is_rejecte
     );
     assert!(!started.load(Ordering::SeqCst));
 
-    ctx.response_item_recorder.flush().await;
+    ctx.response_item_recorder.flush().await.unwrap();
     let history = session.clone_history().await;
     assert_eq!(history.raw_items().len(), 1);
     let closure = turn_context.turn_timing_state.tool_closure_snapshot();
@@ -914,4 +987,48 @@ fn completed_item_keeps_mailbox_delivery_open_for_commentary_messages() {
     assert!(!completed_item_defers_mailbox_delivery_to_next_turn(
         &item, /*plan_mode*/ false,
     ));
+}
+
+#[tokio::test]
+async fn audit_reports_17_19_terminal_generation_rejects_tools_before_acceptance() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    let step_context = step_context.with_tool_router_for_test(router);
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker)
+        .with_terminal_completion_only(true);
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_string(),
+        namespace: None,
+        arguments: r#"{"cmd":"echo should-not-run"}"#.to_string(),
+        call_id: "denied".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut ctx = HandleOutputCtx {
+        sess: session,
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+        response_item_recorder: OrderedResponseItemRecorder::default(),
+    };
+
+    let result = handle_output_item_done(&mut ctx, item, None, &mut true).await;
+    assert!(matches!(result, Err(CodexErr::Fatal(message)) if message.contains("terminal-only")));
+    assert!(ctx.sess.clone_history().await.raw_items().is_empty());
 }

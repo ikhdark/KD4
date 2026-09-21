@@ -158,7 +158,10 @@ fn should_wait_for_connection_recovery(
 ) -> bool {
     matches!(request, ResponsesStreamRequest::Sampling)
         && matches!(err, CodexErr::ConnectionFailed(_))
-        && !session_source.is_internal()
+        && matches!(
+            session_source,
+            SessionSource::Cli | SessionSource::VSCode | SessionSource::Mcp
+        )
         && !provider.is_amazon_bedrock()
 }
 

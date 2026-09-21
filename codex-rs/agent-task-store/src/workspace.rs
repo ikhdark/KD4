@@ -81,7 +81,7 @@ pub(crate) async fn capture_revision(
     paths: Vec<String>,
 ) -> StoreResult<WorkspaceRevision> {
     let mut transaction = pool.begin().await?;
-    let revision = capture_revision_tx(&mut transaction, repo_root, paths).await?;
+    let revision = capture_revision_tx(&mut transaction, repo_root, paths, false).await?;
     transaction.commit().await?;
     Ok(revision)
 }
@@ -90,6 +90,7 @@ pub(crate) async fn capture_revision_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     repo_root: &Path,
     paths: Vec<String>,
+    require_complete: bool,
 ) -> StoreResult<WorkspaceRevision> {
     let repo_root = repo_root.to_path_buf();
     let (repository, normalized) = tokio::task::spawn_blocking(move || {
@@ -108,10 +109,11 @@ pub(crate) async fn capture_revision_tx(
         .await?;
     let root = repository.canonical_root.clone();
     let snapshot_paths = normalized.clone();
-    let mut capture =
-        tokio::task::spawn_blocking(move || collect_manifest_entries(&root, &snapshot_paths))
-            .await
-            .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
+    let mut capture = tokio::task::spawn_blocking(move || {
+        collect_manifest_entries(&root, &snapshot_paths, require_complete)
+    })
+    .await
+    .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
     #[cfg(test)]
     pause_test_workspace_capture().await;
     let epoch =
@@ -476,14 +478,18 @@ struct ManifestCapture {
     excluded_path_count: u64,
 }
 
-fn collect_manifest_entries(root: &Path, paths: &[String]) -> StoreResult<ManifestCapture> {
+fn collect_manifest_entries(
+    root: &Path,
+    paths: &[String],
+    require_complete: bool,
+) -> StoreResult<ManifestCapture> {
     let mut files = BTreeSet::new();
     let mut repository_wide = false;
     let mut provenance = CaptureProvenance::explicit();
     for path in paths {
         if path == REPOSITORY_WIDE_PATH {
             repository_wide = true;
-            provenance = collect_repository_overlay_files(root, &mut files)?;
+            provenance = collect_repository_overlay_files(root, &mut files, require_complete)?;
             continue;
         }
         let absolute = absolute_repo_path(root, path);
@@ -551,6 +557,7 @@ impl CaptureProvenance {
 fn collect_repository_overlay_files(
     root: &Path,
     files: &mut BTreeSet<String>,
+    require_complete: bool,
 ) -> StoreResult<CaptureProvenance> {
     // Non-Git directories have a filesystem capture contract. Failed Git discovery
     // retains incomplete provenance instead of silently broadening the capture.
@@ -568,12 +575,18 @@ fn collect_repository_overlay_files(
             excluded_path_count,
         });
     }
-    collect_repository_overlay_files_with(root, files, spawn_repository_overlay_command)
+    collect_repository_overlay_files_with(
+        root,
+        files,
+        require_complete,
+        spawn_repository_overlay_command,
+    )
 }
 
 fn collect_repository_overlay_files_with(
     root: &Path,
     files: &mut BTreeSet<String>,
+    require_complete: bool,
     mut spawn: impl FnMut(&Path, &[&str]) -> std::io::Result<Child>,
 ) -> StoreResult<CaptureProvenance> {
     let tracked = spawn(
@@ -581,8 +594,24 @@ fn collect_repository_overlay_files_with(
         &["diff", "--name-only", "-z", "--no-ext-diff", "HEAD", "--"],
     );
     let untracked = spawn(root, &["ls-files", "--others", "--exclude-standard", "-z"]);
-    let tracked = tracked.and_then(Child::wait_with_output);
+    let mut tracked = tracked.and_then(Child::wait_with_output);
     let untracked = untracked.and_then(Child::wait_with_output);
+    // An unborn branch has no HEAD tree to diff. Its entire index is input.
+    if tracked
+        .as_ref()
+        .is_ok_and(|output| !output.status.success())
+    {
+        let head = spawn(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+            .and_then(Child::wait_with_output);
+        let symbolic =
+            spawn(root, &["symbolic-ref", "--quiet", "HEAD"]).and_then(Child::wait_with_output);
+        if head.is_ok_and(|output| !output.status.success())
+            && symbolic.is_ok_and(|output| output.status.success())
+        {
+            tracked =
+                spawn(root, &["ls-files", "--cached", "-z"]).and_then(Child::wait_with_output);
+        }
+    }
     if let (Ok(tracked), Ok(untracked)) = (tracked, untracked)
         && tracked.status.success()
         && untracked.status.success()
@@ -612,6 +641,11 @@ fn collect_repository_overlay_files_with(
         });
     }
 
+    if require_complete {
+        return Err(StoreError::CorruptData(
+            "Git overlay discovery failed; complete validation capture unavailable".to_string(),
+        ));
+    }
     let mut excluded_path_count = 0;
     collect_repository_files_fallback(root, root, files, &mut excluded_path_count)?;
     Ok(CaptureProvenance {
@@ -1201,7 +1235,7 @@ mod overlay_observation_tests {
         let mut files = BTreeSet::new();
 
         let provenance =
-            collect_repository_overlay_files_with(temp.path(), &mut files, |_root, args| {
+            collect_repository_overlay_files_with(temp.path(), &mut files, false, |_root, args| {
                 let role = if args.first() == Some(&"diff") {
                     "tracked"
                 } else {
@@ -1241,6 +1275,22 @@ mod overlay_observation_tests {
             git_relative_path_identity(b"build/source.rs").expect("Git path is represented"),
             "build/source.rs"
         );
+    }
+
+    #[test]
+    fn strict_discovery_failure_does_not_collect_fallback_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("must-not-be-read"), "contents").unwrap();
+        let mut files = BTreeSet::new();
+        let result =
+            collect_repository_overlay_files_with(root.path(), &mut files, true, |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing git",
+                ))
+            });
+        assert!(result.is_err());
+        assert!(files.is_empty());
     }
 
     #[test]

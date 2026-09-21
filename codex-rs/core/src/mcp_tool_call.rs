@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -7,7 +6,7 @@ use crate::config::Config;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::hook_runtime::run_permission_request_hooks;
-use crate::mcp_openai_file::rewrite_mcp_tool_arguments_for_openai_files;
+use crate::mcp_openai_file::prepare_mcp_tool_arguments_for_openai_files;
 use crate::mcp_tool_approval_templates::RenderedMcpToolApprovalParam;
 use crate::mcp_tool_approval_templates::render_mcp_tool_approval_template;
 use crate::session::session::Session;
@@ -72,8 +71,6 @@ use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rollout::state_integration;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::truncate_text;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use rmcp::model::ToolAnnotations;
@@ -107,6 +104,8 @@ const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 // Dropping the in-flight request stops local work, but the MCP transport does not
 // currently provide an acknowledgement that the remote server stopped too.
+const MCP_TOOL_CALL_NOT_DISPATCHED_MESSAGE: &str =
+    "MCP tool call aborted by user before dispatch; the remote tool was not invoked";
 const MCP_TOOL_CALL_CANCELLED_MESSAGE: &str =
     "MCP tool call cancellation requested; remote completion status is unknown";
 
@@ -149,7 +148,9 @@ pub(crate) async fn handle_mcp_tool_call(
 
     if cancellation_token.is_cancelled() {
         return HandledMcpToolCall {
-            result: CallToolResult::from_error_text(MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string()),
+            result: CallToolResult::from_error_text(
+                MCP_TOOL_CALL_NOT_DISPATCHED_MESSAGE.to_string(),
+            ),
             tool_input: arguments_value
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
@@ -203,7 +204,7 @@ pub(crate) async fn handle_mcp_tool_call(
         _ = cancellation_token.cancelled() => {
             return HandledMcpToolCall {
                 result: CallToolResult::from_error_text(
-                    MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string(),
+                    MCP_TOOL_CALL_NOT_DISPATCHED_MESSAGE.to_string(),
                 ),
                 tool_input: arguments_value
                     .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
@@ -221,19 +222,46 @@ pub(crate) async fn handle_mcp_tool_call(
         let annotations = metadata
             .as_ref()
             .and_then(|metadata| metadata.annotations.as_ref());
-        AppToolPolicyEvaluator::new(&turn_context.config.config_layer_stack).policy(
-            AppToolPolicyInput {
-                connector_id: metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.connector_id.as_deref()),
-                tool_name: &tool_name,
-                tool_title: metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.tool_title.as_deref()),
-                destructive_hint: annotations.and_then(|annotations| annotations.destructive_hint),
-                open_world_hint: annotations.and_then(|annotations| annotations.open_world_hint),
-            },
-        )
+        let evaluator = match AppToolPolicyEvaluator::new(&turn_context.config.config_layer_stack) {
+            Ok(evaluator) => evaluator,
+            Err(error) => {
+                let result = notify_mcp_tool_call_skip(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &call_id,
+                    invocation,
+                    item_metadata.clone(),
+                    format!("MCP tool call blocked: {error}"),
+                    false,
+                )
+                .await;
+                emit_mcp_call_metrics(
+                    turn_context.as_ref(),
+                    &McpCallMetricOutcome::from_status("error"),
+                    &server,
+                    &tool_name,
+                    connector_id.as_deref(),
+                    connector_name.as_deref(),
+                    None,
+                );
+                return HandledMcpToolCall {
+                    result: CallToolResult::from_result(result),
+                    tool_input: arguments_value
+                        .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+                };
+            }
+        };
+        evaluator.policy(AppToolPolicyInput {
+            connector_id: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.connector_id.as_deref()),
+            tool_name: &tool_name,
+            tool_title: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.tool_title.as_deref()),
+            destructive_hint: annotations.and_then(|annotations| annotations.destructive_hint),
+            open_world_hint: annotations.and_then(|annotations| annotations.open_world_hint),
+        })
     } else {
         AppToolPolicy::default()
     };
@@ -278,20 +306,12 @@ pub(crate) async fn handle_mcp_tool_call(
         .clone()
         .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
     let operation_invocation = invocation.clone();
+    let dispatched = std::sync::atomic::AtomicBool::new(false);
     let operation = async {
         let approval_mode = if server == CODEX_APPS_MCP_SERVER_NAME {
             app_tool_policy.approval
-        } else if let Some(approval_mode) = {
-            // Selected-plugin registrations are absent from config.toml and the legacy plugin manager,
-            // so their resolved catalog entry is the authoritative source for tool approval policy.
-            manager
-                .is_selected_plugin_mcp_server(&server)
-                .then(|| manager.tool_approval_mode(&server, &tool_name))
-        } {
-            approval_mode
         } else {
-            custom_mcp_tool_approval_mode(sess.as_ref(), turn_context.as_ref(), &server, &tool_name)
-                .await
+            manager.tool_approval_mode(&server, &tool_name)
         };
 
         if let Some(decision) = maybe_request_mcp_tool_approval(
@@ -331,6 +351,7 @@ pub(crate) async fn handle_mcp_tool_call(
             operation_invocation,
             &live_tool_info,
             metadata.as_ref(),
+            &dispatched,
         )
         .await
     };
@@ -341,6 +362,7 @@ pub(crate) async fn handle_mcp_tool_call(
         _ = cancellation_token.cancelled() => McpToolCallOutcome::cancelled(
             default_tool_input.clone(),
             lifecycle_started.elapsed(),
+            dispatched.load(std::sync::atomic::Ordering::Acquire),
         ),
         outcome = &mut operation => outcome,
     };
@@ -425,9 +447,14 @@ impl McpToolCallOutcome {
         }
     }
 
-    fn cancelled(tool_input: JsonValue, duration: Duration) -> Self {
+    fn cancelled(tool_input: JsonValue, duration: Duration, dispatched: bool) -> Self {
         Self {
-            result: Err(MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string()),
+            result: Err(if dispatched {
+                MCP_TOOL_CALL_CANCELLED_MESSAGE
+            } else {
+                MCP_TOOL_CALL_NOT_DISPATCHED_MESSAGE
+            }
+            .to_string()),
             tool_input,
             duration,
             metric_duration: Some(duration),
@@ -481,6 +508,7 @@ async fn execute_approved_mcp_tool_call(
     invocation: McpInvocation,
     tool_info: &ToolInfo,
     metadata: Option<&McpToolApprovalMetadata>,
+    dispatched: &std::sync::atomic::AtomicBool,
 ) -> McpToolCallOutcome {
     let turn_context = step_context.turn.as_ref();
     let manager = step_context.mcp.manager();
@@ -493,7 +521,7 @@ async fn execute_approved_mcp_tool_call(
     let server_origin = tool_info.server_origin.as_deref();
 
     let start = Instant::now();
-    let rewrite = rewrite_mcp_tool_arguments_for_openai_files(
+    let rewrite = prepare_mcp_tool_arguments_for_openai_files(
         sess,
         step_context,
         arguments_value.clone(),
@@ -501,8 +529,8 @@ async fn execute_approved_mcp_tool_call(
     )
     .await;
     let tool_input = match &rewrite {
-        Ok(Some(rewritten_arguments)) => rewritten_arguments.clone(),
-        Ok(None) | Err(_) => arguments_value
+        Ok(prepared) if prepared.arguments.is_some() => prepared.arguments.clone().unwrap(),
+        Ok(_) | Err(_) => arguments_value
             .clone()
             .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
     };
@@ -519,6 +547,7 @@ async fn execute_approved_mcp_tool_call(
                 rewritten_arguments,
                 metadata,
                 request_meta,
+                dispatched,
             )
             .await
         }
@@ -673,9 +702,10 @@ async fn execute_mcp_tool_call(
     step_context: &StepContext,
     call_id: &str,
     invocation: &McpInvocation,
-    rewritten_arguments: Option<JsonValue>,
+    rewritten_arguments: crate::mcp_openai_file::PreparedOpenAiArguments,
     metadata: Option<&McpToolApprovalMetadata>,
     request_meta: Option<JsonValue>,
+    dispatched: &std::sync::atomic::AtomicBool,
 ) -> Result<ExecutedMcpToolCall, String> {
     let turn_context = step_context.turn.as_ref();
     let manager = step_context.mcp.manager();
@@ -703,11 +733,12 @@ async fn execute_mcp_tool_call(
     let request_meta =
         with_tool_call_progress_token_meta(request_meta, turn_context.sub_id.as_str(), call_id);
     let tool_execution_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
+    dispatched.store(true, std::sync::atomic::Ordering::Release);
     let result = manager
         .call_tool(
             &invocation.server,
             &invocation.tool,
-            rewritten_arguments,
+            rewritten_arguments.dispatched(),
             request_meta,
         )
         .await;
@@ -936,148 +967,98 @@ fn truncate_mcp_tool_result_for_event(
     result: &Result<CallToolResult, String>,
 ) -> Result<CallToolResult, String> {
     match result {
-        Ok(call_tool_result) => {
-            // The app-server rebuilds `ThreadItem::McpToolCall` from this item,
-            // so avoid persisting multi-megabyte results in rollout storage.
-            let mut writer = CappedMcpEventResultWriter::new(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES);
-            let serialized = serde_json::to_writer(&mut writer, call_tool_result);
-            if serialized.is_err() || !writer.exceeded_limit() {
-                return Ok(call_tool_result.clone());
+        Ok(result) => {
+            let mut budget = EventPreviewBudget {
+                bytes: MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES / 8,
+                nodes: 512,
+                truncated: false,
+            };
+            let mut content = Vec::new();
+            for block in &result.content {
+                if budget.nodes == 0 || budget.bytes == 0 {
+                    budget.truncated = true;
+                    break;
+                }
+                content.push(budget.project(block, 0));
             }
-
-            // A huge MCP result can put bytes in `content`, `structuredContent`,
-            // or `_meta`. Collapse the event copy to a text preview of the whole
-            // serialized result so the UI still has useful context without
-            // preserving a multi-megabyte structured payload.
-            //
-            // This budget applies to the preview text, not the final event JSON.
-            // The preview is itself serialized into a JSON string, so quotes and
-            // backslashes can be escaped again and the stored event may end up
-            // somewhat larger than this byte budget.
-            let truncated = writer.into_truncated_preview();
+            let structured = result
+                .structured_content
+                .as_ref()
+                .map(|value| budget.project(value, 0));
+            let meta = result.meta.as_ref().map(|value| budget.project(value, 0));
+            if !budget.truncated {
+                return Ok(result.clone());
+            }
+            let preview = serde_json::json!({
+                "content": content, "structuredContent": structured, "_meta": meta,
+                "notice": "event preview truncated; original tool result retained",
+            })
+            .to_string();
             Ok(CallToolResult {
-                content: vec![serde_json::json!({
-                    "type": "text",
-                    "text": truncated,
-                })],
+                content: vec![serde_json::json!({"type": "text", "text": preview})],
                 structured_content: None,
-                is_error: call_tool_result.is_error,
+                is_error: result.is_error,
                 meta: None,
             })
         }
-        Err(message) => Err(truncate_text(
-            message,
-            TruncationPolicy::Bytes(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES),
-        )),
+        Err(message) if message.len() > MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES => {
+            let end = message.floor_char_boundary(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES);
+            Err(format!("{} [event error truncated]", &message[..end]))
+        }
+        Err(message) => Err(message.clone()),
     }
 }
 
-struct CappedMcpEventResultWriter {
-    prefix: Vec<u8>,
-    suffix: VecDeque<u8>,
-    limit: usize,
-    total_bytes: usize,
-    total_chars: usize,
+// Bound traversal before serialization, including objects, keys, strings and
+// nesting. In particular, never scan an entire base64 body or count omitted
+// characters simply to display an event preview.
+struct EventPreviewBudget {
+    bytes: usize,
+    nodes: usize,
+    truncated: bool,
 }
 
-impl CappedMcpEventResultWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            prefix: Vec::new(),
-            suffix: VecDeque::new(),
-            limit,
-            total_bytes: 0,
-            total_chars: 0,
+impl EventPreviewBudget {
+    fn text(&mut self, value: &str) -> String {
+        let end = value.floor_char_boundary(self.bytes.min(value.len()));
+        self.bytes -= end;
+        self.truncated |= end != value.len();
+        value[..end].to_string()
+    }
+
+    fn project(&mut self, value: &JsonValue, depth: usize) -> JsonValue {
+        if self.nodes == 0 || self.bytes == 0 || depth == 16 {
+            self.truncated = true;
+            return JsonValue::Null;
         }
-    }
-
-    fn exceeded_limit(&self) -> bool {
-        self.total_bytes > self.limit
-    }
-
-    fn prefix_limit(&self) -> usize {
-        self.limit / 2
-    }
-
-    fn suffix_limit(&self) -> usize {
-        self.limit.saturating_sub(self.prefix_limit())
-    }
-
-    fn into_truncated_preview(mut self) -> String {
-        let valid_prefix_len = match std::str::from_utf8(&self.prefix) {
-            Ok(_) => self.prefix.len(),
-            Err(error) => error.valid_up_to(),
-        };
-        self.prefix.truncate(valid_prefix_len);
-
-        let suffix_target = self.total_bytes.saturating_sub(self.suffix_limit());
-        let suffix_buffer_start = self.total_bytes.saturating_sub(self.suffix.len());
-        let mut suffix_start = suffix_target.saturating_sub(suffix_buffer_start);
-        while self
-            .suffix
-            .get(suffix_start)
-            .is_some_and(|byte| *byte & 0b1100_0000 == 0b1000_0000)
-        {
-            suffix_start = suffix_start.saturating_add(1);
-        }
-
-        let prefix = String::from_utf8(self.prefix).unwrap_or_default();
-        let suffix_bytes = self.suffix.into_iter().collect::<Vec<_>>();
-        let suffix = std::str::from_utf8(&suffix_bytes[suffix_start..]).unwrap_or_default();
-        let kept_chars = prefix
-            .chars()
-            .count()
-            .saturating_add(suffix.chars().count());
-        let removed_chars = self.total_chars.saturating_sub(kept_chars);
-        let removed_chars = u64::try_from(removed_chars).unwrap_or(u64::MAX);
-        let marker = format!("…{removed_chars} chars truncated…");
-
-        let mut preview = String::with_capacity(prefix.len() + marker.len() + suffix.len());
-        preview.push_str(&prefix);
-        preview.push_str(&marker);
-        preview.push_str(suffix);
-        preview
-    }
-}
-
-impl std::io::Write for CappedMcpEventResultWriter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.total_bytes = self.total_bytes.saturating_add(buffer.len());
-        self.total_chars = self.total_chars.saturating_add(
-            buffer
-                .iter()
-                .filter(|byte| **byte & 0b1100_0000 != 0b1000_0000)
-                .count(),
-        );
-
-        let prefix_remaining = self.prefix_limit().saturating_sub(self.prefix.len());
-        if prefix_remaining > 0 {
-            self.prefix
-                .extend_from_slice(&buffer[..buffer.len().min(prefix_remaining)]);
-        }
-
-        let suffix_limit = self.suffix_limit();
-        if suffix_limit > 0 {
-            if buffer.len() >= suffix_limit {
-                self.suffix.clear();
-                self.suffix
-                    .extend(buffer[buffer.len() - suffix_limit..].iter().copied());
-            } else {
-                let excess = self
-                    .suffix
-                    .len()
-                    .saturating_add(buffer.len())
-                    .saturating_sub(suffix_limit);
-                drop(self.suffix.drain(..excess));
-                self.suffix.extend(buffer.iter().copied());
+        self.nodes -= 1;
+        match value {
+            JsonValue::String(text) => JsonValue::String(self.text(text)),
+            JsonValue::Array(values) => {
+                let mut output = Vec::new();
+                for value in values {
+                    if self.nodes == 0 || self.bytes == 0 {
+                        self.truncated = true;
+                        break;
+                    }
+                    output.push(self.project(value, depth + 1));
+                }
+                JsonValue::Array(output)
             }
+            JsonValue::Object(values) => {
+                let mut output = serde_json::Map::new();
+                for (key, value) in values {
+                    if self.nodes == 0 || self.bytes == 0 {
+                        self.truncated = true;
+                        break;
+                    }
+                    let key = self.text(key);
+                    output.insert(key, self.project(value, depth + 1));
+                }
+                JsonValue::Object(output)
+            }
+            value => value.clone(),
         }
-
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -1229,35 +1210,23 @@ const MCP_TOOL_PLUGIN_ID_META_KEY: &str = "plugin_id";
 const MCP_TOOL_TEMPLATE_ID_META_KEY: &str = "template_id";
 const MCP_TOOL_RESOURCE_URI_META_KEY: &str = "resource_uri";
 
+#[cfg(test)]
 async fn custom_mcp_tool_approval_mode(
     sess: &Session,
     turn_context: &TurnContext,
     server: &str,
     tool_name: &str,
 ) -> AppToolApproval {
-    let user_configured_mode =
-        configured_mcp_tool_approval_mode(turn_context.config.mcp_servers.get(), server, tool_name);
-    if let Some(user_configured_mode) = user_configured_mode {
-        return user_configured_mode;
-    }
-
-    sess.services
-        .plugins_manager
-        .plugins_for_config(&turn_context.config.plugins_config_input())
-        .await
-        .plugins()
-        .iter()
-        .filter(|plugin| plugin.is_active())
-        .find_map(|plugin| {
-            let server_config = plugin.mcp_servers.get(server)?;
-            server_config
-                .tools
-                .get(tool_name)
-                .and_then(|tool| tool.approval_mode)
-                .or(server_config.default_tools_approval_mode)
-        })
-        .unwrap_or_default()
+    let config = sess
+        .services
+        .mcp_manager
+        .runtime_config(&turn_context.config)
+        .await;
+    let servers = codex_mcp::configured_mcp_servers(&config);
+    configured_mcp_tool_approval_mode(&servers, server, tool_name).unwrap_or_default()
 }
+
+#[cfg(test)]
 
 fn configured_mcp_tool_approval_mode(
     servers: &HashMap<String, codex_config::types::McpServerConfig>,

@@ -259,6 +259,7 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
     );
     let catalog = provider
         .list(SkillListQuery {
+            continuation: None,
             turn_id: "turn-1".to_string(),
             executor_roots: ["root-a", "root-b"]
                 .into_iter()

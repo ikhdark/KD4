@@ -242,6 +242,45 @@ async fn handle_spawn_agent(
             "spawned agent is missing a canonical task name".to_string(),
         )
     })?;
+    if typed_role == AgentRole::Explorer
+        && let Some(assignment) = args.assignment.as_ref()
+        && assignment.workspace_strategy != WorkspaceStrategy::Isolated
+    {
+        let coordinator = session.services.agent_control.task_coordinator();
+        if coordinator.store().is_none() {
+            coordinator
+                .initialize_for_workspace_coordination(
+                    session.services.state_db.clone(),
+                    config.sqlite_home.clone(),
+                    config.model_provider_id.clone(),
+                    session.services.agent_control.session_id().to_string(),
+                )
+                .await
+                .map_err(typed_task_store_error)?;
+        }
+        if let (Some(store), Some(root)) = (coordinator.store(), coordinator.root_session_id()) {
+            let cwd = match turn.environments.primary() {
+                Some(environment) => environment
+                    .cwd()
+                    .to_abs_path()
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                    .to_path_buf(),
+                None => turn.config.cwd.to_path_buf(),
+            };
+            let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+            if let Some(existing) = store
+                .reusable_explorer_assignment(
+                    &repo_root,
+                    assignment.clone().into_draft(root, typed_role),
+                )
+                .await
+                .map_err(typed_task_store_error)?
+            {
+                emit_admission_reuse_metric(&turn.session_telemetry);
+                return reusable_spawn_result(coordinator, existing).await;
+            }
+        }
+    }
     // Typed spawns reserve execution, registry identity, and V2 residency before any
     // worktree or durable assignment preparation. The token holds only logical RAII
     // reservations; all synchronization guards used to create it have already been released.
@@ -505,6 +544,17 @@ async fn handle_spawn_agent(
     } else {
         None
     };
+    if let Some((assignment, _, _)) = typed_task.as_ref()
+        && assignment.admission_origin == AssignmentAdmissionOrigin::Typed
+    {
+        // Capsule and history forks share the same receipt lifecycle. Keep it in the
+        // child configuration so the canonical capsule payload remains unchanged.
+        let instructions = config.developer_instructions.get_or_insert_default();
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(TYPED_RECEIPT_LIFECYCLE);
+    }
     let options = SpawnAgentOptions {
         fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
         fork_mode,
@@ -1441,7 +1491,7 @@ impl SpawnAgentArgs {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TypedAssignmentArgs {
     objective: String,
@@ -1508,8 +1558,7 @@ fn legacy_message_draft(
         objective: message.to_string(),
         acceptance_criteria: vec![AcceptanceCriterion {
             id: "legacy-message-result".to_string(),
-            text: "Return a concrete result for the requested task to the parent agent."
-                .to_string(),
+            text: "Return a final response for the requested task to the parent agent.".to_string(),
         }],
         read_scope: Vec::new(),
         write_scope: vec![RepoScope {
@@ -1520,7 +1569,7 @@ fn legacy_message_draft(
             .to_string(),
         dependencies: Vec::new(),
         risk_hints: Vec::new(),
-        required_evidence: vec!["task result reported to the parent agent".to_string()],
+        required_evidence: Vec::new(),
         prohibited_changes: Vec::new(),
         contract_claims: Vec::new(),
         workspace_strategy: WorkspaceStrategy::Shared,
@@ -1709,7 +1758,18 @@ fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallE
     }
 }
 
+const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Use apply_patch for source edits so mutation evidence is captured. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment.";
+
 fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> String {
+    if matches!(
+        assignment.admission_origin,
+        AssignmentAdmissionOrigin::LegacyMessage { .. }
+    ) {
+        return format!(
+            "{}\n\nReturn your result in the final response. The host records the outcome; no receipt tool call is required.",
+            assignment.objective
+        );
+    }
     let integration_directive = match assignment.integration_plan {
         IntegrationPlan::SingleWriter => {
             "Integration plan: single_writer; you own the bounded write scope."
@@ -1722,7 +1782,7 @@ fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> Strin
         }
     };
     format!(
-        "You have a durable typed assignment. assignment_id={} attempt_id={}. Objective: {} {} Use get_agent_task with this assignment_id for the complete contract and captured validation call ids. Use apply_patch for source edits so mutation evidence is captured, then submit_agent_receipt before finishing.",
+        "You have a durable typed assignment. assignment_id={} attempt_id={}. Objective: {} {}",
         assignment.assignment_id, attempt.attempt_id, assignment.objective, integration_directive
     )
 }
@@ -1787,7 +1847,10 @@ mod tests {
 
     #[test]
     fn task_store_failures_log_causes_without_exposing_them_to_the_model() {
-        super::super::store_error_tests::assert_error_reporting("spawn_agent", typed_task_store_error);
+        super::super::store_error_tests::assert_error_reporting(
+            "spawn_agent",
+            typed_task_store_error,
+        );
     }
 
     fn typed_assignment() -> TypedAssignmentArgs {
@@ -2015,5 +2078,56 @@ mod tests {
             args.fork_mode(AgentRole::Verifier, false),
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
+    }
+}
+
+#[cfg(test)]
+mod output_schema_tests {
+
+    #[test]
+    fn spawn_agent_schema_accepts_actual_visible_hidden_and_reused_results() {
+        use super::SpawnAgentResult;
+        use crate::tools::handlers::multi_agents_spec::spawn_agent_output_schema_v2;
+        use codex_agent_task_store::AttemptState;
+        use codex_agent_task_store::IntegrationPlan;
+        for hidden in [false, true] {
+            let schema = spawn_agent_output_schema_v2(hidden);
+            let validator = jsonschema::validator_for(&schema).unwrap();
+            let result = if hidden {
+                SpawnAgentResult::HiddenMetadata {
+                    task_name: "/root/task".into(),
+                    assignment_id: "assignment".into(),
+                    integration_plan: IntegrationPlan::SingleWriter,
+                }
+            } else {
+                SpawnAgentResult::WithNickname {
+                    task_name: "/root/task".into(),
+                    nickname: None,
+                    assignment_id: "assignment".into(),
+                    integration_plan: IntegrationPlan::SingleWriter,
+                }
+            };
+            let value = serde_json::to_value(result).unwrap();
+            assert!(validator.is_valid(&value));
+            let mut missing_plan = value.clone();
+            missing_plan
+                .as_object_mut()
+                .unwrap()
+                .remove("integration_plan");
+            assert!(!validator.is_valid(&missing_plan));
+            let reused = serde_json::to_value(SpawnAgentResult::Reused {
+                task_name: "/root/task".into(),
+                assignment_id: "assignment".into(),
+                attempt_id: "attempt".into(),
+                agent_path: None,
+                thread_id: None,
+                status: AttemptState::Active,
+                receipt_available: false,
+                integration_plan: IntegrationPlan::SingleWriter,
+                reused: true,
+            })
+            .unwrap();
+            assert!(validator.is_valid(&reused));
+        }
     }
 }

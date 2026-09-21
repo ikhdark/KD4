@@ -127,6 +127,13 @@ async fn run_websocket_listener(
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !bind_address.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the unauthenticated exec-server WebSocket listener requires a loopback address",
+        )
+        .into());
+    }
     let listener = TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
     let processor = ConnectionProcessor::new_with_telemetry(runtime_paths, telemetry);

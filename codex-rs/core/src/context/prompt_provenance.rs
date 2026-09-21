@@ -173,6 +173,41 @@ pub(crate) struct PromptProvenanceSidecar {
 }
 
 impl PromptProvenanceSidecar {
+    /// Extend attribution for a normalization-safe suffix without shifting the prefix.
+    pub(crate) fn with_appended_items(
+        &self,
+        items: &[ResponseItem],
+        manifest: &StableContextManifest,
+    ) -> Self {
+        let suffix = Self::from_assembled_items(items, manifest);
+        let mut aligned_items = self.aligned_items.to_vec();
+        aligned_items.extend(suffix.aligned_items.iter().cloned().zip(items).map(
+            |(mut provenance, item)| {
+                if matches!(item, ResponseItem::Message { .. }) {
+                    provenance.current_input = self
+                        .current_turn_id
+                        .as_deref()
+                        .is_some_and(|turn_id| item.turn_id() == Some(turn_id));
+                }
+                provenance
+            },
+        ));
+        let mut contributions_by_item = Arc::clone(&self.contributions_by_item);
+        if !suffix.contributions_by_item.is_empty() {
+            Arc::make_mut(&mut contributions_by_item).extend(
+                suffix
+                    .contributions_by_item
+                    .iter()
+                    .map(|(key, value)| (*key, Arc::clone(value))),
+            );
+        }
+        Self {
+            aligned_items: aligned_items.into(),
+            contributions_by_item,
+            ..self.clone()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn shares_contributions_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.contributions_by_item, &other.contributions_by_item)
@@ -201,17 +236,8 @@ impl PromptProvenanceSidecar {
         }
 
         let current_input_index = items.iter().rposition(|item| {
-            let ResponseItem::Message { role, content, .. } = item else {
-                return false;
-            };
-            role == "user"
-                && content.iter().any(|content| match content {
-                    ContentItem::InputText { text } => {
-                        let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
-                        !categories_by_content_hash.contains_key(&hash)
-                    }
-                    _ => true,
-                })
+            matches!(item, ResponseItem::Message { role, .. } if role == "user")
+                && crate::context_manager::is_user_turn_boundary(item)
         });
         let mut contributions_by_item = BTreeMap::new();
         let mut aligned_items = Vec::with_capacity(items.len());
@@ -228,7 +254,12 @@ impl PromptProvenanceSidecar {
                 .iter()
                 .map(|content| match content {
                     ContentItem::InputText { text } => {
-                        let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                        if categories_by_content_hash.is_empty()
+                            || crate::context_manager::is_user_turn_boundary(item)
+                        {
+                            return None;
+                        }
+                        let hash = category_lookup_hash(text);
                         categories_by_content_hash.get(&hash).copied().flatten()
                     }
                     _ => None,
@@ -290,10 +321,22 @@ impl PromptProvenanceSidecar {
         if fragments.is_empty() {
             return self.clone();
         }
+        let mut occurrences = HashMap::<&str, usize>::new();
+        for item in items {
+            if let ResponseItem::Message { role, content, .. } = item
+                && role == "developer"
+            {
+                for part in content {
+                    if let ContentItem::InputText { text } = part {
+                        *occurrences.entry(text.as_str()).or_default() += 1;
+                    }
+                }
+            }
+        }
         let mut contributions_by_item = Arc::clone(&self.contributions_by_item);
         let mut aligned_items = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
-            let ResponseItem::Message { content, .. } = item else {
+            let ResponseItem::Message { role, content, .. } = item else {
                 aligned_items.push(PromptItemProvenance::default());
                 continue;
             };
@@ -307,10 +350,12 @@ impl PromptProvenanceSidecar {
                 let ContentItem::InputText { text } = content_item else {
                     continue;
                 };
-                if let Some((_, category)) = fragments
-                    .iter()
-                    .rev()
-                    .find(|(fragment, _)| text.as_str() == *fragment)
+                if role == "developer"
+                    && occurrences.get(text.as_str()) == Some(&1)
+                    && let Some((_, category)) = fragments
+                        .iter()
+                        .rev()
+                        .find(|(fragment, _)| text.as_str() == *fragment)
                 {
                     categories[index] = Some(*category);
                     changed = true;
@@ -371,34 +416,58 @@ impl PromptProvenanceSidecar {
     /// Rebuild alignment only when transport fallback replay changes the
     /// assembled sequence. Canonical fingerprints are recovery hints here;
     /// ordinary requests retain occurrence-specific aligned attribution.
-    pub(crate) fn for_reprojected_items(&self, items: &[ResponseItem]) -> Self {
-        let aligned_items = items
+    pub(crate) fn for_reprojected_items(
+        &self,
+        original: &[ResponseItem],
+        items: &[ResponseItem],
+    ) -> Self {
+        if self.aligned_items.is_empty() {
+            return Self {
+                aligned_items: vec![PromptItemProvenance::default(); items.len()].into(),
+                ..self.clone()
+            };
+        }
+        // Fallback projection retains the order of equal messages. Carry each occurrence's
+        // aligned metadata from the actual source sequence, never a category per text value.
+        let offset = original.len().saturating_sub(self.aligned_items.len());
+        let mut origins = HashMap::<_, Vec<PromptItemProvenance>>::new();
+        for (index, item) in original.iter().enumerate() {
+            if let Some(fingerprint) = response_item_fingerprint(item) {
+                let provenance = index
+                    .checked_sub(offset)
+                    .and_then(|index| self.aligned_item(index))
+                    .cloned()
+                    .unwrap_or_default();
+                origins.entry(fingerprint).or_default().push(provenance);
+            }
+        }
+        let fingerprints = items
             .iter()
-            .map(|item| {
-                let ResponseItem::Message { content, .. } = item else {
+            .map(response_item_fingerprint)
+            .collect::<Vec<_>>();
+        let mut counts = HashMap::<_, usize>::new();
+        for fingerprint in fingerprints.iter().flatten() {
+            *counts.entry(*fingerprint).or_default() += 1;
+        }
+        let mut used = HashMap::<_, usize>::new();
+        let aligned_items = fingerprints
+            .into_iter()
+            .map(|fingerprint| {
+                let Some(fingerprint) = fingerprint else {
                     return PromptItemProvenance::default();
                 };
-                let fingerprint = if !self.contributions_by_item.is_empty()
-                    || (self.current_turn_id.is_none() && self.current_input_fingerprint.is_some())
-                {
-                    response_item_fingerprint(item)
-                } else {
-                    None
+                let Some(matches) = origins.get(&fingerprint) else {
+                    return PromptItemProvenance::default();
                 };
-                let current_input = if let Some(turn_id) = self.current_turn_id.as_deref() {
-                    item.turn_id() == Some(turn_id)
-                } else {
-                    self.current_input_fingerprint
-                        .zip(fingerprint)
-                        .is_some_and(|(expected, actual)| expected == actual)
-                };
-                PromptItemProvenance::new(
-                    fingerprint
-                        .and_then(|fingerprint| self.contributions_by_item.get(&fingerprint))
-                        .map(|categories| categories.to_vec())
-                        .unwrap_or_else(|| vec![None; content.len()]),
-                    current_input,
-                )
+                // If projection removed or added an indistinguishable occurrence, provenance is
+                // unresolved. Do not turn an older identical user request into current input.
+                if counts.get(&fingerprint) != Some(&matches.len()) {
+                    return PromptItemProvenance::default();
+                }
+                let index = used.entry(fingerprint).or_default();
+                let provenance = matches[*index].clone();
+                *index += 1;
+                provenance
             })
             .collect::<Vec<_>>();
         Self {
@@ -816,6 +885,12 @@ fn response_item_fingerprint(item: &ResponseItem) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
+fn category_lookup_hash(text: &str) -> [u8; 32] {
+    #[cfg(test)]
+    tests::CATEGORY_LOOKUP_BYTES.with(|count| count.set(count.get() + text.len()));
+    Sha256::digest(text.as_bytes()).into()
+}
+
 fn prompt_item_requires_fingerprint(
     categories: &[Option<PromptContextCategory>],
     current_input: bool,
@@ -875,6 +950,7 @@ mod tests {
     // Synchronous tests count real fingerprint work without timing thresholds
     // or interference from tests running on other threads.
     thread_local! {
+        pub(super) static CATEGORY_LOOKUP_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(super) static FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
@@ -970,10 +1046,10 @@ mod tests {
             "remember café & quotes \"here\"",
             PromptContextCategory::Memory,
         );
-        let mut replay = original;
+        let mut replay = original.clone();
         replay[0].clear_internal_chat_message_metadata_passthrough();
         replay.push(message("developer", "different context", None));
-        let recovered = sidecar.for_reprojected_items(&replay);
+        let recovered = sidecar.for_reprojected_items(&original, &replay);
         for measured in measure_both(&replay, &recovered) {
             assert_eq!(
                 measured.bytes(PromptContextCategory::Memory),
@@ -996,6 +1072,179 @@ mod tests {
         let categorized = CategorizedPromptFragment::from_extension(fragment.clone());
         assert_eq!(categorized.category(), PromptContextCategory::OtherInjected);
         assert_eq!(categorized.into_fragment(), fragment);
+    }
+
+    #[test]
+    fn replay_keeps_duplicate_occurrences_and_input_after_metadata_removal() {
+        let original = vec![
+            message("developer", "same", None),
+            message("developer", "same", None),
+            message("user", "continue", Some("old")),
+            message("user", "continue", Some("current")),
+        ];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &original,
+            &StableContextManifest::default(),
+        )
+        .with_response_item_category(&original, 1, PromptContextCategory::Memory);
+        let mut replay = vec![message("developer", "transport context", None)];
+        replay.extend(original.iter().cloned());
+        for item in &mut replay {
+            item.clear_internal_chat_message_metadata_passthrough();
+        }
+        let before = serde_json::to_vec(&replay).unwrap();
+        let recovered = sidecar.for_reprojected_items(&original, &replay);
+        for measured in measure_both(&replay, &recovered) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::Memory),
+                item_bytes(&replay[2])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::History),
+                item_bytes(&replay[3])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&replay[4])
+            );
+        }
+        assert_eq!(serde_json::to_vec(&replay).unwrap(), before);
+        replay.remove(3);
+        let ambiguous = sidecar.for_reprojected_items(&original, &replay);
+        assert_eq!(
+            measure_both(&replay, &ambiguous)[0].bytes(PromptContextCategory::TaskInput),
+            0
+        );
+    }
+
+    #[test]
+    fn empty_manifest_skips_category_hashing_and_injected_user_context_is_not_task_input() {
+        let items = vec![
+            message("user", "current request", None),
+            crate::context::ContextualUserFragment::into(
+                crate::context::InternalModelContextFragment::new(
+                    crate::context::InternalContextSource::from_static("extension"),
+                    "steering",
+                ),
+            ),
+        ];
+        CATEGORY_LOOKUP_BYTES.set(0);
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &items,
+            &StableContextManifest::default(),
+        );
+        assert_eq!(CATEGORY_LOOKUP_BYTES.get(), 0);
+        let sidecar = sidecar.with_appended_items(&items[1..], &StableContextManifest::default());
+        for measured in measure_both(&items, &sidecar) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&items[0])
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_fragment_matching_does_not_claim_quotes_or_ambiguous_occurrences() {
+        let items = vec![
+            message("developer", "memory", None),
+            message("user", "memory", None),
+        ];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &items,
+            &StableContextManifest::default(),
+        )
+        .with_exact_fragment(&items, "memory", PromptContextCategory::Memory);
+        assert_eq!(
+            measure_both(&items, &sidecar)[0].bytes(PromptContextCategory::Memory),
+            item_bytes(&items[0])
+        );
+        let repeated = vec![items[0].clone(), items[0].clone()];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &repeated,
+            &StableContextManifest::default(),
+        )
+        .with_exact_fragment(&repeated, "memory", PromptContextCategory::Memory);
+        assert_eq!(
+            measure_both(&repeated, &sidecar)[0].bytes(PromptContextCategory::Memory),
+            0
+        );
+    }
+
+    #[test]
+    fn queued_agent_message_does_not_displace_current_user_input() {
+        let items = vec![
+            message("user", "current user input", None),
+            ResponseItem::AgentMessage {
+                id: None,
+                author: "worker".into(),
+                recipient: "root".into(),
+                content: vec![
+                    codex_protocol::models::AgentMessageInputContent::InputText {
+                        text: "child result".into(),
+                    },
+                ],
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &items,
+            &StableContextManifest::default(),
+        );
+        for measured in measure_both(&items, &sidecar) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&items[0])
+            );
+        }
+    }
+
+    #[test]
+    fn user_quote_of_stable_component_keeps_task_input_identity() {
+        let text = "exact stable policy text";
+        let items = vec![
+            message("developer", text, None),
+            message("user", text, None),
+        ];
+        let manifest = StableContextManifest::default().add_component_bytes(
+            StableContextKind::Repository,
+            "repository",
+            text.as_bytes(),
+        );
+        let provenance = PromptProvenanceSidecar::from_assembled_items(&items, &manifest);
+        for measured in measure_both(&items, &provenance) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&items[1])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::Repository),
+                item_bytes(&items[0])
+            );
+        }
+    }
+
+    #[test]
+    fn appended_non_messages_preserve_current_input_alignment() {
+        let mut items = vec![message("user", "current request", None)];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &items,
+            &StableContextManifest::default(),
+        );
+        items.push(ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call".into(),
+            namespace: None,
+            name: "read_file".into(),
+            arguments: "{}".into(),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        let sidecar = sidecar.with_appended_items(&items[1..], &StableContextManifest::default());
+        for measured in measure_both(&items, &sidecar) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&items[0])
+            );
+        }
     }
 
     #[test]
@@ -1082,7 +1331,7 @@ mod tests {
             "no identity or category hints exist to look up"
         );
 
-        let recovered = sidecar.for_reprojected_items(&items);
+        let recovered = sidecar.for_reprojected_items(&items, &items);
         for measured in measure_both(&items, &recovered) {
             assert_eq!(measured.measurements(), logical.measurements());
         }
@@ -1158,11 +1407,11 @@ mod tests {
                 original[1].clone(),
             ];
             FINGERPRINT_CALLS.set(0);
-            let recovered = sidecar.for_reprojected_items(&replay);
+            let recovered = sidecar.for_reprojected_items(&original, &replay);
             assert_eq!(
                 FINGERPRINT_CALLS.replace(0),
-                3,
-                "recover each message identity once"
+                6,
+                "match the source and replay occurrences only during fallback"
             );
             for measured in measure_both(&replay, &recovered) {
                 assert_eq!(

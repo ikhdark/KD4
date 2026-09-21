@@ -6931,7 +6931,46 @@ async fn loads_compact_prompt_from_file() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result<()> {
+async fn prompt_overrides_skip_invalid_fallback_files() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    for contents in [None, Some(""), Some("fallback")] {
+        let path = home
+            .path()
+            .join(format!("prompt-{}.txt", contents.unwrap_or("missing")));
+        if let Some(contents) = contents {
+            std::fs::write(&path, contents)?;
+        }
+        let cfg = ConfigToml {
+            model_instructions_file: Some(path.abs()),
+            experimental_compact_prompt_file: Some(path.abs()),
+            ..Default::default()
+        };
+        let config = Config::load_from_base_config_with_overrides(
+            cfg.clone(),
+            ConfigOverrides {
+                base_instructions: Some("".to_string()),
+                compact_prompt: Some("  compact override  ".to_string()),
+                ..Default::default()
+            },
+            home.abs(),
+        )
+        .await?;
+        assert_eq!(config.base_instructions.as_deref(), Some(""));
+        assert_eq!(config.compact_prompt.as_deref(), Some("compact override"));
+        let selected = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            home.abs(),
+        )
+        .await;
+        assert_eq!(selected.is_ok(), contents == Some("fallback"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_preserves_valid_roles_when_one_config_file_is_missing() -> std::io::Result<()>
+{
     let codex_home = TempDir::new()?;
     let missing_path = codex_home.path().join("agents").join("researcher.toml");
     let cfg = ConfigToml {
@@ -6940,14 +6979,24 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
             max_depth: None,
             job_max_runtime_seconds: None,
             interrupt_message: None,
-            roles: BTreeMap::from([(
-                "researcher".to_string(),
-                AgentRoleToml {
-                    description: Some("Research role".to_string()),
-                    config_file: Some(missing_path.abs()),
-                    nickname_candidates: None,
-                },
-            )]),
+            roles: BTreeMap::from([
+                (
+                    "researcher".to_string(),
+                    AgentRoleToml {
+                        description: Some("Research role".to_string()),
+                        config_file: Some(missing_path.abs()),
+                        nickname_candidates: None,
+                    },
+                ),
+                (
+                    "reviewer".to_string(),
+                    AgentRoleToml {
+                        description: Some("Review role".to_string()),
+                        config_file: None,
+                        nickname_candidates: None,
+                    },
+                ),
+            ]),
         }),
         ..Default::default()
     };
@@ -6957,12 +7006,19 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
         ConfigOverrides::default(),
         codex_home.abs(),
     )
-    .await;
-    let err = result.expect_err("missing role config file should be rejected");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    let message = err.to_string();
-    assert!(message.contains("agents.researcher.config_file"));
-    assert!(message.contains("must point to an existing file"));
+    .await?;
+    assert!(!result.agent_roles.contains_key("researcher"));
+    assert_eq!(
+        result.agent_roles["reviewer"].description.as_deref(),
+        Some("Review role")
+    );
+    assert!(
+        result
+            .startup_warnings
+            .iter()
+            .any(|message| message.contains("agents.researcher.config_file")
+                && message.contains("must point to an existing file"))
+    );
 
     Ok(())
 }
@@ -7071,6 +7127,45 @@ config_file = "./agents/researcher.toml"
         Some(&role_config_path)
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_optional_role_discovery_preserves_explicit_roles() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let mut nested = home.path().join("agents");
+    for _ in 0..8 {
+        nested = nested.join("nested");
+    }
+    std::fs::create_dir_all(&nested)?;
+    std::fs::write(
+        home.path().join("agents/discovered.toml"),
+        "name = 'discovered'\ndescription = 'optional'\ndeveloper_instructions = 'read carefully'\n",
+    )?;
+    std::fs::write(
+        home.path().join(CONFIG_TOML_FILE),
+        "[agents.explicit]\ndescription = 'explicit role'\n",
+    )?;
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .build()
+        .await?;
+    assert!(config.agent_roles.contains_key("explicit"));
+    assert!(!config.agent_roles.contains_key("discovered"));
+    assert!(
+        config
+            .startup_warnings
+            .iter()
+            .any(|warning| warning.contains("discovery unavailable")
+                && warning.contains("traversal limit"))
+    );
+    assert!(
+        crate::agent::role::apply_role_to_config(&mut config, Some("discovered"))
+            .await
+            .unwrap_err()
+            .contains("unknown agent_type")
+    );
     Ok(())
 }
 
@@ -7923,112 +8018,45 @@ async fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Res
 }
 
 #[tokio::test]
-async fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        agents: Some(AgentsToml {
-            max_threads: None,
-            max_depth: None,
-            job_max_runtime_seconds: None,
-            interrupt_message: None,
-            roles: BTreeMap::from([(
-                "researcher".to_string(),
-                AgentRoleToml {
-                    description: Some("Research role".to_string()),
-                    config_file: None,
-                    nickname_candidates: Some(Vec::new()),
-                },
-            )]),
-        }),
-        ..Default::default()
-    };
-
-    let result = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await;
-    let err = result.expect_err("empty nickname candidates should be rejected");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string()
-            .contains("agents.researcher.nickname_candidates")
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        agents: Some(AgentsToml {
-            max_threads: None,
-            max_depth: None,
-            job_max_runtime_seconds: None,
-            interrupt_message: None,
-            roles: BTreeMap::from([(
-                "researcher".to_string(),
-                AgentRoleToml {
-                    description: Some("Research role".to_string()),
-                    config_file: None,
-                    nickname_candidates: Some(vec!["Hypatia".to_string(), " Hypatia ".to_string()]),
-                },
-            )]),
-        }),
-        ..Default::default()
-    };
-
-    let result = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await;
-    let err = result.expect_err("duplicate nickname candidates should be rejected");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string()
-            .contains("agents.researcher.nickname_candidates cannot contain duplicates")
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        agents: Some(AgentsToml {
-            max_threads: None,
-            max_depth: None,
-            job_max_runtime_seconds: None,
-            interrupt_message: None,
-            roles: BTreeMap::from([(
-                "researcher".to_string(),
-                AgentRoleToml {
-                    description: Some("Research role".to_string()),
-                    config_file: None,
-                    nickname_candidates: Some(vec!["Agent <One>".to_string()]),
-                },
-            )]),
-        }),
-        ..Default::default()
-    };
-
-    let result = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await;
-    let err = result.expect_err("unsafe nickname candidates should be rejected");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains(
-            "agents.researcher.nickname_candidates may only contain ASCII letters, digits, spaces, hyphens, and underscores"
-        ));
-
+async fn invalid_agent_role_nicknames_do_not_hide_valid_roles() -> std::io::Result<()> {
+    for (candidates, diagnostic) in [
+        (Vec::new(), "agents.researcher.nickname_candidates"),
+        (
+            vec!["Hypatia".into(), " Hypatia ".into()],
+            "cannot contain duplicates",
+        ),
+        (vec!["Agent <One>".into()], "may only contain ASCII letters"),
+    ] {
+        let home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str("[agents.reviewer]\ndescription = 'Review role'\n[agents.researcher]\ndescription = 'Research role'\n").unwrap();
+        let mut cfg = cfg;
+        cfg.agents
+            .as_mut()
+            .unwrap()
+            .roles
+            .get_mut("researcher")
+            .unwrap()
+            .nickname_candidates = Some(candidates);
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            home.abs(),
+        )
+        .await?;
+        assert!(!config.agent_roles.contains_key("researcher"));
+        assert_eq!(
+            config.agent_roles["reviewer"].description.as_deref(),
+            Some("Review role")
+        );
+        assert!(
+            config
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.contains(diagnostic)),
+            "{:?}",
+            config.startup_warnings
+        );
+    }
     Ok(())
 }
 

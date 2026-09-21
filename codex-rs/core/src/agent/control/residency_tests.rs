@@ -289,6 +289,7 @@ async fn late_residency_shutdown_keeps_claim_charged_until_slot_handoff() {
             &manager_state,
             /*protected_thread_id*/ None,
             Duration::ZERO,
+            &mut std::collections::HashSet::new(),
         )
         .await
     {
@@ -389,6 +390,17 @@ async fn registered_interrupted_v2_agent_reloads_after_residency_eviction() {
         Err(err) => panic!("expected evicted thread to be missing, got {err:?}"),
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
+    let cold_agents = control
+        .list_agents(&SessionSource::Cli, Some("/root/worker_1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        cold_agents.len(),
+        1,
+        "cold registry identity remains visible without a receipt"
+    );
+    assert!(!cold_agents[0].runtime_loaded);
+    assert_eq!(cold_agents[0].agent_name, "/root/worker_1");
     let second =
         spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker_2").await;
     second_slot.commit(second.thread_id);
@@ -1005,4 +1017,51 @@ async fn explicit_v2_resume_preserves_cold_identity_and_accounts_for_residency()
         vec![first.thread_id]
     );
     assert_eq!(residents.pending_slots, 0);
+}
+
+#[tokio::test]
+async fn touching_an_eviction_has_a_foreground_deadline_without_releasing_occupancy() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let manager = ThreadManager::with_models_provider_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let root = manager.start_thread(config.clone()).await.unwrap();
+    let control = manager.agent_control();
+    let state = control.upgrade().unwrap();
+    let child = spawn_v2_subagent(&control, &state, config, root.thread_id, "evicting").await;
+    let residency = &control.v2_residency;
+    assert!(residency.try_reserve_pending_slot(1));
+    residency.commit_slot(child.thread_id);
+    let claim = residency.claim_lru_candidate(None).unwrap();
+    tokio::time::pause();
+    let result = control
+        .use_loaded_v2_agent_or_clear_stopped(&state, child.thread_id)
+        .await;
+    assert!(
+        matches!(result, Err(CodexErr::UnsupportedOperation(message)) if message.contains("residency transition"))
+    );
+    assert!(
+        !residency.try_reserve_pending_slot(1),
+        "timeout cannot release another shutdown owner's occupancy"
+    );
+    assert!(
+        residency
+            .state
+            .lock()
+            .unwrap()
+            .evicting
+            .contains_key(&child.thread_id)
+    );
+    drop(claim);
+    assert!(
+        residency
+            .state
+            .lock()
+            .unwrap()
+            .residents
+            .contains(&child.thread_id)
+    );
 }

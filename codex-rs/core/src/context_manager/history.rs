@@ -705,6 +705,24 @@ impl ContextManager {
         if appended.is_empty() {
             return;
         }
+        // Clones may prepare the same snapshot together, but a divergent append
+        // must not reuse another branch's positional estimates or consume its cache.
+        if Arc::strong_count(&self.prepared_history) > 1 {
+            let cache = self
+                .prepared_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            self.prepared_history = Arc::new(StdMutex::new(cache));
+        }
+        if Arc::strong_count(&self.item_token_estimates) > 1 {
+            let estimates = self
+                .item_token_estimates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            self.item_token_estimates = Arc::new(StdMutex::new(estimates));
+        }
         let prepared_append = {
             let mut cache = self
                 .prepared_history
@@ -1301,30 +1319,6 @@ impl ContextManager {
         );
     }
 
-    fn get_non_last_reasoning_items_tokens(&self) -> i64 {
-        // The server snapshot accounts for the current response's reasoning even when it omits
-        // resolved reasoning from earlier turns. Re-estimate only reasoning before the latest
-        // instruction boundary so the current response is not counted twice.
-        let Some(last_user_index) = self.items.iter().rposition(is_user_turn_boundary) else {
-            return 0;
-        };
-
-        self.items
-            .iter()
-            .take(last_user_index)
-            .filter(|item| {
-                matches!(
-                    item,
-                    ResponseItem::Reasoning {
-                        encrypted_content: Some(_),
-                        ..
-                    }
-                )
-            })
-            .map(estimate_item_token_count)
-            .fold(0i64, i64::saturating_add)
-    }
-
     // These are local items added after the most recent model-emitted item.
     // They are not reflected in `last_token_usage.total_tokens`.
     fn items_after_last_model_generated_item(&self) -> &[ResponseItem] {
@@ -1336,11 +1330,11 @@ impl ContextManager {
         &self.items[start..]
     }
 
-    /// Returns the active model-visible context estimate. When the server omits resolved
-    /// reasoning from its usage snapshot, earlier encrypted reasoning is estimated locally.
+    /// Returns the active model-visible context estimate. Resolved reasoning is
+    /// absent from outgoing prompts and must not be restored to server usage.
     pub(crate) fn get_total_token_usage(
         &self,
-        server_reasoning_included: bool,
+        _server_reasoning_included: bool,
         base_instructions: &BaseInstructions,
     ) -> i64 {
         let items_after_last_model_generated = self.items_after_last_model_generated_item();
@@ -1381,14 +1375,7 @@ impl ContextManager {
                     .map(|(index, item)| (tail_start + index, item)),
                 /*policy*/ None,
             );
-        let earlier_reasoning_tokens = if server_reasoning_included {
-            0
-        } else {
-            self.get_non_last_reasoning_items_tokens()
-        };
-        last_tokens
-            .saturating_add(earlier_reasoning_tokens)
-            .saturating_add(items_after_last_model_generated_tokens)
+        last_tokens.saturating_add(items_after_last_model_generated_tokens)
     }
 
     pub(crate) fn estimated_tokens_after_last_model_generated_item(&self) -> i64 {
@@ -1601,13 +1588,22 @@ fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: boo
     for item in items {
         match item {
             ResponseItem::Reasoning { .. } => {}
+            ResponseItem::Message { role, content, .. }
+                if role == "assistant"
+                    && content.iter().all(|content| {
+                        matches!(
+                            content,
+                            codex_protocol::models::ContentItem::InputText { .. }
+                                | codex_protocol::models::ContentItem::OutputText { .. }
+                        )
+                    }) => {}
             ResponseItem::FunctionCall { name, call_id, .. } if name != "update_plan" => {
-                if !calls.insert(call_id.as_str()) {
+                if !calls.insert((false, call_id.as_str())) {
                     return false;
                 }
             }
             ResponseItem::CustomToolCall { call_id, .. } => {
-                if !calls.insert(call_id.as_str()) {
+                if !calls.insert((true, call_id.as_str())) {
                     return false;
                 }
             }
@@ -1629,7 +1625,8 @@ fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: boo
                 {
                     return false;
                 }
-                if !outputs.insert(call_id.as_str()) {
+                let custom = matches!(item, ResponseItem::CustomToolCallOutput { .. });
+                if !outputs.insert((custom, call_id.as_str())) {
                     return false;
                 }
             }
@@ -1646,16 +1643,16 @@ fn prepared_append_is_complete_and_safe(items: &[ResponseItem], supports_images:
     let calls = items
         .iter()
         .filter_map(|item| match item {
-            ResponseItem::FunctionCall { call_id, .. }
-            | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+            ResponseItem::FunctionCall { call_id, .. } => Some((false, call_id.as_str())),
+            ResponseItem::CustomToolCall { call_id, .. } => Some((true, call_id.as_str())),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
     let outputs = items
         .iter()
         .filter_map(|item| match item {
-            ResponseItem::FunctionCallOutput { call_id, .. }
-            | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+            ResponseItem::FunctionCallOutput { call_id, .. } => Some((false, call_id.as_str())),
+            ResponseItem::CustomToolCallOutput { call_id, .. } => Some((true, call_id.as_str())),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -1810,7 +1807,10 @@ impl ContextManager {
             return;
         };
         let preserved_policy = entry.prepared.policy;
-        let prompt_provenance = entry.prepared.prompt_provenance.clone();
+        let prompt_provenance = entry
+            .prepared
+            .prompt_provenance
+            .with_appended_items(&append, &entry.prepared.stable_context_manifest);
         let compacted_tool_search_outputs = Arc::new(OnceLock::new());
         if let Some(compacted) = entry.prepared.compacted_tool_search_outputs.get() {
             let _ = compacted_tool_search_outputs.set(compacted.appended(Arc::clone(&append)));
@@ -1989,59 +1989,6 @@ pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
 ) -> FunctionCallOutputPayload {
-    // Code Mode's command receipt is control state, independent of the script
-    // payload budget. Admission may have consolidated content items into text.
-    const RECEIPT: &str = "Nested command states (independent of script completion):\n";
-    let retain_receipt = |receipt: &str, reduced: bool| -> Option<String> {
-        let mut states = serde_json::from_str::<Vec<serde_json::Value>>(receipt).ok()?;
-        if !states.iter().all(serde_json::Value::is_object) {
-            return None;
-        }
-        if reduced {
-            for state in &mut states {
-                state["history_output_reduced"] = serde_json::Value::Bool(true);
-                state["output_complete"] = serde_json::Value::Bool(false);
-            }
-        }
-        Some(format!("{RECEIPT}{}", serde_json::json!(states)))
-    };
-    match &output.body {
-        FunctionCallOutputBody::Text(text) => {
-            if let Some((payload, receipt)) = text.rsplit_once(RECEIPT) {
-                let truncated = truncate_text(payload, policy);
-                if let Some(receipt) = retain_receipt(receipt, truncated != payload) {
-                    let separator = if truncated.ends_with('\n') { "" } else { "\n" };
-                    return FunctionCallOutputPayload {
-                        body: FunctionCallOutputBody::Text(format!(
-                            "{truncated}{separator}{receipt}"
-                        )),
-                        success: output.success,
-                    };
-                }
-            }
-        }
-        FunctionCallOutputBody::ContentItems(items) => {
-            if let Some((FunctionCallOutputContentItem::InputText { text }, payload)) =
-                items.split_last()
-                && let Some((inline_payload, receipt)) = text.rsplit_once(RECEIPT)
-            {
-                let mut payload = payload.to_vec();
-                if !inline_payload.is_empty() {
-                    payload.push(FunctionCallOutputContentItem::InputText {
-                        text: inline_payload.to_string(),
-                    });
-                }
-                let mut truncated = truncate_function_output_items_with_policy(&payload, policy);
-                if let Some(receipt) = retain_receipt(receipt, truncated != payload) {
-                    truncated.push(FunctionCallOutputContentItem::InputText { text: receipt });
-                    return FunctionCallOutputPayload {
-                        body: FunctionCallOutputBody::ContentItems(truncated),
-                        success: output.success,
-                    };
-                }
-            }
-        }
-    }
     let body = match &output.body {
         FunctionCallOutputBody::Text(content) => {
             FunctionCallOutputBody::Text(truncate_text(content, policy))
@@ -2286,6 +2233,10 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
                 }
                 _ => RESIZED_IMAGE_BYTES_ESTIMATE,
             });
+        } else if image_url.starts_with("https://") || image_url.starts_with("http://") {
+            // URL images still consume image tokens even though their encoded
+            // pixels are not embedded in the request.
+            replacement_bytes = replacement_bytes.saturating_add(RESIZED_IMAGE_BYTES_ESTIMATE);
         }
     };
 

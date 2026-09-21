@@ -963,7 +963,7 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                     &call,
                     ExternalMutationIntent::MayMutate,
                 ),
-                Err(crate::FunctionCallError::DeniedToModel(_))
+                Err(crate::FunctionCallError::RespondToModel(_))
             ));
         }
     }
@@ -1013,7 +1013,7 @@ async fn inactive_typed_assignment_is_a_blocked_tool_call() {
 
     assert!(matches!(
         error,
-        crate::FunctionCallError::DeniedToModel(message)
+        crate::FunctionCallError::RequiredOperationBlocked(message)
             if message.contains("no longer active")
     ));
 }
@@ -1628,7 +1628,8 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
     };
     session
         .record_conversation_items(&turn, std::slice::from_ref(&history_item))
-        .await;
+        .await
+        .unwrap();
     let mut expected_history_item = history_item.clone();
     expected_history_item.set_turn_id_if_missing(&turn.sub_id);
 

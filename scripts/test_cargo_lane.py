@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 
-from pathlib import Path
+import contextlib
+import json
 import os
-import stat
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts import rust_build_status  # noqa: E402
-
 
 SCRIPT = REPO_ROOT / "scripts" / "cargo-lane.ps1"
 CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cargo-lane-trash-cleanup.ps1"
@@ -35,6 +37,285 @@ def ps_single_quote(value: str | Path) -> str:
 
 
 class CargoLaneTest(unittest.TestCase):
+    def test_background_pruning_does_not_block_commands_and_has_one_owner(self):
+        repo = self.temp_root / "repo with spaces"
+        scripts = repo / "scripts"
+        scripts.mkdir(parents=True)
+        (repo / "codex-rs").mkdir()
+        for name in (
+            "cargo-lane.ps1",
+            "common-rust-env.ps1",
+            "cargo-lane-patterns.ps1",
+            "cargo_lane_patterns.json",
+            "cargo-lane-trash-cleanup.ps1",
+        ):
+            shutil.copyfile(SCRIPT.parent / name, scripts / name)
+        ready, release = repo / "prune-ready", repo / "prune-release"
+        (scripts / "rust_build_status.py").write_text(
+            "import pathlib,time\n"
+            f"root=pathlib.Path({str(repo)!r})\n"
+            "with (root/'attempts').open('a') as out: out.write('attempt\\n')\n"
+            "(root/'prune-ready').touch()\n"
+            "deadline=time.monotonic()+20\n"
+            "while not (root/'prune-release').exists() and time.monotonic()<deadline: time.sleep(.02)\n"
+            "assert (root/'prune-release').exists(), 'fixture was not released'\n"
+        )
+        lanes = repo / "codex-rs/target/lanes"
+        env = {
+            **os.environ,
+            "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0",
+            "CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE": "0",
+            "CODEX_CARGO_LANE_ACTIVE_NAMES": "",
+            "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "1",
+        }
+        completed = False
+        try:
+            first = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-File",
+                    str(scripts / "cargo-lane.ps1"),
+                    "-Lane",
+                    "first",
+                    sys.executable,
+                    "-c",
+                    "raise SystemExit(7)",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 7, first.stdout + first.stderr)
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), first.stdout + first.stderr)
+            self.assertFalse((lanes / ".gc-stamp").exists())
+            # Python's production entrypoint uses the same existing worker.
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
+                with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(errors):
+                    self.assertEqual(
+                        rust_build_status.run_in_cargo_lane(
+                            repo_root=repo,
+                            requested_lane="second",
+                            command=[sys.executable, "-c", "raise SystemExit(9)"],
+                        ),
+                        9,
+                    )
+                errors.seek(0)
+                self.assertEqual(errors.read(), "")
+            self.assertEqual((repo / "attempts").read_text().splitlines(), ["attempt"])
+            self.assertFalse(release.exists())
+            completed = True
+        finally:
+            release.touch()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if (lanes / ".gc-stamp").exists() and not (
+                    lanes / ".cargo-lane-trash-cleanup.lock"
+                ).exists():
+                    break
+                time.sleep(0.05)
+            # Lock release precedes PowerShell process exit. Wait for the actual
+            # fixture workers before removing directories held as their cwd.
+            wait = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-Command",
+                    f"Get-CimInstance Win32_Process -Filter \"Name = 'powershell.exe'\" | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*cargo-lane*' -and $_.CommandLine.Contains({ps_single_quote(repo)}) }} | ForEach-Object {{ Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue }}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(wait.returncode, 0, wait.stderr)
+            if completed:
+                self.assertTrue((lanes / ".gc-stamp").exists())
+                self.assertFalse((lanes / ".cargo-lane-trash-cleanup.lock").exists())
+
+    def test_shared_target_argument_corpus(self):
+        target = self.temp_root / "target with spaces"
+        t = str(target)
+        cases = [
+            (
+                ["cargo", "+stable", "check", "-p", "core"],
+                ["cargo", "+stable", "check", "--target-dir", t, "-p", "core"],
+            ),
+            (
+                ["rustup", "run", "stable", "cargo", "check"],
+                ["rustup", "run", "stable", "cargo", "check", "--target-dir", t],
+            ),
+            (
+                [
+                    "rustup",
+                    "run",
+                    "--install",
+                    "stable",
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--",
+                    "--target-dir",
+                    "test-arg",
+                ],
+                [
+                    "rustup",
+                    "run",
+                    "--install",
+                    "stable",
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--target-dir",
+                    t,
+                    "--",
+                    "--target-dir",
+                    "test-arg",
+                ],
+            ),
+            (
+                ["cargo", "watch", "-xcheck"],
+                ["cargo", "watch", '-xcheck --target-dir "' + t + '"'],
+            ),
+            (
+                ["cargo", "watch", "-qx=test -- --nocapture"],
+                [
+                    "cargo",
+                    "watch",
+                    "-q",
+                    '-xtest --target-dir "' + t + '" -- --nocapture',
+                ],
+            ),
+            (
+                ["cargo", "watch", "--watch", "-sfilename", "-xcheck"],
+                [
+                    "cargo",
+                    "watch",
+                    "--watch",
+                    "-sfilename",
+                    '-xcheck --target-dir "' + t + '"',
+                ],
+            ),
+            (["cargo", "watch", "-scargo check"], None),
+            (["cargo", "watch", "-qscargo check"], None),
+            (["cargo", "watch", "check"], None),
+            (["cargo", "watch", "-x"], None),
+            (["cargo", "check", "--target-dir", "escape"], None),
+        ]
+        corpus = self.temp_root / "corpus.json"
+        corpus.write_text(json.dumps([{"args": args} for args, _ in cases]))
+        script = f"""
+$ErrorActionPreference = 'Stop'
+. {ps_single_quote(SCRIPT.parent / "common-rust-env.ps1")}
+$results = @(foreach ($case in (Get-Content -Raw {ps_single_quote(corpus)} | ConvertFrom-Json)) {{
+    try {{ @{{ args = @(Add-CargoTargetDirArgument -CommandArgs $case.args -TargetDir {ps_single_quote(target)}); rejected = $false }} }}
+    catch {{ @{{ args = @(); rejected = $true }} }}
+}})
+ConvertTo-Json -InputObject $results -Depth 10 -Compress
+"""
+        result = subprocess.run(
+            [self.shell, "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        for (args, expected), ps_result in zip(cases, actual, strict=True):
+            with self.subTest(args=args):
+                if expected is None:
+                    with self.assertRaises(ValueError):
+                        rust_build_status._cargo_command_with_target_dir(args, target)
+                    self.assertTrue(ps_result["rejected"])
+                else:
+                    self.assertEqual(
+                        rust_build_status._cargo_command_with_target_dir(args, target),
+                        expected,
+                    )
+                    self.assertFalse(ps_result["rejected"])
+                    self.assertEqual(ps_result["args"], expected)
+
+    def test_candidate_junction_is_skipped_without_writing_external_metadata(self):
+        self.mark_lanes_root()
+        outside = self.temp_root / "outside"
+        outside.mkdir()
+        (outside / "sentinel").write_bytes(b"unchanged")
+        self.make_junction(self.lanes_root / "candidate", outside)
+        result = self.run_script("-Lane", "candidate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LANE=candidate-2", result.stdout)
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["sentinel"])
+        self.assertEqual((outside / "sentinel").read_bytes(), b"unchanged")
+
+    def test_concurrent_auto_reservations_stay_in_canonical_family(self):
+        self.make_lane("core-2")
+        self.make_lane("core-3")
+        os.utime(self.lanes_root / "core-2", None)
+        line = next(
+            i
+            for i, text in enumerate(SCRIPT.read_text().splitlines(), 1)
+            if text.startswith("$candidateLane =")
+        )
+        cargo = self.temp_root / "cargo.ps1"
+        cargo.write_text(
+            f"[IO.File]::WriteAllText((Join-Path {ps_single_quote(self.temp_root)} ('child-' + $PID)), $env:CODEX_CARGO_LANE_TARGET_DIR)\nwhile (-not (Test-Path {ps_single_quote(self.temp_root / 'release-child')})) {{ Start-Sleep -Milliseconds 20 }}\n"
+        )
+        processes = []
+        try:
+            for index in range(2):
+                command = f"""
+$env:CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE = '1'
+$env:CODEX_CARGO_LANE_ACTIVE_NAMES = 'core'
+Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
+    [IO.File]::WriteAllText({ps_single_quote(self.temp_root / f"ready-{index}")}, 'ready')
+    while (-not (Test-Path {ps_single_quote(self.temp_root / "release-snapshot")})) {{ Start-Sleep -Milliseconds 20 }}
+}} | Out-Null
+& {ps_single_quote(SCRIPT)} -Lane auto -LanesRoot {ps_single_quote(self.lanes_root)} {ps_single_quote(cargo)} check -p core
+"""
+                processes.append(
+                    subprocess.Popen(
+                        [self.shell, "-NoProfile", "-Command", command],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                )
+            deadline = time.monotonic() + 15
+            while (
+                len(list(self.temp_root.glob("ready-*"))) != 2
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertEqual(len(list(self.temp_root.glob("ready-*"))), 2)
+            (self.temp_root / "release-snapshot").touch()
+            while (
+                len(list(self.temp_root.glob("child-*"))) != 2
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            children = list(self.temp_root.glob("child-*"))
+            self.assertEqual(len(children), 2)
+            self.assertEqual(
+                {Path(p.read_text(encoding="utf-8-sig")).name for p in children},
+                {"core-2", "core-3"},
+            )
+        finally:
+            (self.temp_root / "release-snapshot").touch()
+            (self.temp_root / "release-child").touch()
+            for process in processes:
+                out, err = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, out + err)
+
     def test_reservation_rechecks_cargo_lock_after_active_snapshot(self):
         lane = self.make_lane("late-cargo")
         lock_path = lane / "debug" / ".cargo-lock"
@@ -366,6 +647,7 @@ Write-Output 'reservation released'
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE"] = "1"
+        env["CODEX_CARGO_LANE_MAINTENANCE_SYNC"] = "1"
         # Most lane-wrapper tests exercise naming, locking, and forwarding. Keep
         # them isolated from the real repository's large non-lane target tree;
         # target-budget tests opt back into the production default explicitly.
@@ -570,6 +852,7 @@ Write-Output 'reservation released'
         )
         env = os.environ.copy()
         env["CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE"] = "1"
+        env["CODEX_CARGO_LANE_MAINTENANCE_SYNC"] = "1"
         env["CODEX_CARGO_TARGET_MAX_TOTAL_BYTES"] = "0"
         result = subprocess.run(
             [

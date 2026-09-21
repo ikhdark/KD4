@@ -213,6 +213,86 @@ async fn stopped_session_start_restores_input_and_requests_a_fresh_turn() {
 }
 
 #[tokio::test]
+async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigLayerStack;
+    use codex_config::ConfigRequirements;
+    use codex_config::ConfigRequirementsToml;
+    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let layer = serde_json::from_value(serde_json::json!({"hooks": {
+        "UserPromptSubmit": [{"hooks": [{
+            "type": "command",
+            "command": "python3 -c \"import sys; sys.stderr.write('blocked by test'); sys.exit(2)\"",
+            "commandWindows": "python -c \"import sys; sys.stderr.write('blocked by test'); sys.exit(2)\""
+        }]}]
+    }}))
+    .unwrap();
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: turn.config.codex_home.join("config.toml"),
+                profile: None,
+            },
+            layer,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .unwrap();
+    session
+        .services
+        .hooks
+        .store(Arc::new(codex_hooks::Hooks::new(
+            codex_hooks::HooksConfig {
+                feature_enabled: true,
+                bypass_hook_trust: true,
+                config_layer_stack: Some(stack),
+                ..Default::default()
+            },
+        )));
+    let mut budget = LogicalGenerationBudget::default();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_turn(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            Arc::new(ExtensionData::new(turn.sub_id.clone())),
+            vec![TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "blocked prompt".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }],
+            None,
+            &mut budget,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("blocking hook must finish without planning or model access")
+    .unwrap();
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .pending_context_baseline()
+            .is_none()
+    );
+    assert_eq!(budget.regular_generations, 0);
+    let mut stopped = false;
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::Warning(warning) = event.msg {
+            stopped |= warning.message.contains("UserPromptSubmit hook stopped");
+        }
+    }
+    assert!(stopped, "the real hook must have blocked the prompt");
+}
+
+#[tokio::test]
 async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
     let (session, first_turn) = crate::session::tests::make_session_and_context().await;
 
@@ -449,7 +529,8 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
     let turn_context = Arc::new(turn_context);
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let equivalent_turn_context = session
         .new_default_turn_with_sub_id("equivalent-scaffold-owner".to_string())
         .await;
@@ -462,7 +543,10 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
         equivalent_turn_context.config.as_ref(),
         "the cross-turn test requires value-equivalent config owners"
     );
-    let equivalent_step_context = session.capture_step_context(equivalent_turn_context).await;
+    let equivalent_step_context = session
+        .capture_step_context(equivalent_turn_context)
+        .await
+        .unwrap();
     let router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools(std::iter::empty::<
             Arc<dyn crate::tools::registry::CoreToolRuntime>,
@@ -745,7 +829,8 @@ async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
     let turn_context = Arc::new(turn_context);
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools(std::iter::empty::<
             Arc<dyn crate::tools::registry::CoreToolRuntime>,
@@ -839,7 +924,8 @@ async fn projected_prompt_defers_dynamic_history_measurement_across_retries() {
     let turn_context = Arc::new(turn_context);
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let router = ToolRouter::from_parts(
         ToolRegistry::from_tools(std::iter::empty::<
             Arc<dyn crate::tools::registry::CoreToolRuntime>,
@@ -906,7 +992,8 @@ async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Re
     let planning_generation = session.services.planning_generation();
     let first_step = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let first = built_tools_for_pending_turn(
         session.as_ref(),
         &first_step,
@@ -917,7 +1004,8 @@ async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Re
     .await?;
     let second_step = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let second = built_tools_for_pending_turn(
         session.as_ref(),
         &second_step,
@@ -934,7 +1022,7 @@ async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Re
             .services
             .advance_planning_generation(&mut state_owner)
     };
-    let changed_step = session.capture_step_context(turn_context).await;
+    let changed_step = session.capture_step_context(turn_context).await.unwrap();
     let changed = built_tools_for_pending_turn(
         session.as_ref(),
         &changed_step,
@@ -985,7 +1073,7 @@ async fn effective_workspace_roots_are_cached_in_the_turn_context() {
 async fn built_tools_uses_the_revision_tagged_on_the_step_mcp_snapshot() -> Result<()> {
     let (session, turn_context, _events) =
         crate::session::tests::make_session_and_context_with_rx().await;
-    let step_context = session.capture_step_context(turn_context).await;
+    let step_context = session.capture_step_context(turn_context).await.unwrap();
     let snapshot_revision = step_context
         .mcp
         .manager()
@@ -1138,13 +1226,54 @@ async fn deferred_tool_schema_survives_sampling_error_exit() {
 }
 
 #[test]
-fn sampling_retry_rebuilds_after_accepted_output() {
-    let mut progress = SamplingAttemptProgress::default();
-    assert!(!progress.requires_authoritative_retry_input());
-
-    progress.accepted_output = true;
-
-    assert!(progress.requires_authoritative_retry_input());
+fn audit_reports_17_19_retry_preserves_accepted_history_and_retry_limit() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit_reports_17_19_retry", || async {
+        core_test_support::require_network!();
+        for accepted_output in [false, true] {
+            let server = responses::start_mock_server().await;
+            let partial = if accepted_output {
+                responses::sse(vec![responses::ev_assistant_message(
+                    "partial",
+                    "retained partial answer",
+                )])
+            } else {
+                responses::sse(vec![])
+            };
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![
+                    partial,
+                    responses::sse(vec![
+                        responses::ev_assistant_message("final", "finished answer"),
+                        responses::ev_completed("finished"),
+                    ]),
+                ],
+            )
+            .await;
+            let test = test_codex()
+                .with_config(|config| {
+                    config.model_provider.stream_max_retries = Some(1);
+                })
+                .build(&server)
+                .await?;
+            let completion = test
+                .submit_turn_and_capture_completion("finish this task")
+                .await?;
+            assert!(completion.error.is_none(), "{completion:?}");
+            let requests = requests.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                serde_json::to_string(&requests[1].input())
+                    .unwrap()
+                    .contains("retained partial answer"),
+                accepted_output
+            );
+            if !accepted_output {
+                assert_eq!(requests[0].input(), requests[1].input());
+            }
+        }
+        Ok(())
+    })
 }
 
 #[test]
@@ -1355,7 +1484,8 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
                 outputs[1].clone(),
             ],
         )
-        .await;
+        .await
+        .unwrap();
 
     for (index, (call_id, response)) in call_ids.iter().zip(&responses).enumerate() {
         let classification = &classifications[index];
@@ -1979,6 +2109,54 @@ fn completion_pending_input_stays_in_the_sampling_loop_when_capacity_remains() {
 }
 
 #[tokio::test]
+async fn soft_convergence_records_one_instruction_without_requesting_a_generation() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    tokio::time::pause();
+    let mut control = TurnExecutionControl::new();
+    let before = session.clone_history().await;
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        before.raw_items()
+    );
+    tokio::time::advance(Duration::from_secs(120)).await;
+    record_soft_convergence_directive(&session, &turn_context, &mut control, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        before.raw_items()
+    );
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
+        .await
+        .unwrap();
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
+        .await
+        .unwrap();
+    let history = session.clone_history().await;
+    assert_eq!(history.raw_items().len(), before.raw_items().len() + 1);
+    assert!(
+        matches!(history.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
+        if role == "developer" && content.iter().any(|item| matches!(item,
+            ContentItem::InputText { text }
+                if text.starts_with("Soft convergence intervention:")
+                    && text.contains("complete required implementation or validation")
+                    && text.contains("does not interrupt an in-flight request"))))
+    );
+    assert_eq!(
+        turn_context
+            .turn_timing_state
+            .complete_snapshot()
+            .protocol_timing()
+            .counters
+            .logical_generation_count,
+        0
+    );
+}
+
+#[tokio::test]
 async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
     let (session, turn_context, events) =
         crate::session::tests::make_session_and_context_with_rx().await;
@@ -1988,15 +2166,33 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
         proven_loop_activated: true,
         authoritative_wait: None,
     };
-    record_convergence_decision(&session, &turn_context, Some(&mut decision)).await;
-    record_convergence_decision(&session, &turn_context, Some(&mut decision)).await;
+    record_convergence_decision(&session, &turn_context, Some(&mut decision))
+        .await
+        .unwrap();
+    record_convergence_decision(&session, &turn_context, Some(&mut decision))
+        .await
+        .unwrap();
     let mut advisory = SamplingConvergenceDecision {
         continuation: ContinuationDisposition::ModelRequired,
         directive: Some("Try a different method.".to_string()),
         proven_loop_activated: false,
         authoritative_wait: None,
     };
-    record_convergence_decision(&session, &turn_context, Some(&mut advisory)).await;
+    record_convergence_decision(&session, &turn_context, Some(&mut advisory))
+        .await
+        .unwrap();
+    let mut repeated_advisory = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::ModelRequired,
+        directive: Some("Try a different method.".to_string()),
+        proven_loop_activated: false,
+        authoritative_wait: None,
+    };
+    record_convergence_decision(&session, &turn_context, Some(&mut repeated_advisory))
+        .await
+        .unwrap();
+    assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
+        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text == "Try a different method.")))
+    }).count(), 1, "separate decisions must not accumulate identical advice");
     let mut warnings = Vec::new();
     while let Ok(event) = events.try_recv() {
         if let EventMsg::Warning(warning) = event.msg {
@@ -2006,7 +2202,7 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
     assert_eq!(
         warnings,
         vec![
-            "This turn's tools were stopped after a repeated action/result cycle without state progress. The assistant will summarize the available evidence and report anything unfinished."
+            "A repeated action/result cycle was detected. Existing results will be reused where possible; other actions remain available to complete the task."
         ]
     );
 }
@@ -3285,43 +3481,235 @@ async fn mid_turn_compaction_failure_preserves_completed_message_impl() -> Resul
 }
 
 #[test]
-fn deterministic_protocol_completion_does_not_count_a_cancelled_generation() -> Result<()> {
+fn protocol_continuation_runs_required_work_without_new_input() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
-        "deterministic_protocol_completion_does_not_count_a_cancelled_generation",
-        deterministic_protocol_completion_does_not_count_a_cancelled_generation_impl,
+        "protocol_continuation_runs_required_work_without_new_input",
+        protocol_continuation_runs_required_work_without_new_input_impl,
     )
 }
 
-async fn deterministic_protocol_completion_does_not_count_a_cancelled_generation_impl() -> Result<()>
-{
+async fn protocol_continuation_runs_required_work_without_new_input_impl() -> Result<()> {
+    core_test_support::require_network!();
+    for response_kind in ["commentary", "reasoning", "empty"] {
+        let server = responses::start_mock_server().await;
+        let mut completed = responses::ev_completed("continuing");
+        completed["response"]["end_turn"] = serde_json::json!(false);
+        let mut initial = vec![responses::ev_response_created("continuing")];
+        match response_kind {
+            "commentary" => {
+                let mut message = responses::ev_assistant_message(
+                    "progress",
+                    "I will now write the requested result.",
+                );
+                message["item"]["phase"] = serde_json::json!("commentary");
+                initial.push(message);
+            }
+            "reasoning" => initial.push(responses::ev_reasoning_item(
+                "reasoning",
+                &["The requested file still needs to be written."],
+                &[],
+            )),
+            _ => {}
+        }
+        initial.push(completed);
+        let requests = responses::mount_sse_sequence(
+            &server,
+            vec![
+                responses::sse(initial),
+                responses::sse(vec![
+                    responses::ev_response_created("write-result"),
+                    responses::ev_apply_patch_custom_tool_call(
+                        "required-write",
+                        "*** Begin Patch\n*** Add File: result.txt\n+requested result\n*** End Patch",
+                    ),
+                    responses::ev_completed("write-result"),
+                ]),
+                responses::sse(vec![
+                    responses::ev_assistant_message("answer", "The result was written."),
+                    responses::ev_completed("finished"),
+                ]),
+            ],
+        ).await;
+        let test = test_codex()
+            .with_config(|config| {
+                config.features.enable(Feature::Kd4Runtime).unwrap();
+                config.features.disable(Feature::CodeModeHost).unwrap();
+            })
+            .build(&server)
+            .await?;
+        let completion = test
+            .submit_turn_and_capture_completion("Write result.txt.")
+            .await?;
+        assert!(
+            completion.error.is_none(),
+            "{response_kind}: {completion:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(test.workspace_path("result.txt"))?,
+            "requested result\n"
+        );
+        assert_eq!(
+            completion.last_agent_message.as_deref(),
+            Some("The result was written.")
+        );
+        assert_eq!(requests.requests().len(), 3, "{response_kind}");
+        let timing = completion.timing.expect("completed turn timing");
+        assert_eq!(timing.counters.residual_deterministic_generation_count, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn passing_focused_validation_keeps_the_second_change_executable() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "passing_focused_validation_keeps_the_second_change_executable",
+        passing_focused_validation_keeps_the_second_change_executable_impl,
+    )
+}
+
+async fn passing_focused_validation_keeps_the_second_change_executable_impl() -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
-    let mut completed = responses::ev_completed("protocol-only");
-    completed["response"]["end_turn"] = serde_json::json!(false);
-    let request = responses::mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_response_created("protocol-only"),
-            responses::ev_assistant_message("answer", "Finished."),
-            completed,
-        ]),
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let mut sequence = Vec::new();
+    for part in ["first", "second"] {
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {part}.txt\n+{part} result\n*** Add File: test_{part}.py\n+import unittest\n+from pathlib import Path\n+class ResultTest(unittest.TestCase):\n+    def test_result(self):\n+        self.assertEqual(Path('{part}.txt').read_text(), '{part} result\\n')\n*** End Patch"
+        );
+        sequence.push(responses::sse(vec![
+            responses::ev_response_created(&format!("patch-{part}")),
+            responses::ev_apply_patch_custom_tool_call(&format!("patch-{part}"), &patch),
+            responses::ev_completed(&format!("patch-{part}")),
+        ]));
+        sequence.push(responses::sse(vec![
+            responses::ev_response_created(&format!("validate-{part}")),
+            responses::ev_shell_command_call(
+                &format!("validate-{part}"),
+                &format!("{python} -m unittest test_{part} -q"),
+            ),
+            responses::ev_completed(&format!("validate-{part}")),
+        ]));
+    }
+    sequence.push(responses::sse(vec![
+        responses::ev_assistant_message("answer", "Both changes passed their focused tests."),
+        responses::ev_completed("finished"),
+    ]));
+    let requests = responses::mount_sse_sequence(&server, sequence).await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::Kd4Runtime).unwrap();
+            config.features.disable(Feature::CodeModeHost).unwrap();
+            config.features.disable(Feature::UnifiedExec).unwrap();
+        })
+        .build(&server)
+        .await?;
+    let completion = test.submit_turn_and_capture_completion(
+        "Implement the first result and validate it, then implement and validate the second result.",
+    ).await?;
+    assert!(completion.error.is_none(), "{completion:?}");
+    for part in ["first", "second"] {
+        assert_eq!(
+            fs::read_to_string(test.workspace_path(format!("{part}.txt")))?,
+            format!("{part} result\n")
+        );
+    }
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 5);
+    for (request_index, part) in [(2, "first"), (4, "second")] {
+        let output = requests[request_index]
+            .function_call_output_text(&format!("validate-{part}"))
+            .expect("model receives the completed validation");
+        assert!(output.contains("Ran 1 test"), "{output}");
+        assert!(output.contains("OK"), "{output}");
+        assert!(
+            requests[request_index].body_json()["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "passing a focused test must not remove the next action's tools"
+        );
+    }
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("Both changes passed their focused tests.")
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_failed_read_preserves_a_different_required_action() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "repeated_failed_read_preserves_a_different_required_action",
+        repeated_failed_read_preserves_a_different_required_action_impl,
     )
-    .await;
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Kd4Runtime)
-            .expect("enable KD4 runtime");
-    });
-    let test = builder.build(&server).await?;
+}
+
+async fn repeated_failed_read_preserves_a_different_required_action_impl() -> Result<()> {
+    core_test_support::require_network!();
+    let server = responses::start_mock_server().await;
+    let mut sequence = Vec::new();
+    for index in 1..=3 {
+        sequence.push(responses::sse(vec![
+            responses::ev_response_created(&format!("repeat-{index}")),
+            responses::ev_function_call(&format!("repeat-{index}"), "read_tool_output",
+                r#"{"artifact_id":"11111111-1111-4111-8111-111111111111","selectors":[{"kind":"lines","start":1,"end":1}]}"#),
+            responses::ev_completed(&format!("repeat-{index}")),
+        ]));
+    }
+    sequence.push(responses::sse(vec![
+        responses::ev_response_created("different-action"),
+        responses::ev_apply_patch_custom_tool_call("required-write",
+            "*** Begin Patch\n*** Add File: recovered.txt\n+recovered through a different action\n*** End Patch"),
+        responses::ev_completed("different-action"),
+    ]));
+    sequence.push(responses::sse(vec![
+        responses::ev_assistant_message("answer", "Recovered and completed the required change."),
+        responses::ev_completed("finished"),
+    ]));
+    let requests = responses::mount_sse_sequence(&server, sequence).await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::Kd4Runtime).unwrap();
+            config.features.disable(Feature::CodeModeHost).unwrap();
+        })
+        .build(&server)
+        .await?;
     let completion = test
-        .submit_turn_and_capture_completion("Return the answer.")
+        .submit_turn_and_capture_completion("Recover the evidence, then write the required result.")
         .await?;
     assert!(completion.error.is_none(), "{completion:?}");
-    assert_eq!(completion.last_agent_message.as_deref(), Some("Finished."));
-    let timing = completion.timing.expect("completed turn timing");
-    assert_eq!(timing.counters.residual_deterministic_generation_count, 0);
-    request.single_request();
+    assert_eq!(
+        fs::read_to_string(test.workspace_path("recovered.txt"))?,
+        "recovered through a different action\n"
+    );
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 5);
+    // Missing-artifact errors do not claim to be permanent, so they remain
+    // retryable. Their repeated cycle still exercises convergence without
+    // permission to disable a different required action.
+    for index in 1..=3 {
+        let failure = requests[index]
+            .function_call_output_text(&format!("repeat-{index}"))
+            .expect("repeated artifact lookup failure");
+        assert!(
+            failure.contains("artifact expired or does not belong to this thread"),
+            "a valid artifact lookup should reach the repeated failure path: {failure}"
+        );
+    }
+    assert!(
+        requests[3]
+            .body_json()
+            .to_string()
+            .contains("Other tools remain available for unfinished work and recovery.")
+    );
+    assert!(
+        requests[3].body_json()["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("Recovered and completed the required change.")
+    );
     Ok(())
 }
 
@@ -3372,7 +3760,8 @@ async fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl
         .await;
     let step = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let mut client = session.services.model_client.new_session();
     let error = run_auto_compact(
         &session,
@@ -4286,6 +4675,7 @@ async fn drain_in_flight_returns_earliest_required_terminal_after_persisting_all
     .into_future()
     .await;
     first.result = Ok(ToolCallCompletion {
+        failure_detail: None,
         response: synthetic_tool_result("first-terminal"),
         required_terminal: Some(RequiredToolTerminal {
             call_id: "first-terminal".to_string(),
@@ -4300,11 +4690,12 @@ async fn drain_in_flight_returns_earliest_required_terminal_after_persisting_all
     .into_future()
     .await;
     second.result = Ok(ToolCallCompletion {
+        failure_detail: None,
         response: synthetic_tool_result("second-terminal"),
         required_terminal: Some(RequiredToolTerminal {
             call_id: "second-terminal".to_string(),
-            cause: RequiredToolTerminalCause::TimedOut,
-            message: "second required timeout".to_string(),
+            cause: RequiredToolTerminalCause::Blocked,
+            message: "second required denial".to_string(),
         }),
     });
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
@@ -5032,7 +5423,8 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() ->
 
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     const SNAPSHOT_APP_ID: &str = "phase68-snapshot-app";
     const SNAPSHOT_APP_NAME: &str = "Phase 68 Snapshot App";
     const SNAPSHOT_TOOL_NAMESPACE: &str = "mcp__codex_apps__phase_68_snapshot_app";
@@ -5143,7 +5535,8 @@ async fn pending_plan_commit_and_invalidation_share_the_session_state_owner() {
         crate::session::tests::make_session_and_context_with_rx().await;
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let stale_generation = session.services.planning_generation();
     let prepared_context_update = session.prepare_context_update(step_context.as_ref()).await;
     let history_before = session.clone_history().await.into_raw_items();
@@ -5168,6 +5561,7 @@ async fn pending_plan_commit_and_invalidation_share_the_session_state_owner() {
             commit_session
                 .compare_and_record_context_updates(prepared_context_update, stale_generation)
                 .await
+                .unwrap()
         });
         wait_for_concurrent_state_attempt(&commit_attempted);
         assert!(!commit.is_finished());
@@ -5195,12 +5589,14 @@ async fn pending_plan_commit_and_invalidation_share_the_session_state_owner() {
     let current_generation = session.services.planning_generation();
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let prepared_context_update = session.prepare_context_update(step_context.as_ref()).await;
     assert!(
         session
             .compare_and_record_context_updates(prepared_context_update, current_generation)
             .await
+            .unwrap()
             .is_some()
     );
     let invalidation = {
@@ -5264,10 +5660,12 @@ async fn realized_context_commits_only_the_bound_physical_attempt() {
         crate::session::tests::make_session_and_context_with_rx().await;
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     session
         .record_context_updates_and_set_reference_context_item(step_context.as_ref())
-        .await;
+        .await
+        .unwrap();
 
     assert!(
         session
@@ -5319,7 +5717,8 @@ async fn pending_plan_rebuilds_after_generation_changes_during_planning() -> Res
     let planning_generation = session.services.planning_generation();
     let stale_step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     {
         let mut state_owner = session.state.lock().await;
         session
@@ -5342,7 +5741,7 @@ async fn pending_plan_rebuilds_after_generation_changes_during_planning() -> Res
     );
 
     let rebuilt_generation = session.services.planning_generation();
-    let rebuilt_step_context = session.capture_step_context(turn_context).await;
+    let rebuilt_step_context = session.capture_step_context(turn_context).await.unwrap();
     let rebuilt = build_pure_pending_turn_plan(
         &session,
         rebuilt_step_context,
@@ -5431,34 +5830,51 @@ fn pending_token_estimate_excludes_stable_startup_injections_from_body_growth() 
 }
 
 #[test]
-fn pending_injection_byte_count_serializes_each_item_once_with_array_overhead() {
-    let stable = ContextualUserFragment::into(TaskModelGuidance);
-    let dynamic = ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![codex_protocol::models::ContentItem::InputText {
-            text: "dynamic injection".repeat(256),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
+fn audit_reports_17_19_pending_images_use_modality_estimates() {
+    let router = ToolRouter::from_parts(
+        crate::tools::registry::ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        Vec::new(),
+    );
+    let image = |bytes: usize| {
+        ResponseItem::from(ResponseInputItem::from(vec![UserInput::Image {
+            image_url: format!("data:image/png;base64,{}", "a".repeat(bytes)),
+            detail: None,
+        }]))
     };
-    let items = [stable, dynamic.clone()];
-
-    let (total, body) =
-        injection_serialized_lengths(&items).expect("count injection serialization");
-
-    assert_eq!(
-        total,
-        serde_json::to_vec(&items)
-            .expect("serialize comparison injection")
-            .len(),
-    );
-    assert_eq!(
-        body,
-        serde_json::to_vec(&dynamic)
-            .expect("serialize comparison body item")
-            .len(),
-    );
+    let short = estimate_pending_tokens(&[], &[image(100)], &[], &router, false);
+    let long = estimate_pending_tokens(&[], &[image(4 * 1024 * 1024)], &[], &router, false);
+    assert_eq!(short.total_tokens, long.total_tokens);
+    assert_eq!(short.body_growth_tokens, long.body_growth_tokens);
+    assert!(long.total_tokens > 1_800 && long.total_tokens < 2_000);
+    for content in [
+        UserInput::Image {
+            image_url: format!("data:image/png;base64,{}", "a".repeat(4 * 1024 * 1024)),
+            detail: None,
+        },
+        UserInput::Image {
+            image_url: "https://example.invalid/image.png".to_string(),
+            detail: None,
+        },
+        UserInput::LocalImage {
+            path: PathBuf::from("nonexistent-image.png"),
+            detail: None,
+        },
+    ] {
+        let pending = [TurnInput::UserInput {
+            content: vec![content],
+            client_id: None,
+        }];
+        let estimate = estimate_pending_tokens(&pending, &[], &[], &router, false);
+        assert!(estimate.total_tokens > 1_800 && estimate.total_tokens < 2_000);
+        assert!(estimate.body_growth_tokens > 1_800);
+    }
+    let text = ResponseItem::from(ResponseInputItem::from(vec![UserInput::Text {
+        text: "a".repeat(40_000),
+        text_elements: Vec::new(),
+    }]));
+    assert!(estimate_pending_tokens(&[], &[text], &[], &router, false).total_tokens > 10_000);
 }
 
 #[test]
@@ -6020,7 +6436,8 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
         /*previously_active_item*/ None,
         &mut last_agent_message,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert!(handled);
     assert_eq!(
@@ -6588,6 +7005,210 @@ async fn pending_turn_cancelled_before_planning_does_not_charge_budget() {
     assert!(session.clone_history().await.raw_items().is_empty());
 }
 
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held state owner proves legacy follow-up renewal precedes planning"
+)]
+async fn legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not() {
+    use codex_agent_task_store::AcceptanceCriterion;
+    use codex_agent_task_store::AgentRole;
+    use codex_agent_task_store::AgentTaskBindingDraft;
+    use codex_agent_task_store::AssignmentAdmissionOrigin;
+    use codex_agent_task_store::AssignmentDraft;
+    use codex_agent_task_store::CapabilityProfile;
+    use codex_agent_task_store::WorkspaceStrategy;
+    use codex_protocol::protocol::AgentStatus;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
+
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let state =
+        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .unwrap();
+    let coordinator = session.services.agent_control.task_coordinator();
+    coordinator
+        .initialize(state, "root-session".to_string())
+        .await
+        .unwrap();
+    let (assignment, attempt) = coordinator
+        .create_assignment(
+            repo.path(),
+            AssignmentDraft {
+                root_session_id: "root-session".to_string(),
+                admission_origin: AssignmentAdmissionOrigin::LegacyMessage {
+                    parent_assignment_id: None,
+                },
+                role: AgentRole::Worker,
+                capability_profile: CapabilityProfile::ScopedSourceWrite,
+                objective: "complete the follow-up".to_string(),
+                acceptance_criteria: vec![AcceptanceCriterion {
+                    id: "completed".to_string(),
+                    text: "follow-up completed".to_string(),
+                }],
+                read_scope: Vec::new(),
+                write_scope: Vec::new(),
+                stop_condition: "task complete".to_string(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: Vec::new(),
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: WorkspaceStrategy::Shared,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await
+        .unwrap();
+    let path = AgentPath::root().join("followup_worker").unwrap();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: path.to_string(),
+            task_name: "followup_worker".to_string(),
+            thread_id: Some(session.thread_id.to_string()),
+        })
+        .await
+        .unwrap();
+    turn_context.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: codex_protocol::ThreadId::new(),
+        depth: 1,
+        agent_path: Some(path.clone()),
+        agent_nickname: None,
+        agent_role: None,
+    });
+    coordinator
+        .seal_missing_receipt(
+            &path,
+            session.thread_id,
+            &AgentStatus::Completed(Some("initial result".to_string())),
+        )
+        .await
+        .unwrap()
+        .expect("initial completion seals its attempt");
+    let mut stale_turn = turn_context
+        .with_model(
+            turn_context.model_info.slug.clone(),
+            &session.services.models_manager,
+        )
+        .await;
+    stale_turn.agent_task_binding = Arc::new(std::sync::OnceLock::from(
+        coordinator.binding_for_agent_path(&path),
+    ));
+    stale_turn.multi_agent_version = MultiAgentVersion::V2;
+    let turn_context = Arc::new(turn_context);
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let mut budget = LogicalGenerationBudget::default();
+    let result = run_turn(
+        Arc::clone(&session),
+        Arc::clone(&turn_context),
+        Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        Vec::new(),
+        None,
+        &mut budget,
+        cancelled,
+    )
+    .await;
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    assert_eq!(
+        coordinator
+            .binding_for_source(&turn_context.session_source)
+            .unwrap()
+            .attempt_id,
+        attempt.attempt_id
+    );
+    assert_eq!(budget.regular_generations, 0);
+
+    // Stop planning at its first state read. The attempt must already be fresh,
+    // and the cancellation must propagate without charging a model generation.
+    let state = session.state.lock().await;
+    let cancellation = CancellationToken::new();
+    let turn_cancellation = cancellation.clone();
+    let running_session = Arc::clone(&session);
+    let running_context = Arc::clone(&turn_context);
+    let running = tokio::spawn(async move {
+        let mut budget = LogicalGenerationBudget::default();
+        let extension_data = Arc::new(ExtensionData::new(running_context.sub_id.clone()));
+        let result = run_turn(
+            running_session,
+            running_context,
+            extension_data,
+            Vec::new(),
+            None,
+            &mut budget,
+            turn_cancellation,
+        )
+        .await;
+        (result, budget)
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if coordinator
+                .binding_for_source(&turn_context.session_source)
+                .unwrap()
+                .attempt_id
+                != attempt.attempt_id
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("run_turn must renew the completed binding before planning");
+    cancellation.cancel();
+    drop(state);
+    let (result, budget) = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("cancelled follow-up returns without model work")
+        .unwrap();
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    assert_eq!(budget.regular_generations, 0);
+    let task = coordinator
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(task.current_attempt.ordinal, 1);
+    assert!(task.receipt.is_none());
+    assert!(
+        session
+            .maybe_notify_parent_of_terminal_turn(
+                &stale_turn,
+                &EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
+                    surfaced_result: None,
+                    turn_id: stale_turn.sub_id.clone(),
+                    last_agent_message: Some("late old result".to_string()),
+                    error: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                })
+            )
+            .await
+    );
+    let after_stale = coordinator
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        after_stale.current_attempt.attempt_id,
+        task.current_attempt.attempt_id
+    );
+    assert!(
+        after_stale.receipt.is_none(),
+        "a stale Session callback must not seal the renewed attempt"
+    );
+    assert!(session.clone_history().await.raw_items().is_empty());
+}
+
 #[test]
 fn pending_turn_mechanism_does_not_replay_the_completed_mcp_effect() {
     let completed = ("install:tool@v1".to_string(), None);
@@ -6783,7 +7404,8 @@ enabled = true
     }];
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     let PendingTurnPlanBuild::Ready(plan) = build_pure_pending_turn_plan(
         &session,
         step_context,
@@ -7009,4 +7631,242 @@ async fn plan_prose_prefix_survives_worker_abort_during_item_start_impl() -> Res
         "the real plan stream was not retried"
     );
     Ok(())
+}
+
+#[test]
+fn audit_stop_hook_unchanged_failure_stops_after_one_repair() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit_stop_hook_unchanged_failure", || async {
+        core_test_support::require_network!();
+        let server = responses::start_mock_server().await;
+        let requests = responses::mount_sse_sequence(
+            &server,
+            (0..2)
+                .map(|index| {
+                    responses::sse(vec![
+                        responses::ev_assistant_message(&format!("draft-{index}"), "draft answer"),
+                        responses::ev_completed(&format!("response-{index}")),
+                    ])
+                })
+                .collect(),
+        )
+        .await;
+        let test = test_codex().with_pre_build_hook(|home| {
+            let script = home.join("always_block.py");
+            fs::write(&script, "import json,sys\njson.load(sys.stdin)\nprint(json.dumps({'decision':'block','reason':'same required validation'}))\n").unwrap();
+            fs::write(home.join("hooks.json"), serde_json::json!({"hooks":{"Stop":[{"hooks":[{
+                "type":"command", "command":format!("python3 \"{}\"", script.display()),
+                "commandWindows":format!("python \"{}\"", script.display())
+            }]}]}}).to_string()).unwrap();
+        }).with_config(trust_discovered_hooks).build(&server).await?;
+        let completion = test
+            .submit_turn_and_capture_completion("Finish the answer")
+            .await?;
+        assert!(completion.error.is_some(), "{completion:?}");
+        assert_eq!(requests.requests().len(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn audit_finalizer_failure_precedes_stop_repair() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "audit_finalizer_failure_precedes_stop_repair",
+        || async {
+            core_test_support::require_network!();
+            let server = responses::start_mock_server().await;
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![responses::sse(vec![
+                    responses::ev_assistant_message("answer", "draft answer"),
+                    responses::ev_completed("r1"),
+                ])],
+            )
+            .await;
+            let test = test_codex()
+                .with_pre_build_hook(|home| {
+                    write_one_shot_stop_hook(home).unwrap();
+                })
+                .with_config(|config| {
+                    trust_discovered_hooks(config);
+                    config.after_agent_policy = AfterAgentPolicy::MutatingFinalizer;
+                    config.notify = Some(vec![
+                        if cfg!(windows) { "python" } else { "python3" }.into(),
+                        "-c".into(),
+                        "import sys; sys.exit(1)".into(),
+                    ]);
+                })
+                .build(&server)
+                .await?;
+            let completion = test
+                .submit_turn_and_capture_completion("Finish the answer")
+                .await?;
+            assert!(completion.error.is_some(), "{completion:?}");
+            assert_eq!(requests.requests().len(), 1);
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn audit_provider_overflow_recovers_once_in_the_same_turn() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit_provider_overflow_recovers_once", || async {
+        core_test_support::require_network!();
+        for repeated_overflow in [false, true] {
+            let server = responses::start_mock_server().await;
+            let overflow = responses::sse_failed(
+                "overflow",
+                "context_length_exceeded",
+                "context window exceeded",
+            );
+            let final_response = if repeated_overflow {
+                overflow.clone()
+            } else {
+                responses::sse(vec![
+                    responses::ev_assistant_message("answer", "recovered answer"),
+                    responses::ev_completed("done"),
+                ])
+            };
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![
+                    overflow,
+                    responses::sse(vec![
+                        responses::ev_assistant_message(
+                            "summary",
+                            &complete_compaction_summary("continue the answer"),
+                        ),
+                        responses::ev_completed("compact"),
+                    ]),
+                    final_response,
+                ],
+            )
+            .await;
+            let provider = non_openai_model_provider(&server);
+            let test = test_codex()
+                .with_config(move |config| {
+                    config.model_provider = provider;
+                    config.model_provider.stream_max_retries = Some(0);
+                    config.model_auto_compact_token_limit = Some(100_000);
+                    config.model_context_window = Some(200_000);
+                })
+                .build(&server)
+                .await?;
+            let completion = test
+                .submit_turn_and_capture_completion("Answer the user")
+                .await?;
+            assert_eq!(
+                completion.error.is_some(),
+                repeated_overflow,
+                "{completion:?}"
+            );
+            if !repeated_overflow {
+                assert_eq!(
+                    completion.last_agent_message.as_deref(),
+                    Some("recovered answer")
+                );
+            }
+            assert_eq!(requests.requests().len(), 3);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn oversized_required_instructions_stop_after_bounded_compaction() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("oversized_required_instructions", || async {
+        core_test_support::require_network!();
+        let server = responses::start_mock_server().await;
+        let requests = responses::mount_sse_sequence(
+            &server,
+            vec![responses::sse(vec![
+                responses::ev_assistant_message(
+                    "summary",
+                    &complete_compaction_summary("continue"),
+                ),
+                responses::ev_completed("compact"),
+            ])],
+        )
+        .await;
+        let provider = non_openai_model_provider(&server);
+        let test = test_codex()
+            .with_pre_build_hook(|home| {
+                std::fs::write(
+                    home.join("AGENTS.md"),
+                    "Required safety and execution rule. ".repeat(4000),
+                )
+                .unwrap();
+            })
+            .with_config(move |config| {
+                config.model_provider = provider;
+                config.model_provider.stream_max_retries = Some(0);
+                config.project_doc_max_bytes = 200_000;
+                config.model_auto_compact_token_limit = Some(4_000);
+                config.model_context_window = Some(8_000);
+            })
+            .build(&server)
+            .await?;
+        let completion = tokio::time::timeout(
+            Duration::from_secs(20),
+            test.submit_turn_and_capture_completion("Apply the required rules"),
+        )
+        .await??;
+        assert!(
+            completion.error.is_some(),
+            "oversized mandatory context must stop locally: {completion:?}"
+        );
+        assert!(
+            requests.requests().len() <= 1,
+            "compaction cannot repeatedly resend irreducible required context"
+        );
+        assert!(
+            completion.last_agent_message.is_none(),
+            "no ordinary generation may run after overflow"
+        );
+        Ok(())
+    })
+}
+
+#[tokio::test]
+async fn audit_reports_17_19_failed_prefix_does_not_admit_deferred_tools() {
+    let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+    crate::session::tests::attach_thread_persistence(&mut session).await;
+    session.live_thread().unwrap().shutdown().await.unwrap();
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let recorder = OrderedResponseItemRecorder::default();
+    let _barrier = recorder
+        .enqueue(
+            session,
+            turn,
+            ResponseItem::from(synthetic_tool_result("persist-fails")),
+            Vec::new(),
+            None,
+        )
+        .await;
+    let tail = ResponseTailSignal::new();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let call = tokio::spawn(defer_tool_future_until_response_tail(
+        controlled_tool_call("must-not-run", started_tx, release_rx),
+        tail.clone(),
+    ));
+    assert!(
+        close_response_tail_after_persistence(
+            &recorder,
+            &tail,
+            ResponseTailOutcome::SuccessfulTail
+        )
+        .await
+        .is_err()
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.result.is_ok());
+    assert!(
+        started_rx.await.is_err(),
+        "failed persistence must never poll the handler"
+    );
+    assert!(release_tx.send(()).is_err());
 }

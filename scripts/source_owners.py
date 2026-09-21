@@ -529,6 +529,8 @@ def load_and_validate(
     def path_is_dir(candidate: Path) -> bool:
         return observe_path(candidate)[1]
 
+    symbol_results = {}
+
     def validate_symbol(
         owner_id: str, label: str, evidence: dict, *, primary: bool = False
     ) -> None:
@@ -559,11 +561,14 @@ def load_and_validate(
             errors.append(f"{owner_id}: unreadable symbol evidence {raw_path}: {error}")
             return
         source = source_text[candidate]
-        present = (
-            _has_primary_declaration(candidate, source, symbol)
-            if primary
-            else _evidence_symbol_present(candidate, source, symbol)
-        )
+        key = (candidate, symbol, primary)
+        if key not in symbol_results:
+            symbol_results[key] = (
+                _has_primary_declaration(candidate, source, symbol)
+                if primary
+                else _evidence_symbol_present(candidate, source, symbol)
+            )
+        present = symbol_results[key]
         if not present:
             errors.append(f"{owner_id}: stale symbol evidence {raw_path}::{symbol}")
 
@@ -905,6 +910,7 @@ def query_graph(
     max_relationships: int = MAX_QUERY_RELATIONSHIPS,
     *,
     graph: dict | None = None,
+    source_fingerprints: dict[Path, tuple[bytes, int]] | None = None,
 ) -> dict:
     if not 1 <= max_relationships <= MAX_QUERY_RELATIONSHIPS:
         raise ValueError(
@@ -918,7 +924,9 @@ def query_graph(
         graph = _select_index_graph(graph, owner_ids, None)
     # Freshness covers the selected declaration closure, including incoming
     # edges and evidence omitted by the response budget, before truncation.
-    snapshot, _, _ = _slice_source_snapshot(root, graph, graph["owners"])
+    snapshot, _, _ = _slice_source_snapshot(
+        root, graph, graph["owners"], source_fingerprints
+    )
     graph["repository_revision"] = f"manifest:{digest}:sources:{snapshot}"
     return _select_index_graph(graph, None, max_relationships)
 
@@ -1362,13 +1370,23 @@ def _focused_validation_routes(
     return selected, omitted
 
 
-def _bound_slice_output(result: dict, max_bytes: int) -> dict:
+def _bound_slice_output(result: dict, max_bytes: int, *, compact: bool = False) -> dict:
     """Bound the complete wire JSON while keeping evidence and pagination intact."""
     if max_bytes < 4096:
         raise ValueError("max_bytes must be at least 4096")
     result["output_budget_bytes"] = max_bytes
     while (
-        len((json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+        len(
+            (
+                json.dumps(
+                    compact_slice_output(result) if compact else result,
+                    indent=None if compact else 2,
+                    separators=(",", ":") if compact else None,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
         > max_bytes
     ):
         tests = result.get("tests_and_contracts", {})
@@ -1426,6 +1444,7 @@ def architecture_slice(
     expected_snapshot: str | None = None,
     max_bytes: int = MAX_SLICE_OUTPUT_BYTES,
     source_fingerprints: dict[Path, tuple[bytes, int]] | None = None,
+    compact: bool = False,
 ) -> dict:
     """Return a completeness-first slice ranked within each architecture facet."""
     if not 1 <= max_relationships <= MAX_SLICE_RELATIONSHIPS:
@@ -1751,6 +1770,7 @@ def architecture_slice(
             },
         },
         max_bytes,
+        compact=compact,
     )
 
 
@@ -2181,6 +2201,7 @@ def main() -> int:
                     args.owners,
                     args.max_relationships,
                     graph=cached_graph,
+                    source_fingerprints=source_fingerprints,
                 )
             else:
                 result = architecture_slice(
@@ -2197,6 +2218,7 @@ def main() -> int:
                     expected_snapshot=args.expected_snapshot,
                     max_bytes=args.max_bytes,
                     source_fingerprints=source_fingerprints,
+                    compact=args.compact,
                 )
             result["index_status"] = (
                 "reused" if cached_graph is not None else "fallback"
@@ -2256,7 +2278,7 @@ def main() -> int:
                     **read_metrics,
                     "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
                 }
-                _bound_slice_output(result, args.max_bytes)
+                _bound_slice_output(result, args.max_bytes, compact=args.compact)
             print(
                 json.dumps(
                     compact_slice_output(result) if args.compact else result,

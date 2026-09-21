@@ -24,6 +24,55 @@ use codex_code_mode::WaitOutcome;
 use codex_code_mode::WaitRequest;
 use codex_code_mode::host::MAX_FRAME_BYTES;
 use codex_code_mode_protocol::NestedCancellation;
+use codex_code_mode_protocol::OutputLoss;
+
+#[tokio::test]
+async fn host_process_exits_on_broken_output_while_stdin_remains_open() {
+    use codex_code_mode_protocol::host::*;
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").unwrap(),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut input = FramedWriter::new(child.stdin.take().unwrap());
+    let mut output = FramedReader::new(child.stdout.take().unwrap());
+    input
+        .write(&ClientToHost::ClientHello(
+            ClientHello::new(
+                SupportedProtocolVersions::try_new([ProtocolVersion::V1]).unwrap(),
+                CapabilitySet::empty(),
+                CapabilitySet::empty(),
+            )
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        output.read::<HostToClient>().await.unwrap(),
+        Some(HostToClient::HostHello(_))
+    ));
+    drop(output);
+    input
+        .write(&ClientToHost::Request {
+            id: RequestId::new(1),
+            request: HostRequest::OpenSession {
+                session_id: SessionId::new("broken-output").unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(12), child.wait())
+        .await
+        .expect("host must exit without additional stdin or EOF")
+        .unwrap();
+    assert!(!status.success());
+    drop(input);
+}
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -292,6 +341,7 @@ text([absent.value, explicitNull.value, object.value].join(","));
         assert_eq!(
             response,
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "output,output,output".to_string(),
@@ -385,6 +435,7 @@ async fn remote_session_persists_values_forwards_delegates_and_controls_cells() 
     assert_eq!(
         execute(&session, execute_request(r#"store("key", "persisted");"#),).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: None,
@@ -411,6 +462,7 @@ text(result.value);
     assert_eq!(
         execute(&session, callback_request).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "output".to_string(),
@@ -517,6 +569,7 @@ async fn dropping_session_outside_runtime_closes_cells_and_preserves_shared_host
     assert_eq!(
         execute(&survivor, execute_request(r#"store("key", "preserved");"#)).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: None,
@@ -544,6 +597,7 @@ async fn dropping_session_outside_runtime_closes_cells_and_preserves_shared_host
     assert_eq!(
         execute(&survivor, execute_request(r#"text(load("key"));"#)).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "preserved".to_string(),
@@ -718,11 +772,15 @@ return;
             .expect("wait task")
             .expect("wait for terminal response"),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
+            output_loss: None,
             cell_id: running_cell_id,
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "hello".to_string(),
             }],
-            error_text: None,
+            error_text: Some(
+                "cell completed with 1 unawaited tool call(s); outstanding tool work is cancelled"
+                    .to_string(),
+            ),
         })
     );
     session.shutdown().await.expect("shutdown remote session");
@@ -750,6 +808,7 @@ async fn oversized_execute_request_does_not_close_the_shared_host() {
     assert_eq!(
         execute(&session, execute_request(r#"text("still alive");"#)).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
@@ -793,6 +852,7 @@ try {{
     assert_eq!(
         execute_to_terminal(&session, oversized_argument).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "argument rejected".to_string(),
@@ -815,6 +875,7 @@ try {
     assert_eq!(
         execute_to_terminal(&session, oversized_result).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "result rejected".to_string(),
@@ -826,6 +887,7 @@ try {
     assert_eq!(
         execute(&session, execute_request(r#"text("still alive");"#)).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("3"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
@@ -857,6 +919,10 @@ async fn oversized_initial_response_is_bounded_without_closing_the_shared_host()
             .await
             .expect("oversized output should be bounded before IPC framing"),
         RuntimeResponse::Result {
+            output_loss: Some(OutputLoss {
+                discarded_items: 1,
+                discarded_bytes_lower_bound: MAX_FRAME_BYTES as u64,
+            }),
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "Code mode output was truncated because the cell buffered more than 64 MiB."
@@ -869,6 +935,7 @@ async fn oversized_initial_response_is_bounded_without_closing_the_shared_host()
     assert_eq!(
         execute(&session, execute_request(r#"text("still alive");"#)).await,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),

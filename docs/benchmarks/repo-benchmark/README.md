@@ -496,6 +496,36 @@ Rollout-trace recording remains opt-in: enabling additional trace recording on
 the timed path would require assessing overhead and compatibility across all
 selected revisions. The Python audit remains authoritative for benchmark metrics.
 
+### Efficiency acceptance: mechanism and complete-turn outcome
+
+Diagnose missing capability, failure to follow existing guidance, and interface
+friction separately. A retained result is not adequate merely because it exists:
+the supported handle and selector path must make valid evidence easier and cheaper
+to reuse than to reproduce. Count recovery calls, recovered output, and subsequent
+model requests in the comparison, not just the suppressed producer execution.
+
+| Mechanism acceptance | Additional outcome required before claiming improvement |
+| --- | --- |
+| Replay returns usable evidence through dispatch, rebinds the current call ID, skips the producer, and rejects invalidated evidence. | Compare complete-turn elapsed time and model requests. A replay hit after the model generates a call saves execution, not that request. |
+| Independent operations overlap with bounded concurrency; every outcome is collected and conflicting resources remain serialized. | Include batching overhead in total elapsed time. Independence permits overlap; it does not require launching everything simultaneously. |
+| Predetermined empty waits remain inside the existing execution handler, while input, cancellation, and decision boundaries still interrupt it. | Show removed model handoffs and preserved cancellation responsiveness, rather than merely longer waits. |
+| A bounded model-facing projection exposes failure and incomplete coverage, with a usable route to all omitted evidence. | Compare canonical and model-visible output, recovery frequency, retruncation, omitted sections, total tokens, and elapsed time together. Smaller initial output alone is insufficient. |
+| The resolved prompt delivers consolidated guidance without requiring per-action explanations. | In model-driven tasks, verify requested substance and task success as well as output length and total turn cost. Prompt string assertions prove delivery, not compliance. |
+
+Use the existing scripted and live measurement paths, retained attempt records,
+and frozen audit reports; do not introduce another scheduler or evaluation
+framework. Scripted responses prove runtime mechanisms, not that a model chooses
+to avoid unnecessary work. Compare like tasks, model/reasoning settings, permission
+policies, and completeness of evidence; keep failures, missing metrics, and
+unresolved coverage visible rather than accepting only surviving fast samples.
+If no comparable model-driven evidence exists, report user-visible improvement as
+unmeasured. Reduced execution counts do not substitute for fewer model handoffs.
+
+Use existing code mode first. Only measured recurring mechanical overhead justifies
+a small extension to its owning handler; it does not justify a second scheduler.
+Likewise, change locking only for demonstrated shared-resource conflicts or
+unnecessary exclusion, never by serializing entire categories of writes or builds.
+
 ## Audit AJâ€“AY: verified changes and measurement limits
 
 The behavior vector uses the existing `investigation-evidence-v1` envelope.

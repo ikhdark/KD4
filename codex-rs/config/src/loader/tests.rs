@@ -151,6 +151,12 @@ project = true
 #[derive(Default)]
 struct TestFileSystem {
     metadata_error: Option<(AbsolutePathBuf, io::ErrorKind)>,
+    read_error: Option<AbsolutePathBuf>,
+    canonical_alias: Option<(AbsolutePathBuf, AbsolutePathBuf)>,
+    reads: std::sync::Mutex<Vec<AbsolutePathBuf>>,
+    metadata_reads: std::sync::Mutex<Vec<AbsolutePathBuf>>,
+    read_snapshot: Option<(AbsolutePathBuf, String)>,
+    read_started: Option<(AbsolutePathBuf, std::sync::Arc<tokio::sync::Notify>)>,
 }
 
 impl ExecutorFileSystem for TestFileSystem {
@@ -161,6 +167,11 @@ impl ExecutorFileSystem for TestFileSystem {
     ) -> ExecutorFileSystemFuture<'a, PathUri> {
         Box::pin(async move {
             let path = path.to_abs_path()?;
+            if let Some((alias, target)) = &self.canonical_alias
+                && &path == alias
+            {
+                return Ok(PathUri::from_abs_path(target));
+            }
             let canonicalized = path.canonicalize()?;
             Ok(PathUri::from_abs_path(&canonicalized))
         })
@@ -173,6 +184,23 @@ impl ExecutorFileSystem for TestFileSystem {
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let path = path.to_abs_path()?;
+            self.reads.lock().unwrap().push(path.clone());
+            if let Some((watched, notify)) = &self.read_started
+                && watched == &path
+            {
+                notify.notify_one();
+            }
+            if let Some((source_path, source)) = &self.read_snapshot
+                && source_path == &path
+            {
+                return Ok(source.as_bytes().to_vec());
+            }
+            if self.read_error.as_ref() == Some(&path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected read failure",
+                ));
+            }
             tokio::fs::read(path.as_path()).await
         })
     }
@@ -215,6 +243,7 @@ impl ExecutorFileSystem for TestFileSystem {
     ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
         Box::pin(async move {
             let path = path.to_abs_path()?;
+            self.metadata_reads.lock().unwrap().push(path.clone());
             if let Some((failed_path, kind)) = &self.metadata_error
                 && &path == failed_path
             {
@@ -552,6 +581,7 @@ async fn discovery_reports_operational_metadata_errors() {
         for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
             let fs = TestFileSystem {
                 metadata_error: Some((failed_path.clone(), kind)),
+                ..Default::default()
             };
             let error = load_config_layers_state(
                 &fs,
@@ -753,6 +783,89 @@ async fn disabled_project_config_ignores_unsupported_version() {
 }
 
 #[tokio::test]
+async fn disabled_project_contents_are_not_read_but_trusted_read_errors_propagate() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+    std::fs::create_dir(cwd.join(".codex")).unwrap();
+    let file = cwd.join(".codex/config.toml");
+    let fs = TestFileSystem {
+        read_error: Some(file.clone()),
+        ..Default::default()
+    };
+    for trusted in [false, true] {
+        let mut overrides = vec![("project_root_markers".to_string(), TomlValue::Array(vec![]))];
+        if trusted {
+            overrides.push((
+                "projects".to_string(),
+                TomlValue::Table(toml::map::Map::from_iter([(
+                    project_trust_key(cwd.as_path()),
+                    toml::toml! { trust_level = "trusted" }.into(),
+                )])),
+            ));
+        }
+        let result = load_config_layers_state(
+            &fs,
+            home.path(),
+            Some(cwd.clone()),
+            &overrides,
+            LoaderOverrides::without_managed_config_for_tests(),
+            &crate::NoopThreadConfigLoader,
+        )
+        .await;
+        if trusted {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(fs.reads.lock().unwrap().contains(&file));
+        } else {
+            let stack = result.unwrap();
+            let layers =
+                stack.get_layers(crate::ConfigLayerStackOrdering::LowestPrecedenceFirst, true);
+            assert!(layers.iter().any(|layer| matches!(
+                layer.name,
+                ConfigLayerSource::Project { .. }
+            ) && layer.is_disabled()));
+            assert!(!fs.reads.lock().unwrap().contains(&file));
+        }
+    }
+}
+
+#[tokio::test]
+async fn executor_canonicalization_prevents_reloading_codex_home_as_project() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+    let folder = cwd.join(".codex");
+    std::fs::create_dir(&folder).unwrap();
+    let fs = TestFileSystem {
+        canonical_alias: Some((
+            folder.clone(),
+            AbsolutePathBuf::from_absolute_path(home.path())
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+        )),
+        read_error: Some(folder.join(CONFIG_TOML_FILE)),
+        ..Default::default()
+    };
+    let stack = load_config_layers_state(
+        &fs,
+        home.path(),
+        Some(cwd),
+        &[("project_root_markers".to_string(), TomlValue::Array(vec![]))],
+        LoaderOverrides::without_managed_config_for_tests(),
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !stack
+            .get_layers(crate::ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
+            .iter()
+            .any(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+    );
+}
+
+#[tokio::test]
 async fn root_checkout_hook_config_obeys_version_boundary() {
     let root = tempdir().unwrap();
     let folder = AbsolutePathBuf::from_absolute_path(root.path()).unwrap();
@@ -779,5 +892,323 @@ async fn root_checkout_hook_config_obeys_version_boundary() {
         .await
         .unwrap(),
         config
+    );
+}
+
+#[tokio::test]
+async fn linked_worktree_inherits_only_root_hooks_without_local_codex_directory() {
+    let home = tempdir().unwrap();
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let worktree = temp.path().join("worktree");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(&worktree)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root_folder = repo.join(".codex");
+    std::fs::create_dir(&root_folder).unwrap();
+    std::fs::write(
+        root_folder.join("config.toml"),
+        "model = 'root-only'\n[hooks]\n",
+    )
+    .unwrap();
+    assert!(!worktree.join(".codex").exists());
+    for trusted in [false, true] {
+        let overrides = if trusted {
+            vec![(
+                "projects".to_string(),
+                TomlValue::Table(toml::map::Map::from_iter([(
+                    project_trust_key(&repo),
+                    toml::toml! { trust_level = "trusted" }.into(),
+                )])),
+            )]
+        } else {
+            vec![]
+        };
+        let fs = TestFileSystem::default();
+        let stack = load_config_layers_state(
+            &fs,
+            home.path(),
+            Some(AbsolutePathBuf::from_absolute_path(&worktree).unwrap()),
+            &overrides,
+            LoaderOverrides::without_managed_config_for_tests(),
+            &crate::NoopThreadConfigLoader,
+        )
+        .await
+        .unwrap();
+        let layers = stack.get_layers(crate::ConfigLayerStackOrdering::LowestPrecedenceFirst, true);
+        let project = layers
+            .iter()
+            .find(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+            .unwrap();
+        assert_eq!(project.is_disabled(), !trusted);
+        assert_eq!(
+            project.hooks_config_folder(),
+            Some(AbsolutePathBuf::from_absolute_path(&root_folder).unwrap())
+        );
+        assert_eq!(project.config.get("hooks").is_some(), trusted);
+        assert!(project.config.get("model").is_none());
+        assert_eq!(
+            fs.reads.lock().unwrap().contains(
+                &AbsolutePathBuf::from_absolute_path(root_folder.join("config.toml")).unwrap()
+            ),
+            trusted
+        );
+    }
+}
+
+#[tokio::test]
+async fn config_diagnostics_use_executor_snapshot_after_host_changes() {
+    let home = tempdir().unwrap();
+    let path = AbsolutePathBuf::from_absolute_path(home.path().join("config.toml")).unwrap();
+    let source = "# executor source\nproject_root_markers = 123\n";
+    std::fs::write(&path, "model = 456\n").unwrap();
+    let fs = TestFileSystem {
+        read_snapshot: Some((path.clone(), source.into())),
+        ..Default::default()
+    };
+    let layer = load_config_toml_for_required_layer(&fs, &path, false, |config| {
+        ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: path.clone(),
+                profile: None,
+            },
+            config,
+        )
+    })
+    .await
+    .unwrap();
+    std::fs::write(&path, "allow_login_shell = 789\n").unwrap();
+    let error = first_layer_config_error_from_entries(&[layer])
+        .await
+        .unwrap();
+    assert_eq!(error.path, path.to_path_buf());
+    assert_eq!(error.range.start.line, 2);
+    let rendered = crate::format_config_error_with_source(&error).await;
+    assert!(
+        rendered.contains("project_root_markers = 123"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("allow_login_shell"));
+    assert_eq!(fs.reads.lock().unwrap().as_slice(), &[path]);
+}
+
+#[tokio::test]
+async fn discovery_reuses_only_current_load_observations() {
+    let workspace = tempdir().unwrap();
+    let root = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+    let cwd = root.join("child");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    let fs = TestFileSystem::default();
+    let mut probes = DiscoveryProbes::new();
+    assert_eq!(
+        find_project_root(&fs, &cwd, &[".git".into()], &mut probes)
+            .await
+            .unwrap(),
+        root
+    );
+    assert_eq!(
+        find_git_checkout_root(&fs, &cwd, &mut probes)
+            .await
+            .unwrap(),
+        Some(root.clone())
+    );
+    for path in [cwd.join(".git"), root.join(".git")] {
+        assert_eq!(
+            fs.metadata_reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|read| **read == path)
+                .count(),
+            1
+        );
+    }
+    std::fs::create_dir(cwd.join(".git")).unwrap();
+    assert_eq!(
+        find_git_checkout_root(&fs, &cwd, &mut DiscoveryProbes::new())
+            .await
+            .unwrap(),
+        Some(cwd)
+    );
+}
+
+#[tokio::test]
+async fn thread_config_wait_does_not_block_local_config_reads() {
+    struct WaitingLoader(std::sync::Arc<tokio::sync::Notify>);
+    impl crate::ThreadConfigLoader for WaitingLoader {
+        fn load(
+            &self,
+            _: crate::ThreadConfigContext,
+        ) -> crate::ThreadConfigLoaderFuture<'_, Vec<crate::ThreadConfigSource>> {
+            Box::pin(async {
+                self.0.notified().await;
+                Ok(vec![])
+            })
+        }
+    }
+    let home = tempdir().unwrap();
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let fs = TestFileSystem {
+        read_started: Some((
+            AbsolutePathBuf::from_absolute_path(home.path().join("config.toml")).unwrap(),
+            notify.clone(),
+        )),
+        ..Default::default()
+    };
+    // Disable prerequisite managed reads so only the joined ordinary branch can wake the loader.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        load_config_layers_state(
+            &fs,
+            home.path(),
+            None,
+            &[],
+            LoaderOverrides::without_managed_config_for_tests(),
+            &WaitingLoader(notify),
+        ),
+    )
+    .await
+    .expect("local reads must progress during thread acquisition")
+    .unwrap();
+    assert!(
+        !result
+            .get_layers(
+                crate::ConfigLayerStackOrdering::LowestPrecedenceFirst,
+                false
+            )
+            .is_empty()
+    );
+}
+
+#[test]
+fn invalid_nested_sibling_preserves_source_relative_paths() {
+    let source = tempdir().unwrap();
+    let config: TomlValue = toml::from_str(
+        r#"
+[sandbox_workspace_write]
+network_access = "invalid"
+writable_roots = ["./scratch", 42]
+[agents.worker]
+config_file = "./worker.toml"
+nickname_candidates = 42
+[profiles.test]
+model = 42
+model_instructions_file = "./instructions.md"
+"#,
+    )
+    .unwrap();
+    let resolved = resolve_relative_paths_in_config_toml(config, source.path()).unwrap();
+    let expected = AbsolutePathBuf::resolve_path_against_base("scratch", source.path());
+    assert_eq!(
+        resolved["sandbox_workspace_write"]["writable_roots"][0].as_str(),
+        expected.as_path().to_str()
+    );
+    assert_eq!(
+        resolved["sandbox_workspace_write"]["writable_roots"][1].as_integer(),
+        Some(42)
+    );
+    assert_eq!(
+        resolved["sandbox_workspace_write"]["network_access"].as_str(),
+        Some("invalid")
+    );
+    assert_eq!(
+        resolved["agents"]["worker"]["config_file"].as_str(),
+        source.path().join("worker.toml").to_str()
+    );
+    assert_eq!(
+        resolved["profiles"]["test"]["model_instructions_file"].as_str(),
+        source.path().join("instructions.md").to_str()
+    );
+}
+
+#[tokio::test]
+async fn strict_project_validation_ignores_discarded_fields_but_checks_supported_fields() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(project.path()).unwrap();
+    std::fs::create_dir(project.path().join(".codex")).unwrap();
+    let file = project.path().join(".codex/config.toml");
+    let overrides = vec![
+        ("project_root_markers".into(), TomlValue::Array(vec![])),
+        (
+            "projects".into(),
+            TomlValue::Table(toml::map::Map::from_iter([(
+                project_trust_key(cwd.as_path()),
+                toml::toml! { trust_level = "trusted" }.into(),
+            )])),
+        ),
+    ];
+    for key in PROJECT_LOCAL_CONFIG_DENYLIST {
+        std::fs::write(&file, format!("{key} = 42\nmodel = 'supported'\n")).unwrap();
+        let mut options =
+            crate::ConfigLoadOptions::from(LoaderOverrides::without_managed_config_for_tests());
+        options.strict_config = true;
+        let stack = load_config_layers_state(
+            &TestFileSystem::default(),
+            home.path(),
+            Some(cwd.clone()),
+            &overrides,
+            options,
+            &crate::NoopThreadConfigLoader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stack.effective_config()["model"].as_str(),
+            Some("supported")
+        );
+        assert!(stack.effective_config().get(*key).is_none(), "{key}");
+    }
+    std::fs::write(&file, "model = 42\n").unwrap();
+    let mut options =
+        crate::ConfigLoadOptions::from(LoaderOverrides::without_managed_config_for_tests());
+    options.strict_config = true;
+    assert!(
+        load_config_layers_state(
+            &TestFileSystem::default(),
+            home.path(),
+            Some(cwd),
+            &overrides,
+            options,
+            &crate::NoopThreadConfigLoader
+        )
+        .await
+        .is_err()
     );
 }

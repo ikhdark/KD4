@@ -27,6 +27,7 @@ pub struct ConfigError {
     pub path: PathBuf,
     pub range: TextRange,
     pub message: String,
+    source: Option<std::sync::Arc<str>>,
 }
 
 impl ConfigError {
@@ -35,7 +36,12 @@ impl ConfigError {
             path,
             range,
             message: message.into(),
+            source: None,
         }
+    }
+    fn with_source(mut self, contents: &str) -> Self {
+        self.source = Some(contents.into());
+        self
     }
 }
 
@@ -116,7 +122,7 @@ pub(crate) fn config_error_from_toml_for_source(
         .span()
         .map(|span| text_range_from_span(contents, span))
         .unwrap_or_else(default_range);
-    ConfigError::new(source.to_path_buf(), range, err.message())
+    ConfigError::new(source.to_path_buf(), range, err.message()).with_source(contents)
 }
 
 pub fn config_error_from_typed_toml<T: DeserializeOwned>(
@@ -148,11 +154,10 @@ fn config_error_from_typed_toml_for_source<T: DeserializeOwned>(
                 .or_else(|| toml_err.span())
                 .map(|span| text_range_from_span(contents, span))
                 .unwrap_or_else(default_range);
-            Some(ConfigError::new(
-                source.to_path_buf(),
-                range,
-                toml_err.message(),
-            ))
+            Some(
+                ConfigError::new(source.to_path_buf(), range, toml_err.message())
+                    .with_source(contents),
+            )
         }
     }
 }
@@ -189,45 +194,23 @@ where
     I: IntoIterator<Item = &'a ConfigLayerEntry>,
 {
     for layer in layers {
-        if let Some(contents) = layer.raw_toml() {
-            let source_name = format_config_layer_source(&layer.name, config_toml_file);
-            let Some(base_dir) = layer.raw_toml_base_dir() else {
-                tracing::debug!(
-                    "Skipping raw TOML diagnostics for {source_name} because it has no base directory"
-                );
-                continue;
-            };
-            // Match the base directory used when the raw non-file layer was
-            // parsed into the runtime layer so diagnostics resolve relative
-            // path fields with the same semantics.
-            let _absolute_path_base = AbsolutePathBufGuard::new(base_dir.as_path());
-            if let Some(error) = config_error_from_typed_toml_for_source::<T>(
-                ConfigDiagnosticSource::DisplayName(&source_name),
-                contents,
-            ) {
-                return Some(error);
-            }
+        if layer.is_disabled() || layer.config.clone().try_into::<T>().is_ok() {
             continue;
         }
-
-        let Some(path) = config_path_for_layer(layer, config_toml_file) else {
+        let Some(contents) = layer.raw_toml() else {
             continue;
         };
-        let contents = match tokio::fs::read_to_string(&path).await {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                tracing::debug!("Failed to read config file {}: {err}", path.display());
-                continue;
-            }
-        };
-
-        let Some(parent) = path.parent() else {
-            tracing::debug!("Config file {} has no parent directory", path.display());
+        let Some(base_dir) = layer.raw_toml_base_dir() else {
             continue;
         };
-        let _guard = AbsolutePathBufGuard::new(parent);
-        if let Some(error) = config_error_from_typed_toml::<T>(&path, &contents) {
+        let source_name = format_config_layer_source(&layer.name, config_toml_file);
+        let path = config_path_for_layer(layer, config_toml_file);
+        let source = match path.as_deref() {
+            Some(path) => ConfigDiagnosticSource::Path(path),
+            None => ConfigDiagnosticSource::DisplayName(&source_name),
+        };
+        let _guard = AbsolutePathBufGuard::new(base_dir.as_path());
+        if let Some(error) = config_error_from_typed_toml_for_source::<T>(source, contents) {
             return Some(error);
         }
     }
@@ -298,10 +281,7 @@ pub fn format_config_error(error: &ConfigError, contents: &str) -> String {
 }
 
 pub async fn format_config_error_with_source(error: &ConfigError) -> String {
-    match tokio::fs::read_to_string(&error.path).await {
-        Ok(contents) => format_config_error(error, &contents),
-        Err(_) => format_config_error(error, ""),
-    }
+    format_config_error(error, error.source.as_deref().unwrap_or(""))
 }
 
 fn position_for_offset(contents: &str, index: usize) -> TextPosition {
@@ -509,7 +489,7 @@ mod consolidated_type_tests {
         tokio::fs::remove_file(&path).await.expect("remove config");
         assert_eq!(
             super::format_config_error_with_source(&error).await,
-            super::format_config_error(&error, ""),
+            super::format_config_error(&error, contents),
         );
     }
 

@@ -2,11 +2,11 @@ use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::git_workspace::GitWorkspaceMetadataSource;
 use crate::shell_snapshot::ShellSnapshotFile;
+use codex_code_mode::CancellationCause;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
-use codex_code_mode::CancellationCause;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -161,6 +161,7 @@ impl std::fmt::Debug for TurnEnvironment {
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
+    pub(crate) hook_context_budget: Arc<Mutex<codex_context_fragments::ModelContextBudget>>,
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
     pub config: Arc<Config>,
@@ -201,6 +202,8 @@ pub struct TurnContext {
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     /// Deferred tools selected during this root task, bound to exact capability revisions.
+    pub(crate) workspace_execution_coordinator:
+        Arc<crate::tools::parallel::WorkspaceExecutionCoordinator>,
     pub(crate) deferred_tool_activations: Arc<std::sync::RwLock<DeferredToolActivationState>>,
     pub(crate) validation_authorization: crate::validation_admission::SharedValidationAuthorization,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
@@ -214,6 +217,8 @@ pub struct TurnContext {
     /// Remembers completed ordered-history commit retry keys for this turn only.
     pub(crate) durable_history_completed_commits: Arc<Mutex<HashSet<String>>>,
     pub(crate) terminal_error: Arc<Mutex<Option<ErrorEvent>>>,
+    /// Identity captured at turn entry, before terminal callbacks can outlive this attempt.
+    pub(crate) agent_task_binding: Arc<OnceLock<Option<codex_agent_task_store::AgentTaskBinding>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
     /// Ensures external-context producers signal memory pollution at most once
@@ -558,6 +563,7 @@ impl TurnContext {
         let effective_workspace_roots = config.effective_workspace_roots().into();
 
         Self {
+            hook_context_budget: Arc::clone(&self.hook_context_budget),
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
             config: Arc::new(config),
@@ -598,6 +604,7 @@ impl TurnContext {
             available_models,
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
+            workspace_execution_coordinator: Arc::clone(&self.workspace_execution_coordinator),
             deferred_tool_activations: Arc::clone(&self.deferred_tool_activations),
             validation_authorization: Arc::clone(&self.validation_authorization),
             turn_metadata_state: self.turn_metadata_state.clone(),
@@ -608,6 +615,7 @@ impl TurnContext {
             tool_call_acceptance: Arc::clone(&self.tool_call_acceptance),
             durable_history_completed_commits: Arc::clone(&self.durable_history_completed_commits),
             terminal_error: Arc::clone(&self.terminal_error),
+            agent_task_binding: Arc::clone(&self.agent_task_binding),
             server_model_warning_emitted: AtomicBool::new(
                 self.server_model_warning_emitted.load(Ordering::Relaxed),
             ),
@@ -865,6 +873,7 @@ impl Session {
         });
         let effective_workspace_roots = per_turn_config.effective_workspace_roots().into();
         TurnContext {
+            hook_context_budget: Default::default(),
             sub_id,
             trace_id: current_span_trace_id(),
             config: per_turn_config,
@@ -897,6 +906,7 @@ impl Session {
             available_models,
             final_output_json_schema: None,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
+            workspace_execution_coordinator: Arc::default(),
             deferred_tool_activations: Arc::new(std::sync::RwLock::new(
                 DeferredToolActivationState::default(),
             )),
@@ -911,6 +921,7 @@ impl Session {
             tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),
             durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
             terminal_error: Arc::new(Mutex::new(None)),
+            agent_task_binding: Arc::new(OnceLock::new()),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
             memory_pollution_signal_claimed: AtomicBool::new(false),

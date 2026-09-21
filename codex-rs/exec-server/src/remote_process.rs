@@ -35,8 +35,11 @@ impl RemoteProcess {
         &self,
         params: ExecParams,
     ) -> Result<StartedExecProcess, crate::ExecServerError> {
-        let client = self.client.get().await?;
-        let session = client.start_process(params).await?;
+        let deadline = tokio::time::Instant::now() + crate::client::PROCESS_START_TIMEOUT;
+        let client = tokio::time::timeout_at(deadline, self.client.get())
+            .await
+            .map_err(|_| crate::ExecServerError::ProcessStartTimedOut)??;
+        let session = client.start_process_before(params, deadline).await?;
 
         Ok(StartedExecProcess {
             process: Arc::new(RemoteExecProcess { session }),

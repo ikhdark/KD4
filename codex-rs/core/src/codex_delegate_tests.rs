@@ -190,6 +190,115 @@ async fn forward_ops_preserves_mailbox_admission_acknowledgement() {
         .expect("proxy task");
 }
 
+struct CancellationObservedTask {
+    started: Arc<tokio::sync::Notify>,
+    stopped: Arc<tokio::sync::Notify>,
+}
+
+impl crate::tasks::SessionTask for CancellationObservedTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "session_task.delegate_cancel_test"
+    }
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        cancellation: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, crate::tasks::SessionTaskResult> {
+        Box::pin(async move {
+            self.started.notify_one();
+            cancellation.cancelled().await;
+            self.stopped.notify_one();
+            Ok(crate::tasks::TurnTaskResult::default())
+        })
+    }
+}
+
+#[tokio::test]
+async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
+    let (session, ctx, _rx_evt) = crate::session::tests::make_session_and_context_with_rx().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let stopped = Arc::new(tokio::sync::Notify::new());
+    session
+        .spawn_task(
+            ctx,
+            Vec::new(),
+            CancellationObservedTask {
+                started: Arc::clone(&started),
+                stopped: Arc::clone(&stopped),
+            },
+        )
+        .await;
+    timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("child starts");
+    let (tx_sub, rx_sub) = bounded(1);
+    let queued = |id: &str| crate::session::QueuedSubmission {
+        submission: Submission {
+            id: id.to_string(),
+            op: Op::Interrupt,
+            client_user_message_id: None,
+            trace: None,
+        },
+        mailbox_admission: None,
+    };
+    tx_sub.send(queued("fills-child-mailbox")).await.unwrap();
+    let (_tx_events, rx_event) = bounded(1);
+    let (_status_tx, agent_status) = watch::channel(AgentStatus::Running);
+    let codex = Arc::new(Codex {
+        tx_sub,
+        rx_event,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: completed_session_loop_termination(),
+    });
+    let (tx_ops, rx_ops) = bounded(1);
+    let (admission_tx, admission_rx) = oneshot::channel();
+    let mut blocked = queued("blocked-forward");
+    blocked.mailbox_admission = Some(admission_tx);
+    tx_ops.send(blocked).await.unwrap();
+    let cancel = CancellationToken::new();
+    let forward = tokio::spawn(forward_ops(
+        Arc::clone(&codex),
+        rx_ops.clone(),
+        cancel.clone(),
+    ));
+    timeout(Duration::from_secs(5), async {
+        while !rx_ops.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("forwarder takes queued submission");
+    cancel.cancel();
+    timeout(Duration::from_secs(1), forward)
+        .await
+        .expect("full queue must not trap cancellation")
+        .unwrap();
+    assert!(
+        admission_rx.await.is_err(),
+        "a canceled forwarding operation cannot acknowledge admission"
+    );
+    let start_gate = session.task_start_gate.acquire().await.unwrap();
+    timeout(Duration::from_secs(1), shutdown_delegate(&codex))
+        .await
+        .expect("shutdown deadline covers the task-start gate");
+    assert!(
+        session
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(rx_sub.is_closed());
+    drop(start_gate);
+    timeout(Duration::from_secs(5), stopped.notified())
+        .await
+        .expect("owned teardown must cancel the actual child after the drain deadline");
+}
+
 #[tokio::test]
 async fn forward_ops_preserves_submission_trace_context() {
     let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);

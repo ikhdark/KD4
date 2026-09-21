@@ -160,20 +160,7 @@ async fn full_handshake_reply_queue_preserves_existing_stream() -> Result<()> {
     };
     let mut transport = handshake.finish(&response.payload)?;
 
-    // Unknown stream data queues resets without charging the handshake budget.
-    for i in 0..crate::connection::CHANNEL_CAPACITY * 2 {
-        harness
-            .send(Message::Binary(
-                encode_relay_message_frame(&RelayMessageFrame::data(
-                    format!("unknown-{i}"),
-                    0,
-                    vec![0],
-                ))
-                .into(),
-            ))
-            .await?;
-    }
-    let (_, request) = InitiatorHandshake::start(
+    let (new_handshake, request) = InitiatorHandshake::start(
         &harness_identity,
         &identity.public_key(),
         &noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, "new"),
@@ -190,6 +177,19 @@ async fn full_handshake_reply_queue_preserves_existing_stream() -> Result<()> {
         }
     })
     .await?;
+    // Unknown stream data queues resets without charging the handshake budget.
+    for i in 0..crate::connection::CHANNEL_CAPACITY * 2 {
+        harness
+            .send(Message::Binary(
+                encode_relay_message_frame(&RelayMessageFrame::data(
+                    format!("unknown-{i}"),
+                    0,
+                    vec![0],
+                ))
+                .into(),
+            ))
+            .await?;
+    }
     release.notify_one();
     // Give validation completion a turn while keeping the writer blocked.
     // This is shorter than the physical write deadline (100 ms in tests).
@@ -207,11 +207,24 @@ async fn full_handshake_reply_queue_preserves_existing_stream() -> Result<()> {
                 .into(),
         ))
         .await?;
+    let mut new_handshake = Some(new_handshake);
+    let mut new_stream_completed = false;
     let response = timeout(Duration::from_secs(1), async {
         loop {
             match harness.next().await {
                 Some(Ok(Message::Binary(payload))) => {
                     let frame = decode_relay_message_frame(&payload)?;
+                    if frame.stream_id == "new" {
+                        let Some(Body::Handshake(reply)) = frame.body else {
+                            anyhow::bail!("new handshake rejected");
+                        };
+                        new_handshake
+                            .take()
+                            .expect("one handshake reply")
+                            .finish(&reply.payload)?;
+                        new_stream_completed = true;
+                        continue;
+                    }
                     if frame.stream_id == "existing" {
                         let Some(Body::Data(data)) = frame.body else {
                             anyhow::bail!("existing stream reset");
@@ -231,6 +244,10 @@ async fn full_handshake_reply_queue_preserves_existing_stream() -> Result<()> {
         }
     })
     .await??;
+    assert!(
+        new_stream_completed,
+        "admitted handshake completion must survive queue pressure"
+    );
     assert_eq!(response["id"], 7);
     assert_eq!(response["error"]["code"], -32601);
     assert_eq!(
@@ -581,10 +598,20 @@ async fn repeated_cancellation_during_validation_exhausts_budget(reset: bool) ->
             .await?;
         timeout(Duration::from_secs(5), async {
             while calls.load(Ordering::SeqCst) != attempt + 1 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                    message = harness_websocket.next() => match message {
+                        Some(Ok(Message::Ping(payload))) => {
+                            harness_websocket.send(Message::Pong(payload)).await?;
+                        }
+                        Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                        other => anyhow::bail!("relay closed before validating attempt {attempt}: {other:?}"),
+                    }
+                }
             }
+            Ok::<(), anyhow::Error>(())
         })
-        .await?;
+        .await??;
         let frame = if reset {
             RelayMessageFrame::reset(stream_id.clone(), "cancelled".to_string())
         } else {

@@ -21,6 +21,7 @@ use std::io::Result as IoResult;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
@@ -939,7 +940,7 @@ pub async fn run_main(
                                     .send(OutboundControlEvent::Opened {
                                         connection_id,
                                         writer,
-                                        disconnect_sender,
+                                        disconnect_sender: Some(disconnect_sender.unwrap_or_else(|| transport_shutdown_token.clone())),
                                         initialized: Arc::clone(&outbound_initialized),
                                         experimental_api_enabled: Arc::clone(
                                             &outbound_experimental_api_enabled,
@@ -1163,25 +1164,56 @@ async fn finish_runtime_task_groups(
     transport_shutdown: CancellationToken,
     transport_handles: Vec<JoinHandle<()>>,
 ) -> IoResult<()> {
+    use futures::StreamExt;
+    use futures::stream::FuturesUnordered;
+
+    let mut owners = FuturesUnordered::new();
+    let mut abort_handles = Vec::new();
+    for (name, handle) in [("processor", processor), ("outbound router", outbound)]
+        .into_iter()
+        .chain(
+            transport_handles
+                .into_iter()
+                .map(|handle| ("transport", handle)),
+        )
+    {
+        abort_handles.push(handle.abort_handle());
+        owners.push(async move { (name, handle.await) });
+    }
     let mut first_error = None;
-    for (task, result) in [
-        ("processor", processor.await),
-        ("outbound router", outbound.await),
-    ] {
+    let mut primary_owners = 2;
+    let mut failure_deadline = None;
+    while !owners.is_empty() {
+        let next = if let Some(deadline) = failure_deadline {
+            match tokio::time::timeout_at(deadline, owners.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    for handle in &abort_handles {
+                        handle.abort();
+                    }
+                    failure_deadline = None;
+                    continue;
+                }
+            }
+        } else {
+            owners.next().await
+        };
+        let Some((task, result)) = next else { break };
+        if task != "transport" {
+            primary_owners -= 1;
+        }
         if let Err(error) = result {
             warn!(task, %error, "app-server runtime task failed");
-            first_error.get_or_insert_with(|| {
-                std::io::Error::other(format!("app-server {task} task failed: {error}"))
-            });
-        }
-    }
-    transport_shutdown.cancel();
-    for handle in transport_handles {
-        if let Err(error) = handle.await {
-            warn!(%error, "app-server transport task failed");
-            first_error.get_or_insert_with(|| {
-                std::io::Error::other(format!("app-server transport task failed: {error}"))
-            });
+            if first_error.is_none() {
+                first_error = Some(std::io::Error::other(format!(
+                    "app-server {task} task failed: {error}"
+                )));
+                failure_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(10));
+            }
+            transport_shutdown.cancel();
+        } else if primary_owners == 0 {
+            // Healthy processor shutdown still drains outbound terminal output.
+            transport_shutdown.cancel();
         }
     }
     // Retire all task owners before exposing an infrastructure failure to the
@@ -1472,16 +1504,37 @@ mod tests {
             } else {
                 let error = result.unwrap_err();
                 assert_eq!(error.kind(), std::io::ErrorKind::Other);
-                let owner = [
-                    "processor",
-                    "outbound router",
-                    "transport",
-                    "unused",
-                    "processor",
-                ][failing_group];
-                assert!(error.to_string().contains(owner), "{error}");
+                let owners: &[&str] = if failing_group == 4 {
+                    &["processor", "outbound router", "transport"]
+                } else {
+                    &[["processor", "outbound router", "transport"][failing_group]]
+                };
+                assert!(
+                    owners.iter().any(|owner| error.to_string().contains(owner)),
+                    "{error}"
+                );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_failure_cancels_a_waiting_sibling() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        let shutdown = CancellationToken::new();
+        let processor = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        });
+        let outbound = tokio::spawn(async { panic!("outbound witness") });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::finish_runtime_task_groups(processor, outbound, shutdown.clone(), vec![]),
+        )
+        .await
+        .expect("failure must be observed before sibling exits");
+        assert!(shutdown.is_cancelled());
+        assert!(result.unwrap_err().to_string().contains("outbound router"));
     }
 
     #[test]

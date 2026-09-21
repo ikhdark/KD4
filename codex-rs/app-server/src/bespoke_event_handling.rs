@@ -190,7 +190,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
-            respond_to_pending_interrupts(&thread_state, &outgoing).await;
+            respond_to_pending_interrupts(&thread_state, &outgoing, &event_turn_id).await;
             let turn_failed = turn_complete_event.error.is_some()
                 || thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
@@ -868,7 +868,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnAborted(turn_aborted_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
-            respond_to_pending_interrupts(&thread_state, &outgoing).await;
+            respond_to_pending_interrupts(&thread_state, &outgoing, &event_turn_id).await;
 
             thread_watch_manager
                 .note_turn_aborted(&conversation_id.to_string(), &turn_aborted_event.reason)
@@ -1377,10 +1377,11 @@ fn thread_rollback_response_from_stored_thread(
 async fn respond_to_pending_interrupts(
     thread_state: &Arc<Mutex<ThreadState>>,
     outgoing: &ThreadScopedOutgoingMessageSender,
+    turn_id: &str,
 ) {
     let pending = {
         let mut state = thread_state.lock().await;
-        state.take_pending_interrupts()
+        state.take_pending_interrupts(turn_id)
     };
 
     for request_id in pending {
@@ -1638,23 +1639,11 @@ async fn on_request_permissions_response(
         Ok(Some(response)) => response,
         Ok(None) => return,
         Err(err) => {
-            let message = format!("invalid granted filesystem paths: {err}");
-            handle_error_notification(
-                conversation_id,
-                &turn_id,
-                TurnError {
-                    message,
-                    codex_error_info: None,
-                    additional_details: None,
-                },
-                &outgoing,
-                &thread_state,
-            )
-            .await;
-            if let Err(err) = conversation.submit(Op::Interrupt).await {
-                error!("failed to interrupt turn after invalid permission paths: {err}");
+            tracing::warn!(%conversation_id, %turn_id, %call_id, %err, "invalid permission grant; denying this request");
+            CoreRequestPermissionsResponse {
+                permissions: Default::default(),
+                scope: CorePermissionGrantScope::Turn,
             }
-            return;
         }
     };
     if let Some(pending_request_id) = pending_request_id {
@@ -1717,7 +1706,16 @@ fn request_permissions_response_from_client_result(
                 scope: codex_app_server_protocol::PermissionGrantScope::Turn,
             }
         });
-    let granted_permissions = response.permissions.into_core_with_cwd(cwd)?;
+    let granted_permissions = match response.permissions.into_core_with_cwd(cwd) {
+        Ok(permissions) => permissions,
+        Err(error) => {
+            tracing::warn!(%error, "invalid granted filesystem paths; rejecting the entire permission grant");
+            return Ok(Some(CoreRequestPermissionsResponse {
+                permissions: Default::default(),
+                scope: CorePermissionGrantScope::Turn,
+            }));
+        }
+    };
     let permissions = if granted_permissions.is_empty() {
         CoreRequestPermissionProfile::default()
     } else {
@@ -2337,6 +2335,29 @@ mod tests {
                 action: McpServerElicitationAction::Cancel,
                 content: None,
                 meta: None,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_permission_path_denies_the_entire_call_scoped_grant() {
+        let cwd = native_path_uri(&std::env::current_dir().unwrap());
+        let result = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile {
+                network: Some(CoreNetworkPermissions { enabled: Some(true) }),
+                ..Default::default()
+            },
+            Ok(Ok(serde_json::json!({
+                "permissions": {"network":{"enabled":true},"fileSystem":{"write":["valid-child","bad\u{0}path"]}},
+                "scope":"session"
+            }))),
+            &cwd,
+        ).expect("invalid paths must not escape as a turn error").expect("call must receive a denial");
+        assert_eq!(
+            result,
+            CoreRequestPermissionsResponse {
+                permissions: Default::default(),
+                scope: CorePermissionGrantScope::Turn,
             }
         );
     }

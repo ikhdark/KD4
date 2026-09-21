@@ -1305,6 +1305,11 @@ impl ThreadManager {
             /*user_shell_override*/ None,
         ))
         .await?;
+        // Reattachment borrows the live runtime. Its current settings and lifetime
+        // belong to the original owner, not to this historical reconstruction.
+        if new_thread.was_already_running {
+            return Ok(new_thread);
+        }
         if let Err(err) = self
             .restore_reconstructed_runtime_settings(
                 &new_thread,

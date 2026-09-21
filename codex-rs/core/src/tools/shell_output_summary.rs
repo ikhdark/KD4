@@ -47,8 +47,8 @@ pub(crate) fn summarize_shell_output_for_model(
         .is_some_and(|limit| codex_utils_string::approx_token_count_exceeds(output, limit));
     if !exceeds_token_budget
         && output.len() <= DEFAULT_SUMMARY_AFTER_BYTES
-        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES + 1).count()
-            <= DEFAULT_SUMMARY_AFTER_LINES
+        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES).count()
+            < DEFAULT_SUMMARY_AFTER_LINES
     {
         return None;
     }
@@ -69,7 +69,6 @@ pub(crate) fn summarize_shell_output_for_model(
         return None;
     }
 
-    let line_count = output.lines().count();
     let failed = timed_out || exit_code != 0;
     let validation = options.command_text.is_some_and(|command| {
         matches!(
@@ -77,6 +76,23 @@ pub(crate) fn summarize_shell_output_for_model(
             ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
         )
     });
+    // A successful command with no diagnostic line has nothing to rank, so the
+    // head/warning/tail policy degenerates to positional truncation that drops
+    // the middle of a flat list. A summary also reads as complete in a way a
+    // truncation notice does not. Leave those to ordinary truncation, which
+    // retains the artifact and reports exactly what it withheld.
+    if !exceeds_token_budget
+        && !failed
+        && !validation
+        && !output.lines().any(|line| {
+            let classification = classify_line(line);
+            classification.critical || classification.advisory
+        })
+    {
+        return None;
+    }
+
+    let line_count = output.lines().count();
     let selection = select_lines(output, line_count, failed, validation);
     let selection_policy = if validation {
         "source-ordered failure-focused lines, final status lines, tail"

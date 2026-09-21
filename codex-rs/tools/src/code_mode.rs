@@ -145,7 +145,7 @@ fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {
         .map(|definition| definition.description)
 }
 
-fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
+pub fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
     if matches!(spec, ToolSpec::Namespace(namespace) if namespace.tools.len() != 1) {
         return None;
     }

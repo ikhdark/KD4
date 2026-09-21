@@ -382,6 +382,7 @@ fn storage_rejected_event(event: CellEvent) -> CellEvent {
         CellEvent::Completed {
             content_items,
             error_text,
+            output_loss,
         } => {
             let limit_error = stored_value_limit_message();
             let error_text = Some(match error_text {
@@ -391,6 +392,7 @@ fn storage_rejected_event(event: CellEvent) -> CellEvent {
             CellEvent::Completed {
                 content_items,
                 error_text,
+                output_loss,
             }
         }
         event => event,

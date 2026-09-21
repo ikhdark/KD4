@@ -664,7 +664,7 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     assert_eq!(call.process_spawned_at_ms, Some(42));
     assert_eq!(call.process_exited_at_ms, Some(62));
     assert_eq!(call.delivered_at_ms, Some(100));
-    assert_eq!(call.model_resumed_at_ms, Some(120));
+    assert_eq!(call.model_resumed_at_ms, Some(130));
     assert_eq!(call.ready_to_sample_to_dispatch_ns, Some(25_000_000));
     assert_eq!(call.post_handler_ms, Some(30));
     assert!(call.eager);
@@ -706,7 +706,7 @@ fn batched_tool_results_share_one_model_resume_boundary() {
     let calls = state.complete_snapshot().protocol_timing().tool_calls;
     assert_eq!(calls.len(), 2);
     for call in &calls {
-        assert_eq!(call.model_resumed_at_ms, Some(120));
+        assert_eq!(call.model_resumed_at_ms, Some(130));
         assert_eq!(call.ready_to_sample_to_dispatch_ns, Some(25_000_000));
     }
 }
@@ -1540,11 +1540,54 @@ fn decision_latency_unions_parallel_tool_time_per_generation() {
 }
 
 #[test]
+fn late_request_diagnostics_update_only_the_original_sampling_request() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("old", "old-attempt");
+    drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("new", "new-attempt");
+    state.record_model_request_token_categories(
+        "old",
+        "old-attempt",
+        codex_protocol::protocol::TurnTimingRequestTokenCategories {
+            logical_total: 123,
+            ..Default::default()
+        },
+    );
+    state.record_model_request_cache_identity("old", "old-attempt", true, Some("old-cache"));
+    let timing = state.complete_snapshot().protocol_timing();
+    let old = timing
+        .model_requests
+        .iter()
+        .find(|request| request.sampling_request_id.as_deref() == Some("old"))
+        .expect("old request");
+    let new = timing
+        .model_requests
+        .iter()
+        .find(|request| request.sampling_request_id.as_deref() == Some("new"))
+        .expect("new request");
+    assert_eq!(
+        old.request_token_categories
+            .as_ref()
+            .expect("old categories")
+            .logical_total,
+        123
+    );
+    assert_eq!(old.fixed_prefix_reuse_eligible, Some(true));
+    assert!(new.request_token_categories.is_none());
+    assert!(new.fixed_prefix_reuse_eligible.is_none());
+}
+
+#[test]
 fn request_categories_reconcile_full_logical_prompt_with_provider_usage() {
     let (_clock, state) = timing();
     state.mark_turn_started();
     drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("measurement", "physical");
     state.record_model_request_token_categories(
+        "measurement",
+        "physical",
         codex_protocol::protocol::TurnTimingRequestTokenCategories {
             base_instructions: 10,
             tool_schemas: 20,
@@ -1579,8 +1622,19 @@ fn request_cache_identity_records_reuse_and_redacts_raw_key_once() {
     state.mark_turn_started();
     drop(state.begin_model_request_wait());
 
-    state.record_model_request_cache_identity(true, Some("private-cache-key"));
-    state.record_model_request_cache_identity(false, Some("retry-cache-key"));
+    state.record_model_attempt_identity("measurement", "physical");
+    state.record_model_request_cache_identity(
+        "measurement",
+        "physical",
+        true,
+        Some("private-cache-key"),
+    );
+    state.record_model_request_cache_identity(
+        "measurement",
+        "physical",
+        false,
+        Some("retry-cache-key"),
+    );
 
     let timing = state.complete_snapshot().protocol_timing();
     let request = &timing.model_requests[0];
@@ -1951,6 +2005,7 @@ fn deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating
     );
 
     drop(state.begin_model_request_wait());
+    state.mark_model_request_dispatched();
     let primary = state.begin_model_stream_wait();
     clock.set_ms(10);
     drop(primary);
@@ -1959,6 +2014,7 @@ fn deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating
 
     state.record_model_retry();
     drop(state.begin_model_request_wait());
+    state.mark_model_request_dispatched();
     let retry = state.begin_model_stream_wait();
     clock.set_ms(15);
     drop(retry);
@@ -1966,6 +2022,7 @@ fn deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating
     state.record_model_fallback();
     state.record_model_retry();
     drop(state.begin_model_request_wait());
+    state.mark_model_request_dispatched();
     let fallback = state.begin_model_stream_wait();
     clock.set_ms(22);
     drop(fallback);
@@ -2701,6 +2758,7 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
         let mut pending = None;
         state.begin_model_generation(&mut pending, &SessionSource::Cli);
         drop(state.begin_model_request_wait());
+        state.mark_model_request_dispatched();
         state.record_model_attempt_identity(
             &format!("sampling-{request_index}"),
             &format!("attempt-{request_index}"),
@@ -2742,4 +2800,145 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
         latest.progress_kinds.len(),
         MAX_MODEL_REQUEST_PROGRESS_KINDS
     );
+}
+
+#[test]
+fn live_timestamp_samples_now_without_advancing_accounting_and_freezes_on_completion() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(100);
+    assert_eq!(state.monotonic_offset_ms(), 100);
+    assert_eq!(state.state().last_monotonic_ns, Some(0));
+    state.mark_model_request_dispatched();
+    clock.set_ms(150);
+    assert_eq!(state.monotonic_offset_ms(), 150);
+    clock.set_ms(50);
+    assert_eq!(state.monotonic_offset_ms(), 100);
+    clock.set_ms(200);
+    let snapshot = state.complete_snapshot();
+    clock.set_ms(900);
+    assert_eq!(state.monotonic_offset_ms(), 200);
+    assert_eq!(
+        state.complete_snapshot().protocol_timing(),
+        snapshot.protocol_timing()
+    );
+}
+
+#[test]
+fn sealed_acceptance_rejects_new_ownership_before_snapshot() {
+    let (_, state) = timing();
+    state.mark_turn_started();
+    state.record_tool_call_acceptance_closed();
+    assert!(!state.try_record_accepted_tool_call(
+        "late",
+        &ToolExecutionId("late".into()),
+        TurnTimingToolCallSource::Direct,
+        None
+    ));
+    assert_eq!(state.tool_closure_snapshot().accepted_count, 0);
+}
+
+#[test]
+fn persistence_batch_only_attests_its_captured_execution() {
+    let (_, state) = timing();
+    state.mark_turn_started();
+    state.mark_model_request_dispatched();
+    let first = ToolExecutionId("first".into());
+    state.record_accepted_tool_call("reused", &first, TurnTimingToolCallSource::Direct, None);
+    let batch = vec![state.tool_result_execution_id("reused").unwrap()];
+    state.state().current_generation_index = Some(99);
+    let second = ToolExecutionId("second".into());
+    state.record_accepted_tool_call("reused", &second, TurnTimingToolCallSource::Direct, None);
+    state.record_tool_result_executions_queued(&[first.clone(), second.clone()]);
+    state.record_tool_result_executions_persisted(&batch);
+    let closure = state.tool_closure_snapshot();
+    assert_eq!(closure.persisted_count, 1);
+    assert_eq!(state.queued_tool_result_executions(), vec![second.clone()]);
+    assert!(!state.state().tool_closure.entries[&second].terminal);
+    state.record_tool_result_executions_persisted(&[second]);
+    assert_eq!(state.tool_closure_snapshot().persisted_count, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unrelated_successful_flush_does_not_erase_a_failed_append() {
+    let (_, state) = timing();
+    state.mark_turn_started();
+    let failed = ToolExecutionId("failed-append".into());
+    let other = ToolExecutionId("other-append".into());
+    state.record_accepted_tool_call("failed", &failed, TurnTimingToolCallSource::Direct, None);
+    state.record_accepted_tool_call("other", &other, TurnTimingToolCallSource::Direct, None);
+    state.record_tool_result_persistence_barrier_failed();
+    state.record_tool_result_executions_persisted(&[]);
+    assert!(state.state().tool_result_persistence_barrier_failed);
+    state.record_tool_result_executions_persisted(&[other]);
+    state.record_tool_call_acceptance_closed();
+    let closure = tokio::time::timeout(
+        Duration::from_millis(10),
+        state.wait_for_tool_closure_after_seal(),
+    )
+    .await
+    .expect("an unrelated flush cannot leave the failed append waiting again");
+    assert_eq!(closure.accepted_count, 2);
+    assert_eq!(closure.persisted_count, 1);
+    assert!(!closure.complete);
+    state.record_tool_result_executions_persisted(&[failed]);
+    assert!(!state.state().tool_result_persistence_barrier_failed);
+    assert_eq!(state.tool_closure_snapshot().persisted_count, 2);
+}
+
+#[test]
+fn uncontended_projection_bookkeeping_does_not_wait_for_the_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (_clock, timing) = timing();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        started_rx.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            timing
+                .record_projection_source_dependencies_reuse_async()
+                .await;
+            timing
+                .record_projection_source_dependencies_fallback_async()
+                .await;
+            timing
+                .record_tool_output_projection_facts_async(
+                    1000, 250, 400, 100, true, false, true, 3, true,
+                )
+                .await;
+        })
+        .await;
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        result.expect("uncontended counters must not queue behind blocking work");
+        let counters = timing.complete_snapshot().protocol_timing().counters;
+        assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
+        assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
+        assert_eq!(counters.tool_output_artifact_creation_count, 1);
+        assert_eq!(counters.tool_output_omitted_section_count, 3);
+    });
+}
+
+#[test]
+fn prepared_request_is_not_counted_until_dispatched() {
+    let (_, state) = timing();
+    state.mark_turn_started();
+    state.begin_model_generation(&mut None, &SessionSource::Cli);
+    let request = state.begin_model_request_wait();
+    assert_eq!(state.state().counters.model_request_count, 0);
+    assert_eq!(state.state().counters.attempts_by_kind.primary, 0);
+    state.mark_model_request_dispatched();
+    state.mark_model_request_dispatched();
+    drop(request);
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.model_request_count, 1);
+    assert_eq!(counters.attempts_by_kind.primary, 1);
 }

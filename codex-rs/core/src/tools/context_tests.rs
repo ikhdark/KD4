@@ -320,16 +320,7 @@ fn mcp_tool_output_response_item_includes_wall_time() {
             let Some(payload) = text.strip_prefix("Wall time: 1.2500 seconds\nOutput:\n") else {
                 panic!("MCP output should include wall-time header: {text}");
             };
-            let parsed: serde_json::Value = serde_json::from_str(payload).unwrap_or_else(|err| {
-                panic!("MCP output should serialize JSON content: {err}");
-            });
-            assert_eq!(
-                parsed,
-                json!([{
-                    "type": "text",
-                    "text": "done",
-                }])
-            );
+            assert_eq!(payload, "done", "plain MCP text retains its content");
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
@@ -397,7 +388,7 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
         CallToolResult {
             content: vec![serde_json::json!({
                 "type": "text",
-                "text": "ignored when structured content is present",
+                "text": "distinct caption",
             })],
             structured_content: Some(serde_json::json!({
                 "items": "large structured value ".repeat(1_000),
@@ -427,7 +418,13 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
                 .expect("MCP output should serialize as text");
             assert!(text.starts_with("Wall time: 1.2500 seconds\nOutput:\n"));
             assert!(text.contains("chars truncated"));
-            assert!(!text.contains("ignored when structured content is present"));
+            assert!(text.contains("distinct caption"));
+            assert!(text.contains("\"items\""));
+            assert!(text.contains("large structured value"));
+            assert!(
+                text.len() < 512,
+                "the large structured value must be bounded"
+            );
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
@@ -1733,4 +1730,31 @@ async fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
     let nonregular_response = output.response_text();
     assert!(!nonregular_response.contains("[command output reduced;"));
     assert!(!nonregular_response.contains("full retained output is available"));
+}
+
+#[tokio::test]
+async fn audit_tiny_recovery_budget_preserves_process_state() {
+    let (mut output, _, _, _root) =
+        artifact_backed_exec_output("large output ".repeat(1000).as_bytes(), Some(4)).await;
+    output.process_id = Some(42);
+    output.process_exited = false;
+    output.exit_code = None;
+    assert!(
+        output
+            .response_text()
+            .contains("Process running with session ID 42")
+    );
+    output.process_exited = true;
+    output.exit_code = Some(7);
+    assert!(
+        output
+            .response_text()
+            .contains("Process exited with code 7")
+    );
+    output.exit_code = None;
+    assert!(
+        output
+            .response_text()
+            .contains("Process exited without an available exit code")
+    );
 }

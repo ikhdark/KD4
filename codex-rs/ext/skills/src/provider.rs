@@ -23,6 +23,7 @@ pub use orchestrator::OrchestratorSkillProvider;
 
 #[derive(Clone, Debug)]
 pub struct SkillListQuery {
+    pub continuation: Option<crate::catalog::SkillDiscoveryContinuation>,
     pub turn_id: String,
     pub executor_roots: Vec<SelectedCapabilityRoot>,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,

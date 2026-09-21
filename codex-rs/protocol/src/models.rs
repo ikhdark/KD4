@@ -1847,22 +1847,50 @@ impl ResponseInputItem {
         local_image_preparation: LocalImagePreparation,
     ) -> Self {
         let mut image_index = 0;
-        let mut remaining_paths = items
+        let path_demands: Vec<usize> = items
             .iter()
-            .filter(|item| matches!(item, UserInput::LocalPath { .. }))
-            .count();
+            .filter_map(|item| match item {
+                UserInput::LocalPath { path, content } => {
+                    let path = path.to_string_lossy();
+                    let path = codex_utils_string::xml_attribute(&path);
+                    Some(
+                        approx_token_count(&format!("<local_path_context path=\"{path}\">\n"))
+                            .saturating_add(approx_token_count(content))
+                            .saturating_add(approx_token_count("\n</local_path_context>")),
+                    )
+                }
+                _ => None,
+            })
+            .collect();
+        let path_count = path_demands.len();
         let mut remaining_path_tokens = LOCAL_PATH_CONTEXT_TOKEN_BUDGET;
         // Preserve the existing marginal-overage behavior for one selected path;
         // multiple paths must not multiply that allowance.
-        let retry_margin = if remaining_paths == 1 {
+        let retry_margin = if path_count == 1 {
             LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN
         } else {
             0
         };
-        let omit_path_group = remaining_paths
+        let omit_path_group = path_count
             > LOCAL_PATH_CONTEXT_TOKEN_BUDGET
                 / approx_token_count(LOCAL_PATH_CONTEXT_METADATA_OMISSION);
         let mut path_group_omission_emitted = false;
+        // Allocate before rendering so presentation order loses no evidence.
+        let mut demand_order: Vec<usize> = (0..path_count).collect();
+        demand_order.sort_unstable_by_key(|&index| path_demands[index]);
+        let mut path_budgets = vec![0; path_count];
+        for (position, &index) in demand_order.iter().enumerate() {
+            let share = remaining_path_tokens / (path_count - position);
+            if path_demands[index] > share {
+                for &remaining_index in &demand_order[position..] {
+                    path_budgets[remaining_index] = share;
+                }
+                break;
+            }
+            path_budgets[index] = path_demands[index];
+            remaining_path_tokens -= path_demands[index];
+        }
+        let mut path_budgets = path_budgets.into_iter();
         Self::Message {
             role: "user".to_string(),
             content: items
@@ -1915,12 +1943,9 @@ impl ResponseInputItem {
                         let text = render_local_path_context(
                             &path,
                             &content,
-                            remaining_path_tokens / remaining_paths,
+                            path_budgets.next().unwrap_or_default(),
                             retry_margin,
                         );
-                        remaining_paths -= 1;
-                        remaining_path_tokens =
-                            remaining_path_tokens.saturating_sub(approx_token_count(&text));
                         vec![ContentItem::InputText { text }]
                     }
                     UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
@@ -2211,36 +2236,46 @@ impl CallToolResult {
             };
         }
 
-        if let Some(structured_content) = &self.structured_content
-            && !structured_content.is_null()
+        let mut items = content_items.unwrap_or_default();
+        if let Some(structured) = self
+            .structured_content
+            .as_ref()
+            .filter(|value| !value.is_null())
         {
-            match serde_json::to_string(structured_content) {
-                Ok(serialized_structured_content) => {
-                    return FunctionCallOutputPayload {
-                        body: FunctionCallOutputBody::Text(serialized_structured_content),
-                        success: Some(self.success()),
-                    };
-                }
-                Err(err) => {
-                    return FunctionCallOutputPayload {
-                        body: FunctionCallOutputBody::Text(err.to_string()),
-                        success: Some(false),
-                    };
-                }
-            }
+            // MCP servers commonly include a JSON text mirror for older clients.
+            // Only that exact representation is redundant; captions and images are not.
+            items.retain(|item| !matches!(item,
+                FunctionCallOutputContentItem::InputText { text }
+                    if serde_json::from_str::<serde_json::Value>(text).ok().as_ref() == Some(structured)
+            ));
+            items.push(FunctionCallOutputContentItem::InputText {
+                text: structured.to_string(),
+            });
         }
-
-        let body = match content_items {
-            Some(content_items) => FunctionCallOutputBody::ContentItems(content_items),
-            None => match serde_json::to_string(&self.content) {
-                Ok(serialized_content) => FunctionCallOutputBody::Text(serialized_content),
-                Err(err) => {
-                    return FunctionCallOutputPayload {
-                        body: FunctionCallOutputBody::Text(err.to_string()),
-                        success: Some(false),
-                    };
-                }
-            },
+        if !self.success() {
+            items.insert(
+                0,
+                FunctionCallOutputContentItem::InputText {
+                    text: "MCP tool reported an error.".to_string(),
+                },
+            );
+        }
+        let body = if items
+            .iter()
+            .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+        {
+            FunctionCallOutputBody::Text(
+                items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        FunctionCallOutputContentItem::InputText { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        } else {
+            FunctionCallOutputBody::ContentItems(items)
         };
 
         FunctionCallOutputPayload {
@@ -2281,7 +2316,6 @@ fn convert_mcp_content_to_items(
         Unknown,
     }
 
-    let mut saw_content_item = false;
     let mut items = Vec::with_capacity(contents.len());
 
     for content in contents {
@@ -2293,7 +2327,6 @@ fn convert_mcp_content_to_items(
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
                 {
-                    saw_content_item = true;
                     FunctionCallOutputContentItem::EncryptedContent {
                         encrypted_content: text,
                     }
@@ -2306,7 +2339,6 @@ fn convert_mcp_content_to_items(
                 mime_type,
                 meta,
             }) => {
-                saw_content_item = true;
                 let image_url = if data.starts_with("data:") {
                     data
                 } else {
@@ -2330,14 +2362,20 @@ fn convert_mcp_content_to_items(
                         .or(Some(DEFAULT_IMAGE_DETAIL)),
                 }
             }
-            Ok(McpContent::Unknown) | Err(_) => FunctionCallOutputContentItem::InputText {
-                text: serde_json::to_string(content).unwrap_or_else(|_| "<content>".to_string()),
-            },
+            Ok(McpContent::Unknown) | Err(_) => {
+                let mut public_content = content.clone();
+                if let Some(object) = public_content.as_object_mut() {
+                    object.remove("_meta");
+                }
+                FunctionCallOutputContentItem::InputText {
+                    text: public_content.to_string(),
+                }
+            }
         };
         items.push(item);
     }
 
-    if saw_content_item { Some(items) } else { None }
+    Some(items)
 }
 
 // Implement Display so callers can treat the payload like a plain string when logging or doing
@@ -2440,6 +2478,101 @@ mod tests {
                 phase: Some(MessagePhase::Commentary),
                 internal_chat_message_metadata_passthrough: None,
             }
+        );
+    }
+
+    #[test]
+    fn local_path_budget_retention_is_independent_of_selection_order() {
+        for large_size in [28_000, 80_000] {
+            let paths = vec![
+                UserInput::LocalPath {
+                    path: "large.txt".into(),
+                    content: "x".repeat(large_size),
+                },
+                UserInput::LocalPath {
+                    path: "small.txt".into(),
+                    content: "small evidence".into(),
+                },
+            ];
+            let render = |paths| {
+                let ResponseInputItem::Message { content, .. } = ResponseInputItem::from(paths)
+                else {
+                    panic!("message");
+                };
+                content
+                    .into_iter()
+                    .map(|item| match item {
+                        ContentItem::InputText { text } => text,
+                        _ => panic!("text"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let forward = render(paths.clone());
+            let mut backward = render(paths.into_iter().rev().collect::<Vec<_>>());
+            backward.reverse();
+            assert_eq!(forward, backward);
+            assert!(
+                forward
+                    .iter()
+                    .map(|text| approx_token_count(text))
+                    .sum::<usize>()
+                    <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET
+            );
+            assert!(forward[1].contains("small evidence"));
+            if large_size == 28_000 {
+                assert!(!forward[0].contains("omission"));
+                assert!(forward[0].contains(&"x".repeat(large_size)));
+            } else {
+                assert!(forward[0].contains("omission"));
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_projection_preserves_evidence_error_and_deduplicates_only_json_mirrors() {
+        for is_error in [false, true] {
+            let result = CallToolResult {
+                content: vec![
+                    serde_json::json!({"type":"text", "text":"Search incomplete: timeout", "_meta":{"private":"secret"}}),
+                    serde_json::json!({"type":"text", "text":"{ \"matches\": [] }"}),
+                    serde_json::json!({"type":"image", "data":"AAAA", "mimeType":"image/png"}),
+                ],
+                structured_content: Some(serde_json::json!({"matches":[]})),
+                is_error: Some(is_error),
+                meta: Some(serde_json::json!({"private":"secret"})),
+            };
+            let item = ResponseItem::from(ResponseInputItem::McpToolCallOutput {
+                call_id: "call".into(),
+                output: result,
+            });
+            let wire = serde_json::to_value(item).expect("wire output");
+            let output = wire["output"]
+                .as_array()
+                .expect("native multimodal content");
+            let text = output
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Search incomplete: timeout"));
+            assert_eq!(text.matches("matches").count(), 1);
+            assert_eq!(text.contains("MCP tool reported an error."), is_error);
+            assert!(
+                output
+                    .iter()
+                    .any(|item| item["image_url"] == "data:image/png;base64,AAAA")
+            );
+            assert!(!wire.to_string().contains("secret"));
+        }
+        let result = CallToolResult {
+            content: vec![serde_json::json!({"type":"text","text":"native text"})],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+        assert_eq!(
+            serde_json::to_value(result.into_function_call_output_payload()).unwrap(),
+            serde_json::json!("native text")
         );
     }
 
@@ -3096,13 +3229,18 @@ mod tests {
     }
 
     #[test]
-    fn convert_mcp_content_to_items_returns_none_without_images() {
+    fn convert_mcp_content_to_items_preserves_plain_text() {
         let contents = vec![serde_json::json!({
             "type": "text",
             "text": "hello",
         })];
 
-        assert_eq!(convert_mcp_content_to_items(&contents), None);
+        assert_eq!(
+            convert_mcp_content_to_items(&contents),
+            Some(vec![FunctionCallOutputContentItem::InputText {
+                text: "hello".to_string()
+            }])
+        );
     }
 
     #[test]

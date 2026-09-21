@@ -64,6 +64,19 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
             Ok(ModelsFetchResult::Modified { models, etag })
         })
     }
+    /// Freeze and validate request credentials against this cache identity before
+    /// dispatch, including the representation associated with a conditional ETag.
+    /// Static endpoint implementations can use the default; mutable auth adapters
+    /// must override this operation using the credentials actually sent.
+    fn list_models_for_identity<'a>(
+        &'a self,
+        client_version: &'a str,
+        http_client_factory: HttpClientFactory,
+        etag: Option<&'a str>,
+        _expected_identity: &'a str,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsFetchResult>> {
+        self.list_models_conditional(client_version, http_client_factory, etag)
+    }
 }
 
 pub type ModelsEndpointFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -404,6 +417,7 @@ struct ModelState {
     available_models: AvailableModelPresets,
     etag: Option<String>,
     active_cache_identity: String,
+    fresh_until: Option<Instant>,
 }
 
 impl ModelState {
@@ -418,6 +432,7 @@ impl ModelState {
             available_models,
             etag,
             active_cache_identity,
+            fresh_until: None,
         }
     }
 
@@ -433,6 +448,7 @@ impl ModelState {
 
         self.replace_remote_models(load_bundled_models_or_panic());
         self.etag = None;
+        self.fresh_until = None;
         self.active_cache_identity = cache_identity;
         true
     }
@@ -794,7 +810,11 @@ impl OpenAiModelsManager {
             } else {
                 let current_etag = self.get_etag().await;
                 match self
-                    .fetch_models(&notice.http_client_factory, current_etag.as_deref())
+                    .fetch_models(
+                        &notice.http_client_factory,
+                        current_etag.as_deref(),
+                        &refresh_identity,
+                    )
                     .await
                 {
                     Ok(ModelsFetchResult::Modified { models, etag }) => {
@@ -816,6 +836,8 @@ impl OpenAiModelsManager {
                             {
                                 model_state.replace_remote_models(merged_models);
                                 model_state.etag = etag.clone();
+                                model_state.fresh_until =
+                                    Some(Instant::now() + self.cache_manager.ttl());
                                 (true, true)
                             } else {
                                 (false, identity_is_current)
@@ -845,6 +867,10 @@ impl OpenAiModelsManager {
                         if !self.cache_manager.identity_is_current(&refresh_identity) {
                             self.ensure_current_cache_identity().await;
                             continue;
+                        }
+                        if current_etag.is_some() {
+                            self.mark_memory_fresh(&refresh_identity, self.cache_manager.ttl())
+                                .await;
                         }
                         if let (Some(etag), Some(write_basis)) =
                             (current_etag, write_basis.as_ref())
@@ -879,50 +905,43 @@ impl OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
-        if refresh_strategy == RefreshStrategy::Offline {
-            self.try_load_cache().await?;
+        self.ensure_current_cache_identity().await;
+        if refresh_strategy != RefreshStrategy::Online && self.memory_is_fresh().await {
             return Ok(());
         }
-        if !self.should_refresh_models().await {
-            match refresh_strategy {
-                RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached => {
-                    self.try_load_cache().await?;
-                }
-                RefreshStrategy::Online => {
-                    // This no-op route has no cache or fetch operation to own
-                    // the identity transition.
-                    self.ensure_current_cache_identity().await;
+        if refresh_strategy == RefreshStrategy::Offline || !self.should_refresh_models().await {
+            if refresh_strategy != RefreshStrategy::Online {
+                // Offline snapshot readers must not wait behind a network transaction.
+                if let Ok(_refresh) = self.refresh_gate.try_lock()
+                    && let Err(err) = self.try_load_cache_locked().await
+                {
+                    error!("models cache unavailable; retaining eligible memory catalog: {err}");
                 }
             }
             return Ok(());
         }
+        self.fetch_and_update_models(
+            http_client_factory,
+            refresh_strategy == RefreshStrategy::OnlineIfUncached,
+        )
+        .await
+    }
 
-        match refresh_strategy {
-            RefreshStrategy::Offline => {
-                // Only try to load from cache, never fetch
-                self.try_load_cache().await?;
-                Ok(())
-            }
-            RefreshStrategy::OnlineIfUncached => {
-                // Try cache first, fall back to online if unavailable
-                match self.try_load_cache().await {
-                    Ok(true) => {
-                        info!("models cache: using cached models for OnlineIfUncached");
-                        return Ok(());
-                    }
-                    Ok(false) => {}
-                    Err(CodexErr::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
-                        error!("models cache: corrupt cache, fetching remote models: {err}");
-                    }
-                    Err(err) => return Err(err),
-                }
-                info!("models cache: cache miss, fetching remote models");
-                self.fetch_and_update_models(http_client_factory).await
-            }
-            RefreshStrategy::Online => {
-                // Always fetch from network
-                self.fetch_and_update_models(http_client_factory).await
-            }
+    async fn memory_is_fresh(&self) -> bool {
+        let state = self.state.read().await;
+        self.cache_manager
+            .identity_is_current(&state.active_cache_identity)
+            && state
+                .fresh_until
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    async fn mark_memory_fresh(&self, identity: &str, remaining: Duration) {
+        let mut state = self.state.write().await;
+        if state.active_cache_identity == identity
+            && self.cache_manager.identity_is_current(identity)
+        {
+            state.fresh_until = Some(Instant::now() + remaining);
         }
     }
 
@@ -933,8 +952,19 @@ impl OpenAiModelsManager {
     async fn fetch_and_update_models(
         &self,
         http_client_factory: &HttpClientFactory,
+        use_cache: bool,
     ) -> CoreResult<()> {
         let _refresh = self.refresh_gate.lock().await;
+        if use_cache {
+            if self.memory_is_fresh().await {
+                return Ok(());
+            }
+            match self.try_load_cache_locked().await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err) => error!("models cache unavailable; fetching remote models: {err}"),
+            }
+        }
         let fetch_identity = self.ensure_current_cache_identity().await;
         let client_version = crate::client_version_to_whole();
         let current_etag = self.get_etag().await;
@@ -950,7 +980,11 @@ impl OpenAiModelsManager {
             }
         };
         match self
-            .fetch_models(http_client_factory, current_etag.as_deref())
+            .fetch_models(
+                http_client_factory,
+                current_etag.as_deref(),
+                &fetch_identity,
+            )
             .await?
         {
             ModelsFetchResult::Modified { models, etag } => {
@@ -969,6 +1003,8 @@ impl OpenAiModelsManager {
                     self.ensure_current_cache_identity().await;
                     return Ok(());
                 }
+                self.mark_memory_fresh(&fetch_identity, self.cache_manager.ttl())
+                    .await;
                 if let Some(write_basis) = write_basis
                     && !self
                         .cache_manager
@@ -988,6 +1024,10 @@ impl OpenAiModelsManager {
                 if !self.cache_manager.identity_is_current(&fetch_identity) {
                     self.ensure_current_cache_identity().await;
                     return Ok(());
+                }
+                if current_etag.is_some() {
+                    self.mark_memory_fresh(&fetch_identity, self.cache_manager.ttl())
+                        .await;
                 }
                 if let (Some(etag), Some(write_basis)) = (current_etag, write_basis.as_ref())
                     && let Err(err) = self
@@ -1011,12 +1051,14 @@ impl OpenAiModelsManager {
         &self,
         http_client_factory: &HttpClientFactory,
         etag: Option<&str>,
+        expected_identity: &str,
     ) -> CoreResult<ModelsFetchResult> {
         self.endpoint_client
-            .list_models_conditional(
+            .list_models_for_identity(
                 &crate::client_version_to_whole(),
                 http_client_factory.clone(),
                 etag,
+                expected_identity,
             )
             .await
     }
@@ -1087,6 +1129,7 @@ impl OpenAiModelsManager {
             state.replace_remote_models(merged_models);
         }
         state.etag = etag;
+        state.fresh_until = None;
         true
     }
 
@@ -1129,8 +1172,16 @@ impl OpenAiModelsManager {
         clippy::await_holding_invalid_type,
         reason = "Serializes model catalog and cache refresh transactions across network and disk awaits"
     )]
+    #[cfg(test)]
     async fn try_load_cache(&self) -> CoreResult<bool> {
         let _refresh = self.refresh_gate.lock().await;
+        self.try_load_cache_locked().await
+    }
+
+    async fn try_load_cache_locked(&self) -> CoreResult<bool> {
+        if self.memory_is_fresh().await {
+            return Ok(true);
+        }
         let load_identity = self.ensure_current_cache_identity().await;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
@@ -1151,6 +1202,11 @@ impl OpenAiModelsManager {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
+        let remaining = self.cache_manager.ttl().saturating_sub(
+            (chrono::Utc::now() - cache.fetched_at)
+                .to_std()
+                .unwrap_or_default(),
+        );
         let models_count = cache.models.len();
         if !self
             .apply_remote_models_and_etag_for_identity(
@@ -1167,6 +1223,7 @@ impl OpenAiModelsManager {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
+        self.mark_memory_fresh(&load_identity, remaining).await;
         info!(
             models_count,
             etag = ?cache.etag,
@@ -1241,8 +1298,7 @@ impl ModelsManager for StaticModelsManager {
                 let requested_model = model.as_deref();
 
                 if allow_provider_model_fallback {
-                    if (requested_model_is_available(requested_model, &available_models)
-                        || requested_model_is_sol(requested_model))
+                    if requested_model_is_available(requested_model, &available_models)
                         && let Some(requested_model) = requested_model
                     {
                         return Ok(requested_model.to_string());
@@ -1354,17 +1410,6 @@ fn requested_model_is_available(
         available_models
             .iter()
             .any(|available_model| available_model.model == requested_model)
-    })
-}
-
-fn requested_model_is_sol(requested_model: Option<&str>) -> bool {
-    const SOL_MODEL: &str = "gpt-5.6-sol";
-    requested_model.is_some_and(|requested_model| {
-        requested_model == SOL_MODEL
-            || requested_model
-                .strip_suffix(SOL_MODEL)
-                .and_then(|prefix| prefix.strip_suffix('.'))
-                .is_some_and(|provider| !provider.is_empty())
     })
 }
 

@@ -3,6 +3,7 @@ use codex_protocol::protocol::EventMsg;
 
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
 
 /// Derive the next agent status from a single emitted event.
 /// Returns `None` when the event does not affect status tracking.
@@ -42,9 +43,31 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
 }
 
 /// Projects the durable typed-task outcome used by parent notifications.
-pub(crate) fn agent_status_from_task(task: &AgentTask) -> Option<AgentStatus> {
+pub(crate) fn agent_status_from_task(
+    task: &AgentTask,
+    observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
+) -> Option<AgentStatus> {
     let receipt = task.receipt.as_ref()?;
-    if !task.workspace_status.pending_gates.is_empty() {
+    let observed_status = observed_status
+        .filter(|(attempt_id, _)| {
+            *attempt_id == task.current_attempt.attempt_id && *attempt_id == receipt.attempt_id
+        })
+        .map(|(_, status)| status);
+    let plain_message = matches!(
+        task.assignment.admission_origin,
+        AssignmentAdmissionOrigin::LegacyMessage { .. }
+    );
+    // Preparation can fail before a follow-up gets a new attempt. Its live failure
+    // must not be replaced by the previous turn's durable completed receipt.
+    if plain_message
+        && matches!(
+            observed_status,
+            Some(AgentStatus::Errored(_) | AgentStatus::Shutdown | AgentStatus::Interrupted)
+        )
+    {
+        return observed_status.cloned();
+    }
+    if !plain_message && !task.workspace_status.pending_gates.is_empty() {
         return Some(AgentStatus::Errored(format!(
             "durable typed task has pending gates: {}",
             task.workspace_status
@@ -56,6 +79,25 @@ pub(crate) fn agent_status_from_task(task: &AgentTask) -> Option<AgentStatus> {
         )));
     }
     match receipt.status {
+        AgentStatusClaim::Completed
+            if matches!(
+                observed_status,
+                Some(AgentStatus::CompletedWithSurface { .. })
+            ) =>
+        {
+            observed_status.cloned()
+        }
+        AgentStatusClaim::Completed if plain_message => {
+            let evidence_note = if receipt.risks.is_empty() {
+                ""
+            } else {
+                "\nUnresolved risks are retained in the task record."
+            };
+            Some(AgentStatus::Completed(Some(format!(
+                "Agent-reported result (behavior unverified): {}{evidence_note}",
+                receipt.summary
+            ))))
+        }
         AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(format!(
             "{}\n\nAgent-reported summary (not verification evidence): {}",
             task.completion_evidence_summary(),
@@ -279,7 +321,8 @@ mod tests {
         let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
         task.receipt.as_mut().unwrap().summary =
             "Everything passed and Desktop is running the new build".to_string();
-        let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(&task) else {
+        let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(&task, None)
+        else {
             panic!("sealed completed task must produce a parent notification");
         };
         assert!(message.contains("behavior unverified"));
@@ -291,7 +334,7 @@ mod tests {
         );
         for status in [AgentStatusClaim::NeedsMain, AgentStatusClaim::Blocked] {
             assert!(matches!(
-                agent_status_from_task(&typed_task_with_receipt(status, false)),
+                agent_status_from_task(&typed_task_with_receipt(status, false), None),
                 Some(AgentStatus::Errored(message)) if message.contains("durable typed receipt status")
             ));
         }
@@ -301,17 +344,88 @@ mod tests {
             AgentStatusClaim::Abandoned,
         ] {
             assert!(matches!(
-                agent_status_from_task(&typed_task_with_receipt(status, false)),
+                agent_status_from_task(&typed_task_with_receipt(status, false), None),
                 Some(AgentStatus::Errored(message)) if message.contains("durable typed receipt status")
             ));
         }
     }
 
     #[test]
+    fn plain_message_completion_preserves_surface_without_claiming_verified_behavior() {
+        let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, true);
+        task.assignment.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+            parent_assignment_id: None,
+        };
+        let observed = AgentStatus::CompletedWithSurface {
+            last_agent_message: None,
+            surfaced_result: SurfacedToolResult {
+                adapter: "owner".to_string(),
+                value: serde_json::json!({"result": "answer artifact"}),
+                canonical_message: Some("answer artifact".to_string()),
+            },
+        };
+        assert_eq!(
+            agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &observed))),
+            Some(observed)
+        );
+        assert_eq!(
+            agent_status_from_task(&task, None),
+            Some(AgentStatus::Completed(Some(
+                "Agent-reported result (behavior unverified): durable summary".to_string()
+            )))
+        );
+        for failed_followup in [
+            AgentStatus::Errored("follow-up preparation failed".to_string()),
+            AgentStatus::Shutdown,
+            AgentStatus::Interrupted,
+        ] {
+            assert_eq!(
+                agent_status_from_task(
+                    &task,
+                    Some((task.current_attempt.attempt_id, &failed_followup))
+                ),
+                Some(failed_followup)
+            );
+        }
+        task.receipt.as_mut().unwrap().status = AgentStatusClaim::Failed;
+        assert!(matches!(
+            agent_status_from_task(&task, None),
+            Some(AgentStatus::Errored(_))
+        ));
+    }
+
+    #[test]
     fn pending_gate_blocks_completed_receipt_projection() {
         assert!(matches!(
-            agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Completed, true)),
+            agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Completed, true), None),
             Some(AgentStatus::Errored(message)) if message.contains("pending gates")
         ));
+    }
+
+    #[test]
+    fn typed_surface_requires_current_attempt_and_cleared_gates() {
+        let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+        let observed = AgentStatus::CompletedWithSurface {
+            last_agent_message: None,
+            surfaced_result: SurfacedToolResult {
+                adapter: "owner".to_string(),
+                value: serde_json::json!({"answer": [1, 2, 3]}),
+                canonical_message: None,
+            },
+        };
+        let attempt_id = task.current_attempt.attempt_id;
+        assert_eq!(
+            agent_status_from_task(&task, Some((attempt_id, &observed))),
+            Some(observed.clone())
+        );
+        assert!(matches!(
+            agent_status_from_task(&task, Some((AttemptId::new(), &observed))),
+            Some(AgentStatus::Completed(_))
+        ));
+        task.workspace_status =
+            typed_task_with_receipt(AgentStatusClaim::Completed, true).workspace_status;
+        assert!(
+            matches!(agent_status_from_task(&task, Some((attempt_id, &observed))), Some(AgentStatus::Errored(message)) if message.contains("pending gates"))
+        );
     }
 }

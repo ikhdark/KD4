@@ -28,6 +28,9 @@ pub(super) fn tool_callback(
             return;
         }
     };
+    if reject_unavailable_callback(scope, &mut retval) {
+        return;
+    }
     let input = if args.length() == 0 {
         Ok(None)
     } else {
@@ -83,13 +86,16 @@ pub(super) fn tool_callback(
     state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
     let event_tx = state.event_tx.clone();
     state.pending_tool_calls.insert(id.clone(), resolver);
-    let _ = event_tx.send(RuntimeEvent::ToolCall {
-        id,
+    if event_tx.send(RuntimeEvent::ToolCall {
+        id: id.clone(),
         name: tool_name,
         kind: tool_kind,
         input,
         timeout_ms,
-    });
+    }).is_err() {
+        state.pending_tool_calls.remove(&id);
+        scope.terminate_execution();
+    }
     retval.set(promise.into());
 }
 
@@ -103,6 +109,9 @@ pub(super) fn text_callback(
     } else {
         args.get(0)
     };
+    if skip_output_conversion(scope, value) {
+        return;
+    }
     let text = match serialize_output_text(scope, value) {
         Ok(text) => text,
         Err(error_text) => {
@@ -125,10 +134,17 @@ pub(super) fn console_log_callback(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
-    let mut parts = Vec::with_capacity(usize::try_from(args.length()).unwrap_or_default());
+    if skip_output_conversion(scope, args.get(0)) {
+        return;
+    }
+    let mut output = String::new();
     for index in 0..args.length() {
-        match serialize_output_text(scope, args.get(index)) {
-            Ok(text) => parts.push(text),
+        if index != 0 {
+            output.push(' ');
+        }
+        let remaining = super::value::MAX_PAYLOAD_BYTES.saturating_sub(output.len());
+        match super::value::serialize_console_text(scope, args.get(index), remaining) {
+            Ok(text) => output.push_str(&text),
             Err(error_text) => {
                 throw_type_error(scope, &error_text);
                 return;
@@ -137,7 +153,7 @@ pub(super) fn console_log_callback(
     }
     if let Some(state) = scope.get_slot::<RuntimeState>() {
         state.emit_output(FunctionCallOutputContentItem::InputText {
-            text: parts.join(" "),
+            text: output,
         });
     }
     retval.set(v8::undefined(scope).into());
@@ -232,14 +248,34 @@ pub(super) fn store_callback(
     _retval: v8::ReturnValue<v8::Value>,
 ) {
     let key = match args.get(0).to_string(scope) {
-        Some(key) => key.to_rust_string_lossy(scope),
+        Some(key) => match super::value::bounded_string(scope, key, MAX_SESSION_STORED_VALUE_BYTES) {
+            Ok(key) => key,
+            Err(_) => {
+                reject_storage_limit(scope);
+                return;
+            }
+        },
         None => {
             throw_type_error(scope, "store key must be a string");
             return;
         }
     };
+    let admission = scope.get_slot::<RuntimeState>().and_then(|state| {
+        if state.stored_value_limit_error.is_some()
+            || (!state.stored_values.contains_key(&key) && state.stored_values.len() >= MAX_SESSION_STORED_VALUES) {
+            return None;
+        }
+        let key_bytes = stored_value_entry_bytes(&key, &serde_json::Value::Null).saturating_sub(4);
+        MAX_SESSION_STORED_VALUE_BYTES.checked_sub(state.total_stored_value_bytes)
+            .and_then(|available| available.checked_add(state.stored_value_bytes.get(&key).copied().unwrap_or(0)))
+            .and_then(|available| available.checked_sub(key_bytes))
+    });
+    let Some(max_bytes) = admission else {
+        reject_storage_limit(scope);
+        return;
+    };
     let value = args.get(1);
-    let serialized = match v8_value_to_json(scope, value) {
+    let serialized = match super::value::v8_value_to_json_with_limit(scope, value, max_bytes) {
         Ok(Some(value)) => value,
         Ok(None) => {
             throw_type_error(
@@ -248,7 +284,11 @@ pub(super) fn store_callback(
             );
             return;
         }
-        Err(error_text) => {
+        Err(super::value::JsonConversionError::TooLarge) => {
+            reject_storage_limit(scope);
+            return;
+        }
+        Err(super::value::JsonConversionError::Invalid(error_text)) => {
             throw_type_error(scope, &error_text);
             return;
         }
@@ -286,6 +326,15 @@ pub(super) fn store_callback(
     }
 }
 
+fn reject_storage_limit(scope: &mut v8::PinScope<'_, '_>) {
+    let error = stored_value_limit_message();
+    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+        state.stored_value_writes.clear();
+        state.stored_value_limit_error = Some(error.clone());
+    }
+    throw_type_error(scope, &error);
+}
+
 pub(super) fn load_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -318,12 +367,15 @@ pub(super) fn notify_callback(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
+    if reject_unavailable_callback(scope, &mut retval) {
+        return;
+    }
     let value = if args.length() == 0 {
         v8::undefined(scope).into()
     } else {
         args.get(0)
     };
-    let text = match serialize_output_text(scope, value) {
+    let text = match super::value::serialize_output_text_with_limit(scope, value, super::value::MAX_NOTIFICATION_BYTES) {
         Ok(text) => text,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
@@ -354,12 +406,45 @@ pub(super) fn notify_callback(
     let id = format!("notify-{}", state.next_notification_id);
     state.next_notification_id = state.next_notification_id.saturating_add(1);
     state.pending_notifications.insert(id.clone(), resolver);
-    let _ = state.event_tx.send(RuntimeEvent::Notify {
-        id: Some(id),
+    if state.event_tx.send(RuntimeEvent::Notify {
+        id: Some(id.clone()),
         call_id: state.tool_call_id.clone(),
         text,
-    });
+    }).is_err() {
+        state.pending_notifications.remove(&id);
+        scope.terminate_execution();
+    }
     retval.set(promise.into());
+}
+
+fn skip_output_conversion(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> bool {
+    let bytes = v8::Local::<v8::String>::try_from(value).map(|value| value.utf8_length(scope)).unwrap_or(0);
+    let Some(state) = scope.get_slot::<RuntimeState>() else { return false; };
+    let Some(event) = state.output_admission.reject_before_conversion(bytes) else { return false; };
+    if let Some(event) = event {
+        let _ = state.event_tx.send(event);
+    }
+    true
+}
+
+fn reject_unavailable_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    retval: &mut v8::ReturnValue<v8::Value>,
+) -> bool {
+    if scope.get_slot::<RuntimeState>().is_some_and(|state| state.event_tx.is_closed()) {
+        scope.terminate_execution();
+        return true;
+    }
+    if scope.get_slot::<RuntimeState>().is_some_and(|state| !state.can_admit_callback()) {
+        if let Some(resolver) = v8::PromiseResolver::new(scope) {
+            let promise = resolver.get_promise(scope);
+            reject_callback_limit(scope, resolver, promise, retval);
+        } else {
+            throw_type_error(scope, "failed to create callback promise");
+        }
+        return true;
+    }
+    false
 }
 
 fn reject_callback_limit(
@@ -371,9 +456,7 @@ fn reject_callback_limit(
     let message = format!(
         "code mode cell exceeded its limit of {MAX_OUTSTANDING_CALLBACKS_PER_CELL} outstanding tool and notification callbacks"
     );
-    let error = v8::String::new(scope, &message)
-        .map(Into::into)
-        .unwrap_or_else(|| v8::undefined(scope).into());
+    let error = super::value::error_value(scope, &message);
     resolver.reject(scope, error);
     retval.set(promise.into());
 }

@@ -7,15 +7,16 @@ import argparse
 import hashlib
 import os
 import shlex
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 try:
     from scripts.generated_output_lock import GenerationLockError, generated_output_lock
+    from scripts.process_owner import run_finite
 except ModuleNotFoundError:
     from generated_output_lock import GenerationLockError, generated_output_lock
+    from process_owner import run_finite
 
 
 GENERATED_OUTPUTS = ("codex-rs/core/config.schema.json",)
@@ -28,10 +29,19 @@ def repo_root() -> Path:
 def run(args: Sequence[str], *, cwd: Path) -> int:
     print("$ " + shlex.join(str(arg) for arg in args), flush=True)
     try:
-        return subprocess.run(list(args), cwd=cwd).returncode
+        result = run_finite(args, cwd=cwd)
     except OSError as error:
         print(f"Could not run {args[0]}: {error}", file=sys.stderr)
         return 127 if isinstance(error, FileNotFoundError) else 1
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.output_truncated:
+        print("[output truncated; retaining final 65536 bytes]", file=sys.stderr)
+    if result.status == "could_not_start":
+        print(f"Could not run {args[0]}: {result.stdout}", file=sys.stderr)
+    elif result.status not in {"passed", "failed"}:
+        print(f"Command {result.status}: {args[0]}", file=sys.stderr)
+    return result.returncode
 
 
 def hash_file(path: Path) -> str:
@@ -93,7 +103,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--owner",
         help="Required identity for the serialized force-regeneration lane.",
     )
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=None,
+        help="Lock wait seconds (check: 60, force: 0; 0 fails immediately).",
+    )
     args = parser.parse_args(argv)
+    if args.lock_timeout is not None and (not 0 <= args.lock_timeout <= 3600):
+        parser.error("--lock-timeout must be between 0 and 3600")
+    lock_timeout = (
+        args.lock_timeout
+        if args.lock_timeout is not None
+        else (60 if args.mode == "check" else 0)
+    )
 
     root = repo_root()
     if args.mode == "force" and (not args.owner or not args.owner.strip()):
@@ -101,7 +124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     lock_owner = args.owner if args.mode == "force" else f"check:{os.getpid()}"
     generated_changed = False
     try:
-        with generated_output_lock(root, lock_owner):
+        with generated_output_lock(root, lock_owner, timeout=lock_timeout):
             if args.mode == "force":
                 print("Forcing config schema regeneration.")
                 generated_changed = regenerate_schema(root, args.owner)

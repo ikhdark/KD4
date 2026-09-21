@@ -7,8 +7,8 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 use codex_code_mode_protocol::CellId;
-use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::NestedCancellation;
+use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
 use codex_code_mode_protocol::host::DelegateResponse;
@@ -41,12 +41,59 @@ pub(super) struct HostPeer {
 struct PendingDelegate {
     response_tx: oneshot::Sender<Result<DelegateResponse, String>>,
     dispatched: bool,
+    cell_key: (SessionId, CellId),
     _permit: OwnedSemaphorePermit,
 }
 
 enum CellRoute {
     Pending(VecDeque<CellMessage>),
-    Active(mpsc::Sender<CellMessage>),
+    Active(Arc<CellQueue>),
+}
+
+#[derive(Default)]
+struct CellQueue {
+    messages: StdMutex<VecDeque<CellMessage>>,
+    changed: Notify,
+}
+
+impl CellQueue {
+    async fn recv(&self) -> Option<CellMessage> {
+        loop {
+            let changed = self.changed.notified();
+            if let Some(message) = self
+                .messages
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+            {
+                return Some(message);
+            }
+            changed.await;
+        }
+    }
+}
+
+fn push_cell_message(
+    messages: &mut VecDeque<CellMessage>,
+    message: CellMessage,
+) -> Result<(), String> {
+    // Closure owns a reserved slot, and is idempotent. Callback admission can
+    // fail locally without destroying other cells or the connection.
+    if messages
+        .iter()
+        .any(|message| matches!(message, CellMessage::Closed))
+    {
+        return if matches!(message, CellMessage::Closed) {
+            Ok(())
+        } else {
+            Err("code-mode cell is closed".to_string())
+        };
+    }
+    if messages.len() >= CELL_MESSAGE_CAPACITY && !matches!(message, CellMessage::Closed) {
+        return Err("code-mode cell message queue is full".to_string());
+    }
+    messages.push_back(message);
+    Ok(())
 }
 
 enum CellMessage {
@@ -139,6 +186,11 @@ impl HostPeer {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| "code-mode delegate request ID space exhausted".to_string())?,
         );
+        let cell_id = match &request {
+            DelegateRequest::InvokeTool { invocation } => invocation.cell_id.clone().into(),
+            DelegateRequest::Notify { cell_id, .. } => cell_id.clone().into(),
+        };
+        let cell_key = (session_id, cell_id);
         let (response_tx, response_rx) = oneshot::channel();
         self.pending
             .lock()
@@ -148,17 +200,14 @@ impl HostPeer {
                 PendingDelegate {
                     response_tx,
                     dispatched: false,
+                    cell_key: cell_key.clone(),
                     _permit: permit,
                 },
             );
         let mut pending = PendingDelegateRequest::new(Arc::clone(self), id);
-        let cell_id = match &request {
-            DelegateRequest::InvokeTool { invocation } => invocation.cell_id.clone().into(),
-            DelegateRequest::Notify { cell_id, .. } => cell_id.clone().into(),
-        };
         let (dispatched_tx, dispatched_rx) = oneshot::channel();
         if let Err(err) = self.route_cell_message(
-            (session_id, cell_id),
+            cell_key,
             CellMessage::Delegate {
                 id,
                 request: Box::new(request),
@@ -176,6 +225,8 @@ impl HostPeer {
 
         let dispatched = tokio::select! {
             _ = cancellation_token.cancelled() => {
+                self.cancel_pending(id, cancellation.cause());
+                pending.disarm();
                 return Err("code mode delegate request cancelled".to_string());
             }
             dispatched = dispatched_rx => dispatched.map_err(|_| {
@@ -204,15 +255,7 @@ impl HostPeer {
                 })?
             }
             _ = cancellation_token.cancelled() => {
-                if self.remove_pending(id).is_some() {
-                    // The origin recorded its cause before signalling, so the
-                    // client can attribute this cancellation instead of
-                    // defaulting to "aborted by user".
-                    let _ = self.send(HostToClient::CancelDelegateRequest {
-                        id,
-                        cause: cancellation.cause(),
-                    });
-                }
+                self.cancel_pending(id, cancellation.cause());
                 pending.disarm();
                 Err("code mode delegate request cancelled".to_string())
             }
@@ -243,24 +286,20 @@ impl HostPeer {
     ) -> oneshot::Receiver<()> {
         let (initial_response_sent_tx, initial_response_sent_rx) = oneshot::channel();
         let key = (session_id, started.cell_id.clone());
-        let (messages_tx, messages_rx) = mpsc::channel(CELL_MESSAGE_CAPACITY);
+        let messages_rx = Arc::new(CellQueue::default());
         let mut routes = self
             .cell_routes
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         // Keep activation and transfer atomic with respect to callbacks so a
         // newer message cannot overtake buffered delegates or closure.
-        let previous = routes.insert(key.clone(), CellRoute::Active(messages_tx.clone()));
+        let previous = routes.insert(key.clone(), CellRoute::Active(Arc::clone(&messages_rx)));
         match previous {
             Some(CellRoute::Pending(messages)) => {
-                for message in messages {
-                    if messages_tx.try_send(message).is_err() {
-                        self.fail(
-                            "code-mode cell message queue is full during activation".to_string(),
-                        );
-                        return initial_response_sent_rx;
-                    }
-                }
+                *messages_rx
+                    .messages
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = messages;
             }
             Some(CellRoute::Active(_)) => {
                 self.fail("code-mode cell route is already active".to_string());
@@ -347,6 +386,13 @@ impl HostPeer {
         request: DelegateRequest,
         dispatched_tx: oneshot::Sender<Result<(), String>>,
     ) {
+        // Prepare large frames without holding the shared pending-call lock.
+        let frame = EncodedFrame::encode(&HostToClient::DelegateRequest {
+            id,
+            session_id,
+            request,
+        })
+        .map_err(|error| PeerSendError::Payload(error.to_string()));
         let result = {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(pending) = pending.get_mut(&id) else {
@@ -355,11 +401,7 @@ impl HostPeer {
                 ));
                 return;
             };
-            match self.send(HostToClient::DelegateRequest {
-                id,
-                session_id,
-                request,
-            }) {
+            match frame.and_then(|frame| self.send_frame(frame)) {
                 Ok(()) => {
                     pending.dispatched = true;
                     Ok(())
@@ -390,34 +432,61 @@ impl HostPeer {
         if self.is_disconnected() {
             return Err("code-mode client connection closed".to_string());
         }
-        let result = match routes.entry(key) {
+        match routes.entry(key) {
             Entry::Occupied(mut entry) => match entry.get_mut() {
-                CellRoute::Pending(messages) if messages.len() < CELL_MESSAGE_CAPACITY => {
-                    messages.push_back(message);
+                CellRoute::Pending(messages) => push_cell_message(messages, message),
+                CellRoute::Active(queue) => {
+                    push_cell_message(
+                        &mut queue
+                            .messages
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner),
+                        message,
+                    )?;
+                    queue.changed.notify_one();
                     Ok(())
                 }
-                CellRoute::Pending(_) => Err("code-mode cell message queue is full".to_string()),
-                CellRoute::Active(sender) => sender
-                    .try_send(message)
-                    .map_err(|_| "code-mode cell message queue is unavailable".to_string()),
             },
             Entry::Vacant(entry) => {
                 entry.insert(CellRoute::Pending(VecDeque::from([message])));
                 Ok(())
             }
-        };
-        drop(routes);
-        if let Err(reason) = &result {
-            self.fail(reason.clone());
         }
-        result
     }
 
     fn remove_pending(&self, id: DelegateRequestId) -> Option<PendingDelegate> {
-        self.pending
+        let pending = self
+            .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id)
+            .remove(&id)?;
+        let mut routes = self
+            .cell_routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let retain = |message: &CellMessage| !matches!(message, CellMessage::Delegate { id: queued, .. } if *queued == id);
+        match routes.get_mut(&pending.cell_key) {
+            Some(CellRoute::Pending(messages)) => messages.retain(retain),
+            Some(CellRoute::Active(queue)) => queue
+                .messages
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(retain),
+            None => {}
+        }
+        Some(pending)
+    }
+
+    fn cancel_pending(
+        &self,
+        id: DelegateRequestId,
+        cause: Option<codex_code_mode_protocol::CancellationCause>,
+    ) {
+        if let Some(pending) = self.remove_pending(id)
+            && pending.dispatched
+        {
+            let _ = self.send(HostToClient::CancelDelegateRequest { id, cause });
+        }
     }
 
     pub(super) fn spawn_critical<F>(self: &Arc<Self>, task_name: &'static str, future: F)
@@ -457,7 +526,7 @@ async fn drive_cell(
     key: (SessionId, CellId),
     request_id: RequestId,
     started: StartedCell,
-    mut messages_rx: mpsc::Receiver<CellMessage>,
+    messages_rx: Arc<CellQueue>,
     initial_response_sent_tx: oneshot::Sender<()>,
     _active_cell_permit: OwnedSemaphorePermit,
 ) {

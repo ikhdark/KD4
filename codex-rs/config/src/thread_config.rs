@@ -66,6 +66,7 @@ pub struct ThreadConfigLoadError {
     code: ThreadConfigLoadErrorCode,
     message: String,
     status_code: Option<u16>,
+    grpc_code: Option<tonic::Code>,
 }
 
 impl ThreadConfigLoadError {
@@ -78,6 +79,7 @@ impl ThreadConfigLoadError {
             code,
             message: message.into(),
             status_code,
+            grpc_code: None,
         }
     }
 
@@ -87,6 +89,16 @@ impl ThreadConfigLoadError {
 
     pub fn status_code(&self) -> Option<u16> {
         self.status_code
+    }
+
+    /// Original remote status, independent of the broad loader error category.
+    pub fn grpc_code(&self) -> Option<tonic::Code> {
+        self.grpc_code
+    }
+
+    pub(crate) fn with_grpc_code(mut self, code: tonic::Code) -> Self {
+        self.grpc_code = Some(code);
+        self
     }
 }
 

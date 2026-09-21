@@ -1,7 +1,8 @@
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
@@ -18,45 +19,81 @@ pub(super) struct ScheduledTimeout {
     callback: v8::Global<v8::Function>,
 }
 
-enum TimerSchedulerCommand {
-    Schedule { id: u64, deadline: Instant },
-    Cancel { id: u64 },
-    Shutdown,
+#[derive(Default)]
+struct TimerWork {
+    scheduled: HashMap<u64, Instant>,
+    fired: Vec<u64>,
+    wake_pending: bool,
+    shutdown: bool,
 }
 
 pub(super) struct TimerScheduler {
-    command_tx: std_mpsc::Sender<TimerSchedulerCommand>,
+    shared: Arc<(Mutex<TimerWork>, Condvar)>,
+    runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
     worker: Option<thread::JoinHandle<()>>,
+    #[cfg(test)]
+    barrier: Option<Arc<std::sync::Barrier>>,
 }
 
 impl TimerScheduler {
     pub(super) fn new(runtime_command_tx: std_mpsc::Sender<RuntimeCommand>) -> Self {
-        let (command_tx, command_rx) = std_mpsc::channel();
-        let worker = thread::spawn(move || run_scheduler(command_rx, runtime_command_tx));
         Self {
-            command_tx,
-            worker: Some(worker),
+            shared: Arc::new((Mutex::new(TimerWork::default()), Condvar::new())),
+            runtime_command_tx,
+            worker: None,
+            #[cfg(test)]
+            barrier: None,
         }
     }
 
-    fn schedule(&self, id: u64, delay: Duration) -> Result<(), String> {
+    fn schedule(&mut self, id: u64, delay: Duration) -> Result<(), String> {
         let now = Instant::now();
         let deadline = now
             .checked_add(delay)
             .ok_or_else(|| "setTimeout delay exceeds the platform timer limit".to_string())?;
-        self.command_tx
-            .send(TimerSchedulerCommand::Schedule { id, deadline })
-            .map_err(|_| "code mode timer scheduler is unavailable".to_string())
+        if self.worker.is_none() {
+            let shared = Arc::clone(&self.shared);
+            let command_tx = self.runtime_command_tx.clone();
+            #[cfg(test)]
+            let barrier = self.barrier.clone();
+            self.worker = Some(thread::spawn(move || {
+                #[cfg(test)]
+                if let Some(barrier) = barrier {
+                    barrier.wait();
+                }
+                run_scheduler(shared, command_tx);
+            }));
+        }
+        let (work, wake) = &*self.shared;
+        let mut work = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if work.scheduled.len() + work.fired.len() >= MAX_PENDING_TIMEOUTS_PER_CELL {
+            return Err("code mode timer scheduler is full".to_string());
+        }
+        work.scheduled.insert(id, deadline);
+        wake.notify_one();
+        Ok(())
     }
 
     fn cancel(&self, id: u64) {
-        let _ = self.command_tx.send(TimerSchedulerCommand::Cancel { id });
+        let (work, wake) = &*self.shared;
+        let mut work = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        work.scheduled.remove(&id);
+        work.fired.retain(|fired| *fired != id);
+        wake.notify_one();
+    }
+
+    pub(super) fn take_fired(&self) -> Vec<u64> {
+        let mut work = self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        work.wake_pending = false;
+        std::mem::take(&mut work.fired)
     }
 }
 
 impl Drop for TimerScheduler {
     fn drop(&mut self) {
-        let _ = self.command_tx.send(TimerSchedulerCommand::Shutdown);
+        let (work, wake) = &*self.shared;
+        work.lock().unwrap_or_else(std::sync::PoisonError::into_inner).shutdown = true;
+        wake.notify_one();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -64,51 +101,39 @@ impl Drop for TimerScheduler {
 }
 
 fn run_scheduler(
-    command_rx: std_mpsc::Receiver<TimerSchedulerCommand>,
+    shared: Arc<(Mutex<TimerWork>, Condvar)>,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
 ) {
-    let mut deadlines = BinaryHeap::<Reverse<(Instant, u64)>>::new();
-    let mut scheduled = HashMap::<u64, Instant>::new();
+    let (work, wake) = &*shared;
+    let mut work = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
-        while let Some(Reverse((deadline, id))) = deadlines.peek().copied() {
-            if scheduled.get(&id) != Some(&deadline) {
-                deadlines.pop();
-            } else if deadline <= Instant::now() {
-                deadlines.pop();
-                scheduled.remove(&id);
-                let _ = runtime_command_tx.send(RuntimeCommand::TimeoutFired { id });
-            } else {
+        if work.shutdown {
+            break;
+        }
+        let now = Instant::now();
+        let mut due: Vec<_> = work.scheduled.iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, deadline)| (*deadline, *id))
+            .collect();
+        due.sort_unstable();
+        for (_, id) in due {
+            work.scheduled.remove(&id);
+            work.fired.push(id);
+        }
+        // At most one wake is queued, even if JavaScript clears already-fired
+        // timers and schedules replacements without returning to the event loop.
+        if !work.fired.is_empty() && !work.wake_pending {
+            work.wake_pending = true;
+            if runtime_command_tx.send(RuntimeCommand::TimersReady).is_err() {
                 break;
             }
         }
-
-        let command = match deadlines.peek().copied() {
-            Some(Reverse((deadline, _))) => {
-                let wait = deadline.saturating_duration_since(Instant::now());
-                match command_rx.recv_timeout(wait) {
-                    Ok(command) => command,
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            None => match command_rx.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            },
+        work = if let Some(deadline) = work.scheduled.values().min().copied() {
+            wake.wait_timeout(work, deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner).0
+        } else {
+            wake.wait(work).unwrap_or_else(std::sync::PoisonError::into_inner)
         };
-        match command {
-            TimerSchedulerCommand::Schedule { id, deadline } => {
-                scheduled.insert(id, deadline);
-                deadlines.push(Reverse((deadline, id)));
-            }
-            TimerSchedulerCommand::Cancel { id } => {
-                scheduled.remove(&id);
-                // A long-lived earlier timer must not retain cancelled later
-                // deadlines indefinitely when a cell repeatedly replaces timers.
-                deadlines.retain(|Reverse((_, pending_id))| *pending_id != id);
-            }
-            TimerSchedulerCommand::Shutdown => break,
-        }
     }
 }
 
@@ -242,7 +267,7 @@ mod tests {
     fn dropping_scheduler_cancels_long_timers_without_waiting_for_their_deadlines() {
         let (runtime_tx, runtime_rx) = std_mpsc::channel();
         let started = Instant::now();
-        let scheduler = TimerScheduler::new(runtime_tx);
+        let mut scheduler = TimerScheduler::new(runtime_tx);
         scheduler
             .schedule(1, Duration::from_secs(60))
             .expect("schedule long timer");
@@ -262,11 +287,14 @@ mod tests {
     #[test]
     fn cancelled_timer_never_reaches_the_runtime() {
         let (runtime_tx, runtime_rx) = std_mpsc::channel();
-        let scheduler = TimerScheduler::new(runtime_tx);
+        let mut scheduler = TimerScheduler::new(runtime_tx);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        scheduler.barrier = Some(std::sync::Arc::clone(&barrier));
         scheduler
-            .schedule(1, Duration::from_millis(5))
+            .schedule(1, Duration::ZERO)
             .expect("schedule timer");
         scheduler.cancel(1);
+        barrier.wait();
 
         assert!(matches!(
             runtime_rx.recv_timeout(Duration::from_millis(20)),
@@ -274,5 +302,40 @@ mod tests {
         ));
         drop(scheduler);
         assert!(runtime_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn timer_churn_is_coalesced_before_the_worker_runs() {
+        let (runtime_tx, runtime_rx) = std_mpsc::channel();
+        let mut scheduler = TimerScheduler::new(runtime_tx);
+        assert!(scheduler.worker.is_none(), "timer worker must start lazily");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        scheduler.barrier = Some(std::sync::Arc::clone(&barrier));
+        for id in 0..100_000 {
+            scheduler.schedule(id, Duration::ZERO).unwrap();
+            scheduler.cancel(id);
+        }
+        {
+            let work = scheduler.shared.0.lock().unwrap();
+            assert!(work.scheduled.is_empty());
+            assert!(work.fired.is_empty());
+            assert!(!work.wake_pending);
+        }
+        assert!(runtime_rx.try_recv().is_err());
+        let started = Instant::now();
+        barrier.wait();
+        drop(scheduler);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(runtime_rx.try_recv(), Err(std_mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn clearing_an_already_queued_timer_discards_the_callback() {
+        let (runtime_tx, runtime_rx) = std_mpsc::channel();
+        let mut scheduler = TimerScheduler::new(runtime_tx);
+        scheduler.schedule(1, Duration::ZERO).unwrap();
+        assert!(matches!(runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(), super::RuntimeCommand::TimersReady));
+        scheduler.cancel(1);
+        assert!(scheduler.take_fired().is_empty());
     }
 }

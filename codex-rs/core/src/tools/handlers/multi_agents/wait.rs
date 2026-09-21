@@ -174,99 +174,49 @@ impl Handler {
             }
         }
 
-        let partial_statuses = initial_final_statuses.clone();
-        let receiver_count = receiver_thread_ids.len();
-        let status_session = session.clone();
-        let status_wait = async move {
-            match args.return_when {
-                WaitReturnWhen::First if !initial_final_statuses.is_empty() => {
-                    Ok(initial_final_statuses)
+        let mut partial_statuses = initial_final_statuses;
+        let mut futures = FuturesUnordered::new();
+        for (id, rx) in status_rxs {
+            if !partial_statuses.iter().any(|(final_id, _)| *final_id == id) {
+                futures.push(wait_for_final_status(session.clone(), id, rx));
+            }
+        }
+        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms as u64));
+        let completion = loop {
+            if (args.return_when == WaitReturnWhen::First && !partial_statuses.is_empty())
+                || partial_statuses.len() == receiver_thread_ids.len()
+            {
+                break LegacyWaitCompletion::Statuses(partial_statuses.clone());
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    return Err(FunctionCallError::RespondToModel("wait_agent cancelled".into()));
                 }
-                WaitReturnWhen::First => {
-                    let mut futures = FuturesUnordered::new();
-                    for (id, rx) in status_rxs {
-                        let session = status_session.clone();
-                        futures.push(wait_for_final_status(session, id, rx));
+                result = futures.next() => {
+                    match result {
+                        Some(Some(result)) => partial_statuses.push(result),
+                        Some(None) => {},
+                        None => return Err(FunctionCallError::RespondToModel(
+                            "wait_agent status subscriptions ended before targets reached a final state".into(),
+                        )),
                     }
-                    while let Some(result) = futures.next().await {
+                    // Include all completions already observed in this wake, even in First mode.
+                    while let Some(Some(result)) = futures.next().now_or_never() {
                         if let Some(result) = result {
-                            let mut results = vec![result];
-                            loop {
-                                match futures.next().now_or_never() {
-                                    Some(Some(Some(result))) => results.push(result),
-                                    Some(Some(None)) => continue,
-                                    Some(None) | None => break,
-                                }
-                            }
-                            return Ok(results);
+                            partial_statuses.push(result);
                         }
                     }
-                    Err("wait_agent status subscriptions ended before a target reached a final state"
-                        .to_string())
-                }
-                WaitReturnWhen::All => {
-                    let mut results = initial_final_statuses;
-                    let mut futures = FuturesUnordered::new();
-                    for (id, rx) in status_rxs {
-                        if results.iter().any(|(final_id, _)| *final_id == id) {
-                            continue;
-                        }
-                        let session = status_session.clone();
-                        futures.push(wait_for_final_status(session, id, rx));
-                    }
-                    while results.len() < receiver_count {
-                        match futures.next().await {
-                            Some(Some(result)) => results.push(result),
-                            Some(None) => continue,
-                            None => {
-                                return Err(
-                                    "wait_agent status subscriptions ended before all targets reached a final state"
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    Ok(results)
-                }
-            }
-        };
-        tokio::pin!(status_wait);
-        let deadline =
-            timeout_ms.map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms as u64));
-        let completion = if let Some(deadline) = deadline {
-            tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
-                    return Err(FunctionCallError::RespondToModel(
-                        "wait_agent cancelled".to_string(),
-                    ));
                 }
                 activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
-                    LegacyWaitCompletion::InputActivity(activity)
+                    break LegacyWaitCompletion::InputActivity(activity);
                 }
-                statuses = &mut status_wait => {
-                    LegacyWaitCompletion::Statuses(
-                        statuses.map_err(FunctionCallError::RespondToModel)?,
-                    )
-                }
-                _ = tokio::time::sleep_until(deadline) => LegacyWaitCompletion::TimedOut,
-            }
-        } else {
-            tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
-                    return Err(FunctionCallError::RespondToModel(
-                        "wait_agent cancelled".to_string(),
-                    ));
-                }
-                activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
-                    LegacyWaitCompletion::InputActivity(activity)
-                }
-                statuses = &mut status_wait => {
-                    LegacyWaitCompletion::Statuses(
-                        statuses.map_err(FunctionCallError::RespondToModel)?,
-                    )
-                }
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => break LegacyWaitCompletion::TimedOut,
             }
         };
         let (statuses, timed_out, interruption) = match completion {
@@ -295,6 +245,7 @@ impl Handler {
                 })
                 .collect(),
             timed_out,
+            interruption,
         };
 
         session
@@ -317,10 +268,6 @@ impl Handler {
                 }),
             )
             .await;
-
-        if let Some(message) = interruption {
-            return Err(FunctionCallError::RespondToModel(message));
-        }
 
         Ok(boxed_tool_output(result))
     }
@@ -405,6 +352,8 @@ async fn next_input_activity(
 pub(crate) struct WaitAgentResult {
     pub(crate) status: HashMap<String, AgentStatus>,
     pub(crate) timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) interruption: Option<String>,
 }
 
 impl ToolOutput for WaitAgentResult {
@@ -414,6 +363,14 @@ impl ToolOutput for WaitAgentResult {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn outcome_for_logging(&self) -> codex_tools::ToolOutputOutcome {
+        if self.timed_out || self.interruption.is_some() {
+            codex_tools::ToolOutputOutcome::Yielded
+        } else {
+            codex_tools::ToolOutputOutcome::Success
+        }
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {

@@ -349,6 +349,20 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                         self.assertNotEqual(first, second)
 
     def setUp(self) -> None:
+        owned = mock.patch.object(
+            cargo_module,
+            "run_owned",
+            side_effect=lambda *a, **kw: subprocess.run(*a, **kw),
+        )
+        owned.start()
+        self.addCleanup(owned.stop)
+        tools = mock.patch.object(
+            cargo_module,
+            "effective_tool_contents",
+            return_value={"rustc": {"sha256": "fixture"}},
+        )
+        tools.start()
+        self.addCleanup(tools.stop)
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         home_patch = mock.patch.object(Path, "home", return_value=Path(home.name))
@@ -444,7 +458,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
         self.assertEqual(
             target_dir,
-            codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release",
+            codex_rs
+            / "target"
+            / "package"
+            / "x86_64-pc-windows-msvc-release"
+            / "toolchain-c2379b1792c5f5e0854d",
         )
 
     def test_package_target_dir_ignores_inherited_cargo_target_dir(self) -> None:
@@ -463,7 +481,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
         self.assertEqual(
             target_dir,
-            codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release",
+            codex_rs
+            / "target"
+            / "package"
+            / "x86_64-pc-windows-msvc-release"
+            / "toolchain-c2379b1792c5f5e0854d",
         )
 
     def test_package_target_dir_honors_package_override(self) -> None:
@@ -480,7 +502,10 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                         "release",
                     )
 
-        self.assertEqual(target_dir, codex_rs / "target" / "custom-package")
+        self.assertEqual(
+            target_dir,
+            codex_rs / "target" / "custom-package" / "toolchain-c2379b1792c5f5e0854d",
+        )
 
     def test_package_build_sets_fast_env_defaults_and_sccache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -542,7 +567,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             target_dir_arg = call.cmd[call.cmd.index("--target-dir") + 1]
             self.assertEqual(
                 Path(target_dir_arg),
-                codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release",
+                codex_rs
+                / "target"
+                / "package"
+                / "x86_64-pc-windows-msvc-release"
+                / "toolchain-c2379b1792c5f5e0854d",
             )
             self.assertNotIn("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS", call.env)
             self.assertEqual(
@@ -677,7 +706,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             root = Path(temp_dir)
             codex_rs = root / "codex-rs"
             target_dir = (
-                codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release"
+                codex_rs
+                / "target"
+                / "package"
+                / "x86_64-pc-windows-msvc-release"
+                / "toolchain-c2379b1792c5f5e0854d"
             )
             output_dir = target_dir / "x86_64-pc-windows-msvc" / "release"
             outputs = cargo_module.SourceBuildOutputs(
@@ -732,7 +765,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             root = Path(temp_dir)
             codex_rs = root / "codex-rs"
             target_dir = (
-                codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release"
+                codex_rs
+                / "target"
+                / "package"
+                / "x86_64-pc-windows-msvc-release"
+                / "toolchain-c2379b1792c5f5e0854d"
             )
             output_dir = target_dir / "x86_64-pc-windows-msvc" / "release"
             outputs = cargo_module.SourceBuildOutputs(
@@ -817,7 +854,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             root = Path(temp_dir)
             codex_rs = root / "codex-rs"
             target_dir = (
-                codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release"
+                codex_rs
+                / "target"
+                / "package"
+                / "x86_64-pc-windows-msvc-release"
+                / "toolchain-c2379b1792c5f5e0854d"
             )
             output_dir = target_dir / "x86_64-pc-windows-msvc" / "release"
             outputs = cargo_module.SourceBuildOutputs(
@@ -887,7 +928,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             root = Path(temp_dir)
             codex_rs = root / "codex-rs"
             target_dir = (
-                codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release"
+                codex_rs
+                / "target"
+                / "package"
+                / "x86_64-pc-windows-msvc-release"
+                / "toolchain-c2379b1792c5f5e0854d"
             )
             output_dir = target_dir / "x86_64-pc-windows-msvc" / "release"
             outputs = cargo_module.SourceBuildOutputs(
@@ -1140,7 +1185,11 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             self.assertIn("codex-windows-sandbox-setup", calls[0].cmd)
             self.assertTrue(
                 source_build_stamp_path(
-                    codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release"
+                    codex_rs
+                    / "target"
+                    / "package"
+                    / "x86_64-pc-windows-msvc-release"
+                    / "toolchain-c2379b1792c5f5e0854d"
                 ).is_file()
             )
 

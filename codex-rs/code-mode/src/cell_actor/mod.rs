@@ -104,7 +104,7 @@ impl CellActor {
 
 struct CellContext {
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
-    runtime_terminate_handle: v8::IsolateHandle,
+    runtime_terminate_handle: crate::runtime::RuntimeTerminationHandle,
     cell_state: Arc<CellState>,
     output_admission: Arc<OutputAdmission>,
 }
@@ -276,6 +276,7 @@ async fn run_cell<H: CellHost>(
                     let event = CellEvent::Completed {
                         content_items: std::mem::take(&mut content_items),
                         error_text: Some("exec runtime ended unexpectedly".to_string()),
+                        output_loss: None,
                     };
                     let rejected_event = match host
                         .commit_completion(
@@ -381,7 +382,7 @@ async fn run_cell<H: CellHost>(
                             task_failure_handler.clone(),
                         );
                     }
-                    RuntimeEvent::Result { stored_value_writes, error_text } => {
+                    RuntimeEvent::Result { stored_value_writes, error_text, output_loss } => {
                         runtime_closed = true;
                         yield_timer = None;
                         if termination || cancellation_token.is_cancelled() {
@@ -414,6 +415,7 @@ async fn run_cell<H: CellHost>(
                         let event = CellEvent::Completed {
                             content_items: std::mem::take(&mut content_items),
                             error_text,
+                            output_loss,
                         };
                         let rejected_event = match host
                             .commit_completion(
@@ -553,7 +555,7 @@ fn observer_timer(
 
 fn begin_termination(
     runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
-    runtime_terminate_handle: &v8::IsolateHandle,
+    runtime_terminate_handle: &crate::runtime::RuntimeTerminationHandle,
     cancellation_token: &CancellationToken,
 ) {
     cancellation_token.cancel();

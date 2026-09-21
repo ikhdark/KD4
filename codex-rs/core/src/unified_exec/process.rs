@@ -225,6 +225,7 @@ pub(crate) struct UnifiedExecProcess {
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     termination_requested: AtomicBool,
+    stdin_closed: AtomicBool,
     termination_lock: Semaphore,
     output_drained: CancellationToken,
     interaction_lock: Arc<Mutex<()>>,
@@ -309,6 +310,7 @@ impl UnifiedExecProcess {
             output_closed_notify,
             cancellation_token,
             termination_requested: AtomicBool::new(false),
+            stdin_closed: AtomicBool::new(false),
             termination_lock: Semaphore::new(1),
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
@@ -335,6 +337,14 @@ impl UnifiedExecProcess {
         sender
     }
 
+    pub(super) fn terminal_completion_is_ready(&self) -> bool {
+        self.terminal_completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|receiver| receiver.borrow().is_some())
+    }
+
     pub(super) async fn wait_for_terminal_completion(&self) -> Result<(), String> {
         let receiver = self
             .terminal_completion
@@ -354,6 +364,9 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {
+        if self.stdin_closed.load(Ordering::Acquire) {
+            return Err(UnifiedExecError::StdinClosed);
+        }
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle
                 .writer_sender()
@@ -364,13 +377,14 @@ impl UnifiedExecProcess {
                 match process_handle.write(data.to_vec()).await {
                     Ok(response) => match response.status {
                         WriteStatus::Accepted => Ok(()),
-                        WriteStatus::UnknownProcess | WriteStatus::StdinClosed => {
-                            self.state_tx.send_modify(|state| {
-                                *state = state.exited(state.exit_code);
-                            });
-                            self.cancellation_token.cancel();
-                            Err(UnifiedExecError::WriteToStdin)
+                        WriteStatus::StdinClosed => {
+                            self.stdin_closed.store(true, Ordering::Release);
+                            Err(UnifiedExecError::StdinClosed)
                         }
+                        WriteStatus::UnknownProcess => Err(UnifiedExecError::process_failed(
+                            "remote executor no longer recognizes the process; exit is unconfirmed"
+                                .to_string(),
+                        )),
                         WriteStatus::Starting => Err(UnifiedExecError::WriteToStdin),
                     },
                     Err(err) => Err(UnifiedExecError::process_failed(err.to_string())),
@@ -635,7 +649,7 @@ impl UnifiedExecProcess {
         let interrupt =
             tty || matches!(&self.process_handle, ProcessHandle::Local(_)) && !cfg!(windows);
         crate::tools::context::ExecSessionCapabilities {
-            stdin: running && tty,
+            stdin: running && tty && !self.stdin_closed.load(Ordering::Acquire),
             interrupt: running && interrupt,
             // write_stdin exposes polling and input, not process termination.
             cancellation: false,
@@ -913,7 +927,7 @@ impl UnifiedExecProcess {
                 };
                 let event_seq = event.as_ref().and_then(|event| match event {
                     ExecProcessEvent::Output(chunk) => Some(chunk.seq),
-                    ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq } => {
+                    ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
                         Some(*seq)
                     }
                     ExecProcessEvent::Failed(_) => None,
@@ -1031,10 +1045,16 @@ impl UnifiedExecProcess {
                         });
                         cancellation_token.cancel();
                     }
-                    ExecProcessEvent::Closed { seq } => {
+                    ExecProcessEvent::Closed {
+                        seq,
+                        sandbox_denied,
+                    } => {
                         if seq <= last_seq {
                             continue;
                         }
+                        state_tx.send_modify(|state| {
+                            state.sandbox_denied |= sandbox_denied.unwrap_or(false);
+                        });
                         break;
                     }
                     ExecProcessEvent::Failed(message) => {

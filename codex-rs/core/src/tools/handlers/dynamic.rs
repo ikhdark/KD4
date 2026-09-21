@@ -140,7 +140,7 @@ impl DynamicToolHandler {
         let args: Value = parse_arguments(&arguments)?;
         let response = request_dynamic_tool(
             &session,
-            turn.as_ref(),
+            &turn,
             call_id,
             self.tool_name.clone(),
             args,
@@ -175,8 +175,8 @@ impl CoreToolRuntime for DynamicToolHandler {
     reason = "active turn checks and dynamic tool response registration must remain atomic"
 )]
 async fn request_dynamic_tool(
-    session: &Session,
-    turn_context: &TurnContext,
+    session: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     call_id: String,
     tool_name: ToolName,
     arguments: Value,
@@ -216,31 +216,41 @@ async fn request_dynamic_tool(
     });
 
     let started_at = Instant::now();
-    session
-        .emit_turn_item_started(
-            turn_context,
-            &TurnItem::DynamicToolCall(DynamicToolCallItem {
-                id: call_id.clone(),
-                namespace: namespace.clone(),
-                tool: tool.clone(),
-                arguments: arguments.clone(),
-                status: DynamicToolCallStatus::InProgress,
-                content_items: None,
-                success: None,
-                error: None,
-                duration: None,
-            }),
-        )
-        .await;
-    let response = tokio::select! {
-        response = &mut rx_response => response.ok(),
-        () = cancellation_token.cancelled() => {
-            rx_response.close();
-            originating_turn_state
-                .lock()
-                .await
-                .remove_closed_pending_dynamic_tool(&call_id);
-            None
+    let start_item = TurnItem::DynamicToolCall(DynamicToolCallItem {
+        id: call_id.clone(),
+        namespace: namespace.clone(),
+        tool: tool.clone(),
+        arguments: arguments.clone(),
+        status: DynamicToolCallStatus::InProgress,
+        content_items: None,
+        success: None,
+        error: None,
+        duration: None,
+    });
+    let delivered = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => false,
+        _ = session.emit_turn_item_started(turn_context, &start_item) => true,
+    };
+    let response = if !delivered {
+        rx_response.close();
+        originating_turn_state
+            .lock()
+            .await
+            .remove_closed_pending_dynamic_tool(&call_id);
+        None
+    } else {
+        tokio::select! {
+            biased;
+            response = &mut rx_response => response.ok(),
+            () = cancellation_token.cancelled() => {
+                rx_response.close();
+                originating_turn_state
+                    .lock()
+                    .await
+                    .remove_closed_pending_dynamic_tool(&call_id);
+                None
+            }
         }
     };
 
@@ -272,9 +282,27 @@ async fn request_dynamic_tool(
             duration: Some(started_at.elapsed()),
         },
     };
-    session
-        .emit_turn_item_completed(turn_context, TurnItem::DynamicToolCall(item))
+    // The pending owner is retired before event backpressure can delay return.
+    // A tracked, bounded terminal publisher preserves the one terminal outcome.
+    rx_response.close();
+    originating_turn_state
+        .lock()
+        .await
+        .remove_closed_pending_dynamic_tool(&event_id);
+    let terminal_session = Arc::clone(session);
+    let terminal_turn = Arc::clone(turn_context);
+    let mut terminal = session.terminal_tasks.spawn(async move {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            terminal_session
+                .emit_turn_item_completed(&terminal_turn, TurnItem::DynamicToolCall(item)),
+        )
         .await;
+    });
+    tokio::select! {
+        _ = &mut terminal => {},
+        _ = cancellation_token.cancelled() => {},
+    }
 
     response
         .ok_or_else(|| "dynamic tool call was cancelled before receiving a response".to_string())
@@ -313,6 +341,50 @@ mod tests {
             .expect("first receiver remains connected");
         assert!(first_rx.blocking_recv().is_ok());
         assert!(second_rx.blocking_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_blocked_start_never_delivers_dynamic_request() {
+        use codex_protocol::protocol::Event;
+        use codex_protocol::protocol::EventMsg;
+        use codex_protocol::protocol::WarningEvent;
+        let (session, turn, events_tx, events) =
+            crate::session::tests::make_session_and_context_with_event_capacity(1).await;
+        *session.active_turn.lock().await = Some(ActiveTurn::default());
+        events_tx
+            .send(Event {
+                id: "occupied".into(),
+                msg: EventMsg::Warning(WarningEvent {
+                    message: "occupied".into(),
+                }),
+            })
+            .await
+            .unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut request = Box::pin(request_dynamic_tool(
+            &session,
+            &turn,
+            "blocked-start".into(),
+            ToolName::plain("dynamic_test"),
+            serde_json::json!({}),
+            cancellation.clone(),
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut request)
+                .await
+                .expect("cancellation must not wait for start delivery")
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        assert_eq!(events.recv().await.unwrap().id, "occupied");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event.msg, EventMsg::DynamicToolCallRequest(_)),
+                "cancelled start may not dispatch later"
+            );
+        }
     }
 
     #[tokio::test]

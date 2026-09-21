@@ -481,9 +481,11 @@ class ConfigSchemaCheckTest(unittest.TestCase):
         stdout = io.StringIO()
         with (
             mock.patch.object(
-                config_schema_check.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0),
+                config_schema_check,
+                "run_finite",
+                return_value=mock.Mock(
+                    returncode=0, stdout="", status="passed", output_truncated=False
+                ),
             ),
             contextlib.redirect_stdout(stdout),
         ):
@@ -510,8 +512,8 @@ class ConfigSchemaCheckTest(unittest.TestCase):
                 stderr = io.StringIO()
                 with (
                     mock.patch.object(
-                        config_schema_check.subprocess,
-                        "run",
+                        config_schema_check,
+                        "run_finite",
                         side_effect=FileNotFoundError(
                             2, "No such file or directory", command
                         ),
@@ -607,6 +609,13 @@ class GeneratedOutputLockTest(unittest.TestCase):
 
 
 class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
+    def setUp(self):
+        self.baseline = mock.patch.object(
+            app_server_schema_runtime_check, "resolve_baseline", return_value="a" * 40
+        )
+        self.baseline.start()
+        self.addCleanup(self.baseline.stop)
+
     def test_command_launch_errors_preserve_exit_classification(self) -> None:
         for module in (config_schema_check, app_server_schema_runtime_check):
             for error, expected in (
@@ -615,7 +624,7 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             ):
                 with (
                     self.subTest(module=module.__name__, error=error),
-                    mock.patch.object(module.subprocess, "run", side_effect=error),
+                    mock.patch.object(module, "run_finite", side_effect=error),
                     contextlib.redirect_stdout(io.StringIO()),
                     contextlib.redirect_stderr(io.StringIO()) as stderr,
                 ):
@@ -667,8 +676,8 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
         stderr = io.StringIO()
         with (
             mock.patch.object(
-                app_server_schema_runtime_check.subprocess,
-                "run",
+                app_server_schema_runtime_check,
+                "run_finite",
                 side_effect=FileNotFoundError("cargo missing"),
             ),
             contextlib.redirect_stderr(stderr),
@@ -682,11 +691,13 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
 
     def test_logged_command_quotes_arguments_with_spaces(self) -> None:
         stdout = io.StringIO()
-        completed = subprocess.CompletedProcess(["tool"], 0)
+        completed = mock.Mock(
+            returncode=0, stdout="", status="passed", output_truncated=False
+        )
         with (
             mock.patch.object(
-                app_server_schema_runtime_check.subprocess,
-                "run",
+                app_server_schema_runtime_check,
+                "run_finite",
                 return_value=completed,
             ),
             contextlib.redirect_stdout(stdout),
@@ -731,7 +742,14 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
         ):
             self.assertEqual(
                 app_server_schema_runtime_check.main(
-                    ["--mode", "force", "--owner", "assignment:app-server-owner"]
+                    [
+                        "--mode",
+                        "force",
+                        "--owner",
+                        "assignment:app-server-owner",
+                        "--compatibility-baseline",
+                        "contract",
+                    ]
                 ),
                 0,
             )
@@ -886,12 +904,15 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(
-                app_server_schema_runtime_check.main(["--mode", "check"]),
+                app_server_schema_runtime_check.main(
+                    ["--mode", "check", "--compatibility-baseline", "contract"]
+                ),
                 0,
             )
 
         self.assertEqual(
-            calls, ["lock", "protocol", "compatibility:HEAD^", "python-sdk", "unlock"]
+            calls,
+            ["lock", "protocol", "compatibility:" + "a" * 40, "python-sdk", "unlock"],
         )
 
     def test_schema_gate_stops_before_consumer_on_compatibility_failure(self) -> None:
@@ -917,7 +938,9 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(
-                app_server_schema_runtime_check.main(["--mode", "check"]),
+                app_server_schema_runtime_check.main(
+                    ["--mode", "check", "--compatibility-baseline", "contract"]
+                ),
                 1,
             )
 

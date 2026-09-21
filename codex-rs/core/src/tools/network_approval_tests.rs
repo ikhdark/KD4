@@ -584,7 +584,7 @@ async fn record_call_outcome_ignores_inactive_call() {
 }
 
 #[tokio::test]
-async fn ambiguous_unattributed_blocked_request_marks_and_cancels_every_candidate() {
+async fn ambiguous_unattributed_blocked_request_does_not_cancel_unrelated_calls() {
     let service = NetworkApprovalService::default();
     let first = register_default_shell_call(&service, "registration-1").await;
     let second = register_default_shell_call(&service, "registration-2").await;
@@ -593,14 +593,10 @@ async fn ambiguous_unattributed_blocked_request_marks_and_cancels_every_candidat
         .record_blocked_request(denied_blocked_request("example.com"))
         .await;
 
-    assert!(first.is_cancelled());
-    assert!(second.is_cancelled());
+    assert!(!first.is_cancelled());
+    assert!(!second.is_cancelled());
     for registration_id in ["registration-1", "registration-2"] {
-        assert!(matches!(
-            service.take_call_outcome(registration_id).await,
-            Some(NetworkApprovalOutcome::DeniedByPolicy(message))
-                if message.contains("attribution was ambiguous across 2 active tool calls")
-        ));
+        assert_eq!(service.take_call_outcome(registration_id).await, None);
     }
 }
 

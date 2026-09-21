@@ -186,14 +186,26 @@ impl SkillCatalogEntry {
 /// Merged catalog for one turn.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SkillCatalog {
+    /// Work remaining in bounded orchestrator discovery, distinct from warnings.
+    pub continuation: Option<SkillDiscoveryContinuation>,
     pub entries: Vec<SkillCatalogEntry>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillDiscoveryContinuation {
+    pub cursor: Option<String>,
+    pub resource_offset: usize,
+    pub seen_cursors: HashSet<String>,
 }
 
 impl SkillCatalog {
     pub fn extend(&mut self, other: SkillCatalog) {
         self.extend_entries(other.entries);
         self.warnings.extend(other.warnings);
+        if other.continuation.is_some() {
+            self.continuation = other.continuation;
+        }
     }
 
     /// Append a batch in order, retaining the first entry for each authority/package.
@@ -233,12 +245,53 @@ pub struct SkillReadResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillProviderError {
     pub message: String,
+    pub kind: SkillProviderErrorKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillProviderErrorKind {
+    Unavailable,
+    Timeout,
+    InvalidResource,
+    OversizedContent,
+    InvalidResponse,
+    Transport,
 }
 
 impl SkillProviderError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: SkillProviderErrorKind::Unavailable,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: SkillProviderErrorKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Fixed messages keep private provider errors out of model-visible context.
+    pub(crate) fn model_message(&self) -> &'static str {
+        match self.kind {
+            SkillProviderErrorKind::Timeout => {
+                "Skill read timed out. Retry if these instructions are still required."
+            }
+            SkillProviderErrorKind::Unavailable => {
+                "Skill instructions are unavailable from this provider. Check availability before retrying; the instructions have not been loaded."
+            }
+            SkillProviderErrorKind::InvalidResource => {
+                "Invalid skill resource or package. Use the exact authority, package, and resource handles from skills.list."
+            }
+            SkillProviderErrorKind::OversizedContent => {
+                "Skill resource exceeds the provider's 1 MiB read limit. Output pagination cannot fix this; the provider must supply a smaller resource."
+            }
+            SkillProviderErrorKind::InvalidResponse => {
+                "Skill provider returned an invalid resource response. The instructions have not been loaded; the provider must repair the response."
+            }
+            SkillProviderErrorKind::Transport => {
+                "Skill provider could not be reached. No instructions were loaded; check availability before retrying."
+            }
         }
     }
 }

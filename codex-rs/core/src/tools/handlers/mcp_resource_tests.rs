@@ -977,3 +977,96 @@ async fn successful_resource_call_emits_one_completed_terminal_item() {
         }
     }
 }
+
+#[tokio::test]
+async fn resource_cancellation_bounds_start_delivery_without_dispatch() {
+    let (session, turn, tx, events) =
+        crate::session::tests::make_session_and_context_with_event_capacity(1).await;
+    tx.send(codex_protocol::protocol::Event {
+        id: "occupied".into(),
+        msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+            message: "occupied".into(),
+        }),
+    })
+    .await
+    .unwrap();
+    let token = CancellationToken::new();
+    let called = std::sync::atomic::AtomicBool::new(false);
+    let mut call = Box::pin(execute_resource_call(
+        &session,
+        &turn,
+        "blocked",
+        McpInvocation {
+            server: "test".into(),
+            tool: "read_resource".into(),
+            arguments: None,
+        },
+        token.clone(),
+        async {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(FunctionCallError::RespondToModel(
+                "unexpected operation".into(),
+            ))
+        },
+    ));
+    assert!(futures::poll!(call.as_mut()).is_pending());
+    token.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("bounded cancelled start")
+            .is_err()
+    );
+    assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(events.recv().await.unwrap().id, "occupied");
+}
+
+#[tokio::test]
+async fn resource_completed_result_survives_cancelled_terminal_delivery() {
+    let (session, turn, _tx, events) =
+        crate::session::tests::make_session_and_context_with_event_capacity(2).await;
+    let token = CancellationToken::new();
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    let mut call = Box::pin(execute_resource_call(
+        &session,
+        &turn,
+        "known-result",
+        McpInvocation {
+            server: "test".into(),
+            tool: "read_resource".into(),
+            arguments: None,
+        },
+        token.clone(),
+        async {
+            completed_tx.send(()).unwrap();
+            Ok(McpResourceToolOutput {
+                visible: FunctionToolOutput::from_text("known bytes".into(), Some(true)),
+                canonical: json!({"value":"known bytes"}),
+            })
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = &mut call => panic!("terminal delivery should wait for event capacity"),
+            completed = completed_rx => completed.expect("operation completed"),
+        }
+    })
+    .await
+    .expect("operation completes before cancellation");
+    token.cancel();
+    let output = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .expect("terminal delivery cannot delay cancellation")
+        .expect("known operation result is preserved");
+    assert!(output.success_for_logging());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.msg, EventMsg::ItemCompleted(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("terminal event is eventually published");
+}

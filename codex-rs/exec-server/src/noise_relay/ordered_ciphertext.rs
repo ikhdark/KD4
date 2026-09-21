@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::ExecServerError;
 
+pub(crate) const CIPHERTEXT_GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const CIPHERTEXT_GAP_TIMEOUT_REASON: &str = "Noise relay ciphertext gap timed out";
+
 const MAX_REORDER_DISTANCE: u32 = 64;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
@@ -12,9 +15,13 @@ pub(crate) struct OrderedCiphertextFrames {
     next_seq: u32,
     pending: BTreeMap<u32, Vec<u8>>,
     pending_bytes: usize,
+    gap_deadline: Option<tokio::time::Instant>,
 }
 
 impl OrderedCiphertextFrames {
+    pub(crate) fn gap_deadline(&self) -> Option<tokio::time::Instant> {
+        self.gap_deadline
+    }
     /// Accept one relay record and return the newly contiguous ciphertext run.
     ///
     /// Returns nothing for duplicates or while a gap remains. Closing a gap also
@@ -41,6 +48,8 @@ impl OrderedCiphertextFrames {
                     "Noise relay pending ciphertext buffer is full".to_string(),
                 ));
             }
+            self.gap_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + CIPHERTEXT_GAP_TIMEOUT);
             self.pending.insert(seq, payload);
             self.pending_bytes = pending_bytes;
             return Ok(Vec::new());
@@ -53,6 +62,9 @@ impl OrderedCiphertextFrames {
             self.pending_bytes -= payload.len();
             ready.push(payload);
             self.advance()?;
+        }
+        if self.pending.is_empty() {
+            self.gap_deadline = None;
         }
         Ok(ready)
     }

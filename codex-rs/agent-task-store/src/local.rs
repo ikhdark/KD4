@@ -867,8 +867,10 @@ impl LocalAgentTaskStore {
             .filter(|gate| gate.status == GateStatus::Pending)
             .map(|gate| gate.kind)
             .collect::<Vec<_>>();
-        let next_required_action = (!pending_gates.is_empty())
-            .then(|| "resolve pending gates before completion".to_string());
+        let next_required_action = (assignment.admission_origin
+            == crate::AssignmentAdmissionOrigin::Typed
+            && !pending_gates.is_empty())
+        .then(|| "resolve pending gates before completion".to_string());
         transaction.commit().await?;
         hydrate_task_capsule(&self.coordination_root, &mut assignment).await?;
         Ok(AgentTask {
@@ -1044,13 +1046,9 @@ LIMIT 1
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        if !matches!(
-            attempt.state,
-            AttemptState::NeedsMain | AttemptState::Abandoned
-        ) || attempt.sealed_at.is_none()
-        {
+        if !attempt.state.is_terminal() || attempt.sealed_at.is_none() {
             return Err(StoreError::InvalidAssignment(
-                "an agent task binding may be removed only after a failed start seals the current attempt"
+                "an agent task binding may be removed only after the current attempt is sealed"
                     .to_string(),
             ));
         }
@@ -1247,11 +1245,9 @@ LIMIT 1
         lock_attempt_tx(&mut transaction, call.attempt_id).await?;
         let attempt = load_attempt_tx(&mut transaction, call.attempt_id).await?;
         let current = load_current_attempt_tx(&mut transaction, attempt.assignment_id).await?;
-        if current.attempt_id != call.attempt_id {
-            return Err(StoreError::AttemptNotActive(call.attempt_id));
-        }
-        let attempt_is_active =
-            attempt.state == AttemptState::Active && attempt.sealed_at.is_none();
+        let attempt_is_active = current.attempt_id == call.attempt_id
+            && attempt.state == AttemptState::Active
+            && attempt.sealed_at.is_none();
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, body_json, status FROM validation_calls WHERE call_id = ?",
         )
@@ -1277,9 +1273,6 @@ LIMIT 1
                 transaction.commit().await?;
                 return Ok(());
             }
-            if !attempt_is_active {
-                return Err(StoreError::AttemptNotActive(call.attempt_id));
-            }
             if existing.status.is_terminal()
                 || !call.status.is_terminal()
                 || existing.command_summary != call.command_summary
@@ -1288,14 +1281,31 @@ LIMIT 1
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
             call.evidence.start_epoch = existing.evidence.start_epoch;
-            let end_epoch = if call.status == crate::ValidationCallStatus::Succeeded {
-                capture_complete_repository_revision_tx(&mut transaction, attempt.assignment_id)
-                    .await?
-                    .epoch
+            // Sealing an attempt revokes proof eligibility, not the host's
+            // ability to acknowledge completion of an operation it already owns.
+            let end_epoch = if !attempt_is_active {
+                None
+            } else if call.status == crate::ValidationCallStatus::Succeeded {
+                let mut capture = transaction.begin().await?;
+                match capture_complete_repository_revision_tx(&mut capture, attempt.assignment_id)
+                    .await
+                {
+                    Ok(revision) => {
+                        capture.commit().await?;
+                        Some(revision.epoch)
+                    }
+                    Err(error) => {
+                        capture.rollback().await?;
+                        call.evidence.output_summary = Some(format!(
+                            "Process completed; validation evidence is unavailable: {error}"
+                        ));
+                        None
+                    }
+                }
             } else {
-                assignment_epoch_tx(&mut transaction, attempt.assignment_id).await?
+                Some(assignment_epoch_tx(&mut transaction, attempt.assignment_id).await?)
             };
-            call.evidence.end_epoch = Some(end_epoch);
+            call.evidence.end_epoch = end_epoch;
             call.evidence.lease_expires_at = None;
             if call.evidence.retained_output_ref.is_none() {
                 call.evidence.retained_output_ref = existing.evidence.retained_output_ref;
@@ -1346,7 +1356,9 @@ LIMIT 1
                 )));
             }
             call.evidence.start_epoch =
-                assignment_epoch_tx(&mut transaction, attempt.assignment_id).await?;
+                capture_complete_repository_revision_tx(&mut transaction, attempt.assignment_id)
+                    .await?
+                    .epoch;
             call.evidence.end_epoch = None;
             call.evidence.lease_expires_at = Some(
                 comparison_now() + chrono::Duration::seconds(crate::MAX_VALIDATION_LEASE_SECONDS),
@@ -1506,13 +1518,15 @@ LIMIT 1
         attempt_id: AttemptId,
         mut draft: ReceiptDraft,
         review_reason: Option<String>,
+        host_legacy_outcome: bool,
     ) -> StoreResult<AgentReceipt> {
         if draft.summary.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
                 "receipt summary cannot be empty".to_string(),
             ));
         }
-        let handoff_action = if draft.status == AgentStatusClaim::Completed {
+        let handoff_action = if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome
+        {
             self.prepare_receipt_handoff_action(attempt_id).await?
         } else {
             None
@@ -1536,7 +1550,55 @@ LIMIT 1
             return Err(StoreError::ReceiptAlreadySealed(attempt_id));
         }
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-        validate_criterion_results(&assignment, attempt.amendment.as_ref(), &draft)?;
+        if host_legacy_outcome {
+            if !matches!(
+                assignment.admission_origin,
+                crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
+            ) || assignment.workspace_strategy != crate::WorkspaceStrategy::Shared
+            {
+                return Err(StoreError::InvalidAssignment(
+                    "host turn outcomes require a shared plain-message assignment".to_string(),
+                ));
+            }
+            // A final response establishes turn completion, not acceptance or validation.
+            // This also handles persisted legacy assignments whose synthetic required_evidence
+            // was prose rather than an executable validation obligation.
+            draft.criterion_results = effective_criteria(&assignment, attempt.amendment.as_ref())
+                .iter()
+                .map(|criterion| crate::CriterionResult {
+                    criterion_id: criterion.id.clone(),
+                    status: crate::CriterionStatus::NotRun,
+                    evidence: None,
+                    evidence_ref: None,
+                })
+                .collect();
+            let paths = sqlx::query_scalar::<_, String>(
+                "SELECT path FROM mutation_files WHERE attempt_id = ? AND finalized_at IS NOT NULL ORDER BY path",
+            )
+            .bind(attempt_id.to_string())
+            .fetch_all(&mut *transaction)
+            .await?;
+            draft.declared_changes = paths
+                .into_iter()
+                .map(|path| crate::DeclaredChange {
+                    path,
+                    summary: "Host-recorded mutation; behavior unverified".to_string(),
+                })
+                .collect();
+            let pending_mutations = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mutation_files WHERE attempt_id = ? AND finalized_at IS NULL",
+            )
+            .bind(attempt_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            if pending_mutations > 0 {
+                draft.risks.push(format!(
+                    "{pending_mutations} recorded mutations were not finalized; change attribution is incomplete"
+                ));
+            }
+        } else {
+            validate_criterion_results(&assignment, attempt.amendment.as_ref(), &draft)?;
+        }
         let mut invalid_calls = Vec::new();
         let mut invalid_statuses = Vec::new();
         let mut seen_calls = HashSet::new();
@@ -1619,7 +1681,7 @@ LIMIT 1
                 call_ids: running_call_ids,
             });
         }
-        if draft.status == AgentStatusClaim::Completed {
+        if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome {
             let missing_obligations =
                 missing_evidence_obligations(&assignment, &validation_summaries);
             if !missing_obligations.is_empty() {
@@ -1714,7 +1776,8 @@ LIMIT 1
         if updated.rows_affected() != 1 {
             return Err(StoreError::AttemptSealed(attempt_id));
         }
-        if !receipt.status.is_success()
+        if host_legacy_outcome
+            || !receipt.status.is_success()
             || pending_gate_count(&mut transaction, attempt.assignment_id).await? == 0
         {
             release_claim(&mut transaction, attempt.assignment_id, None).await?;
@@ -1833,21 +1896,35 @@ LIMIT 1
         actor: TaskActor,
         assignment_id: AssignmentId,
         amendment: AttemptAmendment,
+        host_legacy_followup: bool,
     ) -> StoreResult<Attempt> {
         actor.require_root()?;
         amendment.validate()?;
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        if host_legacy_followup
+            && (!matches!(
+                assignment.admission_origin,
+                crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
+            ) || assignment.workspace_strategy != crate::WorkspaceStrategy::Shared)
+        {
+            return Err(StoreError::InvalidAssignment(
+                "host follow-up attempts require a shared plain-message assignment".to_string(),
+            ));
+        }
         release_orphaned_claims_tx(&mut transaction, &assignment.workspace_id).await?;
         if assignment.role != AgentRole::Worker {
             return Err(StoreError::WorkerCorrectionRequired(assignment_id));
         }
         let current = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        if current.ordinal != 0 {
+        if !host_legacy_followup && current.ordinal != 0 {
             return Err(StoreError::AmendmentLimitReached(assignment_id));
         }
         if !current.state.is_terminal() {
+            if host_legacy_followup {
+                return Ok(current);
+            }
             return Err(StoreError::InvalidAssignment(
                 "the original attempt must be sealed before amendment".to_string(),
             ));
@@ -1861,7 +1938,7 @@ LIMIT 1
         .fetch_one(&mut *transaction)
         .await?
             != 0;
-        if !changes_requested {
+        if !host_legacy_followup && !changes_requested {
             return Err(StoreError::InvalidAssignment(
                 "a correction attempt requires a changes_requested review gate".to_string(),
             ));
@@ -1869,7 +1946,10 @@ LIMIT 1
         let next = Attempt {
             attempt_id: AttemptId::new(),
             assignment_id,
-            ordinal: 1,
+            ordinal: current
+                .ordinal
+                .checked_add(1)
+                .ok_or(StoreError::AmendmentLimitReached(assignment_id))?,
             amendment: Some(amendment),
             state: AttemptState::Active,
             created_at: Utc::now(),
@@ -1960,19 +2040,20 @@ LIMIT 1
         .bind(current.attempt_id.to_string())
         .execute(&mut *transaction)
         .await?;
-        let gate_now = Utc::now();
-        let gate_epoch = assignment_epoch_tx(&mut transaction, assignment_id).await?;
-        let correction_gate = AgentGate {
-            assignment_id,
-            kind: GateKind::Review,
-            status: GateStatus::Pending,
-            reason: "correction attempt requires a new review verdict".to_string(),
-            waiver_reason: None,
-            evidence_epoch: gate_epoch,
-            updated_at: gate_now,
-            sealed_at: None,
-        };
-        let reset_gate = sqlx::query("UPDATE gates SET status = ?, body_json = ?, updated_at = ?, sealed_at = NULL WHERE assignment_id = ? AND kind = ? AND status = ?")
+        if !host_legacy_followup {
+            let gate_now = Utc::now();
+            let gate_epoch = assignment_epoch_tx(&mut transaction, assignment_id).await?;
+            let correction_gate = AgentGate {
+                assignment_id,
+                kind: GateKind::Review,
+                status: GateStatus::Pending,
+                reason: "correction attempt requires a new review verdict".to_string(),
+                waiver_reason: None,
+                evidence_epoch: gate_epoch,
+                updated_at: gate_now,
+                sealed_at: None,
+            };
+            let reset_gate = sqlx::query("UPDATE gates SET status = ?, body_json = ?, updated_at = ?, sealed_at = NULL WHERE assignment_id = ? AND kind = ? AND status = ?")
             .bind(encode(&GateStatus::Pending)?)
             .bind(encode(&correction_gate)?)
             .bind(encode(&gate_now)?)
@@ -1981,17 +2062,23 @@ LIMIT 1
             .bind(encode(&GateStatus::ChangesRequested)?)
             .execute(&mut *transaction)
             .await?;
-        if reset_gate.rows_affected() != 1 {
-            return Err(StoreError::CorruptData(format!(
-                "assignment {assignment_id} review gate changed during amendment"
-            )));
+            if reset_gate.rows_affected() != 1 {
+                return Err(StoreError::CorruptData(format!(
+                    "assignment {assignment_id} review gate changed during amendment"
+                )));
+            }
         }
         append_observation_tx(
             &mut transaction,
             &assignment,
             next.attempt_id,
             ObservationKind::Accepted,
-            "single correction attempt accepted".to_string(),
+            if host_legacy_followup {
+                "plain-message follow-up turn accepted"
+            } else {
+                "single correction attempt accepted"
+            }
+            .to_string(),
             None,
         )
         .await?;
@@ -2432,6 +2519,7 @@ LIMIT 1
         consuming_agent_path: String,
         expected: Option<WakeEventId>,
         next: WakeEventId,
+        delivery_json: Option<String>,
     ) -> StoreResult<bool> {
         async fn wake_event_sequence_tx(
             transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -2501,11 +2589,12 @@ LIMIT 1
         }
         let changed = sqlx::query(
             "UPDATE automatic_wake_cursors
-             SET event_id = ?, updated_at = ?
+             SET event_id = ?, updated_at = ?, delivery_json = ?
              WHERE root_session_id = ? AND consuming_agent_path = ?",
         )
         .bind(next.to_string())
         .bind(encode(&Utc::now())?)
+        .bind(delivery_json)
         .bind(&root_session_id)
         .bind(&consuming_agent_path)
         .execute(&mut *transaction)
@@ -3523,6 +3612,54 @@ impl LocalAgentTaskStore {
         })
     }
 
+    /// Read-only early reuse check. Final admitted creation still repeats the
+    /// same predicate under its transaction to handle simultaneous misses.
+    pub fn reusable_explorer_assignment<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        draft: AssignmentDraft,
+    ) -> TaskStoreFuture<'a, Option<AssignmentId>> {
+        Box::pin(async move {
+            let root = repo_root.to_path_buf();
+            let (repository, mut assignment) = tokio::task::spawn_blocking(move || {
+                Ok::<_, StoreError>((repository_identity(&root)?, draft.normalize(&root)?))
+            })
+            .await
+            .map_err(|error| StoreError::CorruptData(error.to_string()))??;
+            assignment.validate_selective_role_contract()?;
+            if assignment.repository_id != repository.id {
+                return Err(StoreError::InvalidScope(
+                    "repository root changed during reuse lookup".to_string(),
+                ));
+            }
+            assignment.workspace_id = repository.workspace_id;
+            if assignment.role != AgentRole::Explorer
+                || assignment.workspace_strategy == WorkspaceStrategy::Isolated
+            {
+                return Ok(None);
+            }
+            let mut transaction = self.pool.begin().await?;
+            validate_dependencies_tx(
+                &mut transaction,
+                assignment.assignment_id,
+                Some(&assignment.repository_id),
+                &assignment.dependencies,
+                None,
+            )
+            .await?;
+            let result = selective_admission_tx(&mut transaction, &assignment, false).await;
+            transaction.rollback().await?;
+            match result {
+                Err(StoreError::AdmissionRejected {
+                    reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
+                    reusable_assignment_id,
+                }) => Ok(reusable_assignment_id),
+                Ok(_) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     pub fn create_admitted_assignment<'a>(
         &'a self,
         repo_root: &'a Path,
@@ -3687,7 +3824,37 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, None)
+                .submit_agent_receipt_impl(attempt_id, receipt, None, false)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
+    }
+
+    /// Persist an observed plain-message child outcome without treating its prose as proof.
+    /// Explicit typed assignments must still submit and satisfy their receipt contract.
+    pub fn record_legacy_agent_outcome(
+        &self,
+        attempt_id: AttemptId,
+        status: AgentStatusClaim,
+        summary: String,
+    ) -> TaskStoreFuture<'_, AgentReceipt> {
+        Box::pin(async move {
+            let receipt = ReceiptDraft {
+                status,
+                summary,
+                criterion_results: Vec::new(),
+                declared_changes: Vec::new(),
+                validation_call_ids: Vec::new(),
+                blockers: Vec::new(),
+                risks: Vec::new(),
+                next_action: None,
+                architecture_contract: None,
+            };
+            let result = self
+                .submit_agent_receipt_impl(attempt_id, receipt, None, true)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3704,7 +3871,7 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason))
+                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason), false)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3721,7 +3888,34 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, Attempt> {
         Box::pin(async move {
             let result = self
-                .amend_agent_task_impl(actor, assignment_id, amendment)
+                .amend_agent_task_impl(actor, assignment_id, amendment, false)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
+    }
+
+    /// Reuse an active ordinary attempt or start a fresh one for a subsequent model turn.
+    /// This host operation cannot amend an explicit typed contract.
+    pub fn begin_legacy_agent_turn(
+        &self,
+        assignment_id: AssignmentId,
+    ) -> TaskStoreFuture<'_, Attempt> {
+        Box::pin(async move {
+            let result = self
+                .amend_agent_task_impl(
+                    TaskActor::Root,
+                    assignment_id,
+                    AttemptAmendment {
+                        reason: "plain-message follow-up turn".to_string(),
+                        objective: None,
+                        acceptance_criteria: None,
+                        stop_condition: None,
+                    },
+                    true,
+                )
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3830,8 +4024,41 @@ impl LocalAgentTaskStore {
                 consuming_agent_path,
                 expected,
                 next,
+                None,
             )
             .await
+        })
+    }
+
+    pub fn publish_automatic_wake_delivery(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+        expected: Option<WakeEventId>,
+        next: WakeEventId,
+        delivery_json: String,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move {
+            self.compare_and_swap_automatic_wake_cursor_impl(
+                root_session_id,
+                consuming_agent_path,
+                expected,
+                next,
+                Some(delivery_json),
+            )
+            .await
+        })
+    }
+
+    pub fn automatic_wake_delivery(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+    ) -> TaskStoreFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let row = sqlx::query("SELECT delivery_json FROM automatic_wake_cursors WHERE root_session_id = ? AND consuming_agent_path = ?")
+                .bind(root_session_id).bind(consuming_agent_path).fetch_optional(&self.pool).await?;
+            Ok(row.and_then(|row| row.get::<Option<String>, _>("delivery_json")))
         })
     }
 
@@ -4262,6 +4489,7 @@ async fn capture_complete_repository_revision_tx(
         transaction,
         &repo_root,
         vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
+        true,
     )
     .await?;
     require_complete_workspace_capture(&revision)?;
@@ -4330,7 +4558,7 @@ fn validation_call_has_successful_result(call: &ValidationCall) -> bool {
         return false;
     };
     call.status == ValidationCallStatus::Succeeded
-        && call.evidence.end_epoch.is_some()
+        && call.evidence.end_epoch == Some(call.evidence.start_epoch)
         && result.call_id == call.call_id
         && result.status == StoredValidationTerminalStatus::Succeeded
         && !result.argv.is_empty()

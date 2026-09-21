@@ -915,25 +915,69 @@ async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
         assert!(!description.is_empty());
         assert!(!mixed_exec.description.contains(description.trim()));
         assert!(nested_exec.description.contains(description.trim()));
-        // The direct contract plus exec's declaration must retain every byte
-        // of the full nested contract, including parameter and result guidance.
-        let full = codex_tools::tool_spec_to_code_mode_tool_definition(spec).unwrap();
-        let declaration = full
-            .description
-            .strip_prefix(description.trim())
-            .unwrap()
-            .trim_start();
-        assert!(mixed_exec.description.contains(declaration));
-        assert!(nested_exec.description.contains(declaration));
     }
     assert!(mixed_exec.description.contains("exec_command(args:"));
     assert!(mixed_exec.description.contains("yield_time_ms"));
     assert!(mixed_exec.description.contains("apply_patch(input: string"));
     for exec in [mixed_exec, nested_exec] {
+        assert_eq!(exec.description.matches("declare const tools").count(), 1);
+        for contract_field in [
+            "max_output_tokens",
+            "session_id",
+            "wall_time_seconds",
+            "timeout_ms",
+            "read_file(args:",
+            "read_tool_output(args:",
+        ] {
+            assert!(
+                exec.description.contains(contract_field),
+                "missing {contract_field}"
+            );
+        }
         assert!(exec.description.contains("curr_time(args:"));
         assert!(exec.description.contains("Return the current time in UTC."));
     }
     assert!(mixed_exec.description.len() < nested_exec.description.len());
+}
+
+#[test]
+fn recovery_contract_bundle_reduces_repeated_shapes_without_removing_call_contracts() {
+    use crate::tools::handlers::ReadFileHandler;
+    use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
+    let specs = [ReadFileHandler.spec(), create_read_tool_output_tool()];
+    let definitions = specs
+        .iter()
+        .map(|spec| codex_tools::code_mode_tool_definition_for_spec(spec).unwrap())
+        .collect::<Vec<_>>();
+    let separate_bytes: usize = definitions
+        .iter()
+        .cloned()
+        .map(codex_code_mode::augment_tool_definition)
+        .map(|definition| definition.description.len())
+        .sum();
+    let bundle = codex_code_mode::render_code_mode_tool_bundle(&definitions);
+    eprintln!(
+        "Recovery contracts: separate={} bytes, shared bundle={} bytes",
+        separate_bytes,
+        bundle.len()
+    );
+    assert!(
+        bundle.len() + 500 < separate_bytes,
+        "bundle={}, separate={separate_bytes}",
+        bundle.len()
+    );
+    assert_eq!(bundle.matches("declare const tools").count(), 1);
+    for required in [
+        "read_file(args:",
+        "read_tool_output(args:",
+        "canonical_sha256",
+        "child_selectors",
+        "continuation",
+        "retained_artifact_complete",
+        "snapshot_error",
+    ] {
+        assert!(bundle.contains(required), "missing {required}");
+    }
 }
 
 #[tokio::test]
@@ -1991,6 +2035,7 @@ async fn request_plugin_install_requires_all_discovery_features() {
             presentation: ToolSuggestPresentation::RecommendationContext,
         }),
     ] {
+        let cold_catalog = tool_suggest_candidates.is_none();
         let plan = probe_with(
             |turn| {
                 set_features(
@@ -2004,10 +2049,16 @@ async fn request_plugin_install_requires_all_discovery_features() {
             },
         )
         .await;
-        plan.assert_visible_lacks(&[
+        let names = [
             "list_available_plugins_to_install",
             "request_plugin_install",
-        ]);
+        ];
+        if cold_catalog {
+            plan.assert_visible_contains(&names);
+            plan.assert_registered_contains(&names);
+        } else {
+            plan.assert_visible_lacks(&names);
+        }
     }
 
     let enabled = probe_with(

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::time::Duration;
 
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -11,6 +10,7 @@ use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillPackageId;
 use crate::catalog::SkillProviderError;
+use crate::catalog::SkillProviderErrorKind;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
 use crate::catalog::SkillSourceKind;
@@ -53,100 +53,10 @@ impl SkillProvider for OrchestratorSkillProvider {
                 return Ok(SkillCatalog::default());
             }
 
-            let discovery_deadline =
-                tokio::time::Instant::now() + ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT;
-            let mut catalog = SkillCatalog::default();
-            let mut cursor = None;
-            let mut seen_cursors = HashSet::new();
-            let mut skill_resources_seen = 0usize;
-            let mut skipped_resources = 0usize;
-            let mut truncated = false;
-            let mut completed_pages = 0usize;
-
-            for _ in 0..MAX_RESOURCE_PAGES {
-                let page = match tokio::time::timeout_at(
-                    discovery_deadline,
-                    client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor.clone()),
-                )
-                .await
-                {
-                    Ok(result) => result.map_err(|err| {
-                        SkillProviderError::new(format!(
-                            "failed to list orchestrator skill resources: {err:#}"
-                        ))
-                    }),
-                    Err(_) => Err(SkillProviderError::new(format!(
-                        "orchestrator skill discovery timed out after {ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT:?}"
-                    ))),
-                };
-                let result = match page {
-                    Ok(result) => result,
-                    Err(err) if completed_pages == 0 => return Err(err),
-                    Err(err) => {
-                        let page_word = if completed_pages == 1 {
-                            "page"
-                        } else {
-                            "pages"
-                        };
-                        catalog.warnings.push(format!(
-                            "Orchestrator skill discovery stopped after {completed_pages} resource {page_word}: {}",
-                            err.message
-                        ));
-                        cursor = None;
-                        break;
-                    }
-                };
-                completed_pages = completed_pages.saturating_add(1);
-
-                for resource in &result.resources {
-                    if resource.mime_type.as_deref() != Some(ORCHESTRATOR_SKILL_MIME_TYPE) {
-                        continue;
-                    }
-                    if skill_resources_seen >= MAX_ORCHESTRATOR_SKILLS {
-                        truncated = true;
-                        break;
-                    }
-                    skill_resources_seen = skill_resources_seen.saturating_add(1);
-                    match catalog_entry_from_resource(resource) {
-                        Some(entry) => catalog.push_entry(entry),
-                        None => skipped_resources = skipped_resources.saturating_add(1),
-                    }
-                }
-
-                if truncated
-                    || (skill_resources_seen >= MAX_ORCHESTRATOR_SKILLS
-                        && result.next_cursor.is_some())
-                {
-                    truncated = true;
-                    break;
-                }
-                let Some(next_cursor) = result.next_cursor else {
-                    cursor = None;
-                    break;
-                };
-                if !seen_cursors.insert(next_cursor.clone()) {
-                    catalog.warnings.push(
-                        "Orchestrator skill resource pagination returned a duplicate cursor."
-                            .to_string(),
-                    );
-                    cursor = None;
-                    break;
-                }
-                cursor = Some(next_cursor);
-            }
-
-            if cursor.is_some() || truncated {
-                catalog.warnings.push(format!(
-                    "Orchestrator skill discovery was truncated at {MAX_ORCHESTRATOR_SKILLS} skills or {MAX_RESOURCE_PAGES} resource pages."
-                ));
-            }
-            if skipped_resources > 0 {
-                catalog.warnings.push(format!(
-                    "Skipped {skipped_resources} malformed orchestrator skill resources."
-                ));
-            }
-
-            Ok(catalog)
+            Ok(discover(query.continuation, |cursor| {
+                client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor)
+            })
+            .await)
         })
     }
 
@@ -158,12 +68,14 @@ impl SkillProvider for OrchestratorSkillProvider {
                 return Err(SkillProviderError::new(format!(
                     "orchestrator skill provider cannot read authority {}",
                     request.authority.id
-                )));
+                ))
+                .with_kind(SkillProviderErrorKind::InvalidResource));
             }
             if !resource_belongs_to_package(&request.package.0, request.resource.as_str()) {
                 return Err(SkillProviderError::new(
                     "orchestrator skill resource does not match its package",
-                ));
+                )
+                .with_kind(SkillProviderErrorKind::InvalidResource));
             }
 
             let Some(client) = request.mcp_resources.as_ref() else {
@@ -180,12 +92,14 @@ impl SkillProvider for OrchestratorSkillProvider {
                 SkillProviderError::new(format!(
                     "orchestrator skill read timed out after {ORCHESTRATOR_SKILL_READ_TIMEOUT:?}"
                 ))
+                .with_kind(SkillProviderErrorKind::Timeout)
             })?
             .map_err(|err| {
                 SkillProviderError::new(format!(
                     "failed to read orchestrator skill resource {}: {err:#}",
                     request.resource.as_str()
                 ))
+                .with_kind(SkillProviderErrorKind::Transport)
             })?;
             let contents = result
                 .contents
@@ -200,13 +114,14 @@ impl SkillProvider for OrchestratorSkillProvider {
                 return Err(SkillProviderError::new(format!(
                     "orchestrator skill resource {} did not return matching text contents",
                     request.resource.as_str()
-                )));
+                ))
+                .with_kind(SkillProviderErrorKind::InvalidResponse));
             };
             if contents.len() > MAX_SKILL_RESOURCE_CONTENT_BYTES {
                 return Err(SkillProviderError::new(format!(
                     "orchestrator skill resource {} exceeds the {MAX_SKILL_RESOURCE_CONTENT_BYTES}-byte read limit",
                     request.resource.as_str()
-                )));
+                )).with_kind(SkillProviderErrorKind::OversizedContent));
             }
 
             Ok(SkillReadResult {
@@ -215,6 +130,93 @@ impl SkillProvider for OrchestratorSkillProvider {
             })
         })
     }
+}
+
+async fn discover<F, Fut, E>(
+    continuation: Option<crate::catalog::SkillDiscoveryContinuation>,
+    mut list_page: F,
+) -> SkillCatalog
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<codex_mcp::McpResourcePage, E>>,
+{
+    let discovery_deadline = tokio::time::Instant::now() + ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT;
+    let mut catalog = SkillCatalog::default();
+    let mut progress = continuation.unwrap_or_default();
+    let mut skill_resources_seen = 0usize;
+    let mut skipped_resources = 0usize;
+    for page_index in 0..MAX_RESOURCE_PAGES {
+        let page =
+            match tokio::time::timeout_at(discovery_deadline, list_page(progress.cursor.clone()))
+                .await
+            {
+                Ok(result) => result.map_err(|_| {
+                    SkillProviderError::new(
+                        "Orchestrator skill discovery is unavailable; continue listing to retry.",
+                    )
+                    .with_kind(SkillProviderErrorKind::Transport)
+                }),
+                Err(_) => Err(SkillProviderError::new(
+                    "Orchestrator skill discovery timed out; continue listing to retry.",
+                )
+                .with_kind(SkillProviderErrorKind::Timeout)),
+            };
+        let result = match page {
+            Ok(result) => result,
+            Err(error) => {
+                catalog.warnings.push(error.message);
+                catalog.continuation = Some(progress);
+                break;
+            }
+        };
+        for (index, resource) in result
+            .resources
+            .iter()
+            .enumerate()
+            .skip(progress.resource_offset)
+        {
+            if resource.mime_type.as_deref() != Some(ORCHESTRATOR_SKILL_MIME_TYPE) {
+                continue;
+            }
+            if skill_resources_seen == MAX_ORCHESTRATOR_SKILLS {
+                progress.resource_offset = index;
+                catalog.continuation = Some(progress.clone());
+                break;
+            }
+            skill_resources_seen += 1;
+            match catalog_entry_from_resource(resource) {
+                Some(entry) => catalog.push_entry(entry),
+                None => skipped_resources += 1,
+            }
+        }
+        if catalog.continuation.is_some() {
+            break;
+        }
+        let Some(next_cursor) = result.next_cursor else {
+            break;
+        };
+        if !progress.seen_cursors.insert(next_cursor.clone()) {
+            catalog.warnings.push("Orchestrator skill pagination repeated a cursor; discovery cannot advance on this provider response.".to_string());
+            catalog.continuation = Some(progress);
+            break;
+        }
+        progress.cursor = Some(next_cursor);
+        progress.resource_offset = 0;
+        if page_index + 1 == MAX_RESOURCE_PAGES || skill_resources_seen == MAX_ORCHESTRATOR_SKILLS {
+            catalog.continuation = Some(progress);
+            break;
+        }
+    }
+    if catalog.continuation.is_some() {
+        catalog.warnings.push("Orchestrator skill discovery is incomplete. Follow skills.list next_cursor to continue discovery.".to_string());
+    }
+    if skipped_resources > 0 {
+        catalog.warnings.push(format!(
+            "Skipped {skipped_resources} malformed orchestrator skill resources."
+        ));
+    }
+
+    catalog
 }
 
 fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry> {
@@ -378,6 +380,88 @@ fn main_prompt_uri(package_uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page(start: usize, count: usize, next: Option<&str>) -> codex_mcp::McpResourcePage {
+        codex_mcp::McpResourcePage {
+            resources: (start..start + count).map(|index| serde_json::from_value(serde_json::json!({
+                "uri":format!("skill://plugin/skill-{index}"), "name":format!("skill-{index}"), "mimeType":"mcp/skill",
+                "_meta":{"skill_name":format!("skill-{index}"),"source":"user"}
+            })).expect("resource")).collect(),
+            next_cursor: next.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_resumes_after_page_failure_and_mid_page_limit() {
+        let mut calls = 0;
+        let prefix = discover(None, |cursor| {
+            calls += 1;
+            std::future::ready(if cursor.is_none() {
+                Ok(page(0, 1, Some("page-two")))
+            } else {
+                Err(())
+            })
+        })
+        .await;
+        assert_eq!(calls, 2);
+        assert_eq!(prefix.entries.len(), 1);
+        let resumed = discover(prefix.continuation, |cursor| {
+            assert_eq!(cursor.as_deref(), Some("page-two"));
+            std::future::ready(Ok::<_, ()>(page(1, 1, None)))
+        })
+        .await;
+        assert_eq!(resumed.entries[0].name, "skill-1");
+        assert!(resumed.continuation.is_none());
+
+        let first = discover(None, |_| {
+            std::future::ready(Ok::<_, ()>(page(0, 101, None)))
+        })
+        .await;
+        assert_eq!(first.entries.len(), 100);
+        let continuation = first.continuation.expect("remaining resource");
+        assert_eq!(continuation.resource_offset, 100);
+        let last = discover(Some(continuation), |_| {
+            std::future::ready(Ok::<_, ()>(page(0, 101, None)))
+        })
+        .await;
+        assert_eq!(last.entries.len(), 1);
+        assert_eq!(last.entries[0].name, "skill-100");
+        assert!(last.continuation.is_none());
+    }
+
+    #[tokio::test]
+    async fn page_budget_and_duplicate_cursors_remain_bounded_and_recoverable() {
+        let mut calls = 0;
+        let first = discover(None, |_| {
+            let index = calls;
+            calls += 1;
+            std::future::ready(Ok::<_, ()>(page(index, 1, Some(&calls.to_string()))))
+        })
+        .await;
+        assert_eq!(calls, MAX_RESOURCE_PAGES);
+        assert_eq!(first.entries.len(), MAX_RESOURCE_PAGES);
+        let last = discover(first.continuation, |cursor| {
+            assert_eq!(cursor.as_deref(), Some("10"));
+            std::future::ready(Ok::<_, ()>(page(10, 1, None)))
+        })
+        .await;
+        assert_eq!(last.entries[0].name, "skill-10");
+        assert!(last.continuation.is_none());
+        let mut calls = 0;
+        let repeated = discover(None, |_| {
+            calls += 1;
+            std::future::ready(Ok::<_, ()>(page(0, 1, Some("same"))))
+        })
+        .await;
+        assert_eq!(calls, 2);
+        assert!(repeated.continuation.is_some());
+        assert!(
+            repeated
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("repeated a cursor"))
+        );
+    }
 
     #[test]
     fn resource_metadata_is_bounded_and_escaped_before_entering_catalog() {

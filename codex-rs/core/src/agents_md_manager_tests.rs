@@ -757,3 +757,50 @@ async fn identical_paths_on_distinct_filesystems_do_not_share_cache_entries() {
         AgentsMdCacheKey::capture(&config, &next_generation)
     );
 }
+
+#[tokio::test]
+async fn audit_stalled_instruction_read_falls_back_and_releases_gate() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("AGENTS.md"), "retained instructions").unwrap();
+    let config = config_for(&root).await;
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let environments = environment_snapshot_with_environment(&config.cwd, 1, environment);
+    let manager = AgentsMdManager::new(None);
+    let first = manager.refresh_and_observe(&config, &environments).await;
+    filesystem.set_next_project_read(NextProjectRead::Block {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    });
+    let fallback = timeout(
+        REFRESH_TIMEOUT + Duration::from_secs(1),
+        manager.refresh_and_observe(&config, &environments),
+    )
+    .await
+    .expect("bounded refresh");
+    assert_eq!(fallback.freshness, AgentsMdFreshness::CachedFallback);
+    assert_eq!(
+        fallback.loaded.unwrap().text(),
+        first.loaded.unwrap().text()
+    );
+    fs::write(root.path().join("AGENTS.md"), "recovered instructions").unwrap();
+    let recovered = manager.refresh_and_observe(&config, &environments).await;
+    assert_eq!(recovered.freshness, AgentsMdFreshness::Refreshed);
+    assert!(
+        recovered
+            .loaded
+            .unwrap()
+            .text()
+            .contains("recovered instructions")
+    );
+    let mut changed_scope = environments.clone();
+    changed_scope.generation += 1;
+    assert!(
+        manager
+            .scoped_fallback(&config, &changed_scope)
+            .loaded
+            .is_none()
+    );
+}

@@ -34,6 +34,7 @@ const MAX_QUEUED_CONTROL_REQUESTS_PER_KEY: usize = 8;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RequestSerializationQueueKey {
+    Control(Box<RequestSerializationQueueKey>),
     Global(&'static str),
     Thread {
         thread_id: String,
@@ -89,8 +90,8 @@ impl RequestSerializationQueueKey {
                 Self::Thread { thread_id },
                 RequestSerializationAccess::Exclusive,
             ),
-            // Control traffic shares the thread key so it stays serialized against that
-            // thread, but is admitted and drained through the reserved control lane.
+            // Enqueue wraps this thread key in a separate control lane, allowing
+            // cancellation while an ordered request is still running.
             ClientRequestSerializationScope::ThreadControl { thread_id } => (
                 Self::Thread { thread_id },
                 RequestSerializationAccess::Control,
@@ -276,6 +277,7 @@ struct RequestSerializationState {
     queues: HashMap<RequestSerializationQueueKey, KeyQueues>,
     total_queued: usize,
     total_queued_bytes: usize,
+    total_control: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,10 +361,20 @@ impl RequestSerializationQueues {
     ) -> RequestAdmission {
         let request = QueuedSerializedRequest { access, request };
         let is_control = access == RequestSerializationAccess::Control;
+        // A separate drain is required: queue priority alone cannot interrupt a
+        // handler that is already running and waiting for cancellation.
+        let key = if is_control {
+            RequestSerializationQueueKey::Control(Box::new(key))
+        } else {
+            key
+        };
         let should_spawn = {
             let mut state = self.inner.lock().await;
             let existing = state.queues.get(&key);
             if is_control {
+                if state.total_control >= MAX_TOTAL_QUEUED_REQUESTS {
+                    return RequestAdmission::Rejected(RequestAdmissionError::ControlLane);
+                }
                 // Control traffic is admitted from its own reserved capacity and is excluded
                 // from the queued-payload byte budget, so a thread saturated with large
                 // queued mutations still accepts an interrupt.
@@ -396,7 +408,11 @@ impl RequestSerializationQueues {
             } else {
                 request.estimated_bytes()
             };
-            state.total_queued += 1;
+            if is_control {
+                state.total_control += 1;
+            } else {
+                state.total_queued += 1;
+            }
             state.total_queued_bytes = state.total_queued_bytes.saturating_add(request_bytes);
             match state.queues.get_mut(&key) {
                 Some(queues) => {
@@ -426,13 +442,14 @@ impl RequestSerializationQueues {
     pub(crate) async fn cancel_for_gate(&self, gate: &Arc<ConnectionRpcGate>) -> usize {
         let mut state = self.inner.lock().await;
         let mut cancelled = 0;
+        let mut cancelled_control = 0;
         let mut cancelled_bytes = 0usize;
         for queues in state.queues.values_mut() {
             let previous_control_len = queues.control_len();
             queues
                 .control
                 .retain(|request| !request.request.belongs_to_gate(gate));
-            cancelled += previous_control_len - queues.control_len();
+            cancelled_control += previous_control_len - queues.control_len();
 
             let previous_len = queues.ordered_len();
             let previous_bytes = queues.ordered_bytes();
@@ -445,8 +462,9 @@ impl RequestSerializationQueues {
                 cancelled_bytes.saturating_add(previous_bytes.saturating_sub(retained_bytes));
         }
         state.total_queued -= cancelled;
+        state.total_control -= cancelled_control;
         state.total_queued_bytes = state.total_queued_bytes.saturating_sub(cancelled_bytes);
-        cancelled
+        cancelled + cancelled_control
     }
 
     async fn drain(self, key: RequestSerializationQueueKey) {
@@ -481,8 +499,8 @@ impl RequestSerializationQueues {
                                 popped += 1;
                             }
                         }
-                        state.total_queued -= popped;
                         if !from_control {
+                            state.total_queued -= popped;
                             state.total_queued_bytes = state.total_queued_bytes.saturating_sub(
                                 requests
                                     .iter()
@@ -500,6 +518,9 @@ impl RequestSerializationQueues {
             };
 
             join_all(requests.into_iter().map(|request| request.request.run())).await;
+            if matches!(key, RequestSerializationQueueKey::Control(_)) {
+                self.inner.lock().await.total_control -= 1;
+            }
         }
     }
 }
@@ -764,11 +785,11 @@ mod tests {
             "an interrupt must be admitted even when the ordered byte budget is full"
         );
 
-        let _ = release_tx.send(());
         timeout(queue_drain_timeout(), interrupt_rx)
             .await
             .expect("interrupt should run")
             .expect("interrupt signal should remain open");
+        let _ = release_tx.send(());
     }
 
     /// N14: a queued interrupt runs ahead of ordered work that was queued before it, while
@@ -825,9 +846,13 @@ mod tests {
             )
             .await;
 
+        assert_eq!(
+            timeout(queue_drain_timeout(), rx.recv()).await.unwrap(),
+            Some("interrupt")
+        );
         let _ = release_tx.send(());
         let mut observed = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..4 {
             let value = timeout(queue_drain_timeout(), rx.recv())
                 .await
                 .expect("request should run")
@@ -837,7 +862,7 @@ mod tests {
 
         assert_eq!(
             observed,
-            vec!["blocker", "interrupt", "start", "rollback", "inject"],
+            vec!["blocker", "start", "rollback", "inject"],
             "the interrupt must jump the queued mutations while they stay FIFO"
         );
     }
@@ -855,7 +880,7 @@ mod tests {
         queues
             .enqueue(
                 key.clone(),
-                RequestSerializationAccess::Exclusive,
+                RequestSerializationAccess::Control,
                 QueuedInitializedRequest::new(gate(), async move {
                     let _ = started_tx.send(());
                     let _ = release_rx.await;

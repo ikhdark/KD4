@@ -6,8 +6,8 @@ use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileSystemSandboxContext;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_path_uri::PathUri;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ pub struct ToolEnvironment {
     /// Stable host environment id used to route executor-scoped capabilities.
     pub environment_id: String,
     /// Effective working directory for this turn in the environment.
-    pub cwd: AbsolutePathBuf,
+    pub cwd: PathUri,
     /// Filesystem implementation for this environment.
     pub file_system: Arc<dyn ExecutorFileSystem>,
     /// Sandbox context to use for filesystem operations.

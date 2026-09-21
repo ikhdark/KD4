@@ -28,6 +28,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.process_owner import run_owned, CleanupFailed  # noqa: E402
+
 from scripts.tool_versions import cargo_lane_patterns  # noqa: E402
 
 from scripts.rust_build_status_support import (  # noqa: E402
@@ -485,6 +487,8 @@ def locked_lane_names(lane_dirs: Sequence[Path]) -> set[str]:
 
 
 def lane_active_lock_is_held(lane_dir: Path) -> bool:
+    if (lane_dir / ".lane-cleanup-unconfirmed").exists():
+        return True
     lock_path = lane_dir / ".lane-active.lock"
     try:
         if not stat.S_ISREG(lock_path.stat().st_mode):
@@ -795,7 +799,10 @@ def reserve_cargo_lane(
                     f"refusing indirect Cargo lane path {candidate_dir}"
                 )
             candidate_dir.mkdir(exist_ok=True)
-            if cargo_lock_is_busy(candidate_dir):
+            if (
+                cargo_lock_is_busy(candidate_dir)
+                or (candidate_dir / ".lane-cleanup-unconfirmed").exists()
+            ):
                 continue
             active_handle = _try_acquire_binary_file_lock(
                 candidate_dir / ".lane-active.lock"
@@ -961,6 +968,19 @@ def _cargo_command_with_target_dir(
     target_dir: Path,
 ) -> list[str]:
     result = list(command)
+    if (
+        len(result) >= 4
+        and Path(result[0]).stem.lower() == "rustup"
+        and result[1] == "run"
+    ):
+        cargo_index = 4 if result[2] == "--install" else 3
+        if (
+            cargo_index < len(result)
+            and Path(result[cargo_index]).stem.lower() == "cargo"
+        ):
+            return result[:cargo_index] + _cargo_command_with_target_dir(
+                result[cargo_index:], target_dir
+            )
     if len(result) < 2 or Path(result[0]).stem.lower() != "cargo":
         return result
     subcommand_index = _cargo_subcommand_index(result)
@@ -1257,6 +1277,61 @@ def maintain_cargo_lanes(repo_root: Path, lane_root: Path) -> None:
             os.environ["CODEX_CARGO_LANES_ROOT"] = previous_root
 
 
+def request_cargo_lane_maintenance(repo_root: Path, lane_root: Path) -> None:
+    """Request the shared worker; only explicit administration waits for pruning."""
+    if os.environ.get("CODEX_CARGO_LANE_MAINTENANCE_SYNC") == "1":
+        maintain_cargo_lanes(repo_root, lane_root)
+        return
+    if os.environ.get("CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE") == "1":
+        return
+    try:
+        interval = (
+            max(0, int(os.environ.get("CODEX_CARGO_LANE_GC_INTERVAL_HOURS", "1")))
+            * 3600
+        )
+    except ValueError:
+        interval = 3600
+    stamp, retry = lane_root / ".gc-stamp", lane_root / ".gc-retry"
+    due = not stamp.exists() or time.time() - stamp.stat().st_mtime >= interval
+    due &= not retry.exists() or time.time() - retry.stat().st_mtime >= 60
+    if not due and not any(lane_root.glob("*.trash-*")):
+        return
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        print("warning: Cargo maintenance worker requires PowerShell", file=sys.stderr)
+        return
+    worker = repo_root / "scripts" / "cargo-lane-trash-cleanup.ps1"
+    if not worker.is_file():
+        print(f"warning: Cargo maintenance worker is missing: {worker}", file=sys.stderr)
+        return
+    command = [
+        shell,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(repo_root / "scripts" / "cargo-lane-trash-cleanup.ps1"),
+        "-LanesRoot",
+        str(lane_root),
+    ]
+    if due:
+        command.append("-Prune")
+    # The worker logs its own failures after acquiring ownership. Opening its
+    # log here conflicts with PowerShell's append handle on Windows.
+    child = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    # Reap asynchronously if this launcher stays alive; never await pruning.
+    import threading
+
+    threading.Thread(target=child.wait, daemon=True).start()
+
+
 def run_in_cargo_lane(
     *,
     repo_root: Path,
@@ -1316,10 +1391,12 @@ def run_in_cargo_lane(
             # not fragment compiler-cache keys. Nested recipes consume CODEX's value.
             child_env.pop("CARGO_TARGET_DIR", None)
             child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
+            child_env.pop("CODEX_CARGO_LANE_OWNER_PID", None)
             direct_command = _direct_reserved_lane_command(
                 command, child_env, repo_root=repo_root, target_dir=target_dir
             )
             if direct_command is None:
+                child_env["CODEX_CARGO_LANE_OWNER_PID"] = str(os.getpid())
                 child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
             child_command = _cargo_command_with_target_dir(
                 direct_command if direct_command is not None else command,
@@ -1332,12 +1409,25 @@ def run_in_cargo_lane(
                 if resolved_program is not None:
                     child_command[0] = resolved_program
             next_phase("maintenance")
-            maintain_cargo_lanes(repo_root, target_dir.parent)
+            try:
+                request_cargo_lane_maintenance(repo_root, target_dir.parent)
+            except OSError as error:
+                print(f"warning: could not request Cargo maintenance: {error}", file=sys.stderr)
             next_phase("command")
             try:
-                exit_code = subprocess.run(
-                    child_command, env=child_env, check=False
-                ).returncode
+                try:
+                    exit_code = run_owned(
+                        child_command,
+                        env=child_env,
+                        check=False,
+                        stdout=sys.stdout,
+                        stderr=sys.stderr,
+                    ).returncode
+                except CleanupFailed:
+                    (target_dir / ".lane-cleanup-unconfirmed").write_text(
+                        "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
+                    )
+                    raise
                 record.update(
                     exitCode=exit_code,
                     status="completed" if exit_code == 0 else "failed",
@@ -1546,8 +1636,9 @@ def protected_warm_lane_names(
         ranked = sorted(
             lanes,
             key=lambda path: (
-                warm_lane_rank(path.name),
                 -lane_mtime(path),
+                warm_lane_rank(path.name),
+                path.name.casefold(),
                 path.name,
             ),
         )

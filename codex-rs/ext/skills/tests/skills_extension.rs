@@ -208,6 +208,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
     let list_calls = Arc::new(AtomicUsize::new(0));
     let executor_provider = Arc::new(StaticSkillProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries: vec![test_entry(
                 SkillSourceKind::Executor,
                 "env-1",
@@ -450,6 +451,7 @@ async fn default_context_truncates_catalog_descriptions() -> TestResult {
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
+                continuation: None,
                 entries: vec![entry],
                 warnings: Vec::new(),
             },
@@ -500,6 +502,7 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
+                continuation: None,
                 entries: vec![entry],
                 warnings: Vec::new(),
             },
@@ -568,6 +571,7 @@ async fn skills_read_honors_response_budgets_without_rereading_cached_contents()
     let read_calls = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(ReadContentsProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries: vec![test_entry(
                 SkillSourceKind::Orchestrator,
                 "codex_apps",
@@ -771,6 +775,7 @@ async fn estimate_thread_context_does_not_populate_orchestrator_cache() -> TestR
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
+                continuation: None,
                 entries: vec![test_entry(
                     SkillSourceKind::Orchestrator,
                     "codex_apps",
@@ -836,6 +841,7 @@ async fn orchestrator_failure_is_retried_only_by_explicit_discovery() -> TestRes
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
+                continuation: None,
                 entries: vec![test_entry(
                     SkillSourceKind::Orchestrator,
                     "codex_apps",
@@ -932,6 +938,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
     let root_b_locator = "skill://root-b/shared/lint-fix/SKILL.md";
     let executor_provider = Arc::new(StaticSkillProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries: [("root-a", root_a_locator), ("root-b", root_b_locator)]
                 .into_iter()
                 .map(|(root_id, locator)| {
@@ -1031,6 +1038,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
     let read_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(StaticSkillProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries: vec![
                 test_entry(
                     SkillSourceKind::Host,
@@ -1120,6 +1128,51 @@ struct ReadContentsProvider {
     read_calls: Arc<AtomicUsize>,
 }
 
+#[tokio::test]
+async fn undiscovered_package_reports_incomplete_discovery_without_reading() -> TestResult {
+    for incomplete in [false, true] {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReadContentsProvider {
+            catalog: SkillCatalog {
+                continuation: incomplete.then(Default::default),
+                ..Default::default()
+            },
+            contents: "must not be read".to_string(),
+            returned_resource: None,
+            read_calls: Arc::clone(&read_calls),
+        };
+        let (registry, session, thread) = start_test_extension(
+            SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+            default_config(),
+        )
+        .await;
+        let tools = registry.tool_contributors()[0].tools(&session, &thread);
+        let read = tools
+            .iter()
+            .find(|tool| tool.tool_name().name == "read")
+            .ok_or("missing read tool")?;
+        let result = read
+            .handle(skills_tool_call(
+                read.tool_name(),
+                serde_json::json!({
+                    "authority": {"kind": "orchestrator"},
+                    "package": "later",
+                    "resource": "skill://later/SKILL.md"
+                }),
+                1_024,
+            ))
+            .await;
+        let Err(FunctionCallError::RespondToModel(message)) = result else {
+            panic!("unknown packages must not bypass discovery");
+        };
+        assert_eq!(message.contains("skills.list"), incomplete);
+        assert_eq!(message.contains("next_cursor"), incomplete);
+        assert_eq!(message.contains("not available"), !incomplete);
+        assert_eq!(read_calls.load(Ordering::Relaxed), 0);
+    }
+    Ok(())
+}
+
 impl SkillProvider for ReadContentsProvider {
     fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
         let catalog = self.catalog.clone();
@@ -1189,6 +1242,7 @@ async fn skills_list_reports_warnings_omitted_by_count_and_output_budget() -> Te
     {
         let provider = StaticSkillProvider {
             catalog: SkillCatalog {
+                continuation: None,
                 entries: Vec::new(),
                 warnings: (0..warning_count)
                     .map(|index| format!("warning {index}: {}", "é".repeat(200)))
@@ -1256,6 +1310,7 @@ async fn skills_list_pages_preserve_handles_and_respect_serialized_budget() -> T
         .collect();
     let provider = StaticSkillProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries,
             warnings: vec!["warning".repeat(100)],
         },
@@ -1326,6 +1381,7 @@ async fn executor_failure_retries_next_turn_and_real_input_populates_snapshot() 
     let calls = Arc::new(AtomicUsize::new(0));
     let provider = StaticSkillProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries: vec![test_entry(
                 SkillSourceKind::Executor,
                 "root",
@@ -1421,9 +1477,10 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
     );
     entry.name = "bounded<&>".to_string();
     entry.display_path = Some("skill://orchestrator/<bounded>&/SKILL.md".to_string());
-    let original_contents = format!("<body>{}OMITTED_TAIL", "🚀".repeat(3_000));
+    let original_contents = format!("<body>{}OMITTED_TAIL", "🚀".repeat(12_000));
     let provider = ReadContentsProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries: vec![entry],
             warnings: Vec::new(),
         },
@@ -1466,7 +1523,8 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
         .ok_or("contents")?
         .strip_suffix("\n</skill>")
         .ok_or("closing skill")?;
-    assert!(contents.len() <= 8_006); // Escaping the body tag adds six bytes.
+    assert!(rendered.len() <= 32_000);
+    assert!(!contents.is_empty());
     let recovery_args = rendered
         .split("skills.read(")
         .nth(1)
@@ -1482,7 +1540,15 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
         .iter()
         .find(|tool| tool.tool_name().name == "read")
         .ok_or("read tool")?;
-    let mut recovered = String::new();
+    let start = args["cursor"]
+        .as_str()
+        .ok_or("continuation cursor")?
+        .split_once(':')
+        .ok_or("cursor offset")?
+        .1
+        .parse::<usize>()?;
+    assert!(start > 0);
+    let mut recovered = original_contents[..start].to_string();
     loop {
         let payload = ToolPayload::Function {
             arguments: args.to_string(),
@@ -1529,6 +1595,7 @@ async fn mismatched_resources_are_rejected_for_injection_and_tools() -> TestResu
         };
         let provider = ReadContentsProvider {
             catalog: SkillCatalog {
+                continuation: None,
                 entries: vec![test_entry(
                     kind.clone(),
                     authority,
@@ -1550,6 +1617,7 @@ async fn mismatched_resources_are_rejected_for_injection_and_tools() -> TestResu
         let mut config = default_config();
         config.include_instructions = false;
         let (registry, session, thread) = start_test_extension(providers, config).await;
+        let turn = ExtensionData::new("turn");
         let fragments = registry.turn_input_contributors()[0]
             .contribute(
                 &TurnInputContext {
@@ -1563,13 +1631,23 @@ async fn mismatched_resources_are_rejected_for_injection_and_tools() -> TestResu
                 },
                 &session,
                 &thread,
-                &ExtensionData::new("turn"),
+                &turn,
             )
             .await;
+        assert_eq!(fragments.len(), 1);
         assert!(
-            fragments.is_empty(),
-            "mismatched contents must never be injected"
+            fragments[0]
+                .render()
+                .contains("Instructions were not loaded")
         );
+        assert!(!fragments[0].render().contains("WRONG_RESOURCE_BODY"));
+        if kind == SkillSourceKind::Host {
+            assert!(
+                turn.get::<InjectedHostSkillPrompts>()
+                    .ok_or("failed selected host load must suppress legacy fallback")?
+                    .contains_path("skill://orchestrator/demo/SKILL.md")
+            );
+        }
         if kind == SkillSourceKind::Orchestrator {
             let tools = registry.tool_contributors()[0].tools(&session, &thread);
             let read = tools
@@ -1580,7 +1658,7 @@ async fn mismatched_resources_are_rejected_for_injection_and_tools() -> TestResu
                 "authority":{"kind":"orchestrator"}, "package":"orchestrator/demo", "resource":"skill://orchestrator/demo/SKILL.md"
             }), 1_024)).await;
             assert!(
-                matches!(result, Err(FunctionCallError::RespondToModel(message)) if message == "failed to read skill resource")
+                matches!(result, Err(FunctionCallError::RespondToModel(message)) if message.contains("invalid resource response"))
             );
         }
     }
@@ -1609,6 +1687,7 @@ async fn oversized_catalog_entries_report_omission_and_leave_room_for_later_entr
         }
         let provider = StaticSkillProvider {
             catalog: SkillCatalog {
+                continuation: None,
                 entries,
                 warnings: Vec::new(),
             },
@@ -1645,6 +1724,7 @@ fn batch_catalog_merge_preserves_order_authority_and_first_entry() {
     let mut catalog = SkillCatalog::default();
     catalog.extend_entries([first.clone(), duplicate.clone(), other.clone()]);
     catalog.extend(SkillCatalog {
+        continuation: None,
         entries: vec![duplicate],
         warnings: vec!["warning".to_string()],
     });
@@ -1668,6 +1748,7 @@ async fn omitted_catalog_entries_are_recoverable_through_advertised_list_route()
         .collect();
     let provider = ReadContentsProvider {
         catalog: SkillCatalog {
+            continuation: None,
             entries,
             warnings: Vec::new(),
         },
@@ -1843,4 +1924,101 @@ fn read_request_keys(
             )
         })
         .collect()
+}
+
+#[tokio::test]
+async fn partial_discovery_cursor_recovers_a_previously_unavailable_skill() -> TestResult {
+    struct ResumingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    impl SkillProvider for ResumingProvider {
+        fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call == 1 {
+                    return Err(codex_skills_extension::catalog::SkillProviderError::new(
+                        "temporary",
+                    ));
+                }
+                assert_eq!(query.continuation.is_some(), call != 0);
+                let name = if call == 0 { "first" } else { "recovered" };
+                Ok(SkillCatalog {
+                    continuation: (call == 0).then(Default::default),
+                    entries: vec![test_entry(
+                        SkillSourceKind::Orchestrator,
+                        "codex_apps",
+                        &format!("orchestrator/{name}"),
+                        &format!("skill://orchestrator/{name}/SKILL.md"),
+                    )],
+                    warnings: Vec::new(),
+                })
+            })
+        }
+        fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+            Box::pin(async move {
+                Ok(SkillReadResult {
+                    resource: request.resource,
+                    contents: "recovered instructions".to_string(),
+                })
+            })
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (registry, session, thread) = start_test_extension(
+        SkillProviders::new().with_orchestrator_provider(Arc::new(ResumingProvider {
+            calls: calls.clone(),
+        })),
+        default_config(),
+    )
+    .await;
+    let tools = registry.tool_contributors()[0].tools(&session, &thread);
+    let list = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("list")?;
+    let call = skills_tool_call(
+        list.tool_name(),
+        serde_json::json!({"authority":{"kind":"orchestrator"}}),
+        8_000,
+    );
+    let payload = call.payload.clone();
+    let first = list
+        .handle(call)
+        .await?
+        .post_tool_use_response("call", &payload)
+        .ok_or("first")?;
+    assert_eq!(first["skills"][0]["package"], "orchestrator/first");
+    assert!(first["next_cursor"].is_string());
+    let call = skills_tool_call(
+        list.tool_name(),
+        serde_json::json!({"authority":{"kind":"orchestrator"},"cursor":first["next_cursor"]}),
+        8_000,
+    );
+    let payload = call.payload.clone();
+    let next = list
+        .handle(call)
+        .await?
+        .post_tool_use_response("call", &payload)
+        .ok_or("next")?;
+    assert_eq!(next["skills"].as_array().ok_or("skills")?.len(), 1);
+    assert_eq!(next["skills"][0]["package"], "orchestrator/recovered");
+    assert!(next["next_cursor"].is_null());
+    let read = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "read")
+        .ok_or("read")?;
+    let call = skills_tool_call(
+        read.tool_name(),
+        serde_json::json!({"authority":{"kind":"orchestrator"},"package":"orchestrator/recovered","resource":"skill://orchestrator/recovered/SKILL.md"}),
+        8_000,
+    );
+    let payload = call.payload.clone();
+    let result = read
+        .handle(call)
+        .await?
+        .post_tool_use_response("call", &payload)
+        .ok_or("result")?;
+    assert_eq!(result["contents"], "recovered instructions");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    Ok(())
 }

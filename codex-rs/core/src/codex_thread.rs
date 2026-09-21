@@ -88,9 +88,9 @@ pub struct ThreadConfigSnapshot {
 /// idle turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TryStartTurnIfIdleRejectionReason {
-    /// User/client-triggered mailbox work is already queued and must take
+    /// Recovered user input or trigger-enabled mailbox work must take
     /// priority over extension-initiated idle work.
-    PendingTriggerTurn,
+    PendingTurnStartWork,
     /// The thread is in Plan mode, where automatic idle work must not start a
     /// new model turn.
     PlanMode,
@@ -100,6 +100,35 @@ pub enum TryStartTurnIfIdleRejectionReason {
     /// The session already holds the maximum pending input item or byte budget.
     PendingInputLimitExceeded,
 }
+
+/// Failed live admission retains the caller's items for an explicit retry.
+#[derive(Debug)]
+pub enum InjectResponseItemsError {
+    NoActiveTurn(Vec<ResponseItem>),
+    PendingInputLimitExceeded {
+        input: Vec<ResponseItem>,
+        max_items: usize,
+        max_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for InjectResponseItemsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveTurn(_) => f.write_str("no active turn"),
+            Self::PendingInputLimitExceeded {
+                max_items,
+                max_bytes,
+                ..
+            } => write!(
+                f,
+                "pending input limit exceeded ({max_items} items or {max_bytes} bytes); retry after input is consumed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InjectResponseItemsError {}
 
 /// Rejection returned when an extension asks to start automatic idle work but
 /// the thread is not eligible to run it.
@@ -395,7 +424,7 @@ impl CodexThread {
     pub async fn inject_if_running(
         &self,
         items: Vec<ResponseItem>,
-    ) -> Result<(), Vec<ResponseItem>> {
+    ) -> Result<(), InjectResponseItemsError> {
         self.codex.session.inject_if_running(items).await
     }
 
@@ -636,10 +665,25 @@ impl CodexThread {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        self.codex
+        if let Err(error) = self
+            .codex
             .session
             .inject_no_new_turn(vec![item], /*current_turn_context*/ None)
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "failed to deliver session-prefix message");
+            self.codex
+                .session
+                .send_event_raw(codex_protocol::protocol::Event {
+                    id: String::new(),
+                    msg: codex_protocol::protocol::EventMsg::Warning(
+                        codex_protocol::protocol::WarningEvent {
+                            message: format!("Session-prefix message was not delivered: {error}"),
+                        },
+                    ),
+                })
+                .await;
+        }
     }
 
     /// Record raw Responses API items without starting a new turn.
@@ -657,16 +701,16 @@ impl CodexThread {
                 .codex
                 .session
                 .capture_step_context(Arc::clone(&turn_context))
-                .await;
+                .await?;
             self.codex
                 .session
                 .record_context_updates_and_set_reference_context_item(step_context.as_ref())
-                .await;
+                .await?;
         }
         self.codex
             .session
             .inject_no_new_turn(items, Some(turn_context.as_ref()))
-            .await;
+            .await?;
         self.codex.session.flush_rollout().await?;
         Ok(())
     }
@@ -779,8 +823,8 @@ impl CodexThread {
             .session
             .capture_step_context(turn_context)
             .await
-            .mcp
-            .clone()
+            .map(|step| Arc::clone(&step.mcp))
+            .unwrap_or_else(|_| self.codex.session.services.latest_mcp_runtime())
     }
 
     pub fn multi_agent_version(&self) -> Option<MultiAgentVersion> {

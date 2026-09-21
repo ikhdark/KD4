@@ -75,6 +75,17 @@ pub struct ModelProvider {
     pub requires_openai_auth: bool,
     #[prost(bool, tag = "17")]
     pub supports_websockets: bool,
+    #[prost(bool, tag = "18")]
+    pub supports_standalone_web_search: bool,
+    #[prost(message, optional, tag = "19")]
+    pub aws: ::core::option::Option<ModelProviderAwsAuthInfo>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ModelProviderAwsAuthInfo {
+    #[prost(string, optional, tag = "1")]
+    pub profile: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub region: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StringMap {

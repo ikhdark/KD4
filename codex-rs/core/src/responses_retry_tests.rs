@@ -268,7 +268,7 @@ fn connection_retry_delay_backs_off_and_is_bounded() {
 #[tokio::test]
 async fn connection_recovery_reaches_https_fallback_without_exhausting_network_waits() {
     let home = tempfile::tempdir().unwrap();
-    let (session, turn_context, events) =
+    let (session, mut turn_context, events) =
         crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
             codex_login::CodexAuth::from_api_key("test key"),
             Vec::new(),
@@ -280,6 +280,10 @@ async fn connection_recovery_reaches_https_fallback_without_exhausting_network_w
     let mut retry_state = ResponsesStreamRetryState::default();
     let cancellation_token = CancellationToken::new();
     assert!(session.services.model_client.responses_websocket_enabled());
+    // Shared fixtures default to batch Exec; this test is interactive.
+    std::sync::Arc::get_mut(&mut turn_context)
+        .expect("test turn context should be uniquely owned")
+        .session_source = SessionSource::Cli;
     tokio::time::pause();
 
     for expected_delay in [Duration::from_millis(500), Duration::from_secs(1)] {
@@ -359,4 +363,41 @@ async fn connection_recovery_reaches_https_fallback_without_exhausting_network_w
     )
     .await;
     assert!(matches!(result, Err(CodexErr::RequestTimeout)));
+}
+
+#[test]
+fn batch_and_subagent_sources_do_not_opt_into_unlimited_recovery() {
+    for source in [
+        SessionSource::Exec,
+        SessionSource::Unknown,
+        SessionSource::Custom("batch-worker".into()),
+        SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::Review),
+    ] {
+        assert!(!should_wait_for_connection_recovery(
+            ResponsesStreamRequest::Sampling,
+            &connection_failed(),
+            &source,
+            &ModelProviderInfo::default()
+        ));
+    }
+}
+
+#[test]
+fn audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_transport() {
+    for reason in ["max_output_tokens", "content_filter", "future_reason"] {
+        let err =
+            CodexErr::IncompleteResponse(Box::new(codex_protocol::error::IncompleteResponse {
+                response_id: Some("partial".into()),
+                reason: reason.into(),
+                token_usage: None,
+            }));
+        assert!(!should_retry_response_stream(&err));
+        assert!(!should_switch_fallback_transport(&err));
+    }
+    let unknown = CodexErr::ProviderFailure {
+        code: Some("unknown".into()),
+        message: "failure".into(),
+    };
+    assert!(!should_retry_response_stream(&unknown));
+    assert!(!should_switch_fallback_transport(&unknown));
 }

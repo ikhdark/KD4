@@ -35,9 +35,8 @@ impl super::ContextualUserFragment for LegacyApplyPatchExecCommandWarning {
     }
 
     fn matches_text(text: &str) -> bool {
-        let trimmed = text.trim();
-        trimmed.starts_with("Warning: apply_patch was requested via ")
-            && trimmed.ends_with("Use the apply_patch tool instead of exec_command.")
+        text.trim()
+            == "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command."
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {

@@ -889,7 +889,7 @@ async fn non_empty_write_stdin_collects_later_output_until_the_interaction_cap()
 }
 
 #[tokio::test]
-async fn remote_write_unknown_process_marks_process_exited() {
+async fn remote_write_unknown_process_does_not_confirm_exit() {
     let process = remote_process(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
 
     let err = process
@@ -897,20 +897,26 @@ async fn remote_write_unknown_process_marks_process_exited() {
         .await
         .expect_err("expected write failure");
 
-    assert!(matches!(err, UnifiedExecError::WriteToStdin));
-    assert!(process.has_exited());
+    assert!(matches!(err, UnifiedExecError::ProcessFailed { .. }));
+    assert!(!process.has_exited());
 }
 
 #[tokio::test]
-async fn remote_write_closed_stdin_marks_process_exited() {
-    let process = remote_process(WriteStatus::StdinClosed, /*terminate_error*/ None).await;
-
-    let err = process
-        .write(b"hello")
+async fn remote_write_closed_stdin_preserves_live_process_and_output() {
+    let process = remote_process(WriteStatus::StdinClosed, None).await;
+    let err = process.write(b"hello").await.expect_err("closed stdin");
+    assert!(matches!(err, UnifiedExecError::StdinClosed));
+    assert!(!process.has_exited());
+    assert!(!process.cancellation_token().is_cancelled());
+    assert!(!process.session_capabilities(true).stdin);
+    process
+        .publish_output_for_test(b"still running\n".to_vec())
+        .await;
+    assert_eq!(process.snapshot_output().await, b"still running\n");
+    process
+        .terminate_confirmed()
         .await
-        .expect_err("expected write failure");
-
-    assert!(matches!(err, UnifiedExecError::WriteToStdin));
+        .expect("terminate live child");
     assert!(process.has_exited());
 }
 

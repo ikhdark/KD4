@@ -62,6 +62,14 @@ impl From<WaitOutcome> for RuntimeResponse {
     }
 }
 
+/// Output rejected by runtime admission is discarded, not retained for recovery.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct OutputLoss {
+    pub discarded_items: u64,
+    /// A lower bound because full buffers may reject values before conversion.
+    pub discarded_bytes_lower_bound: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum RuntimeResponse {
     Yielded {
@@ -80,6 +88,8 @@ pub enum RuntimeResponse {
         cell_id: CellId,
         content_items: Vec<FunctionCallOutputContentItem>,
         error_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_loss: Option<OutputLoss>,
     },
 }
 

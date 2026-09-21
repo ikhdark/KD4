@@ -93,8 +93,38 @@ impl WorldStateSection for AgentsMdState {
         role == "user" && UserInstructions::matches_text(text)
     }
 
-    fn truncate_when_oversized() -> bool {
+    fn required() -> bool {
         true
+    }
+
+    fn retained_state_supported(
+        previous: &Self::Snapshot,
+        items: &[codex_protocol::models::ResponseItem],
+    ) -> bool {
+        // Freshness-only notices do not replace the last substantive instruction body.
+        let latest = super::retained_texts(items, "user").rev().find(|text| {
+            UserInstructions::matches_text(text) && !text.contains("<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>")
+        });
+        let Some(text) = latest else {
+            return previous.text.is_none();
+        };
+        let expected_body = instruction_body(previous).unwrap_or(Self::REMOVAL_NOTICE);
+        let instructions = UserInstructions {
+            directory: previous.directory.clone(),
+            text: expected_body.to_string(),
+        };
+        let rendered = instructions.render();
+        let (header, body) = rendered
+            .split_once("<INSTRUCTIONS>\n")
+            .expect("instruction framing");
+        let header = header.trim_end();
+        text.starts_with(&format!("{header}\n\n"))
+            && text
+                .split_once("<INSTRUCTIONS>\n")
+                .is_some_and(|(_, actual)| {
+                    actual == body
+                        || actual.strip_prefix(&format!("{REPLACEMENT_NOTICE}\n\n")) == Some(body)
+                })
     }
 
     fn render_diff(

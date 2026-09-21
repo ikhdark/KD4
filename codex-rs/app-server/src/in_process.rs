@@ -477,15 +477,17 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
 
     let runtime_handle = tokio::spawn(async move {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
+        let (notification_tx, mut notification_rx) =
+            mpsc::channel::<OutgoingEnvelope>(channel_capacity);
         let auth_manager =
             AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)
                 .await;
         let analytics_events_client =
             analytics_events_client_from_config(Arc::clone(&auth_manager), args.config.as_ref());
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            analytics_events_client.clone(),
-        ));
+        let outgoing_message_sender = Arc::new(
+            OutgoingMessageSender::new(outgoing_tx, analytics_events_client.clone())
+                .with_notification_sender(notification_tx),
+        );
         #[cfg(test)]
         let _ = test_outgoing_tx.send(Arc::downgrade(&outgoing_message_sender));
 
@@ -504,6 +506,47 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             crate::transport::OutboundNotificationOptOuts::new(HashSet::new()),
         );
 
+        // Transcript backpressure belongs to this single ordered owner. Responses,
+        // interrupts and client replies continue through the independent runtime loop.
+        let mut notification_handle = tokio::spawn({
+            let event_tx = event_tx.clone();
+            let delivery_failure = delivery_failure.clone();
+            let initialized = Arc::clone(&outbound_initialized);
+            let experimental = Arc::clone(&outbound_experimental_api_enabled);
+            let opt_outs = Arc::clone(&outbound_opted_out_notification_methods);
+            async move {
+                let _delivery_owner = delivery_failure.clone().drop_guard();
+                let (tx, mut rx) = mpsc::channel(1);
+                let mut connections = HashMap::from([(
+                    IN_PROCESS_CONNECTION_ID,
+                    OutboundConnectionState::new(tx, initialized, experimental, opt_outs, None),
+                )]);
+                let mut skipped = 0;
+                loop {
+                    let envelope = tokio::select! {
+                        _ = delivery_failure.cancelled() => break,
+                        envelope = notification_rx.recv() => match envelope { Some(envelope) => envelope, None => break },
+                    };
+                    route_outgoing_envelope(&mut connections, envelope).await;
+                    // Filtering can intentionally omit a notification.
+                    let Ok(queued) = rx.try_recv() else { continue };
+                    if let OutgoingMessage::AppServerNotification(notification) = queued.message {
+                        let delivered = tokio::select! {
+                            _ = delivery_failure.cancelled() => false,
+                            delivered = forward_server_notification(&event_tx, &mut skipped, notification) => delivered,
+                        };
+                        if !delivered {
+                            delivery_failure.cancel();
+                            break;
+                        }
+                    }
+                    if let Some(ack) = queued.write_complete_tx {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
         outbound_connections.insert(
             IN_PROCESS_CONNECTION_ID,
@@ -512,7 +555,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 Arc::clone(&outbound_initialized),
                 Arc::clone(&outbound_experimental_api_enabled),
                 Arc::clone(&outbound_opted_out_notification_methods),
-                /*disconnect_sender*/ None,
+                Some(delivery_failure.clone()),
             ),
         );
         let mut outbound_handle = tokio::spawn(async move {
@@ -784,6 +827,14 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             }
         }
 
+        delivery_failure.cancel();
+        if timeout(SHUTDOWN_TIMEOUT, &mut notification_handle)
+            .await
+            .is_err()
+        {
+            notification_handle.abort();
+            let _ = notification_handle.await;
+        }
         // Settle requests queued while lossless event delivery was blocked.
         drop(client_rx);
         drop(writer_rx);
@@ -1249,18 +1300,23 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!delivery.is_finished());
 
-        timeout(Duration::from_secs(2), async {
-            let sender = client.sender();
-            loop {
-                match sender.notify(ClientNotification::Initialized) {
-                    Ok(()) => tokio::task::yield_now().await,
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                    Err(err) => panic!("client queue should remain available: {err}"),
-                }
-            }
-        })
-        .await
-        .expect("blocked lossless delivery should stop draining the client queue");
+        for request_id in 100..110 {
+            let response = timeout(
+                Duration::from_secs(2),
+                client
+                    .sender()
+                    .request(ClientRequest::ConfigRequirementsRead {
+                        request_id: RequestId::Integer(request_id),
+                        params: None,
+                    }),
+            )
+            .await
+            .expect("RPC must progress while transcript delivery is blocked")
+            .unwrap()
+            .unwrap();
+            let parsed: ConfigRequirementsReadResponse = serde_json::from_value(response).unwrap();
+            assert_eq!(parsed.requirements, None);
+        }
         drop(outgoing);
 
         timeout(Duration::from_secs(2), client.shutdown())

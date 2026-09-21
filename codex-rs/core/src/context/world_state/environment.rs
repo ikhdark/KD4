@@ -43,7 +43,17 @@ impl EnvironmentsState {
 
     pub(crate) fn with_subagents(mut self, subagents: String) -> Self {
         if !subagents.is_empty() {
-            self.subagents = Some(subagents);
+            let mut budget = codex_context_fragments::ModelContextBudget::new(1024);
+            let mut lines = Vec::new();
+            for line in subagents.lines() {
+                if !budget.try_take(line) {
+                    lines
+                        .push("Additional subagents omitted; use list_agents for current details.");
+                    break;
+                }
+                lines.push(line);
+            }
+            self.subagents = Some(lines.join("\n"));
         }
         self
     }
@@ -54,7 +64,10 @@ impl EnvironmentsState {
                 .environments
                 .iter()
                 .map(|(id, environment)| {
-                    (id.clone(), EnvironmentUpdate::Current(environment.clone()))
+                    (
+                        id.clone(),
+                        EnvironmentUpdate::Current(environment.clone(), false),
+                    )
                 })
                 .collect(),
             legacy_single: is_legacy_single(&self.environments),
@@ -74,6 +87,14 @@ impl WorldStateSection for EnvironmentsState {
 
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "user" && Self::matches_text(text)
+    }
+
+    fn required() -> bool {
+        true
+    }
+
+    fn records_delivery() -> bool {
+        true
     }
 
     fn snapshot(&self) -> Self::Snapshot {
@@ -108,6 +129,7 @@ impl WorldStateSection for EnvironmentsState {
         let current = self.snapshot();
         let empty = EnvironmentsSnapshot::default();
         let replace_all = matches!(previous, PreviousSectionState::Unknown);
+        let replace_visible_context = !matches!(previous, PreviousSectionState::Absent);
         let previous = match previous {
             PreviousSectionState::Known(previous) => previous,
             PreviousSectionState::Absent | PreviousSectionState::Unknown => &empty,
@@ -137,7 +159,23 @@ impl WorldStateSection for EnvironmentsState {
                 {
                     environment.shell = Some("unknown".to_string());
                 }
-                (id.clone(), EnvironmentUpdate::Current(environment))
+                if environment.os.is_none()
+                    && previous
+                        .environments
+                        .get(id)
+                        .is_some_and(|previous| previous.os.is_some())
+                {
+                    environment.os = Some("unknown".to_string());
+                }
+                let became_available = environment.status == EnvironmentStatus::Available
+                    && previous
+                        .environments
+                        .get(id)
+                        .is_some_and(|previous| previous.status == EnvironmentStatus::Starting);
+                (
+                    id.clone(),
+                    EnvironmentUpdate::Current(environment, became_available),
+                )
             })
             .collect::<BTreeMap<_, _>>();
         updates.extend(
@@ -150,13 +188,22 @@ impl WorldStateSection for EnvironmentsState {
         let legacy_single = is_legacy_single(&self.environments)
             && updates
                 .values()
-                .all(|update| matches!(update, EnvironmentUpdate::Current(_)));
+                .all(|update| matches!(update, EnvironmentUpdate::Current(..)));
         (replace_all || !updates.is_empty() || turn_context_values_changed || subagents_changed)
             .then(|| {
+                // Stable-context projection replaces the previous environment
+                // block. Include unchanged current fields as well as removals.
+                for (id, environment) in &self.environments {
+                    updates
+                        .entry(id.clone())
+                        .or_insert_with(|| EnvironmentUpdate::Current(environment.clone(), false));
+                }
                 Box::new(RenderedEnvironments {
                     updates,
                     legacy_single,
-                    replace_all,
+                    // This block contains all current facts. Make omission semantics explicit
+                    // so its delivery remains sufficient if an earlier clearing delta is lost.
+                    replace_all: replace_visible_context,
                     current_date: changed_value(
                         &current.current_date,
                         &previous.current_date,
@@ -209,7 +256,7 @@ struct RenderedEnvironments {
 }
 
 enum EnvironmentUpdate {
-    Current(EnvironmentState),
+    Current(EnvironmentState, bool),
     Unavailable,
 }
 
@@ -233,20 +280,26 @@ impl ContextualUserFragment for RenderedEnvironments {
                 rendered.push_str("  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n");
             }
             if self.legacy_single {
-                if let Some(EnvironmentUpdate::Current(environment)) = self.updates.values().next()
+                if let Some(EnvironmentUpdate::Current(environment, report_available)) =
+                    self.updates.values().next()
                 {
-                    push_environment_values(&mut rendered, environment, "  ");
+                    push_environment_values(&mut rendered, environment, "  ", *report_available);
                 }
             } else if !self.updates.is_empty() {
                 rendered.push_str("  <environments>\n");
                 for (id, update) in &self.updates {
                     match update {
-                        EnvironmentUpdate::Current(environment) => {
+                        EnvironmentUpdate::Current(environment, report_available) => {
                             rendered.push_str("    <environment id=\"");
                             push_xml_escaped_attribute(&mut rendered, id);
                             rendered.push('"');
                             rendered.push_str(">\n");
-                            push_environment_values(&mut rendered, environment, "      ");
+                            push_environment_values(
+                                &mut rendered,
+                                environment,
+                                "      ",
+                                *report_available,
+                            );
                             rendered.push_str("    </environment>\n");
                         }
                         EnvironmentUpdate::Unavailable => {
@@ -289,10 +342,17 @@ fn changed_value(
     previous: &Option<String>,
     cleared: &str,
 ) -> Option<String> {
-    (current != previous).then(|| current.clone().unwrap_or_else(|| cleared.to_string()))
+    current
+        .clone()
+        .or_else(|| previous.as_ref().map(|_| cleared.to_string()))
 }
 
-fn push_environment_values(rendered: &mut String, environment: &EnvironmentState, indent: &str) {
+fn push_environment_values(
+    rendered: &mut String,
+    environment: &EnvironmentState,
+    indent: &str,
+    report_available: bool,
+) {
     rendered.push_str(indent);
     rendered.push_str("<cwd>");
     push_xml_escaped_text(rendered, &environment.cwd.inferred_native_path_string());
@@ -306,6 +366,9 @@ fn push_environment_values(rendered: &mut String, environment: &EnvironmentState
     if environment.status == EnvironmentStatus::Starting {
         rendered.push_str(indent);
         rendered.push_str("<status>starting</status>\n");
+    } else if report_available {
+        rendered.push_str(indent);
+        rendered.push_str("<status>available</status>\n");
     }
     if let Some(shell) = &environment.shell {
         rendered.push_str(indent);
@@ -453,3 +516,7 @@ mod tests;
 #[cfg(test)]
 #[path = "environment_render_tests.rs"]
 mod render_tests;
+
+#[cfg(test)]
+#[path = "environment_retention_tests.rs"]
+mod retention_tests;

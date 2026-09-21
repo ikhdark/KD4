@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use codex_prompts::render_review_exit_interrupted;
@@ -18,7 +17,6 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnStartedEvent;
-use codex_protocol::review_format::format_review_findings_block;
 use codex_protocol::review_format::render_review_output_text;
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
@@ -279,16 +277,9 @@ pub(crate) async fn exit_review_mode(
     ctx: Arc<TurnContext>,
 ) {
     let (user_message, assistant_message) = if let Some(out) = review_output.clone() {
-        let mut findings_str = String::new();
-        let text = out.overall_explanation.trim();
-        if !text.is_empty() {
-            findings_str.push_str(text);
-        }
-        if !out.findings.is_empty() {
-            let block = format_review_findings_block(&out.findings, /*selection*/ None);
-            let _ = write!(findings_str, "\n{block}");
-        }
-        let rendered = render_review_exit_success(&findings_str);
+        let rendered = render_review_exit_success(
+            "The complete review findings and verdict are in the following assistant message.",
+        );
         let assistant_message = render_review_output_text(&out);
         (rendered, assistant_message)
     } else {
@@ -299,7 +290,7 @@ pub(crate) async fn exit_review_mode(
         (rendered, assistant_message)
     };
 
-    session
+    if let Err(error) = session
         .record_conversation_items(
             &ctx,
             &[ResponseItem::Message {
@@ -310,7 +301,19 @@ pub(crate) async fn exit_review_mode(
                 internal_chat_message_metadata_passthrough: None,
             }],
         )
-        .await;
+        .await
+    {
+        session
+            .send_event(
+                &ctx,
+                EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: format!("Could not record review output: {error}"),
+                    codex_error_info: None,
+                }),
+            )
+            .await;
+        return;
+    }
 
     let item = TurnItem::ExitedReviewMode(ExitedReviewModeItem {
         id: uuid::Uuid::now_v7().to_string(),
@@ -318,7 +321,7 @@ pub(crate) async fn exit_review_mode(
     });
     session.emit_turn_item_started(ctx.as_ref(), &item).await;
     session.emit_turn_item_completed(ctx.as_ref(), item).await;
-    session
+    if let Err(error) = session
         .record_response_item_and_emit_turn_item(
             ctx.as_ref(),
             ResponseItem::Message {
@@ -331,7 +334,18 @@ pub(crate) async fn exit_review_mode(
                 internal_chat_message_metadata_passthrough: None,
             },
         )
-        .await;
+        .await
+    {
+        session
+            .send_event(
+                &ctx,
+                EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: format!("Could not record review assistant output: {error}"),
+                    codex_error_info: None,
+                }),
+            )
+            .await;
+    }
 
     // Review turns can run before any regular user turn, so explicitly
     // materialize rollout persistence. Do this after emitting review output so

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -45,7 +46,13 @@ struct GoalRuntimeInner {
     thread_manager: Weak<ThreadManager>,
     accounting_state: Arc<GoalAccountingState>,
     enabled: AtomicBool,
-    continuation_suppressed: AtomicBool,
+    suppressed_goal: Mutex<Option<String>>,
+    live_turn: Mutex<Option<String>>,
+    live_usage: Mutex<(
+        codex_protocol::config_types::ModeKind,
+        codex_protocol::protocol::TokenUsage,
+    )>,
+    pending_steering: Mutex<Option<ResponseItem>>,
     tools_available_for_thread: bool,
     goal_state_lock: Semaphore,
 }
@@ -98,10 +105,120 @@ impl GoalRuntimeHandle {
                 thread_manager,
                 accounting_state,
                 enabled: AtomicBool::new(config.enabled),
-                continuation_suppressed: AtomicBool::new(false),
+                suppressed_goal: Mutex::new(None),
+                live_turn: Mutex::new(None),
+                live_usage: Mutex::new((
+                    codex_protocol::config_types::ModeKind::Default,
+                    Default::default(),
+                )),
+                pending_steering: Mutex::new(None),
                 tools_available_for_thread: config.tools_available_for_thread,
                 goal_state_lock: Semaphore::new(/*permits*/ 1),
             }),
+        }
+    }
+
+    pub(crate) fn start_live_turn(
+        &self,
+        turn_id: &str,
+        mode: codex_protocol::config_types::ModeKind,
+        usage: &codex_protocol::protocol::TokenUsage,
+    ) {
+        *self
+            .inner
+            .live_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (mode, usage.clone());
+        *self
+            .inner
+            .live_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn_id.to_string());
+    }
+
+    pub(crate) fn record_live_usage(
+        &self,
+        turn_id: &str,
+        usage: &codex_protocol::protocol::TokenUsage,
+    ) {
+        if self
+            .inner
+            .live_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            == Some(turn_id)
+        {
+            self.inner
+                .live_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .1 = usage.clone();
+        }
+    }
+
+    pub(crate) async fn prepare_goal_creation(&self, turn_id: &str) -> Result<(), String> {
+        // A new goal must not overwrite the frozen ledger of a completed goal.
+        self.retry_pending_goal_progress(None).await?;
+        if self.inner.accounting_state.current_turn_id().is_none() && self.admits_tool(turn_id) {
+            let (mode, usage) = self
+                .inner
+                .live_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            self.inner
+                .accounting_state
+                .start_turn(turn_id, mode, &usage);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_live_turn(&self, turn_id: &str) {
+        let mut live = self
+            .inner
+            .live_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if live.as_deref() == Some(turn_id) {
+            *live = None;
+        }
+    }
+
+    pub(crate) fn admits_tool(&self, turn_id: &str) -> bool {
+        self.tools_visible()
+            && self
+                .inner
+                .live_turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref()
+                == Some(turn_id)
+    }
+
+    pub(crate) fn suppress_goal(&self, goal_id: &str) {
+        *self
+            .inner
+            .suppressed_goal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(goal_id.to_string());
+    }
+
+    pub(crate) async fn retry_goal_steering(&self) {
+        let item = self
+            .inner
+            .pending_steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(item) = item
+            && self.inject_active_turn_steering(item).await
+        {
+            *self
+                .inner
+                .pending_steering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
     }
 
@@ -188,14 +305,23 @@ impl GoalRuntimeHandle {
         self.inner
             .analytics
             .status_changed(&goal, previous_status, GoalEventAttribution::NoTurn);
-        let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
-            !replaced_existing_goal && previous_goal.objective != goal.objective
+        let objective_changed = previous_goal.as_ref().is_none_or(|previous_goal| {
+            replaced_existing_goal || previous_goal.objective != goal.objective
         });
+        if goal.status != codex_state::ThreadGoalStatus::Active {
+            *self
+                .inner
+                .pending_steering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
         match goal.status {
             codex_state::ThreadGoalStatus::Active => {
-                self.inner
-                    .continuation_suppressed
-                    .store(false, Ordering::Relaxed);
+                *self
+                    .inner
+                    .suppressed_goal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 if self.inner.accounting_state.current_turn_id().is_some() {
                     let _ = self
                         .inner
@@ -207,8 +333,13 @@ impl GoalRuntimeHandle {
                         .mark_idle_goal_active(goal.goal_id.clone());
                 }
                 if objective_changed {
-                    let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
-                    self.inject_active_turn_steering(item).await;
+                    let item = objective_updated_steering_item(&goal);
+                    *self
+                        .inner
+                        .pending_steering
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(item);
+                    self.retry_goal_steering().await;
                 }
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
@@ -234,6 +365,11 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
+        *self
+            .inner
+            .pending_steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.inner.analytics.cleared(&goal);
         self.inner.accounting_state.clear_active_goal();
         Ok(())
@@ -265,9 +401,16 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
-        self.inner
-            .continuation_suppressed
-            .store(true, Ordering::Relaxed);
+        if let Some(goal) = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .get_thread_goal(self.thread_id())
+            .await
+            .map_err(|err| err.to_string())?
+        {
+            self.suppress_goal(&goal.goal_id);
+        }
         let (event_name, status) = match reason {
             ActiveGoalStopReason::TurnError => {
                 ("turn-error", codex_state::ThreadGoalStatus::Blocked)
@@ -371,9 +514,6 @@ impl GoalRuntimeHandle {
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
         // Recheck stopping state after any mutation we waited for has completed.
         let _goal_state_permit = self.goal_state_permit().await?;
-        if self.inner.continuation_suppressed.load(Ordering::Relaxed) {
-            return Ok(());
-        }
         if !self.tools_visible() {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
@@ -404,7 +544,17 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
-        let item = continuation_steering_item(&protocol_goal_from_state(goal));
+        if self
+            .inner
+            .suppressed_goal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            == Some(goal.goal_id.as_str())
+        {
+            return Ok(());
+        }
+        let item = continuation_steering_item(&goal);
 
         if let Err(err) = thread.try_start_turn_if_idle(vec![item]).await {
             let reason = err.reason();
@@ -438,8 +588,8 @@ impl GoalRuntimeHandle {
             tracing::debug!("skipping goal steering because live thread is unavailable");
             return false;
         };
-        if thread.inject_if_running(vec![item]).await.is_err() {
-            tracing::debug!("skipping goal steering because no turn is active");
+        if let Err(error) = thread.inject_if_running(vec![item]).await {
+            tracing::debug!(%error, "goal steering was not admitted");
             return false;
         }
         true
@@ -452,14 +602,17 @@ impl GoalRuntimeHandle {
         mode: codex_state::GoalAccountingMode,
         budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
     ) -> Result<Option<AccountedGoalProgress>, String> {
-        self.retry_pending_goal_progress(Some(turn_id)).await?;
-        self.account_goal_progress_for_turn(
-            turn_id,
-            event_id,
-            mode,
-            budget_limited_goal_disposition,
-        )
-        .await
+        let pending_result = self.retry_pending_goal_progress(Some(turn_id)).await;
+        let progress = self
+            .account_goal_progress_for_turn(
+                turn_id,
+                event_id,
+                mode,
+                budget_limited_goal_disposition,
+            )
+            .await?;
+        pending_result?;
+        Ok(progress)
     }
 
     pub(crate) async fn retry_pending_goal_progress(

@@ -1,10 +1,8 @@
 use std::borrow::Cow;
-use std::path::Path;
 
 use super::command_search::rg_search_path_operands;
 use crate::shell::ShellType;
 use crate::tools::handlers::command_shape::CommandInvocation;
-use codex_shell_command::quote_powershell_single_quoted;
 
 #[cfg(test)]
 use super::command_search::RgSearchBreadth;
@@ -15,9 +13,6 @@ use super::command_search::classify_rg_search_narrowing_without_native_scope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandPreflightIssueCode {
-    UnbalancedQuotes,
-    ShellMismatch,
-    WindowsLiteralPathRequired,
     DirectArgvPowerShellCmdlet,
     KnownFlagTypo,
     RgLiteralGlobPath,
@@ -31,7 +26,6 @@ pub(crate) enum CommandPreflightRetry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CommandPreflightRejected {
-    Script(String),
     Argv(Vec<String>),
 }
 
@@ -106,9 +100,6 @@ impl CommandPreflightIssue {
 impl CommandPreflightIssueCode {
     fn tool_error_kind(self) -> &'static str {
         match self {
-            Self::UnbalancedQuotes => "command_preflight_unbalanced_quotes",
-            Self::ShellMismatch => "command_preflight_shell_mismatch",
-            Self::WindowsLiteralPathRequired => "windows_literal_path_required",
             Self::DirectArgvPowerShellCmdlet => "direct_argv_powershell_cmdlet",
             Self::KnownFlagTypo => "known_flag_typo",
             Self::RgLiteralGlobPath => "rg_literal_glob_path",
@@ -119,7 +110,6 @@ impl CommandPreflightIssueCode {
 impl CommandPreflightRejected {
     fn render_for_model(&self) -> String {
         match self {
-            Self::Script(script) => truncate(script),
             Self::Argv(argv) => truncate(&codex_shell_command::parse_command::shlex_join(argv)),
         }
     }
@@ -159,17 +149,9 @@ fn preflight_command_issue(
     shell_type: Option<ShellType>,
 ) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
     let preflight_shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
-    // Static parsing supports the targeted preflight lints below, but it is not
-    // an execution-safety boundary. Dynamic shell constructs remain valid and
-    // still receive every lint that can operate on the original script.
+    // Parsing here extracts validation metadata; the target shell owns script
+    // syntax and expansion. Heuristic quote/name/path checks can reject valid scripts.
     let argv_commands = argv_commands(command, preflight_shell_type).unwrap_or_default();
-
-    if let Some(script) = shell_script(command, preflight_shell_type) {
-        let script = script.as_ref();
-        lint_balanced_quotes(script, preflight_shell_type)?;
-        lint_shell_mismatch(script, preflight_shell_type, &argv_commands)?;
-        lint_windows_path_shape(script, preflight_shell_type, &argv_commands)?;
-    }
 
     for argv in &argv_commands {
         lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)?;
@@ -383,36 +365,6 @@ fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
-pub(crate) fn powershell_single_quoted_literal(path: &Path) -> String {
-    quote_powershell_single_quoted(&path.to_string_lossy())
-}
-
-pub(crate) fn powershell_literal_path_arg(path: &Path) -> Vec<String> {
-    vec![
-        "-LiteralPath".to_string(),
-        powershell_single_quoted_literal(path),
-    ]
-}
-
-pub(crate) fn cmd_quoted_path(path: &Path) -> String {
-    format!("\"{}\"", path.to_string_lossy().replace('"', "\"\""))
-}
-
-fn shell_script(command: &[String], shell_type: Option<ShellType>) -> Option<Cow<'_, str>> {
-    match shell_type {
-        Some(ShellType::Bash | ShellType::Zsh | ShellType::Sh) => {
-            codex_shell_command::bash::extract_bash_command(command)
-                .map(|(_, script)| Cow::Borrowed(script))
-        }
-        Some(ShellType::PowerShell) => {
-            codex_shell_command::powershell::extract_powershell_command(command)
-                .map(|(_, script)| Cow::Borrowed(script))
-        }
-        Some(ShellType::Cmd) => extract_cmd_command(command),
-        None => None,
-    }
-}
-
 fn extract_cmd_command(command: &[String]) -> Option<Cow<'_, str>> {
     for (index, arg) in command.iter().skip(1).enumerate() {
         let trimmed = arg.trim();
@@ -588,297 +540,6 @@ fn split_cmd_words(command: &str) -> Option<Vec<String>> {
         words.push(word);
     }
     Some(words)
-}
-
-fn lint_balanced_quotes(
-    script: &str,
-    shell_type: Option<ShellType>,
-) -> Result<(), CommandPreflightIssue> {
-    let normalized_script = script_without_multiline_literal_bodies(script, shell_type);
-    let (single, double) = match shell_type {
-        Some(ShellType::PowerShell) => powershell_unclosed_quotes(&normalized_script),
-        Some(ShellType::Cmd) => (false, cmd_has_unclosed_double_quote(&normalized_script)),
-        Some(ShellType::Bash | ShellType::Zsh | ShellType::Sh) | None => {
-            posix_unclosed_quotes(&normalized_script)
-        }
-    };
-
-    if single || double {
-        let quote = if single { "single" } else { "double" };
-        return Err(CommandPreflightIssue::reject(
-            CommandPreflightIssueCode::UnbalancedQuotes,
-            CommandPreflightRejected::Script(script.to_string()),
-            format!("missing closing {quote} quote."),
-            Some(
-                "regenerate the command with balanced quotes, or use structured argv for simple commands."
-                    .to_string(),
-            ),
-            None,
-        ));
-    }
-
-    Ok(())
-}
-
-fn posix_unclosed_quotes(script: &str) -> (bool, bool) {
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    let mut in_comment = false;
-    let mut word_start = true;
-
-    for ch in script.chars() {
-        if in_comment {
-            if ch == '\n' {
-                in_comment = false;
-                word_start = true;
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            if ch != '\n' {
-                word_start = false;
-            }
-            continue;
-        }
-        if !single && !double && word_start && ch == '#' {
-            in_comment = true;
-            continue;
-        }
-        word_start = !single && !double && (ch.is_whitespace() || ";|&()".contains(ch));
-        if ch == '\\' && !single {
-            escaped = true;
-            continue;
-        }
-        match ch {
-            '\'' if !double => single = !single,
-            '"' if !single => double = !double,
-            _ => {}
-        }
-    }
-    (single, double)
-}
-
-fn powershell_unclosed_quotes(script: &str) -> (bool, bool) {
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    let mut in_comment = false;
-    let mut chars = script.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if in_comment {
-            if matches!(ch, '\n' | '\r') {
-                in_comment = false;
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if !single && ch == '`' {
-            escaped = true;
-            continue;
-        }
-        if !single && !double && ch == '#' {
-            in_comment = true;
-            continue;
-        }
-        match ch {
-            '\'' if !double => {
-                if single && chars.peek() == Some(&'\'') {
-                    chars.next();
-                } else {
-                    single = !single;
-                }
-            }
-            '"' if !single => double = !double,
-            _ => {}
-        }
-    }
-    (single, double)
-}
-
-fn cmd_has_unclosed_double_quote(script: &str) -> bool {
-    let mut double = false;
-    let mut escaped = false;
-    for ch in script.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '^' {
-            escaped = true;
-        } else if ch == '"' {
-            double = !double;
-        }
-    }
-    double
-}
-
-fn lint_shell_mismatch(
-    script: &str,
-    shell_type: Option<ShellType>,
-    argv_commands: &[Vec<String>],
-) -> Result<(), CommandPreflightIssue> {
-    match shell_type {
-        Some(ShellType::PowerShell)
-            if argv_commands.iter().any(|argv| {
-                argv.first().is_some_and(|program| {
-                    matches_ignore_ascii_case(program_name(program), &["export", "source"])
-                })
-            }) || powershell_contains_active_marker(script, "2>/dev/null")
-                || powershell_contains_active_marker(script, " && \\")
-                || powershell_contains_active_marker(script, " || \\") =>
-        {
-            Err(CommandPreflightIssue::reject(
-                CommandPreflightIssueCode::ShellMismatch,
-                CommandPreflightRejected::Script(script.to_string()),
-                "this looks like POSIX shell syntax, but the target shell is PowerShell."
-                    .to_string(),
-                Some("rewrite the command for PowerShell.".to_string()),
-                None,
-            ))
-        }
-        Some(ShellType::Cmd) if starts_with_powershell_cmdlet(script) => {
-            Err(CommandPreflightIssue::reject(
-                CommandPreflightIssueCode::ShellMismatch,
-                CommandPreflightRejected::Script(script.to_string()),
-                "this looks like a PowerShell cmdlet or alias, but the target shell is cmd."
-                    .to_string(),
-                Some("run it with PowerShell or rewrite it for cmd.".to_string()),
-                None,
-            ))
-        }
-        Some(ShellType::Bash | ShellType::Zsh | ShellType::Sh)
-            if argv_commands.iter().any(|argv| {
-                argv.first()
-                    .is_some_and(|program| is_powershell_cmdlet_or_alias(program_name(program)))
-            }) || (argv_commands.is_empty() && starts_with_powershell_cmdlet(script)) =>
-        {
-            Err(CommandPreflightIssue::reject(
-                CommandPreflightIssueCode::ShellMismatch,
-                CommandPreflightRejected::Script(script.to_string()),
-                "this looks like PowerShell syntax, but the target shell is POSIX.".to_string(),
-                Some("rewrite the command for POSIX shell or select PowerShell.".to_string()),
-                None,
-            ))
-        }
-        _ => Ok(()),
-    }
-}
-
-fn lint_windows_path_shape(
-    script: &str,
-    shell_type: Option<ShellType>,
-    argv_commands: &[Vec<String>],
-) -> Result<(), CommandPreflightIssue> {
-    if shell_type != Some(ShellType::PowerShell) || !contains_windows_drive_path(script) {
-        return Ok(());
-    }
-
-    let has_filesystem_cmdlet = argv_commands.iter().any(|argv| {
-        argv.first()
-            .is_some_and(|program| is_powershell_filesystem_cmdlet(program_name(program)))
-    });
-    let has_literal_path_parameter = argv_commands
-        .iter()
-        .any(|argv| has_powershell_parameter(argv, "LiteralPath"));
-    if has_filesystem_cmdlet
-        && !has_literal_path_parameter
-        && argv_commands
-            .iter()
-            .any(|argv| powershell_path_parameter_requires_literal(argv))
-    {
-        let example_path = Path::new("C:\\path with spaces\\[name]");
-        let powershell_example = powershell_literal_path_arg(example_path).join(" ");
-        return Err(CommandPreflightIssue::reject(
-            CommandPreflightIssueCode::WindowsLiteralPathRequired,
-            CommandPreflightRejected::Script(script.to_string()),
-            "PowerShell filesystem paths with spaces or wildcard characters should use `-LiteralPath`."
-                .to_string(),
-            Some(format!(
-                "pass the path as `{powershell_example}`.\ncmd quoting example: {}.",
-                cmd_quoted_path(example_path),
-            )),
-            None,
-        ));
-    }
-
-    Ok(())
-}
-
-fn powershell_contains_active_marker(script: &str, marker: &str) -> bool {
-    let mut characters = script.char_indices().peekable();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_comment = false;
-    let mut escaped = false;
-
-    while let Some((index, character)) = characters.next() {
-        if in_comment {
-            if matches!(character, '\r' | '\n') {
-                in_comment = false;
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '`' && !in_single_quote {
-            escaped = true;
-            continue;
-        }
-        if character == '\'' && !in_double_quote {
-            if in_single_quote && characters.peek().is_some_and(|(_, next)| *next == '\'') {
-                characters.next();
-            } else {
-                in_single_quote = !in_single_quote;
-            }
-            continue;
-        }
-        if character == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            continue;
-        }
-        if character == '#' && !in_single_quote && !in_double_quote {
-            in_comment = true;
-            continue;
-        }
-        if !in_single_quote && !in_double_quote && script[index..].starts_with(marker) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn powershell_path_parameter_requires_literal(argv: &[String]) -> bool {
-    let mut index = 1;
-    while let Some(argument) = argv.get(index) {
-        let Some(rest) = argument.trim_start().strip_prefix('-') else {
-            index += 1;
-            continue;
-        };
-        let (name, inline_value) = rest
-            .split_once(':')
-            .or_else(|| rest.split_once('='))
-            .map_or((rest, None), |(name, value)| (name, Some(value)));
-        if name.eq_ignore_ascii_case("Path") {
-            let value = inline_value.or_else(|| argv.get(index + 1).map(String::as_str));
-            return value.is_some_and(|value| {
-                value
-                    .chars()
-                    .any(|character| matches!(character, '*' | '?' | '[' | ']'))
-            });
-        }
-        index += 1;
-    }
-
-    false
 }
 
 fn lint_known_flag_typos(argv: &[String]) -> Result<(), CommandPreflightIssue> {
@@ -1180,43 +841,6 @@ fn is_windows_executable_extension(extension: &str) -> bool {
     matches_ignore_ascii_case(extension, &["bat", "cmd", "com", "exe"])
 }
 
-fn starts_with_powershell_cmdlet(script: &str) -> bool {
-    let trimmed =
-        script.trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&'));
-    let first = trimmed
-        .split_once(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&'))
-        .map_or(trimmed, |(first, _)| first);
-    is_powershell_cmdlet_or_alias(program_name(first))
-}
-
-fn is_powershell_cmdlet_or_alias(command: &str) -> bool {
-    is_known_powershell_cmdlet(command)
-        || is_known_powershell_alias(command)
-        || has_powershell_cmdlet_shape(command)
-}
-
-fn is_powershell_filesystem_cmdlet(command: &str) -> bool {
-    is_known_powershell_filesystem_cmdlet(command)
-        || is_known_powershell_filesystem_alias(command)
-        || has_powershell_filesystem_cmdlet_shape(command)
-}
-
-fn is_known_powershell_filesystem_cmdlet(command: &str) -> bool {
-    matches_ignore_ascii_case(
-        command,
-        &[
-            "Get-ChildItem",
-            "Get-Content",
-            "Set-Content",
-            "Remove-Item",
-            "Move-Item",
-            "Copy-Item",
-            "Test-Path",
-            "Resolve-Path",
-        ],
-    )
-}
-
 fn is_known_powershell_cmdlet(command: &str) -> bool {
     matches_ignore_ascii_case(
         command,
@@ -1248,233 +872,10 @@ fn is_known_powershell_alias(command: &str) -> bool {
     )
 }
 
-fn is_known_powershell_filesystem_alias(command: &str) -> bool {
-    matches_ignore_ascii_case(
-        command,
-        &[
-            "cat", "copy", "cp", "cpi", "dir", "gc", "gci", "ls", "mi", "move", "mv", "ri", "rm",
-            "rmdir", "rvpa", "sc", "type",
-        ],
-    )
-}
-
-fn has_powershell_cmdlet_shape(command: &str) -> bool {
-    let Some((verb, noun)) = command.split_once('-') else {
-        return false;
-    };
-    !noun.is_empty()
-        && is_common_powershell_verb(verb)
-        && noun
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-}
-
-fn has_powershell_filesystem_cmdlet_shape(command: &str) -> bool {
-    let Some((verb, noun)) = command.split_once('-') else {
-        return false;
-    };
-    matches_ignore_ascii_case(
-        verb,
-        &["Copy", "Get", "Move", "Remove", "Resolve", "Set", "Test"],
-    ) && noun
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-        && matches_ignore_ascii_case(
-            noun,
-            &["ChildItem", "Content", "Item", "ItemProperty", "Path"],
-        )
-}
-
-fn is_common_powershell_verb(verb: &str) -> bool {
-    matches_ignore_ascii_case(
-        verb,
-        &[
-            "Add",
-            "Clear",
-            "Compare",
-            "ConvertFrom",
-            "ConvertTo",
-            "Copy",
-            "Disable",
-            "Enable",
-            "Enter",
-            "Exit",
-            "Export",
-            "Find",
-            "ForEach",
-            "Format",
-            "Get",
-            "Group",
-            "Import",
-            "Install",
-            "Invoke",
-            "Join",
-            "Measure",
-            "Move",
-            "New",
-            "Out",
-            "Pop",
-            "Push",
-            "Read",
-            "Receive",
-            "Register",
-            "Remove",
-            "Rename",
-            "Resolve",
-            "Restart",
-            "Resume",
-            "Save",
-            "Search",
-            "Select",
-            "Send",
-            "Set",
-            "Sort",
-            "Split",
-            "Start",
-            "Stop",
-            "Tee",
-            "Test",
-            "Uninstall",
-            "Unregister",
-            "Update",
-            "Wait",
-            "Where",
-            "Write",
-        ],
-    )
-}
-
-fn has_powershell_parameter(argv: &[String], parameter: &str) -> bool {
-    argv.iter().skip(1).any(|arg| {
-        powershell_parameter_name(arg).is_some_and(|name| name.eq_ignore_ascii_case(parameter))
-    })
-}
-
-fn powershell_parameter_name(arg: &str) -> Option<&str> {
-    let rest = arg.trim_start().strip_prefix('-')?;
-    let name = rest.split_once(':').map_or(rest, |(name, _)| name);
-    let name = name.split_once('=').map_or(name, |(name, _)| name);
-    (!name.is_empty()).then_some(name)
-}
-
 pub(super) fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
         .any(|candidate| value.eq_ignore_ascii_case(candidate))
-}
-
-fn contains_windows_drive_path(script: &str) -> bool {
-    let bytes = script.as_bytes();
-    bytes
-        .windows(3)
-        .any(|window| window[0].is_ascii_alphabetic() && window[1] == b':' && window[2] == b'\\')
-}
-
-fn script_without_multiline_literal_bodies(script: &str, shell_type: Option<ShellType>) -> String {
-    match shell_type {
-        Some(ShellType::Bash | ShellType::Zsh | ShellType::Sh) => {
-            strip_posix_heredoc_bodies(script)
-        }
-        Some(ShellType::PowerShell) => strip_powershell_here_string_bodies(script),
-        _ => script.to_string(),
-    }
-}
-
-fn strip_posix_heredoc_bodies(script: &str) -> String {
-    let mut rendered = String::new();
-    let mut pending_delimiters = Vec::<String>::new();
-    let mut lines = script.lines();
-
-    while let Some(line) = lines.next() {
-        rendered.push_str(line);
-        rendered.push('\n');
-        pending_delimiters.extend(posix_heredoc_delimiters(line));
-
-        while let Some(delimiter) = pending_delimiters.first() {
-            let Some(body_line) = lines.next() else {
-                return rendered;
-            };
-            if body_line == delimiter {
-                rendered.push_str(body_line);
-                rendered.push('\n');
-                pending_delimiters.remove(0);
-            }
-        }
-    }
-
-    rendered
-}
-
-fn posix_heredoc_delimiters(line: &str) -> Vec<String> {
-    let mut delimiters = Vec::new();
-    let mut rest = line;
-    while let Some(index) = rest.find("<<") {
-        rest = &rest[index + 2..];
-        if rest.starts_with('-') {
-            rest = &rest[1..];
-        }
-        rest = rest.trim_start();
-        let Some((delimiter, tail)) = read_shell_word(rest) else {
-            break;
-        };
-        if !delimiter.is_empty() {
-            delimiters.push(delimiter);
-        }
-        rest = tail;
-    }
-    delimiters
-}
-
-fn read_shell_word(value: &str) -> Option<(String, &str)> {
-    let mut word = String::new();
-    let mut chars = value.char_indices().peekable();
-    let mut end = 0;
-    while let Some((index, ch)) = chars.next() {
-        end = index + ch.len_utf8();
-        match ch {
-            '\'' | '"' => {
-                let quote = ch;
-                for (_, quoted_ch) in chars.by_ref() {
-                    end += quoted_ch.len_utf8();
-                    if quoted_ch == quote {
-                        break;
-                    }
-                    word.push(quoted_ch);
-                }
-            }
-            ch if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')') => {
-                end = index;
-                break;
-            }
-            _ => word.push(ch),
-        }
-    }
-    (!word.is_empty()).then(|| (word, &value[end..]))
-}
-
-fn strip_powershell_here_string_bodies(script: &str) -> String {
-    let mut rendered = String::new();
-    let mut in_here_string: Option<&str> = None;
-    for line in script.lines() {
-        if let Some(terminator) = in_here_string {
-            if line.trim_start().starts_with(terminator) {
-                rendered.push_str(line);
-                rendered.push('\n');
-                in_here_string = None;
-            }
-            continue;
-        }
-
-        rendered.push_str(line);
-        rendered.push('\n');
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("@'") {
-            in_here_string = Some("'@");
-        } else if trimmed.starts_with("@\"") {
-            in_here_string = Some("\"@");
-        }
-    }
-    rendered
 }
 
 fn truncate(value: &str) -> String {

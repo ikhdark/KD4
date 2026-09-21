@@ -23,8 +23,10 @@ from typing import Any
 import tomllib
 
 try:
+    from .process_owner import owned_process, CleanupFailed
     from .rust_tool_env import cargo_package_specs
 except ImportError:
+    from process_owner import owned_process, CleanupFailed
     from rust_tool_env import cargo_package_specs
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -410,19 +412,25 @@ def _stdout_text(result: subprocess.CompletedProcess[str]) -> str:
 
 
 def _stop_process_tree(process: subprocess.Popen) -> None:
-    if os.name == "nt":
+    if getattr(process, "_codex_owned_job", None) is not None:
+        import time
+
+        process._codex_owned_job.stop(time.monotonic() + 15)
+    elif os.name == "nt":
         subprocess.run(
             ["taskkill", "/PID", str(process.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            check=False,
+            timeout=15,
+            check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    process.wait()
+    process.wait(timeout=15)
 
 
 def _default_executor(
@@ -463,18 +471,39 @@ def _default_executor(
             )
             paths[name] = Path(log.name)
             streams[name] = log
-        process = subprocess.Popen(
-            list(args),
-            cwd=cwd,
-            env=dict(env),
-            **streams,
-            start_new_session=os.name != "nt",
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        process = stack.enter_context(
+            owned_process(
+                list(args),
+                cwd=cwd,
+                env=dict(env),
+                **streams,
+                start_new_session=os.name != "nt",
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                if os.name == "nt"
+                else 0,
+            )
         )
         try:
             returncode = process.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
-            _stop_process_tree(process)
+            try:
+                _stop_process_tree(process)
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                KeyboardInterrupt,
+                CleanupFailed,
+            ) as cleanup_error:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                raise RunnerError(
+                    f"command cleanup_failed; process tree {process.pid} is unconfirmed; "
+                    + "; ".join(f"Full {name}: {path}" for name, path in paths.items()),
+                    outcome="cleanup_failed",
+                ) from cleanup_error
             outcome = "cancelled" if isinstance(exc, KeyboardInterrupt) else "timed_out"
             logs = "\n".join(f"Full {name}: {path}" for name, path in paths.items())
             raise RunnerError(
@@ -761,7 +790,7 @@ class RustTestRunner:
                     capture=CAPTURE_BOTH,
                 )
             except RunnerError as error:
-                if error.outcome in {"cancelled", "timed_out"}:
+                if error.outcome in {"cancelled", "timed_out", "cleanup_failed"}:
                     raise
                 failures.append(error)
                 continue
@@ -773,14 +802,25 @@ class RustTestRunner:
             skipped = False
             zero_tests = False
             expected = set(step.tests)
+            suffix = (
+                f"bin/{target.selector_value}"
+                if target.selector_kind == "bin"
+                else target.selector_value
+            )
+            expected_binary = (
+                target.package
+                if target.selector_kind == "lib"
+                else f"{target.package}::{suffix}"
+            )
             for stream in ("stdout", "stderr"):
                 for line in _output_lines(result, stream):
                     match = re.fullmatch(
-                        r"\s*PASS\s+\[[^]\r\n]+\]\s+\S+\s+(\S+)\s*", line
+                        r"\s*PASS\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
+                        line,
                     )
                     if match:
-                        test = match.group(1)
-                        if test in expected:
+                        binary, test = match.groups()
+                        if binary == expected_binary and test in expected:
                             passed[test] = min(2, passed.get(test, 0) + 1)
                         else:
                             unexpected = True
@@ -989,6 +1029,7 @@ class RustTestRunner:
             "cargo",
             "nextest",
             verb,
+            "--locked",
             "--target-dir",
             str(self.target_dir),
             *target.selection_args(),
@@ -1031,6 +1072,7 @@ class RustTestRunner:
         return [
             "cargo",
             "build",
+            "--locked",
             "--message-format=json-render-diagnostics",
             "--target-dir",
             str(self.target_dir),
@@ -1124,12 +1166,16 @@ class RustTestRunner:
         env: Mapping[str, str],
         capture: str,
     ) -> subprocess.CompletedProcess[str]:
-        result = self.executor(
-            list(args),
-            cwd=self.cwd,
-            env=env,
-            capture=capture,
-        )
+        try:
+            result = self.executor(
+                list(args),
+                cwd=self.cwd,
+                env=env,
+                capture=capture,
+            )
+        except CleanupFailed as error:
+            (self.target_dir / ".lane-cleanup-unconfirmed").write_text(str(error))
+            raise RunnerError(str(error), outcome="cleanup_failed") from error
         if result.returncode != 0:
             # A CAPTURE_STDOUT command captured only machine-readable output and
             # already streamed its diagnostics to the terminal.
@@ -1437,7 +1483,7 @@ def load_metadata(
             raise RunnerError("command timeout must be a finite positive number")
         env["CODEX_RUST_TEST_TIMEOUT_SECS"] = str(command_timeout_seconds)
     result = executor(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
         cwd=cwd,
         env=env,
         capture=CAPTURE_BOTH,

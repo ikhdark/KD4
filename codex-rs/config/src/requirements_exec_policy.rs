@@ -163,6 +163,9 @@ impl RequirementsExecPolicyToml {
             let (first_token, remaining_tokens) = pattern_tokens
                 .split_first()
                 .ok_or(RequirementsExecPolicyParseError::EmptyPattern { rule_index })?;
+            first_token
+                .validate_program()
+                .map_err(|err| invalid_pattern_token_from_execpolicy(err, rule_index, 0))?;
 
             let rest: Arc<[PatternToken]> = remaining_tokens.to_vec().into();
 
@@ -304,7 +307,29 @@ mod tests {
                 rule_index: 0,
                 token_index: 0,
                 ref reason,
-            } if reason == "pattern alternatives cannot include empty tokens"
+            } if reason == "token cannot be empty"
         ));
+    }
+
+    #[test]
+    fn requirements_policy_preserves_literal_blank_arguments() {
+        let config: RequirementsExecPolicyToml = toml::from_str(
+            "[[prefix_rules]]\npattern = [{ token = 'git' }, { any_of = ['', ' '] }]\ndecision = 'forbidden'\n",
+        ).unwrap();
+        let policy = config.to_policy().unwrap();
+        for argument in ["", " "] {
+            assert_eq!(
+                policy
+                    .check(&["git".into(), argument.into()], &|_| Decision::Allow)
+                    .decision,
+                Decision::Forbidden
+            );
+        }
+        assert_eq!(
+            policy
+                .check(&["git".into(), "status".into()], &|_| Decision::Allow)
+                .decision,
+            Decision::Allow
+        );
     }
 }

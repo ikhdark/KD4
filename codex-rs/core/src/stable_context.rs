@@ -12,7 +12,6 @@ use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
-use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_utils_output_truncation::approx_token_count;
 use sha2::Digest;
@@ -27,7 +26,6 @@ use std::cell::Cell;
 #[cfg(test)]
 std::thread_local! {
     static MANIFEST_FINGERPRINT_CALLS: Cell<usize> = const { Cell::new(0) };
-    static COMPACT_CATALOG_CALLS: Cell<usize> = const { Cell::new(0) };
     static CLASSIFY_STABLE_TEXT_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -772,7 +770,6 @@ fn project_items(
 ) -> (Vec<ResponseItem>, Vec<StableContextComponent>) {
     let selected_skill_indexes =
         current_selected_skill_indexes(items, occurrences, latest_real_user);
-    let selected_skills_active = !selected_skill_indexes.is_empty();
     let mut latest_by_slot = HashMap::<StableContextSlot, usize>::new();
     for (index, occurrence) in occurrences.iter().enumerate() {
         if occurrence.slot != StableContextSlot::SelectedSkill {
@@ -804,29 +801,6 @@ fn project_items(
                 || occurrence_matches_latest_user_turn(items, occurrence, latest_real_user)
         });
 
-    let compact_catalogs = if selected_skills_active {
-        [
-            StableContextSlot::SkillCatalog,
-            StableContextSlot::ExtensionSkillCatalog,
-            StableContextSlot::EnvironmentSkillCatalog,
-        ]
-        .into_iter()
-        .filter_map(|slot| {
-            latest_by_slot
-                .get(&slot)
-                .map(|occurrence_index| (slot, occurrence_index))
-        })
-        .map(|(slot, occurrence_index)| {
-            (
-                *occurrence_index,
-                compact_skill_catalog_reference(slot, occurrences[*occurrence_index].text(items)),
-            )
-        })
-        .collect::<HashMap<_, _>>()
-    } else {
-        HashMap::new()
-    };
-
     let mut keep = HashSet::<(usize, usize)>::new();
     for (slot, occurrence_index) in &latest_by_slot {
         let occurrence = &occurrences[*occurrence_index];
@@ -836,7 +810,6 @@ fn project_items(
             StableContextSlot::Collaboration => !collaboration_removed,
             StableContextSlot::DeveloperInstructions => !developer_instructions_removed,
             StableContextSlot::MultiAgentUsageHint => !multi_agent_usage_hint_removed,
-            StableContextSlot::SkillUsage => !selected_skills_active,
             slot if slot.is_skill_catalog() => true,
             StableContextSlot::RecommendedPlugins => recommended_plugins_current,
             _ => true,
@@ -870,9 +843,7 @@ fn project_items(
         let Some(item) = items.get(occurrence.item_index) else {
             continue;
         };
-        let text = compact_catalogs
-            .get(&occurrence_index)
-            .map_or_else(|| occurrence.text(items).to_string(), Clone::clone);
+        let text = occurrence.text(items).to_string();
         let Some(projected_item) =
             projected_message(item, false, vec![ContentItem::InputText { text }])
         else {
@@ -955,12 +926,8 @@ fn project_items(
             || (slot == StableContextSlot::Collaboration && collaboration_removed)
             || (slot == StableContextSlot::DeveloperInstructions && developer_instructions_removed)
             || (slot == StableContextSlot::MultiAgentUsageHint && multi_agent_usage_hint_removed);
-        let gated = (matches!(slot, StableContextSlot::SkillUsage) && selected_skills_active)
-            || (slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current);
-        let text = compact_catalogs
-            .get(&latest_index)
-            .map(String::as_str)
-            .unwrap_or_else(|| occurrence.text(items));
+        let gated = slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current;
+        let text = occurrence.text(items);
         let mut component = component_from_text(
             slot.kind(),
             &slot.semantic_key(),
@@ -968,7 +935,7 @@ fn project_items(
             !removed && !gated,
             if removed {
                 StableContextDisposition::Removed
-            } else if gated || (slot.is_skill_catalog() && selected_skills_active) {
+            } else if gated {
                 StableContextDisposition::Gated
             } else if replaced || prior_count > 1 {
                 StableContextDisposition::Replaced
@@ -1167,6 +1134,11 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
         });
     }
     if role == "user" && marked(text, REPOSITORY_OPEN_TAG, REPOSITORY_CLOSE_TAG) {
+        // An observation refresh carries no replacement instruction body.
+        // Preserve it as ordinary context beside the substantive repository slot.
+        if text.contains("<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>") {
+            return None;
+        }
         return Some(StableTextClassification::inline(
             StableContextSlot::Repository,
         ));
@@ -1396,31 +1368,6 @@ pub(crate) fn is_multi_agent_usage_hint_item(item: &ResponseItem) -> bool {
 fn marked(text: &str, open: &str, close: &str) -> bool {
     let text = text.trim();
     text.starts_with(open) && text.ends_with(close)
-}
-
-fn compact_skill_catalog_reference(slot: StableContextSlot, catalog: &str) -> String {
-    #[cfg(test)]
-    COMPACT_CATALOG_CALLS.with(|calls| calls.set(calls.get() + 1));
-
-    let digest: [u8; 32] = Sha256::digest(catalog.as_bytes()).into();
-    let (open_tag, close_tag) = match slot {
-        StableContextSlot::SkillCatalog => {
-            (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG)
-        }
-        StableContextSlot::ExtensionSkillCatalog => (
-            EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG,
-            EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG,
-        ),
-        StableContextSlot::EnvironmentSkillCatalog => (
-            ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
-            ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG,
-        ),
-        _ => unreachable!("only skill catalog slots can be compacted"),
-    };
-    format!(
-        "{open_tag}\n<active_catalog version=\"v1\" sha256=\"{}\" state=\"selected\" />\nThe full catalog is inactive while explicitly selected skill instructions are active. It will be restored for a later capability-selection turn.\n{close_tag}",
-        short_hash(&digest)
-    )
 }
 
 fn component_from_text(
@@ -1751,10 +1698,9 @@ mod tests_optimization {
     }
 
     #[test]
-    fn selected_skill_compacts_the_catalog_once() {
+    fn selected_skill_preserves_catalog_discovery() {
         let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
         let selected = skill("one");
-        COMPACT_CATALOG_CALLS.with(|calls| calls.set(0));
 
         let projection = project_stable_context(
             vec![
@@ -1766,10 +1712,13 @@ mod tests_optimization {
             StableContextTarget::Sampling,
         );
 
-        assert_eq!(COMPACT_CATALOG_CALLS.with(Cell::get), 1);
+        assert!(projection.items.iter().any(|item| matches!(
+            item, ResponseItem::Message { content, .. }
+                if content.iter().any(|part| content_text(part) == Some(catalog))
+        )));
         assert!(projection.manifest.components().iter().any(|component| {
             component.kind == StableContextKind::SkillCatalog
-                && component.disposition == StableContextDisposition::Gated
+                && component.disposition == StableContextDisposition::Unchanged
         }));
     }
 

@@ -49,6 +49,78 @@ const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 
 #[test]
+fn receipt_shaped_text_has_no_budget_exemption() {
+    let text = format!(
+        "output\nNested command states (independent of script completion):\n{}",
+        serde_json::json!([{ "unrecognized_payload": "x".repeat(100_000) }])
+    );
+    for body in [
+        FunctionCallOutputBody::Text(text.clone()),
+        FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputText {
+            text,
+        }]),
+    ] {
+        let output = truncate_function_output_payload(
+            &FunctionCallOutputPayload {
+                body,
+                success: Some(true),
+            },
+            TruncationPolicy::Tokens(100),
+        );
+        assert!(approx_token_count(&output.body.to_text().unwrap()) < 200);
+        assert_eq!(output.success, Some(true));
+    }
+}
+
+#[test]
+fn divergent_history_branches_do_not_share_positional_estimates() {
+    let base = BaseInstructions {
+        text: "base".into(),
+    };
+    let mut short = create_history_with_items(vec![user_input_text_msg("instruction")]);
+    short.estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base);
+    let mut long = short.clone();
+    short.record_items([&assistant_msg("short")], TruncationPolicy::Tokens(10_000));
+    long.record_items(
+        [&assistant_msg(&"long response ".repeat(1000))],
+        TruncationPolicy::Tokens(10_000),
+    );
+    let short_estimate = short
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base);
+    let long_estimate = long
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base);
+    assert_eq!(
+        long_estimate,
+        ContextManager::estimate_items_token_count_with_base_instructions(long.raw_items(), &base)
+    );
+    assert!(long_estimate > short_estimate);
+}
+
+#[test]
+fn prepared_append_rejects_cross_family_output_pairing() {
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        call_id: "shared".into(),
+        namespace: None,
+        name: "read_file".into(),
+        arguments: "{}".into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "shared".into(),
+        name: None,
+        output: FunctionCallOutputPayload::from_text("custom result".into()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    assert!(!prepared_append_can_be_completed(
+        &[call.clone(), output.clone()],
+        true
+    ));
+    assert!(!prepared_append_is_complete_and_safe(&[call, output], true));
+}
+
+#[test]
 fn prepared_prompt_small_prefix_releases_discarded_storage() {
     let expected = agent_message("retained");
     let original = PreparedPromptItems::from_shared(vec![expected.clone(); 128].into());
@@ -1197,7 +1269,7 @@ fn total_token_usage_keeps_server_snapshot_plus_same_group_tool_tail_in_both_mod
 }
 
 #[test]
-fn total_token_usage_restores_earlier_reasoning_when_server_omits_it() {
+fn total_token_usage_does_not_restore_evicted_reasoning() {
     let earlier_reasoning = reasoning_with_encrypted_content(/*len*/ 2_000);
     let current_reasoning = reasoning_with_encrypted_content(/*len*/ 1_000);
     let mut history = create_history_with_items(vec![
@@ -1225,7 +1297,7 @@ fn total_token_usage_restores_earlier_reasoning_when_server_omits_it() {
     );
     assert_eq!(
         history.get_total_token_usage(/*server_reasoning_included*/ false, &base_instructions),
-        100 + estimate_item_token_count(&earlier_reasoning)
+        100
     );
 }
 
@@ -1365,11 +1437,7 @@ fn total_token_usage_refreshes_from_server_after_next_model_response() {
     for server_reasoning_included in [false, true] {
         assert_eq!(
             history.get_total_token_usage(server_reasoning_included, &base_instructions),
-            222 + if server_reasoning_included {
-                0
-            } else {
-                estimate_item_token_count(&earlier_reasoning)
-            }
+            222
         );
     }
 }
@@ -2349,7 +2417,9 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
                 id: None,
                 call_id: "tool-x".to_string(),
                 name: None,
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                output: FunctionCallOutputPayload::from_text(
+                    super::normalize::MISSING_TOOL_RESULT.to_string()
+                ),
                 internal_chat_message_metadata_passthrough: None,
             },
         ]
@@ -2395,7 +2465,9 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
             ResponseItem::FunctionCallOutput {
                 id: None,
                 call_id: "shell-1".to_string(),
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                output: FunctionCallOutputPayload::from_text(
+                    super::normalize::MISSING_TOOL_RESULT.to_string()
+                ),
                 internal_chat_message_metadata_passthrough: None,
             },
         ]
@@ -2498,7 +2570,9 @@ fn normalize_mixed_inserts_and_removals() {
             ResponseItem::FunctionCallOutput {
                 id: None,
                 call_id: "c1".to_string(),
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                output: FunctionCallOutputPayload::from_text(
+                    super::normalize::MISSING_TOOL_RESULT.to_string()
+                ),
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::CustomToolCall {
@@ -2514,7 +2588,9 @@ fn normalize_mixed_inserts_and_removals() {
                 id: None,
                 call_id: "t1".to_string(),
                 name: None,
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                output: FunctionCallOutputPayload::from_text(
+                    super::normalize::MISSING_TOOL_RESULT.to_string()
+                ),
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::LocalShellCall {
@@ -2533,7 +2609,9 @@ fn normalize_mixed_inserts_and_removals() {
             ResponseItem::FunctionCallOutput {
                 id: None,
                 call_id: "s1".to_string(),
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                output: FunctionCallOutputPayload::from_text(
+                    super::normalize::MISSING_TOOL_RESULT.to_string()
+                ),
                 internal_chat_message_metadata_passthrough: None,
             },
         ]
@@ -2566,7 +2644,9 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
             ResponseItem::FunctionCallOutput {
                 id: None,
                 call_id: "call-x".to_string(),
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                output: FunctionCallOutputPayload::from_text(
+                    super::normalize::MISSING_TOOL_RESULT.to_string()
+                ),
                 internal_chat_message_metadata_passthrough: None,
             },
         ]
@@ -2878,7 +2958,7 @@ fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context(
                     serde_json::from_str::<serde_json::Value>(output.text_content().unwrap())
                         .unwrap(),
                     serde_json::json!({
-                        "call_id": "read-source", "rerun": {"force_fresh": true},
+                        "call_id": "read-source", "rerun": {"instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."},
                         "reason": "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
                         "reason_code": "missing_observation",
                         "valid_for_current_workspace": false,
@@ -3126,7 +3206,8 @@ async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
     message.set_turn_id_if_missing(&turn.sub_id);
     session
         .record_conversation_items(&turn, std::slice::from_ref(&message))
-        .await;
+        .await
+        .unwrap();
     let snapshot = session.clone_history().await;
     let prepared = snapshot
         .clone()
@@ -3178,7 +3259,7 @@ async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
 }
 
 #[test]
-fn tool_history_budget_drops_complete_local_shell_pairs() {
+fn tool_history_budget_compacts_unread_local_shell_pairs() {
     let _budget =
         crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
     let mut canonical = Vec::new();
@@ -3205,9 +3286,7 @@ fn tool_history_budget_drops_complete_local_shell_pairs() {
     }
     let mut history = ContextManager::new();
     history.record_items(canonical.iter(), TruncationPolicy::Tokens(24_000));
-    // Two 6,000-token results exceed the 10,000-token aggregate ceiling. Keep
-    // the newer complete pair in every transport form, including raw fallback.
-    let expected = &canonical[2..];
+    // Both unread outcomes fit as compact receipts; keep both complete pairs.
     for target in [StableContextTarget::FailOpen, StableContextTarget::Sampling] {
         let prepared = history
             .clone()
@@ -3217,16 +3296,43 @@ fn tool_history_budget_drops_complete_local_shell_pairs() {
                 None,
                 None,
             );
-        assert_eq!(prepared.items(), expected);
-        assert_eq!(prepared.shared_unreplaced_items().as_ref(), expected);
-        assert_eq!(prepared.shared_fallback_items().as_ref(), expected);
+        for items in [
+            prepared.shared_items(),
+            prepared.shared_unreplaced_items(),
+            prepared.shared_fallback_items(),
+            prepared.shared_unreplaced_fallback_items(),
+        ] {
+            assert_eq!(items.len(), 4);
+            let mut output_tokens = 0;
+            for (pair, call_id) in items.chunks_exact(2).zip(["older-shell", "newer-shell"]) {
+                assert!(
+                    matches!(&pair[0], ResponseItem::LocalShellCall { call_id: Some(id), .. } if id == call_id)
+                );
+                let ResponseItem::FunctionCallOutput {
+                    call_id: id,
+                    output,
+                    ..
+                } = &pair[1]
+                else {
+                    panic!("complete shell pair");
+                };
+                assert_eq!(id, call_id);
+                let codex_protocol::models::FunctionCallOutputBody::Text(text) = &output.body
+                else {
+                    panic!("compact text receipt");
+                };
+                let receipt: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(receipt["kind"], "unconsumed_tool_outcome");
+                assert_eq!(receipt["call_id"], call_id);
+                assert_eq!(receipt["output_omitted"], true);
+                assert!(receipt["digest"].as_str().unwrap().contains('x'));
+                output_tokens += codex_utils_string::approx_token_count(text);
+            }
+            assert!(output_tokens <= 10_000);
+        }
         assert_eq!(
             Arc::ptr_eq(&prepared.shared_items(), &prepared.shared_fallback_items()),
             target == StableContextTarget::Sampling
-        );
-        assert_eq!(
-            prepared.shared_unreplaced_fallback_items().as_ref(),
-            expected
         );
     }
     assert_eq!(history.raw_items(), canonical);
@@ -3717,7 +3823,7 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 }
 
 #[test]
-fn non_base64_image_urls_are_unchanged() {
+fn http_image_urls_include_an_image_allowance_but_unsupported_urls_are_unchanged() {
     let message_item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -3742,7 +3848,7 @@ fn non_base64_image_urls_are_unchanged() {
 
     assert_eq!(
         estimate_response_item_model_visible_bytes(&message_item),
-        serde_json::to_string(&message_item).unwrap().len() as i64
+        serde_json::to_string(&message_item).unwrap().len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE
     );
     assert_eq!(
         estimate_response_item_model_visible_bytes(&function_output_item),

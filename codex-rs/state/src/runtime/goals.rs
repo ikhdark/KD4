@@ -475,7 +475,9 @@ RETURNING
             GoalAccountingMode::ActiveOrComplete => {
                 "status IN ('active', 'budget_limited', 'complete')"
             }
-            GoalAccountingMode::ActiveOrStopped => active_or_stopped_status_filter,
+            GoalAccountingMode::ActiveOrStopped => {
+                "status IN ('active', 'paused', 'blocked', 'usage_limited', 'budget_limited', 'complete')"
+            }
         };
         let budget_limit_status_filter = match mode {
             GoalAccountingMode::ActiveStatusOnly

@@ -6,7 +6,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
-import io
+import tempfile
+import shutil
 import json
 import os
 from dataclasses import dataclass
@@ -20,14 +21,20 @@ _READ_CHUNK_BYTES = 1024 * 1024
 @dataclass(frozen=True)
 class RolloutSnapshot:
     path: Path
-    data: bytes
+    stream: BinaryIO
     sha256: str
     byte_length: int
+
+    @property
+    def data(self) -> bytes:
+        self.stream.seek(0)
+        return self.stream.read()
 
     @contextlib.contextmanager
     def open_lines(self) -> Iterator[BinaryIO]:
         """Decode captured bytes without changing their on-disk identity."""
-        with io.BytesIO(self.data) as raw:
+        self.stream.seek(0)
+        with contextlib.nullcontext(self.stream) as raw:
             if self.path.name.endswith(".jsonl.zst"):
                 try:
                     from compression import zstd
@@ -128,7 +135,8 @@ def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
         _open_shared_binary(resolved) if os.name == "nt" else resolved.open("rb")
     ) as handle:
         byte_length = os.fstat(handle.fileno()).st_size
-        chunks: list[bytes] = []
+        captured = tempfile.SpooledTemporaryFile(max_size=4 * _READ_CHUNK_BYTES)
+        digest = hashlib.sha256()
         remaining = byte_length
         while remaining:
             chunk = handle.read(min(remaining, _READ_CHUNK_BYTES))
@@ -137,14 +145,14 @@ def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
                     f"rollout shrank while reading {resolved}: "
                     f"expected {byte_length} bytes"
                 )
-            chunks.append(chunk)
+            captured.write(chunk)
+            digest.update(chunk)
             remaining -= len(chunk)
 
-    data = b"".join(chunks)
     return RolloutSnapshot(
         path=resolved,
-        data=data,
-        sha256=hashlib.sha256(data).hexdigest(),
+        stream=captured,
+        sha256=digest.hexdigest(),
         byte_length=byte_length,
     )
 
@@ -176,7 +184,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             raise ValueError("snapshot output must not overwrite the live rollout")
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(snapshot.data)
+        snapshot.stream.seek(0)
+        with output.open("wb") as destination:
+            shutil.copyfileobj(snapshot.stream, destination)
         metadata["output"] = str(output)
     print(json.dumps(metadata, sort_keys=True))
     return 0

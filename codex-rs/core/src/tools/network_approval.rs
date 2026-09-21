@@ -495,20 +495,15 @@ impl NetworkApprovalService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active = calls.active_calls.values().cloned().collect::<Vec<_>>();
-        if active.is_empty() {
+        if active.len() != 1 {
+            if !active.is_empty() {
+                tracing::warn!(
+                    active_calls = active.len(),
+                    "blocked network request has no execution attribution; leaving unrelated calls running"
+                );
+            }
             return;
         }
-        let outcome = if active.len() == 1 {
-            outcome
-        } else {
-            let NetworkApprovalOutcome::DeniedByPolicy(message) = outcome else {
-                return;
-            };
-            NetworkApprovalOutcome::DeniedByPolicy(format!(
-                "{message} Network request attribution was ambiguous across {} active tool calls.",
-                active.len()
-            ))
-        };
         for call in &active {
             if !matches!(
                 calls.call_outcomes.get(&call.registration_id),
@@ -1034,7 +1029,15 @@ pub(crate) async fn begin_network_approval(
     }
 
     let registration_id = Uuid::new_v4().to_string();
-    let execution_proxy = network.clone();
+    let execution_proxy = network
+        .for_execution(
+            &environment_id,
+            &registration_id,
+            Uuid::new_v4().to_string(),
+        )
+        .map_err(|err| {
+            ToolError::Rejected(format!("network execution attribution failed: {err}"))
+        })?;
     let cancellation_token = CancellationToken::new();
     let service = Arc::clone(&session.services.network_approval);
     service

@@ -30,7 +30,8 @@ pub struct MatchOptions {
 pub struct Policy {
     rules_by_program: MultiMap<String, RuleRef>,
     network_rules: Vec<NetworkRule>,
-    host_executables_by_name: HashMap<String, Arc<[AbsolutePathBuf]>>,
+    basename_rules: MultiMap<String, RuleRef>,
+    host_executables_by_name: Arc<HashMap<String, Arc<[AbsolutePathBuf]>>>,
 }
 
 impl Policy {
@@ -45,9 +46,30 @@ impl Policy {
         network_rules: Vec<NetworkRule>,
         host_executables_by_name: HashMap<String, Arc<[AbsolutePathBuf]>>,
     ) -> Self {
+        Self::from_shared_parts(
+            rules_by_program,
+            network_rules,
+            Arc::new(host_executables_by_name),
+        )
+    }
+
+    pub(crate) fn from_shared_parts(
+        rules_by_program: MultiMap<String, RuleRef>,
+        network_rules: Vec<NetworkRule>,
+        host_executables_by_name: Arc<HashMap<String, Arc<[AbsolutePathBuf]>>>,
+    ) -> Self {
+        let mut basename_rules = MultiMap::new();
+        for (program, rules) in rules_by_program.iter_all() {
+            if !program.contains(['/', '\\']) {
+                for rule in rules {
+                    basename_rules.insert(executable_lookup_key(program), Arc::clone(rule));
+                }
+            }
+        }
         Self {
             rules_by_program,
             network_rules,
+            basename_rules,
             host_executables_by_name,
         }
     }
@@ -98,7 +120,7 @@ impl Policy {
             .iter()
             .map(|token| PatternToken::single(token.clone()))
             .collect::<Result<Vec<_>>>()?;
-        PatternToken::single(first_token.clone())?;
+        PatternToken::single(first_token.clone())?.validate_program()?;
         let first_token = first_token.clone();
         let rule: RuleRef = Arc::new(PrefixRule {
             pattern: PrefixPattern {
@@ -109,6 +131,10 @@ impl Policy {
             justification: None,
         });
 
+        if !first_token.contains(['/', '\\']) {
+            self.basename_rules
+                .insert(executable_lookup_key(&first_token), Arc::clone(&rule));
+        }
         self.rules_by_program.insert(first_token, rule);
         Ok(())
     }
@@ -138,7 +164,7 @@ impl Policy {
     }
 
     pub fn set_host_executable_paths(&mut self, name: String, paths: Vec<AbsolutePathBuf>) {
-        self.host_executables_by_name
+        Arc::make_mut(&mut self.host_executables_by_name)
             .insert(executable_lookup_key(&name), paths.into());
     }
 
@@ -154,14 +180,14 @@ impl Policy {
         combined_network_rules.extend(overlay.network_rules.iter().cloned());
 
         let mut host_executables_by_name = self.host_executables_by_name.clone();
-        host_executables_by_name.extend(
+        Arc::make_mut(&mut host_executables_by_name).extend(
             overlay
                 .host_executables_by_name
                 .iter()
                 .map(|(name, paths)| (name.clone(), paths.clone())),
         );
 
-        Policy::from_parts(
+        Policy::from_shared_parts(
             combined_rules,
             combined_network_rules,
             host_executables_by_name,
@@ -283,66 +309,80 @@ impl Policy {
         heuristics_fallback: HeuristicsFallback<'_>,
         options: &MatchOptions,
     ) -> Vec<RuleMatch> {
-        let matched_rules = self
-            .match_exact_rules(cmd)
-            .filter(|matched_rules| !matched_rules.is_empty())
-            .or_else(|| {
-                options
-                    .resolve_host_executables
-                    .then(|| self.match_host_executable_rules(cmd))
-                    .filter(|matched_rules| !matched_rules.is_empty())
-            })
-            .unwrap_or_default();
-
+        let mut matched_rules = Vec::new();
+        self.visit_matches(cmd, options, |rule, resolved| {
+            matched_rules.push(rule.materialize_match(cmd, resolved));
+            false
+        });
         if matched_rules.is_empty()
-            && let Some(heuristics_fallback) = heuristics_fallback
+            && let Some(fallback) = heuristics_fallback
         {
-            vec![RuleMatch::HeuristicsRuleMatch {
+            matched_rules.push(RuleMatch::HeuristicsRuleMatch {
                 command: cmd.to_vec(),
-                decision: heuristics_fallback(cmd),
-            }]
-        } else {
-            matched_rules
+                decision: fallback(cmd),
+            });
         }
+        matched_rules
     }
 
-    fn match_exact_rules(&self, cmd: &[String]) -> Option<Vec<RuleMatch>> {
-        let first = cmd.first()?;
-        Some(
-            self.rules_by_program
-                .get_vec(first)
-                .map(|rules| rules.iter().filter_map(|rule| rule.matches(cmd)).collect())
-                .unwrap_or_default(),
-        )
-    }
-
-    fn match_host_executable_rules(&self, cmd: &[String]) -> Vec<RuleMatch> {
+    /// Visits borrowed matches; returning true stops observation, never authorization aggregation.
+    pub(crate) fn visit_matches(
+        &self,
+        cmd: &[String],
+        options: &MatchOptions,
+        mut visit: impl FnMut(&PrefixRule, Option<&AbsolutePathBuf>) -> bool,
+    ) -> bool {
         let Some(first) = cmd.first() else {
-            return Vec::new();
+            return false;
         };
+        let mut matched = false;
+        if let Some(rules) = self.rules_by_program.get_vec(first) {
+            for rule in rules {
+                if rule.pattern.matches_args(&cmd[1..]) {
+                    matched = true;
+                    if visit(rule, None) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if matched || !options.resolve_host_executables {
+            return matched;
+        }
         let Ok(program) = AbsolutePathBuf::try_from(first.as_str()) else {
-            return Vec::new();
+            return false;
         };
         let Some(basename) = executable_path_lookup_key(program.as_path()) else {
-            return Vec::new();
-        };
-        let Some(rules) = self.rules_by_program.get_vec(&basename) else {
-            return Vec::new();
+            return false;
         };
         if let Some(paths) = self.host_executables_by_name.get(&basename)
             && !paths.iter().any(|path| path == &program)
         {
-            return Vec::new();
+            return false;
         }
-
-        let basename_command = std::iter::once(basename)
-            .chain(cmd.iter().skip(1).cloned())
-            .collect::<Vec<_>>();
-        rules
-            .iter()
-            .filter_map(|rule| rule.matches(&basename_command))
-            .map(|rule_match| rule_match.with_resolved_program(&program))
-            .collect()
+        let Some(rules) = self.basename_rules.get_vec(&basename) else {
+            return false;
+        };
+        let Some(filename) = program.as_path().file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        for rule in rules {
+            // Extensionless aliases keep their existing behavior. Explicit suffixes
+            // only match that suffix, even though the host-path gate shares an alias.
+            let name = rule.program();
+            let applicable = if cfg!(windows) {
+                name.eq_ignore_ascii_case(filename) || name.eq_ignore_ascii_case(&basename)
+            } else {
+                name == filename
+            };
+            if applicable && rule.pattern.matches_args(&cmd[1..]) {
+                matched = true;
+                if visit(rule, Some(&program)) {
+                    return true;
+                }
+            }
+        }
+        matched
     }
 }
 

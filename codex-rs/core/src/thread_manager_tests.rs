@@ -1356,6 +1356,28 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         .rollout_path()
         .expect("source rollout path should exist");
 
+    // Persisted rollout settings are deliberately older than live settings.
+    let live_mode = source
+        .thread
+        .config_snapshot()
+        .await
+        .collaboration_mode
+        .with_updates(
+            None,
+            None,
+            Some(Some("live-only developer policy".to_string())),
+        );
+    source
+        .thread
+        .codex
+        .session
+        .update_settings(SessionSettingsUpdate {
+            collaboration_mode: Some(live_mode.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("update running settings");
+
     let resumed = manager
         .resume_thread_from_rollout(
             config,
@@ -1368,6 +1390,11 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         .expect("resume active source thread");
     assert_eq!(resumed.thread_id, source.thread_id);
     assert!(Arc::ptr_eq(&resumed.thread, &source.thread));
+    assert!(resumed.was_already_running);
+    assert_eq!(
+        resumed.thread.config_snapshot().await.collaboration_mode,
+        live_mode
+    );
 
     source
         .thread

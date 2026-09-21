@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_exec_server_protocol::RequestId;
 use serde_json::to_value;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -64,7 +64,7 @@ pub(crate) struct ExecServerHandler {
     session_registry: Arc<SessionRegistry>,
     notifications: RpcNotificationSender,
     session: StdMutex<Option<SessionHandle>>,
-    active_body_stream_ids: Mutex<HashSet<String>>,
+    active_body_stream_ids: Mutex<HashMap<String, (RequestId, CancellationToken)>>,
     background_task_shutdown: CancellationToken,
     background_tasks: TaskTracker,
     file_system: FileSystemHandler,
@@ -83,7 +83,7 @@ impl ExecServerHandler {
             session_registry,
             notifications,
             session: StdMutex::new(None),
-            active_body_stream_ids: Mutex::new(HashSet::new()),
+            active_body_stream_ids: Mutex::new(HashMap::new()),
             background_task_shutdown: CancellationToken::new(),
             background_tasks: TaskTracker::new(),
             file_system: FileSystemHandler::new(runtime_paths.clone()),
@@ -212,12 +212,30 @@ impl ExecServerHandler {
         self.require_initialized_for("http")?;
         let stream_response = params.stream_response;
         let http_request_id = params.request_id.clone();
-        if stream_response {
-            self.reserve_http_body_stream(&http_request_id).await?;
-        }
-        let response = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy)
-            .run(params)
-            .await;
+        let cancellation = if stream_response {
+            let admitted = self
+                .active_body_stream_ids
+                .lock()
+                .await
+                .get(&http_request_id)
+                .filter(|(id, _)| id == &request_id)
+                .map(|(_, token)| token.clone());
+            match admitted {
+                Some(token) => token,
+                None => {
+                    self.reserve_http_body_stream(&http_request_id, &request_id)
+                        .await?
+                }
+            }
+        } else {
+            CancellationToken::new()
+        };
+        let runner = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy);
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(invalid_request("http/request cancelled".into())),
+            response = runner.run(params) => response,
+        };
         if response.is_err() && stream_response {
             self.release_http_body_stream(&http_request_id).await;
         }
@@ -390,6 +408,15 @@ impl ExecServerHandler {
             self.release_http_body_stream(&request_id).await;
             return;
         }
+        let Some((_, cancellation)) = self
+            .active_body_stream_ids
+            .lock()
+            .await
+            .get(&request_id)
+            .cloned()
+        else {
+            return;
+        };
         let finished_request_id = request_id.clone();
         let handler = Arc::clone(self);
         let notifications = self.notifications.clone();
@@ -397,10 +424,22 @@ impl ExecServerHandler {
         self.background_tasks.spawn(async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
+                _ = cancellation.cancelled() => {}
                 _ = ReqwestHttpRequestRunner::stream_body(pending_stream, notifications) => {}
             }
             handler.release_http_body_stream(&finished_request_id).await;
         });
+    }
+
+    pub(crate) async fn cancel_http_body_stream(
+        &self,
+        request_id: &str,
+    ) -> Result<(), JSONRPCErrorError> {
+        self.require_initialized_for("http")?;
+        if let Some((_, cancellation)) = self.active_body_stream_ids.lock().await.get(request_id) {
+            cancellation.cancel();
+        }
+        Ok(())
     }
 
     async fn release_http_body_stream(&self, request_id: &str) {
@@ -408,15 +447,26 @@ impl ExecServerHandler {
         active_body_stream_ids.remove(request_id);
     }
 
-    async fn reserve_http_body_stream(&self, request_id: &str) -> Result<(), JSONRPCErrorError> {
+    pub(crate) async fn reserve_http_body_stream(
+        &self,
+        request_id: &str,
+        rpc_id: &RequestId,
+    ) -> Result<CancellationToken, JSONRPCErrorError> {
         let mut active_body_stream_ids = self.active_body_stream_ids.lock().await;
-        if active_body_stream_ids.contains(request_id) {
+        if active_body_stream_ids.contains_key(request_id) {
             return Err(invalid_params(format!(
                 "http/request streamResponse requestId `{request_id}` is already active"
             )));
         }
-        active_body_stream_ids.insert(request_id.to_string());
-        Ok(())
+        if active_body_stream_ids.len() >= crate::connection::CHANNEL_CAPACITY {
+            return Err(invalid_request("too many active HTTP streams".into()));
+        }
+        let cancellation = CancellationToken::new();
+        active_body_stream_ids.insert(
+            request_id.to_string(),
+            (rpc_id.clone(), cancellation.clone()),
+        );
+        Ok(cancellation)
     }
 }
 

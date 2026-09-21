@@ -1171,6 +1171,37 @@ impl ThreadRequestProcessor {
             return Err(err);
         }
 
+        // Listener readiness is a prerequisite of a successful setup response.
+        match super::thread_lifecycle::ensure_conversation_listener_for_instance(
+            listener_task_context.clone(),
+            thread_id,
+            Arc::clone(&thread),
+            request_id.connection_id,
+            experimental_raw_events,
+        )
+        .await
+        {
+            Ok(EnsureConversationListenerResult::Attached) => {}
+            Ok(EnsureConversationListenerResult::ConnectionClosed) => {
+                return Err(invalid_request(
+                    "thread/start connection closed during setup",
+                ));
+            }
+            Err(error) => {
+                listener_task_context
+                    .thread_manager
+                    .rollback_thread_spawn(thread_id, &thread)
+                    .await;
+                return Err(error);
+            }
+        }
+
+        if dynamic_tool_count > 0 {
+            listener_task_context
+                .outgoing
+                .register_dynamic_tool_owner(thread_id, request_id.connection_id)
+                .await;
+        }
         let instruction_sources = thread.legacy_instruction_sources().await;
         let config_snapshot = thread
             .config_snapshot()
@@ -1186,25 +1217,6 @@ impl ThreadRequestProcessor {
             session_configured.rollout_path.clone(),
         );
         thread.project_id = project_id;
-
-        // Auto-attach a thread listener when starting a thread.
-        log_listener_attach_result(
-            super::thread_lifecycle::ensure_conversation_listener(
-                listener_task_context.clone(),
-                thread_id,
-                request_id.connection_id,
-                experimental_raw_events,
-            )
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.attach_listener",
-                otel.name = "app_server.thread_start.attach_listener",
-                thread_start.experimental_raw_events = experimental_raw_events,
-            ))
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "thread",
-        );
 
         listener_task_context
             .thread_watch_manager
@@ -2964,10 +2976,15 @@ impl ThreadRequestProcessor {
         supports_openai_form_elicitation: bool,
     ) -> Result<(), JSONRPCErrorError> {
         let parsed_thread_id = ParsedThreadId::parse(&params.thread_id);
-        if let Some(thread_id) = parsed_thread_id.valid() {
-            self.pending_thread_unloads
-                .wait_until_finished(&thread_id)
-                .await;
+        if let Some(thread_id) = parsed_thread_id.valid()
+            && self.pending_thread_unloads.contains(&thread_id).await
+        {
+            return Err(JSONRPCErrorError {
+                data: Some(serde_json::json!({"reason": "threadClosing"})),
+                ..invalid_request(format!(
+                    "thread {thread_id} is closing; retry after the thread is closed"
+                ))
+            });
         }
 
         if params.permissions.is_some()
@@ -3182,18 +3199,23 @@ impl ThreadRequestProcessor {
                     self.outgoing.send_error(request_id, error).await;
                     return Ok(());
                 };
-                // Auto-attach a thread listener when resuming a thread.
-                log_listener_attach_result(
-                    self.ensure_conversation_listener(
-                        thread_id,
-                        request_id.connection_id,
-                        /*raw_events_enabled*/ false,
-                    )
-                    .await,
-                    thread_id,
-                    request_id.connection_id,
-                    "thread",
-                );
+                match self
+                    .ensure_conversation_listener(thread_id, request_id.connection_id, false)
+                    .await
+                {
+                    Ok(EnsureConversationListenerResult::Attached) => {}
+                    Ok(EnsureConversationListenerResult::ConnectionClosed) => return Ok(()),
+                    Err(error) => {
+                        self.rollback_failed_resumed_thread(
+                            thread_id,
+                            &codex_thread,
+                            was_already_running,
+                        )
+                        .await;
+                        self.outgoing.send_error(request_id, error).await;
+                        return Ok(());
+                    }
+                }
 
                 let (mut thread, token_usage_snapshot) = match self
                     .load_thread_from_resume_source_or_send_internal(
@@ -3303,26 +3325,45 @@ impl ThreadRequestProcessor {
                 };
 
                 let connection_id = request_id.connection_id;
-                self.outgoing
-                    .send_response_with_thread_originator(request_id, response, thread_originator)
-                    .await;
-                // `excludeTurns` is explicitly the cheap resume path, so avoid
-                // rebuilding history only to attribute a replayed usage update.
-                if let Some(token_usage_snapshot) = token_usage_snapshot {
-                    // The client needs restored usage before it starts another turn.
-                    // Sending after the response preserves JSON-RPC request ordering while
-                    // still filling the status line before the next turn lifecycle begins.
-                    send_thread_token_usage_update_to_connection(
-                        &self.outgoing,
-                        connection_id,
-                        thread_id,
-                        token_usage_snapshot,
-                    )
-                    .await;
-                }
-                self.thread_goal_processor
-                    .emit_resume_goal_snapshot_and_continue(thread_id, codex_thread.as_ref())
-                    .await;
+                // Own response delivery through idle finalization so disconnects
+                // cannot strand an already resumed goal-enabled thread.
+                let processor = self.clone();
+                self.background_tasks
+                    .spawn(async move {
+                        processor
+                            .outgoing
+                            .send_response_with_thread_originator(
+                                request_id,
+                                response,
+                                thread_originator,
+                            )
+                            .await;
+                        // `excludeTurns` is explicitly the cheap resume path, so avoid
+                        // rebuilding history only to attribute a replayed usage update.
+                        if let Some(token_usage_snapshot) = token_usage_snapshot {
+                            // The client needs restored usage before it starts another turn.
+                            // Sending after the response preserves JSON-RPC request ordering while
+                            // still filling the status line before the next turn lifecycle begins.
+                            send_thread_token_usage_update_to_connection(
+                                &processor.outgoing,
+                                connection_id,
+                                thread_id,
+                                token_usage_snapshot,
+                            )
+                            .await;
+                        }
+                        processor
+                            .thread_goal_processor
+                            .emit_resume_goal_snapshot_and_continue(
+                                thread_id,
+                                codex_thread.as_ref(),
+                            )
+                            .await;
+                    })
+                    .await
+                    .map_err(|error| {
+                        internal_error(format!("resume finalization failed: {error}"))
+                    })?;
             }
             Err(err) => {
                 let error = internal_error(format!("error resuming thread: {err}"));
@@ -4095,18 +4136,29 @@ impl ThreadRequestProcessor {
         thread.session_id = session_configured.session_id.to_string();
         thread.thread_source = config_snapshot.thread_source.clone();
 
-        // Auto-attach a conversation listener only after all fallible fork setup has completed.
-        log_listener_attach_result(
-            self.ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                /*raw_events_enabled*/ false,
-            )
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "thread",
-        );
+        match self
+            .ensure_conversation_listener(thread_id, request_id.connection_id, false)
+            .await
+        {
+            Ok(EnsureConversationListenerResult::Attached) => {}
+            Ok(EnsureConversationListenerResult::ConnectionClosed) => {
+                return Err(invalid_request(
+                    "thread/fork connection closed during setup",
+                ));
+            }
+            Err(error) => {
+                let rolled_back = self
+                    .thread_manager
+                    .rollback_thread_spawn(thread_id, &forked_thread)
+                    .await;
+                let still_loaded =
+                    !rolled_back && self.thread_manager.get_thread(thread_id).await.is_ok();
+                if should_finalize_failed_thread_setup(rolled_back, still_loaded) {
+                    self.finalize_thread_teardown(thread_id).await;
+                }
+                return Err(error);
+            }
+        }
 
         self.thread_watch_manager
             .upsert_thread_silently(thread.clone())

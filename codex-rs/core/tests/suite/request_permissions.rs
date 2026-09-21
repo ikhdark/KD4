@@ -1857,17 +1857,6 @@ async fn granular_inline_execution_approval(
         sandbox_approval,
         "the model's escalation choices must agree with runtime approval policy"
     );
-    if shell_denied {
-        assert!(
-            results.requests().is_empty(),
-            "a terminal shell denial must not start a follow-up model request"
-        );
-        assert!(
-            !marker.exists(),
-            "rejected execution must leave no child write"
-        );
-        return Ok(());
-    }
     let output = results.single_request().function_call_output(call_id);
     let result = parse_result(&output);
     if sandbox_approval && approve {

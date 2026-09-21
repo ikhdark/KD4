@@ -33,7 +33,19 @@ pub fn item_event_to_server_notification(
     turn_id: &str,
 ) -> ServerNotification {
     let thread_id = thread_id.to_string();
-    let turn_id = turn_id.to_string();
+    // Late lifecycle events retain their original owner even when a newer turn
+    // is active. Legacy events without an owner still use the caller's scope.
+    let owner = match &msg {
+        EventMsg::ItemStarted(event) => Some(event.turn_id.as_str()),
+        EventMsg::ItemCompleted(event) => Some(event.turn_id.as_str()),
+        EventMsg::ExecCommandBegin(event) => Some(event.turn_id.as_str()),
+        EventMsg::ExecCommandEnd(event) => Some(event.turn_id.as_str()),
+        _ => None,
+    };
+    let turn_id = owner
+        .filter(|id| !id.is_empty())
+        .unwrap_or(turn_id)
+        .to_string();
     match msg {
         EventMsg::DynamicToolCallResponse(response) => {
             let status = if response.success {

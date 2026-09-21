@@ -360,8 +360,13 @@ function Add-CargoWatchTargetDirArgument {
 
     $updated = [System.Collections.Generic.List[string]]::new()
     $hasExec = $false
+    $valueOptions = @("-d", "--delay", "--env-file", "-E", "--env", "--features", "-i", "--ignore", "-B", "-L", "--use-shell", "-w", "--watch", "-C", "--workdir")
     for ($i = 0; $i -lt $CommandArgs.Count; $i++) {
         $arg = $CommandArgs[$i]
+        if ($i -gt $SubcommandIndex -and $arg -cmatch '^(-[cqNhV]+)([xsdiEBLwC].*)$') {
+            [void]$updated.Add($matches[1])
+            $arg = "-" + $matches[2]
+        }
         [void]$updated.Add($arg)
 
         if ($i -le $SubcommandIndex) {
@@ -375,7 +380,7 @@ function Add-CargoWatchTargetDirArgument {
             break
         }
         if (
-            $arg -eq "-s" -or
+            $arg.StartsWith("-s", [StringComparison]::Ordinal) -or
             $arg -eq "--shell" -or
             $arg.StartsWith("--shell=", [StringComparison]::Ordinal)
         ) {
@@ -396,6 +401,23 @@ function Add-CargoWatchTargetDirArgument {
             [void]$updated.RemoveAt($updated.Count - 1)
             [void]$updated.Add("--exec=$(Add-CargoWatchExecTargetDir -ExecCommand $exec -TargetDir $TargetDir)")
             continue
+        }
+        if ($arg.StartsWith("-x", [StringComparison]::Ordinal)) {
+            $hasExec = $true
+            $exec = $arg.Substring(2)
+            if ($exec.StartsWith("=")) { $exec = $exec.Substring(1) }
+            [void]$updated.RemoveAt($updated.Count - 1)
+            [void]$updated.Add("-x$(Add-CargoWatchExecTargetDir -ExecCommand $exec -TargetDir $TargetDir)")
+            continue
+        }
+        if ($arg -cin $valueOptions) {
+            $i++
+            if ($i -ge $CommandArgs.Count) { throw "Cargo watch $arg requires a value." }
+            [void]$updated.Add($CommandArgs[$i])
+            continue
+        }
+        if (-not $arg.StartsWith("-")) {
+            throw "Cargo watch positional commands cannot enforce a reserved target; use --exec/-x."
         }
     }
 
@@ -451,6 +473,12 @@ function Add-CargoTargetDirArgument {
         [string]$TargetDir
     )
 
+    if ($CommandArgs.Count -ge 4 -and [IO.Path]::GetFileNameWithoutExtension($CommandArgs[0]) -eq "rustup" -and $CommandArgs[1] -eq "run") {
+        $cargoIndex = if ($CommandArgs[2] -eq "--install") { 4 } else { 3 }
+        if ($cargoIndex -lt $CommandArgs.Count -and (Test-CargoProgram -Value $CommandArgs[$cargoIndex])) {
+            return @(@($CommandArgs | Select-Object -First $cargoIndex) + @(Add-CargoTargetDirArgument -CommandArgs @($CommandArgs | Select-Object -Skip $cargoIndex) -TargetDir $TargetDir))
+        }
+    }
     if ($CommandArgs.Count -lt 2 -or -not (Test-CargoProgram -Value $CommandArgs[0])) {
         return $CommandArgs
     }

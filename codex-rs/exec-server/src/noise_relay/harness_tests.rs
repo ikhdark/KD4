@@ -17,8 +17,6 @@ use futures::StreamExt;
 use futures::channel::mpsc as futures_mpsc;
 use pretty_assertions::assert_eq;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio::time::Instant;
 use tokio::time::timeout;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::connect_async;
@@ -27,6 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use super::*;
 use crate::connection::JsonRpcConnectionEvent;
 use crate::noise_channel::PendingResponderHandshake;
+use crate::relay_proto::RelayData;
 
 const ENVIRONMENT_ID: &str = "environment-1";
 const EXECUTOR_REGISTRATION_ID: &str = "registration-1";
@@ -216,45 +215,95 @@ async fn pong_keeps_harness_alive_until_peer_stops_responding() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn application_event_delivery_is_bounded() -> Result<()> {
-    let (incoming_tx, _incoming_rx) = mpsc::channel(1);
-    incoming_tx
-        .send(JsonRpcConnectionEvent::MalformedMessage {
-            reason: "fill queue".to_string(),
-        })
-        .await?;
-
-    let result = timeout(
-        Duration::from_secs(1),
-        send_incoming_event(
-            &incoming_tx,
-            JsonRpcConnectionEvent::MalformedMessage {
-                reason: "blocked event".to_string(),
-            },
-            Instant::now() + Duration::from_millis(10),
-        ),
+async fn write_flush_has_an_independent_deadline() -> Result<()> {
+    let (mut websocket, _control, mut outbound_rx) = ControlledWebSocket::new(1);
+    websocket.block_flush = true;
+    let (_, result, ping) = timeout(
+        WEBSOCKET_PONG_TIMEOUT + Duration::from_secs(1),
+        write_owned(websocket, Message::Ping(Vec::new().into()), true),
     )
     .await?;
-
-    assert!(matches!(result, Err(ExecServerError::Closed)));
+    assert_eq!(result, Err("websocket write timed out".to_string()));
+    assert!(ping);
+    assert!(matches!(outbound_rx.try_recv()?, Message::Ping(_)));
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
-async fn keepalive_flush_is_bounded_without_starting_pong_clock() -> Result<()> {
-    let (mut websocket, _control, mut outbound_rx) = ControlledWebSocket::new(1);
-    websocket.block_flush = true;
-    let mut watchdog = WebSocketPongWatchdog::new(WEBSOCKET_PONG_TIMEOUT);
-    let deadline = tokio::time::sleep(WEBSOCKET_PONG_TIMEOUT);
-    tokio::pin!(deadline);
-    let result = timeout(
-        WEBSOCKET_PONG_TIMEOUT + Duration::from_secs(1),
-        send_keepalive_ping(&mut websocket, &mut watchdog, deadline.as_mut()),
+async fn blocked_write_does_not_block_inbound_control() -> Result<()> {
+    let (mut connection, mut control, _outbound) = connected_controlled_harness().await?;
+    connection
+        .outgoing_tx
+        .send(JSONRPCMessage::Request(JSONRPCRequest {
+            id: RequestId::Integer(1),
+            method: "blocked".into(),
+            params: None,
+            trace: None,
+        }))
+        .await?;
+    control.wait_for_blocked_write(1).await?;
+    let inbound = JSONRPCMessage::Request(JSONRPCRequest {
+        id: RequestId::Integer(2),
+        method: "inbound".into(),
+        params: None,
+        trace: None,
+    });
+    control.send_rpc(inbound.clone(), 0)?;
+    let event = timeout(Duration::from_millis(20), connection.incoming_rx.recv()).await?;
+    assert!(matches!(event, Some(JsonRpcConnectionEvent::Message(message)) if message == inbound));
+    let reads = control.inbound_reads();
+    control.send_inbound(Message::Pong(Vec::new().into()))?;
+    timeout(Duration::from_millis(20), async {
+        while control.inbound_reads() == reads {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("reader must progress before a write permit is granted")?;
+    control.send_inbound(Message::Close(None))?;
+    timeout(
+        Duration::from_millis(20),
+        connection.disconnected_rx.changed(),
     )
+    .await??;
+    assert!(*connection.disconnected_rx.borrow());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_application_allows_control_reads_then_disconnects() -> Result<()> {
+    let (mut connection, mut control, _outbound) = connected_controlled_harness().await?;
+    for seq in 0..=CHANNEL_CAPACITY {
+        control.send_rpc(
+            JSONRPCMessage::Request(JSONRPCRequest {
+                id: RequestId::Integer(seq as i64),
+                method: "queued".into(),
+                params: None,
+                trace: None,
+            }),
+            seq as u32,
+        )?;
+        while control.inbound_reads() < seq + 2 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+    }
+    let reads = control.inbound_reads();
+    control.send_inbound(Message::Pong(Vec::new().into()))?;
+    timeout(Duration::from_millis(20), async {
+        while control.inbound_reads() == reads {
+            tokio::task::yield_now().await;
+        }
+    })
     .await?;
-    assert_eq!(result, Err("websocket write timed out".to_string()));
-    assert!(matches!(outbound_rx.try_recv()?, Message::Ping(_)));
-    assert_eq!(watchdog.deadline(), None);
+    assert!(!*connection.disconnected_rx.borrow());
+    tokio::time::advance(WEBSOCKET_PONG_TIMEOUT + Duration::from_millis(1)).await;
+    timeout(
+        Duration::from_millis(20),
+        connection.disconnected_rx.changed(),
+    )
+    .await??;
+    assert!(*connection.disconnected_rx.borrow());
     Ok(())
 }
 
@@ -277,7 +326,8 @@ async fn connected_controlled_harness() -> Result<(
     ControlledWebSocketHandle,
     futures_mpsc::UnboundedReceiver<Message>,
 )> {
-    let (websocket, control, mut outbound_rx) = ControlledWebSocket::new(/*write_permits*/ 2);
+    let (websocket, mut control, mut outbound_rx) =
+        ControlledWebSocket::new(/*write_permits*/ 2);
     let executor_identity = NoiseChannelIdentity::generate()?;
     let connection = noise_harness_connection_from_websocket(
         websocket,
@@ -306,6 +356,7 @@ async fn connected_controlled_harness() -> Result<(
     };
     let handshake = decode_relay_message_frame(handshake_payload.as_ref())?;
     let stream_id = handshake.stream_id.clone();
+    control.stream_id = stream_id.clone();
     assert_eq!(stream_id, resume.stream_id);
     let prologue =
         noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, stream_id.as_str());
@@ -314,7 +365,8 @@ async fn connected_controlled_harness() -> Result<(
         &prologue,
         &handshake.into_handshake_payload()?,
     )?;
-    let (_transport, response) = pending.complete()?;
+    let (transport, response) = pending.complete()?;
+    control.transport = Some(transport);
     control.send_inbound(Message::Binary(
         encode_relay_message_frame(&RelayMessageFrame::handshake(stream_id, response)).into(),
     ))?;
@@ -333,6 +385,8 @@ struct ControlledWebSocket {
 }
 
 struct ControlledWebSocketHandle {
+    stream_id: String,
+    transport: Option<crate::noise_channel::NoiseTransport>,
     inbound_tx: futures_mpsc::UnboundedSender<Result<Message, std::convert::Infallible>>,
     write_permit_tx: futures_mpsc::UnboundedSender<()>,
     blocked_write_rx: futures_mpsc::UnboundedReceiver<usize>,
@@ -369,6 +423,8 @@ impl ControlledWebSocket {
                 block_flush: false,
             },
             ControlledWebSocketHandle {
+                stream_id: String::new(),
+                transport: None,
                 inbound_tx,
                 write_permit_tx,
                 blocked_write_rx,
@@ -380,6 +436,23 @@ impl ControlledWebSocket {
 }
 
 impl ControlledWebSocketHandle {
+    fn send_rpc(&mut self, message: JSONRPCMessage, seq: u32) -> Result<()> {
+        let bytes = frame_jsonrpc_message(&message)?;
+        let encrypted = self
+            .transport
+            .as_mut()
+            .context("handshake not complete")?
+            .encrypt(&bytes)?;
+        self.send_inbound(Message::Binary(
+            encode_relay_message_frame(&RelayMessageFrame::data(
+                self.stream_id.clone(),
+                seq,
+                encrypted,
+            ))
+            .into(),
+        ))
+    }
+
     fn send_inbound(&self, message: Message) -> Result<()> {
         self.inbound_tx
             .unbounded_send(Ok(message))
@@ -465,4 +538,32 @@ impl futures::Stream for ControlledWebSocket {
         }
         result
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn harness_expires_gap_without_needing_another_data_frame() -> Result<()> {
+    let (mut connection, control, _outbound) = connected_controlled_harness().await?;
+    control.grant_writes(16);
+    control.send_inbound(Message::Binary(
+        encode_relay_message_frame(&RelayMessageFrame::data(
+            control.stream_id.clone(),
+            1,
+            vec![1],
+        ))
+        .into(),
+    ))?;
+    // Two reads are the handshake response and the future ciphertext.
+    while control.inbound_reads() < 2 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(
+        crate::noise_relay::ordered_ciphertext::CIPHERTEXT_GAP_TIMEOUT + Duration::from_secs(1),
+    )
+    .await;
+    let event = timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?;
+    assert!(
+        matches!(event, Some(JsonRpcConnectionEvent::Disconnected { reason: Some(reason) })
+        if reason == crate::noise_relay::ordered_ciphertext::CIPHERTEXT_GAP_TIMEOUT_REASON)
+    );
+    Ok(())
 }

@@ -321,11 +321,14 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_rejects_invalid_dynamic_tools_from_rollout() -> Result<()> {
+async fn resume_quarantines_invalid_dynamic_tools_from_rollout() -> Result<()> {
     let server = start_mock_server().await;
-    mount_sse_once(
+    let mock = mount_sse_sequence(
         &server,
-        responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        vec![
+            responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            responses::sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
     )
     .await;
 
@@ -357,6 +360,9 @@ async fn resume_rejects_invalid_dynamic_tools_from_rollout() -> Result<()> {
             "properties": {},
             "additionalProperties": false
         }
+    }, {
+        "type": "function", "name": "valid_restored_tool", "description": "Valid restored tool survives quarantine.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
     }]);
     let rollout = rollout_lines
         .iter()
@@ -366,19 +372,18 @@ async fn resume_rejects_invalid_dynamic_tools_from_rollout() -> Result<()> {
     fs::write(&rollout_path, format!("{rollout}\n"))?;
 
     let mut resume_builder = test_codex();
-    let error = match resume_builder
+    let resumed = resume_builder
         .resume(&server, base_test.home.clone(), rollout_path)
-        .await
-    {
-        Ok(_) => panic!("invalid restored dynamic tools should reject resume"),
-        Err(error) => error,
-    };
-    assert!(
-        format!("{error:#}").contains(
-            "dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: invalid tool name"
-        ),
-        "unexpected resume error: {error:#}"
-    );
+        .await?;
+    resumed
+        .submit_turn("continue without the invalid restored tool")
+        .await?;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let body = requests[1].body_json();
+    assert!(!body["tools"].to_string().contains("invalid tool name"));
+    assert!(body["tools"].to_string().contains("valid_restored_tool"));
+    assert!(body["input"].to_string().contains("persist this thread"));
 
     Ok(())
 }

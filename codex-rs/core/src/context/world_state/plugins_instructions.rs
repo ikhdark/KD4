@@ -36,6 +36,25 @@ impl WorldStateSection for PluginsInstructionsState {
         Self::matches_legacy_fragment(role, text)
     }
 
+    fn required() -> bool {
+        true
+    }
+
+    fn retained_state_supported(
+        previous: &Self::Snapshot,
+        items: &[codex_protocol::models::ResponseItem],
+    ) -> bool {
+        let latest = super::retained_texts(items, "developer")
+            .rev()
+            .find(|text| Self::matches_legacy_fragment("developer", text));
+        let expected = if *previous {
+            AvailablePluginsInstructions.render()
+        } else {
+            PluginsInstructionsUnavailable.render()
+        };
+        latest.map_or(!*previous, |text| text.contains(&expected))
+    }
+
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,

@@ -152,10 +152,10 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         parameters.required.as_ref(),
         Some(&vec!["task_name".to_string()])
     );
-    let output_schema = output_schema.expect("spawn_agent output schema");
+    let output_schema = output_schema.expect("spawn_agent output schema")["oneOf"][0].clone();
     assert_eq!(
         output_schema["required"],
-        json!(["task_name", "nickname", "assignment_id"])
+        json!(["task_name", "nickname", "assignment_id", "integration_plan"])
     );
     assert_eq!(
         output_schema["properties"]["assignment_id"]["type"],

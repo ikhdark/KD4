@@ -940,13 +940,17 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact() {
+async fn steered_user_input_arrives_immediately_after_mid_turn_compact() {
+    let (release_response, response_gate) = oneshot::channel();
     let first_chunks = vec![
         chunk(ev_response_created("resp-1")),
         chunk(ev_function_call("call-1", "test_tool", "{}")),
-        chunk(ev_completed_with_tokens(
-            "resp-1", /*total_tokens*/ 500_000,
-        )),
+        gated_chunk(
+            response_gate,
+            vec![ev_completed_with_tokens(
+                "resp-1", /*total_tokens*/ 500_000,
+            )],
+        ),
     ];
 
     let compact_chunks = vec![
@@ -955,17 +959,6 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         chunk(ev_completed_with_tokens(
             "resp-compact",
             /*total_tokens*/ 50_000,
-        )),
-    ];
-
-    let post_compact_continuation_chunks = vec![
-        chunk(ev_response_created("resp-post-compact")),
-        chunk(ev_message_item_added("msg-post-compact", "")),
-        chunk(ev_output_text_delta("resumed old task")),
-        chunk(ev_message_item_done("msg-post-compact", "resumed old task")),
-        chunk(ev_completed_with_tokens(
-            "resp-post-compact",
-            /*total_tokens*/ 60_000,
         )),
     ];
 
@@ -981,13 +974,9 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         )),
     ];
 
-    let (server, _completions) = start_streaming_sse_server(vec![
-        first_chunks,
-        compact_chunks,
-        post_compact_continuation_chunks,
-        steered_follow_up_chunks,
-    ])
-    .await;
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, compact_chunks, steered_follow_up_chunks])
+            .await;
 
     let codex = test_codex()
         .with_model("gpt-5.4")
@@ -1002,31 +991,34 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         .codex;
 
     submit_user_input(&codex, "first prompt").await;
-    submit_user_input(&codex, "second prompt").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnStarted(_))).await;
+    steer_user_input(&codex, "second prompt").await;
+    release_response
+        .send(())
+        .expect("response waits for admitted steering");
 
-    wait_for_agent_message(&codex, "resumed old task").await;
+    wait_for_agent_message(&codex, "processed steered prompt").await;
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 3);
 
-    let post_compact_body: Value = from_slice(&requests[2]).expect("parse post-compact request");
-    let steered_body: Value = from_slice(&requests[3]).expect("parse steered request");
-
-    let post_compact_user_texts = message_input_texts(&post_compact_body, "user");
+    let compact_body: Value = from_slice(&requests[1]).expect("parse compact request");
     assert!(
-        !post_compact_user_texts
+        !message_input_texts(&compact_body, "user")
             .iter()
-            .any(|text| text == "second prompt"),
-        "steered input should stay pending until the model resumes after compaction"
+            .any(|text| text == "second prompt")
     );
+    let steered_body: Value = from_slice(&requests[2]).expect("parse steered request");
 
     let steered_user_texts = message_input_texts(&steered_body, "user");
-    assert!(
+    assert_eq!(
         steered_user_texts
             .iter()
-            .any(|text| text == "second prompt"),
-        "steered input should be recorded on the request after the post-compact continuation"
+            .filter(|text| *text == "second prompt")
+            .count(),
+        1,
+        "steering must arrive exactly once on the first post-compaction request"
     );
 
     server.shutdown().await;
@@ -1120,7 +1112,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_request() {
+async fn steered_user_input_arrives_when_tool_output_triggers_compact_before_next_request() {
     let (gate_first_completed_tx, gate_first_completed_rx) = oneshot::channel();
 
     let large_output_command = "[Console]::Out.Write([string]::new([char]'0', 40000))";
@@ -1159,18 +1151,6 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         )),
     ];
 
-    let post_compact_continuation_chunks = vec![
-        chunk(ev_response_created("resp-post-compact")),
-        chunk(ev_message_item_done(
-            "msg-post-compact",
-            "resumed after compacting tool output",
-        )),
-        chunk(ev_completed_with_tokens(
-            "resp-post-compact",
-            /*total_tokens*/ 6_000,
-        )),
-    ];
-
     let steered_follow_up_chunks = vec![
         chunk(ev_response_created("resp-steered")),
         chunk(ev_message_item_done(
@@ -1183,13 +1163,9 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         )),
     ];
 
-    let (server, _completions) = start_streaming_sse_server(vec![
-        first_chunks,
-        compact_chunks,
-        post_compact_continuation_chunks,
-        steered_follow_up_chunks,
-    ])
-    .await;
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, compact_chunks, steered_follow_up_chunks])
+            .await;
 
     let test = test_codex()
         .with_model("gpt-5.4")
@@ -1219,11 +1195,10 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
     .await;
 
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 3);
 
     let compact_body: Value = from_slice(&requests[1]).expect("parse compact request");
-    let post_compact_body: Value = from_slice(&requests[2]).expect("parse post-compact request");
-    let steered_body: Value = from_slice(&requests[3]).expect("parse steered request");
+    let steered_body: Value = from_slice(&requests[2]).expect("parse steered request");
 
     let compact_user_texts = message_input_texts(&compact_body, "user");
     assert!(
@@ -1233,21 +1208,19 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         "steered input should not be included in the compaction request"
     );
 
-    let post_compact_user_texts = message_input_texts(&post_compact_body, "user");
-    assert!(
-        !post_compact_user_texts
-            .iter()
-            .any(|text| text == "second prompt"),
-        "steered input should stay pending until after the compacted continuation"
-    );
-
     let steered_user_texts = message_input_texts(&steered_body, "user");
-    assert!(
+    assert_eq!(
         steered_user_texts
             .iter()
-            .any(|text| text == "second prompt"),
-        "steered input should be recorded on the request after the post-compact continuation"
+            .filter(|text| *text == "second prompt")
+            .count(),
+        1,
+        "steering must arrive exactly once on the first post-compaction request"
     );
 
+    // This case launches a real shell. Join session teardown before the test
+    // runtime drops so its child handles cannot outlive the test process.
+    codex.submit(Op::Shutdown).await.expect("shutdown session");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.shutdown().await;
 }

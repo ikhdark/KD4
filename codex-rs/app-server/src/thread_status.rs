@@ -13,14 +13,14 @@ use codex_protocol::protocol::TurnAbortReason;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(test)]
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
 #[derive(Clone)]
 pub(crate) struct ThreadWatchManager {
     state: Arc<Mutex<ThreadWatchState>>,
-    outgoing: Option<Arc<OutgoingMessageSender>>,
+    publications: Option<mpsc::Sender<ThreadStatusChangedNotification>>,
+    publication_failure: tokio_util::sync::CancellationToken,
     running_turn_count_tx: watch::Sender<usize>,
 }
 
@@ -29,7 +29,6 @@ pub(crate) struct ThreadWatchActiveGuard {
     thread_id: String,
     guard_type: ThreadWatchActiveGuardType,
     lifecycle: Arc<()>,
-    handle: tokio::runtime::Handle,
 }
 
 pub(crate) struct ThreadStatusSubscription {
@@ -92,29 +91,14 @@ impl ThreadWatchActiveGuard {
             thread_id,
             guard_type,
             lifecycle,
-            handle: tokio::runtime::Handle::current(),
         }
     }
 }
 
 impl Drop for ThreadWatchActiveGuard {
     fn drop(&mut self) {
-        let notification = self.manager.note_active_guard_released(
-            &self.thread_id,
-            self.guard_type,
-            &self.lifecycle,
-        );
-        if let Some(notification) = notification
-            && let Some(outgoing) = self.manager.outgoing.clone()
-        {
-            // Canonical state and local watchers have already been updated. Only
-            // network delivery depends on the originating runtime remaining alive.
-            self.handle.spawn(async move {
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadStatusChanged(notification))
-                    .await;
-            });
-        }
+        self.manager
+            .note_active_guard_released(&self.thread_id, self.guard_type, &self.lifecycle);
     }
 }
 
@@ -135,16 +119,44 @@ impl ThreadWatchManager {
         let (running_turn_count_tx, _running_turn_count_rx) = watch::channel(0);
         Self {
             state: Arc::new(Mutex::new(ThreadWatchState::default())),
-            outgoing: None,
+            publications: None,
+            publication_failure: tokio_util::sync::CancellationToken::new(),
             running_turn_count_tx,
         }
     }
 
     pub(crate) fn new_with_outgoing(outgoing: Arc<OutgoingMessageSender>) -> Self {
         let (running_turn_count_tx, _running_turn_count_rx) = watch::channel(0);
+        let (publications, mut receiver) = mpsc::channel(1024);
+        let publication_failure = tokio_util::sync::CancellationToken::new();
+        tokio::spawn({
+            let failure = publication_failure.clone();
+            async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = failure.cancelled() => {
+                            outgoing.fail_all_connection_delivery().await;
+                            break;
+                        }
+                        next = receiver.recv() => {
+                            let Some(notification) = next else { break };
+                            tokio::select! {
+                                _ = failure.cancelled() => {
+                                    outgoing.fail_all_connection_delivery().await;
+                                    break;
+                                }
+                                _ = outgoing.send_server_notification(ServerNotification::ThreadStatusChanged(notification)) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
         Self {
             state: Arc::new(Mutex::new(ThreadWatchState::default())),
-            outgoing: Some(outgoing),
+            publications: Some(publications),
+            publication_failure,
             running_turn_count_tx,
         }
     }
@@ -299,7 +311,7 @@ impl ThreadWatchManager {
         // Own the decrement before notification delivery can suspend or be canceled.
         let guard =
             ThreadWatchActiveGuard::new(self.clone(), thread_id.to_string(), guard_type, lifecycle);
-        self.publish_notification(notification).await;
+        let _ = notification;
         guard
     }
 
@@ -322,6 +334,15 @@ impl ThreadWatchManager {
             *count = state.running_turn_count;
             true
         });
+        // Enqueue under the canonical-state lock, including guard drops, so
+        // an older snapshot can never be published after a newer transition.
+        if let Some(notification) = &notification
+            && let Some(publications) = &self.publications
+        {
+            if publications.try_send(notification.clone()).is_err() {
+                self.publication_failure.cancel();
+            }
+        }
         notification
     }
 
@@ -330,17 +351,7 @@ impl ThreadWatchManager {
         F: FnOnce(&mut ThreadWatchState) -> Option<ThreadStatusChangedNotification>,
     {
         let notification = self.mutate_state(mutate);
-        self.publish_notification(notification).await;
-    }
-
-    async fn publish_notification(&self, notification: Option<ThreadStatusChangedNotification>) {
-        if let Some(notification) = notification
-            && let Some(outgoing) = &self.outgoing
-        {
-            outgoing
-                .send_server_notification(ServerNotification::ThreadStatusChanged(notification))
-                .await;
-        }
+        let _ = notification;
     }
 
     #[expect(
@@ -996,6 +1007,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_release_publication_stays_before_later_status_changes() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
+        let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        )));
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        let guard = manager
+            .note_permission_requested(INTERACTIVE_THREAD_ID)
+            .await;
+        // Accumulate changes without letting the bounded transport drain.
+        drop(guard);
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .await;
+        manager.note_thread_shutdown(INTERACTIVE_THREAD_ID).await;
+        for expected in [
+            ThreadStatus::Active {
+                active_flags: vec![],
+            },
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+            },
+            ThreadStatus::Active {
+                active_flags: vec![],
+            },
+            ThreadStatus::Idle,
+            ThreadStatus::NotLoaded,
+        ] {
+            assert_eq!(
+                recv_status_changed_notification(&mut outgoing_rx)
+                    .await
+                    .status,
+                expected
+            );
+        }
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::NotLoaded
+        );
+    }
+
+    #[tokio::test]
     async fn status_change_emits_notification() {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
@@ -1190,6 +1246,13 @@ mod tests {
             .subscribe(ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id"))
             .await
             .expect("status subscription");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while outgoing_rx.len() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication worker fills outgoing queue");
         assert_eq!(
             outgoing_rx.len(),
             1,
@@ -1197,11 +1260,9 @@ mod tests {
         );
         assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
 
-        let mut request = Box::pin(manager.note_permission_requested(INTERACTIVE_THREAD_ID));
-        assert!(
-            futures::poll!(request.as_mut()).is_pending(),
-            "permission publication must be blocked by outgoing backpressure"
-        );
+        let request = manager
+            .note_permission_requested(INTERACTIVE_THREAD_ID)
+            .await;
         assert_pending_request_counts(&manager, 1, 0);
         assert_eq!(
             *subscription.borrow(),
@@ -1244,6 +1305,13 @@ mod tests {
             .subscribe(ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id"))
             .await
             .expect("status subscription");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while outgoing_rx.len() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication worker fills outgoing queue");
         assert_eq!(
             outgoing_rx.len(),
             1,
@@ -1251,11 +1319,9 @@ mod tests {
         );
         assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
 
-        let mut request = Box::pin(manager.note_user_input_requested(INTERACTIVE_THREAD_ID));
-        assert!(
-            futures::poll!(request.as_mut()).is_pending(),
-            "user-input publication must be blocked by outgoing backpressure"
-        );
+        let request = manager
+            .note_user_input_requested(INTERACTIVE_THREAD_ID)
+            .await;
         assert_pending_request_counts(&manager, 0, 1);
         assert_eq!(
             *subscription.borrow(),

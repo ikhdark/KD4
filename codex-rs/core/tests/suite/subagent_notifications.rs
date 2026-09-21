@@ -1434,15 +1434,13 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
     )
     .await;
     let error = "Error while reading the server response: stream closed before response.completed (received 1 SSE events, 60 payload bytes)";
-    let (status, expected_text) = match scenario {
-        CompletionScenario::Completed => {
-            ("Completed(Some(\"child done\"))".to_string(), "child done")
-        }
-        CompletionScenario::TerminalError => (format!("Errored(\"{error}\")"), error),
+    let (payload, expected_text) = match scenario {
+        CompletionScenario::Completed => (
+            "Agent-reported result (behavior unverified): child done".to_string(),
+            "child done",
+        ),
+        CompletionScenario::TerminalError => (format!("Agent errored: {error}"), error),
     };
-    let payload = format!(
-        "Agent errored: durable typed receipt status: needs_main: typed agent /root/worker finished with status {status} without submitting a receipt"
-    );
     let notification = format!(
         "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"
     );

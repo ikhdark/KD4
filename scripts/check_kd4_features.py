@@ -12,6 +12,8 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import Sequence
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -19,11 +21,68 @@ from typing import Any
 import tomllib
 
 if __package__:
-    from scripts import rust_test_runner
+    from scripts import rust_build_status, rust_test_runner
+    from scripts.process_owner import run_finite
 else:
     # runpy-based just recipes do not put this script's directory on sys.path.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import rust_build_status
     import rust_test_runner
+    from process_owner import run_finite
+
+_validation_lane = ContextVar("feature_validation_lane", default=None)
+_validation_session = ContextVar("feature_validation_session", default=None)
+
+
+@contextmanager
+def validation_session():
+    """Retain a lazily acquired lane across export and runtime verification."""
+    with ExitStack() as stack:
+        token = _validation_session.set(stack)
+        try:
+            yield
+        finally:
+            _validation_session.reset(token)
+
+
+@contextmanager
+def validation_lane(repo_root):
+    active = _validation_lane.get()
+    if active is not None and active[0] == repo_root.resolve():
+        yield active[1]
+        return
+    inherited = os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
+    owner = os.environ.get("CODEX_CARGO_LANE_OWNER_PID")
+    if (
+        inherited
+        and owner
+        and rust_build_status.lane_active_lock_is_held(Path(inherited))
+    ):
+        token = _validation_lane.set((repo_root.resolve(), Path(inherited)))
+        try:
+            yield Path(inherited)
+        finally:
+            _validation_lane.reset(token)
+        return
+    reservation = rust_build_status.reserve_cargo_lane(
+        repo_root=repo_root,
+        requested_lane="core-tests",
+        command=["cargo", "nextest", "run", "-p", "codex-core"],
+    )
+    session = _validation_session.get()
+    if session is not None:
+        _, target = session.enter_context(reservation)
+        token = _validation_lane.set((repo_root.resolve(), target))
+        session.callback(_validation_lane.reset, token)
+        yield target
+        return
+    with reservation as (_, target):
+        token = _validation_lane.set((repo_root.resolve(), target))
+        try:
+            yield target
+        finally:
+            _validation_lane.reset(token)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_FILE_NAME = "kd4_features.toml"
@@ -367,7 +426,7 @@ class _TestOutcome:
             self.failed = True
 
     def verdict(self, returncode: int) -> str:
-        if returncode or self.failed:
+        if self.failed:
             return "failed"
         if self.skipped:
             return "skipped"
@@ -486,20 +545,19 @@ def execute_runtime_verification(
         try:
             assert rust_manifest is not None
             cwd = repo_root / "codex-rs"
-            metadata = rust_test_runner.load_metadata(cwd=cwd)
-            runner = rust_test_runner.RustTestRunner(
-                rust_manifest,
-                metadata,
-                cwd=cwd,
-                profile="fast",
-                target_dir=rust_test_runner._resolve_target_dir(
-                    None, metadata, cwd=cwd
-                ),
-            )
-            # Exact selectors and the same execution's outcomes supply proof.
-            # The runner still validates any explicitly declared filters before
-            # batching; generated exact selectors need no preliminary discovery.
-            completed = runner.run_gates(gates, quiet=quiet, discover=False)
+            with validation_lane(repo_root) as target:
+                metadata = rust_test_runner.load_metadata(cwd=cwd)
+                runner = rust_test_runner.RustTestRunner(
+                    rust_manifest,
+                    metadata,
+                    cwd=cwd,
+                    profile="fast",
+                    target_dir=target,
+                )
+                # Exact selectors and the same execution's outcomes supply proof.
+                # The runner still validates any explicitly declared filters before
+                # batching; generated exact selectors need no preliminary discovery.
+                completed = runner.run_gates(gates, quiet=quiet, discover=False)
         except (rust_test_runner.RunnerError, OSError) as exc:
             for feature in rust_features:
                 if outcomes is not None:
@@ -544,29 +602,43 @@ def execute_runtime_verification(
         command = [interpreter, "-m", "unittest", "-v", *observers]
         if not quiet:
             print(f"KD4 RUNTIME VERIFICATION: {' '.join(command)}")
+        pending = None
+        buffered = ""
+        oversized_line = False
+
+        def observe(chunk, observers=observers):
+            nonlocal pending, buffered, oversized_line
+            for part in chunk.splitlines(keepends=True):
+                buffered += part
+                if len(buffered) > 65536:
+                    oversized_line = True
+                    buffered = ""
+                    pending = None
+                if part.endswith("\n"):
+                    if not oversized_line:
+                        pending = _observe_unittest_output(buffered, observers, pending)
+                    oversized_line = False
+                    buffered = ""
+
         try:
-            with subprocess.Popen(
+            process = run_finite(
                 command,
                 cwd=repo_root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                observe=observe,
                 env={**os.environ, "INSTA_UPDATE": "no"},
-            ) as process:
-                assert process.stdout is not None
-                pending = None
-                for line in process.stdout:
-                    pending = _observe_unittest_output(line, observers, pending)
-                    if not quiet:
-                        print(line, end="")
-                returncode = process.wait()
+            )
+            if buffered and not oversized_line:
+                _observe_unittest_output(buffered, observers, pending)
+            if not quiet:
+                if process.output_truncated:
+                    print("[output truncated; retaining final 65536 bytes]")
+                print(process.stdout, end="")
+            returncode = process.returncode
         except OSError as exc:
             if not quiet:
                 print(f"runtime verification could not start: {exc}")
             return 2
-        failed = False
+        failed = returncode != 0
         for feature in features:
             verification = feature["runtime_verification"]
             outcome = observers[verification["command"][3]]
@@ -578,6 +650,7 @@ def execute_runtime_verification(
                         "outcome": verdict,
                         "test_identities": sorted(outcome.passed),
                         "returncode": returncode,
+                        "batch_status": process.status,
                         "evidence_kind": verification["kind"],
                     }
                 )
@@ -663,27 +736,29 @@ def _load_feature_defaults(repo_root: Path) -> dict[str, bool] | None:
     if not manifest_path.is_file():
         return None
     try:
-        completed = subprocess.run(
-            [
-                "cargo",
-                "run",
-                "--quiet",
-                "--manifest-path",
-                str(manifest_path),
-                "-p",
-                "codex-features",
-                "--bin",
-                "codex-features-export",
-            ],
-            cwd=repo_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        with validation_lane(repo_root) as target:
+            completed = run_finite(
+                [
+                    "cargo",
+                    "run",
+                    "--locked",
+                    "--target-dir",
+                    str(target),
+                    "--quiet",
+                    "--manifest-path",
+                    str(manifest_path),
+                    "-p",
+                    "codex-features",
+                    "--bin",
+                    "codex-features-export",
+                ],
+                cwd=repo_root,
+                output_limit=4 * 1024 * 1024,
+                stderr=None,
+            )
     except (OSError, UnicodeError):
         return None
-    if completed.returncode != 0:
+    if completed.returncode != 0 or completed.output_truncated:
         return None
     try:
         entries = json.loads(completed.stdout)
@@ -1979,72 +2054,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest_path = args.manifest
     if not manifest_path.is_absolute():
         manifest_path = args.repo_root / manifest_path
-    result = validate_manifest(
-        manifest_path, repo_root=args.repo_root, strict=args.strict
-    )
-    outcomes: list[dict[str, Any]] = []
-    if args.static_only:
-        if args.run_runtime_verification:
-            raise SystemExit(
-                "--static-only cannot be combined with --run-runtime-verification"
-            )
+    with validation_session():
+        result = validate_manifest(
+            manifest_path, repo_root=args.repo_root, strict=args.strict
+        )
+        outcomes: list[dict[str, Any]] = []
+        if args.static_only:
+            if args.run_runtime_verification:
+                raise SystemExit(
+                    "--static-only cannot be combined with --run-runtime-verification"
+                )
+            if args.json:
+                payload = result.to_json()
+                payload.update(
+                    staticEvidence="present" if result.ok else "invalid",
+                    runtimeVerification="not_run",
+                    runtimeVerificationExitCode=None,
+                )
+                print(json.dumps(payload, sort_keys=True))
+            else:
+                print(
+                    f"KD4 DECLARED EVIDENCE: {'PRESENT' if result.ok else 'INVALID'}; runtime tests not run"
+                )
+                for finding in result.findings:
+                    print(
+                        f"[{finding.level}] [{finding.feature_id}] {finding.code}: {finding.message}"
+                    )
+            return 0 if result.ok else 1
         if args.json:
-            payload = result.to_json()
-            payload.update(
-                staticEvidence="present" if result.ok else "invalid",
-                runtimeVerification="not_run",
-                runtimeVerificationExitCode=None,
+            runtime_exit_code = (
+                execute_runtime_verification(
+                    manifest_path,
+                    feature_id=args.run_runtime_verification,
+                    repo_root=args.repo_root,
+                    quiet=True,
+                    outcomes=outcomes,
+                )
+                if result.ok
+                else None
             )
+            payload = result.to_json()
+            payload["runtimeVerificationExitCode"] = runtime_exit_code
+            payload["runtimeVerificationResults"] = outcomes
+            payload["staticEvidence"] = "present" if result.ok else "invalid"
+            payload["ok"] = result.ok and runtime_exit_code == 0
             print(json.dumps(payload, sort_keys=True))
+            return 1 if runtime_exit_code is None else runtime_exit_code
         else:
+            verdict = "PASSED" if result.ok else "FAILED"
+            counts = ", ".join(
+                f"{status}={count}" for status, count in result.status_counts.items()
+            )
             print(
-                f"KD4 DECLARED EVIDENCE: {'PRESENT' if result.ok else 'INVALID'}; runtime tests not run"
+                f"KD4 DECLARED EVIDENCE {verdict}: {result.feature_count} feature(s); {counts}; "
+                f"runtime={result.runtime_status_counts}"
             )
             for finding in result.findings:
+                feature = f" [{finding.feature_id}]" if finding.feature_id else ""
                 print(
-                    f"[{finding.level}] [{finding.feature_id}] {finding.code}: {finding.message}"
+                    f"[{finding.level.upper()}]{feature} {finding.code}: {finding.message}"
                 )
-        return 0 if result.ok else 1
-    if args.json:
-        runtime_exit_code = (
-            execute_runtime_verification(
-                manifest_path,
-                feature_id=args.run_runtime_verification,
-                repo_root=args.repo_root,
-                quiet=True,
-                outcomes=outcomes,
-            )
-            if result.ok
-            else None
+        if not result.ok:
+            return 1
+        return execute_runtime_verification(
+            manifest_path,
+            feature_id=args.run_runtime_verification,
+            repo_root=args.repo_root,
         )
-        payload = result.to_json()
-        payload["runtimeVerificationExitCode"] = runtime_exit_code
-        payload["runtimeVerificationResults"] = outcomes
-        payload["staticEvidence"] = "present" if result.ok else "invalid"
-        payload["ok"] = result.ok and runtime_exit_code == 0
-        print(json.dumps(payload, sort_keys=True))
-        return 1 if runtime_exit_code is None else runtime_exit_code
-    else:
-        verdict = "PASSED" if result.ok else "FAILED"
-        counts = ", ".join(
-            f"{status}={count}" for status, count in result.status_counts.items()
-        )
-        print(
-            f"KD4 DECLARED EVIDENCE {verdict}: {result.feature_count} feature(s); {counts}; "
-            f"runtime={result.runtime_status_counts}"
-        )
-        for finding in result.findings:
-            feature = f" [{finding.feature_id}]" if finding.feature_id else ""
-            print(
-                f"[{finding.level.upper()}]{feature} {finding.code}: {finding.message}"
-            )
-    if not result.ok:
-        return 1
-    return execute_runtime_verification(
-        manifest_path,
-        feature_id=args.run_runtime_verification,
-        repo_root=args.repo_root,
-    )
 
 
 if __name__ == "__main__":

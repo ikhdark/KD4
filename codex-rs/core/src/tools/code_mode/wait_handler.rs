@@ -633,6 +633,7 @@ mod tests {
         let cell_id = codex_code_mode::CellId::new("cell-terminal".to_string());
         let terminal =
             codex_code_mode::WaitOutcome::LiveCell(codex_code_mode::RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: cell_id.clone(),
                 content_items: Vec::new(),
                 error_text: None,

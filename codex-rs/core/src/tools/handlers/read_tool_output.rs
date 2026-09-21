@@ -20,6 +20,7 @@ use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME;
 use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use base64::Engine as _;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::DeterministicContinuationHostAction;
@@ -91,6 +92,7 @@ enum ContinuationStep {
 }
 
 struct RecoveryContinuationState {
+    initial_result_count: usize,
     output: ReadToolOutputResult,
     reused: bool,
     followed_selectors: Vec<ToolOutputSelector>,
@@ -102,6 +104,7 @@ struct RecoveryContinuationState {
 impl RecoveryContinuationState {
     fn new(output: ReadToolOutputResult, reused: bool, token_ceiling: usize) -> Self {
         Self {
+            initial_result_count: output.results.len(),
             output,
             reused,
             followed_selectors: Vec::new(),
@@ -116,14 +119,22 @@ impl RecoveryContinuationState {
         reason: ContinuationStopReason,
         selector: Option<ToolOutputSelector>,
     ) {
+        let resumable = matches!(
+            reason,
+            ContinuationStopReason::Budget | ContinuationStopReason::Cancelled
+        );
+        let selector = selector.map(|selector| {
+            if resumable {
+                self.remaining_owner_selector(selector)
+            } else {
+                selector
+            }
+        });
         self.continuation_stop = Some(RecoveryContinuationStopV1 {
             version: 1,
             reason,
             selector,
-            resumable: matches!(
-                reason,
-                ContinuationStopReason::Budget | ContinuationStopReason::Cancelled
-            ),
+            resumable,
             message: Some(match reason {
                 ContinuationStopReason::Budget => "Recovery reached its output budget. Continue with the unconsumed selector in a new call.",
                 ContinuationStopReason::Cancelled => "Recovery was cancelled. Already recovered pages are retained; the unconsumed selector can be retried.",
@@ -142,13 +153,39 @@ impl RecoveryContinuationState {
         error: &ReadToolOutputError,
         selector: ToolOutputSelector,
     ) {
+        let resumable = matches!(error, ReadToolOutputError::StillWriting);
+        let selector = if resumable {
+            self.remaining_owner_selector(selector)
+        } else {
+            selector
+        };
         self.continuation_stop = Some(RecoveryContinuationStopV1 {
             version: 1,
             reason: ContinuationStopReason::PageReadError,
             selector: Some(selector),
-            resumable: matches!(error, ReadToolOutputError::StillWriting),
+            resumable,
             message: Some(error.for_model()),
         });
+    }
+
+    // Internal draining follows bounded child ranges. Across model calls the
+    // continuation must also carry the owner's remaining extent: retrying only
+    // one child would complete that child and silently lose every later page.
+    fn remaining_owner_selector(&self, selector: ToolOutputSelector) -> ToolOutputSelector {
+        let ToolOutputSelector::Bytes { start, end } = &selector else {
+            return selector;
+        };
+        let remaining_end = self.output.results.iter().find_map(|owner| {
+            if owner.continuation.as_ref() != Some(&selector) {
+                return None;
+            }
+            let range = owner.canonical_range?;
+            (range.start <= *start && *end <= range.end).then_some(range.end)
+        });
+        match remaining_end {
+            Some(end) => ToolOutputSelector::Bytes { start: *start, end },
+            None => selector,
+        }
     }
 
     fn first_pending_selector(&self) -> Option<ToolOutputSelector> {
@@ -172,6 +209,13 @@ impl RecoveryContinuationState {
             let Some(selector) = result.continuation.as_ref() else {
                 continue;
             };
+            // A search continuation is another requested page, not an unfinished
+            // fragment of the requested page. Preserve the caller's max_results.
+            if result.status == ToolOutputSelectorStatus::Ok
+                && matches!(selector, ToolOutputSelector::Search { .. })
+            {
+                continue;
+            }
             if self.followed_selectors.contains(selector) {
                 return ContinuationStep::Stop(ContinuationStopReason::RepeatedSelector);
             }
@@ -245,7 +289,56 @@ impl RecoveryContinuationState {
         Ok(())
     }
 
-    fn finish(self) -> DrainedRecoveryTransaction {
+    fn finish(mut self) -> DrainedRecoveryTransaction {
+        // Replace overflow descriptors only after exact, gap-free coverage is
+        // proven. Appended byte pages are transport fragments, not extra selections.
+        if self.continuation_stop.is_none()
+            && self.output.unavailable_ranges.is_empty()
+            && self.output.results[..self.initial_result_count]
+                .iter()
+                .any(|owner| owner.status != ToolOutputSelectorStatus::Ok)
+        {
+            let mut reconstructed = self.output.clone();
+            let mut recovered_owners = Vec::new();
+            for owner in &mut reconstructed.results[..self.initial_result_count] {
+                if owner.status == ToolOutputSelectorStatus::Ok {
+                    continue;
+                }
+                if let Some(exact) =
+                    reconstruct_selection(owner, &self.output.results[self.initial_result_count..])
+                {
+                    recovered_owners.push((exact.selector.clone(), exact.canonical_range));
+                    *owner = exact;
+                }
+            }
+            if !recovered_owners.is_empty() {
+                // Only discard fragments represented by a reconstructed owner.
+                // Other continuation pages and explicit search pages remain intact.
+                let mut index = 0;
+                reconstructed.results.retain(|page| {
+                    let keep = index < self.initial_result_count
+                        || !recovered_owners.iter().any(|(selector, range)| {
+                            page.selector == *selector
+                                || (matches!(page.selector, ToolOutputSelector::Bytes { .. })
+                                    && range.zip(page.canonical_range).is_some_and(
+                                        |(owner, page)| {
+                                            owner.start <= page.start && page.end <= owner.end
+                                        },
+                                    ))
+                        });
+                    index += 1;
+                    keep
+                });
+                reconstructed.complete = reconstructed.results.iter().all(|r| {
+                    r.status == ToolOutputSelectorStatus::Ok
+                        && r.complete
+                        && r.continuation.is_none()
+                });
+                if recovery_result_fits_token_ceiling(&reconstructed, self.token_ceiling) {
+                    self.output = reconstructed;
+                }
+            }
+        }
         DrainedRecoveryTransaction {
             output: self.output,
             reused: self.reused,
@@ -253,6 +346,74 @@ impl RecoveryContinuationState {
             continuation_stop: self.continuation_stop,
         }
     }
+}
+
+fn reconstruct_selection(
+    owner: &ToolOutputSelectorResult,
+    pages: &[ToolOutputSelectorResult],
+) -> Option<ToolOutputSelectorResult> {
+    if let Some(page) = pages.iter().find(|page| {
+        page.selector == owner.selector
+            && page.status == ToolOutputSelectorStatus::Ok
+            && page.complete
+            && page.continuation.is_none()
+    }) {
+        return Some(page.clone());
+    }
+    let range = owner.canonical_range?;
+    let mut pages = pages
+        .iter()
+        .filter(|page| {
+            page.status == ToolOutputSelectorStatus::Ok
+                && page.complete
+                && page
+                    .canonical_range
+                    .is_some_and(|r| range.start <= r.start && r.end <= range.end)
+        })
+        .collect::<Vec<_>>();
+    pages.sort_by_key(|page| page.canonical_range.map(|r| r.start));
+    let mut cursor = range.start;
+    let mut bytes = Vec::new();
+    for page in pages {
+        let page_range = page.canonical_range?;
+        if page_range.start != cursor {
+            return None;
+        }
+        let fragment = if let Some(text) = &page.text {
+            text.as_bytes().to_vec()
+        } else {
+            base64::engine::general_purpose::STANDARD
+                .decode(page.data_base64.as_ref()?)
+                .ok()?
+        };
+        if fragment.len() as u64 != page_range.end.checked_sub(page_range.start)? {
+            return None;
+        }
+        bytes.extend(fragment);
+        cursor = page_range.end;
+    }
+    if cursor != range.end || bytes.len() as u64 != range.end.checked_sub(range.start)? {
+        return None;
+    }
+    let mut result = owner.clone();
+    result.status = ToolOutputSelectorStatus::Ok;
+    result.complete = true;
+    result.exact_bytes = Some(bytes.len() as u64);
+    result.continuation = None;
+    result.child_selectors.clear();
+    result.subdivision_plan = None;
+    result.message = None;
+    result.text = None;
+    result.value = None;
+    result.data_base64 = None;
+    if matches!(owner.selector, ToolOutputSelector::JsonPointer { .. }) {
+        result.value = Some(serde_json::from_slice(&bytes).ok()?);
+    } else if let Ok(text) = String::from_utf8(bytes.clone()) {
+        result.text = Some(text);
+    } else {
+        result.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    Some(result)
 }
 
 fn selector_stop_reason(status: ToolOutputSelectorStatus) -> Option<ContinuationStopReason> {
@@ -291,6 +452,19 @@ fn next_owner_continuation(
         .position(|child| child == consumed)
         .and_then(|index| predecessor.child_selectors.get(index.saturating_add(1)))
         .cloned()
+        .or_else(|| {
+            // Large or nonuniform ranges intentionally have no uniform plan.
+            // Re-select their suffix to compute its next bounded UTF-8 page;
+            // exhausting the first advertised child is not owner completion.
+            let ToolOutputSelector::Bytes { end, .. } = consumed else {
+                return None;
+            };
+            let range = predecessor.canonical_range?;
+            (*end < range.end).then_some(ToolOutputSelector::Bytes {
+                start: *end,
+                end: range.end,
+            })
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -942,12 +1116,10 @@ mod tests {
         }
     }
 
-    fn search_selector(start_byte: u64) -> ToolOutputSelector {
-        ToolOutputSelector::Search {
-            query: "needle".to_string(),
-            start_byte,
-            max_results: 1,
-            context_lines: 0,
+    fn page_selector(start: u64) -> ToolOutputSelector {
+        ToolOutputSelector::Bytes {
+            start,
+            end: start + 10,
         }
     }
 
@@ -987,12 +1159,102 @@ mod tests {
     }
 
     #[test]
+    fn search_page_limit_does_not_automatically_fetch_later_matches() {
+        let selector = ToolOutputSelector::Search {
+            query: "needle".into(),
+            start_byte: 0,
+            max_results: 1,
+            context_lines: 0,
+        };
+        let next = ToolOutputSelector::Search {
+            query: "needle".into(),
+            start_byte: 100,
+            max_results: 1,
+            context_lines: 0,
+        };
+        let state = RecoveryContinuationState::new(
+            recovery_output(vec![continuation_result(
+                selector,
+                Some(next.clone()),
+                "one match",
+            )]),
+            false,
+            usize::MAX,
+        );
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+        let output = state.finish();
+        assert_eq!(output.drained_continuation_pages, 0);
+        assert_eq!(output.output.results.len(), 1);
+        assert_eq!(output.output.results[0].continuation, Some(next));
+        assert!(!output.output.complete);
+    }
+
+    #[test]
+    fn overflow_reconstruction_requires_exact_coverage_and_decodes_original_json() {
+        let bytes = br#"{"ok":true}"#;
+        let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        owner.selector = ToolOutputSelector::JsonPointer {
+            pointer: "/result".into(),
+        };
+        owner.canonical_range = Some(CanonicalByteRange { start: 10, end: 21 });
+        let mut first = continuation_result(
+            ToolOutputSelector::Bytes { start: 10, end: 15 },
+            None,
+            std::str::from_utf8(&bytes[..5]).unwrap(),
+        );
+        first.canonical_range = Some(CanonicalByteRange { start: 10, end: 15 });
+        let mut last = continuation_result(
+            ToolOutputSelector::Bytes { start: 15, end: 21 },
+            None,
+            std::str::from_utf8(&bytes[5..]).unwrap(),
+        );
+        last.canonical_range = Some(CanonicalByteRange { start: 15, end: 21 });
+        assert!(reconstruct_selection(&owner, &[first.clone()]).is_none());
+        let exact = reconstruct_selection(&owner, &[last.clone(), first.clone()]).unwrap();
+        assert_eq!(exact.status, ToolOutputSelectorStatus::Ok);
+        assert!(exact.complete);
+        assert_eq!(exact.value, Some(serde_json::json!({"ok":true})));
+        assert!(
+            reconstruct_selection(&owner, &[first.clone(), first.clone(), last.clone()]).is_none()
+        );
+
+        owner.continuation = Some(first.selector.clone());
+        let mut state =
+            RecoveryContinuationState::new(recovery_output(vec![owner.clone()]), false, usize::MAX);
+        let first_selector = first.selector.clone();
+        let last_selector = last.selector.clone();
+        state
+            .accept_page(0, &first_selector, recovery_output(vec![first]), false)
+            .unwrap();
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Follow {
+                result_index: 0,
+                selector: last_selector.clone(),
+            }
+        );
+        state
+            .accept_page(0, &last_selector, recovery_output(vec![last]), false)
+            .unwrap();
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+        let transaction = state.finish();
+        assert_eq!(transaction.drained_continuation_pages, 2);
+        assert!(transaction.output.complete);
+        assert_eq!(transaction.output.results.len(), 1);
+        assert_eq!(transaction.output.results[0].selector, owner.selector);
+        assert_eq!(
+            transaction.output.results[0].value,
+            Some(serde_json::json!({"ok":true}))
+        );
+    }
+
+    #[test]
     fn terminal_recovery_results_complete_after_the_validation_pass() {
-        let mut ok = continuation_result(search_selector(0), None, "ok");
+        let mut ok = continuation_result(page_selector(0), None, "ok");
         ok.status = ToolOutputSelectorStatus::Ok;
-        let mut oversized = continuation_result(search_selector(10), None, "oversized");
+        let mut oversized = continuation_result(page_selector(10), None, "oversized");
         oversized.status = ToolOutputSelectorStatus::SelectorTooLarge;
-        let mut omitted = continuation_result(search_selector(20), None, "omitted");
+        let mut omitted = continuation_result(page_selector(20), None, "omitted");
         omitted.status = ToolOutputSelectorStatus::AggregateOmitted;
         let state = RecoveryContinuationState::new(
             recovery_output(vec![ok, oversized, omitted]),
@@ -1005,8 +1267,8 @@ mod tests {
 
     #[test]
     fn exact_continuation_pages_are_drained_in_selector_order() {
-        let first_selector = search_selector(0);
-        let second_selector = search_selector(10);
+        let first_selector = page_selector(0);
+        let second_selector = page_selector(10);
         let initial = recovery_output(vec![continuation_result(
             first_selector.clone(),
             Some(second_selector.clone()),
@@ -1059,8 +1321,8 @@ mod tests {
 
     #[test]
     fn continuation_budget_stop_preserves_first_unconsumed_selector() {
-        let first_selector = search_selector(0);
-        let second_selector = search_selector(10);
+        let first_selector = page_selector(0);
+        let second_selector = page_selector(10);
         let initial = recovery_output(vec![continuation_result(
             first_selector,
             Some(second_selector.clone()),
@@ -1092,9 +1354,9 @@ mod tests {
 
     #[test]
     fn continuation_identity_drift_stops_without_mutating_the_aggregate() {
-        let second_selector = search_selector(10);
+        let second_selector = page_selector(10);
         let initial = recovery_output(vec![continuation_result(
-            search_selector(0),
+            page_selector(0),
             Some(second_selector.clone()),
             "first page",
         )]);
@@ -1140,9 +1402,9 @@ mod tests {
 
     #[test]
     fn repeated_owner_continuation_is_never_followed_twice() {
-        let second_selector = search_selector(10);
+        let second_selector = page_selector(10);
         let initial = recovery_output(vec![continuation_result(
-            search_selector(0),
+            page_selector(0),
             Some(second_selector.clone()),
             "first page",
         )]);
@@ -1459,9 +1721,9 @@ mod tests {
 
     #[test]
     fn continuation_stop_is_typed_and_preserves_the_unconsumed_selector() {
-        let selector = search_selector(10);
+        let selector = page_selector(10);
         let initial = recovery_output(vec![continuation_result(
-            search_selector(0),
+            page_selector(0),
             Some(selector.clone()),
             "first page",
         )]);
@@ -1488,8 +1750,47 @@ mod tests {
     }
 
     #[test]
+    fn resumable_byte_stop_preserves_the_remaining_owner_suffix() {
+        let child = ToolOutputSelector::Bytes { start: 7, end: 11 };
+        let mut owner = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        owner.selector = ToolOutputSelector::Bytes { start: 3, end: 31 };
+        owner.canonical_range = Some(CanonicalByteRange::new(3, 31));
+        owner.continuation = Some(child.clone());
+        owner.child_selectors = vec![child.clone()];
+        assert_eq!(
+            next_owner_continuation(&owner, &child),
+            Some(ToolOutputSelector::Bytes { start: 11, end: 31 }),
+            "an absent uniform subdivision plan cannot erase the remaining suffix"
+        );
+        for reason in [
+            ContinuationStopReason::Budget,
+            ContinuationStopReason::Cancelled,
+        ] {
+            let mut state = RecoveryContinuationState::new(
+                recovery_output(vec![owner.clone()]),
+                false,
+                usize::MAX,
+            );
+            state.record_stop(reason, Some(child.clone()));
+            let stop = state.finish().continuation_stop.unwrap();
+            assert!(stop.resumable);
+            assert_eq!(
+                stop.selector,
+                Some(ToolOutputSelector::Bytes { start: 7, end: 31 })
+            );
+        }
+        let mut state =
+            RecoveryContinuationState::new(recovery_output(vec![owner]), false, usize::MAX);
+        state.record_page_read_error(&ReadToolOutputError::StillWriting, child);
+        assert_eq!(
+            state.finish().continuation_stop.unwrap().selector,
+            Some(ToolOutputSelector::Bytes { start: 7, end: 31 })
+        );
+    }
+
+    #[test]
     fn continuation_page_error_preserves_retryability_and_cause() {
-        let selector = search_selector(10);
+        let selector = page_selector(10);
         let cases = [
             (ReadToolOutputError::InvalidArtifactId, false),
             (

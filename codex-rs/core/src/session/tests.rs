@@ -955,7 +955,8 @@ async fn raw_response_item_delivery_does_not_append_a_transient_rollout_event() 
 
     session
         .record_conversation_items(&turn_context, &[user_message("persist once")])
-        .await;
+        .await
+        .unwrap();
 
     let event = rx.recv().await.expect("raw response item event");
     assert!(matches!(event.msg, EventMsg::RawResponseItem(_)));
@@ -1251,12 +1252,23 @@ async fn regular_turn_bounds_unfinished_startup_prewarm_handoff() {
     };
     assert_eq!(turn_started.turn_id, tc.sub_id);
     assert_eq!(turn_started.trace_id, tc.trace_id);
+    assert!(!startup_prewarm_tx.is_closed());
+    let resolution = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        sess.consume_startup_prewarm_for_regular_turn(&CancellationToken::new()),
+    )
+    .await
+    .expect("send-boundary handoff must not wait for unfinished prewarm");
+    assert!(matches!(
+        resolution,
+        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Unavailable { .. }
+    ));
     tokio::time::timeout(
         std::time::Duration::from_millis(200),
         startup_prewarm_tx.closed(),
     )
     .await
-    .expect("expected regular turn to cancel an unfinished prewarm immediately");
+    .expect("send-boundary handoff must cancel unfinished prewarm");
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
@@ -1341,7 +1353,10 @@ async fn completed_startup_prewarm_is_reused() {
 async fn startup_prepared_router_handoff_is_one_shot() {
     let (sess, turn_context, _rx) = make_session_and_context_with_rx().await;
     let planning_generation = sess.services.planning_generation();
-    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+    let step_context = sess
+        .capture_step_context(Arc::clone(&turn_context))
+        .await
+        .unwrap();
     let router =
         super::turn::built_tools(sess.as_ref(), &step_context, &[], &CancellationToken::new())
             .await
@@ -2930,7 +2945,8 @@ async fn raw_response_items_are_not_produced_when_no_consumer_requested_them() {
 
     session
         .record_conversation_items(&turn_context, &[user_message("hello")])
-        .await;
+        .await
+        .unwrap();
 
     while let Ok(event) = rx.try_recv() {
         assert!(
@@ -2954,7 +2970,8 @@ async fn raw_response_items_resume_after_a_consumer_requests_them() {
 
     session
         .record_conversation_items(&turn_context, &[user_message("hello")])
-        .await;
+        .await
+        .unwrap();
 
     let mut saw_raw_response_item = false;
     while let Ok(event) = rx.try_recv() {
@@ -2977,7 +2994,8 @@ async fn record_conversation_items_stamps_missing_turn_id_and_preserves_existing
 
     session
         .record_conversation_items(&turn_context, &[fresh_item.clone(), existing_item.clone()])
-        .await;
+        .await
+        .unwrap();
 
     let mut expected_fresh_item = fresh_item;
     expected_fresh_item.set_turn_id_if_missing(&turn_context.sub_id);
@@ -3025,7 +3043,8 @@ async fn record_conversation_items_records_tool_output_model_visibility_boundary
 
     session
         .record_conversation_items(&turn_context, std::slice::from_ref(&item))
-        .await;
+        .await
+        .unwrap();
 
     let timing = turn_context
         .turn_timing_state
@@ -3058,7 +3077,8 @@ async fn record_response_item_and_emit_turn_item_emits_hook_prompt_lifecycle() {
 
     session
         .record_response_item_and_emit_turn_item(&turn_context, response_item)
-        .await;
+        .await
+        .unwrap();
 
     let raw_response = rx.recv().await.expect("raw response item event");
     assert!(matches!(raw_response.msg, EventMsg::RawResponseItem(_)));
@@ -3103,7 +3123,8 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
 
     session
         .record_inter_agent_communication(&turn_context, communication)
-        .await;
+        .await
+        .unwrap();
 
     let recorded_item = session.clone_history().await.raw_items()[0].clone();
     assert_eq!(
@@ -3172,7 +3193,8 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
 
     session
         .record_inter_agent_communication(&turn_context, communication)
-        .await;
+        .await
+        .unwrap();
 
     let live_history = session.clone_history().await;
     let [live_item] = live_history.raw_items() else {
@@ -3252,7 +3274,8 @@ async fn prepares_image_failures_before_history_insertion() {
 
     session
         .record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&item))
-        .await;
+        .await
+        .unwrap();
 
     let history = session.state.lock().await.clone_history();
     let id = history.raw_items()[0]
@@ -3483,7 +3506,8 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "resumed-first-update").await;
     let initial_context = build_initial_context(&session, &turn_context).await;
     expected.extend(initial_context);
@@ -3495,7 +3519,8 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
 
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
     let history_after_second_seed = session.clone_history().await;
     assert_eq!(
         history_after_seed.raw_items(),
@@ -3647,7 +3672,8 @@ async fn recompute_token_usage_uses_session_base_instructions() {
     let item = user_message("hello");
     session
         .record_conversation_items(&turn_context, std::slice::from_ref(&item))
-        .await;
+        .await
+        .unwrap();
 
     let history = session.clone_history().await;
     let session_base_instructions = BaseInstructions {
@@ -3685,7 +3711,8 @@ async fn token_estimate_reuses_turn_owned_base_instructions() {
     let item = user_message("hello");
     session
         .record_conversation_items(&turn_context, std::slice::from_ref(&item))
-        .await;
+        .await
+        .unwrap();
 
     let history = session.clone_history().await;
     let expected_tokens = history
@@ -4733,7 +4760,8 @@ async fn thread_rollback_fails_without_persisted_thread_history() {
 
     let initial_context = build_initial_context(&sess, &tc).await;
     sess.record_conversation_items(tc.as_ref(), &initial_context)
-        .await;
+        .await
+        .unwrap();
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
 
@@ -5168,7 +5196,8 @@ async fn thread_rollback_fails_when_turn_in_progress() {
 
     let initial_context = build_initial_context(&sess, &tc).await;
     sess.record_conversation_items(tc.as_ref(), &initial_context)
-        .await;
+        .await
+        .unwrap();
 
     *sess.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
@@ -5192,7 +5221,8 @@ async fn thread_rollback_fails_when_num_turns_is_zero() {
 
     let initial_context = build_initial_context(&sess, &tc).await;
     sess.record_conversation_items(tc.as_ref(), &initial_context)
-        .await;
+        .await
+        .unwrap();
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 0).await;
 
@@ -5429,10 +5459,9 @@ async fn set_rate_limits_updates_plan_type_when_present() {
 }
 
 #[test]
-fn prefers_structured_content_when_present() {
+fn preserves_complementary_content_when_structured_is_present() {
     let ctr = McpCallToolResult {
-        // Content present but should be ignored because structured_content is set.
-        content: vec![text_block("ignored")],
+        content: vec![text_block("explanation")],
         is_error: None,
         structured_content: Some(json!({
             "ok": true,
@@ -5444,11 +5473,12 @@ fn prefers_structured_content_when_present() {
     let got = ctr.into_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
         body: FunctionCallOutputBody::Text(
-            serde_json::to_string(&json!({
-                "ok": true,
-                "value": 42
-            }))
-            .unwrap(),
+            "explanation\n".to_string()
+                + &serde_json::to_string(&json!({
+                    "ok": true,
+                    "value": 42
+                }))
+                .unwrap(),
         ),
         success: Some(true),
     };
@@ -5536,9 +5566,7 @@ fn falls_back_to_content_when_structured_is_null() {
 
     let got = ctr.into_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
-        body: FunctionCallOutputBody::Text(
-            serde_json::to_string(&vec![text_block("hello"), text_block("world")]).unwrap(),
-        ),
+        body: FunctionCallOutputBody::Text("hello\nworld".to_string()),
         success: Some(true),
     };
 
@@ -5557,7 +5585,8 @@ fn success_flag_reflects_is_error_true() {
     let got = ctr.into_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
         body: FunctionCallOutputBody::Text(
-            serde_json::to_string(&json!({ "message": "bad" })).unwrap(),
+            "MCP tool reported an error.\nunused\n".to_string()
+                + &serde_json::to_string(&json!({ "message": "bad" })).unwrap(),
         ),
         success: Some(false),
     };
@@ -5576,9 +5605,7 @@ fn success_flag_true_with_no_error_and_content_used() {
 
     let got = ctr.into_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
-        body: FunctionCallOutputBody::Text(
-            serde_json::to_string(&vec![text_block("alpha")]).unwrap(),
-        ),
+        body: FunctionCallOutputBody::Text("alpha".to_string()),
         success: Some(true),
     };
 
@@ -9840,7 +9867,8 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
     let old_planning_generation = session.services.planning_generation();
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
-        .await;
+        .await
+        .unwrap();
     assert!(Arc::ptr_eq(&step_context.mcp, &old_runtime));
     let old_token = session.mcp_startup_cancellation_token().await;
     assert!(!old_token.is_cancelled());
@@ -9981,6 +10009,7 @@ async fn concurrent_mcp_refresh_does_not_hold_projection_lock_and_discards_stale
                     &resolved_roots,
                 )
                 .await
+                .unwrap()
         })
         .await
     });
@@ -10906,7 +10935,8 @@ async fn plugin_availability_change_reuses_the_mcp_manager() {
 
     let new_runtime = session
         .mcp_runtime_for_step(&turn_context, &turn_context.environments, &resolved_roots)
-        .await;
+        .await
+        .unwrap();
 
     assert!(!old_runtime.plugins_available());
     assert!(new_runtime.plugins_available());
@@ -10924,7 +10954,7 @@ async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
-    let step_context = session.capture_step_context(turn_context).await;
+    let step_context = session.capture_step_context(turn_context).await.unwrap();
 
     let mut refresh_config = step_context.turn.config.as_ref().clone();
     refresh_config.mcp_servers.set(HashMap::from([(
@@ -11175,13 +11205,15 @@ async fn record_context_update_items(
     let previous_step = StepContext::for_test(previous_context);
     session
         .record_context_updates_and_set_reference_context_item(&previous_step)
-        .await;
+        .await
+        .unwrap();
     let previous_len = session.clone_history().await.raw_items().len();
 
     let current_step = StepContext::for_test(Arc::new(current_context));
     session
         .record_context_updates_and_set_reference_context_item(&current_step)
-        .await;
+        .await
+        .unwrap();
     let history = session.clone_history().await;
     history.raw_items()[previous_len..].to_vec()
 }
@@ -11560,14 +11592,15 @@ async fn build_initial_context_includes_prompt_fragments_from_extensions() {
 
     let initial_context = build_initial_context(&session, &turn_context).await;
     let developer_messages = developer_message_texts(&initial_context);
-    let root_policy = developer_messages
-        .iter()
-        .flatten()
-        .filter(|text| text.starts_with("<root_orchestration_instructions>"))
-        .collect::<Vec<_>>();
-    assert_eq!(root_policy.len(), 1);
-    assert!(root_policy[0].contains("Do not run shared-state mutations concurrently."));
-    assert!(root_policy[0].len() <= 1_200);
+    // A root session receives no separate orchestration policy block; the base
+    // instructions and the exec tool description own those rules exactly once.
+    assert!(
+        developer_messages
+            .iter()
+            .flatten()
+            .all(|text| !text.starts_with("<root_orchestration_instructions>")),
+        "root sessions must not receive a duplicated orchestration policy block"
+    );
 
     assert!(
         developer_messages
@@ -11690,6 +11723,7 @@ async fn prepared_context_update_renders_full_world_only_when_required() {
                     session.services.planning_generation()
                 )
                 .await
+                .unwrap()
                 .is_some()
         );
     }
@@ -11733,6 +11767,7 @@ async fn prepared_context_update_polls_contributors_once_across_planning_and_com
         session
             .compare_and_record_context_updates(prepared, planning_generation)
             .await
+            .unwrap()
             .is_some()
     );
     assert_eq!(thread_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -11789,6 +11824,7 @@ async fn prepared_context_update_replaces_and_removes_turn_fragments_without_sta
                     session.services.planning_generation()
                 )
                 .await
+                .unwrap()
                 .is_some()
         );
         let history = session.clone_history().await;
@@ -12132,6 +12168,12 @@ async fn world_state_rejects_unsupported_roles_without_advancing_delivered_snaps
         phase: Arc::clone(&phase),
     }));
     session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let mut turn_context = turn_context;
+    Arc::make_mut(&mut turn_context.config)
+        .features
+        .enable(Feature::DeferredExecutor)
+        .unwrap();
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
 
@@ -12193,7 +12235,8 @@ async fn world_state_rejects_unsupported_roles_without_advancing_delivered_snaps
     phase.store(2, std::sync::atomic::Ordering::SeqCst);
     let rejected_update = session
         .record_step_world_state_if_changed(&accepted_world, &step_context)
-        .await;
+        .await
+        .unwrap();
     {
         let state = session.state.lock().await;
         assert_eq!(state.history.raw_items(), accepted_items.as_slice());
@@ -12208,7 +12251,8 @@ async fn world_state_rejects_unsupported_roles_without_advancing_delivered_snaps
     phase.store(3, std::sync::atomic::Ordering::SeqCst);
     session
         .record_step_world_state_if_changed(&rejected_update, &step_context)
-        .await;
+        .await
+        .unwrap();
     let state = session.state.lock().await;
     let added_items = &state.history.raw_items()[accepted_items.len()..];
     assert_eq!(added_items.len(), 1);
@@ -12323,6 +12367,11 @@ async fn world_state_delta_preserves_realized_fragment_receipts_without_rebuildi
     }));
     session.services.extensions = Arc::new(builder.build());
     let session = Arc::new(session);
+    let mut turn_context = turn_context;
+    Arc::make_mut(&mut turn_context.config)
+        .features
+        .enable(Feature::DeferredExecutor)
+        .unwrap();
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     let initial_world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
@@ -12353,7 +12402,8 @@ async fn world_state_delta_preserves_realized_fragment_receipts_without_rebuildi
     world_revision.store(2, std::sync::atomic::Ordering::SeqCst);
     let updated_world_state = session
         .record_step_world_state_if_changed(&initial_world_state, &step_context)
-        .await;
+        .await
+        .unwrap();
 
     assert_ne!(
         updated_world_state.snapshot(),
@@ -12408,7 +12458,8 @@ async fn staged_compaction_baseline_prevents_duplicate_full_context_before_sampl
 
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
 
     let state = session.state.lock().await;
     assert_eq!(state.history.raw_items().len(), initial_item_count);
@@ -12420,6 +12471,56 @@ async fn staged_compaction_baseline_prevents_duplicate_full_context_before_sampl
             .is_some(),
         "the unaccepted full world-state receipt must survive local diffing"
     );
+}
+
+#[tokio::test]
+async fn step_agents_md_changes_are_published_with_and_without_deferred_executor() {
+    for deferred in [false, true] {
+        let (session, mut turn) = make_session_and_context().await;
+        let config = Arc::make_mut(&mut turn.config);
+        if deferred {
+            config.features.enable(Feature::DeferredExecutor).unwrap();
+        } else {
+            config.features.disable(Feature::DeferredExecutor).unwrap();
+        }
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let mut first = StepContext::for_test(Arc::clone(&turn));
+        Arc::get_mut(&mut first).unwrap().loaded_agents_md = Some(Arc::new(
+            crate::agents_md::LoadedAgentsMd::from_text_for_testing("old instruction marker"),
+        ));
+        let old_world = session
+            .record_context_updates_and_set_reference_context_item(&first)
+            .await
+            .unwrap();
+        let before_count = session.clone_history().await.raw_items().len();
+        let mut next = StepContext::for_test(Arc::clone(&turn));
+        Arc::get_mut(&mut next).unwrap().loaded_agents_md = Some(Arc::new(
+            crate::agents_md::LoadedAgentsMd::from_text_for_testing("updated instruction marker"),
+        ));
+        let updated = session
+            .record_step_world_state_if_changed(&old_world, &next)
+            .await
+            .unwrap();
+        assert_ne!(updated.snapshot(), old_world.snapshot());
+        let history = session.clone_history().await;
+        let delta = serde_json::to_string(&history.raw_items()[before_count..]).unwrap();
+        assert!(
+            delta.contains("updated instruction marker"),
+            "deferred={deferred}: {delta}"
+        );
+        assert!(!delta.contains("old instruction marker"));
+        let pending = session
+            .state
+            .lock()
+            .await
+            .pending_context_baseline()
+            .unwrap();
+        assert_eq!(
+            pending.world_state_snapshot.section("agents_md"),
+            updated.snapshot().section("agents_md")
+        );
+    }
 }
 
 #[tokio::test]
@@ -12452,7 +12553,8 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
 
     let history = session.clone_history().await;
     let developer_messages = developer_message_texts(history.raw_items());
@@ -12843,7 +12945,8 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "missing-baseline").await;
     let history = session.clone_history().await;
     let initial_context = build_initial_context(&session, &turn_context).await;
@@ -12875,12 +12978,14 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
     };
     session
         .record_conversation_items(&turn_context, std::slice::from_ref(&compacted_summary))
-        .await;
+        .await
+        .unwrap();
 
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
     {
         let mut state = session.state.lock().await;
         state.set_reference_context_item(/*item*/ None);
@@ -12895,7 +13000,8 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
 
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
 
     let history = session.clone_history().await;
     let mut expected_history = vec![compacted_summary];
@@ -12946,7 +13052,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "unchanged-settings").await;
 
     assert_eq!(
@@ -12986,7 +13093,8 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&previous_step)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "previous-fragments").await;
     let previous_history_len = session.clone_history().await.raw_items().len();
 
@@ -13006,7 +13114,8 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
     );
     session
         .record_context_updates_and_set_reference_context_item(&current_step)
-        .await;
+        .await
+        .unwrap();
 
     let history = session.clone_history().await;
     assert_eq!(
@@ -13038,7 +13147,8 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
     let previous_step = StepContext::for_test(Arc::clone(&previous_context));
     session
         .record_context_updates_and_set_reference_context_item(&previous_step)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "previous-multi-agent-usage-hint").await;
     let previous_history_len = session.clone_history().await.raw_items().len();
 
@@ -13060,7 +13170,8 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
     );
     session
         .record_context_updates_and_set_reference_context_item(&changed_step)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "changed-multi-agent-usage-hint").await;
     let changed_history = session.clone_history().await;
     assert_eq!(
@@ -13089,7 +13200,8 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
     );
     session
         .record_context_updates_and_set_reference_context_item(&removed_step)
-        .await;
+        .await
+        .unwrap();
     let removed_history = session.clone_history().await;
     assert_eq!(
         strip_response_item_ids(&removed_history.raw_items()[changed_history_len..]),
@@ -13128,7 +13240,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "split-policy").await;
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
@@ -13239,7 +13352,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
     let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "full-reinjection").await;
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
@@ -13834,7 +13948,8 @@ impl SessionTask for DelayedToolOutputRelayTask {
                         internal_chat_message_metadata_passthrough: None,
                     }],
                 )
-                .await;
+                .await
+                .unwrap();
             self.call_recorded.notify_one();
 
             cancellation_token.cancelled().await;
@@ -13852,7 +13967,8 @@ impl SessionTask for DelayedToolOutputRelayTask {
                         internal_chat_message_metadata_passthrough: None,
                     }],
                 )
-                .await;
+                .await
+                .unwrap();
 
             Err(CodexErr::TurnAborted)
         })
@@ -14135,7 +14251,8 @@ async fn turn_complete_is_an_interaction_ready_boundary_for_rollback() {
     )
     .await;
     sess.record_conversation_items(first_turn.as_ref(), &retained_turn)
-        .await;
+        .await
+        .unwrap();
     sess.spawn_task(Arc::clone(&first_turn), Vec::new(), CompletingTask)
         .await;
     recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
@@ -14172,7 +14289,8 @@ async fn turn_complete_is_an_interaction_ready_boundary_for_rollback() {
     )
     .await;
     sess.record_conversation_items(rollback_turn.as_ref(), &rollback_target)
-        .await;
+        .await
+        .unwrap();
     let (cache_persist_started, release_cache_persist) = sess
         .services
         .command_execution
@@ -14218,7 +14336,8 @@ async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
             internal_chat_message_metadata_passthrough: None,
         }],
     )
-    .await;
+    .await
+    .unwrap();
 
     let input = vec![TurnInput::UserInput {
         content: vec![UserInput::Text {
@@ -14419,7 +14538,7 @@ async fn durable_conversation_commit_retry_keeps_post_tool_context_exactly_once(
 
 #[tokio::test]
 async fn durable_conversation_commit_append_failure_never_publishes_history_or_consumes_hooks() {
-    let (mut session, turn, _rx) = make_session_and_context_with_rx().await;
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
     attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
     session
         .live_thread()
@@ -14427,6 +14546,21 @@ async fn durable_conversation_commit_append_failure_never_publishes_history_or_c
         .shutdown()
         .await
         .expect("close writer");
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn,
+            &[UserInput::Text {
+                text: "must not appear accepted".to_string(),
+                text_elements: Vec::new(),
+            }],
+            None,
+        )
+        .await
+        .expect_err("a rejected user record must fail at admission");
+    assert!(
+        rx.try_recv().is_err(),
+        "failed persistence must not emit accepted user lifecycle events"
+    );
     let output = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: "failed-append".to_string(),
@@ -14441,7 +14575,8 @@ async fn durable_conversation_commit_append_failure_never_publishes_history_or_c
         .await;
     session
         .record_conversation_items(&turn, std::slice::from_ref(&output))
-        .await;
+        .await
+        .expect_err("closed writer must reject publication");
     assert!(session.clone_history().await.raw_items().is_empty());
     assert!(
         session
@@ -14460,7 +14595,7 @@ async fn durable_conversation_commit_append_failure_never_publishes_history_or_c
         session
             .compare_and_record_context_updates(prepared, session.services.planning_generation())
             .await
-            .is_none()
+            .is_err()
     );
     assert!(session.clone_history().await.raw_items().is_empty());
     assert!(
@@ -14482,7 +14617,8 @@ async fn durable_conversation_commit_append_failure_never_publishes_history_or_c
                 false,
             ),
         )
-        .await;
+        .await
+        .expect_err("closed writer must reject publication");
     assert!(session.clone_history().await.raw_items().is_empty());
 }
 
@@ -14910,9 +15046,10 @@ async fn accepted_context_commit_defers_flush_to_terminal_barrier() {
         Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
     )
     .await;
-    let step_context = sess.capture_step_context(Arc::clone(&tc)).await;
+    let step_context = sess.capture_step_context(Arc::clone(&tc)).await.unwrap();
     sess.record_context_updates_and_set_reference_context_item(step_context.as_ref())
-        .await;
+        .await
+        .unwrap();
     assert!(
         sess.bind_context_baseline_candidate("request-1", "attempt-1")
             .await
@@ -14959,14 +15096,15 @@ async fn initial_input_and_sampling_boundary_share_the_terminal_durability_barri
     let before_input = store.calls().await;
 
     sess.record_user_prompt_and_emit_turn_item(
-        tc.as_ref(),
+        &tc,
         &[UserInput::Text {
             text: "measure one ordered request prefix".to_string(),
             text_elements: Vec::new(),
         }],
         None,
     )
-    .await;
+    .await
+    .unwrap();
     let after_input = store.calls().await;
     assert!(after_input.append_items > before_input.append_items);
     assert_eq!(after_input.persist_thread, before_input.persist_thread);
@@ -15259,7 +15397,8 @@ async fn ordinary_and_ordered_history_commits_share_rollout_order() {
             }
             result
         })
-        .await;
+        .await
+        .unwrap();
     });
     ordinary_polled_rx
         .await
@@ -16190,7 +16329,7 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
         .expect_err("pending trigger-turn mail should reject automatic idle input");
 
     assert_eq!(
-        TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+        TryStartTurnIfIdleRejectionReason::PendingTurnStartWork,
         err.reason()
     );
     assert_eq!(vec![item], err.into_input());
@@ -17612,7 +17751,7 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                         "observed_revision": null,
                         "current_revision": null,
                         "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
-                        "rerun": {"force_fresh": true}
+                        "rerun": {"instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."}
                     }),
                     "{case}/{route}: recovered workspace bytes need a fresh observation"
                 );
@@ -18692,7 +18831,8 @@ fn turn_context_projection_uses_one_worker_and_preserves_gitdir_permissions() {
         let session = Arc::new(session);
         session
             .record_context_updates_and_set_reference_context_item(&step)
-            .await;
+            .await
+            .unwrap();
         commit_test_context_baseline(&session, "worker-projection").await;
         let recorded = session
             .reference_context_item()
@@ -19634,4 +19774,86 @@ mod abandoned_interactive_registry_tests {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn durable_conversation_commit_failure_wakes_closure_after_caller_cancellation() {
+    let (mut session, turn, _rx) = make_session_and_context_with_rx().await;
+    attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    session.live_thread().unwrap().shutdown().await.unwrap();
+    let execution = codex_protocol::protocol::ToolExecutionId("failed-owned-write".to_string());
+    turn.turn_timing_state.record_accepted_tool_call(
+        "failed-owned-write",
+        &execution,
+        codex_protocol::protocol::TurnTimingToolCallSource::Direct,
+        None,
+    );
+    turn.turn_timing_state.record_tool_call_acceptance_closed();
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "failed-owned-write".to_string(),
+        output: FunctionCallOutputPayload::from_text("result".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let gate = session.durable_history_commit_gate.acquire().await.unwrap();
+    let items = [output];
+    let mut write = Box::pin(session.record_conversation_items_ordered(&turn, &items));
+    assert!(futures::poll!(write.as_mut()).is_pending());
+    drop(write);
+    drop(gate);
+    let closure = timeout(
+        Duration::from_secs(5),
+        turn.turn_timing_state.wait_for_tool_closure_after_seal(),
+    )
+    .await
+    .expect("owned failed write must notify a waiter after caller cancellation");
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.persisted_count, 0);
+    assert!(!closure.complete);
+    assert!(session.clone_history().await.raw_items().is_empty());
+}
+
+#[tokio::test]
+async fn audit_missing_usage_estimates_context_without_fabricating_billed_tokens() {
+    let (session, turn_context) = make_session_and_context().await;
+    let billed = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15,
+        ..Default::default()
+    };
+    session
+        .record_token_usage_info(&turn_context, Some(&billed))
+        .await
+        .unwrap();
+    let item = user_message(&"new context ".repeat(100));
+    session
+        .record_conversation_items(&turn_context, &[item])
+        .await
+        .unwrap();
+    let base_instructions = BaseInstructions {
+        text: session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .base_instructions
+            .clone(),
+    };
+    let expected = session
+        .clone_history()
+        .await
+        .estimate_prepared_token_count_with_base_instructions(
+            &turn_context.model_info.input_modalities,
+            &base_instructions,
+        )
+        .unwrap();
+    assert!(expected > billed.total_tokens);
+    session
+        .record_token_usage_info(&turn_context, None)
+        .await
+        .unwrap();
+    let info = session.state.lock().await.token_info().unwrap();
+    assert_eq!(info.last_token_usage.total_tokens, expected);
+    assert_eq!(info.total_token_usage, billed);
 }

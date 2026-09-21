@@ -37,6 +37,7 @@ const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
 const MAX_ADDITIONAL_CONTEXT_ENTRIES: usize = 64;
 const MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES: usize = 256;
+const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RAW_BYTES: usize = 128 * 1_024;
 const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 128 * 1_024;
 // Context fragments cap each escaped value at approximately 4,000 tokens.
 const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 16 * 1_024;
@@ -295,6 +296,85 @@ pub(crate) struct TurnRequestProcessor {
     background_tasks: TaskTracker,
 }
 
+fn steer_input_error(err: SteerInputError) -> (JSONRPCErrorError, Option<AnalyticsJsonRpcError>) {
+    let (message, data, error_type) = match err {
+        SteerInputError::NoActiveTurn(_) => (
+            "no active turn to steer".to_string(),
+            Some(serde_json::json!({"reason": "noActiveTurn"})),
+            Some(AnalyticsJsonRpcError::TurnSteer(
+                TurnSteerRequestError::NoActiveTurn,
+            )),
+        ),
+        SteerInputError::ExpectedTurnMismatch { expected, actual } => (
+            format!("expected active turn id `{expected}` but found `{actual}`"),
+            Some(serde_json::json!({
+                "reason": "expectedTurnMismatch",
+                "expectedTurnId": expected,
+                "actualTurnId": actual,
+            })),
+            Some(AnalyticsJsonRpcError::TurnSteer(
+                TurnSteerRequestError::ExpectedTurnMismatch,
+            )),
+        ),
+        SteerInputError::ActiveTurnNotSteerable { turn_kind } => {
+            let (message, turn_steer_error) = match turn_kind {
+                codex_protocol::protocol::NonSteerableTurnKind::Review => (
+                    "cannot steer a review turn".to_string(),
+                    TurnSteerRequestError::NonSteerableReview,
+                ),
+                codex_protocol::protocol::NonSteerableTurnKind::Compact => (
+                    "cannot steer a compact turn".to_string(),
+                    TurnSteerRequestError::NonSteerableCompact,
+                ),
+            };
+            let error = TurnError {
+                message: message.clone(),
+                codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                    turn_kind: turn_kind.into(),
+                }),
+                additional_details: None,
+            };
+            let data = match serde_json::to_value(error) {
+                Ok(data) => Some(data),
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        "failed to serialize active-turn-not-steerable turn error"
+                    );
+                    None
+                }
+            };
+            (
+                message,
+                data,
+                Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
+            )
+        }
+        SteerInputError::EmptyInput => (
+            "input must not be empty".to_string(),
+            Some(serde_json::json!({"reason": "emptyInput"})),
+            Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
+        ),
+        SteerInputError::PendingInputLimitExceeded {
+            max_items,
+            max_bytes,
+        } => (
+            format!(
+                "pending input limit exceeded (maximum {max_items} items or {max_bytes} bytes)"
+            ),
+            Some(serde_json::json!({
+                "reason": "pendingInputLimitExceeded",
+                "maxItems": max_items,
+                "maxBytes": max_bytes,
+            })),
+            None,
+        ),
+    };
+    let mut error = invalid_request(message);
+    error.data = data;
+    (error, error_type)
+}
+
 fn map_additional_context(
     additional_context: Option<IndexMap<String, AdditionalContextEntry>>,
 ) -> Result<IndexMap<String, CoreAdditionalContextEntry>, JSONRPCErrorError> {
@@ -315,6 +395,25 @@ fn map_additional_context(
         return Err(invalid_request(format!(
             "additionalContext source identifiers may contain at most {MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES} bytes (longest was {longest_source_bytes} bytes)"
         )));
+    }
+
+    let raw_bytes = additional_context
+        .iter()
+        .fold(0usize, |total, (source, entry)| {
+            total
+                .saturating_add(source.len())
+                .saturating_add(entry.value.len())
+        });
+    if raw_bytes > MAX_ADDITIONAL_CONTEXT_AGGREGATE_RAW_BYTES {
+        let mut error = invalid_request(format!(
+            "additionalContext may contain at most {MAX_ADDITIONAL_CONTEXT_AGGREGATE_RAW_BYTES} raw bytes (received {raw_bytes} bytes)"
+        ));
+        error.data = Some(serde_json::json!({
+            "reason": "additionalContextTooLarge",
+            "maxBytes": MAX_ADDITIONAL_CONTEXT_AGGREGATE_RAW_BYTES,
+            "actualBytes": raw_bytes,
+        }));
+        return Err(error);
     }
 
     let estimated_rendered_bytes = additional_context
@@ -1205,73 +1304,7 @@ impl TurnRequestProcessor {
             )
             .await
             .map_err(|err| {
-                let (message, data, error_type) = match err {
-                    SteerInputError::NoActiveTurn(_) => (
-                        "no active turn to steer".to_string(),
-                        None,
-                        Some(AnalyticsJsonRpcError::TurnSteer(
-                            TurnSteerRequestError::NoActiveTurn,
-                        )),
-                    ),
-                    SteerInputError::ExpectedTurnMismatch { expected, actual } => (
-                        format!("expected active turn id `{expected}` but found `{actual}`"),
-                        None,
-                        Some(AnalyticsJsonRpcError::TurnSteer(
-                            TurnSteerRequestError::ExpectedTurnMismatch,
-                        )),
-                    ),
-                    SteerInputError::ActiveTurnNotSteerable { turn_kind } => {
-                        let (message, turn_steer_error) = match turn_kind {
-                            codex_protocol::protocol::NonSteerableTurnKind::Review => (
-                                "cannot steer a review turn".to_string(),
-                                TurnSteerRequestError::NonSteerableReview,
-                            ),
-                            codex_protocol::protocol::NonSteerableTurnKind::Compact => (
-                                "cannot steer a compact turn".to_string(),
-                                TurnSteerRequestError::NonSteerableCompact,
-                            ),
-                        };
-                        let error = TurnError {
-                            message: message.clone(),
-                            codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
-                                turn_kind: turn_kind.into(),
-                            }),
-                            additional_details: None,
-                        };
-                        let data = match serde_json::to_value(error) {
-                            Ok(data) => Some(data),
-                            Err(error) => {
-                                tracing::error!(
-                                    ?error,
-                                    "failed to serialize active-turn-not-steerable turn error"
-                                );
-                                None
-                            }
-                        };
-                        (
-                            message,
-                            data,
-                            Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
-                        )
-                    }
-                    SteerInputError::EmptyInput => (
-                        "input must not be empty".to_string(),
-                        None,
-                        Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
-                    ),
-                    SteerInputError::PendingInputLimitExceeded {
-                        max_items,
-                        max_bytes,
-                    } => (
-                        format!(
-                            "pending input limit exceeded (maximum {max_items} items or {max_bytes} bytes)"
-                        ),
-                        None,
-                        None,
-                    ),
-                };
-                let mut error = invalid_request(message);
-                error.data = data;
+                let (error, error_type) = steer_input_error(err);
                 self.track_error_response(request_id, error_type);
                 error
             })?;
@@ -1303,7 +1336,7 @@ impl TurnRequestProcessor {
                     is_running,
                     &turn_id,
                 )?;
-                thread_state.reserve_interrupt(request_id.clone())
+                thread_state.reserve_interrupt(request_id.clone(), turn_id.clone())
             };
 
             self.outgoing
@@ -1313,6 +1346,16 @@ impl TurnRequestProcessor {
         } else {
             None
         };
+
+        if !is_startup_interrupt {
+            // Core checks identity while claiming terminal ownership. A completed
+            // target must never turn this request into an interrupt of its successor.
+            thread.interrupt_turn_if_active(&turn_id).await;
+            let state = self.thread_state_manager.thread_state(thread_uuid).await;
+            let needs_response = state.lock().await.finish_interrupt(request_id);
+            drop(interrupt_reservation);
+            return Ok(needs_response.then_some(TurnInterruptResponse {}));
+        }
 
         // Submit the interrupt. Turn interrupts respond upon TurnAborted; startup
         // interrupts respond here because startup cancellation has no turn event.

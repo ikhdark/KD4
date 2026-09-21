@@ -303,6 +303,197 @@ async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
 }
 
 #[tokio::test]
+async fn plain_message_turn_outcomes_preserve_completion_and_failure_without_proof() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(state, "root-session".to_string())
+        .await
+        .unwrap();
+    for (index, (status, expected)) in [
+        (
+            AgentStatus::Completed(Some("done".to_string())),
+            AgentStatusClaim::Completed,
+        ),
+        (AgentStatus::Completed(None), AgentStatusClaim::NeedsMain),
+        (
+            AgentStatus::Errored("provider failed".to_string()),
+            AgentStatusClaim::Failed,
+        ),
+        (AgentStatus::Shutdown, AgentStatusClaim::Abandoned),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut draft = assignment_draft();
+        draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+            parent_assignment_id: None,
+        };
+        draft.workspace_strategy = WorkspaceStrategy::Shared;
+        let (assignment, attempt) = coordinator
+            .create_assignment(repo.path(), draft)
+            .await
+            .unwrap();
+        let task_name = format!("ordinary_{index}");
+        let path = AgentPath::root().join(&task_name).unwrap();
+        let thread_id = ThreadId::new();
+        coordinator
+            .bind_agent_task(AgentTaskBindingDraft {
+                assignment_id: assignment.assignment_id,
+                attempt_id: attempt.attempt_id,
+                agent_path: path.to_string(),
+                task_name,
+                thread_id: Some(thread_id.to_string()),
+            })
+            .await
+            .unwrap();
+        let receipt = coordinator
+            .seal_missing_receipt(&path, thread_id, &status)
+            .await
+            .unwrap()
+            .expect("terminal outcome persists");
+        assert_eq!(receipt.status, expected);
+        assert!(receipt.validation_call_ids.is_empty());
+        assert!(receipt.criterion_results.iter().all(|result| result.status
+            == CriterionStatus::NotRun
+            && result.evidence_ref.is_none()));
+        assert!(
+            coordinator
+                .seal_missing_receipt(&path, thread_id, &status)
+                .await
+                .unwrap()
+                .is_none(),
+            "duplicate notifications must reuse the immutable outcome"
+        );
+        let persisted = coordinator
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(persisted.receipt, Some(receipt));
+    }
+}
+
+#[tokio::test]
+async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_watcher() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(state, "root-session".to_string())
+        .await
+        .unwrap();
+    let mut draft = assignment_draft();
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    draft.required_evidence.clear();
+    let (assignment, original_attempt) = coordinator
+        .create_assignment(repo.path(), draft)
+        .await
+        .unwrap();
+    let path = AgentPath::root().join("followup_worker").unwrap();
+    let thread_id = ThreadId::new();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: original_attempt.attempt_id,
+            agent_path: path.to_string(),
+            task_name: "followup_worker".to_string(),
+            thread_id: Some(thread_id.to_string()),
+        })
+        .await
+        .unwrap();
+    let source = SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(path.clone()),
+        agent_nickname: None,
+        agent_role: None,
+    });
+    for ordinal in 0..3 {
+        let binding = coordinator.binding_for_source(&source).unwrap();
+        coordinator
+            .prepare_legacy_agent_turn(&source, thread_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator.binding_for_source(&source).unwrap().attempt_id,
+            binding.attempt_id
+        );
+        coordinator
+            .seal_missing_receipt(
+                &path,
+                thread_id,
+                &AgentStatus::Completed(Some(format!("result {ordinal}"))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Delivery alone never starts a new attempt; entering the next turn does.
+        coordinator
+            .prepare_legacy_agent_turn(&source, thread_id)
+            .await
+            .unwrap();
+        let next = coordinator.binding_for_source(&source).unwrap();
+        assert_ne!(next.attempt_id, binding.attempt_id);
+        assert_eq!(
+            coordinator
+                .get_agent_task(assignment.assignment_id, Some(0))
+                .await
+                .unwrap()
+                .current_attempt
+                .ordinal,
+            ordinal + 1
+        );
+        assert!(
+            coordinator
+                .seal_missing_receipt_for_attempt(
+                    &path,
+                    thread_id,
+                    &AgentStatus::Completed(Some("stale watcher".to_string())),
+                    binding.attempt_id
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let active = coordinator
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert!(active.receipt.is_none());
+        assert_eq!(active.current_attempt.state, AttemptState::Active);
+        let persisted = coordinator
+            .required_store()
+            .unwrap()
+            .get_agent_task_binding(assignment.assignment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.attempt_id, next.attempt_id);
+    }
+    let final_receipt = coordinator
+        .seal_missing_receipt(
+            &path,
+            thread_id,
+            &AgentStatus::Completed(Some("latest followup".to_string())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_receipt.summary, "latest followup");
+    assert!(final_receipt.validation_call_ids.is_empty());
+}
+
+#[tokio::test]
 async fn binding_refresh_reconciles_absence_and_old_child_cannot_seal_reused_path() {
     let home = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();
@@ -342,7 +533,11 @@ async fn binding_refresh_reconciles_absence_and_old_child_cannot_seal_reused_pat
         attempt.attempt_id
     );
     coordinator
-        .seal_missing_receipt(&path, old_thread, "stopped".to_string())
+        .seal_missing_receipt(
+            &path,
+            old_thread,
+            &AgentStatus::Completed(Some("stopped".to_string())),
+        )
         .await
         .unwrap()
         .expect("old task sealed");
@@ -392,7 +587,11 @@ async fn binding_refresh_reconciles_absence_and_old_child_cannot_seal_reused_pat
     );
     assert_eq!(
         coordinator
-            .seal_missing_receipt(&path, old_thread, "late completion".to_string())
+            .seal_missing_receipt(
+                &path,
+                old_thread,
+                &AgentStatus::Completed(Some("late completion".to_string()))
+            )
             .await
             .unwrap(),
         None
@@ -405,9 +604,85 @@ async fn binding_refresh_reconciles_absence_and_old_child_cannot_seal_reused_pat
     assert_eq!(task.current_attempt.state, AttemptState::Active);
     assert!(
         coordinator
-            .seal_missing_receipt(&path, new_thread, "new child stopped".to_string())
+            .seal_missing_receipt(
+                &path,
+                new_thread,
+                &AgentStatus::Completed(Some("new child stopped".to_string()))
+            )
             .await
             .unwrap()
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn missing_typed_receipt_preserves_recorded_validation_without_claiming_acceptance() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(state, "root-session".to_string())
+        .await
+        .unwrap();
+    let mut draft = assignment_draft();
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    let (assignment, attempt) = coordinator
+        .create_assignment(repo.path(), draft)
+        .await
+        .unwrap();
+    let path = AgentPath::root().join("worker_evidence").unwrap();
+    let thread = ThreadId::new();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: path.to_string(),
+            task_name: "worker_evidence".to_string(),
+            thread_id: Some(thread.to_string()),
+        })
+        .await
+        .unwrap();
+    coordinator
+        .store()
+        .unwrap()
+        .record_validation_call(codex_agent_task_store::ValidationCall {
+            call_id: "actual-validation".to_string(),
+            attempt_id: attempt.attempt_id,
+            command_summary: "cargo test -p codex-core".to_string(),
+            evidence: codex_agent_task_store::ValidationEvidence::default(),
+            status: codex_agent_task_store::ValidationCallStatus::Failed,
+            recorded_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let receipt = coordinator
+        .seal_missing_receipt_for_attempt(
+            &path,
+            thread,
+            &AgentStatus::Errored("execution failed".to_string()),
+            attempt.attempt_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, AgentStatusClaim::NeedsMain);
+    assert_eq!(receipt.validation_call_ids, vec!["actual-validation"]);
+    assert!(receipt.summary.contains("Failed"));
+    assert!(receipt.criterion_results.iter().all(|criterion| {
+        criterion.status == CriterionStatus::NotRun
+            && criterion
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("unverified"))
+    }));
+    assert!(
+        receipt
+            .next_action
+            .as_deref()
+            .unwrap()
+            .contains(&attempt.attempt_id.to_string())
     );
 }

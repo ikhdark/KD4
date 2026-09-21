@@ -61,6 +61,7 @@ struct RecommendedPluginInstallArgs {
 pub struct RequestPluginInstallHandler {
     discoverable_tools: Vec<DiscoverableTool>,
     presentation: ToolSuggestPresentation,
+    on_demand: bool,
 }
 
 impl RequestPluginInstallHandler {
@@ -71,6 +72,15 @@ impl RequestPluginInstallHandler {
         Self {
             discoverable_tools,
             presentation,
+            on_demand: false,
+        }
+    }
+
+    pub(crate) fn on_demand() -> Self {
+        Self {
+            discoverable_tools: Vec::new(),
+            presentation: ToolSuggestPresentation::ListTool,
+            on_demand: true,
         }
     }
 }
@@ -148,8 +158,13 @@ impl RequestPluginInstallHandler {
             ));
         }
 
+        let candidates = if self.on_demand {
+            discover_plugin_install_candidates(session.as_ref(), step_context.as_ref()).await?
+        } else {
+            self.discoverable_tools.clone()
+        };
         let discoverable_tools = filter_request_plugin_install_discoverable_tools_for_client(
-            self.discoverable_tools.clone(),
+            candidates,
             turn.app_server_client_name.as_deref(),
         );
 
@@ -296,6 +311,59 @@ impl RequestPluginInstallHandler {
             Some(true),
         )))
     }
+}
+
+pub(crate) async fn discover_plugin_install_candidates(
+    session: &crate::session::session::Session,
+    step: &crate::session::step_context::StepContext,
+) -> Result<Vec<DiscoverableTool>, FunctionCallError> {
+    let turn = &step.turn;
+    let manager = &session.services.plugins_manager;
+    let config = turn.config.plugins_config_input();
+    let loaded = manager.plugins_for_config(&config).await;
+    let auth = session.services.auth_manager.auth().await;
+    if let Some(candidates) = manager
+        .recommended_plugin_candidates_for_config(
+            codex_core_plugins::RecommendedPluginCandidatesInput {
+                plugins_config: &config,
+                loaded_plugins: &loaded,
+                auth: auth.as_ref(),
+                disabled_tools: &turn.config.tool_suggest.disabled_tools,
+                app_server_client_name: turn.app_server_client_name.as_deref(),
+            },
+        )
+        .await
+    {
+        return Ok(candidates);
+    }
+    let tools = step.mcp_tool_snapshot().await;
+    let accessible = connectors::with_app_enabled_state(
+        connectors::accessible_connectors_from_mcp_tools(tools.tools.as_slice()),
+        &turn.config,
+    );
+    let ids = step
+        .mcp
+        .config()
+        .connector_snapshot
+        .connector_ids()
+        .iter()
+        .map(|id| id.0.clone())
+        .collect::<Vec<_>>();
+    connectors::list_tool_suggest_discoverable_tools_with_auth(
+        &turn.config,
+        manager,
+        auth.as_ref(),
+        &accessible,
+        &ids,
+    )
+    .await
+    .map(|tools| {
+        filter_request_plugin_install_discoverable_tools_for_client(
+            tools,
+            turn.app_server_client_name.as_deref(),
+        )
+    })
+    .map_err(|err| FunctionCallError::RespondToModel(format!("plugin discovery failed: {err}")))
 }
 
 impl CoreToolRuntime for RequestPluginInstallHandler {}

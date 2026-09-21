@@ -136,3 +136,87 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn wrapper_counts_include_abandonment_exactly_once() -> Result<()> {
+    use std::future::Future;
+    use std::task::Context;
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-cli",
+            env!("CARGO_PKG_VERSION"),
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )?;
+    let manager = SessionTelemetry::new(
+        ThreadId::new(),
+        "test",
+        "test",
+        None,
+        None,
+        None,
+        "test".into(),
+        false,
+        "test".into(),
+        SessionSource::Cli,
+    )
+    .with_metrics(metrics);
+    manager.reset_runtime_metrics();
+    let pending = || {
+        std::future::pending::<
+            std::result::Result<codex_http_client::HttpResponse, codex_http_client::HttpError>,
+        >()
+    };
+    drop(manager.log_request(1, pending));
+    assert!(manager.runtime_metrics_summary().is_none());
+    let mut request = Box::pin(manager.log_request(1, pending));
+    assert!(
+        request
+            .as_mut()
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    drop(request);
+    assert_eq!(
+        manager.runtime_metrics_summary().unwrap().api_calls.count,
+        1
+    );
+    let mut tool = Box::pin(manager.log_tool_result_with_tags(
+        "test",
+        "call",
+        "",
+        &[],
+        &[],
+        || std::future::pending::<std::result::Result<(), &str>>(),
+        |_| true,
+        |_| panic!("abandonment must not render"),
+    ));
+    assert!(
+        tool.as_mut()
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    drop(tool);
+    for success in [true, false] {
+        let result = manager
+            .log_tool_result_with_tags(
+                "test",
+                "call",
+                "",
+                &[],
+                &[],
+                || async { if success { Ok(42) } else { Err("failed") } },
+                |_| true,
+                |_| "ok".into(),
+            )
+            .await;
+        assert_eq!(result.is_ok(), success);
+    }
+    assert_eq!(
+        manager.runtime_metrics_summary().unwrap().tool_calls.count,
+        3
+    );
+    Ok(())
+}

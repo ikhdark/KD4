@@ -922,20 +922,6 @@ fn is_read_only_format_command(command: &[String], tokens: &[String]) -> bool {
     }
 }
 
-fn is_validation_only_command(command: &[String], unwrapped: &[String]) -> bool {
-    if command
-        .iter()
-        .any(|token| token.contains([';', '&', '|', '>', '<', '`', '$', '\n', '\r']))
-    {
-        return false;
-    }
-    matches!(
-        unwrapped,
-        [first, second, ..]
-            if command_basename(first) == "cargo" && matches!(second.as_str(), "check" | "test")
-    )
-}
-
 fn looks_like_mutating_command(command: &[String]) -> bool {
     // Preserve shell syntax and quoted arguments before considering individual
     // executables. A read-only git command must not hide a later write or redirect.
@@ -953,7 +939,6 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
     if codex_shell_command::is_safe_command::is_known_safe_command(command)
         || is_read_only_powershell_command(command)
         || is_direct_file_read_command(command, unwrapped)
-        || is_validation_only_command(command, unwrapped)
         || is_read_only_format_command(command, unwrapped)
     {
         return false;
@@ -1407,6 +1392,12 @@ fn is_known_mutating_command(command: &[String]) -> bool {
 }
 
 pub(crate) fn command_reads_repository_history(command: &[String]) -> bool {
+    if command
+        .iter()
+        .any(|token| token.contains([';', '&', '|', '>', '<', '`', '$', '\n', '\r']))
+    {
+        return false;
+    }
     let normalized = normalized_command_tokens(command);
     let unwrapped = unwrap_command_tokens(&normalized);
     matches!(git_subcommand(unwrapped), Some("log" | "show" | "shortlog"))
@@ -1416,10 +1407,10 @@ pub(crate) fn command_reads_repository_history(command: &[String]) -> bool {
 }
 
 fn git_subcommand(tokens: &[String]) -> Option<&str> {
-    let git = tokens
-        .iter()
-        .position(|token| command_basename(token) == "git")?;
-    let mut index = git.saturating_add(1);
+    if command_basename(tokens.first()?) != "git" {
+        return None;
+    }
+    let mut index = 1;
     while let Some(token) = tokens.get(index).map(String::as_str) {
         if matches!(
             token,

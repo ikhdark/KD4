@@ -72,6 +72,10 @@ impl ModelsCacheManager {
         (self.cache_identity)()
     }
 
+    pub(crate) fn ttl(&self) -> Duration {
+        self.cache_ttl
+    }
+
     pub(crate) fn identity_is_current(&self, expected_identity: &str) -> bool {
         self.current_identity() == expected_identity
     }

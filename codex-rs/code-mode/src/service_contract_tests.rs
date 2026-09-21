@@ -296,6 +296,7 @@ async fn yields_and_resumes() {
             .await
             .unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "after".to_string(),
@@ -378,9 +379,10 @@ text(outcome);
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "nested tool `block` exceeded its 10ms timeout".to_string(),
+                text: "Error: nested tool `block` exceeded its 10ms timeout".to_string(),
             }],
             error_text: None,
         }
@@ -417,9 +419,10 @@ text(outcome);
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "nested tool `block` exceeded its 10ms timeout".to_string(),
+                text: "Error: nested tool `block` exceeded its 10ms timeout".to_string(),
             }],
             error_text: None,
         }
@@ -456,7 +459,7 @@ async fn per_tool_default_survives_runtime_conversion_without_extending_other_to
     assert_eq!(
         content_items,
         vec![FunctionCallOutputContentItem::InputText {
-            text: "nested tool `block` exceeded its 80ms timeout".into(),
+            text: "Error: nested tool `block` exceeded its 80ms timeout".into(),
         }]
     );
 
@@ -483,7 +486,7 @@ async fn per_tool_default_survives_runtime_conversion_without_extending_other_to
     assert_eq!(
         content_items,
         vec![FunctionCallOutputContentItem::InputText {
-            text: "nested tool `block` exceeded its 5ms timeout".into(),
+            text: "Error: nested tool `block` exceeded its 5ms timeout".into(),
         }]
     );
 }
@@ -517,6 +520,7 @@ text(results.length);
             .expect("independent nested calls should rendezvous")
             .unwrap(),
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "2".to_string(),
@@ -545,6 +549,7 @@ const overflow = await tools.block({{overflow: true}}).then(
   (error) => String(error),
 );
 text(overflow);
+yield_control();
 "#
     );
     let cell = service
@@ -559,16 +564,16 @@ text(overflow);
 
     assert_eq!(
         cell.initial_response().await.unwrap(),
-        RuntimeResponse::Result {
+        RuntimeResponse::ExplicitYield {
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: format!(
-                    "code mode cell exceeded its limit of {MAX_OUTSTANDING_CALLBACKS_PER_CELL} outstanding tool and notification callbacks"
+                    "Error: code mode cell exceeded its limit of {MAX_OUTSTANDING_CALLBACKS_PER_CELL} outstanding tool and notification callbacks"
                 ),
             }],
-            error_text: None,
         }
     );
+    service.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -618,6 +623,7 @@ async fn observed_natural_completion_wins_over_termination() {
     assert_eq!(
         service.terminate(cell_id("1")).await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
@@ -924,11 +930,12 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
             }],
-            error_text: None,
+            error_text: Some("cell completed with 1 unawaited tool call(s); outstanding tool work is cancelled".to_string()),
         }
     );
     assert!(delegate.tool_finished.load(Ordering::Acquire));

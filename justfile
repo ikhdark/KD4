@@ -226,7 +226,7 @@ install:
 [no-cd]
 [windows]
 publish-local-codex-final *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile local-release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktop {args}
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile local-release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktopIfNeeded {args}
 
 [no-cd]
 [windows]
@@ -685,13 +685,14 @@ app-server-schema-protocol-check:
 
 # Check app-server schema fixtures without modifying generated output.
 # Forwards checker flags, notably `--allow-stable-break <issue>` for a reviewed
-# stable API break and `--compatibility-baseline <rev>` to move the baseline off
-# the default `HEAD^`.
+# stable API break. Stable checks require `--compatibility-baseline <rev>` or
+# CODEX_SCHEMA_COMPATIBILITY_BASELINE; choose the contract revision explicitly.
 [no-cd]
 app-server-schema-check *args:
     {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check {{ args }}
 
 # Explicitly regenerate app-server schemas under the repository generation lock.
+# Stable regeneration requires CODEX_SCHEMA_COMPATIBILITY_BASELINE.
 [no-cd]
 app-server-schema-regenerate owner experimental="":
     {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("app-server-schema-regenerate only accepts --experimental") } }}

@@ -9,6 +9,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,6 +21,7 @@ use tracing::warn;
 
 const RESIDENCY_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const RESIDENCY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const RESIDENCY_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(super) struct V2Residency {
@@ -136,6 +138,8 @@ impl V2Residency {
         protected_thread_id: Option<ThreadId>,
         shutdown_timeout: Duration,
     ) -> CodexResult<V2ResidencySlot> {
+        timeout(RESIDENCY_ACQUISITION_TIMEOUT, async {
+        let mut attempted = HashSet::new();
         loop {
             if self.try_reserve_pending_slot(capacity) {
                 return Ok(V2ResidencySlot {
@@ -148,6 +152,7 @@ impl V2Residency {
                     manager,
                     protected_thread_id,
                     shutdown_timeout,
+                    &mut attempted,
                 )
                 .await
             {
@@ -167,6 +172,9 @@ impl V2Residency {
                 }
             }
         }
+        }).await.map_err(|_| CodexErr::UnsupportedOperation(
+            "agent residency acquisition timed out; any shutdown in progress still owns its capacity".into()
+        ))?
     }
 
     fn try_reserve_pending_slot(&self, capacity: usize) -> bool {
@@ -192,6 +200,7 @@ impl V2Residency {
         manager: &Arc<ThreadManagerState>,
         protected_thread_id: Option<ThreadId>,
         shutdown_timeout: Duration,
+        attempted: &mut HashSet<ThreadId>,
     ) -> UnloadOneResult {
         let candidates_to_scan = self.resident_count();
         for _ in 0..candidates_to_scan {
@@ -199,6 +208,10 @@ impl V2Residency {
                 return UnloadOneResult::Unavailable;
             };
             let candidate_thread_id = claim.thread_id;
+            if !attempted.insert(candidate_thread_id) {
+                claim.restore();
+                continue;
+            }
             let Some(candidate_thread) = manager
                 .get_thread(candidate_thread_id)
                 .await

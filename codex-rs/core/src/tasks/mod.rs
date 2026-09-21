@@ -942,7 +942,7 @@ impl Session {
         turn_context: &TurnContext,
         turn_had_memory_citation: bool,
         turn_tool_calls: u64,
-        token_usage_at_turn_start: &TokenUsage,
+        turn_token_usage: &TokenUsage,
     ) {
         let memory_feature_enabled = turn_context.config.features.enabled(Feature::MemoryTool);
         let tmp_mem = (
@@ -978,22 +978,6 @@ impl Session {
             i64::try_from(turn_tool_calls).unwrap_or(i64::MAX),
             &[tmp_mem],
         );
-        let total_token_usage = self.total_token_usage().await.unwrap_or_default();
-        let turn_token_usage = TokenUsage {
-            input_tokens: (total_token_usage.input_tokens - token_usage_at_turn_start.input_tokens)
-                .max(0),
-            cached_input_tokens: (total_token_usage.cached_input_tokens
-                - token_usage_at_turn_start.cached_input_tokens)
-                .max(0),
-            output_tokens: (total_token_usage.output_tokens
-                - token_usage_at_turn_start.output_tokens)
-                .max(0),
-            reasoning_output_tokens: (total_token_usage.reasoning_output_tokens
-                - token_usage_at_turn_start.reasoning_output_tokens)
-                .max(0),
-            total_tokens: (total_token_usage.total_tokens - token_usage_at_turn_start.total_tokens)
-                .max(0),
-        };
         let current_span = Span::current();
         current_span.record(
             "codex.turn.token_usage.input_tokens",
@@ -1351,8 +1335,34 @@ impl Session {
             })
         };
 
+        // Freeze accounting while this turn still owns the active slot. Deferred
+        // reporting must never attribute a newer turn's tokens to this one.
+        let total_token_usage = self.total_token_usage().await.unwrap_or_default();
+        let turn_token_usage = TokenUsage {
+            input_tokens: (total_token_usage.input_tokens - token_usage_at_turn_start.input_tokens)
+                .max(0),
+            cached_input_tokens: (total_token_usage.cached_input_tokens
+                - token_usage_at_turn_start.cached_input_tokens)
+                .max(0),
+            output_tokens: (total_token_usage.output_tokens
+                - token_usage_at_turn_start.output_tokens)
+                .max(0),
+            reasoning_output_tokens: (total_token_usage.reasoning_output_tokens
+                - token_usage_at_turn_start.reasoning_output_tokens)
+                .max(0),
+            total_tokens: (total_token_usage.total_tokens - token_usage_at_turn_start.total_tokens)
+                .max(0),
+        };
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
         self.publish_terminal_outcome(finalization, event).await;
+        if cleared_active_turn
+            && (abort_reason == Some(TurnAbortReason::Interrupted)
+                || required_tool_terminal.is_some()
+                || defer_pending_input
+                || finalization.restart_for_pending_input)
+        {
+            self.maybe_start_turn_for_pending_work().await;
+        }
         self.services
             .command_execution
             .persist_cache_after_terminal()
@@ -1361,7 +1371,7 @@ impl Session {
             turn_context.as_ref(),
             turn_had_memory_citation,
             turn_tool_calls,
-            &token_usage_at_turn_start,
+            &turn_token_usage,
         )
         .await;
 
@@ -1371,14 +1381,6 @@ impl Session {
 
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
-        }
-        if cleared_active_turn
-            && (abort_reason == Some(TurnAbortReason::Interrupted)
-                || required_tool_terminal.is_some()
-                || defer_pending_input
-                || finalization.restart_for_pending_input)
-        {
-            self.maybe_start_turn_for_pending_work().await;
         }
     }
 

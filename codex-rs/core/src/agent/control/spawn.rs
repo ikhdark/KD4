@@ -277,8 +277,23 @@ fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
             }
             // Drive delayed cleanup and closing-guard tasks even while the queue is idle.
             runtime.block_on(async move {
-                while let Some(job) = receiver.recv().await {
-                    job.run().await;
+                let mut jobs = tokio::task::JoinSet::new();
+                let mut receiving = true;
+                const MAX_CONCURRENT_CLEANUPS: usize = 32;
+                while receiving || !jobs.is_empty() {
+                    tokio::select! {
+                        job = receiver.recv(), if receiving && jobs.len() < MAX_CONCURRENT_CLEANUPS => {
+                            match job {
+                                Some(job) => { jobs.spawn(job.run()); }
+                                None => receiving = false,
+                            }
+                        }
+                        result = jobs.join_next(), if !jobs.is_empty() => {
+                            if let Some(Err(error)) = result {
+                                warn!(%error, "agent spawn cleanup task failed");
+                            }
+                        }
+                    }
                 }
             });
         });
@@ -765,6 +780,16 @@ impl AgentControl {
         config: Config,
         thread_id: ThreadId,
     ) -> CodexResult<()> {
+        self.ensure_v2_agent_loaded_with_history(config, thread_id, None)
+            .await
+    }
+
+    async fn ensure_v2_agent_loaded_with_history(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+        history: Option<(InitialHistory, SessionSource, Option<ThreadId>)>,
+    ) -> CodexResult<()> {
         let state = self.upgrade()?;
         if self
             .use_loaded_v2_agent_or_clear_stopped(&state, thread_id)
@@ -788,7 +813,7 @@ impl AgentControl {
                     let load_task = tokio::spawn(
                         async move {
                             let result = control
-                                .load_v2_agent_as_owner(&load_state, config, thread_id)
+                                .load_v2_agent_as_owner(&load_state, config, thread_id, history)
                                 .await;
                             load_owner.finish(&result);
                             result
@@ -871,6 +896,19 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         thread_id: ThreadId,
     ) -> CodexResult<bool> {
+        tokio::time::timeout(
+            super::residency::RESIDENCY_ACQUISITION_TIMEOUT,
+            self.use_loaded_v2_agent_or_clear_stopped_inner(state, thread_id),
+        ).await.map_err(|_| CodexErr::UnsupportedOperation(format!(
+            "agent {thread_id} residency transition is still in progress; retry after it completes"
+        )))?
+    }
+
+    async fn use_loaded_v2_agent_or_clear_stopped_inner(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        thread_id: ThreadId,
+    ) -> CodexResult<bool> {
         loop {
             let thread = match state.get_thread(thread_id).await {
                 Ok(thread) => thread,
@@ -932,6 +970,7 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         config: Config,
         thread_id: ThreadId,
+        loaded_history: Option<(InitialHistory, SessionSource, Option<ThreadId>)>,
     ) -> CodexResult<()> {
         if self
             .use_loaded_v2_agent_or_clear_stopped(state, thread_id)
@@ -946,24 +985,30 @@ impl AgentControl {
         #[cfg(test)]
         self.pause_before_v2_cold_load_for_test().await;
 
-        let stored_thread = state
-            .read_stored_thread(ReadThreadParams {
-                thread_id,
-                include_archived: true,
-                include_history: true,
-            })
-            .await?;
-        let stored_source = stored_thread.source.clone();
-        let stored_parent_thread_id = stored_thread.parent_thread_id;
-        let history = stored_thread
-            .history
-            .ok_or(CodexErr::ThreadNotFound(thread_id))?
-            .items;
-        let initial_history = InitialHistory::Resumed(ResumedHistory {
-            conversation_id: thread_id,
-            history: Arc::new(history),
-            rollout_path: stored_thread.rollout_path,
-        });
+        let (initial_history, stored_source, stored_parent_thread_id) = match loaded_history {
+            Some(history) => history,
+            None => {
+                let stored_thread = state
+                    .read_stored_thread(ReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: true,
+                    })
+                    .await?;
+                let stored_source = stored_thread.source.clone();
+                let stored_parent_thread_id = stored_thread.parent_thread_id;
+                let history = stored_thread
+                    .history
+                    .ok_or(CodexErr::ThreadNotFound(thread_id))?
+                    .items;
+                let initial_history = InitialHistory::Resumed(ResumedHistory {
+                    conversation_id: thread_id,
+                    history: Arc::new(history),
+                    rollout_path: stored_thread.rollout_path,
+                });
+                (initial_history, stored_source, stored_parent_thread_id)
+            }
+        };
         if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
@@ -1800,6 +1845,14 @@ impl AgentControl {
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
         let state = self.upgrade()?;
+        if self.state.agent_metadata_for_thread(thread_id).is_some()
+            && let Ok(thread) = state.get_thread(thread_id).await
+            && thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+            && is_v2_resident_session_source(&thread.session_source)
+        {
+            self.ensure_v2_agent_loaded(config, thread_id).await?;
+            return Ok((thread_id, MultiAgentVersion::V2));
+        }
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
                 thread_id,
@@ -1845,7 +1898,12 @@ impl AgentControl {
         let uses_v2_residency = multi_agent_version == MultiAgentVersion::V2
             && is_v2_resident_session_source(&session_source);
         if uses_v2_residency && self.state.agent_metadata_for_thread(thread_id).is_some() {
-            self.ensure_v2_agent_loaded(config, thread_id).await?;
+            self.ensure_v2_agent_loaded_with_history(
+                config,
+                thread_id,
+                Some((initial_history, session_source, parent_thread_id)),
+            )
+            .await?;
             return Ok((thread_id, multi_agent_version));
         }
         if multi_agent_version != MultiAgentVersion::V2 {
@@ -2008,6 +2066,10 @@ mod pending_spawn_cleanup_worker_tests {
             std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             std::sync::Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         );
+        let independent = manager
+            .start_thread(config.clone())
+            .await
+            .expect("independent cleanup target");
         let child = manager
             .start_thread(config)
             .await
@@ -2035,6 +2097,37 @@ mod pending_spawn_cleanup_worker_tests {
                 })
                 .is_ok()
         );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !child.thread.codex.session.terminal_tasks.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first cleanup has reached blocked shutdown");
+        let (independent_tx, independent_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .send(super::PendingSpawnCleanupJob {
+                    control: manager.agent_control(),
+                    child_thread: std::sync::Arc::clone(&independent.thread),
+                    child_thread_id: independent.thread_id,
+                    capacity: super::PendingSpawnCapacity {
+                        reservation: None,
+                        residency_slot: None
+                    },
+                    kind: super::PendingSpawnCleanupKind::Spawn,
+                    completion: Some(independent_tx),
+                })
+                .is_ok()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), independent_rx)
+            .await
+            .expect("blocked cleanup must not delay independent terminal cleanup")
+            .unwrap();
+        assert!(matches!(
+            manager.get_thread(independent.thread_id).await,
+            Err(codex_protocol::error::CodexErr::ThreadNotFound(_))
+        ));
         tokio::time::timeout(std::time::Duration::from_secs(20), completion_rx)
             .await
             .expect("foreground rollback returns at its deadline")

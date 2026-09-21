@@ -56,7 +56,10 @@ impl ResponsesStreamMetadata {
             rate_limit_snapshots: parse_all_rate_limits(headers),
             models_etag: header_string(headers, X_MODELS_ETAG_HEADER),
             server_model: header_string(headers, OPENAI_MODEL_HEADER),
-            reasoning_included: headers.contains_key(X_REASONING_INCLUDED_HEADER),
+            reasoning_included: headers
+                .get(X_REASONING_INCLUDED_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("true")),
             upstream_request_id: header_string(headers, REQUEST_ID_HEADER),
             safety_buffering_treatment: treatment_from_headers(headers).unwrap_or_default(),
             turn_state: header_string(headers, X_CODEX_TURN_STATE_HEADER),
@@ -171,11 +174,23 @@ impl ResponsesEventInterpreter {
         {
             return Err(ResponsesEventError::Api(error));
         }
-        let is_rate_limit = match &event {
-            Ok(event) => event.kind == "codex.rate_limits",
+        let kind = match &event {
+            Ok(event) => Some(event.kind.clone()),
             Err(_) => serde_json::from_str::<EventKindProbe<'_>>(payload)
-                .is_ok_and(|probe| probe.kind.as_deref() == Some("codex.rate_limits")),
+                .ok()
+                .and_then(|probe| probe.kind),
         };
+        if kind.as_deref() == Some("error") {
+            let value: Value = serde_json::from_str(payload)?;
+            let error = value.get("error").unwrap_or(&value);
+            return Err(ResponsesEventError::Api(provider_error(error)));
+        }
+        // Unknown extensions may reuse field names with new types. Known events
+        // remain strict, especially output items containing executable actions.
+        if event.is_err() && kind.as_deref().is_some_and(|kind| !is_known_event(kind)) {
+            return Ok(self.events.drain(..));
+        }
+        let is_rate_limit = kind.as_deref() == Some("codex.rate_limits");
         if is_rate_limit {
             let event: RateLimitStreamEvent = serde_json::from_str(payload)?;
             self.events.extend(
@@ -250,7 +265,7 @@ struct Error {
 struct ResponseCompleted {
     id: String,
     #[serde(default)]
-    usage: Option<ResponseCompletedUsage>,
+    usage: Option<Value>,
     #[serde(default)]
     end_turn: Option<bool>,
 }
@@ -298,7 +313,7 @@ pub(crate) struct ResponsesStreamEvent<'a> {
     kind: Cow<'a, str>,
     headers: Option<Value>,
     metadata: Option<Value>,
-    response: Option<Value>,
+    response: Option<ResponseEnvelope>,
     item: Option<Value>,
     item_id: Option<String>,
     call_id: Option<String>,
@@ -307,6 +322,121 @@ pub(crate) struct ResponsesStreamEvent<'a> {
     summary_index: Option<i64>,
     content_index: Option<i64>,
     safety_buffering: Option<Value>,
+}
+
+// Ignore full output snapshots: items have their own ordered stream events.
+#[derive(Debug, Deserialize)]
+struct ResponseEnvelope {
+    id: Option<Value>,
+    usage: Option<Value>,
+    end_turn: Option<Value>,
+    error: Option<Value>,
+    incomplete_details: Option<Value>,
+    headers: Option<Value>,
+}
+
+fn is_known_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "error"
+            | "codex.rate_limits"
+            | "response.metadata"
+            | "response.created"
+            | "response.in_progress"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.completed"
+            | "response.output_item.done"
+            | "response.output_item.added"
+            | "response.output_text.delta"
+            | "response.custom_tool_call_input.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_part.added"
+    )
+}
+
+pub(crate) fn decode_diagnostic(context: &str, error: &serde_json::Error) -> String {
+    format!(
+        "{context}: {:?} at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
+    let value = value.filter(|value| !value.is_null())?;
+    match serde_json::from_value::<ResponseCompletedUsage>(value) {
+        Ok(usage) => Some(usage.into()),
+        Err(error) => {
+            debug!(category = ?error.classify(), line = error.line(), column = error.column(),
+                "response usage unavailable");
+            None
+        }
+    }
+}
+
+/// Stable error fields are independent of optional provider metadata. HTTP
+/// adapters keep their status-based fallback when the provider code is unknown.
+pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("type").and_then(Value::as_str));
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some(match code? {
+        "context_length_exceeded" => ApiError::ContextWindowExceeded,
+        "insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached" => {
+            ApiError::QuotaExceeded
+        }
+        "usage_not_included" => ApiError::UsageNotIncluded,
+        "cyber_policy" => ApiError::CyberPolicy {
+            message: cyber_policy_message(Some(message)),
+        },
+        "server_is_overloaded" | "slow_down" => ApiError::ServerOverloaded,
+        "server_error" | "internal_server_error" | "rate_limit_exceeded" => {
+            let delay = try_parse_retry_after(&Error {
+                code: code.map(str::to_owned),
+                message: Some(message.clone()),
+            });
+            ApiError::Retryable { message, delay }
+        }
+        "invalid_request_error"
+        | "invalid_prompt"
+        | "bio_policy"
+        | "content_policy_violation"
+        | "invalid_image"
+        | "invalid_image_format"
+        | "invalid_base64_image"
+        | "invalid_image_url"
+        | "image_too_large"
+        | "image_too_small"
+        | "image_parse_error"
+        | "image_content_policy_violation"
+        | "invalid_image_mode"
+        | "image_file_too_large"
+        | "unsupported_image_media_type"
+        | "empty_image_file"
+        | "image_file_not_found" => ApiError::InvalidRequest { message },
+        _ => return None,
+    })
+}
+
+fn provider_error(value: &Value) -> ApiError {
+    classify_provider_error(value).unwrap_or_else(|| ApiError::ProviderFailure {
+        code: value.get("code").and_then(Value::as_str).map(str::to_owned),
+        message: value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Unrecognized provider failure")
+            .to_owned(),
+    })
 }
 
 /// Rate-limit frames only.
@@ -329,7 +459,7 @@ impl ResponsesStreamEvent<'_> {
     pub(crate) fn response_model(&self) -> Option<&str> {
         self.response
             .as_ref()
-            .and_then(|response| response.get("headers"))
+            .and_then(|response| response.headers.as_ref())
             .and_then(header_openai_model_value_from_json)
             .or_else(|| {
                 self.headers
@@ -495,69 +625,53 @@ fn process_responses_event(
             }
         }
         "response.failed" => {
-            let Some(response_value) = event.response else {
-                return Err(ResponsesEventError::Api(ApiError::Stream(
-                    "response.failed event received".into(),
-                )));
-            };
-            let mut response_error = ApiError::Stream("response.failed event received".into());
-            if let Some(error) = response_value.get("error")
-                && let Ok(error) = Error::deserialize(error)
-            {
-                if is_context_window_error(&error) {
-                    response_error = ApiError::ContextWindowExceeded;
-                } else if is_quota_exceeded_error(&error) {
-                    response_error = ApiError::QuotaExceeded;
-                } else if is_usage_not_included(&error) {
-                    response_error = ApiError::UsageNotIncluded;
-                } else if is_cyber_policy_error(&error) {
-                    response_error = ApiError::CyberPolicy {
-                        message: cyber_policy_message(error.message),
-                    };
-                } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy")) {
-                    response_error = ApiError::InvalidRequest {
-                        message: error
-                            .message
-                            .unwrap_or_else(|| "Invalid request.".to_string()),
-                    };
-                } else if is_server_overloaded_error(&error) {
-                    response_error = ApiError::ServerOverloaded;
-                } else {
-                    response_error = ApiError::Retryable {
-                        delay: try_parse_retry_after(&error),
-                        message: error.message.unwrap_or_default(),
-                    };
-                }
-            }
-            return Err(ResponsesEventError::Api(response_error));
+            let error = event
+                .response
+                .and_then(|response| response.error)
+                .unwrap_or(Value::Null);
+            return Err(ResponsesEventError::Api(provider_error(&error)));
         }
         "response.incomplete" => {
-            let reason = event
-                .response
+            let response = event.response;
+            let reason = response
                 .as_ref()
-                .and_then(|response| response.get("incomplete_details"))
+                .and_then(|response| response.incomplete_details.as_ref())
                 .and_then(|details| details.get("reason"))
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(ResponsesEventError::Api(ApiError::Stream(format!(
-                "Incomplete response returned, reason: {reason}"
-            ))));
+                .unwrap_or("unknown")
+                .to_owned();
+            let response_id = response
+                .as_ref()
+                .and_then(|response| response.id.as_ref())
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let token_usage = parse_usage(response.and_then(|response| response.usage));
+            return Err(ResponsesEventError::Api(ApiError::IncompleteResponse(
+                Box::new(codex_protocol::error::IncompleteResponse {
+                    response_id,
+                    reason,
+                    token_usage,
+                }),
+            )));
         }
         "response.completed" => {
-            let response_value = event.response.ok_or_else(|| {
+            let response = event.response.ok_or_else(|| {
                 ResponsesEventError::Api(ApiError::Stream(
                     "response.completed event missing response".into(),
                 ))
             })?;
-            let response =
-                serde_json::from_value::<ResponseCompleted>(response_value).map_err(|error| {
-                    let message = format!("failed to parse ResponseCompleted: {error}");
-                    debug!("{message}");
-                    ResponsesEventError::Api(ApiError::Stream(message))
-                })?;
+            let response = serde_json::from_value::<ResponseCompleted>(serde_json::json!({
+                "id": response.id, "end_turn": response.end_turn, "usage": response.usage
+            }))
+            .map_err(|error| {
+                ResponsesEventError::Api(ApiError::Stream(decode_diagnostic(
+                    "failed to parse ResponseCompleted",
+                    &error,
+                )))
+            })?;
             return Ok(Some(ResponseEvent::Completed {
                 response_id: response.id,
-                token_usage: response.usage.map(Into::into),
+                token_usage: parse_usage(response.usage),
                 end_turn: response.end_turn,
             }));
         }
@@ -587,7 +701,10 @@ fn parse_required_response_item(
         ResponsesEventError::Api(ApiError::Stream(message))
     })?;
     serde_json::from_value(item).map_err(|error| {
-        let message = format!("failed to parse ResponseItem from {event_kind}: {error}");
+        let message = decode_diagnostic(
+            &format!("failed to parse ResponseItem from {event_kind}"),
+            &error,
+        );
         debug!("{message}");
         ResponsesEventError::Api(ApiError::Stream(message))
     })
@@ -635,29 +752,6 @@ fn try_parse_retry_after(error: &Error) -> Option<Duration> {
     }
 }
 
-fn is_context_window_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("context_length_exceeded")
-}
-
-fn is_quota_exceeded_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("insufficient_quota")
-}
-
-fn is_usage_not_included(error: &Error) -> bool {
-    error.code.as_deref() == Some("usage_not_included")
-}
-
-fn is_cyber_policy_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("cyber_policy")
-}
-
-fn is_server_overloaded_error(error: &Error) -> bool {
-    matches!(
-        error.code.as_deref(),
-        Some("server_is_overloaded" | "slow_down")
-    )
-}
-
 fn cyber_policy_message(message: Option<String>) -> String {
     message
         .filter(|message| !message.trim().is_empty())
@@ -678,6 +772,188 @@ mod tests {
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn audit_optional_usage_does_not_destroy_completion() {
+        for usage in [
+            Value::Null,
+            json!({}),
+            json!({"input_tokens": "bad"}),
+            json!({"input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "output_tokens_details": "bad"}),
+        ] {
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let payload = json!({"type":"response.completed","response":{"id":"done","end_turn":true,"usage":usage,
+                "output":[{"unused":"snapshot"}]}}).to_string();
+            let events = interpreter
+                .process_payload(&payload)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert!(matches!(events.as_slice(), [ResponseEvent::Completed {
+                response_id, token_usage: None, end_turn: Some(true) }] if response_id == "done"));
+        }
+        for response in [
+            json!({"end_turn":true}),
+            json!({"id":"done","end_turn":"true"}),
+        ] {
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            assert!(
+                interpreter
+                    .process_payload(
+                        &json!({"type":"response.completed","response":response}).to_string()
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn audit_unknown_events_tolerate_colliding_fields_but_known_events_are_strict() {
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        assert_eq!(
+            interpreter
+                .process_payload(r#"{"type":"future.event","delta":{},"summary_index":"new"}"#)
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(
+            interpreter
+                .process_payload(r#"{"type":"response.output_text.delta","delta":{}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audit_reasoning_header_requires_affirmative_value() {
+        for (value, expected) in [
+            ("true", true),
+            (" TRUE ", true),
+            ("false", false),
+            ("", false),
+            ("1", false),
+            ("invalid", false),
+        ] {
+            let headers = HeaderMap::from_iter([(
+                HeaderName::from_static(X_REASONING_INCLUDED_HEADER),
+                value.parse().unwrap(),
+            )]);
+            let metadata = ResponsesStreamMetadata::from_headers(&headers);
+            assert_eq!(metadata.reasoning_included(), expected);
+            assert_eq!(
+                metadata
+                    .initial_events()
+                    .iter()
+                    .any(|event| matches!(event, ResponseEvent::ServerReasoningIncluded(true))),
+                expected
+            );
+        }
+        let headers = HeaderMap::from_iter([(
+            HeaderName::from_static(X_REASONING_INCLUDED_HEADER),
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        )]);
+        assert!(!ResponsesStreamMetadata::from_headers(&headers).reasoning_included());
+        assert!(!ResponsesStreamMetadata::default().reasoning_included());
+    }
+
+    #[test]
+    fn audit_error_envelopes_share_classification_and_never_disappear() {
+        for code in [
+            "invalid_image",
+            "invalid_base64_image",
+            "insufficient_quota",
+            "context_length_exceeded",
+            "server_error",
+            "cyber_policy",
+            "future_failure",
+        ] {
+            let error =
+                json!({"code":code,"message":"same message", "resets_at":{},"plan_type":[]});
+            for envelope in [
+                json!({"type":"error", "code":code,"message":"same message"}),
+                json!({"type":"error","error":error}),
+                json!({"type":"response.failed","response":{"error":error}}),
+            ] {
+                let mut interpreter =
+                    ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+                let Err(ResponsesEventError::Api(error)) =
+                    interpreter.process_payload(&envelope.to_string())
+                else {
+                    panic!("error must be delivered");
+                };
+                let mapped = crate::api_bridge::map_api_error(error);
+                assert_eq!(
+                    mapped.is_retryable(),
+                    code == "server_error",
+                    "{code}: {mapped:?}"
+                );
+                if code == "future_failure" {
+                    assert!(
+                        matches!(mapped, codex_protocol::error::CodexErr::ProviderFailure { code: Some(ref actual), .. } if actual == code)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audit_incomplete_preserves_usage_and_identity_through_bridge() {
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let payload = json!({"type":"response.incomplete","response":{"id":"partial", "incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}}).to_string();
+        let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else {
+            panic!("incomplete outcome");
+        };
+        let mapped = crate::api_bridge::map_api_error(error);
+        assert!(!mapped.is_retryable());
+        let codex_protocol::error::CodexErr::IncompleteResponse(response) = mapped else {
+            panic!("typed outcome");
+        };
+        assert_eq!(response.response_id.as_deref(), Some("partial"));
+        assert_eq!(response.reason, "max_output_tokens");
+        assert_eq!(response.token_usage.unwrap().total_tokens, 30);
+    }
+
+    #[test]
+    fn audit_required_item_diagnostics_do_not_copy_private_payload() {
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let secret = "private_payload".repeat(100_000);
+        let payload = json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":secret}}).to_string();
+        let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else {
+            panic!("invalid item");
+        };
+        let message = error.to_string();
+        assert!(message.len() < 512);
+        assert!(!message.contains("private_payload"));
+        assert!(message.contains("Data"));
+    }
+
+    #[test]
+    fn audit_incomplete_is_terminal_and_preserves_reason() {
+        for (reason, retryable) in [
+            ("content_filter", false),
+            ("max_output_tokens", false),
+            ("unknown", false),
+        ] {
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let payload = json!({"type": "response.incomplete", "response": {
+                "incomplete_details": {"reason": reason}
+            }})
+            .to_string();
+            let error = match interpreter.process_payload(&payload) {
+                Err(ResponsesEventError::Api(error)) => error,
+                _ => panic!("expected incomplete response error"),
+            };
+            let error = crate::api_bridge::map_api_error(error);
+            assert_eq!(error.is_retryable(), retryable);
+            assert!(error.to_string().contains(reason));
+        }
+    }
 
     #[test]
     fn ordinary_events_skip_transport_error_parsing() {

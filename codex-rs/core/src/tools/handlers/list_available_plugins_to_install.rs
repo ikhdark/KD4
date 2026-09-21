@@ -17,6 +17,7 @@ const MAX_LIST_AVAILABLE_PLUGINS_TO_INSTALL_DESCRIPTION_CHARS: usize = 240;
 
 pub struct ListAvailablePluginsToInstallHandler {
     tools: Vec<RequestPluginInstallEntry>,
+    on_demand: bool,
 }
 
 impl ListAvailablePluginsToInstallHandler {
@@ -26,7 +27,17 @@ impl ListAvailablePluginsToInstallHandler {
                 .cmp(&right.name)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        Self { tools }
+        Self {
+            tools,
+            on_demand: false,
+        }
+    }
+
+    pub(crate) fn on_demand() -> Self {
+        Self {
+            tools: Vec::new(),
+            on_demand: true,
+        }
     }
 
     fn result(&self) -> ListAvailablePluginsToInstallResult {
@@ -97,6 +108,16 @@ impl ListAvailablePluginsToInstallHandler {
             }
         }
 
+        if self.on_demand {
+            let tools = super::request_plugin_install::discover_plugin_install_candidates(
+                invocation.session.as_ref(),
+                invocation.step_context.as_ref(),
+            )
+            .await?;
+            return Ok(boxed_tool_output(
+                Self::new(codex_tools::collect_request_plugin_install_entries(&tools)).output()?,
+            ));
+        }
         Ok(boxed_tool_output(self.output()?))
     }
 }

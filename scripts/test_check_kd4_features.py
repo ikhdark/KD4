@@ -534,6 +534,40 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             ["feature", "second"],
         )
 
+    def test_mixed_batch_keeps_observed_pass_but_fails_capability_proof(self):
+        source = self.repo_root / "tests/test_feature.py"
+        source.write_text(
+            source.read_text()
+            + "\nclass FailingTest(unittest.TestCase):\n    def test_failure(self):\n        self.assertEqual(1, 2)\n"
+        )
+        manifest = self.write_manifest(self.valid_evidence())
+        feature = manifest.read_text().split("[[features]]", 1)[1]
+        feature = feature.replace('id = "feature"', 'id = "second"', 1)
+        feature = feature.replace(
+            "FeatureRegistrationTest.test_feature_is_live", "FailingTest.test_failure"
+        )
+        feature = feature.replace(
+            'symbol = "test_feature_is_live"', 'symbol = "test_failure"'
+        )
+        manifest.write_text(manifest.read_text() + "\n[[features]]" + feature)
+        outcomes = []
+        code = check_kd4_features.execute_runtime_verification(
+            manifest,
+            feature_id=None,
+            repo_root=self.repo_root,
+            quiet=True,
+            outcomes=outcomes,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual([item["outcome"] for item in outcomes], ["passed", "failed"])
+        self.assertEqual(
+            [item["batch_status"] for item in outcomes], ["failed", "failed"]
+        )
+        self.assertEqual(
+            outcomes[0]["test_identities"],
+            ["tests.test_feature.FeatureRegistrationTest.test_feature_is_live"],
+        )
+
     def run_json_verification(self, manifest: Path, *extra: str) -> dict:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -1050,7 +1084,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             "invalid-runtime-status", {finding.code for finding in result.findings}
         )
 
-    @mock.patch.object(check_kd4_features.subprocess, "run")
+    @mock.patch.object(check_kd4_features, "run_finite")
     def test_feature_default_comes_from_machine_readable_rust_export(
         self, run: mock.Mock
     ) -> None:
@@ -1060,6 +1094,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         )
         run.return_value = subprocess_completed = mock.Mock(
             returncode=0,
+            output_truncated=False,
             stdout='[{"key":"platform_feature","defaultEnabled":true}]',
         )
 

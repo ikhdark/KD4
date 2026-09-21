@@ -169,6 +169,7 @@ pub(crate) enum ResolveServerRequestFailure {
     ListenerNotRunning,
     ListenerClosed,
     CompletionDropped,
+    DeliveryTimedOut,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -554,6 +555,7 @@ fn ordered_indexes(
 
 struct PendingInterrupt {
     request_id: ConnectionRequestId,
+    turn_id: String,
     cancelled: tokio_util::sync::CancellationToken,
 }
 
@@ -584,6 +586,7 @@ impl ThreadState {
     pub(crate) fn reserve_interrupt(
         &mut self,
         request_id: ConnectionRequestId,
+        turn_id: String,
     ) -> tokio_util::sync::DropGuard {
         // A dropped request invalidates its entry synchronously, even while the
         // async ThreadState mutex is held elsewhere. Prune those tombstones on
@@ -594,17 +597,38 @@ impl ThreadState {
         let guard = cancelled.clone().drop_guard();
         self.pending_interrupts.push(PendingInterrupt {
             request_id,
+            turn_id,
             cancelled,
         });
         guard
     }
 
-    pub(crate) fn take_pending_interrupts(&mut self) -> Vec<ConnectionRequestId> {
-        std::mem::take(&mut self.pending_interrupts)
-            .into_iter()
-            .filter(|pending| !pending.cancelled.is_cancelled())
-            .map(|pending| pending.request_id)
-            .collect()
+    pub(crate) fn take_pending_interrupts(&mut self, turn_id: &str) -> Vec<ConnectionRequestId> {
+        let mut requests = Vec::new();
+        self.pending_interrupts.retain(|pending| {
+            if pending.cancelled.is_cancelled() {
+                return false;
+            }
+            if pending.turn_id == turn_id {
+                requests.push(pending.request_id.clone());
+                return false;
+            }
+            true
+        });
+        requests
+    }
+
+    /// Claim a response when core settled without an abort event (or before its delivery).
+    pub(crate) fn finish_interrupt(&mut self, request_id: &ConnectionRequestId) -> bool {
+        let mut pending_response = false;
+        self.pending_interrupts.retain(|pending| {
+            if &pending.request_id == request_id {
+                pending_response = !pending.cancelled.is_cancelled();
+                return false;
+            }
+            true
+        });
+        pending_response
     }
 
     #[cfg(test)]
@@ -854,9 +878,14 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
     };
 
     let unresolved_request_id = request_id.clone();
+    let deadline = tokio::time::Instant::now() + crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT;
     let sent = tokio::select! {
         biased;
         _ = cancellation.cancelled() => false,
+        _ = tokio::time::sleep_until(deadline) => {
+            cancellation.cancel();
+            return Err(unresolved(unresolved_request_id, ResolveServerRequestFailure::DeliveryTimedOut));
+        }
         result = listener_command_tx.send(ThreadListenerCommand::ResolveServerRequest {
             request_id,
             completion_tx,
@@ -872,6 +901,10 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
     let completed = tokio::select! {
         biased;
         _ = cancellation.cancelled() => false,
+        _ = tokio::time::sleep_until(deadline) => {
+            cancellation.cancel();
+            return Err(unresolved(unresolved_request_id, ResolveServerRequestFailure::DeliveryTimedOut));
+        }
         result = completion_rx => result.is_ok(),
     };
     if !completed {
@@ -1040,6 +1073,53 @@ mod tests {
         }
 
         assert_eq!(tracker.take("turn-0"), Some(ConnectionId(7)));
+    }
+
+    #[tokio::test]
+    async fn listener_resolution_bounds_admission_and_acknowledgement() {
+        for block_admission in [false, true] {
+            let state = Arc::new(Mutex::new(ThreadState::default()));
+            let (tx, mut rx) = mpsc::channel(1);
+            let cancellation = CancellationToken::new();
+            if block_admission {
+                let (completion_tx, _completion_rx) = oneshot::channel();
+                tx.send(ThreadListenerCommand::ResolveServerRequest {
+                    request_id: RequestId::Integer(0),
+                    completion_tx,
+                })
+                .await
+                .unwrap();
+            }
+            {
+                let mut state = state.lock().await;
+                state.listener_command_tx = Some(tx);
+                state.listener_cancellation = Some(cancellation.clone());
+            }
+            tokio::time::pause();
+            let request_id = RequestId::Integer(1);
+            let resolution = tokio::spawn({
+                let state = Arc::clone(&state);
+                let request_id = request_id.clone();
+                async move { resolve_server_request_on_thread_listener(&state, request_id).await }
+            });
+            let held_command = if block_admission {
+                None
+            } else {
+                Some(rx.recv().await.unwrap())
+            };
+            tokio::task::yield_now().await;
+            tokio::time::advance(crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT).await;
+            assert_eq!(
+                resolution.await.unwrap(),
+                Err(ResolveServerRequestError {
+                    request_id,
+                    failure: ResolveServerRequestFailure::DeliveryTimedOut
+                })
+            );
+            assert!(cancellation.is_cancelled());
+            drop(held_command);
+            tokio::time::resume();
+        }
     }
 
     #[tokio::test]

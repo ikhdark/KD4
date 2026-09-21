@@ -16,6 +16,8 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Owns the inputs and cached result of AGENTS.md discovery for a session.
 pub(crate) struct AgentsMdManager {
     user_instructions: Option<UserInstructions>,
@@ -165,14 +167,17 @@ impl AgentsMdManager {
         config: &Arc<Config>,
         environments: &TurnEnvironmentSnapshot,
     ) -> AgentsMdObservation {
-        // Serialize key capture, filesystem loading, and publication so an older refresh cannot
-        // finish after and overwrite a newer request. Clone the request's published value before
-        // releasing the gate so a later refresh cannot replace it between refresh and capture.
-        let Ok(_refresh_permit) = self.refresh_gate.acquire().await else {
-            return self.get_cached_observation().await;
+        let refresh = async {
+            let _permit = self.refresh_gate.acquire().await.ok()?;
+            Some(
+                self.refresh_with_gate_held(Arc::clone(config), environments)
+                    .await,
+            )
         };
-        self.refresh_with_gate_held(Arc::clone(config), environments)
-            .await
+        match tokio::time::timeout(REFRESH_TIMEOUT, refresh).await {
+            Ok(Some(observation)) => observation,
+            _ => self.scoped_fallback(config, environments),
+        }
     }
 
     pub(crate) async fn refresh_for_step(
@@ -180,18 +185,54 @@ impl AgentsMdManager {
         config: &Arc<Config>,
         environments: &ThreadEnvironments,
     ) -> (TurnEnvironmentSnapshot, AgentsMdObservation) {
-        // Enter serialization before capturing live environments so an older snapshot cannot be
-        // delayed until after a newer one publishes and then overwrite the newer cache entry.
-        let Ok(_refresh_permit) = self.refresh_gate.acquire().await else {
-            let environments = environments.snapshot().await;
-            let observation = self.get_cached_observation().await;
-            return (environments, observation);
+        let refresh = async {
+            let _permit = self.refresh_gate.acquire().await.ok()?;
+            let snapshot = environments.snapshot().await;
+            let observation = self
+                .refresh_with_gate_held(Arc::clone(config), &snapshot)
+                .await;
+            Some((snapshot, observation))
         };
-        let environments = environments.snapshot().await;
-        let observation = self
-            .refresh_with_gate_held(Arc::clone(config), &environments)
-            .await;
-        (environments, observation)
+        match tokio::time::timeout(REFRESH_TIMEOUT, refresh).await {
+            Ok(Some(result)) => result,
+            _ => {
+                // Capture ready identities without awaiting a stalled resolver.
+                let snapshot = environments.snapshot_now().await;
+                let observation = self.scoped_fallback(config, &snapshot);
+                (snapshot, observation)
+            }
+        }
+    }
+
+    fn scoped_fallback(
+        &self,
+        config: &Config,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> AgentsMdObservation {
+        let key = AgentsMdCacheKey::capture_with_markers(
+            config,
+            environments,
+            &self.project_root_markers(config),
+        );
+        if let Ok(cache) = self.cache.try_lock()
+            && cache.key.as_ref() == Some(&key)
+        {
+            return cache.cached_observation(AgentsMdFreshness::CachedFallback);
+        }
+        let loaded = self.user_instructions.as_ref().map(|instructions| {
+            Arc::new(LoadedAgentsMd::new_user(
+                instructions.text.clone(),
+                instructions.source.clone(),
+            ))
+        });
+        let stable_context = loaded
+            .as_ref()
+            .map(|loaded| loaded.stable_context_bundle(&key.active_cwd));
+        AgentsMdObservation {
+            loaded,
+            stable_context,
+            freshness: AgentsMdFreshness::IncompleteRead,
+        }
     }
 
     async fn refresh_with_gate_held(

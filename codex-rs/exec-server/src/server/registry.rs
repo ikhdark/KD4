@@ -57,6 +57,12 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
             handler.initialize(params).await
         },
     );
+    router.request(
+        crate::protocol::HTTP_REQUEST_CANCEL_METHOD,
+        |handler: Arc<ExecServerHandler>, params: crate::protocol::HttpRequestCancelParams| async move {
+            handler.cancel_http_body_stream(&params.request_id).await
+        },
+    );
     router.request_with_id(
         HTTP_REQUEST_METHOD,
         |handler: Arc<ExecServerHandler>, request_id, params: HttpRequestParams| async move {

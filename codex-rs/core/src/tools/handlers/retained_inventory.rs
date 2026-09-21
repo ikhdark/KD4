@@ -14,7 +14,6 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use futures::StreamExt;
-use futures::TryStreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -213,6 +212,8 @@ enum Args {
     },
     Read {
         inventory_id: String,
+        #[serde(default)]
+        unresolved_only: bool,
         #[serde(default)]
         offset: usize,
         #[serde(default = "default_limit")]
@@ -463,6 +464,84 @@ impl Snapshot {
         )
     }
 
+    fn coverage(&self) -> Value {
+        self.categories
+            .iter()
+            .map(|(name, category)| {
+                let candidate_count = self
+                    .records
+                    .get(name)
+                    .into_iter()
+                    .flat_map(|records| records.values())
+                    .filter(|record| record.status != "removed")
+                    .count();
+                let outcome = if category.provenance.is_none() {
+                    "not_enumerated"
+                } else if !category.complete {
+                    "incomplete"
+                } else if candidate_count == 0 {
+                    "complete_empty"
+                } else {
+                    "complete_with_candidates"
+                };
+                (
+                    name.clone(),
+                    json!({
+                        "required": self.profile.required_categories.contains(name),
+                        "outcome": outcome,
+                        "candidate_count": candidate_count,
+                        "unresolved_reason": category.unresolved_reason,
+                        "provenance": category.provenance,
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    fn progress_since(&self, before: &Self) -> Value {
+        let mut categories_completed = 0;
+        let mut categories_reopened = 0;
+        for name in &self.profile.required_categories {
+            match (
+                before
+                    .categories
+                    .get(name)
+                    .is_some_and(|category| category.complete),
+                self.categories
+                    .get(name)
+                    .is_some_and(|category| category.complete),
+            ) {
+                (false, true) => categories_completed += 1,
+                (true, false) => categories_reopened += 1,
+                _ => {}
+            }
+        }
+        let mut records_resolved = 0;
+        let mut records_reopened = 0;
+        for (category, records) in &self.records {
+            for (id, record) in records {
+                let prior = before
+                    .records
+                    .get(category)
+                    .and_then(|records| records.get(id));
+                let was_resolved = prior.is_some_and(|record| record.status == "classified");
+                if record.status == "classified" && !was_resolved {
+                    records_resolved += 1;
+                } else if was_resolved
+                    && !matches!(record.status.as_str(), "classified" | "removed")
+                {
+                    records_reopened += 1;
+                }
+            }
+        }
+        json!({
+            "required_categories_completed": categories_completed,
+            "required_categories_reopened": categories_reopened,
+            "records_resolved": records_resolved,
+            "records_reopened": records_reopened,
+        })
+    }
+
     fn summary(&self) -> Value {
         let mut statuses = BTreeMap::<String, usize>::new();
         let mut unique = BTreeSet::new();
@@ -600,58 +679,90 @@ async fn observe(
     let repo = &repo;
     let tracked = &tracked;
     let observations = futures::stream::iter(resolved.into_values().map(|path| async move {
-        if invocation.cancellation_token.is_cancelled() {
-            return Err(invalid("inventory observation cancelled"));
-        }
-        let tracking = match (path.to_abs_path().ok(), repo, tracked) {
-            (Some(path), Some(repo), Some(tracked)) if path.as_path().starts_with(repo) => {
-                if tracked.contains(&native_key(path.as_path())) {
-                    "tracked"
-                } else {
-                    "untracked"
+        let id = path.inferred_native_path_string();
+        let result = async {
+            if invocation.cancellation_token.is_cancelled() {
+                return Err(invalid("inventory observation cancelled"));
+            }
+            let tracking = match (path.to_abs_path().ok(), repo, tracked) {
+                (Some(path), Some(repo), Some(tracked)) if path.as_path().starts_with(repo) => {
+                    if tracked.contains(&native_key(path.as_path())) {
+                        "tracked"
+                    } else {
+                        "untracked"
+                    }
                 }
-            }
-            _ => "unknown",
-        };
-        let (exists, revision) = match fs.get_metadata(&path, Some(sandbox)).await {
-            Ok(metadata) if metadata.is_file => {
-                let contents = fs
-                    .read_file_bounded(&path, 8 * 1024 * 1024, Some(sandbox))
-                    .await
-                    .map_err(|err| {
-                        invalid(format!(
-                            "unable to fingerprint {}: {err}",
-                            path.inferred_native_path_string()
-                        ))
-                    })?;
-                (
-                    Some(true),
-                    contents.map(|bytes| crate::tool_history::sha256(&bytes)),
-                )
-            }
-            Ok(_) => (Some(true), None),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Some(false), None),
-            Err(error) => {
-                return Err(invalid(format!(
-                    "unable to observe {}: {error}",
-                    path.inferred_native_path_string()
-                )));
-            }
-        };
-        Ok(Candidate {
-            id: path.inferred_native_path_string(),
-            exists,
-            tracking: tracking.to_string(),
-            revision,
-        })
+                _ => "unknown",
+            };
+            let (exists, revision) = match fs.get_metadata(&path, Some(sandbox)).await {
+                Ok(metadata) if metadata.is_file => {
+                    let contents = fs
+                        .read_file_bounded(&path, 8 * 1024 * 1024, Some(sandbox))
+                        .await
+                        .map_err(|err| {
+                            invalid(format!(
+                                "unable to fingerprint {}: {err}",
+                                path.inferred_native_path_string()
+                            ))
+                        })?;
+                    (
+                        Some(true),
+                        contents.map(|bytes| crate::tool_history::sha256(&bytes)),
+                    )
+                }
+                Ok(_) => (Some(true), None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Some(false), None),
+                Err(error) => {
+                    return Err(invalid(format!(
+                        "unable to observe {}: {error}",
+                        path.inferred_native_path_string()
+                    )));
+                }
+            };
+            Ok(Candidate {
+                id: path.inferred_native_path_string(),
+                exists,
+                tracking: tracking.to_string(),
+                revision,
+            })
+        }
+        .await;
+        (id, result)
     }))
     .buffered(OBSERVATION_CONCURRENCY)
-    .try_collect::<Vec<_>>();
-    let candidates = invocation
+    .collect::<Vec<_>>();
+    let observations = invocation
         .cancellation_token
         .run_until_cancelled(observations)
         .await
-        .ok_or_else(|| invalid("inventory observation cancelled"))??;
+        .ok_or_else(|| invalid("inventory observation cancelled"))?;
+    let mut candidates = Vec::new();
+    let mut failures = Vec::new();
+    for (id, observation) in observations {
+        match observation {
+            Ok(candidate) => candidates.push(candidate),
+            Err(error) => {
+                failures.push(error.to_string());
+                candidates.push(Candidate {
+                    id,
+                    exists: None,
+                    tracking: "unknown".to_string(),
+                    revision: None,
+                });
+            }
+        }
+    }
+    // A failed observation cannot establish absence. Preserve successful work
+    // as an incomplete enumeration and retain the failures for targeted retry.
+    let complete = complete && failures.is_empty();
+    let unresolved_reason = if failures.is_empty() {
+        unresolved_reason
+    } else {
+        let artifact = persist(invocation, json!({"observation_errors": failures})).await?;
+        Some(format!(
+            "observation incomplete; retry failed paths in artifact {artifact}"
+        ))
+    };
     let value = json!({"scope_id": snapshot.scope_id, "category": category, "complete": complete,
         "unresolved_reason": unresolved_reason, "candidates": candidates});
     let enumeration =
@@ -730,10 +841,18 @@ fn validate_source(source: &Source) -> Result<(), FunctionCallError> {
     Ok(())
 }
 
+enum EvidenceLink {
+    Record(Record),
+    Source(Source),
+    Evidence(Evidence),
+}
+
 async fn read_evidence(
     invocation: &ToolInvocation,
     source: Source,
-) -> Result<Evidence, FunctionCallError> {
+    require_supporting_source: bool,
+    inspected: &mut BTreeMap<String, bool>,
+) -> Result<(Evidence, Option<EvidenceLink>), FunctionCallError> {
     validate_source(&source)?;
     let selector = match source.lines {
         Some([start, end]) => ToolOutputSelector::Lines { start, end },
@@ -760,10 +879,154 @@ async fn read_evidence(
         .clone()
         .or_else(|| selected.text.clone().map(Value::String))
         .ok_or_else(|| invalid("evidence has no exact text/JSON value"))?;
-    Ok(Evidence {
-        source,
-        sha256: digest(&value)?,
-    })
+    let mut record = None;
+    if require_supporting_source {
+        // Inspect the whole retained object: selecting a scalar or lines must
+        // not turn bookkeeping into supporting source evidence.
+        let source_is_bookkeeping = if let Some(bookkeeping) = inspected.get(&source.artifact_id) {
+            *bookkeeping
+        } else {
+            let bytes = read_complete_canonical_snapshot(
+                &invocation.step_context.turn.config.codex_home,
+                &invocation.session.thread_id.to_string(),
+                &source.artifact_id,
+                crate::tools::command_output_artifact::MAX_RAW_OUTPUT_ARTIFACT_BYTES,
+            )
+            .await
+            .map_err(|err| invalid(err.for_model()))?;
+            let document = serde_json::from_slice::<Value>(&bytes).ok();
+            let bookkeeping = document.as_ref().is_some_and(|doc| {
+                doc["format"] == FORMAT
+                    || doc.get("inventory_id").is_some()
+                    || (doc.get("scope_id").is_some() && doc.get("candidates").is_some())
+                    || serde_json::from_value::<Record>(doc.clone()).is_ok()
+            });
+            if inspected.len() < 128 {
+                inspected.insert(source.artifact_id.clone(), bookkeeping);
+            }
+            bookkeeping
+        };
+        let selected_link = serde_json::from_value::<Record>(value.clone())
+            .ok()
+            .map(EvidenceLink::Record)
+            .or_else(|| {
+                serde_json::from_value::<Evidence>(value.clone())
+                    .ok()
+                    .map(EvidenceLink::Evidence)
+            })
+            .or_else(|| {
+                serde_json::from_value::<Source>(value.clone())
+                    .ok()
+                    .map(EvidenceLink::Source)
+            })
+            .or_else(|| {
+                value
+                    .get("record")
+                    .and_then(|link| serde_json::from_value::<Source>(link.clone()).ok())
+                    .map(EvidenceLink::Source)
+            });
+        let bookkeeping = selected_link.is_some() || source_is_bookkeeping;
+        if bookkeeping {
+            let selected_link = selected_link.ok_or_else(|| invalid(
+                "inventory bookkeeping is not supporting evidence; select a classified record with a source-backed evidence chain",
+            ))?;
+            if source.lines.is_some() {
+                return Err(invalid(
+                    "inventory evidence must reference a classified record with supporting source evidence",
+                ));
+            }
+            if let EvidenceLink::Record(selected_record) = &selected_link {
+                if selected_record.status != "classified" || selected_record.evidence.is_empty() {
+                    return Err(invalid(
+                        "inventory evidence must reference a classified record with supporting source evidence",
+                    ));
+                }
+            }
+            record = Some(selected_link);
+        }
+    }
+    Ok((
+        Evidence {
+            source,
+            sha256: digest(&value)?,
+        },
+        record,
+    ))
+}
+
+async fn resolve_evidence(
+    invocation: &ToolInvocation,
+    snapshot: &Snapshot,
+    decision: &Decision,
+    inspected: &mut BTreeMap<String, bool>,
+) -> Result<Vec<Evidence>, FunctionCallError> {
+    let candidate = snapshot
+        .records
+        .get(&decision.category)
+        .and_then(|records| records.get(&decision.candidate_id))
+        .ok_or_else(|| {
+            invalid("decision names a candidate absent from the retained enumeration")
+        })?;
+    let mut pending = decision
+        .evidence
+        .iter()
+        .rev()
+        .cloned()
+        .map(|source| (source, None::<String>, Vec::<Source>::new()))
+        .collect::<Vec<_>>();
+    let mut evidence = Vec::new();
+    let mut visited = 0;
+    while let Some((source, expected_digest, mut ancestors)) = pending.pop() {
+        if invocation.cancellation_token.is_cancelled() {
+            return Err(invalid("inventory evidence resolution cancelled"));
+        }
+        visited += 1;
+        if visited > 64 || ancestors.contains(&source) {
+            return Err(invalid(
+                "inventory evidence chain is cyclic or exceeds 64 references",
+            ));
+        }
+        ancestors.push(source.clone());
+        // Unresolved records may cite bookkeeping to explain missing evidence;
+        // they cannot subsequently serve as proof of a resolved classification.
+        let require_supporting_source =
+            decision.classification.is_some() && decision.unresolved_reason.is_none();
+        let (reference, record) =
+            read_evidence(invocation, source, require_supporting_source, inspected).await?;
+        if expected_digest
+            .as_ref()
+            .is_some_and(|expected| expected != &reference.sha256)
+        {
+            return Err(invalid(
+                "inventory evidence chain does not match its retained source digest",
+            ));
+        }
+        if let Some(EvidenceLink::Record(record)) = record {
+            if record.scope != snapshot.scope_id
+                || record.category != decision.category
+                || record.candidate != candidate.candidate
+                || record.classification != decision.classification
+            {
+                return Err(invalid(
+                    "inventory evidence record supports a different candidate or classification",
+                ));
+            }
+            pending.extend(
+                record
+                    .evidence
+                    .into_iter()
+                    .rev()
+                    .map(|edge| (edge.source, Some(edge.sha256), ancestors.clone())),
+            );
+        } else if let Some(EvidenceLink::Source(source)) = record {
+            pending.push((source, None, ancestors));
+        } else if let Some(EvidenceLink::Evidence(edge)) = record {
+            pending.push((edge.source, Some(edge.sha256), ancestors));
+        } else if !evidence.contains(&reference) {
+            evidence.push(reference);
+        }
+    }
+    Ok(evidence)
 }
 
 async fn persist(invocation: &ToolInvocation, value: Value) -> Result<String, FunctionCallError> {
@@ -882,7 +1145,8 @@ async fn execute(
             "inventory snapshot violates its scope/profile/record contract",
         ));
     }
-    let before = snapshot.clone();
+    let before =
+        (!matches!(&args, Args::Read { .. } | Args::Render { .. })).then(|| snapshot.clone());
     let mut changes = None;
     match args {
         Args::Import { source, .. } => {
@@ -913,6 +1177,7 @@ async fn execute(
             if decisions.is_empty() || decisions.len() > 100 {
                 return Err(invalid("classify accepts 1-100 decisions"));
             }
+            let mut inspected = BTreeMap::new();
             let mut seen = BTreeSet::new();
             for decision in decisions {
                 if !seen.insert((decision.category.clone(), decision.candidate_id.clone())) {
@@ -943,13 +1208,8 @@ async fn execute(
                         "each decision needs 1-8 exact evidence references and either a classification or an unresolved_reason",
                     ));
                 }
-                let mut evidence = Vec::new();
-                for source in decision.evidence {
-                    let reference = read_evidence(invocation, source).await?;
-                    if !evidence.contains(&reference) {
-                        evidence.push(reference);
-                    }
-                }
+                let evidence =
+                    resolve_evidence(invocation, &snapshot, &decision, &mut inspected).await?;
                 let record = snapshot
                     .records
                     .get_mut(&decision.category)
@@ -968,7 +1228,12 @@ async fn execute(
                 record.unresolved_reason = decision.unresolved_reason;
             }
         }
-        Args::Read { offset, limit, .. } => {
+        Args::Read {
+            offset,
+            limit,
+            unresolved_only,
+            ..
+        } => {
             if !(1..=50).contains(&limit) {
                 return Err(invalid("read limit must be 1-50"));
             }
@@ -976,6 +1241,9 @@ async fn execute(
                 .records
                 .values()
                 .flat_map(|records| records.values())
+                .filter(|record| {
+                    !unresolved_only || !matches!(record.status.as_str(), "classified" | "removed")
+                })
                 .collect::<Vec<_>>();
             if offset > all.len() {
                 return Err(invalid("offset is past the record count"));
@@ -1008,6 +1276,7 @@ async fn execute(
             let end = offset + page.len();
             return Ok(
                 json!({"inventory_id": id, "reused": true, "summary": summary, "records": page,
+                "unresolved_only": unresolved_only, "matching_records": all.len(),
                 "page_complete": end == all.len(), "next_offset": if end < all.len() { Some(end) } else { None }}),
             );
         }
@@ -1031,6 +1300,7 @@ async fn execute(
                 .collect::<BTreeSet<_>>();
             let rendered = json!({"inventory_id": id, "scope": snapshot.scope, "profile": snapshot.profile,
                 "classifications": classifications, "summary": snapshot.summary(),
+                "coverage": snapshot.coverage(),
                 "count": identifiers.len(), "identifiers": identifiers});
             let count = rendered["count"].clone();
             *canonical_render = Some(CanonicalToolResult::json(rendered.clone()));
@@ -1048,11 +1318,13 @@ async fn execute(
             return Ok(
                 json!({"inventory_id": id, "rendered_artifact_id": artifact_id, "rendered_path": rendered_path, "count": count,
                 "summary": snapshot.summary(), "classifications": classifications,
+                "coverage_source": {"artifact_id": artifact_id, "pointer": "/coverage"},
                 "identifiers_source": "exact sorted deduplicated retained identifiers; recover /identifiers from rendered_artifact_id"}),
             );
         }
         Args::Create { .. } => unreachable!(),
     }
+    let before = before.expect("mutating inventory operations retain their baseline");
     let reused = before == snapshot;
     let id = if reused {
         id
@@ -1079,7 +1351,8 @@ async fn execute(
         None
     };
     Ok(
-        json!({"inventory_id": id, "reused": reused, "summary": snapshot.summary(), "changes": change_receipt}),
+        json!({"inventory_id": id, "reused": reused, "summary": snapshot.summary(), "changes": change_receipt,
+            "progress": snapshot.progress_since(&before)}),
     )
 }
 
@@ -1111,7 +1384,7 @@ impl ToolExecutor<ToolInvocation> for RetainedInventoryHandler {
             ("import", json!({"inventory_id":{"type":"string"},"source":source}), vec!["inventory_id","source"]),
             ("observe", json!({"inventory_id":{"type":"string"},"category":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"maxItems":1000},"complete":{"type":"boolean"},"unresolved_reason":{"type":["string","null"]}}), vec!["inventory_id","category","paths","complete"]),
             ("classify", json!({"inventory_id":{"type":"string"},"decisions":{"type":"array","items":decision,"minItems":1,"maxItems":100}}), vec!["inventory_id","decisions"]),
-            ("read", json!({"inventory_id":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}), vec!["inventory_id"]),
+            ("read", json!({"inventory_id":{"type":"string"},"unresolved_only":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}), vec!["inventory_id"]),
             ("render", json!({"inventory_id":{"type":"string"},"classifications":strings}), vec!["inventory_id"]),
         ].into_iter().map(|(operation, mut properties, mut required)| {
             properties["operation"] = json!({"type":"string","enum":[operation]});
@@ -1127,7 +1400,7 @@ impl ToolExecutor<ToolInvocation> for RetainedInventoryHandler {
             serde_json::from_value(json!({"oneOf":variants})).expect("inventory tool schema");
         ToolSpec::Function(ResponsesApiTool {
             name: "inventory".to_string(),
-            description: "Retain a generic repository inventory without retranscribing identifiers. create freezes a scope object and a task-supplied profile (categories, classifications, required_categories); returns inventory_id and summary.scope_id. observe checks caller-selected paths in the bound environment, records exact identifiers, existence, Git tracking (unknown when unavailable), and content revisions without copying file bodies. Pass complete=true only for a full category enumeration; incomplete batches require unresolved_reason. Alternatively, use a chosen enumeration command to emit exact JSON {scope_id,category,complete,unresolved_reason,candidates:[{id,exists,tracking,revision}]}, where exists is boolean/null, tracking is tracked/untracked/unknown, and revision is the relevant source hash or null. Import its original raw-output artifact via source {artifact_id,pointer}; pointer defaults to the JSON root. Import deduplicates exact records, rejects conflicting IDs/scope, merges incomplete batches without deletion, and reconciles complete enumerations with explicit added/changed/removed evidence. Classify existing candidates using profile labels and exact JSON evidence references; evidence is preserved, not interpreted. Evidence references accept a JSON pointer or inclusive 1-based lines [start,end] from a text artifact, including read_file snapshots. read pages bounded records; render produces an exact identifier/count artifact with explicit classification filters and unresolved requirements. Always use the returned inventory_id: updates create immutable snapshots, so concurrent updates branch and never overwrite each other. Unchanged imports reuse the prior snapshot. Evidence describes producer snapshots, not automatically fresh filesystem state. Scope, vocabulary, enumeration completeness, and semantic classification remain the caller's decisions.".to_string(),
+            description: "Retain a generic repository inventory without retranscribing identifiers. create freezes a scope object and a task-supplied profile (categories, classifications, required_categories); returns inventory_id and summary.scope_id. observe checks caller-selected paths in the bound environment, records exact identifiers, existence, Git tracking (unknown when unavailable), and content revisions without copying file bodies. Pass complete=true only for a full category enumeration; incomplete batches require unresolved_reason. Alternatively, use a chosen enumeration command to emit exact JSON {scope_id,category,complete,unresolved_reason,candidates:[{id,exists,tracking,revision}]}, where exists is boolean/null, tracking is tracked/untracked/unknown, and revision is the relevant source hash or null. Import its original raw-output artifact via source {artifact_id,pointer}; pointer defaults to the JSON root. Import deduplicates exact records, rejects conflicting IDs/scope, merges incomplete batches without deletion, and reconciles complete enumerations with explicit added/changed/removed evidence. Classify existing candidates using profile labels and supporting source evidence for that particular claim; an enumeration or file existence does not prove runtime use. Inventory record references resolve to source evidence for the same scope, candidate revision, and classification; bookkeeping-only, cyclic, and mismatched chains are rejected. Mechanical chain validation does not establish semantic support: inspect actual source and consumers before classifying. Evidence references accept a JSON pointer or inclusive 1-based lines [start,end] from a text artifact, including read_file snapshots. read pages bounded records; unresolved_only=true skips classified and removed records, with offsets relative to that filtered snapshot. render produces an exact identifier/count artifact with explicit classification filters and per-category coverage outcomes, reasons, and provenance at /coverage. Update receipts report progress as resolved/reopened records and required categories, not tool-call counts. Always use the returned inventory_id: updates create immutable snapshots, so concurrent updates branch and never overwrite each other. Unchanged imports reuse the prior snapshot. Evidence describes producer snapshots, not automatically fresh filesystem state. Scope, vocabulary, enumeration completeness, and semantic classification remain the caller's decisions; summary.complete covers the declared profile, not an independent check of the user's request.".to_string(),
             strict: false, defer_loading: None, parameters, output_schema: None,
         })
     }

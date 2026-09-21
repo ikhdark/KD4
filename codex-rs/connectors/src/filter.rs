@@ -10,11 +10,19 @@ pub fn filter_tool_suggest_discoverable_connectors(
     let accessible_connector_ids: HashSet<&str> = accessible_connectors
         .iter()
         .filter(|connector| connector.is_accessible)
-        .map(|connector| connector.id.as_str())
+        .filter_map(|connector| crate::canonical_connector_id(&connector.id))
+        .collect();
+    let discoverable_connector_ids: HashSet<&str> = discoverable_connector_ids
+        .iter()
+        .filter_map(|id| crate::canonical_connector_id(id))
         .collect();
 
     let mut connectors = directory_connectors
         .into_iter()
+        .filter_map(|mut connector| {
+            connector.id = crate::canonical_connector_id(&connector.id)?.to_owned();
+            Some(connector)
+        })
         .filter(|connector| !accessible_connector_ids.contains(connector.id.as_str()))
         .filter(|connector| discoverable_connector_ids.contains(connector.id.as_str()))
         .collect::<Vec<_>>();
@@ -59,6 +67,24 @@ mod tests {
             install_url: Some(connector_install_url(name, id)),
             ..app(id)
         }
+    }
+
+    #[test]
+    fn discoverability_joins_use_canonical_connector_ids() {
+        let filtered = filter_tool_suggest_discoverable_connectors(
+            vec![app(" calendar "), app(" mail "), app(" ")],
+            &[AppInfo {
+                is_accessible: true,
+                ..app("calendar ")
+            }],
+            &HashSet::from([
+                " calendar".to_string(),
+                "mail ".to_string(),
+                " ".to_string(),
+            ]),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "mail");
     }
 
     #[test]

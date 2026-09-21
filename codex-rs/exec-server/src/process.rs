@@ -37,6 +37,7 @@ pub enum ExecProcessEvent {
     },
     Closed {
         seq: u64,
+        sandbox_denied: Option<bool>,
     },
     Failed(String),
 }
@@ -73,7 +74,9 @@ impl ExecProcessEvent {
     pub(crate) fn seq(&self) -> Option<u64> {
         match self {
             ExecProcessEvent::Output(chunk) => Some(chunk.seq),
-            ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq } => Some(*seq),
+            ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
+                Some(*seq)
+            }
             ExecProcessEvent::Failed(_) => None,
         }
     }
@@ -247,7 +250,10 @@ mod tests {
             exit_code: 0,
             sandbox_denied: Some(false),
         });
-        log.publish(ExecProcessEvent::Closed { seq: 3 });
+        log.publish(ExecProcessEvent::Closed {
+            seq: 3,
+            sandbox_denied: Some(false),
+        });
 
         let mut events = log.subscribe();
         let replay = vec![
@@ -269,7 +275,10 @@ mod tests {
                     exit_code: 0,
                     sandbox_denied: Some(false),
                 },
-                ExecProcessEvent::Closed { seq: 3 },
+                ExecProcessEvent::Closed {
+                    seq: 3,
+                    sandbox_denied: Some(false)
+                },
             ]
         );
     }

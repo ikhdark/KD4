@@ -35,19 +35,19 @@ pub struct SpawnAgentToolOptions {
 
 fn spawn_agent_default_guidance() -> String {
     format!(
-        "Spawned agents use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If a model override does not support `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, also set `reasoning_effort` to a supported value listed for that model."
+        "Spawned agents use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If the built-in model is unavailable, use the effective model or provider default. Omitted reasoning effort falls back to a supported model effort."
     )
 }
 
 fn spawn_agent_model_override_description() -> String {
     format!(
-        "Model override for the new agent. Omit to use `{DEFAULT_SPAWN_AGENT_MODEL}`. If the chosen model does not support `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, also set `reasoning_effort` to a supported value."
+        "Model override for the new agent. Omit to use `{DEFAULT_SPAWN_AGENT_MODEL}`. If unavailable, the effective model or provider default is used."
     )
 }
 
 fn spawn_agent_reasoning_override_description() -> String {
     format!(
-        "Reasoning effort override for the new agent. Omit to use `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, including when `model` is explicitly overridden."
+        "Reasoning effort override for the new agent. Omit to prefer `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, falling back to a supported effort of the selected model."
     )
 }
 
@@ -288,7 +288,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
         description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
         tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
             name: "wait_agent".to_string(),
-            description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status."
+            description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Timeout or interruption preserves statuses observed before the wait ended. Once the agent reaches a final status, a notification message will be received containing the same completed status."
                 .to_string(),
             strict: false,
             defer_loading: None,
@@ -422,44 +422,42 @@ fn spawn_agent_output_schema_v1() -> Value {
     })
 }
 
-fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
-    if hide_agent_metadata {
-        return json!({
-            "type": "object",
-            "properties": {
-                "task_name": {
-                    "type": "string",
-                    "description": "Canonical task name for the spawned agent."
-                },
-                "assignment_id": {
-                    "type": "string",
-                    "description": "Durable UUIDv7 assignment id for the admitted task."
-                }
-            },
-            "required": ["task_name", "assignment_id"],
-            "additionalProperties": false
-        });
-    }
-
-    json!({
+pub(super) fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
+    let integration_plan = json!({
+        "type": "string",
+        "enum": ["single_writer", "root_owned", "typed_integrator_required"]
+    });
+    let mut spawned = json!({
         "type": "object",
         "properties": {
-            "task_name": {
-                "type": "string",
-                "description": "Canonical task name for the spawned agent."
-            },
-            "nickname": {
-                "type": ["string", "null"],
-                "description": "User-facing nickname for the spawned agent when available."
-            },
-            "assignment_id": {
-                "type": "string",
-                "description": "Durable UUIDv7 assignment id for the admitted task."
-            }
+            "task_name": {"type": "string"},
+            "assignment_id": {"type": "string"},
+            "integration_plan": integration_plan
         },
-        "required": ["task_name", "nickname", "assignment_id"],
+        "required": ["task_name", "assignment_id", "integration_plan"],
         "additionalProperties": false
-    })
+    });
+    if !hide_agent_metadata {
+        spawned["properties"]["nickname"] = json!({"type": ["string", "null"]});
+        spawned["required"] = json!(["task_name", "nickname", "assignment_id", "integration_plan"]);
+    }
+    let reused = json!({
+        "type": "object",
+        "properties": {
+            "task_name": {"type": "string"},
+            "assignment_id": {"type": "string"},
+            "attempt_id": {"type": "string"},
+            "agent_path": {"type": ["string", "null"]},
+            "thread_id": {"type": ["string", "null"]},
+            "status": {"type": "string"},
+            "receipt_available": {"type": "boolean"},
+            "integration_plan": integration_plan,
+            "reused": {"const": true}
+        },
+        "required": ["task_name", "assignment_id", "attempt_id", "agent_path", "thread_id", "status", "receipt_available", "integration_plan", "reused"],
+        "additionalProperties": false
+    });
+    json!({"oneOf": [spawned, reused]})
 }
 
 fn send_input_output_schema() -> Value {
@@ -539,7 +537,11 @@ fn wait_output_schema_v1() -> Value {
             },
             "timed_out": {
                 "type": "boolean",
-                "description": "Whether the wait call returned due to timeout before any agent reached a final status."
+                "description": "Whether the deadline arrived before the requested wait condition was met. Observed final statuses are retained."
+            },
+            "interruption": {
+                "type": "string",
+                "description": "Why observation yielded early. Target work remains independent of this interruption."
             }
         },
         "required": ["status", "timed_out"],

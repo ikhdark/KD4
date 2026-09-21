@@ -5,11 +5,15 @@ use thiserror::Error;
 pub enum FunctionCallError {
     #[error("{0}")]
     RespondToModel(String),
-    /// A model-visible refusal of a required operation. Keep this structured
-    /// through relay so terminal classification can distinguish Blocked from
-    /// an execution failure without parsing human-readable text.
+    /// A model-visible refusal of this operation. Refusal does not establish
+    /// that the operation is required to finish the entire turn. Keep the
+    /// distinction from execution failure structured through relay.
     #[error("{0}")]
     DeniedToModel(String),
+    /// The runtime has established that the turn cannot proceed, for example
+    /// because its assignment was revoked. Unlike call-local denial, this is terminal.
+    #[error("{0}")]
+    RequiredOperationBlocked(String),
     #[error("Fatal error: {0}")]
     Fatal(String),
 }

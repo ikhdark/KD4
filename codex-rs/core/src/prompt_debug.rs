@@ -86,14 +86,14 @@ pub(crate) async fn build_prompt_input_from_session(
 ) -> CodexResult<Vec<ResponseItem>> {
     let turn_context = sess.new_default_turn().await;
     // Prompt debugging builds a standalone request without entering run_turn.
-    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await?;
     sess.record_context_updates_and_set_reference_context_item(step_context.as_ref())
-        .await;
+        .await?;
 
     if !input.is_empty() {
         let response_item = sess.response_item_from_user_input(input);
         sess.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&response_item))
-            .await;
+            .await?;
     }
 
     let prompt_input = sess

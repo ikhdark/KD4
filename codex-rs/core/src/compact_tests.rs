@@ -505,6 +505,17 @@ fn collect_user_messages_filters_legacy_warnings() {
 }
 
 #[test]
+fn legacy_apply_patch_warning_does_not_swallow_interposed_user_instructions() {
+    let text = "Warning: apply_patch was requested via exec_command.\nPlease fix the parser and preserve the existing error messages.\nUse the apply_patch tool instead of exec_command.";
+    let items = vec![user_message(text)];
+    assert_eq!(
+        collect_user_messages(&items),
+        vec![compacted_user_message(text)]
+    );
+    assert_eq!(build_unresolved_user_history(&items).0, items);
+}
+
+#[test]
 fn unresolved_tail_preserves_turn_stamped_warning_shaped_input() {
     let warning = "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.";
     let metadata = InternalChatMessageMetadataPassthrough {
@@ -1815,7 +1826,8 @@ async fn local_compaction_retains_literal_omission_markers_and_reports_retained_
     }
     session
         .record_conversation_items(&turn, &[summary_message("settled state"), request])
-        .await;
+        .await
+        .unwrap();
     // No text was omitted, so compaction must succeed even if recovery storage is unavailable.
     let artifact_path = turn.config.codex_home.join("tool-output");
     std::fs::create_dir_all(&turn.config.codex_home).unwrap();
@@ -1866,7 +1878,8 @@ async fn compaction_recovery_failure_keeps_unresolved_text() {
     let text = "exact unresolved constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS);
     session
         .record_conversation_items(&turn, &[user_message(&text)])
-        .await;
+        .await
+        .unwrap();
     let history = session.clone_history().await;
     let (_, _, _, omitted, _) = build_bounded_unresolved_input_history(history.raw_items());
     assert!(omitted);

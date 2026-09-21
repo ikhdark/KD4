@@ -1090,7 +1090,7 @@ fn measure_responses_request_after_dispatch(
             let provenance = if input_reprojected {
                 prompt
                     .prompt_provenance
-                    .for_reprojected_items(&request.input)
+                    .for_reprojected_items(&prompt.input, &request.input)
             } else {
                 prompt.prompt_provenance.clone()
             };
@@ -1174,6 +1174,7 @@ struct ModelAttemptOffsets {
     first_provider_event_us: Option<u64>,
     first_model_output_us: Option<u64>,
     first_actionable_output_us: Option<u64>,
+    completed_us: Option<u64>,
     first_visible_output_us: Option<u64>,
 }
 
@@ -1250,6 +1251,14 @@ impl ModelAttemptClock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stream_established_us
+            .get_or_insert_with(|| self.elapsed_us());
+    }
+
+    fn mark_completed(&self) {
+        self.offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed_us
             .get_or_insert_with(|| self.elapsed_us());
     }
 
@@ -1398,7 +1407,9 @@ impl ModelAttemptGuard {
             .offsets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let completed_us = self.clock.elapsed_us();
+        let completed_us = offsets
+            .completed_us
+            .unwrap_or_else(|| self.clock.elapsed_us());
         let fresh_response_id_established =
             outcome == ModelAttemptOutcome::Success && self.fresh_response_id_established;
         let (request_construction_us, queue_us, transport_us) =
@@ -1569,6 +1580,7 @@ enum ModelAttemptState {
 }
 
 struct PendingModelAttempt {
+    _diagnostic_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     identity: ResponseAttemptIdentity,
     clock: ModelAttemptClock,
     task: AbortOnDropHandle<ModelAttemptGuard>,
@@ -1588,7 +1600,18 @@ impl ModelAttemptState {
         task: tokio::task::JoinHandle<ModelAttemptGuard>,
         measurement_cancellation: CancellationToken,
     ) -> Self {
+        // Bound optional work retained after provider completion. Saturation
+        // cancels detail collection; usage and provider history remain authoritative.
+        static DIAGNOSTICS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(32)));
+        let permit = Arc::clone(&DIAGNOSTICS).try_acquire_owned().ok();
+        if permit.is_none() {
+            warn!(sampling_request_id = %identity.sampling_request_id, "model request diagnostics omitted: capacity exhausted");
+            measurement_cancellation.cancel();
+            task.abort();
+        }
         Self::Pending(PendingModelAttempt {
+            _diagnostic_permit: permit,
             identity,
             clock,
             task: AbortOnDropHandle::new(task),
@@ -1913,9 +1936,11 @@ pub struct ModelClientSession {
     tool_history_fail_open_pending: bool,
     /// Whether the stream currently handled by this session used the WebSocket transport.
     last_stream_was_websocket: bool,
+    effective_input: Option<Arc<[ResponseItem]>>,
     turn_timing: Option<Arc<TurnTimingState>>,
     logical_sampling_request_count: u32,
     prompt_context_baseline: Arc<StdMutex<Option<PromptContextBaseline>>>,
+    latest_measurement_attempt: Arc<StdMutex<Option<String>>>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -2306,8 +2331,10 @@ impl ModelClient {
             websocket_session,
             websocket_cache_publication: Some(websocket_cache_publication),
             prepared_startup_websocket_attempt: None,
+            latest_measurement_attempt: Default::default(),
             tool_history_fail_open_pending: false,
             last_stream_was_websocket: false,
+            effective_input: None,
             turn_timing: None,
             logical_sampling_request_count: 0,
             prompt_context_baseline: Arc::new(StdMutex::new(None)),
@@ -2323,8 +2350,10 @@ impl ModelClient {
             websocket_session: WebsocketSession::default(),
             websocket_cache_publication: None,
             prepared_startup_websocket_attempt: None,
+            latest_measurement_attempt: Default::default(),
             tool_history_fail_open_pending: false,
             last_stream_was_websocket: false,
+            effective_input: None,
             turn_timing: None,
             logical_sampling_request_count: 0,
             prompt_context_baseline: Arc::new(StdMutex::new(None)),
@@ -3178,6 +3207,7 @@ impl ModelClientSession {
         self.prepared_startup_websocket_attempt = None;
     }
 
+    #[cfg(test)]
     fn remember_request_history(
         &mut self,
         request: &ResponsesApiRequest,
@@ -3228,27 +3258,6 @@ impl ModelClientSession {
                     None
                 }
             };
-    }
-
-    /// Rebinds the realized provider response after remote compaction to the
-    /// compacted local history that represents the same model-visible state.
-    /// The pending response ID is deliberately preserved so the next request
-    /// can inherit that response and send only its new tail.
-    pub(crate) fn rebase_remote_compaction_history(
-        &mut self,
-        compacted_request_prefix: &[ResponseItem],
-        stable_context_fingerprint: [u8; 32],
-    ) {
-        let Some(mut request) = self.websocket_session.last_request.clone() else {
-            return;
-        };
-        request.input = compacted_request_prefix.to_vec().into();
-        self.websocket_session.last_request = Some(request.clone());
-        self.remember_request_history(&request, stable_context_fingerprint);
-        trace!(
-            compacted_prefix_items = compacted_request_prefix.len(),
-            "rebound websocket response lineage to remote compaction history"
-        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3542,9 +3551,6 @@ impl ModelClientSession {
                 &provider_prefix,
             ) {
                 self.tool_history_fail_open_pending = true;
-                self.invalidate_provider_history_inheritance(
-                    "completed-tool receipt replaced inherited provider history",
-                );
                 let build_fallback_request =
                     build_tool_history_fail_open_request.take().ok_or_else(|| {
                         CodexErr::Fatal(
@@ -3553,11 +3559,37 @@ impl ModelClientSession {
                     })?;
                 let fallback_request = build_fallback_request()?;
                 debug_assert!(
-                    !crate::tool_history::substitutions_overlap_items(
-                        tool_history_substitutions,
-                        &fallback_request.input,
-                    ),
+                    !tool_history_substitutions.iter().any(|substitution| {
+                        fallback_request.input.iter().any(|item| {
+                            crate::tool_history::canonical_textual_output_identity(item)
+                                .is_some_and(|(call_id, text)| {
+                                    call_id == substitution.call_id
+                                        && crate::tool_history::sha256(text.as_bytes())
+                                            == substitution.substituted_output_sha256
+                                })
+                        })
+                    }),
                     "tool-history fail-open request retained substituted receipts"
+                );
+                if let Some((incremental_items, verified_history)) = self
+                    .get_incremental_items_with_history(
+                        &fallback_request,
+                        Some(&last_response),
+                        true,
+                    )
+                    && !last_response.response_id.is_empty()
+                {
+                    payload.previous_response_id = Some(last_response.response_id);
+                    payload.input = incremental_items.into();
+                    return Ok((
+                        ResponsesWsRequest::ResponseCreate(payload),
+                        previous_response_id_from_untraced_warmup,
+                        Some(fallback_request),
+                        verified_history,
+                    ));
+                }
+                self.invalidate_provider_history_inheritance(
+                    "completed-tool fallback did not match inherited history",
                 );
                 payload.previous_response_id = None;
                 payload.input = fallback_request.input.clone();
@@ -3887,6 +3919,7 @@ impl ModelClientSession {
             if stream_result.is_ok() {
                 attempt_clock.mark_stream_established();
             }
+            self.effective_input = Some(Arc::clone(&request.input));
             let prompt_cache_key = request.prompt_cache_key.clone();
             let dispatched_request = dispatched_request.get().cloned();
             let logical_request_bytes = dispatched_request
@@ -3910,6 +3943,12 @@ impl ModelClientSession {
             let generation = turn_timing
                 .as_ref()
                 .and_then(|timing| timing.current_model_attempt_metadata());
+            *self
+                .latest_measurement_attempt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(attempt_identity.physical_attempt_id.clone());
+            let latest_measurement_attempt = Arc::clone(&self.latest_measurement_attempt);
             let attempt_task_identity = attempt_identity.clone();
             let attempt_task_clock = attempt_clock.clone();
             let attempt_task_telemetry = request_session_telemetry.clone();
@@ -3935,18 +3974,30 @@ impl ModelClientSession {
                     ModelAttemptProviderBaseline::StatelessFull,
                     /*previous_response_id_present*/ false,
                 );
-                measurements.compare_and_remember_prompt_context(
-                    &mut prompt_context_baseline
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    prompt_cache_key.as_deref(),
-                    prompt_digests,
-                );
+                let latest_attempt = latest_measurement_attempt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if latest_attempt.as_deref()
+                    == Some(attempt_task_identity.physical_attempt_id.as_str())
+                {
+                    measurements.compare_and_remember_prompt_context(
+                        &mut prompt_context_baseline
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        prompt_cache_key.as_deref(),
+                        prompt_digests,
+                    );
+                }
+                drop(latest_attempt);
                 if let Some(timing) = turn_timing.as_ref() {
                     timing.record_model_request_token_categories(
+                        &attempt_task_identity.sampling_request_id,
+                        &attempt_task_identity.physical_attempt_id,
                         measurements.request_token_categories(),
                     );
                     timing.record_model_request_cache_identity(
+                        &attempt_task_identity.sampling_request_id,
+                        &attempt_task_identity.physical_attempt_id,
                         measurements.fixed_prefix_reuse_eligible,
                         prompt_cache_key.as_deref(),
                     );
@@ -4435,6 +4486,12 @@ impl ModelClientSession {
                     let generation = turn_timing
                         .as_ref()
                         .and_then(|timing| timing.current_model_attempt_metadata());
+                    *self
+                        .latest_measurement_attempt
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(attempt_identity.physical_attempt_id.clone());
+                    let latest_measurement_attempt = Arc::clone(&self.latest_measurement_attempt);
                     let attempt_task_identity = attempt_identity.clone();
                     let attempt_task_clock = attempt_clock.clone();
                     let attempt_task_telemetry = request_session_telemetry.clone();
@@ -4460,18 +4517,30 @@ impl ModelClientSession {
                             provider_baseline,
                             previous_response_id_present,
                         );
-                        measurements.compare_and_remember_prompt_context(
-                            &mut prompt_context_baseline
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                            prompt_cache_key.as_deref(),
-                            prompt_digests,
-                        );
+                        let latest_attempt = latest_measurement_attempt
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if latest_attempt.as_deref()
+                            == Some(attempt_task_identity.physical_attempt_id.as_str())
+                        {
+                            measurements.compare_and_remember_prompt_context(
+                                &mut prompt_context_baseline
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                prompt_cache_key.as_deref(),
+                                prompt_digests,
+                            );
+                        }
+                        drop(latest_attempt);
                         if let Some(timing) = turn_timing.as_ref() {
                             timing.record_model_request_token_categories(
+                                &attempt_task_identity.sampling_request_id,
+                                &attempt_task_identity.physical_attempt_id,
                                 measurements.request_token_categories(),
                             );
                             timing.record_model_request_cache_identity(
+                                &attempt_task_identity.sampling_request_id,
+                                &attempt_task_identity.physical_attempt_id,
                                 measurements.fixed_prefix_reuse_eligible,
                                 prompt_cache_key.as_deref(),
                             );
@@ -4523,6 +4592,7 @@ impl ModelClientSession {
                 prompt.stable_context_manifest.fingerprint(),
                 verified_history,
             );
+            self.effective_input = Some(Arc::clone(&request.input));
             self.websocket_session.last_request = Some(request);
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let (stream, last_request_rx) = map_response_stream(
@@ -4613,12 +4683,15 @@ impl ModelClientSession {
                 // Wait for the v2 warmup request to complete before sending the first turn request.
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(ResponseEvent::Completed { .. }) => break,
+                        Ok(ResponseEvent::Completed { .. }) => return Ok(()),
                         Err(err) => return Err(err),
                         _ => {}
                     }
                 }
-                Ok(())
+                Err(CodexErr::Stream(
+                    "stream closed before response.completed".to_string(),
+                    None,
+                ))
             }
             Ok(WebsocketStreamOutcome::FallbackToHttp) => {
                 self.try_switch_fallback_transport(session_telemetry);
@@ -4732,6 +4805,10 @@ impl ModelClientSession {
         }
     }
 
+    pub(crate) fn effective_input(&self) -> Option<&[ResponseItem]> {
+        self.effective_input.as_deref()
+    }
+
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
     ///
     /// This is used after exhausting the provider retry budget, to force subsequent requests onto
@@ -4818,16 +4895,51 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
     }
 }
 
-/// Keeps trace serialization and disk writes off the model stream's runtime worker.
-/// Each operation is awaited so request/terminal events retain their disk ordering.
+/// Optional traces retain per-attempt order without gating provider dispatch or completion.
+type TraceWrite = (bool, Box<dyn FnOnce(&InferenceTraceAttempt) + Send>);
 struct AsyncInferenceTraceAttempt {
     attempt: Option<Arc<InferenceTraceAttempt>>,
+    writes: Option<tokio::sync::mpsc::Sender<TraceWrite>>,
 }
 
 impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
     fn from(attempt: InferenceTraceAttempt) -> Self {
+        static TRACE_SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        if !attempt.is_enabled() {
+            return Self {
+                attempt: None,
+                writes: None,
+            };
+        }
+        let attempt = Arc::new(attempt);
+        let slots = TRACE_SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16)));
+        let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+            warn!("inference trace incomplete: optional trace writer capacity exhausted");
+            return Self {
+                attempt: Some(attempt),
+                writes: None,
+            };
+        };
+        let (writes, mut receiver) = tokio::sync::mpsc::channel::<TraceWrite>(4);
+        tokio::spawn({
+            let attempt = Arc::clone(&attempt);
+            async move {
+                let _permit = permit;
+                while let Some((terminal, write)) = receiver.recv().await {
+                    let attempt = Arc::clone(&attempt);
+                    if let Err(error) = tokio::task::spawn_blocking(move || write(&attempt)).await {
+                        warn!(%error, "inference trace incomplete: writer failed");
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+            }
+        });
         Self {
-            attempt: attempt.is_enabled().then(|| Arc::new(attempt)),
+            attempt: Some(attempt),
+            writes: Some(writes),
         }
     }
 }
@@ -4842,13 +4954,13 @@ impl AsyncInferenceTraceAttempt {
         T: serde::Serialize + Clone + Send + 'static,
         U: serde::Serialize + Clone + Send + 'static,
     {
-        let Some(attempt) = &self.attempt else {
+        let Some(_) = &self.writes else {
             return;
         };
         let request = request.clone();
         let identity = identity.clone();
         let companion = companion.map(|(value, key)| (value.clone(), key));
-        Self::record(Arc::clone(attempt), move |attempt| {
+        self.record(false, move |attempt| {
             let mut metadata = serde_json::json!({
                 "schema_version": 1,
                 "sampling_request_id": identity.sampling_request_id,
@@ -4875,14 +4987,14 @@ impl AsyncInferenceTraceAttempt {
         token_usage: &Option<codex_protocol::protocol::TokenUsage>,
         output_items: &[ResponseItem],
     ) {
-        let Some(attempt) = &self.attempt else {
+        let Some(_) = &self.writes else {
             return;
         };
         let response_id = response_id.to_owned();
         let upstream_request_id = upstream_request_id.map(str::to_owned);
         let token_usage = token_usage.clone();
         let output_items = output_items.to_vec();
-        Self::record(Arc::clone(attempt), move |attempt| {
+        self.record(true, move |attempt| {
             attempt.record_completed(
                 &response_id,
                 upstream_request_id.as_deref(),
@@ -4899,13 +5011,13 @@ impl AsyncInferenceTraceAttempt {
         upstream_request_id: Option<&str>,
         output_items: &[ResponseItem],
     ) {
-        let Some(attempt) = &self.attempt else {
+        let Some(_) = &self.writes else {
             return;
         };
         let error = error.to_string();
         let upstream_request_id = upstream_request_id.map(str::to_owned);
         let output_items = output_items.to_vec();
-        Self::record(Arc::clone(attempt), move |attempt| {
+        self.record(true, move |attempt| {
             attempt.record_failed(error, upstream_request_id.as_deref(), &output_items);
         })
         .await;
@@ -4917,26 +5029,27 @@ impl AsyncInferenceTraceAttempt {
         upstream_request_id: Option<&str>,
         output_items: &[ResponseItem],
     ) {
-        let Some(attempt) = &self.attempt else {
+        let Some(_) = &self.writes else {
             return;
         };
         let reason = reason.to_string();
         let upstream_request_id = upstream_request_id.map(str::to_owned);
         let output_items = output_items.to_vec();
-        Self::record(Arc::clone(attempt), move |attempt| {
+        self.record(true, move |attempt| {
             attempt.record_cancelled(reason, upstream_request_id.as_deref(), &output_items);
         })
         .await;
     }
 
     async fn record(
-        attempt: Arc<InferenceTraceAttempt>,
+        &self,
+        terminal: bool,
         record: impl FnOnce(&InferenceTraceAttempt) + Send + 'static,
     ) {
-        // Dropping the awaiting future does not cancel a started blocking write.
-        // Keep the attempt owned by that write until its payload and event finish.
-        if let Err(err) = tokio::task::spawn_blocking(move || record(&attempt)).await {
-            warn!("inference trace recording task failed: {err}");
+        if let Some(writes) = &self.writes
+            && writes.try_send((terminal, Box::new(record))).is_err()
+        {
+            warn!("inference trace incomplete: optional trace queue saturated or closed");
         }
     }
 }
@@ -4992,7 +5105,6 @@ where
     let consumer_dropped_for_stream = consumer_dropped.clone();
 
     tokio::spawn(async move {
-        let mut logged_error = false;
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
         let (request_start, mut ttft_ms) = (Instant::now(), None);
@@ -5063,6 +5175,9 @@ where
                     end_turn,
                 }) => {
                     feedback_tags!(last_model_response_id = &response_id);
+                    if let Some(attempt) = attempt.as_ref() {
+                        attempt.clock().mark_completed();
+                    }
                     inference_trace_attempt
                         .record_completed(
                             &response_id,
@@ -5071,15 +5186,29 @@ where
                             &items_added,
                         )
                         .await;
-                    // Request diagnostics run after dispatch so they stay off the
-                    // request-preparation critical path. They must still be
-                    // committed before completion becomes observable: turn
-                    // finalization may snapshot timing as soon as it receives
-                    // this event.
-                    let mut resolved_attempt = tokio::select! {
-                        _ = tx_event.closed() => return,
-                        resolved_attempt = resolve_model_attempt(&mut attempt) => resolved_attempt,
-                    };
+                    // Publish authoritative history before releasing the consumer.
+                    // Optional diagnostics must not hold deferred tools or another
+                    // model request behind token measurement work.
+                    if let Some(sender) = tx_last_response.take() {
+                        let _ = sender.send(LastResponse {
+                            response_id: response_id.clone(),
+                            items_added: items_added.clone(),
+                        });
+                    }
+                    if tx_event
+                        .send(Ok(ResponseEvent::Completed {
+                            response_id: response_id.clone(),
+                            token_usage: token_usage.clone(),
+                            end_turn,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    drop(tx_event);
+                    drop(api_stream);
+                    let mut resolved_attempt = resolve_model_attempt(&mut attempt).await;
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(
                             usage.input_tokens,
@@ -5102,21 +5231,6 @@ where
                             &items_added,
                         );
                     }
-                    // Move the completed history after diagnostics have consumed
-                    // it, but before completion is observable to the next request.
-                    if let Some(sender) = tx_last_response.take() {
-                        let _ = sender.send(LastResponse {
-                            response_id: response_id.clone(),
-                            items_added,
-                        });
-                    }
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::Completed {
-                            response_id: response_id.clone(),
-                            token_usage: token_usage.clone(),
-                            end_turn,
-                        }))
-                        .await;
                     // Completion is terminal. Dropping the upstream stream here
                     // releases it without recording a second, failed terminal state.
                     return;
@@ -5153,19 +5267,22 @@ where
                     inference_trace_attempt
                         .record_failed(&mapped, upstream_request_id, &items_added)
                         .await;
-                    if !logged_error {
-                        session_telemetry.see_event_completed_failed(&mapped);
-                        logged_error = true;
-                    }
+                    session_telemetry.see_event_completed_failed(&mapped);
                     if tx_event.send(Err(mapped)).await.is_err() {
                         return;
                     }
                     if let Some(mut attempt) = resolve_model_attempt(&mut attempt).await {
                         attempt.finish(ModelAttemptOutcome::Failed, None, None, &items_added);
                     }
+                    return;
                 }
             }
         }
+        let mapped = provider.map_api_error(ApiError::Stream(
+            "stream closed before response.completed".to_string(),
+        ));
+        session_telemetry.see_event_completed_failed(&mapped);
+        let _ = tx_event.send(Err(mapped)).await;
         inference_trace_attempt
             .record_failed(
                 "stream closed before response.completed",

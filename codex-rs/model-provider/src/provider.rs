@@ -239,6 +239,18 @@ fn model_provider_cache_identity(
     provider_info: &ModelProviderInfo,
     auth_manager: Option<&AuthManager>,
 ) -> String {
+    model_provider_cache_identity_for_auth_identity(
+        model_provider_id,
+        provider_info,
+        provider_cache_auth_identity(auth_manager),
+    )
+}
+
+pub(crate) fn model_provider_cache_identity_for_auth_identity(
+    model_provider_id: &str,
+    provider_info: &ModelProviderInfo,
+    auth_identity: crate::auth::ProviderCacheAuthIdentity,
+) -> String {
     fn normalize_base_url(raw: &str) -> String {
         let Ok(mut url) = url::Url::parse(raw) else {
             return raw.trim().trim_end_matches('/').to_string();
@@ -275,7 +287,6 @@ fn model_provider_cache_identity(
             .collect()
     }
 
-    let auth_identity = provider_cache_auth_identity(auth_manager);
     let uses_chatgpt_endpoint = matches!(
         auth_identity.auth_mode,
         Some(
@@ -513,6 +524,7 @@ impl ModelProvider for ConfiguredModelProvider {
             )),
             None => {
                 let endpoint = Arc::new(OpenAiModelsEndpoint::new(
+                    model_provider_id.to_owned(),
                     self.info.clone(),
                     self.auth_manager.clone(),
                 ));

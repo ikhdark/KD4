@@ -175,6 +175,8 @@ impl TurnCodexErrorFact {
 pub enum CodexErrKind {
     TurnAborted,
     Stream,
+    IncompleteResponse,
+    ProviderFailure,
     PreDispatchRetryExhausted,
     RequestBuild,
     ContextWindowExceeded,
@@ -228,6 +230,8 @@ impl From<&CodexErr> for CodexErrKind {
         match error {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
             CodexErr::Stream(..) => CodexErrKind::Stream,
+            CodexErr::IncompleteResponse(_) => CodexErrKind::IncompleteResponse,
+            CodexErr::ProviderFailure { .. } => CodexErrKind::ProviderFailure,
             CodexErr::PreDispatchRetryExhausted(_) => CodexErrKind::PreDispatchRetryExhausted,
             CodexErr::RequestBuild(_) => CodexErrKind::RequestBuild,
             CodexErr::ContextWindowExceeded => CodexErrKind::ContextWindowExceeded,

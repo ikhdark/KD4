@@ -630,15 +630,24 @@ async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> 
 #[tokio::test]
 async fn cancelled_remote_snapshot_build_terminates_capture_without_publishing_file() -> Result<()>
 {
-    assert_cancelled_remote_snapshot_cleanup(false).await
+    assert_cancelled_remote_snapshot_cleanup(false, false).await
 }
 
 #[tokio::test]
 async fn cancelled_remote_snapshot_validation_removes_published_file() -> Result<()> {
-    assert_cancelled_remote_snapshot_cleanup(true).await
+    assert_cancelled_remote_snapshot_cleanup(true, false).await
 }
 
-async fn assert_cancelled_remote_snapshot_cleanup(cancel_validation: bool) -> Result<()> {
+#[tokio::test]
+async fn cancelled_remote_snapshot_write_removes_file_after_delayed_acknowledgement() -> Result<()>
+{
+    assert_cancelled_remote_snapshot_cleanup(true, true).await
+}
+
+async fn assert_cancelled_remote_snapshot_cleanup(
+    cancel_validation: bool,
+    cancel_write: bool,
+) -> Result<()> {
     use futures::SinkExt;
     use futures::StreamExt;
     use serde_json::json;
@@ -646,7 +655,9 @@ async fn assert_cancelled_remote_snapshot_cleanup(cancel_validation: bool) -> Re
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (read_started, read_observed) = tokio::sync::oneshot::channel();
+    let (release_write, write_released) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
+        let mut write_released = Some(write_released);
         let (socket, _) = listener.accept().await?;
         let mut websocket = tokio_tungstenite::accept_async(socket).await?;
         let mut read_started = Some(read_started);
@@ -702,6 +713,10 @@ async fn assert_cancelled_remote_snapshot_cleanup(cancel_validation: bool) -> Re
                 "fs/writeFile" if cancel_validation => {
                     assert!(published_path.is_none(), "publish exactly one snapshot");
                     published_path = Some(request["params"]["path"].clone());
+                    if cancel_write {
+                        read_started.take().expect("one write").send(()).unwrap();
+                        write_released.take().unwrap().await?;
+                    }
                     json!({})
                 }
                 "fs/remove" if cancel_validation => {
@@ -728,7 +743,7 @@ async fn assert_cancelled_remote_snapshot_cleanup(cancel_validation: bool) -> Re
                         .into(),
                 ))
                 .await?;
-            if terminated && (!cancel_validation || removed) {
+            if (cancel_write && removed) || (terminated && (!cancel_validation || removed)) {
                 return Ok::<_, anyhow::Error>(methods);
             }
         }
@@ -776,10 +791,38 @@ async fn assert_cancelled_remote_snapshot_cleanup(cancel_validation: bool) -> Re
             .expect("outer snapshot waiter is cancelled")
             .is_cancelled()
     );
+    if cancel_write {
+        release_write
+            .send(())
+            .expect("write owner survives cancelled caller");
+    }
     // This is deliberately shorter than SNAPSHOT_TIMEOUT: cancellation must
     // trigger the same cleanup owner immediately, not wait for the normal deadline.
     let methods = timeout(Duration::from_secs(2), peer).await???;
-    if cancel_validation {
+    if cancel_write {
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "fs/writeFile")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "fs/remove")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "process/start")
+                .count(),
+            1,
+            "cancelled write must not launch validation"
+        );
+    } else if cancel_validation {
         assert_eq!(
             &methods[..8],
             &[
@@ -1362,5 +1405,97 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
     }
     timeout(Duration::from_secs(2), peer).await???;
     assert_eq!(removals.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_overflow_returns_before_eof_with_bounded_retention() {
+    let (mut writer, mut reader) = tokio::io::duplex(65536);
+    let producer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        writer
+            .write_all(&vec![b'x'; SNAPSHOT_OUTPUT_LIMIT_BYTES + 1])
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let mut retained = Vec::new();
+    let result = timeout(
+        Duration::from_secs(5),
+        read_snapshot_output_bounded(&mut reader, &mut retained),
+    )
+    .await;
+    producer.abort();
+    assert!(
+        result
+            .expect("overflow must not wait for EOF")
+            .unwrap_err()
+            .to_string()
+            .contains("exceeded")
+    );
+    assert_eq!(retained.len(), SNAPSHOT_OUTPUT_LIMIT_BYTES);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn local_snapshot_overflow_terminates_a_still_running_shell() -> Result<()> {
+    let shell =
+        crate::shell::get_shell(ShellType::PowerShell, None).context("PowerShell installed")?;
+    let root = tempdir()?;
+    let script = format!(
+        "[Console]::Out.Write([string]::new([char]'x', {})); Start-Sleep -Seconds 60",
+        SNAPSHOT_OUTPUT_LIMIT_BYTES + 8192
+    );
+    let result = timeout(
+        Duration::from_secs(10),
+        run_script_with_timeout(
+            &shell,
+            &script,
+            Duration::from_secs(45),
+            false,
+            &root.path().abs(),
+            &current_environment(),
+        ),
+    )
+    .await;
+    assert!(
+        result
+            .expect("overflow must terminate before the ordinary deadline")
+            .unwrap_err()
+            .to_string()
+            .contains("exceeded")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn powershell_snapshot_admission_preserves_profile_launch() -> Result<()> {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
+    let mut environment = turn.environments.primary().unwrap().clone();
+    let shell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: "pwsh".into(),
+    };
+    environment.shell = Some(shell.clone());
+    let root = tempdir()?;
+    let snapshot = ShellSnapshot::new(
+        root.path().abs(),
+        ThreadId::new(),
+        turn.session_telemetry.clone(),
+        None,
+        HashMap::new(),
+        ShellEnvironmentPolicy::default(),
+    );
+    assert!(snapshot.build(environment).await.is_none());
+    let args = shell.derive_exec_args("Get-RepoRoot", true)?;
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case("-NoProfile"))
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg.eq_ignore_ascii_case("-NonInteractive"))
+    );
     Ok(())
 }

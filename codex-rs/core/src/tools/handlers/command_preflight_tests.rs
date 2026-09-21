@@ -1158,6 +1158,47 @@ fn accepts_posix_quoted_shell_text_and_comment_quotes() {
 }
 
 #[tokio::test]
+async fn enabled_preflight_preserves_valid_shell_constructs_and_shell_owned_errors() {
+    for (shell, launcher, script) in [
+        (
+            ShellType::PowerShell,
+            "pwsh",
+            "$text = @'\nit's fine\n'@\nWrite-Output $text",
+        ),
+        (
+            ShellType::PowerShell,
+            "pwsh",
+            r"Get-ChildItem -Path 'C:\repo\*.rs'",
+        ),
+        (ShellType::Bash, "bash", r"printf '%s\n' $'it\'s fine'"),
+        (
+            ShellType::Bash,
+            "bash",
+            "Get-Content() { printf ok; }; Get-Content",
+        ),
+        (ShellType::Bash, "bash", "printf 'unterminated"),
+    ] {
+        let invocation = CommandInvocation::Script(script.into());
+        let flag = if shell == ShellType::PowerShell {
+            "-Command"
+        } else {
+            "-lc"
+        };
+        let outcome = preflight_invocation_for_kd4_runtime(
+            true,
+            false,
+            &invocation,
+            &strings(&[launcher, flag, script]),
+            Some(shell),
+        )
+        .await
+        .expect("shell owns syntax, command names and wildcard expansion");
+        assert_eq!(outcome.invocation, invocation);
+        assert_eq!(outcome.repair_notice, None);
+    }
+}
+
+#[tokio::test]
 async fn kd4_runtime_off_preserves_command_without_repair() {
     let invocation = CommandInvocation::Argv {
         program: "rg".to_string(),
@@ -1325,31 +1366,6 @@ fn accepts_measure_object_property_names_in_powershell_script() {
 }
 
 #[test]
-fn rejects_powershell_shape_in_posix_script() {
-    let issue = preflight_command_issue(
-        &strings(&["/bin/bash", "-lc", "Get-ChildItem -Force"]),
-        Some(ShellType::Bash),
-    )
-    .expect_err("PowerShell cmdlet in POSIX shell should be rejected");
-
-    assert_eq!(issue.code, CommandPreflightIssueCode::ShellMismatch);
-    assert!(issue.render_for_model().contains("PowerShell syntax"));
-}
-
-#[test]
-fn powershell_shell_mismatch_help_is_windows_only() {
-    let issue = preflight_command_issue(
-        &strings(&["pwsh", "-NoProfile", "-Command", "export CODEX_ENV=windows"]),
-        Some(ShellType::PowerShell),
-    )
-    .expect_err("POSIX syntax in PowerShell should be rejected");
-
-    let rendered = issue.render_for_model();
-    assert!(rendered.contains("rewrite the command for PowerShell"));
-    assert!(!rendered.contains("select a POSIX shell"), "{rendered}");
-}
-
-#[test]
 fn powershell_shell_mismatch_ignores_quoted_text_and_comments() {
     preflight_command(
         &strings(&[
@@ -1363,29 +1379,13 @@ fn powershell_shell_mismatch_ignores_quoted_text_and_comments() {
     .expect("quoted data and comments are not active POSIX syntax");
 }
 
-#[test]
-fn rejects_unbalanced_quotes_in_shell_script() {
-    let issue = preflight_command_issue(
-        &strings(&["/bin/bash", "-lc", "rg 'TODO src"]),
-        Some(ShellType::Bash),
-    )
-    .expect_err("unbalanced quotes should be rejected");
-
-    assert_eq!(issue.code, CommandPreflightIssueCode::UnbalancedQuotes);
-    assert!(
-        issue
-            .render_for_model()
-            .contains("missing closing single quote")
-    );
-}
-
 #[tokio::test]
 async fn direct_runtime_does_not_gate_execution_on_preflight_heuristics() {
     let script = "Write-Output 'unterminated";
     let invocation = CommandInvocation::PowerShellScript(script.to_string());
     let command = strings(&["pwsh", "-NoProfile", "-Command", script]);
     preflight_invocation_with_equivalent_repair(&invocation, &command, Some(ShellType::PowerShell))
-        .expect_err("legacy preflight should reject the fixture");
+        .expect("shell syntax is checked by the shell");
 
     let outcome = preflight_invocation_for_runtime(
         /*direct_runtime*/ true,
@@ -1443,79 +1443,12 @@ fn accepts_posix_heredoc_body_with_apostrophe() {
 }
 
 #[test]
-fn rejects_powershell_cmdlets_under_cmd() {
-    let err = preflight_command(
-        &strings(&["cmd.exe", "/d", "/s", "/c", "Get-Content file.txt"]),
-        /*shell_type*/ None,
-    )
-    .expect_err("cmd.exe scripts should reject PowerShell cmdlets");
-
-    assert!(err.contains("PowerShell cmdlet"));
-}
-
-#[test]
-fn literal_path_lint_windows_only_help_matches_path_parameter_colon_form() {
-    let issue = lint_windows_path_shape(
-        r"Get-ChildItem -Path:C:\repo\[name]",
-        Some(ShellType::PowerShell),
-        &[strings(&["Get-ChildItem", r"-Path:C:\repo\[name]"])],
-    )
-    .expect_err("PowerShell -Path: parameters should be recognized");
-
-    assert_eq!(
-        issue.code,
-        CommandPreflightIssueCode::WindowsLiteralPathRequired
-    );
-    let rendered = issue.render_for_model();
-    assert!(rendered.contains("-LiteralPath"));
-    assert!(rendered.contains("cmd quoting example"));
-    assert!(!rendered.contains("POSIX"), "{rendered}");
-}
-
-#[test]
-fn literal_path_lint_accepts_plain_path_parameter() {
-    lint_windows_path_shape(
-        r"Get-Content -Path C:\repo\plain.txt",
-        Some(ShellType::PowerShell),
-        &[strings(&["Get-Content", "-Path", r"C:\repo\plain.txt"])],
-    )
-    .expect("plain -Path values do not need literal-path rewriting");
-}
-
-#[test]
-fn literal_path_lint_accepts_literal_path_case_insensitively() {
-    lint_windows_path_shape(
-        r"Get-ChildItem -literalpath C:\repo\[name]",
-        Some(ShellType::PowerShell),
-        &[strings(&[
-            "Get-ChildItem",
-            "-literalpath",
-            r"C:\repo\[name]",
-        ])],
-    )
-    .expect("PowerShell -LiteralPath parameters are case-insensitive");
-}
-
-#[test]
-fn renders_shell_path_literals() {
-    let path = Path::new(r"C:\A B\[x]\it's.txt");
-    assert_eq!(
-        powershell_literal_path_arg(path),
-        vec![
-            "-LiteralPath".to_string(),
-            r#"'C:\A B\[x]\it''s.txt'"#.to_string()
-        ]
-    );
-    assert_eq!(cmd_quoted_path(path), r#""C:\A B\[x]\it's.txt""#);
-}
-
-#[test]
 fn render_truncates_rejected_command_on_char_boundary() {
     let mut long_non_ascii = "é".repeat(130);
     long_non_ascii.push_str("--ignorecase");
     let issue = CommandPreflightIssue::reject(
         CommandPreflightIssueCode::KnownFlagTypo,
-        CommandPreflightRejected::Script(long_non_ascii),
+        CommandPreflightRejected::Argv(vec![long_non_ascii]),
         "test detail".to_string(),
         None,
         None,

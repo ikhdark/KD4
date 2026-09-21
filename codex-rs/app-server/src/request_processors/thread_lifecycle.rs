@@ -1,6 +1,7 @@
 use super::token_usage_replay::TokenUsageReplaySnapshot;
 use super::*;
 use crate::thread_status::ThreadStatusSubscription;
+#[cfg(test)]
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
@@ -62,7 +63,8 @@ struct ThreadUnloadAuthorityState {
 
 pub(crate) struct PendingThreadUnloads {
     state: Mutex<ThreadUnloadAuthorityState>,
-    admission_gate: Semaphore,
+    admission_gates: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<Semaphore>>>,
+    #[cfg(test)]
     changed: Notify,
 }
 
@@ -70,15 +72,31 @@ impl Default for PendingThreadUnloads {
     fn default() -> Self {
         Self {
             state: Mutex::new(ThreadUnloadAuthorityState::default()),
-            admission_gate: Semaphore::new(1),
+            admission_gates: Default::default(),
+            #[cfg(test)]
             changed: Notify::new(),
         }
     }
 }
 
 impl PendingThreadUnloads {
+    fn admission_gate(&self, thread_id: ThreadId) -> Arc<Semaphore> {
+        let mut gates = self
+            .admission_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(&thread_id).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Semaphore::new(1));
+        gates.insert(thread_id, Arc::downgrade(&gate));
+        gate
+    }
+
     pub(super) async fn begin(&self, thread_id: ThreadId) -> bool {
-        let Ok(_admission_permit) = self.admission_gate.acquire().await else {
+        let gate = self.admission_gate(thread_id);
+        let Ok(_admission_permit) = gate.acquire().await else {
             return false;
         };
         let mut state = self.state.lock().await;
@@ -88,9 +106,9 @@ impl PendingThreadUnloads {
     }
 
     pub(super) async fn finish(&self, thread_id: &ThreadId) {
-        if self.state.lock().await.unloading.remove(thread_id) {
-            self.changed.notify_waiters();
-        }
+        self.state.lock().await.unloading.remove(thread_id);
+        #[cfg(test)]
+        self.changed.notify_waiters();
     }
 
     pub(super) async fn contains(&self, thread_id: &ThreadId) -> bool {
@@ -104,7 +122,8 @@ impl PendingThreadUnloads {
         connection_id: ConnectionId,
         raw_events_enabled: bool,
     ) -> ThreadConnectionAdmission<Arc<Mutex<ThreadState>>> {
-        let Ok(_admission_permit) = self.admission_gate.acquire().await else {
+        let gate = self.admission_gate(thread_id);
+        let Ok(_admission_permit) = gate.acquire().await else {
             return ThreadConnectionAdmission::ThreadClosing;
         };
         if self.state.lock().await.unloading.contains(&thread_id) {
@@ -134,7 +153,8 @@ impl PendingThreadUnloads {
         ThreadConnectionAdmission<tokio::sync::MutexGuard<'a, ThreadState>>,
         JSONRPCErrorError,
     > {
-        let Ok(_admission_permit) = self.admission_gate.acquire().await else {
+        let gate = self.admission_gate(thread_id);
+        let Ok(_admission_permit) = gate.acquire().await else {
             return Ok(ThreadConnectionAdmission::ThreadClosing);
         };
         if self.state.lock().await.unloading.contains(&thread_id) {
@@ -290,6 +310,7 @@ impl PendingThreadUnloads {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn wait_until_finished(&self, thread_id: &ThreadId) {
         loop {
             let changed = self.changed.notified();
@@ -871,6 +892,7 @@ pub(super) async fn finish_thread_unload(
         .remove_thread_if_same(&thread_id, expected_thread)
         .await;
     let ready_for_cold_resume = if removed_expected {
+        outgoing.forget_dynamic_tool_owner(thread_id).await;
         outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
@@ -906,6 +928,7 @@ pub(super) async fn finish_thread_unload(
         match thread_manager.get_thread(thread_id).await {
             Err(_) => {
                 info!("thread {thread_id} was already removed before teardown finalized");
+                outgoing.forget_dynamic_tool_owner(thread_id).await;
                 thread_state_manager.remove_thread_state(thread_id).await;
                 if tokio::time::timeout(
                     crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
@@ -2342,6 +2365,25 @@ mod tests {
         assert!(error.contains("injected watcher initialization failure"));
         assert!(!skills_watcher.is_initialized());
         assert_eq!(skills_watcher.initialization_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_is_independent_between_threads_but_stable_within_one_thread() {
+        let pending = PendingThreadUnloads::default();
+        let a = ThreadId::new();
+        let b = ThreadId::new();
+        let gate = pending.admission_gate(a);
+        let permit = gate.acquire().await.unwrap();
+        assert!(Arc::ptr_eq(&gate, &pending.admission_gate(a)));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending.begin(b))
+                .await
+                .unwrap()
+        );
+        let mut same = Box::pin(pending.begin(a));
+        assert!(futures::poll!(same.as_mut()).is_pending());
+        drop(permit);
+        assert!(same.await);
     }
 
     #[tokio::test]

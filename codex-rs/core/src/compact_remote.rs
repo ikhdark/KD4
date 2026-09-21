@@ -42,10 +42,32 @@ struct RemoteToolSearchReceiptV1 {
     omitted_identity_count: usize,
 }
 
+#[cfg(test)]
 pub(crate) async fn process_compacted_history(
     sess: &Session,
     turn_context: &TurnContext,
-    mut compacted_history: Vec<ResponseItem>,
+    compacted_history: Vec<ResponseItem>,
+    initial_context_injection: &InitialContextInjection,
+) -> (
+    Vec<ResponseItem>,
+    Option<WorldStateSnapshot>,
+    Vec<codex_protocol::protocol::ContextFragmentDigest>,
+) {
+    process_compacted_history_with_retained_input(
+        sess,
+        turn_context,
+        compacted_history,
+        Vec::new(),
+        initial_context_injection,
+    )
+    .await
+}
+
+pub(crate) async fn process_compacted_history_with_retained_input(
+    sess: &Session,
+    turn_context: &TurnContext,
+    compacted_history: Vec<ResponseItem>,
+    mut retained_input: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
 ) -> (
     Vec<ResponseItem>,
@@ -57,15 +79,21 @@ pub(crate) async fn process_compacted_history(
     let (initial_context, world_state_baseline, fragment_digests) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
+    // Only provider output is subject to the consumed-transcript filter. The local
+    // unresolved tail has already been selected against its own retention budget.
+    let retained_input_len = retained_input.len();
+    retained_input.extend(compacted_history);
     let artifact_pin_payload = sess
         .clone_history()
         .await
         .tool_history_state()
-        .artifact_pin_payload_for_items(&compacted_history);
-    compacted_history = append_remote_compaction_artifact_pins(
-        bounded_remote_compacted_history(compacted_history),
-        artifact_pin_payload,
-    );
+        .artifact_pin_payload_for_items(&retained_input);
+    // Recover exact registered references before the provider-output filter
+    // removes consumed tool pairs. Their sidecar must survive that removal.
+    let provider_output = retained_input.split_off(retained_input_len);
+    retained_input.extend(bounded_remote_compacted_history(provider_output));
+    let compacted_history =
+        append_remote_compaction_artifact_pins(retained_input, artifact_pin_payload);
     (
         insert_compaction_initial_context(
             compacted_history,
@@ -551,6 +579,7 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
         turn_context,
         base_instructions,
         None,
+        0,
     )
 }
 
@@ -559,12 +588,14 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
     turn_context: &TurnContext,
     base_instructions: &BaseInstructions,
     prepared_items: Option<&[ResponseItem]>,
+    request_overhead_tokens: i64,
 ) -> (usize, i64) {
     let Some(context_window) = turn_context.model_context_window() else {
         return (0, 0);
     };
     let mut estimated_tokens =
         i128::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i128::MAX);
+    estimated_tokens = estimated_tokens.saturating_add(i128::from(request_overhead_tokens));
     let measured_items = prepared_items.unwrap_or_else(|| history.raw_items());
     for item_tokens in measured_items.iter().map(estimate_item_token_count) {
         estimated_tokens = estimated_tokens.saturating_add(i128::from(item_tokens));

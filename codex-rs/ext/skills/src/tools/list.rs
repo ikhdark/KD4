@@ -33,7 +33,7 @@ struct ListArgs {
     cursor: Option<String>,
 }
 
-#[derive(Debug, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[schemars(deny_unknown_fields)]
 struct ListedSkill {
     authority: SkillToolAuthority,
@@ -79,38 +79,51 @@ impl ToolExecutor<ToolCall> for ListTool {
                     .retry_failed_orchestrator_catalog();
             }
             let authority = args.authority.into_authority();
-            let catalog = self.context.catalog(&call.turn_id, args.authority).await;
-            let skills: Vec<_> = catalog
-                .entries
-                .into_iter()
-                .filter(|entry| entry.enabled && entry.authority == authority)
-                .filter_map(listed_skill)
-                .collect();
-            let (warnings, warnings_omitted) = bounded_warnings(catalog.warnings);
-            let fingerprint =
-                super::read::value_fingerprint(&(&skills, &warnings, warnings_omitted));
+            let mut catalog = self.context.catalog(&call.turn_id, args.authority).await;
+            let listed = |catalog: &crate::catalog::SkillCatalog| {
+                catalog
+                    .entries
+                    .iter()
+                    .cloned()
+                    .filter(|entry| entry.enabled && entry.authority == authority)
+                    .filter_map(listed_skill)
+                    .collect::<Vec<_>>()
+            };
+            let mut skills = listed(&catalog);
             let start = match args.cursor.as_deref() {
                 None => 0,
                 Some(cursor) => {
                     let (hash, offset) = cursor.split_once(':').ok_or_else(invalid_cursor)?;
-                    if u64::from_str_radix(hash, 16).ok() != Some(fingerprint) {
+                    let offset = offset
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|offset| *offset <= skills.len())
+                        .ok_or_else(invalid_cursor)?;
+                    if u64::from_str_radix(hash, 16).ok()
+                        != Some(super::read::value_fingerprint(&skills[..offset]))
+                    {
                         return Err(FunctionCallError::RespondToModel(
                             "skills.list cursor is stale; restart from the first page".to_string(),
                         ));
                     }
                     offset
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|offset| *offset < skills.len())
-                        .ok_or_else(invalid_cursor)?
                 }
             };
+            if catalog.continuation.is_some() && (args.cursor.is_none() || start == skills.len()) {
+                catalog = self
+                    .context
+                    .continue_catalog(&call.turn_id, catalog.entries.len())
+                    .await;
+                skills = listed(&catalog);
+            }
+            let incomplete = catalog.continuation.is_some();
+            let (warnings, warnings_omitted) = bounded_warnings(catalog.warnings);
             let response = page_response(
                 skills,
                 warnings,
                 warnings_omitted,
                 start,
-                fingerprint,
+                incomplete,
                 budget,
             )?;
 
@@ -128,7 +141,7 @@ fn page_response(
     warnings: Vec<String>,
     warnings_omitted: usize,
     start: usize,
-    fingerprint: u64,
+    incomplete: bool,
     budget: usize,
 ) -> Result<ListResponse, FunctionCallError> {
     let count = skills.len();
@@ -136,18 +149,29 @@ fn page_response(
         skills: Vec::new(),
         warnings,
         warnings_omitted,
-        next_cursor: None,
+        next_cursor: incomplete.then(|| {
+            format!(
+                "{:016x}:{start}",
+                super::read::value_fingerprint(&skills[..start])
+            )
+        }),
     };
     // Make room for complete handles before including advisory warnings.
     while super::read::serialized_len(&response)? > budget && !response.warnings.is_empty() {
         response.warnings.pop();
         response.warnings_omitted += 1;
     }
-    for (index, skill) in skills.into_iter().enumerate().skip(start) {
-        let next_cursor = (index + 1 < count).then(|| format!("{fingerprint:016x}:{}", index + 1));
+    for (index, skill) in skills.iter().enumerate().skip(start) {
+        let next_cursor = (index + 1 < count || incomplete).then(|| {
+            format!(
+                "{:016x}:{}",
+                super::read::value_fingerprint(&skills[..=index]),
+                index + 1
+            )
+        });
         let previous_cursor = response.next_cursor.clone();
         response.next_cursor = next_cursor;
-        response.skills.push(skill);
+        response.skills.push(skill.clone());
         if super::read::serialized_len(&response)? > budget {
             if response.skills.len() > 1 {
                 response.skills.pop();

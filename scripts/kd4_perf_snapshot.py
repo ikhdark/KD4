@@ -9,7 +9,6 @@ import json
 import os
 import platform
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -21,9 +20,11 @@ from statistics import median
 from typing import Any, BinaryIO, Sequence
 
 try:
+    from scripts.process_owner import owned_process, CleanupFailed
     from scripts.atomic_json import write_json_atomic
     from scripts import kd4_model_attempt_analysis
 except ImportError:  # Direct script execution places scripts/ on sys.path.
+    from process_owner import owned_process, CleanupFailed
     from atomic_json import write_json_atomic
     import kd4_model_attempt_analysis
 
@@ -41,43 +42,13 @@ def _run_scenario(
     stderr: BinaryIO,
     timeout: float,
 ) -> subprocess.CompletedProcess:
-    # Keep the parent alive until tree termination. subprocess.run kills it
-    # first on timeout, losing the Windows parent/descendant relationship.
-    with subprocess.Popen(
-        command,
-        cwd=cwd,
-        stdout=stdout,
-        stderr=stderr,
-        start_new_session=os.name != "nt",
-    ) as process:
-        try:
+    try:
+        with owned_process(command, cwd=cwd, stdout=stdout, stderr=stderr) as process:
             returncode = process.wait(timeout=timeout)
-        except BaseException:
-            try:
-                if os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                        timeout=15,
-                        check=True,
-                    )
-                else:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                process.wait(timeout=15)
-            except (OSError, subprocess.SubprocessError) as cleanup_error:
-                process.kill()
-                process.wait()
-                # Do not proceed into another measurement with unknown children.
-                raise RuntimeError(
-                    f"Failed to stop scenario process tree {process.pid}; "
-                    "remaining measurements aborted"
-                ) from cleanup_error
-            raise
+    except CleanupFailed as error:
+        raise RuntimeError(
+            "Process cleanup unconfirmed; remaining measurements aborted"
+        ) from error
     return subprocess.CompletedProcess(command, returncode)
 
 

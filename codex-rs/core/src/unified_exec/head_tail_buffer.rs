@@ -14,6 +14,7 @@ pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
 /// allocated to the tail.
 #[derive(Debug)]
 pub(crate) struct HeadTailBuffer {
+    pending_report: Option<Box<HeadTailBuffer>>,
     max_bytes: usize,
     head_budget: usize,
     tail_budget: usize,
@@ -40,6 +41,7 @@ impl HeadTailBuffer {
         let head_budget = max_bytes / 2;
         let tail_budget = max_bytes.saturating_sub(head_budget);
         Self {
+            pending_report: None,
             max_bytes,
             head_budget,
             tail_budget,
@@ -114,9 +116,38 @@ impl HeadTailBuffer {
     }
 
     pub(crate) fn has_unreported_output(&self) -> bool {
+        self.pending_report.is_some() || self.has_uncollected_output()
+    }
+
+    pub(crate) fn has_uncollected_output(&self) -> bool {
         self.retained_bytes() > 0
             || self.unreported_omitted_bytes > 0
             || self.unreported_lagged_chunks > 0
+    }
+
+    /// Keep the in-flight polling receipt with the producer until preparation
+    /// completes. Cancelling a polling future leaves this evidence recoverable.
+    pub(crate) fn begin_output_report(&mut self) {
+        self.pending_report
+            .get_or_insert_with(|| Box::new(Self::default()));
+    }
+
+    pub(crate) fn collect_pending_output(&mut self) -> bool {
+        let mut report = self
+            .pending_report
+            .take()
+            .unwrap_or_else(|| Box::new(Self::default()));
+        let meaningful = self.drain_into(&mut report);
+        self.pending_report = Some(report);
+        meaningful
+    }
+
+    pub(crate) fn pending_output(&self) -> Option<&Self> {
+        self.pending_report.as_deref()
+    }
+
+    pub(crate) fn acknowledge_pending_output(&mut self) {
+        self.pending_report = None;
     }
 
     /// Drain into another bounded buffer without turning omission notices into

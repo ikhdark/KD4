@@ -61,6 +61,13 @@ pub enum CodexErr {
     /// Optionally includes the requested delay before retrying the turn.
     #[error("stream disconnected before completion: {0}")]
     Stream(String, Option<Duration>),
+    #[error("{0}")]
+    IncompleteResponse(Box<IncompleteResponse>),
+    #[error("provider error {code:?}: {message}")]
+    ProviderFailure {
+        code: Option<String>,
+        message: String,
+    },
     /// Returned after the request transport has exhausted its retry policy on failures proven to
     /// have happened before dispatch. Outer response-stream loops must not retry this error again.
     #[error("request failed before dispatch after exhausting retries: {0}")]
@@ -170,6 +177,8 @@ impl CodexErr {
             | CodexErr::QuotaExceeded
             | CodexErr::InvalidImageRequest()
             | CodexErr::InvalidRequest(_)
+            | CodexErr::IncompleteResponse(_)
+            | CodexErr::ProviderFailure { .. }
             | CodexErr::RefreshTokenFailed(_)
             | CodexErr::UnsupportedOperation(_)
             | CodexErr::Sandbox(_)
@@ -259,6 +268,16 @@ impl CodexErr {
         };
         http_status_code.as_ref().map(StatusCode::as_u16)
     }
+}
+
+/// Provider-declared termination, distinct from a lost transport. The turn owner
+/// must not replay an unchanged request or treat partial output as completion.
+#[derive(Debug, Error)]
+#[error("Incomplete response {response_id:?}, reason: {reason}")]
+pub struct IncompleteResponse {
+    pub response_id: Option<String>,
+    pub reason: String,
+    pub token_usage: Option<crate::protocol::TokenUsage>,
 }
 
 #[derive(Debug)]

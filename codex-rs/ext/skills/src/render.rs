@@ -6,7 +6,7 @@ use crate::catalog::SkillSourceKind;
 use crate::fragments::AvailableSkillsInstructions;
 
 const MAX_AVAILABLE_SKILLS_BYTES: usize = 8_000;
-const MAX_MAIN_PROMPT_BYTES: usize = 8_000;
+pub(crate) const MAX_SELECTED_PROMPT_BYTES: usize = 32_000;
 const MAX_CATALOG_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 
@@ -121,46 +121,62 @@ fn render_skill_line(entry: &SkillCatalogEntry, description: &str, locator_kind:
     }
 }
 
-pub(crate) fn truncate_main_prompt_contents(
+pub(crate) fn main_prompt_fragment(
     contents: &str,
     entry: &SkillCatalogEntry,
-) -> (String, bool) {
-    if contents.len() <= MAX_MAIN_PROMPT_BYTES {
-        return (contents.to_string(), false);
+    budget: usize,
+) -> Option<(crate::fragments::SkillInstructions, bool)> {
+    use codex_extension_api::ContextualUserFragment;
+    let fragment = |contents| crate::fragments::SkillInstructions {
+        name: entry.name.clone(),
+        path: entry.main_prompt.as_str().to_string(),
+        contents,
+        source_scope: entry.source_scope,
+    };
+    if contents.len() <= budget {
+        let complete = fragment(contents.to_string());
+        if complete.render().len() <= budget {
+            return Some((complete, false));
+        }
     }
-    let recovery = match &entry.authority.kind {
-        SkillSourceKind::Orchestrator => format!(
-            "Read the full instructions with skills.read({}); follow next_cursor as cursor until absent.",
-            serde_json::json!({
-                "authority": {"kind": "orchestrator"},
-                "package": entry.id.0,
-                "resource": entry.main_prompt.as_str(),
-            })
-        ),
-        SkillSourceKind::Host => format!(
-            "Read the full instructions from the host file {} using filesystem tools.",
-            serde_json::json!(entry.main_prompt.as_str())
-        ),
-        SkillSourceKind::Executor => match entry.main_prompt.environment_path() {
-            Some((environment_id, path)) => format!(
-                "Read the full instructions with read_file({}); follow the returned artifact continuation for remaining text.",
-                serde_json::json!({"environment_id": environment_id, "path": path.inferred_native_path_string()})
+    let fingerprint = crate::tools::read::value_fingerprint(contents);
+    let partial = |end: usize| {
+        let recovery = match &entry.authority.kind {
+            SkillSourceKind::Orchestrator => format!(
+                "Read the remaining instructions with skills.read({}); follow next_cursor as cursor until absent.",
+                serde_json::json!({"authority":{"kind":"orchestrator"}, "package":entry.id.0,
+                    "resource":entry.main_prompt.as_str(), "cursor":format!("{fingerprint:016x}:{end}")})
             ),
-            None => "The resource has no environment binding; report that its full instructions are unavailable.".to_string(),
-        },
-        SkillSourceKind::Custom(_) => "No model-callable read route is exposed for this custom provider; report the missing instructions.".to_string(),
+            SkillSourceKind::Host => format!("Read the full instructions from the host file {} using filesystem tools.", serde_json::json!(entry.main_prompt.as_str())),
+            SkillSourceKind::Executor => match entry.main_prompt.environment_path() {
+                Some((environment_id, path)) => format!("Read the full instructions with read_file({}); follow its artifact continuation.", serde_json::json!({"environment_id":environment_id,"path":path.inferred_native_path_string()})),
+                None => "Report that the resource has no environment binding and its instructions are unavailable.".to_string(),
+            },
+            SkillSourceKind::Custom(_) => "Report missing instructions; this provider exposes no model-callable recovery route.".to_string(),
+        };
+        fragment(format!(
+            "{}\n\n[This skill's instructions are incomplete. The omitted portion has not been loaded. {recovery}]",
+            &contents[..end]
+        ))
     };
-    let notice = format!(
-        "\n\n[This skill's instructions are incomplete because the context limit was reached. The omitted portion has not been loaded. {recovery}]"
-    );
-    let notice = if notice.len() <= MAX_MAIN_PROMPT_BYTES {
-        notice
-    } else {
-        "\n\n[This skill's instructions are incomplete. Its recovery identity exceeds the context budget; do not use a shortened identity. Report the unavailable instructions.]".to_string()
-    };
-    let (mut prefix, _) = truncate_utf8_to_bytes(contents, MAX_MAIN_PROMPT_BYTES - notice.len());
-    prefix.push_str(&notice);
-    (prefix, true)
+    let empty = partial(0);
+    if empty.render().len() > budget {
+        return None;
+    }
+    let mut best = empty;
+    let mut low = 0;
+    let mut high = contents.floor_char_boundary(contents.len().min(budget));
+    while low < high {
+        let end = contents.ceil_char_boundary(low.midpoint(high) + 1);
+        let candidate = partial(end);
+        if candidate.render().len() <= budget {
+            low = end;
+            best = candidate;
+        } else {
+            high = contents.floor_char_boundary(end - 1);
+        }
+    }
+    Some((best, true))
 }
 
 pub(crate) fn truncate_utf8_to_bytes(contents: &str, max_bytes: usize) -> (String, bool) {
@@ -171,6 +187,36 @@ pub(crate) fn truncate_utf8_to_bytes(contents: &str, max_bytes: usize) -> (Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_instructions_share_a_rendered_budget_and_small_skills_are_complete() {
+        use codex_extension_api::ContextualUserFragment;
+        let entry = SkillCatalogEntry::new(
+            crate::catalog::SkillPackageId("skill://test/demo".to_string()),
+            crate::catalog::SkillAuthority::new(SkillSourceKind::Orchestrator, "codex_apps"),
+            "demo",
+            "description",
+            crate::catalog::SkillResourceId::new("skill://test/demo/SKILL.md"),
+        );
+        let text = "x".repeat(8_001);
+        let (complete, partial) =
+            main_prompt_fragment(&text, &entry, MAX_SELECTED_PROMPT_BYTES).expect("fragment");
+        assert!(!partial);
+        assert_eq!(complete.contents, text);
+        let mut remaining = MAX_SELECTED_PROMPT_BYTES;
+        let mut rendered = 0;
+        for index in 0..5 {
+            let budget = remaining / (5 - index);
+            let (fragment, partial) = main_prompt_fragment(&"<&>🚀".repeat(2_000), &entry, budget)
+                .expect("partial instructions");
+            assert!(partial);
+            assert!(fragment.render().len() <= budget);
+            assert!(fragment.contents.contains("\"cursor\":"));
+            rendered += fragment.render().len();
+            remaining -= fragment.render().len();
+        }
+        assert!(rendered <= MAX_SELECTED_PROMPT_BYTES);
+    }
 
     #[test]
     fn truncate_utf8_to_bytes_stops_before_split_character() {

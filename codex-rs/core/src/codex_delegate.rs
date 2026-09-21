@@ -15,7 +15,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-#[cfg(test)]
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -437,20 +436,40 @@ async fn forward_events(
 
 /// Ask the delegate to stop and drain its events so background sends do not hit a closed channel.
 async fn shutdown_delegate(codex: &Codex) {
-    if codex.submit(Op::Interrupt).await.is_err() {
-        return;
+    // Revoke admission and interrupt execution directly. Lifecycle commands are
+    // best effort; a full mailbox must not prevent cancellation of the child.
+    codex
+        .session
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Release);
+    let session = Arc::clone(&codex.session);
+    // Teardown has a session owner and must survive the bounded proxy drain.
+    let mut shutdown = codex.session.terminal_tasks.spawn(async move {
+        session.begin_shutdown().await;
+        session.interrupt_task().await;
+    });
+    for op in [Op::Interrupt, Op::Shutdown] {
+        let _ = codex.tx_sub.try_send(crate::session::QueuedSubmission {
+            submission: Submission {
+                id: uuid::Uuid::new_v4().to_string(),
+                op,
+                client_user_message_id: None,
+                trace: None,
+            },
+            mailbox_admission: None,
+        });
     }
-    if codex.submit(Op::Shutdown {}).await.is_err() {
-        return;
-    }
-
+    codex.tx_sub.close();
     let _ = timeout(Duration::from_millis(500), async {
-        while let Ok(event) = codex.next_event().await {
-            if matches!(
-                event.msg,
-                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
-            ) {
-                break;
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                event = codex.next_event() => {
+                    if event.is_err() {
+                        let _ = shutdown.await;
+                        break;
+                    }
+                }
             }
         }
     })
@@ -485,7 +504,14 @@ async fn forward_ops(
         };
         // Preserve the original acknowledgement through the proxy. Creating a
         // second submission here would acknowledge forwarding instead of admission.
-        if codex.tx_sub.send(submission).await.is_err() {
+        if !matches!(
+            codex
+                .tx_sub
+                .send(submission)
+                .or_cancel(&cancel_token_ops)
+                .await,
+            Ok(Ok(()))
+        ) {
             break;
         }
     }
@@ -542,6 +568,7 @@ async fn handle_exec_approval(
             turn_id: Some(turn_id),
             decision,
         })
+        .or_cancel(cancel_token)
         .await;
 }
 
@@ -572,6 +599,7 @@ async fn handle_patch_approval(
             id: approval_id,
             decision,
         })
+        .or_cancel(cancel_token)
         .await;
 }
 
@@ -596,7 +624,10 @@ async fn handle_request_user_input(
         cancel_token,
     )
     .await;
-    let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
+    let _ = codex
+        .submit(Op::UserInputAnswer { id, response })
+        .or_cancel(cancel_token)
+        .await;
 }
 
 fn protocol_elicitation_id(id: &codex_protocol::mcp::RequestId) -> rmcp::model::RequestId {
@@ -659,6 +690,7 @@ async fn handle_elicitation_request(
             content,
             meta,
         })
+        .or_cancel(cancel_token)
         .await;
 }
 
@@ -691,6 +723,7 @@ async fn handle_request_permissions(
             id: call_id,
             response,
         })
+        .or_cancel(cancel_token)
         .await;
 }
 

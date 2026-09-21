@@ -271,8 +271,8 @@ async fn review_op_emits_lifecycle_and_review_output() {
     }
     assert!(saw_header, "user header missing from rollout");
     assert!(
-        saw_finding_line,
-        "formatted finding line missing from rollout"
+        !saw_finding_line,
+        "user transition marker must not duplicate the assistant findings"
     );
     assert!(
         saw_assistant_plain,
@@ -952,6 +952,11 @@ async fn review_history_surfaces_in_parent_session() {
         contains_review_assistant,
         "review assistant output missing from parent turn input"
     );
+
+    assert_eq!(input.iter().flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+        .filter_map(|item| item["text"].as_str())
+        .map(|text| text.matches("review assistant output").count()).sum::<usize>(), 1,
+        "the next provider request must contain each review result exactly once");
 
     let _codex_home_guard = codex_home;
     server.verify().await;

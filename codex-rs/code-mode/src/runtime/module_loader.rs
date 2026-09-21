@@ -86,9 +86,8 @@ pub(super) fn resolve_tool_response(
             resolver.resolve(&tc, value);
         }
         Err(error_text) => {
-            let value = v8::String::new(&tc, &error_text)
-                .ok_or_else(|| "failed to allocate tool error".to_string())?;
-            resolver.reject(&tc, value.into());
+            let value = super::value::error_value(&mut tc, &error_text);
+            resolver.reject(&tc, value);
         }
     }
     if tc.has_caught() {
@@ -122,9 +121,8 @@ pub(super) fn resolve_notification_response(
             resolver.resolve(&tc, value.into());
         }
         Err(error_text) => {
-            let value = v8::String::new(&tc, &error_text)
-                .ok_or_else(|| "failed to allocate notification error".to_string())?;
-            resolver.reject(&tc, value.into());
+            let value = super::value::error_value(&mut tc, &error_text);
+            resolver.reject(&tc, value);
         }
     }
     if tc.has_caught() {
@@ -136,41 +134,81 @@ pub(super) fn resolve_notification_response(
     Ok(())
 }
 
+pub(super) extern "C" fn promise_rejected(message: v8::PromiseRejectMessage) {
+    v8::callback_scope!(unsafe scope, &message);
+    let promise = v8::Global::new(scope, message.get_promise());
+    let Some(state) = scope.get_slot_mut::<RuntimeState>() else { return; };
+    match message.get_event() {
+        v8::PromiseRejectEvent::PromiseRejectWithNoHandler => {
+            if state.unhandled_rejections.len() < super::MAX_OUTSTANDING_CALLBACKS_PER_CELL {
+                state.unhandled_rejections.push(promise);
+            } else {
+                state.rejection_tracking_overflow = true;
+            }
+        }
+        v8::PromiseRejectEvent::PromiseHandlerAddedAfterReject => {
+            state.unhandled_rejections.retain(|pending| pending != &promise);
+        }
+        _ => {}
+    }
+}
+
+/// At a microtask checkpoint, unhandled rejections fail the cell. Completion
+/// waits for accepted notifications, but not timers. Remaining tool calls are
+/// reported as unawaited work and cancelled by the host before terminal delivery.
 pub(super) fn completion_state(
     scope: &mut v8::PinScope<'_, '_>,
     pending_promise: Option<&v8::Global<v8::Promise>>,
 ) -> CompletionState {
-    let (stored_value_writes, stored_value_limit_error) = scope
-        .get_slot::<RuntimeState>()
-        .map(RuntimeState::stored_value_completion)
-        .unwrap_or_default();
-
-    let Some(pending_promise) = pending_promise else {
-        return CompletionState::Completed {
-            stored_value_writes,
-            error_text: stored_value_limit_error,
-        };
-    };
-
-    let promise = v8::Local::new(scope, pending_promise);
-    match promise.state() {
-        v8::PromiseState::Pending => CompletionState::Pending,
-        v8::PromiseState::Fulfilled => CompletionState::Completed {
-            stored_value_writes,
-            error_text: stored_value_limit_error,
-        },
-        v8::PromiseState::Rejected => {
-            let result = promise.result(scope);
-            let error_text = if is_exit_exception(scope, result) {
-                None
-            } else {
-                Some(value_to_error_text(scope, result))
-            };
-            CompletionState::Completed {
-                stored_value_writes,
-                error_text: stored_value_limit_error.or(error_text),
+    let unhandled = scope.get_slot::<RuntimeState>().and_then(|state| {
+        state.unhandled_rejections.iter().find(|promise| Some(*promise) != pending_promise).cloned()
+    });
+    let async_error = if let Some(unhandled) = unhandled {
+        let promise = v8::Local::new(scope, &unhandled);
+        let reason = promise.result(scope);
+        if is_exit_exception(scope, reason) { None } else {
+            Some(format!("Unhandled promise rejection: {}", value_to_error_text(scope, reason)))
+        }
+    } else if scope.get_slot::<RuntimeState>().is_some_and(|state| state.rejection_tracking_overflow) {
+        Some("code mode cell exceeded its unhandled promise rejection tracking limit".to_string())
+    } else { None };
+    let error_text = if async_error.is_some() {
+        async_error
+    } else if let Some(pending_promise) = pending_promise {
+        let promise = v8::Local::new(scope, pending_promise);
+        match promise.state() {
+            v8::PromiseState::Pending => return CompletionState::Pending,
+            v8::PromiseState::Fulfilled => None,
+            v8::PromiseState::Rejected => {
+                let result = promise.result(scope);
+                if is_exit_exception(scope, result) {
+                    None
+                } else {
+                    Some(value_to_error_text(scope, result))
+                }
             }
         }
+    } else {
+        None
+    };
+    // Accepted notifications retain the existing drain contract. Tool calls are
+    // cancelled by the owner at completion; make abandonment an explicit failure.
+    if error_text.is_none() && scope.get_slot::<RuntimeState>().is_some_and(|state| !state.exit_requested && !state.pending_notifications.is_empty()) {
+        return CompletionState::Pending;
+    }
+    let error_text = error_text.or_else(|| scope.get_slot::<RuntimeState>().and_then(|state| {
+        (!state.exit_requested && !state.pending_tool_calls.is_empty()).then(|| format!(
+            "cell completed with {} unawaited tool call(s); outstanding tool work is cancelled",
+            state.pending_tool_calls.len()
+        ))
+    }));
+    let (stored_value_writes, stored_value_limit_error) = scope
+        .get_slot_mut::<RuntimeState>()
+        .map(RuntimeState::stored_value_completion)
+        .unwrap_or_default();
+    CompletionState::Completed {
+        stored_value_writes,
+        error_text: stored_value_limit_error.or(error_text),
     }
 }
 

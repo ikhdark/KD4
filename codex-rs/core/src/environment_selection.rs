@@ -270,6 +270,10 @@ impl ThreadEnvironments {
             .await
     }
 
+    pub(crate) async fn snapshot_now(&self) -> TurnEnvironmentSnapshot {
+        self.snapshot_with_wait_policy(false).await
+    }
+
     async fn snapshot_with_wait_policy(&self, wait_for_ready: bool) -> TurnEnvironmentSnapshot {
         let current = self.environments.load_full();
         let mut turn_environments = Vec::with_capacity(current.environments.len());

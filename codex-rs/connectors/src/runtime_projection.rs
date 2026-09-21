@@ -39,15 +39,15 @@ pub struct InstalledConnectorRuntime {
 pub fn installed_connector_runtime<'a>(
     config_layer_stack: &ConfigLayerStack,
     tools: impl IntoIterator<Item = ConnectorRuntimeTool<'a>>,
-) -> Vec<InstalledConnectorRuntime> {
-    let policy = AppToolPolicyEvaluator::new(config_layer_stack);
+) -> anyhow::Result<Vec<InstalledConnectorRuntime>> {
+    let policy = AppToolPolicyEvaluator::new(config_layer_stack)?;
     let mut apps = BTreeMap::<&str, (Option<&str>, bool)>::new();
 
     for tool in tools {
         if tool.synthetic {
             continue;
         }
-        let Some(connector_id) = tool.connector_id.map(str::trim) else {
+        let Some(connector_id) = tool.connector_id.and_then(crate::canonical_connector_id) else {
             continue;
         };
         if connector_id.is_empty() {
@@ -75,14 +75,15 @@ pub fn installed_connector_runtime<'a>(
         }
     }
 
-    apps.into_iter()
+    Ok(apps
+        .into_iter()
         .map(|(id, (runtime_name, callable))| InstalledConnectorRuntime {
             enabled: policy.app_enabled(id),
             id: id.to_string(),
             runtime_name: runtime_name.map(str::to_string),
             callable,
         })
-        .collect()
+        .collect())
 }
 
 /// Returns whether connector metadata marks a runtime tool as a synthetic link helper.

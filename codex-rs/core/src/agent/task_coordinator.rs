@@ -8,6 +8,7 @@ use codex_agent_task_store::AgentTaskAuthorization;
 use codex_agent_task_store::AgentTaskBinding;
 use codex_agent_task_store::AgentTaskBindingDraft;
 use codex_agent_task_store::Assignment;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 #[cfg(test)]
@@ -28,6 +29,7 @@ use codex_agent_task_store::WorkspaceStrategy;
 use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::SessionSource;
 use codex_state::StateRuntime;
 use std::collections::HashMap;
@@ -490,15 +492,81 @@ impl AgentTaskCoordinator {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize follow-up renewal and durable binding cache publication"
+    )]
+    pub(crate) async fn prepare_legacy_agent_turn(
+        &self,
+        source: &SessionSource,
+        thread_id: ThreadId,
+    ) -> StoreResult<()> {
+        let _update = self.binding_updates.lock().await;
+        let Some(binding) = self
+            .binding_for_source(source)
+            .filter(|binding| binding.thread_id.as_deref() == Some(thread_id.to_string().as_str()))
+        else {
+            return Ok(());
+        };
+        let store = self.required_store()?;
+        let authorization = store
+            .get_agent_task_authorization(binding.assignment_id)
+            .await?;
+        if !matches!(
+            authorization.admission_origin,
+            AssignmentAdmissionOrigin::LegacyMessage { .. }
+        ) {
+            return Ok(());
+        }
+        if authorization.current_attempt.attempt_id == binding.attempt_id
+            && authorization.current_attempt.state == AttemptState::Active
+        {
+            return Ok(());
+        }
+        store.begin_legacy_agent_turn(binding.assignment_id).await?;
+        let renewed = store
+            .get_agent_task_binding(binding.assignment_id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::CorruptData(
+                    "plain-message follow-up lost its durable binding".to_string(),
+                )
+            })?;
+        self.remember_binding(renewed);
+        self.set_task_metric_active(binding.assignment_id, true);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn seal_missing_receipt(
         &self,
         agent_path: &AgentPath,
         expected_thread_id: ThreadId,
-        summary: String,
+        status: &AgentStatus,
+    ) -> StoreResult<Option<AgentReceipt>> {
+        let Some(binding) = self.binding_for_agent_path(agent_path) else {
+            return Ok(None);
+        };
+        self.seal_missing_receipt_for_attempt(
+            agent_path,
+            expected_thread_id,
+            status,
+            binding.attempt_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn seal_missing_receipt_for_attempt(
+        &self,
+        agent_path: &AgentPath,
+        expected_thread_id: ThreadId,
+        status: &AgentStatus,
+        expected_attempt_id: AttemptId,
     ) -> StoreResult<Option<AgentReceipt>> {
         // Retain the complete identity across awaits; a reused path must never select a new child.
         let Some(binding) = self.binding_for_agent_path(agent_path).filter(|binding| {
             binding.thread_id.as_deref() == Some(expected_thread_id.to_string().as_str())
+                && binding.attempt_id == expected_attempt_id
         }) else {
             return Ok(None);
         };
@@ -510,19 +578,64 @@ impl AgentTaskCoordinator {
         {
             return Ok(None);
         }
+        let mut risks = Vec::new();
         if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
             if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
                 return Ok(None);
             }
+            risks.push(format!("Mutation evidence finalization failed: {error}"));
             tracing::warn!(
                 %error,
                 attempt_id = %binding.attempt_id,
                 "typed mutation evidence finalization was unavailable; sealing the missing receipt anyway"
             );
         }
+        // Finalization can change evidence and another turn can renew the binding.
+        let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+        if task.current_attempt.attempt_id != binding.attempt_id
+            || task.receipt.is_some()
+            || task.current_attempt.state != AttemptState::Active
+        {
+            return Ok(None);
+        }
+        let validation_call_ids = task
+            .validation_calls
+            .iter()
+            .filter(|call| call.attempt_id == binding.attempt_id && call.status.is_terminal())
+            .map(|call| call.call_id.clone())
+            .collect();
+        let legacy_outcome = matches!(
+            task.assignment.admission_origin,
+            AssignmentAdmissionOrigin::LegacyMessage { .. }
+        );
+        let (outcome, summary) = match status {
+            AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => {
+                (AgentStatusClaim::Completed, message.clone())
+            }
+            AgentStatus::CompletedWithSurface {
+                last_agent_message, ..
+            } => (
+                AgentStatusClaim::Completed,
+                last_agent_message
+                    .clone()
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or_else(|| "Agent returned a surfaced result.".to_string()),
+            ),
+            AgentStatus::Errored(message) => (AgentStatusClaim::Failed, message.clone()),
+            AgentStatus::Shutdown => (
+                AgentStatusClaim::Abandoned,
+                "Agent shut down before returning a final response.".to_string(),
+            ),
+            _ => (
+                AgentStatusClaim::NeedsMain,
+                "Agent stopped without a final response.".to_string(),
+            ),
+        };
         let receipt = ReceiptDraft {
             status: AgentStatusClaim::NeedsMain,
-            summary,
+            summary: format!(
+                "typed agent {agent_path}, attempt {}, stopped with execution outcome {outcome:?} without submitting a receipt: {summary}", binding.attempt_id
+            ),
             criterion_results: task
                 .assignment
                 .acceptance_criteria
@@ -531,22 +644,28 @@ impl AgentTaskCoordinator {
                     evidence_ref: None,
                     criterion_id: criterion.id.clone(),
                     status: CriterionStatus::NotRun,
-                    evidence: None,
+                    evidence: Some("No criterion report was submitted; acceptance is unverified. Recorded validation calls remain linked separately.".to_string()),
                 })
                 .collect(),
             declared_changes: Vec::new(),
-            validation_call_ids: Vec::new(),
+            validation_call_ids,
             blockers: vec!["typed agent finished without a valid receipt".to_string()],
-            risks: Vec::new(),
+            risks,
             next_action: Some(
-                "main agent must inspect the task and decide the outcome".to_string(),
+                format!("Inspect assignment {} attempt {} and the linked validation calls; check evidence freshness and supply the missing criterion report before accepting the result.", binding.assignment_id, binding.attempt_id),
             ),
             architecture_contract: None,
         };
-        match store
-            .submit_agent_receipt(binding.attempt_id, receipt)
-            .await
-        {
+        let result = if legacy_outcome {
+            store
+                .record_legacy_agent_outcome(binding.attempt_id, outcome, summary)
+                .await
+        } else {
+            store
+                .submit_agent_receipt(binding.attempt_id, receipt)
+                .await
+        };
+        match result {
             Ok(receipt) => {
                 self.mark_task_inactive(binding.assignment_id);
                 Ok(Some(receipt))

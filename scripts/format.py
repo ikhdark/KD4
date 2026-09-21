@@ -3,22 +3,25 @@
 
 import argparse
 import shlex
-import subprocess
 import sys
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.root_maintenance import python_lint_targets  # noqa: E402
-from scripts.root_maintenance import resolved_changed_paths  # noqa: E402
-from scripts.tool_versions import RUSTFMT_TOOLCHAIN  # noqa: E402
-
+from scripts.process_owner import (
+    OwnedThreadPoolExecutor as ThreadPoolExecutor,
+)
+from scripts.process_owner import run_finite
+from scripts.root_maintenance import (
+    python_lint_targets,
+    resolved_changed_paths,
+)
+from scripts.tool_versions import RUSTFMT_TOOLCHAIN
 
 PRETTIER_TARGETS = (
     "*.json",
@@ -190,21 +193,11 @@ def run_formatter_group(group: FormatterGroup) -> FormatterResult:
     returncode = 0
     for command in group.commands:
         output.append(f"$ {shlex.join(command.args)}\n")
-        try:
-            process = subprocess.run(
-                command.args,
-                cwd=command.cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-        except OSError as error:
-            output.append(f"{error}\n")
-            return FormatterResult(group.name, "".join(output), 1)
-
+        process = run_finite(command.args, cwd=command.cwd)
+        if process.output_truncated:
+            output.append("[output truncated; retaining final 65536 bytes]\n")
+        if process.status not in {"passed", "failed"}:
+            output.append(f"[{process.status}]\n")
         output.append(process.stdout)
         if process.stdout and not process.stdout.endswith("\n"):
             output.append("\n")

@@ -103,6 +103,7 @@ pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
     pub(crate) last_task_message: Option<String>,
+    pub(crate) runtime_loaded: bool,
 }
 
 #[cfg(test)]
@@ -510,10 +511,33 @@ impl AgentControl {
             // No agent available if upgrade fails.
             return AgentStatus::NotFound;
         };
-        let Ok(thread) = state.get_thread(agent_id).await else {
+        if let Ok(thread) = state.get_thread(agent_id).await {
+            return thread.agent_status().await;
+        }
+        // Completed actors may be unloaded while their identity and durable receipt remain.
+        let Some(path) = self
+            .state
+            .agent_metadata_for_thread(agent_id)
+            .and_then(|metadata| metadata.agent_path)
+        else {
             return AgentStatus::NotFound;
         };
-        thread.agent_status().await
+        let coordinator = self.task_coordinator();
+        let Some(binding) = coordinator
+            .binding_for_agent_path(&path)
+            .filter(|binding| binding.thread_id.as_deref() == Some(agent_id.to_string().as_str()))
+        else {
+            return AgentStatus::NotFound;
+        };
+        match coordinator
+            .get_agent_task(binding.assignment_id, Some(0))
+            .await
+        {
+            Ok(task) if task.current_attempt.attempt_id == binding.attempt_id => {
+                agent_status_from_task(&task, None).unwrap_or(AgentStatus::NotFound)
+            }
+            _ => AgentStatus::NotFound,
+        }
     }
 
     pub(crate) fn register_session_root(
@@ -652,6 +676,7 @@ impl AgentControl {
             agents.push(ListedAgent {
                 agent_name: root_path.to_string(),
                 agent_status: root_thread.agent_status().await,
+                runtime_loaded: true,
                 last_task_message: Some(ROOT_LAST_TASK_MESSAGE.to_string()),
             });
         }
@@ -667,9 +692,8 @@ impl AgentControl {
                 continue;
             }
 
-            let Ok(thread) = state.get_thread(thread_id).await else {
-                continue;
-            };
+            let status = self.get_status(thread_id).await;
+            let runtime_loaded = state.get_thread(thread_id).await.is_ok();
             let agent_name = metadata
                 .agent_path
                 .as_ref()
@@ -678,7 +702,8 @@ impl AgentControl {
             let last_task_message = metadata.last_task_message.clone();
             agents.push(ListedAgent {
                 agent_name,
-                agent_status: thread.agent_status().await,
+                agent_status: status,
+                runtime_loaded,
                 last_task_message,
             });
         }
@@ -704,6 +729,9 @@ impl AgentControl {
             return None;
         };
         let control = self.clone();
+        let watched_binding = child_agent_path
+            .as_ref()
+            .and_then(|path| self.task_coordinator().binding_for_agent_path(path));
         Some(tokio::spawn(async move {
             let mut status = match control.subscribe_status(child_thread_id).await {
                 Ok(mut status_rx) => {
@@ -728,21 +756,17 @@ impl AgentControl {
                 Some(state) => state.get_thread(child_thread_id).await.ok(),
                 None => None,
             };
-            if let Some(child_agent_path) = child_agent_path.as_ref() {
+            if let (Some(child_agent_path), Some(binding)) =
+                (child_agent_path.as_ref(), watched_binding.as_ref())
+            {
                 let task_coordinator = control.task_coordinator();
-                let assignment_id = task_coordinator
-                    .binding_for_agent_path(child_agent_path)
-                    .filter(|binding| {
-                        binding.thread_id.as_deref() == Some(child_thread_id.to_string().as_str())
-                    })
-                    .map(|binding| binding.assignment_id);
+                let assignment_id = Some(binding.assignment_id);
                 match task_coordinator
-                    .seal_missing_receipt(
+                    .seal_missing_receipt_for_attempt(
                         child_agent_path,
                         child_thread_id,
-                        format!(
-                            "typed agent {child_agent_path} finished with status {status:?} without submitting a receipt"
-                        ),
+                        &status,
+                        binding.attempt_id,
                     )
                     .await
                 {
@@ -774,7 +798,14 @@ impl AgentControl {
                 if let Some(assignment_id) = assignment_id {
                     match task_coordinator.get_agent_task(assignment_id, None).await {
                         Ok(task) => {
-                            if let Some(durable_status) = agent_status_from_task(&task) {
+                            if watched_binding.as_ref().is_some_and(|binding| {
+                                binding.attempt_id != task.current_attempt.attempt_id
+                            }) {
+                                return;
+                            }
+                            if let Some(durable_status) =
+                                agent_status_from_task(&task, Some((binding.attempt_id, &status)))
+                            {
                                 status = durable_status;
                             }
                         }

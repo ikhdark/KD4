@@ -152,7 +152,7 @@ fn validation_commands_do_not_clear_generic_mutation_revision() {
         0,
         false,
     );
-    assert_eq!(tracker.current_mutation_revision(), 1);
+    assert_eq!(tracker.current_mutation_revision(), 3);
 
     tracker.record_exec_command_end(
         &[
@@ -163,7 +163,7 @@ fn validation_commands_do_not_clear_generic_mutation_revision() {
         0,
         false,
     );
-    assert_eq!(tracker.current_mutation_revision(), 2);
+    assert_eq!(tracker.current_mutation_revision(), 4);
 }
 
 #[tokio::test]
@@ -264,7 +264,7 @@ fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
     let mut tracker = TurnDiffTracker::new();
     tracker.record_unknown_mutation();
     tracker.record_exec_command_end(&["cargo".into(), "check".into()], 0, false);
-    assert_eq!(tracker.current_mutation_revision(), 1);
+    assert_eq!(tracker.current_mutation_revision(), 2);
 
     tracker.record_exec_command_end(
         &[
@@ -276,7 +276,7 @@ fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
         0,
         false,
     );
-    assert_eq!(tracker.current_mutation_revision(), 2);
+    assert_eq!(tracker.current_mutation_revision(), 3);
 }
 
 #[test]
@@ -398,8 +398,6 @@ fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
         vec!["grep", "-n", ">>", "file"],
         vec!["bash", "-lc", "rg ' > ' file"],
         vec!["bash", "-lc", "rg '>>' file"],
-        vec!["pwsh", "-Command", "cargo check"],
-        vec!["cmd", "/c", "cargo check"],
         vec!["git", "-ccolor.ui=false", "show", "HEAD"],
         vec!["git", "blame", "file"],
         vec!["git", "rev-list", "HEAD"],
@@ -410,6 +408,8 @@ fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
         assert_eq!(tracker.current_mutation_revision(), 0, "{command:?}");
     }
     for argv in [
+        vec!["pwsh", "-Command", "cargo check"],
+        vec!["cmd", "/c", "cargo check"],
         vec!["bash", "-lc", "cargo build >out.txt"],
         vec!["bash", "-lc", "git show HEAD >out.txt"],
         vec!["bash", "-lc", "git status; touch out.txt"],
@@ -463,7 +463,7 @@ fn arbitrary_script_runners_fail_closed_as_possible_mutations() {
         "-m".into(),
         "pytest".into(),
     ]));
-    assert!(!command_may_mutate(&["cargo".into(), "check".into()]));
+    assert!(command_may_mutate(&["cargo".into(), "check".into()]));
 }
 
 #[test]
@@ -1227,4 +1227,27 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
         fs::read_to_string(path).expect("read large file"),
         new_content
     );
+}
+
+#[test]
+fn git_history_requires_the_executable_and_a_single_command() {
+    for command in [
+        vec!["python", "worker.py", "git", "log"],
+        vec!["bash", "-lc", "git log -1\ncat src/lib.rs"],
+        vec!["pwsh", "-Command", "git log; Get-Content src/lib.rs"],
+    ] {
+        let command = command.into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert!(!command_reads_repository_history(&command), "{command:?}");
+    }
+    assert!(command_may_mutate(&[
+        "python".into(),
+        "worker.py".into(),
+        "git".into(),
+        "log".into()
+    ]));
+    assert!(command_reads_repository_history(&[
+        "git".into(),
+        "log".into(),
+        "-1".into()
+    ]));
 }

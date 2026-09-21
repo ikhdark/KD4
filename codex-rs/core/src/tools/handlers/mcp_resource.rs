@@ -1010,7 +1010,7 @@ async fn emit_tool_call_end(
 
 async fn execute_resource_call<F>(
     session: &Arc<Session>,
-    turn: &TurnContext,
+    turn: &Arc<TurnContext>,
     call_id: &str,
     invocation: McpInvocation,
     cancellation_token: CancellationToken,
@@ -1019,15 +1019,25 @@ async fn execute_resource_call<F>(
 where
     F: Future<Output = Result<McpResourceToolOutput, FunctionCallError>>,
 {
-    emit_tool_call_begin(session, turn, call_id, invocation.clone()).await;
+    let delivered = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => false,
+        _ = emit_tool_call_begin(session, turn, call_id, invocation.clone()) => true,
+    };
     let start = Instant::now();
     tokio::pin!(operation);
-    let result = tokio::select! {
-        biased;
-        result = &mut operation => result,
-        _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
-            MCP_RESOURCE_CALL_CANCELLED_MESSAGE.to_string(),
-        )),
+    let result = if !delivered {
+        Err(FunctionCallError::RespondToModel(
+            MCP_RESOURCE_CALL_CANCELLED_MESSAGE.into(),
+        ))
+    } else {
+        tokio::select! {
+            biased;
+            result = &mut operation => result,
+            _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
+                MCP_RESOURCE_CALL_CANCELLED_MESSAGE.to_string(),
+            )),
+        }
     };
 
     let terminal_result = match result.as_ref() {
@@ -1041,15 +1051,27 @@ where
         }
         Err(err) => Err(err.to_string()),
     };
-    emit_tool_call_end(
-        session,
-        turn,
-        call_id,
-        invocation,
-        start.elapsed(),
-        terminal_result,
-    )
-    .await;
+    let terminal_session = Arc::clone(session);
+    let terminal_turn = Arc::clone(turn);
+    let call_id = call_id.to_owned();
+    let mut terminal = session.terminal_tasks.spawn(async move {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            emit_tool_call_end(
+                &terminal_session,
+                &terminal_turn,
+                &call_id,
+                invocation,
+                start.elapsed(),
+                terminal_result,
+            ),
+        )
+        .await;
+    });
+    tokio::select! {
+        _ = &mut terminal => {},
+        _ = cancellation_token.cancelled() => {},
+    }
 
     result.map(boxed_tool_output)
 }

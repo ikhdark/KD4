@@ -11,7 +11,9 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
-use crate::tools::handlers::command_preflight::powershell_single_quoted_literal;
+fn powershell_single_quoted_literal(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;

@@ -11,7 +11,9 @@ pub(crate) enum UnifiedExecError {
     CreateProcess { message: String },
     #[error("Unified exec process failed: {message}")]
     ProcessFailed { message: String },
-    #[error("tool-history persistence failed after command completion: {message}")]
+    #[error(
+        "command completed with exit code {exit_code}; tool-history persistence failed: {message}. Do not repeat completed effects"
+    )]
     ToolHistoryPersistence {
         message: String,
         exit_code: i32,

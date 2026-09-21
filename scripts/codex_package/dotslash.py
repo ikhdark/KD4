@@ -16,6 +16,8 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
 from urllib.request import urlopen
+import time
+from scripts.process_owner import check_operation
 
 from .targets import TargetSpec
 
@@ -286,8 +288,17 @@ def download_archive(url: str, archive_path: Path) -> None:
     temp_path = Path(temp_file.name)
     try:
         with temp_file as out:
-            with urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECS) as response:
-                shutil.copyfileobj(response, out, length=HASH_CHUNK_BYTES)
+            deadline = time.monotonic() + DOWNLOAD_TIMEOUT_SECS
+            check_operation()
+            with urlopen(url, timeout=min(5, DOWNLOAD_TIMEOUT_SECS)) as response:
+                while True:
+                    check_operation()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("dependency transfer deadline expired")
+                    chunk = response.read(HASH_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    out.write(chunk)
         temp_path.replace(archive_path)
     finally:
         temp_path.unlink(missing_ok=True)

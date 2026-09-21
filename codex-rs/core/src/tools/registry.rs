@@ -1158,6 +1158,64 @@ impl ToolRegistry {
         ))
     }
 
+    pub(crate) async fn prepare_hook_input(
+        &self,
+        mut invocation: ToolInvocation,
+    ) -> Result<(ToolInvocation, Option<String>), FunctionCallError> {
+        if !invocation
+            .session
+            .hooks()
+            .has_handler_for(HookEventName::PreToolUse)
+        {
+            return Ok((invocation, None));
+        }
+        let Some(registered) = self.tools.get(&invocation.tool_name) else {
+            return Ok((invocation, None));
+        };
+        let tool = registered.runtime();
+        let parsed = ParsedFunctionArguments::from_payload(&invocation.payload);
+        let payload = with_parsed_function_arguments(parsed.clone(), async {
+            tool.pre_tool_use_payload(&invocation)
+        })
+        .await;
+        let Some(payload) = payload else {
+            return Ok((invocation, None));
+        };
+        let started = Instant::now();
+        let result = run_pre_tool_use_hooks(
+            &invocation.session,
+            &invocation.step_context.turn,
+            invocation.call_id.clone(),
+            &payload.tool_name,
+            &payload.tool_input,
+        )
+        .await;
+        record_lifecycle_phase(&invocation, "pre_hooks", started);
+        match result {
+            PreToolUseHookResult::Blocked(message) => {
+                Err(FunctionCallError::RespondToModel(message))
+            }
+            PreToolUseHookResult::Continue {
+                updated_input: None,
+            } => Ok((invocation, None)),
+            PreToolUseHookResult::Continue {
+                updated_input: Some(updated),
+            } => {
+                let notice = format!(
+                    "PreToolUse hook changed the input for tool `{}` (call `{}`). The tool will receive this input: {}",
+                    invocation.tool_name,
+                    invocation.call_id,
+                    truncate_text_to_token_ceiling(&updated.to_string(), 512)
+                );
+                invocation = with_parsed_function_arguments(parsed, async {
+                    tool.with_updated_hook_input(invocation, updated)
+                })
+                .await?;
+                Ok((invocation, Some(notice)))
+            }
+        }
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
@@ -1308,34 +1366,12 @@ impl ToolRegistry {
             return Err(error);
         }
 
-        let mut hook_rewrote_input = false;
-        let mut hook_input_notice = None;
-        let pre_tool_use_payload = if invocation
-            .session
-            .hooks()
-            .has_handler_for(HookEventName::PreToolUse)
-        {
-            with_parsed_function_arguments(parsed_function_arguments.clone(), async {
-                tool.pre_tool_use_payload(&invocation)
-            })
-            .await
-        } else {
-            None
-        };
-        if let Some(pre_tool_use_payload) = pre_tool_use_payload {
-            let phase_started = Instant::now();
-            let pre_tool_use_result = run_pre_tool_use_hooks(
-                &invocation.session,
-                &invocation.step_context.turn,
-                invocation.call_id.clone(),
-                &pre_tool_use_payload.tool_name,
-                &pre_tool_use_payload.tool_input,
-            )
-            .await;
-            record_lifecycle_phase(&invocation, "pre_hooks", phase_started);
-            match pre_tool_use_result {
-                PreToolUseHookResult::Blocked(message) => {
-                    let err = FunctionCallError::RespondToModel(message);
+        let prepared = PREPARED_HOOK_INPUT.try_with(Clone::clone).ok();
+        let (prepared_invocation, hook_input_notice) = match prepared {
+            Some(notice) => (invocation, notice),
+            None => match self.prepare_hook_input(invocation.clone()).await {
+                Ok(prepared) => prepared,
+                Err(err) => {
                     dispatch_trace.record_failed(&err).await;
                     notify_tool_finish_if_unclaimed(
                         &invocation,
@@ -1345,56 +1381,24 @@ impl ToolRegistry {
                     .await;
                     return Err(err);
                 }
-                PreToolUseHookResult::Continue {
-                    updated_input: Some(updated_input),
-                } => {
-                    let notice = format!(
-                        "PreToolUse hook changed the input for tool `{tool_name_flat}` (call `{call_id_owned}`). The tool will receive this input: {updated_input}"
-                    );
-                    match with_parsed_function_arguments(parsed_function_arguments.clone(), async {
-                        tool.with_updated_hook_input(invocation.clone(), updated_input)
-                    })
-                    .await
-                    {
-                        Ok(updated_invocation) => {
-                            invocation = updated_invocation;
-                            parsed_function_arguments =
-                                ParsedFunctionArguments::from_payload(&invocation.payload);
-                            hook_rewrote_input = true;
-                            hook_input_notice = Some(notice);
-                            let rewritten_tool_name = flat_tool_name(&invocation.tool_name);
-                            rewritten_source_dependencies = crate::tool_history::tool_observes_workspace(
-                                rewritten_tool_name.as_ref(),
-                            )
-                            .then(|| {
-                                crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
-                                    rewritten_tool_name.as_ref(),
-                                    &invocation.payload,
-                                    parsed_function_arguments
-                                        .as_ref()
-                                        .and_then(|parsed| parsed.value().ok()),
-                                    invocation.step_context.turn.config.cwd.as_path(),
-                                )
-                            });
-                        }
-                        Err(err) => {
-                            dispatch_trace.record_failed(&err).await;
-                            notify_tool_finish_if_unclaimed(
-                                &invocation,
-                                dispatch_state.as_ref(),
-                                ToolCallOutcome::Failed {
-                                    handler_executed: false,
-                                },
-                            )
-                            .await;
-                            return Err(err);
-                        }
-                    }
-                }
-                PreToolUseHookResult::Continue {
-                    updated_input: None,
-                } => {}
-            }
+            },
+        };
+        invocation = prepared_invocation;
+        let hook_rewrote_input = hook_input_notice.is_some();
+        if hook_rewrote_input {
+            parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
+            let name = flat_tool_name(&invocation.tool_name);
+            rewritten_source_dependencies =
+                crate::tool_history::tool_observes_workspace(name.as_ref()).then(|| {
+                    crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
+                        name.as_ref(),
+                        &invocation.payload,
+                        parsed_function_arguments
+                            .as_ref()
+                            .and_then(|parsed| parsed.value().ok()),
+                        invocation.step_context.turn.config.cwd.as_path(),
+                    )
+                });
         }
         // Recorded after PreToolUse hooks so a hook sees only earlier dispatches.
         invocation
@@ -1444,10 +1448,14 @@ impl ToolRegistry {
                 &invocation.step_context.turn,
                 vec![notice],
             )
-            .await;
+            .await
+            .map_err(|error| {
+                FunctionCallError::Fatal(format!("Could not record hook input context: {error}"))
+            })?;
         }
 
         let invocation_for_tool = invocation.clone();
+        let handler_dispatch_state = Arc::clone(&dispatch_state);
         let log_payload = invocation.payload.log_payload();
 
         let phase_started = Instant::now();
@@ -1462,6 +1470,7 @@ impl ToolRegistry {
                     let tool = tool.clone();
                     let parsed_function_arguments = parsed_function_arguments.clone();
                     async move {
+                        handler_dispatch_state.mark_handler_started();
                         with_parsed_function_arguments(
                             parsed_function_arguments,
                             handle_any_tool(tool.as_ref(), invocation_for_tool),
@@ -1527,6 +1536,7 @@ impl ToolRegistry {
             } else {
                 None
             };
+        let mut hook_context_error = None;
         if let (Ok(result), Some(outcome)) = (&mut result, post_tool_use_outcome) {
             let phase_started = Instant::now();
             let additional_contexts = apply_post_tool_use_outcome(result, outcome);
@@ -1543,14 +1553,22 @@ impl ToolRegistry {
                     .queue_post_tool_contexts(&invocation.call_id, contexts)
                     .await;
             } else {
-                record_additional_contexts(
+                if let Err(error) = record_additional_contexts(
                     &invocation.session,
                     &invocation.step_context.turn,
                     additional_contexts,
                 )
-                .await;
+                .await
+                {
+                    hook_context_error = Some(FunctionCallError::Fatal(format!(
+                        "Could not record post-tool context: {error}"
+                    )));
+                }
             }
             record_lifecycle_phase(&invocation, "additional_context", phase_started);
+        }
+        if let Some(error) = hook_context_error {
+            result = Err(error);
         }
 
         // A cooperative runtime can finish teardown after cancellation has
@@ -1683,9 +1701,6 @@ impl ToolRegistry {
                     dispatch_trace.record_failed(&err).await;
                     return Err(err);
                 }
-                let phase_started = Instant::now();
-                notify_tool_finish(&invocation, lifecycle_outcome).await;
-                record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                 dispatch_trace
                     .record_completed(
                         &invocation,
@@ -1695,6 +1710,11 @@ impl ToolRegistry {
                     )
                     .await;
                 if dispatch_state.try_complete() {
+                    // The projected result and required commits are settled. A
+                    // delayed observer must not turn these effects into an abort.
+                    let phase_started = Instant::now();
+                    notify_tool_finish(&invocation, lifecycle_outcome).await;
+                    record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                     Ok(result)
                 } else {
                     Err(FunctionCallError::RespondToModel(
@@ -1703,15 +1723,16 @@ impl ToolRegistry {
                 }
             }
             Err(err) => {
-                let phase_started = Instant::now();
-                notify_tool_finish(&invocation, lifecycle_outcome).await;
-                record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                 dispatch_trace.record_failed(&err).await;
-                if dispatch_state.try_complete()
-                    || (dispatch_state.is_aborted() && invocation.tool_name.name == "apply_patch")
+                if dispatch_state.try_complete() {
+                    let phase_started = Instant::now();
+                    notify_tool_finish(&invocation, lifecycle_outcome).await;
+                    record_lifecycle_phase(&invocation, "notify_finish", phase_started);
+                    Err(err)
+                } else if dispatch_state.is_aborted() && invocation.tool_name.name == "apply_patch"
                 {
-                    // The cancellation owner retains patch recovery information after
-                    // joining the committed mutation cleanup. It still owns publication.
+                    // The cancellation owner retains committed patch recovery information
+                    // and owns the single aborted lifecycle notification.
                     Err(err)
                 } else {
                     Err(FunctionCallError::RespondToModel(
@@ -1840,7 +1861,15 @@ fn admission_only_artifact_is_profitable(canonical: &CanonicalToolResult) -> boo
     !canonical.complete || canonical.exact_bytes >= LAZY_CANONICAL_ARTIFACT_MIN_BYTES
 }
 
+pub(crate) async fn with_prepared_hook_input<F: std::future::Future>(
+    notice: Option<String>,
+    future: F,
+) -> F::Output {
+    PREPARED_HOOK_INPUT.scope(notice, future).await
+}
+
 tokio::task_local! {
+    static PREPARED_HOOK_INPUT: Option<String>;
     static PRECOMPUTED_PROJECTION_SOURCE_DEPENDENCIES:
         std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>;
 }
@@ -2016,7 +2045,13 @@ async fn prepare_model_projection(
     let needs_canonical_artifact = result.result.requires_canonical_artifact()
         || projection_truncated
         || has_predetermined_selectors;
-    if !needs_canonical_artifact && !force_inline_carrier && !track_for_admission {
+    let retain_for_history = track_for_admission
+        && invocation
+            .step_context
+            .turn
+            .config
+            .completed_tool_history_projection;
+    if !needs_canonical_artifact && !force_inline_carrier && !retain_for_history {
         return None;
     }
     let materialization = if force_inline_carrier {
@@ -2527,12 +2562,28 @@ fn select_typed_projection_fragments(
         .saturating_sub(headings_tokens)
         .checked_div(active_kinds.max(1))
         .unwrap_or(0);
+    let demands = PROJECTION_FRAGMENT_KIND_ORDER.map(|kind| {
+        unique
+            .iter()
+            .filter(|fragment| fragment.kind == kind)
+            .map(|fragment| approx_token_count(&fragment.text).saturating_add(1))
+            .sum::<usize>()
+    });
+    let mut allocations = demands.map(|demand| demand.min(section_budget));
+    let mut spare = token_limit
+        .saturating_sub(headings_tokens)
+        .saturating_sub(allocations.iter().sum::<usize>());
+    for (allocation, demand) in allocations.iter_mut().zip(demands) {
+        let extra = spare.min(demand.saturating_sub(*allocation));
+        *allocation += extra;
+        spare -= extra;
+    }
     let mut sections = Vec::new();
     let mut selected_fragments = 0;
     let mut selected_ids = Vec::new();
     let mut partial_ids = Vec::new();
 
-    for kind in PROJECTION_FRAGMENT_KIND_ORDER {
+    for (kind, allocation) in PROJECTION_FRAGMENT_KIND_ORDER.into_iter().zip(allocations) {
         let section_fragments = unique
             .iter()
             .filter(|fragment| fragment.kind == kind)
@@ -2540,7 +2591,7 @@ fn select_typed_projection_fragments(
         if section_fragments.is_empty() {
             continue;
         }
-        let mut remaining_budget = section_budget;
+        let mut remaining_budget = allocation;
         let mut bounded_fragments = Vec::new();
         for fragment in section_fragments {
             if remaining_budget == 0 {
@@ -2575,7 +2626,11 @@ fn select_typed_projection_fragments(
         ));
     }
 
-    let projected = truncate_text_to_token_ceiling(&sections.join("\n\n"), token_limit);
+    let selected_text = sections.join("\n\n");
+    let projected = truncate_text_to_token_ceiling(&selected_text, token_limit);
+    if projected != selected_text {
+        partial_ids = selected_ids.clone();
+    }
     let selected_id_set = selected_ids.iter().collect::<HashSet<_>>();
     let omitted_inline_ids = unique
         .iter()
@@ -2895,7 +2950,6 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
         .map(|section| section.id.clone())
         .collect::<Vec<_>>();
-    let omitted_section_count = omitted_sections.len() as u64;
     let mut envelope = ToolProjectionV1 {
         version: 1,
         tool: tool_name.clone(),
@@ -2911,11 +2965,13 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         omitted_sections,
         result: result_value,
     };
+    let fitted = serialize_projection_with_limit(envelope, &projected_text, applied_token_limit)?;
+    envelope = fitted.envelope()?.clone();
     let (predetermined_ranges, predetermined_json_pointers) =
         validated_omitted_predetermined_selectors(
             &predetermined_ranges,
             &predetermined_json_pointers,
-            &canonical.sections,
+            &envelope.sections,
             &canonical.json_pointers,
         );
     let (drained_content, mut deterministic_continuation_receipt) =
@@ -2926,7 +2982,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             &canonical.sha256,
             predetermined_ranges,
             predetermined_json_pointers,
-            &canonical.sections,
+            &envelope.sections,
             &canonical.json_pointers,
             applied_token_limit,
         )
@@ -2952,6 +3008,10 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         bounded =
             serialize_projection_with_limit(base_envelope, &projected_text, applied_token_limit)?;
     }
+    let final_envelope = bounded.envelope()?;
+    let omitted_section_count = final_envelope.omitted_sections.len() as u64;
+    let projection_truncated = projection_truncated
+        || final_envelope.result["selected_text"].as_str() != Some(projected_text.as_str());
     let rendered = bounded.rendered().to_string();
     let projected_tokens =
         approx_token_count(&rendered).saturating_add(retained_non_text_tokens) as u64;
@@ -3472,8 +3532,35 @@ fn serialize_projection_with_limit(
     let effective_limit = token_limit.max(1);
     let mut output_limit = effective_limit;
     loop {
-        envelope.result["selected_text"] =
-            Value::String(truncate_text_to_token_ceiling(output, output_limit));
+        let retained = truncate_text_to_token_ceiling(output, output_limit);
+        if retained != output {
+            for section in &mut envelope.sections {
+                if section.inclusion == ToolProjectionInclusion::Included {
+                    section.inclusion = ToolProjectionInclusion::Omitted;
+                }
+            }
+            envelope.omitted_sections = envelope
+                .sections
+                .iter()
+                .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
+                .map(|section| section.id.clone())
+                .collect();
+            if let Some(selection) = envelope.result.get_mut("selection") {
+                let selected = selection["selected_ids"].clone();
+                selection["partial_ids"] = selected.clone();
+                if retained.is_empty() {
+                    let mut omitted = selection["omitted_inline_ids"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    omitted.extend(selected.as_array().cloned().unwrap_or_default());
+                    selection["omitted_inline_ids"] = omitted.into();
+                    selection["selected_ids"] = serde_json::json!([]);
+                    selection["partial_ids"] = serde_json::json!([]);
+                }
+            }
+        }
+        envelope.result["selected_text"] = Value::String(retained);
         let rendered = render_projection_with_exact_metrics(&mut envelope)?;
         let rendered_tokens = approx_token_count(&rendered);
         if rendered_tokens <= effective_limit {

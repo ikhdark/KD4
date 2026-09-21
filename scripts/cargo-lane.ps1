@@ -32,6 +32,7 @@ function Parse-CargoLaneArguments {
     $parsedLanesRoot = $null
     $parsedIsolateCargoHome = $false
     $parsedFetch = $false
+    $maintenanceOnly = $false
     $commandStart = $RawArgs.Count
 
     for ($i = 0; $i -lt $RawArgs.Count; $i++) {
@@ -75,6 +76,10 @@ function Parse-CargoLaneArguments {
             $parsedFetch = $true
             continue
         }
+        if ($arg -eq "-MaintenanceOnly") {
+            $maintenanceOnly = $true
+            continue
+        }
         if ($null -eq $parsedLane -and -not $arg.StartsWith("-", [StringComparison]::Ordinal)) {
             if (Test-CargoLaneCommandToken -Value $arg) {
                 throw "First positional argument '$arg' looks like a command. Pass -Lane <name> before the command."
@@ -110,6 +115,7 @@ function Parse-CargoLaneArguments {
         LanesRoot = $parsedLanesRoot
         IsolateCargoHome = $parsedIsolateCargoHome
         Fetch = $parsedFetch
+        MaintenanceOnly = $maintenanceOnly
         Command = @($RawArgs | Select-Object -Skip $commandStart)
     }
 }
@@ -337,6 +343,7 @@ function Get-ActiveCargoLaneNames {
     $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if (Test-Path -LiteralPath $LanesRoot -PathType Container) {
         foreach ($lane in @(Get-ChildItem -LiteralPath $LanesRoot -Directory -ErrorAction SilentlyContinue)) {
+            if (($lane.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
             if ((Test-CargoLockBusy -TargetDir $lane.FullName) -or (Test-LaneActiveLockBusy -TargetDir $lane.FullName)) {
                 [void]$names.Add((ConvertTo-SafeLaneName $lane.Name))
             }
@@ -511,7 +518,8 @@ function Write-CargoLaneTrashCleanupLog {
 
 function Start-CargoLaneTrashCleanup {
     param(
-        [string]$LanesRoot
+        [string]$LanesRoot,
+        [switch]$Prune
     )
 
     if ($env:CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE -eq "1") {
@@ -524,7 +532,7 @@ function Start-CargoLaneTrashCleanup {
     $firstTrash = @(Get-ChildItem -LiteralPath $LanesRoot -Directory -Filter "*.trash-*" -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match "\.trash-\d{17}$" } |
         Select-Object -First 1)
-    if ($firstTrash.Count -eq 0) {
+    if (-not $Prune -and $firstTrash.Count -eq 0) {
         return
     }
 
@@ -545,7 +553,7 @@ function Start-CargoLaneTrashCleanup {
         # Start-Process joins -ArgumentList with spaces without quoting under
         # Windows PowerShell 5.1, so paths containing spaces must be quoted
         # explicitly or the worker's parameters are split and never bind.
-        Start-Process -FilePath $shell -WindowStyle Hidden -ArgumentList @(
+        $workerArgs = @(
             "-NoLogo",
             "-NoProfile",
             "-ExecutionPolicy",
@@ -554,7 +562,9 @@ function Start-CargoLaneTrashCleanup {
             ('"{0}"' -f $workerPath),
             "-LanesRoot",
             ('"{0}"' -f $LanesRoot)
-        ) | Out-Null
+        )
+        if ($Prune) { $workerArgs += "-Prune" }
+        Start-Process -FilePath $shell -WindowStyle Hidden -ArgumentList $workerArgs | Out-Null
     }
     catch {
         Write-CargoLaneTrashCleanupLog -LogPath $logPath -Message ("failed to start trash cleanup worker: {0}" -f $_.Exception.Message)
@@ -697,55 +707,11 @@ function Get-CargoLaneLastUsed {
     return $newest
 }
 
-function Resolve-CargoLaneName {
-    param(
-        [string]$RequestedLane,
-        [string[]]$CommandArgs,
-        [string]$LanesRoot,
-        [string[]]$ActiveNames = @()
-    )
-
-    if ($RequestedLane -ne "auto") {
-        return $RequestedLane
-    }
-
-    $baseLane = Get-AffinityLaneBase -CommandArgs $CommandArgs
-    $active = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in @($ActiveNames)) {
-        [void]$active.Add($name)
-    }
-
-    $warmLanes = @()
-    if (Test-Path -LiteralPath $LanesRoot -PathType Container) {
-        $warmLanes = @(Get-ChildItem -LiteralPath $LanesRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -eq $baseLane -or $_.Name -match "^$([regex]::Escape($baseLane))-\d+$" } |
-            Sort-Object -Property @{ Expression = { Get-CargoLaneLastUsed -Lane $_ }; Descending = $true }, Name)
-    }
-
-    foreach ($lane in $warmLanes) {
-        if (-not $active.Contains($lane.Name)) {
-            return $lane.Name
-        }
-    }
-
-    if (-not $active.Contains($baseLane)) {
-        return $baseLane
-    }
-
-    for ($i = 2; $i -le 64; $i++) {
-        $candidate = "$baseLane-$i"
-        if (-not $active.Contains($candidate)) {
-            return $candidate
-        }
-    }
-
-    throw "Could not find an idle cargo lane for '$baseLane'."
-}
-
 function Acquire-CargoLaneReservation {
     param(
         [string]$LaneRoot,
         [string]$BaseLane,
+        [switch]$PreferWarm,
         [string[]]$ActiveNames = @()
     )
 
@@ -780,13 +746,22 @@ function Acquire-CargoLaneReservation {
             }
         }
 
-        for ($i = 0; $i -le 64; $i++) {
-            $candidate = if ($i -eq 0) { $BaseLane } else { "$BaseLane-$($i + 1)" }
+        $candidates = @()
+        if ($PreferWarm) {
+            $candidates += @(Get-ChildItem -LiteralPath $LaneRoot -Directory -ErrorAction Stop |
+                Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($_.Name -eq $BaseLane -or $_.Name -match "^$([regex]::Escape($BaseLane))-\d+$") } |
+                Sort-Object -Property @{ Expression = { Get-CargoLaneLastUsed -Lane $_ }; Descending = $true }, Name |
+                ForEach-Object { $_.Name })
+        }
+        $candidates += @($BaseLane) + @(2..65 | ForEach-Object { "$BaseLane-$_" })
+        foreach ($candidate in @($candidates | Select-Object -Unique)) {
             if ($active.Contains($candidate)) {
                 continue
             }
             $target = Join-Path $LaneRoot $candidate
+            if (Test-CargoLanesRootReparsePoint -LanesRoot $target) { continue }
             New-Item -ItemType Directory -Force -Path $target | Out-Null
+            if (Test-CargoLanesRootReparsePoint -LanesRoot $target) { continue }
             # The earlier process/lock snapshot can be stale while waiting for
             # coordination. Recheck Cargo's profile locks before reservation.
             if (Test-CargoLockBusy -TargetDir $target) { continue }
@@ -915,6 +890,10 @@ else {
     $cargoLanesRoot = Join-Path $rustRoot "target\lanes"
 }
 Initialize-CargoLanesRoot -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot
+if ($parsedArgs.MaintenanceOnly) {
+    Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames @()
+    exit 0
+}
 $commandArgs = @($Command)
 if ($commandArgs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($commandArgs[0])) {
     $commandArgs = @()
@@ -922,20 +901,33 @@ if ($commandArgs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($commandArgs[0]))
 
 $requestedLane = Normalize-RequestedLaneName $Lane
 $activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
-$candidateLane = Resolve-CargoLaneName -RequestedLane $requestedLane -CommandArgs $commandArgs -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames
+$candidateLane = if ($requestedLane -eq "auto") { Get-AffinityLaneBase -CommandArgs $commandArgs } else { $requestedLane }
 $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
-$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames
+$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames -PreferWarm:($requestedLane -eq "auto")
 try {
     $resolvedLane = $reservation.Lane
     $targetDir = $reservation.TargetDir
+    Push-Location $rustRoot
+    $didPushLocation = $true
+    $commandArgs = @(Add-CargoTargetDirArgument -CommandArgs $commandArgs -TargetDir $targetDir)
     $env:CODEX_CARGO_LANE_TARGET_DIR = $targetDir
     if ($requestedLane -ne "auto" -and $resolvedLane -ne $requestedLane) {
         Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
     }
     Update-CargoLaneLastUsed -TargetDir $targetDir
     try {
-        Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames -ExcludedNames @($resolvedLane)
+        if ($env:CODEX_CARGO_LANE_MAINTENANCE_SYNC -eq "1") {
+            Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames -ExcludedNames @($resolvedLane)
+        }
+        else {
+            $stamp = Join-Path $cargoLanesRoot ".gc-stamp"
+            $retry = Join-Path $cargoLanesRoot ".gc-retry"
+            $interval = Get-EnvIntValue -Name "CODEX_CARGO_LANE_GC_INTERVAL_HOURS" -DefaultValue 1 -MinimumValue 0
+            $due = -not (Test-Path -LiteralPath $stamp) -or ((Get-Date) - (Get-Item -LiteralPath $stamp).LastWriteTime).TotalHours -ge $interval
+            $retryReady = -not (Test-Path -LiteralPath $retry) -or ((Get-Date) - (Get-Item -LiteralPath $retry).LastWriteTime).TotalSeconds -ge 60
+            Start-CargoLaneTrashCleanup -LanesRoot $cargoLanesRoot -Prune:($due -and $retryReady)
+        }
     }
     catch {
         Write-Warning "Cargo lane pruning failed unexpectedly ($($_.Exception.Message)); continuing without pruning."
@@ -965,8 +957,6 @@ try {
         Enable-SccacheForLane -RepoRoot $repoRoot
     }
 
-    Push-Location $rustRoot
-    $didPushLocation = $true
     if ($Fetch) {
         cargo fetch --locked
         if ($LASTEXITCODE -ne 0) {
@@ -997,7 +987,6 @@ try {
     # cargo itself uses --target-dir, so never export the lane and drop any
     # inherited value; cargo commands receive the lane as an argument instead.
     Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-    $commandArgs = @(Add-CargoTargetDirArgument -CommandArgs $commandArgs -TargetDir $targetDir)
     $program = $commandArgs[0]
     $arguments = @($commandArgs | Select-Object -Skip 1)
     $global:LASTEXITCODE = $null

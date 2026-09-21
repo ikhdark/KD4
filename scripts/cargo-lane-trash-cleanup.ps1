@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$LanesRoot,
+    [switch]$Prune,
     [int]$MaxPasses = 3,
     [int]$RetryDelaySeconds = 5
 )
@@ -161,6 +162,16 @@ try {
             Write-CleanupLog ("could not acquire cleanup worker lock: {0}" -f $_.Exception.Message)
         }
         exit 0
+    }
+
+    if ($Prune) {
+        # Reuse the synchronous administrative implementation after acquiring
+        # the worker lock. Python discovers current owners, not a launch snapshot.
+        $env:CODEX_CARGO_LANE_ACTIVE_NAMES = $null
+        $env:CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE = "1"
+        $shell = (Get-Process -Id $PID).Path
+        & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "cargo-lane.ps1") -Lane maintenance -LanesRoot $root -MaintenanceOnly *>> $logPath
+        if ($LASTEXITCODE -ne 0) { Write-CleanupLog "maintenance command failed with exit code $LASTEXITCODE" }
     }
 
     for ($pass = 1; $pass -le $MaxPasses; $pass++) {

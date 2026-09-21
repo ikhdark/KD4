@@ -235,6 +235,20 @@ fn build_tool_specs_and_registry(
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
+    if crate::agent::task_capabilities::is_independent_review_source(&turn_context.session_source) {
+        planned_tools.runtimes.retain(|runtime| {
+            matches!(
+                runtime.authorization_class(),
+                TypedToolClass::AgentCommunication
+                    | TypedToolClass::OwnTask
+                    | TypedToolClass::ReadSearch
+                    | TypedToolClass::CodeModeControl
+                    | TypedToolClass::Shell
+            ) || (runtime.authorization_class() == TypedToolClass::DynamicExternal
+                && runtime.external_mutation_intent()
+                    == crate::agent::task_capabilities::ExternalMutationIntent::ProvenReadOnly)
+        });
+    }
     promote_deferred_tools(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     retain_unique_planned_tool_names(&mut planned_tools);
@@ -659,7 +673,7 @@ fn build_code_mode_executors(
 
     let mut code_mode_nested_tool_specs = Vec::new();
     let mut deferred_code_mode_nested_tool_specs = Vec::new();
-    let mut eager_nested_tool_descriptions = Vec::new();
+    let mut eager_nested_tool_definitions = Vec::new();
     let mut direct_only_tool_names = Vec::new();
     let mut has_deferred_tools = false;
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
@@ -693,38 +707,14 @@ fn build_code_mode_executors(
             // keep their schemas lazy to avoid rebuilding the prompt around
             // an external inventory that can change between turns.
             if executor.authorization_class() != TypedToolClass::DynamicExternal
-                && let Some(mut definition) =
-                    codex_tools::tool_spec_to_code_mode_tool_definition(&spec)
+                && let Some(mut definition) = codex_tools::code_mode_tool_definition_for_spec(&spec)
             {
-                let direct_description =
-                    if is_hidden_by_code_mode_only(turn_context, executor.tool_name(), exposure) {
-                        None
-                    } else {
-                        match &spec {
-                            ToolSpec::Function(tool) => Some(tool.description.as_str()),
-                            ToolSpec::Freeform(tool) => Some(tool.description.as_str()),
-                            _ => None,
-                        }
-                    };
-                if let Some(description) = direct_description
-                    && let Some(declaration) =
-                        definition.description.strip_prefix(description.trim())
+                if !is_hidden_by_code_mode_only(turn_context, executor.tool_name(), exposure)
+                    && matches!(&spec, ToolSpec::Function(_) | ToolSpec::Freeform(_))
                 {
-                    let duplicate_prefix_len =
-                        definition.description.len() - declaration.trim_start().len();
-                    definition
-                        .description
-                        .replace_range(..duplicate_prefix_len, "");
+                    definition.description.clear();
                 }
-                tracing::debug!(
-                    target: "codex_core::tool_schema_audit",
-                    tool = %executor.tool_name(),
-                    declaration_bytes = definition.description.len(),
-                    declaration_approx_tokens = codex_utils_output_truncation::approx_token_count(&definition.description),
-                    declaration_sha256 = %crate::tool_history::sha256(definition.description.as_bytes()),
-                    "eager built-in declaration"
-                );
-                eager_nested_tool_descriptions.push(definition.description);
+                eager_nested_tool_definitions.push(definition);
             }
             code_mode_nested_tool_specs.push(spec);
         }
@@ -732,6 +722,13 @@ fn build_code_mode_executors(
 
     direct_only_tool_names.sort();
     direct_only_tool_names.dedup();
+    let eager_nested_tool_descriptions = if eager_nested_tool_definitions.is_empty() {
+        Vec::new()
+    } else {
+        vec![codex_code_mode::render_code_mode_tool_bundle(
+            &eager_nested_tool_definitions,
+        )]
+    };
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
         create_code_mode_tool(
             tool_mode == ToolMode::CodeModeOnly,
@@ -1057,6 +1054,15 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         }
         planned_tools.add_with_authorization_class(
             RequestPluginInstallHandler::new(candidates.tools.clone(), candidates.presentation),
+            TypedToolClass::DynamicExternal,
+        );
+    } else if tool_suggest_enabled(turn_context) && context.tool_suggest_candidates.is_none() {
+        planned_tools.add_with_authorization_class(
+            ListAvailablePluginsToInstallHandler::on_demand(),
+            TypedToolClass::ReadSearch,
+        );
+        planned_tools.add_with_authorization_class(
+            RequestPluginInstallHandler::on_demand(),
             TypedToolClass::DynamicExternal,
         );
     }

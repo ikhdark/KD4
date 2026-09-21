@@ -225,12 +225,7 @@ async fn observe_rg_search_scope_state_with(
     };
     let observation = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let first = capture(&state_paths, &mut budget)?;
-        // Each traversal must be able to inspect the same scope. Retain the
-        // shared deadline and cancellation so the optional cache stays bounded.
-        budget.remaining = SEARCH_SNAPSHOT_MAX_ENTRIES;
-        let second = capture(&state_paths, &mut budget)?;
-        (first == second).then_some(first)
+        capture_stable_search_scope_state(&state_paths, &mut budget, &mut capture)
     });
     // Dropping the wait cannot interrupt a filesystem call already in progress.
     // The drop guard cancels subsequent work, and late results are discarded.
@@ -239,6 +234,18 @@ async fn observe_rg_search_scope_state_with(
         .ok()
         .and_then(Result::ok)
         .flatten();
+}
+
+fn capture_stable_search_scope_state(
+    state_paths: &[PathBuf],
+    budget: &mut SearchSnapshotBudget,
+    capture: &mut impl FnMut(&[PathBuf], &mut SearchSnapshotBudget) -> Option<String>,
+) -> Option<String> {
+    let first = capture(state_paths, budget)?;
+    // Each traversal gets its entry budget, but shares the deadline and cancellation.
+    budget.remaining = SEARCH_SNAPSHOT_MAX_ENTRIES;
+    let second = capture(state_paths, budget)?;
+    (first == second).then_some(first)
 }
 
 fn search_state_paths(
@@ -826,64 +833,48 @@ mod deadline_tests {
         assert_eq!(workers.available_permits(), 1);
     }
 
-    #[tokio::test]
-    async fn stable_scope_can_use_the_full_entry_budget_in_both_captures() {
-        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
-        let mut search = classify_rg_search_narrowing(
-            &command,
-            None,
-            Path::new("workspace"),
-            Path::new("workspace"),
-        )
-        .unwrap()
-        .unwrap();
-
-        observe_rg_search_scope_state_with(
-            &mut search,
-            false,
-            Arc::new(Semaphore::new(1)),
-            |_, budget| {
+    #[test]
+    fn stable_scope_can_use_the_full_entry_budget_in_both_captures() {
+        let mut captures = 0;
+        let identity = capture_stable_search_scope_state(
+            &[],
+            &mut SearchSnapshotBudget {
+                remaining: SEARCH_SNAPSHOT_MAX_ENTRIES,
+                deadline: Instant::now() + Duration::from_secs(10),
+                cancellation: CancellationToken::new(),
+            },
+            &mut |_, budget| {
                 for _ in 0..SEARCH_SNAPSHOT_MAX_ENTRIES {
                     budget.check().ok()?;
                 }
+                captures += 1;
                 Some("stable scope".to_string())
             },
-        )
-        .await;
+        );
 
-        assert_eq!(search.scope_state_identity.as_deref(), Some("stable scope"));
+        assert_eq!(captures, 2);
+        assert_eq!(identity.as_deref(), Some("stable scope"));
     }
 
-    #[tokio::test]
-    async fn changed_scope_is_not_reusable_between_captures() {
-        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
-        let mut search = classify_rg_search_narrowing(
-            &command,
-            None,
-            Path::new("workspace"),
-            Path::new("workspace"),
-        )
-        .unwrap()
-        .unwrap();
-        let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed_captures = std::sync::Arc::clone(&captures);
-        observe_rg_search_scope_state_with(
-            &mut search,
-            false,
-            Arc::new(Semaphore::new(1)),
-            move |_, budget| {
-                budget.check().ok()?;
-                let capture_number = captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Some(format!("scope revision {capture_number}"))
+    #[test]
+    fn changed_scope_is_not_reusable_between_captures() {
+        let mut captures = 0;
+        let identity = capture_stable_search_scope_state(
+            &[],
+            &mut SearchSnapshotBudget {
+                remaining: SEARCH_SNAPSHOT_MAX_ENTRIES,
+                deadline: Instant::now() + Duration::from_secs(10),
+                cancellation: CancellationToken::new(),
             },
-        )
-        .await;
-
-        assert_eq!(
-            observed_captures.load(std::sync::atomic::Ordering::SeqCst),
-            2
+            &mut |_, budget| {
+                budget.check().ok()?;
+                captures += 1;
+                Some(format!("scope revision {captures}"))
+            },
         );
-        assert_eq!(search.scope_state_identity, None);
+
+        assert_eq!(captures, 2);
+        assert_eq!(identity, None);
     }
 
     #[tokio::test]

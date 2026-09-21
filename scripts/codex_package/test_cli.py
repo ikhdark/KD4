@@ -129,12 +129,12 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
                 expected_version="1.2.3",
             )
-            entries.assert_called_once_with(package_dir)
+            entries.assert_called_once_with(staged_package_dir)
             resolve_rg_bin.assert_called_once_with(
                 cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
                 target_dir / "rg.exe",
             )
-            self.assertEqual(write_archive.call_count, 2)
+            self.assertEqual(write_archive.call_count, 1)
             for call in write_archive.call_args_list:
                 self.assertEqual(call.kwargs["entries"], archive_entries)
                 self.assertEqual(call.kwargs["compression"], "fast")
@@ -503,7 +503,14 @@ class CliPreflightTest(unittest.TestCase):
             ):
                 cli.main()
             self.assertEqual((package / "old").read_bytes(), b"previous")
-            self.assertEqual(list(root.iterdir()), [package])
+            self.assertEqual(
+                [
+                    path
+                    for path in root.iterdir()
+                    if not path.name.endswith(".publish.lock")
+                ],
+                [package],
+            )
 
     def test_non_force_package_preserves_destination_created_during_staging(
         self,

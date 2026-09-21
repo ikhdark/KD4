@@ -96,6 +96,7 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
 impl WebSearchTool {
     async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let commands = parse_commands(&call)?;
+        validate_commands(&commands)?;
         let command_action = command_action(&commands);
         let Some(client) = call
             .cancellation_token
@@ -104,18 +105,18 @@ impl WebSearchTool {
                     .provider
                     .api_provider()
                     .await
-                    .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+                    .map_err(|_| setup_error("provider configuration"))?;
                 let auth = self
                     .provider
                     .api_auth()
                     .await
-                    .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+                    .map_err(|_| setup_error("authentication"))?;
                 let endpoint = provider.url_for_path("alpha/search");
                 let client = self
                     .http_clients
                     .client_for_url(&endpoint)
                     .await
-                    .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+                    .map_err(|_| setup_error("HTTP client configuration"))?;
                 Ok::<_, FunctionCallError>(SearchClient::new(
                     ReqwestTransport::from_http_client(client),
                     provider,
@@ -162,7 +163,7 @@ impl WebSearchTool {
             }
             Some(Err(err)) => {
                 call.turn_item_emitter.emit_completed(terminal_item).await;
-                Err(FunctionCallError::Fatal(err.to_string()))
+                Err(search_error(err))
             }
             Some(Ok(response)) => {
                 call.turn_item_emitter.emit_completed(terminal_item).await;
@@ -174,6 +175,113 @@ impl WebSearchTool {
 
 fn cancelled_error() -> FunctionCallError {
     FunctionCallError::RespondToModel(WEB_SEARCH_CANCELLED_MESSAGE.to_string())
+}
+
+fn setup_error(stage: &str) -> FunctionCallError {
+    FunctionCallError::RespondToModel(format!(
+        "Web search is unavailable because {stage} failed. User configuration or authentication must be repaired before retrying."
+    ))
+}
+
+fn search_error(error: codex_api::ApiError) -> FunctionCallError {
+    use codex_api::ApiError;
+    let message = match error {
+        ApiError::Api { status, .. }
+        | ApiError::Transport(codex_api::TransportError::Http { status, .. })
+            if status == http::StatusCode::UNAUTHORIZED
+                || status == http::StatusCode::FORBIDDEN =>
+        {
+            "Web search access was denied. User authentication or permissions must be repaired before retrying."
+        }
+        ApiError::Api { status, .. }
+        | ApiError::Transport(codex_api::TransportError::Http { status, .. })
+            if status == http::StatusCode::BAD_REQUEST
+                || status == http::StatusCode::UNPROCESSABLE_ENTITY =>
+        {
+            "Web search rejected the request. Correct the commands or reduce the request before retrying."
+        }
+        ApiError::Api { status, .. }
+        | ApiError::Transport(codex_api::TransportError::Http { status, .. })
+            if status == http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() =>
+        {
+            "Web search is temporarily unavailable or rate limited. Retry later if the evidence is still needed."
+        }
+        ApiError::InvalidRequest { .. } | ApiError::ContextWindowExceeded => {
+            "Web search rejected the request. Correct the commands or reduce the request before retrying."
+        }
+        ApiError::QuotaExceeded | ApiError::UsageNotIncluded => {
+            "Web search is unavailable for this account's current quota or plan. User action is required before retrying."
+        }
+        ApiError::CyberPolicy { .. } => {
+            "Web search was blocked by policy. Do not retry the same operation."
+        }
+        ApiError::RateLimit(_) | ApiError::ServerOverloaded | ApiError::Retryable { .. } => {
+            "Web search is temporarily unavailable or rate limited. Retry later if the evidence is still needed."
+        }
+        _ => {
+            "Web search failed to obtain a valid service response. No evidence was retrieved; retry only if the evidence is still needed."
+        }
+    };
+    FunctionCallError::RespondToModel(message.to_string())
+}
+
+fn validate_commands(commands: &SearchCommands) -> Result<(), FunctionCallError> {
+    let invalid = |message: &str| FunctionCallError::RespondToModel(message.to_string());
+    let counts = [
+        commands.search_query.as_ref().map_or(0, Vec::len),
+        commands.image_query.as_ref().map_or(0, Vec::len),
+        commands.open.as_ref().map_or(0, Vec::len),
+        commands.click.as_ref().map_or(0, Vec::len),
+        commands.find.as_ref().map_or(0, Vec::len),
+        commands.screenshot.as_ref().map_or(0, Vec::len),
+        commands.finance.as_ref().map_or(0, Vec::len),
+        commands.weather.as_ref().map_or(0, Vec::len),
+        commands.sports.as_ref().map_or(0, Vec::len),
+        commands.time.as_ref().map_or(0, Vec::len),
+    ];
+    if counts.iter().all(|count| *count == 0) {
+        return Err(invalid(
+            "web.run requires at least one operation; response_length alone is not an operation",
+        ));
+    }
+    if counts[0] > 4 {
+        return Err(invalid("search_query accepts at most four queries"));
+    }
+    if counts[0] == 4
+        && !matches!(
+            commands.response_length,
+            Some(codex_api::SearchResponseLength::Medium | codex_api::SearchResponseLength::Long)
+        )
+    {
+        return Err(invalid(
+            "four search queries require response_length medium or long",
+        ));
+    }
+    // Empty search queries remain supported by the documented accidental-call
+    // escape hatch. Opaque references are valid, but blank references are not.
+    let references = commands
+        .open
+        .iter()
+        .flatten()
+        .map(|op| op.ref_id.as_str())
+        .chain(commands.click.iter().flatten().map(|op| op.ref_id.as_str()))
+        .chain(commands.find.iter().flatten().map(|op| op.ref_id.as_str()))
+        .chain(
+            commands
+                .screenshot
+                .iter()
+                .flatten()
+                .map(|op| op.ref_id.as_str()),
+        );
+    if references
+        .into_iter()
+        .any(|reference| reference.trim().is_empty())
+    {
+        return Err(invalid(
+            "page operations require a nonblank ref_id (a returned reference or URL)",
+        ));
+    }
+    Ok(())
 }
 
 fn completed_turn_item(call_id: &str, action: WebSearchAction) -> ExtensionTurnItem {
@@ -274,6 +382,59 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::command_action;
+
+    #[test]
+    fn invalid_commands_are_rejected_and_opaque_references_are_valid() {
+        for json in [
+            "{}",
+            r#"{"response_length":"long"}"#,
+            r#"{"open":[]}"#,
+            r#"{"open":[{"ref_id":" "}]}"#,
+            r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}]}"#,
+        ] {
+            let commands = serde_json::from_str(json).expect("commands");
+            assert!(matches!(
+                super::validate_commands(&commands),
+                Err(codex_extension_api::FunctionCallError::RespondToModel(_))
+            ));
+        }
+        for json in [
+            r#"{"open":[{"ref_id":"turn0search0"}]}"#,
+            r#"{"search_query":[{"q":""}]}"#,
+            r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}],"response_length":"long"}"#,
+        ] {
+            let commands = serde_json::from_str(json).expect("commands");
+            assert!(super::validate_commands(&commands).is_ok());
+        }
+    }
+
+    #[test]
+    fn operational_errors_are_actionable_without_backend_details() {
+        use codex_api::ApiError;
+        use codex_extension_api::FunctionCallError;
+        for (error, expected) in [
+            (
+                ApiError::Api {
+                    status: http::StatusCode::UNAUTHORIZED,
+                    message: "secret".to_string(),
+                },
+                "authentication",
+            ),
+            (
+                ApiError::InvalidRequest {
+                    message: "secret".to_string(),
+                },
+                "Correct the commands",
+            ),
+            (ApiError::ServerOverloaded, "Retry later"),
+        ] {
+            let FunctionCallError::RespondToModel(message) = super::search_error(error) else {
+                panic!("recoverable error");
+            };
+            assert!(message.contains(expected));
+            assert!(!message.contains("secret"));
+        }
+    }
 
     #[test]
     fn command_action_reports_queries_and_navigation_detail() {

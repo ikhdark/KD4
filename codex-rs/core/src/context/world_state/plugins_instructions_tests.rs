@@ -123,3 +123,23 @@ fn persisted_guidance_is_restored_only_when_missing_from_history() {
             .is_empty()
     );
 }
+
+#[test]
+fn missing_revocation_cannot_be_proven_by_old_availability() {
+    let mut world_state = super::super::WorldState::default();
+    world_state.add_section(PluginsInstructionsState::new(false));
+    let accepted = world_state.snapshot();
+    let old = ContextualUserFragment::into(AvailablePluginsInstructions);
+    let fragments = world_state.render_history_diff(Some(&accepted), &[old]);
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(
+        fragments[0].render(),
+        PluginsInstructionsUnavailable.render()
+    );
+    let retained = vec![ContextualUserFragment::into(PluginsInstructionsUnavailable)];
+    assert!(
+        world_state
+            .render_history_diff(Some(&accepted), &retained)
+            .is_empty()
+    );
+}

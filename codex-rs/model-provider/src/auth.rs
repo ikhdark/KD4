@@ -45,6 +45,7 @@ struct ProviderAccountScope {
     workspace_account: Option<bool>,
     fedramp_header: Option<Vec<u8>>,
     credential_scope_digest: Option<Vec<u8>>,
+    routing_headers_digest: Option<Vec<u8>>,
 }
 
 impl ProviderAccountScope {
@@ -58,6 +59,7 @@ impl ProviderAccountScope {
                 workspace_account: None,
                 fedramp_header: None,
                 credential_scope_digest: None,
+                routing_headers_digest: None,
             };
         };
 
@@ -115,6 +117,10 @@ impl ProviderAccountScope {
             workspace_account,
             fedramp_header,
             credential_scope_digest,
+            routing_headers_digest: match auth {
+                CodexAuth::Headers(auth) => Some(header_scope_digest(auth.headers(), true)),
+                _ => None,
+            },
         }
     }
 }
@@ -127,8 +133,17 @@ fn credential_scope_digest(credential: &[u8]) -> Vec<u8> {
 }
 
 fn credential_scope_digest_for_headers(headers: &HeaderMap) -> Vec<u8> {
-    let mut entries = headers
+    header_scope_digest(headers, false)
+}
+
+fn header_scope_digest(headers: &HeaderMap, routing_only: bool) -> Vec<u8> {
+    let mut names = headers
         .keys()
+        .filter(|name| !routing_only || *name != http::header::AUTHORIZATION)
+        .collect::<Vec<_>>();
+    names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    let entries = names
+        .into_iter()
         .flat_map(|name| {
             headers
                 .get_all(name)
@@ -136,7 +151,6 @@ fn credential_scope_digest_for_headers(headers: &HeaderMap) -> Vec<u8> {
                 .map(move |value| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
         })
         .collect::<Vec<_>>();
-    entries.sort_unstable();
     let mut canonical = Vec::new();
     for (name, value) in entries {
         canonical.extend_from_slice(&(name.len() as u64).to_le_bytes());
@@ -159,7 +173,14 @@ pub(crate) fn provider_cache_auth_identity(
     auth_manager: Option<&AuthManager>,
 ) -> ProviderCacheAuthIdentity {
     let auth = auth_manager.and_then(AuthManager::auth_cached);
-    let account_scope = ProviderAccountScope::from_auth(auth.as_ref());
+    provider_cache_auth_identity_for_auth(auth.as_ref(), auth_manager)
+}
+
+pub(crate) fn provider_cache_auth_identity_for_auth(
+    auth: Option<&CodexAuth>,
+    auth_manager: Option<&AuthManager>,
+) -> ProviderCacheAuthIdentity {
+    let account_scope = ProviderAccountScope::from_auth(auth);
     let auth_mode = account_scope.auth_mode;
     let effective_chatgpt_workspaces = auth_manager
         .and_then(AuthManager::effective_chatgpt_workspaces)
@@ -169,7 +190,7 @@ pub(crate) fn provider_cache_auth_identity(
             workspaces
         });
     let canonical = serde_json::to_vec(&serde_json::json!({
-        "version": 2,
+        "version": 3,
         "auth_mode": account_scope.auth_mode,
         "account_id": account_scope.account_id,
         "chatgpt_user_id": account_scope.chatgpt_user_id,
@@ -177,6 +198,7 @@ pub(crate) fn provider_cache_auth_identity(
         "workspace_account": account_scope.workspace_account,
         "fedramp_header": account_scope.fedramp_header,
         "credential_scope_digest": account_scope.credential_scope_digest,
+        "routing_headers_digest": account_scope.routing_headers_digest,
         "effective_chatgpt_workspaces": effective_chatgpt_workspaces,
     }))
     .unwrap_or_else(|error| {
@@ -384,14 +406,14 @@ pub(crate) fn resolve_provider_auth(
     auth: Option<&CodexAuth>,
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<SharedAuthProvider> {
+    if let Some(auth) = bearer_auth_for_provider(provider)? {
+        return Ok(Arc::new(auth));
+    }
+
     if matches!(auth, Some(CodexAuth::BedrockApiKey(_))) {
         return Err(CodexErr::UnsupportedOperation(
             BEDROCK_API_KEY_UNSUPPORTED_MESSAGE.to_string(),
         ));
-    }
-
-    if let Some(auth) = bearer_auth_for_provider(provider)? {
-        return Ok(Arc::new(auth));
     }
 
     Ok(match auth {
@@ -857,6 +879,63 @@ mod tests {
             reordered.account_scope_digest
         );
         assert!(!restricted.account_scope_digest.contains("workspace-a"));
+    }
+
+    #[test]
+    fn explicit_provider_token_precedes_incompatible_fallback() {
+        let mut provider = ModelProviderInfo::create_openai_provider(None);
+        provider.experimental_bearer_token = Some("provider-token".into());
+        let auth = CodexAuth::BedrockApiKey(BedrockApiKeyAuth {
+            api_key: "bedrock-token".into(),
+            region: "us-east-1".into(),
+        });
+        let resolved = resolve_provider_auth(Some(&auth), &provider).expect("explicit token");
+        assert_eq!(
+            resolved.to_auth_headers()[http::header::AUTHORIZATION],
+            "Bearer provider-token"
+        );
+    }
+
+    #[test]
+    fn external_routing_digest_preserves_authority_and_repeated_value_order() {
+        let mut headers = HeaderMap::new();
+        headers.insert("chatgpt-account-id", HeaderValue::from_static("account"));
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        headers.append("x-catalog-route", HeaderValue::from_static("first"));
+        headers.append("x-catalog-route", HeaderValue::from_static("second"));
+        let scope = |headers| {
+            ProviderAccountScope::from_auth(Some(&CodexAuth::Headers(AuthHeaders::new(headers))))
+        };
+        let original = scope(headers.clone());
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer rotated"),
+        );
+        assert!(original == scope(headers.clone()));
+        headers.remove("x-catalog-route");
+        headers.append("x-catalog-route", HeaderValue::from_static("second"));
+        headers.append("x-catalog-route", HeaderValue::from_static("first"));
+        assert!(original != scope(headers));
+    }
+
+    #[test]
+    fn external_routing_headers_partition_same_account_catalogs() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("same-account"),
+        );
+        headers.insert("x-catalog-route", HeaderValue::from_static("first"));
+        let first = ProviderAccountScope::from_auth(Some(&CodexAuth::Headers(AuthHeaders::new(
+            headers.clone(),
+        ))));
+        headers.insert("x-catalog-route", HeaderValue::from_static("second"));
+        let second =
+            ProviderAccountScope::from_auth(Some(&CodexAuth::Headers(AuthHeaders::new(headers))));
+        assert_ne!(first.routing_headers_digest, second.routing_headers_digest);
     }
 
     #[test]

@@ -575,8 +575,37 @@ where
     let disconnect_reason;
 
     loop {
+        // Expire against the current map entry, so no stale timer can close a reused ID.
+        let now = tokio::time::Instant::now();
+        let expired = streams
+            .iter()
+            .filter(|(_, stream)| {
+                stream
+                    .gap_deadline()
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in expired {
+            if let Some(stream) = streams.remove(&id) {
+                stream.disconnect(Some(
+                    crate::noise_relay::ordered_ciphertext::CIPHERTEXT_GAP_TIMEOUT_REASON.into(),
+                ));
+                send_reset(&physical_outgoing_tx, id);
+            }
+        }
+        let gap_deadline = streams
+            .values()
+            .filter_map(NoiseVirtualStream::gap_deadline)
+            .min();
         // Registry calls run separately so a slow check does not block the relay.
         let frame = tokio::select! {
+            _ = async {
+                match gap_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => continue,
             writer_result = &mut physical_writer_task => {
                 match writer_result {
                     Ok(reason) => disconnect_reason = reason,
@@ -661,16 +690,9 @@ where
                             validation_result.stream_id.clone(),
                             response,
                         );
-                        // Do not leave a half-open stream if the handshake reply
-                        // cannot be queued immediately.
-                        match physical_outgoing_tx.try_send(encode_relay_message_frame(&response)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => continue,
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                disconnect_reason = RendezvousDisconnectReason::WriteError;
-                                break;
-                            }
-                        }
+                        // Admission reserved this capacity before cryptography and
+                        // authorization. Established traffic cannot discard the reply.
+                        pending.reply_permit.send(encode_relay_message_frame(&response));
                         info!(
                             noise_event = "handshake",
                             noise_outcome = "ok",
@@ -773,6 +795,10 @@ where
                 }
                 let prologue =
                     noise_channel_prologue(&environment_id, &executor_registration_id, &stream_id);
+                let Ok(reply_permit) = physical_outgoing_tx.clone().try_reserve_owned() else {
+                    send_reset(&physical_outgoing_tx, stream_id);
+                    continue;
+                };
                 let request = match frame.into_handshake_payload() {
                     Ok(request) => request,
                     Err(error) => {
@@ -831,6 +857,7 @@ where
                     PendingHandshake {
                         validation_id,
                         handshake: pending,
+                        reply_permit,
                     },
                 );
                 let validator = validator.clone();
@@ -928,6 +955,7 @@ fn failed_handshake_budget_exhausted(failed_handshakes: &mut usize) -> bool {
 struct PendingHandshake {
     validation_id: u64,
     handshake: PendingResponderHandshake,
+    reply_permit: mpsc::OwnedPermit<Vec<u8>>,
 }
 
 /// `validation_id` prevents an old check from completing a reused `stream_id`.

@@ -77,7 +77,12 @@ impl ToolExecutor<ToolCall> for ReadTool {
             });
             if !package_is_available {
                 return Err(FunctionCallError::RespondToModel(
-                    "skill package is not available from the requested authority".to_string(),
+                    if catalog.continuation.is_some() {
+                        "skill package has not been discovered yet; use skills.list and follow next_cursor to continue incomplete discovery"
+                    } else {
+                        "skill package is not available from the requested authority"
+                    }
+                    .to_string(),
                 ));
             }
 
@@ -104,7 +109,7 @@ impl ToolExecutor<ToolCall> for ReadTool {
                         resource = requested_resource.as_str(),
                         "skills.read provider request failed"
                     );
-                    FunctionCallError::RespondToModel("failed to read skill resource".to_string())
+                    FunctionCallError::RespondToModel(err.model_message().to_string())
                 })?;
             let fingerprint = OnceCell::new();
             let start = parse_pagination_cursor(
@@ -196,7 +201,7 @@ fn parse_pagination_cursor(
     offset.parse::<usize>().map_err(|_| invalid())
 }
 
-pub(super) fn value_fingerprint(value: &(impl Hash + ?Sized)) -> u64 {
+pub(crate) fn value_fingerprint(value: &(impl Hash + ?Sized)) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()

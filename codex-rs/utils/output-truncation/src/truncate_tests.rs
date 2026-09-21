@@ -449,9 +449,9 @@ fn byte_count_conversion_clamps_non_positive_values() {
 
 #[test]
 fn optimization_priority_coherent_packet_defaults_precede_trimming() {
-    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 4_000);
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
-    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 16_000);
     assert_eq!(
         resolve_output_limits(None, OutputOutcome::Success, Some("echo ok"), "ok", 20_000),
         OutputLimitResolution {
@@ -469,11 +469,13 @@ fn optimization_priority_coherent_packet_defaults_precede_trimming() {
             "failed",
             20_000,
         ),
+        // The output text itself reads as a diagnostic, so it takes the
+        // diagnostic budget rather than the ordinary failure budget.
         OutputLimitResolution {
             requested_limit: None,
-            default_limit: DEFAULT_FAILURE_OUTPUT_TOKENS,
+            default_limit: DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
             hard_limit: 20_000,
-            applied_limit: DEFAULT_FAILURE_OUTPUT_TOKENS,
+            applied_limit: DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
         }
     );
     assert_eq!(
@@ -559,7 +561,10 @@ fn fork_validation_routes_receive_the_diagnostic_budget() {
     ] {
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000);
-        assert_eq!(limits.applied_limit, 10_000, "{command}");
+        assert_eq!(
+            limits.applied_limit, DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
+            "{command}"
+        );
         let explicit = resolve_output_limits(
             Some(500),
             OutputOutcome::Success,
@@ -622,6 +627,31 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
         .applied_limit,
         DEFAULT_FAILURE_OUTPUT_TOKENS
     );
+    // Outcome no longer changes the budget: successful discovery output is the
+    // evidence a turn is built on, so it gets the same room as a failure. The
+    // diagnostic class is the distinction that still has to be observable.
+    for outcome in [
+        OutputOutcome::Success,
+        OutputOutcome::Failure,
+        OutputOutcome::TimedOut,
+        OutputOutcome::Skipped,
+    ] {
+        let normal =
+            resolve_projected_output_limits(None, outcome, OutputDiagnosticClass::Normal, usize::MAX)
+                .applied_limit;
+        let high_signal = resolve_projected_output_limits(
+            None,
+            outcome,
+            OutputDiagnosticClass::HighSignal,
+            usize::MAX,
+        )
+        .applied_limit;
+        assert_eq!(normal, DEFAULT_SUCCESS_OUTPUT_TOKENS, "{outcome:?}");
+        assert!(
+            high_signal > normal,
+            "high-signal diagnostics must keep more room than ordinary output: {outcome:?}"
+        );
+    }
     assert_eq!(
         resolve_projected_output_limits(
             Some(250),
@@ -637,10 +667,10 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
             Some(20_000),
             OutputOutcome::Failure,
             OutputDiagnosticClass::HighSignal,
-            4_000,
+            10_000,
         )
         .applied_limit,
-        4_000
+        10_000
     );
 }
 
@@ -774,7 +804,7 @@ fn diagnostic_output_receives_budget_without_command_metadata() {
         "project.csproj: error MSB1009: Project file does not exist.",
     ] {
         let limits = resolve_output_limits(None, OutputOutcome::Success, None, diagnostic, 20_000);
-        assert_eq!(limits.applied_limit, 10_000, "{diagnostic}");
+        assert_eq!(limits.applied_limit, 16_000, "{diagnostic}");
     }
 }
 
@@ -855,8 +885,10 @@ fn validation_launchers_preserve_diagnostic_budgets_without_promoting_arguments(
             "failed",
             20_000,
         );
+        // "failed" in the output is itself a diagnostic signal, which outranks
+        // the launcher's own classification.
         assert_eq!(
-            limits.applied_limit, DEFAULT_FAILURE_OUTPUT_TOKENS,
+            limits.applied_limit, DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
             "{command}"
         );
     }
@@ -871,7 +903,7 @@ fn reading_typescript_configuration_is_not_validation() {
         "{}",
         20_000,
     );
-    assert_eq!(limits.applied_limit, 4_000);
+    assert_eq!(limits.applied_limit, 10_000);
 }
 
 #[test]
@@ -951,7 +983,7 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
     ] {
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000);
-        assert_eq!(limits.applied_limit, 4_000, "{command}");
+        assert_eq!(limits.applied_limit, 10_000, "{command}");
     }
     for command in [
         "cargo +stable test",
@@ -963,7 +995,7 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000)
                 .applied_limit,
-            10_000,
+            16_000,
             "{command}"
         );
     }
@@ -984,7 +1016,7 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
     ] {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, None, output, 20_000).applied_limit,
-            4_000,
+            10_000,
             "{output}"
         );
     }
@@ -996,7 +1028,7 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
     ] {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, None, output, 20_000).applied_limit,
-            10_000,
+            16_000,
             "{output}"
         );
     }

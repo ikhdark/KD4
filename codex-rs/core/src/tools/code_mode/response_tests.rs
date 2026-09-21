@@ -218,6 +218,29 @@ impl PacketRuntime {
     }
 }
 
+#[tokio::test]
+async fn discarded_runtime_output_remains_machine_readable_after_projection() {
+    let runtime = PacketRuntime::new().await;
+    let output = runtime
+        .exec("// @exec: {\"max_output_tokens\": 1}\ntext('x'.repeat(64 * 1024 * 1024 + 1));")
+        .await;
+    let rendered = packet_output_text(output.as_ref());
+    assert!(rendered.contains("Script completed"), "{rendered}");
+    let metadata = rendered
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("output_complete").is_some())
+        .expect("structured output completeness");
+    assert_eq!(metadata["output_complete"], false);
+    assert_eq!(metadata["discarded_output_recoverable"], false);
+    assert_eq!(metadata["output_loss"]["discarded_items"], 1);
+    assert_eq!(
+        metadata["output_loss"]["discarded_bytes_lower_bound"],
+        64 * 1024 * 1024 + 1
+    );
+    runtime.finish().await;
+}
+
 fn packet_output_text(output: &dyn ToolOutput) -> String {
     let response = output.to_response_item(
         "packet-output",
@@ -258,8 +281,12 @@ async fn nested_failures_preserve_only_observed_workspace_dependencies() {
                 "await tools.exec_command({{cmd: 'Get-Content source.txt'}}); try {{ await tools.exec_command({input}); }} catch {{}}"
             ))
             .await;
-        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
         let visible = packet_output_text(output.as_ref());
+        assert_eq!(
+            output.outcome_for_logging(),
+            ToolOutputOutcome::Success,
+            "caught input {input}: {visible}"
+        );
         assert!(visible.contains("READ_RESULT_42"), "{visible}");
         let expected_error = match input["cmd"].as_str() {
             Some("Remove-Item output.txt") => "write rejected",
@@ -328,34 +355,27 @@ async fn exec_reports_omitted_nested_fallback_results() {
 }
 
 #[tokio::test]
-async fn exec_caught_nested_error_is_budgeted_and_fully_recoverable() {
+async fn exec_caught_nested_error_allows_successful_fallback() {
     let runtime = PacketRuntime::new().await;
-    let diagnostic = format!("REQUIRED_ROOT_CAUSE {} CANONICAL_TAIL", "é".repeat(40_000));
-    let source = format!(
-        "// @exec: {{\"max_output_tokens\": 200}}\ntry {{ await tools.read_tool_output({}); }} catch {{ text('caught'); }}",
-        serde_json::json!({"error": diagnostic}),
-    );
-    let output = runtime.exec(&source).await;
+    let output = runtime.exec("try { await tools.read_tool_output({error: 'ordinary failure'}); } catch { text(await tools.read_tool_output({})); }").await;
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+    assert!(packet_output_text(output.as_ref()).contains("READ_RESULT_42"));
+    let output = runtime
+        .exec("await tools.read_tool_output({error: 'uncaught failure'});")
+        .await;
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
-    let visible = packet_output_text(output.as_ref());
-    assert!(visible.contains("REQUIRED_ROOT_CAUSE"), "{visible}");
-    assert!(codex_utils_string::approx_token_count(&visible) < 300);
-    let canonical = output
-        .canonical_result(&ToolPayload::Custom { input: source })
-        .unwrap();
-    assert!(
-        String::from_utf8(canonical.bytes)
-            .unwrap()
-            .contains(&diagnostic)
-    );
-    let signal = output.sampling_request_signal().unwrap();
-    assert_eq!(signal["outcome"], "failure");
-    assert_eq!(signal["nested_ordinal"], 0);
-    assert!(
-        signal["semantic_evidence"]
-            .to_string()
-            .contains("REQUIRED_ROOT_CAUSE")
-    );
+    assert!(packet_output_text(output.as_ref()).contains("uncaught failure"));
+    for outcome in ["failure", "timeout", "blocked"] {
+        let output = runtime.exec(&format!("try {{ await tools.read_tool_output({{outcome: '{outcome}'}}); }} catch {{ text('caught'); }}")).await;
+        assert_eq!(
+            output.outcome_for_logging(),
+            if outcome == "blocked" {
+                ToolOutputOutcome::Skipped
+            } else {
+                ToolOutputOutcome::Success
+            }
+        );
+    }
     assert!(
         runtime
             .session
@@ -375,7 +395,7 @@ async fn wait_propagates_real_nested_terminal_outcomes_and_keeps_owner_evidence(
     for (outcome, typed) in [
         ("failure", ToolOutputOutcome::Failure),
         ("blocked", ToolOutputOutcome::Skipped),
-        ("timeout", ToolOutputOutcome::TimedOut),
+        ("timeout", ToolOutputOutcome::Failure),
     ] {
         let runtime = PacketRuntime::new().await;
         let initial = runtime
@@ -389,20 +409,42 @@ async fn wait_propagates_real_nested_terminal_outcomes_and_keeps_owner_evidence(
         let output = runtime.wait(&cell).await;
         assert_eq!(output.outcome_for_logging(), typed);
         let signal = output.sampling_request_signal().unwrap();
-        assert_eq!(signal["outcome"], outcome);
-        assert_eq!(signal["nested_ordinal"], 0);
+        assert_eq!(
+            signal["outcome"],
+            if outcome == "timeout" {
+                "failure"
+            } else {
+                outcome
+            }
+        );
+        assert_eq!(
+            signal["nested_ordinal"],
+            if outcome == "blocked" {
+                serde_json::json!(0)
+            } else {
+                serde_json::Value::Null
+            }
+        );
         assert_eq!(
             signal["authoritative_wait_owner_v1"]["owner"],
             cell.as_str()
         );
         assert_eq!(
             signal["authoritative_wait_owner_v1"]["state_revision"],
-            "completed"
+            if outcome == "blocked" {
+                "completed"
+            } else {
+                "failed"
+            }
         );
         assert!(
             signal["semantic_evidence"]
                 .to_string()
-                .contains("required nested tool")
+                .contains(if outcome == "blocked" {
+                    "required nested tool"
+                } else {
+                    "Script error"
+                })
         );
         assert!(
             signal["failure_signature"]
@@ -489,8 +531,8 @@ async fn real_nested_calls_keep_registration_order_across_yield_and_wait() {
     let output = runtime.wait(&runtime.live_cell()).await;
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
     assert_eq!(
-        output.sampling_request_signal().unwrap()["nested_ordinal"],
-        1
+        output.sampling_request_signal().unwrap()["outcome"],
+        "failure"
     );
     runtime.finish().await;
 }
@@ -544,7 +586,7 @@ async fn nested_status_codes_remain_distinct_in_the_continuation_consumer() {
             &output.to_response_item("packet-exec", &payload),
             false,
         );
-        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
         let control = TurnExecutionControl::new();
         let request = control.continuation_generation_request(
             &control.baselines(0),
@@ -554,7 +596,6 @@ async fn nested_status_codes_remain_distinct_in_the_continuation_consumer() {
                 tool_exposure_revision: 0,
             },
             false,
-            true,
         );
         fingerprints.push(
             request
@@ -582,6 +623,7 @@ use super::response_needs_retained_nested_results;
 
 fn nested_result_evidence(output: &str) -> CodeModeNestedResultEvidence {
     CodeModeNestedResultEvidence {
+        failed: false,
         command_state: None,
         ordinal: 0,
         call_id: "exec-cell-1-call-1".to_string(),
@@ -599,6 +641,7 @@ fn failed_runtime_response_builds_a_linkable_cell_item() {
     let item = failed_code_mode_cell_item(
         "exec-call-3",
         &RuntimeResponse::Result {
+            output_loss: None,
             cell_id: CellId::new("cell-7".to_string()),
             content_items: Vec::new(),
             error_text: Some("TypeError at line 4".to_string()),
@@ -626,6 +669,7 @@ fn failed_cell_error_is_bounded_without_splitting_utf8() {
     let item = failed_code_mode_cell_item(
         "exec-call-3",
         &RuntimeResponse::Result {
+            output_loss: None,
             cell_id: CellId::new("cell-7".to_string()),
             content_items: Vec::new(),
             error_text: Some(oversized_error),
@@ -667,6 +711,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
         ),
         (
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: cell_id(),
                 content_items: content_items(),
                 error_text: None,
@@ -676,6 +721,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
         ),
         (
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: cell_id(),
                 content_items: content_items(),
                 error_text: Some("boom".to_string()),
@@ -759,6 +805,7 @@ fn terminated_runtime_response_emits_failure_sampling_evidence() {
 #[test]
 fn runtime_response_sampling_identity_excludes_wall_time() {
     let response = || RuntimeResponse::Result {
+        output_loss: None,
         cell_id: CellId::new("cell-1".to_string()),
         content_items: vec![RuntimeContentItem::InputText {
             text: "same result".to_string(),
@@ -797,6 +844,7 @@ fn runtime_response_sampling_identity_excludes_wall_time() {
 fn post_tool_feedback_survives_code_mode_projection() {
     let output = format_runtime_response(
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: CellId::new("cell-feedback".to_string()),
             content_items: Vec::new(),
             error_text: None,
@@ -826,6 +874,7 @@ fn post_tool_feedback_survives_code_mode_projection() {
 #[test]
 fn failed_script_keeps_successful_nested_result_and_linkage_visible() {
     let response = RuntimeResponse::Result {
+        output_loss: None,
         cell_id: CellId::new("cell-1".to_string()),
         content_items: vec![RuntimeContentItem::InputText {
             text: "before failure".to_string(),
@@ -857,6 +906,7 @@ fn failed_script_keeps_successful_nested_result_and_linkage_visible() {
 #[test]
 fn empty_successful_script_projects_retained_nested_result() {
     let response = RuntimeResponse::Result {
+        output_loss: None,
         cell_id: CellId::new("cell-1".to_string()),
         content_items: Vec::new(),
         error_text: None,
@@ -881,6 +931,7 @@ fn empty_successful_script_projects_retained_nested_result() {
 #[test]
 fn successful_script_output_suppresses_duplicate_retained_result_projection() {
     let response = RuntimeResponse::Result {
+        output_loss: None,
         cell_id: CellId::new("cell-1".to_string()),
         content_items: vec![RuntimeContentItem::InputText {
             text: "already projected".to_string(),
@@ -966,6 +1017,7 @@ async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical
     let output = super::handle_runtime_response(
         &exec,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell.clone(),
             content_items: Vec::new(),
             error_text: None,
@@ -1018,6 +1070,7 @@ async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical
 fn mixed_runtime_failure_uses_the_actual_error_after_a_printed_error_log() {
     let output = format_runtime_response(
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: CellId::new("mixed-errors".to_string()),
             content_items: vec![
                 RuntimeContentItem::InputText {
@@ -1085,6 +1138,7 @@ async fn live_packet_drain_preserves_ordinals_for_outstanding_calls() {
     let terminal = super::handle_runtime_response(
         &exec,
         RuntimeResponse::Result {
+            output_loss: None,
             cell_id: cell.clone(),
             content_items: Vec::new(),
             error_text: None,
@@ -1097,6 +1151,94 @@ async fn live_packet_drain_preserves_ordinals_for_outstanding_calls() {
     assert_eq!(
         terminal.sampling_request_signal().unwrap()["nested_ordinal"],
         0
+    );
+    service.finish_cell_dispatch(&cell);
+}
+
+#[tokio::test]
+async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_states() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let exec = super::ExecContext {
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+    };
+    let service = &exec.session.services.code_mode_service;
+    let cell = CellId::new("receipt-budget".to_string());
+    service.record_cell_parent_call_id(&cell, "outer-receipts");
+    for index in 0..400 {
+        let ordinal = service.begin_packet_call(&cell).unwrap();
+        let mut result = nested_result_evidence("read");
+        result.command_state = Some(serde_json::json!({
+            "polled_session_id": 777, "process_exited": index == 399,
+            "chunk_id": format!("POLL_{index}"), "output_complete": index == 399,
+        }));
+        service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+    }
+    for index in 0..100 {
+        let ordinal = service.begin_packet_call(&cell).unwrap();
+        let mut result = nested_result_evidence("read");
+        result.command_state = Some(serde_json::json!({
+            "session_id": index, "process_exited": index != 99,
+            "chunk_id": format!("DISTINCT_{index}"),
+            "raw_output_artifact_error": "large diagnostic".repeat(100),
+        }));
+        service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+    }
+    let output = super::handle_runtime_response(
+        &exec,
+        RuntimeResponse::Result {
+            cell_id: cell.clone(),
+            content_items: vec![RuntimeContentItem::InputText {
+                text: "printed output".into(),
+            }],
+            error_text: Some("ACTUAL_RECEIPT_FAILURE".into()),
+            output_loss: None,
+        },
+        Some(200),
+        Instant::now(),
+    )
+    .unwrap();
+    let visible = super::code_mode_text_content(&output.body);
+    assert!(
+        codex_utils_string::approx_token_count(&visible) < 300,
+        "{visible}"
+    );
+    assert!(visible.contains("ACTUAL_RECEIPT_FAILURE"));
+    let inline = output.essential_inline["nested_commands"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        inline.len(),
+        crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES
+    );
+    assert_eq!(inline[0]["session_id"], 99);
+    assert!(
+        inline
+            .iter()
+            .all(|state| state.get("raw_output_artifact_error").is_none())
+    );
+    let canonical = output.canonical_body.as_ref().unwrap();
+    let receipts = canonical
+        .iter()
+        .find_map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text } => {
+                text.strip_prefix("Nested command states (independent of script completion):\n")
+            }
+            _ => None,
+        })
+        .unwrap();
+    let states: Vec<serde_json::Value> = serde_json::from_str(receipts).unwrap();
+    assert_eq!(states.len(), 101);
+    let polled = states
+        .iter()
+        .find(|state| state["polled_session_id"] == 777)
+        .unwrap();
+    assert_eq!(polled["chunk_id"], "POLL_399");
+    assert_eq!(polled["process_exited"], true);
+    assert!(
+        states
+            .iter()
+            .any(|state| state["chunk_id"] == "DISTINCT_99")
     );
     service.finish_cell_dispatch(&cell);
 }

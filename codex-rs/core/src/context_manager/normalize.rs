@@ -12,6 +12,7 @@ use tracing::info;
 
 const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
     "image content omitted because you do not support image input";
+pub(super) const MISSING_TOOL_RESULT: &str = "Result unavailable. Execution outcome and side effects are unknown. Do not repeat a state-changing operation solely because its result is missing.";
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
@@ -72,7 +73,9 @@ fn collect_missing_call_outputs(
                     ResponseItem::FunctionCallOutput {
                         id: synthetic_output_id("fco", id.as_deref()),
                         call_id: call_id.clone(),
-                        output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                        output: FunctionCallOutputPayload::from_text(
+                            MISSING_TOOL_RESULT.to_string(),
+                        ),
                         internal_chat_message_metadata_passthrough: None,
                     },
                 ));
@@ -110,7 +113,9 @@ fn collect_missing_call_outputs(
                         id: synthetic_output_id("ctco", id.as_deref()),
                         call_id: call_id.clone(),
                         name: None,
-                        output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                        output: FunctionCallOutputPayload::from_text(
+                            MISSING_TOOL_RESULT.to_string(),
+                        ),
                         internal_chat_message_metadata_passthrough: None,
                     },
                 ));
@@ -131,7 +136,9 @@ fn collect_missing_call_outputs(
                     ResponseItem::FunctionCallOutput {
                         id: synthetic_output_id("fco", id.as_deref()),
                         call_id: call_id.clone(),
-                        output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                        output: FunctionCallOutputPayload::from_text(
+                            MISSING_TOOL_RESULT.to_string(),
+                        ),
                         internal_chat_message_metadata_passthrough: None,
                     },
                 ));

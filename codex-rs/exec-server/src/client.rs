@@ -115,7 +115,7 @@ mod recovery;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
-const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_RETAINED_BYTES: usize = 1024 * 1024;
@@ -197,10 +197,11 @@ pub(crate) struct Session {
 #[derive(Default)]
 struct HttpBodyStreams {
     streams: HashMap<String, mpsc::Sender<HttpRequestBodyDeltaNotification>>,
-    failures: HashMap<String, String>,
+    terminals: HashMap<String, Result<HttpRequestBodyDeltaNotification, String>>,
 }
 
 struct Inner {
+    file_read_slots: Arc<tokio::sync::Semaphore>,
     connection: StdMutex<ConnectionState>,
     connection_changed: watch::Sender<()>,
     // The remote transport delivers one shared notification stream for every
@@ -555,6 +556,10 @@ pub enum ExecServerError {
     },
     #[error("timed out waiting for exec-server initialize handshake after {timeout:?}")]
     InitializeTimedOut { timeout: Duration },
+    #[error("exec-server environment/info timed out after {timeout:?}")]
+    EnvironmentInfoTimedOut { timeout: Duration },
+    #[error("exec-server process start timed out")]
+    ProcessStartTimedOut,
     #[error("exec-server transport closed")]
     Closed,
     #[error("{0}")]
@@ -677,11 +682,15 @@ impl ExecServerClient {
             return Ok(info.clone());
         }
         let rpc_client = self.rpc_client().await?;
-        let info = map_rpc_call_result(
-            rpc_client
-                .call_with_timeout(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
-                .await,
-        )?;
+        let info = match rpc_client
+            .call_with_timeout(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
+            .await
+        {
+            Err(RpcCallError::TimedOut { timeout, .. }) => {
+                return Err(ExecServerError::EnvironmentInfoTimedOut { timeout });
+            }
+            result => map_rpc_call_result(result)?,
+        };
         Ok(self.inner.environment_info.get_or_init(|| info).clone())
     }
 
@@ -757,6 +766,15 @@ impl ExecServerClient {
         self.call(FS_OPEN_METHOD, &params).await
     }
 
+    pub(crate) async fn reserve_file_stream(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ExecServerError> {
+        Arc::clone(&self.inner.file_read_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| ExecServerError::Closed)
+    }
+
     pub async fn fs_read_block(
         &self,
         params: FsReadBlockParams,
@@ -821,12 +839,35 @@ impl ExecServerClient {
         self.call(FS_COPY_METHOD, &params).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_process(
         &self,
         params: ExecParams,
     ) -> Result<Session, ExecServerError> {
+        self.start_process_before(params, Instant::now() + PROCESS_START_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn start_process_before(
+        &self,
+        params: ExecParams,
+        deadline: Instant,
+    ) -> Result<Session, ExecServerError> {
+        tokio::time::timeout_at(deadline, self.start_process_inner(params, deadline))
+            .await
+            .map_err(|_| ExecServerError::ProcessStartTimedOut)?
+    }
+
+    async fn start_process_inner(
+        &self,
+        params: ExecParams,
+        deadline: Instant,
+    ) -> Result<Session, ExecServerError> {
         loop {
             let rpc_client = self.rpc_client().await?;
+            if Instant::now() >= deadline {
+                return Err(ExecServerError::ProcessStartTimedOut);
+            }
             if !self.inner.begin_process_start(&rpc_client) {
                 continue;
             }
@@ -849,7 +890,7 @@ impl ExecServerClient {
                         &rpc_client,
                         EXEC_METHOD,
                         &params,
-                        PROCESS_START_TIMEOUT,
+                        deadline.saturating_duration_since(Instant::now()),
                     ) => Some(result),
                     _ = result_tx.closed() => None,
                 };
@@ -943,6 +984,9 @@ impl ExecServerClient {
         let session_id = OnceLock::new();
         let (connection_changed, _connection_changed_rx) = watch::channel(());
         let inner = Arc::new(Inner {
+            file_read_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::file_read::MAX_OPEN_FILE_READS,
+            )),
             connection: StdMutex::new(ConnectionState {
                 status: ConnectionStatus::Connected(Arc::clone(&rpc_client)),
                 active_process_starts: 0,
@@ -1415,6 +1459,10 @@ impl Session {
     }
 
     pub(crate) fn unregister(&self) {
+        // Failed replay retains this identity until its cleanup owner finishes.
+        if !self.state.recoverable.load(Ordering::Acquire) {
+            return;
+        }
         self.client
             .inner
             .remove_session_if(&self.process_id, &self.state);
@@ -1562,8 +1610,10 @@ async fn handle_server_notification(
                 // Closed is terminal, but it can arrive before tail output or
                 // exited. Keep routing this process until the ordered publisher
                 // says Closed has actually been delivered.
-                let result =
-                    session.publish_ordered_event(ExecProcessEvent::Closed { seq: params.seq });
+                let result = session.publish_ordered_event(ExecProcessEvent::Closed {
+                    seq: params.seq,
+                    sandbox_denied: params.sandbox_denied,
+                });
                 if result.is_ok() {
                     session.note_change(params.seq);
                 }
@@ -2325,6 +2375,7 @@ mod tests {
                     serde_json::to_value(ExecClosedNotification {
                         process_id: process_id.clone(),
                         seq: 4,
+                        sandbox_denied: Some(false),
                     })
                     .expect("closed notification should serialize"),
                 ),
@@ -2400,7 +2451,10 @@ mod tests {
                     exit_code: 0,
                     sandbox_denied: Some(true),
                 },
-                ExecProcessEvent::Closed { seq: 4 },
+                ExecProcessEvent::Closed {
+                    seq: 4,
+                    sandbox_denied: Some(false)
+                },
             ]
         );
 
@@ -2977,6 +3031,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_replay_cleanup_does_not_block_healthy_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+        let (cleaned_tx, cleaned_rx) = oneshot::channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_release = Arc::clone(&release);
+        let server = tokio::spawn(async move {
+            let mut first = accept_websocket(&listener).await;
+            complete_websocket_initialize(&mut first, "mixed-replay", None).await;
+            disconnect_rx.await.unwrap();
+            drop(first);
+            let mut resumed = accept_websocket(&listener).await;
+            complete_websocket_session_initialize(
+                &mut resumed,
+                "mixed-replay",
+                Some("mixed-replay"),
+            )
+            .await;
+            let mut cleaned_tx = Some(cleaned_tx);
+            loop {
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut resumed).await
+                else {
+                    panic!("request");
+                };
+                let result = match request.method.as_str() {
+                    EXEC_READ_METHOD => {
+                        let params: crate::protocol::ReadParams =
+                            serde_json::from_value(request.params.unwrap()).unwrap();
+                        let bad = params.process_id.as_str() == "bad";
+                        serde_json::to_value(ReadResponse {
+                            chunks: if bad {
+                                vec![]
+                            } else {
+                                vec![crate::protocol::ProcessOutputChunk {
+                                    seq: 1,
+                                    stream: crate::protocol::ExecOutputStream::Stdout,
+                                    chunk: b"healthy".to_vec().into(),
+                                }]
+                            },
+                            next_seq: 2,
+                            exited: false,
+                            exit_code: None,
+                            closed: false,
+                            failure: bad.then(|| "lost output".into()),
+                            sandbox_denied: false,
+                        })
+                        .unwrap()
+                    }
+                    EXEC_TERMINATE_METHOD => {
+                        let done = cleanup_release.load(std::sync::atomic::Ordering::SeqCst);
+                        if done {
+                            cleaned_tx.take().unwrap().send(()).unwrap();
+                        }
+                        serde_json::json!({"running": !done})
+                    }
+                    "probe" => serde_json::json!({"usable": true}),
+                    other => panic!("unexpected method {other}"),
+                };
+                write_jsonrpc_websocket(
+                    &mut resumed,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result,
+                    }),
+                )
+                .await;
+                if cleaned_tx.is_none() {
+                    break;
+                }
+            }
+        });
+        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+            websocket_url,
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(1),
+        });
+        let client = lazy.get().await.unwrap();
+        let bad = client
+            .register_session(&ProcessId::from("bad"))
+            .await
+            .unwrap();
+        let healthy = client
+            .register_session(&ProcessId::from("healthy"))
+            .await
+            .unwrap();
+        let mut healthy_events = healthy.subscribe_events();
+        let mut bad_events = bad.subscribe_events();
+        disconnect_tx.send(()).unwrap();
+        assert!(
+            matches!(timeout(Duration::from_secs(2), bad_events.recv()).await.unwrap().unwrap(), ExecProcessEvent::Failed(message) if message.contains("lost output"))
+        );
+        assert!(
+            matches!(timeout(Duration::from_secs(2), healthy_events.recv()).await.unwrap().unwrap(), ExecProcessEvent::Output(chunk) if chunk.chunk.0 == b"healthy")
+        );
+        let response: serde_json::Value =
+            timeout(Duration::from_secs(2), client.call("probe", &()))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(response, serde_json::json!({"usable": true}));
+        bad.unregister();
+        assert!(
+            client
+                .register_session(&ProcessId::from("bad"))
+                .await
+                .is_err(),
+            "failed process identity must remain reserved while cleanup can still terminate it"
+        );
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        timeout(Duration::from_secs(2), cleaned_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_process_start_cleanup_does_not_block_other_process_recovery() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
@@ -3419,6 +3591,231 @@ mod tests {
             panic!("expected saved connection failures");
         };
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn terminal_file_bytes_precede_close_ack_and_keep_cleanup_bounded() {
+        use crate::ExecutorFileSystem;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_websocket(&listener).await;
+            complete_websocket_initialize(&mut socket, "file-tail", None).await;
+            let JSONRPCMessage::Request(open) = read_jsonrpc_websocket(&mut socket).await else {
+                panic!("open");
+            };
+            assert_eq!(open.method, crate::protocol::FS_OPEN_METHOD);
+            let params: crate::protocol::FsOpenParams =
+                serde_json::from_value(open.params.unwrap()).unwrap();
+            write_jsonrpc_websocket(
+                &mut socket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: open.id,
+                    result: serde_json::json!({"handleId": params.handle_id}),
+                }),
+            )
+            .await;
+            let JSONRPCMessage::Request(read) = read_jsonrpc_websocket(&mut socket).await else {
+                panic!("read");
+            };
+            assert_eq!(read.method, crate::protocol::FS_READ_BLOCK_METHOD);
+            write_jsonrpc_websocket(
+                &mut socket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: read.id,
+                    result: serde_json::to_value(crate::protocol::FsReadBlockResponse {
+                        chunk: b"final bytes".to_vec().into(),
+                        eof: true,
+                    })
+                    .unwrap(),
+                }),
+            )
+            .await;
+            let JSONRPCMessage::Request(close) = read_jsonrpc_websocket(&mut socket).await else {
+                panic!("close");
+            };
+            assert_eq!(close.method, crate::protocol::FS_CLOSE_METHOD);
+            release_rx.await.unwrap();
+            write_jsonrpc_websocket(
+                &mut socket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: close.id,
+                    result: serde_json::json!({}),
+                }),
+            )
+            .await;
+            let _ = socket.next().await;
+        });
+        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+            websocket_url,
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(1),
+        });
+        let client = lazy.get().await.unwrap();
+        let fs = crate::remote_file_system::RemoteFileSystem::new(lazy);
+        let path = PathUri::from_host_native_path(std::env::temp_dir().join("test.txt")).unwrap();
+        let mut stream = fs.read_file_stream(&path, None).await.unwrap();
+        let chunk = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("final bytes cannot wait for close")
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.as_ref(), b"final bytes");
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            client.inner.file_read_slots.available_permits(),
+            crate::file_read::MAX_OPEN_FILE_READS - 1
+        );
+        let held = Arc::clone(&client.inner.file_read_slots)
+            .acquire_many_owned((crate::file_read::MAX_OPEN_FILE_READS - 1) as u32)
+            .await
+            .unwrap();
+        let mut next = Box::pin(client.reserve_file_stream());
+        assert!(
+            futures::poll!(next.as_mut()).is_pending(),
+            "cleanup retains admission"
+        );
+        release_tx.send(()).unwrap();
+        let next = timeout(Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(next);
+        drop(held);
+        drop(stream);
+        drop(fs);
+        drop(client);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_start_deadline_includes_lazy_readiness() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (connected_tx, connected_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut websocket = accept_websocket(&listener).await;
+            connected_tx.send(()).unwrap();
+            ready_rx.await.unwrap();
+            complete_websocket_initialize(&mut websocket, "start-budget", None).await;
+            assert!(matches!(read_jsonrpc_websocket(&mut websocket).await,
+                JSONRPCMessage::Request(request) if request.method == EXEC_METHOD));
+            started_tx.send(()).unwrap();
+            // The test advances the client's thirty-second deadline while this
+            // read waits; do not install the helper's unrelated one-second timer.
+            let frame = websocket.next().await.unwrap().unwrap();
+            let message: JSONRPCMessage = serde_json::from_slice(&frame.into_data()).unwrap();
+            let JSONRPCMessage::Request(cleanup) = message else {
+                panic!("expected cleanup");
+            };
+            assert_eq!(cleanup.method, EXEC_TERMINATE_METHOD);
+            write_jsonrpc_websocket(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: cleanup.id,
+                    result: serde_json::json!({"running": false}),
+                }),
+            )
+            .await;
+        });
+        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+            websocket_url,
+            connect_timeout: Duration::from_secs(60),
+            initialize_timeout: Duration::from_secs(60),
+        });
+        let start = tokio::spawn(async move {
+            let backend = crate::remote_process::RemoteProcess::new(lazy);
+            crate::ExecBackend::start(
+                &backend,
+                ExecParams {
+                    process_id: ProcessId::from("budget"),
+                    argv: vec!["unused".into()],
+                    cwd: PathUri::from_host_native_path(std::env::current_dir().unwrap()).unwrap(),
+                    env_policy: None,
+                    env: HashMap::new(),
+                    tty: false,
+                    pipe_stdin: false,
+                    arg0: None,
+                    sandbox: None,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                },
+            )
+            .await
+        });
+        connected_rx.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::resume();
+        ready_tx.send(()).unwrap();
+        started_rx.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::resume();
+        let outcome = timeout(Duration::from_secs(1), start)
+            .await
+            .expect("readiness must consume the same thirty-second start budget")
+            .unwrap();
+        assert!(outcome.is_err(), "unacknowledged start must time out");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn environment_info_timeout_allows_shared_startup_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (waiting_tx, waiting_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = accept_websocket(&listener).await;
+            complete_websocket_session_initialize(&mut first, "first", None).await;
+            assert!(matches!(read_jsonrpc_websocket(&mut first).await,
+                JSONRPCMessage::Request(request) if request.method == ENVIRONMENT_INFO_METHOD));
+            waiting_tx.send(()).unwrap();
+            let mut replacement = accept_websocket(&listener).await;
+            complete_websocket_initialize(&mut replacement, "replacement", None).await;
+            let _ = replacement.next().await;
+        });
+        let client = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+            websocket_url,
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(1),
+        });
+        let startup_client = client.clone();
+        let startup = tokio::spawn(async move { startup_client.get().await });
+        waiting_rx.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(super::ENVIRONMENT_INFO_TIMEOUT + Duration::from_millis(1)).await;
+        let error = startup
+            .await
+            .unwrap()
+            .err()
+            .expect("withheld environment info must time out");
+        tokio::time::resume();
+        assert!(
+            matches!(error, super::ExecServerError::ConnectionAttempt(ref error)
+            if matches!(error.as_ref(), super::ExecServerError::EnvironmentInfoTimedOut { .. }))
+        );
+        let (first, second) = tokio::join!(client.get(), client.get());
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.session_id().as_deref(), Some("replacement"));
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+        drop(first);
+        drop(second);
+        drop(client);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -109,7 +109,7 @@ fn network_amendments_preserve_latest_decision_after_reload() -> Result<()> {
 fn prefix_amendment_rejects_empty_tokens_before_creating_file() -> Result<()> {
     let tmp = tempdir()?;
     let path = tmp.path().join("rules/default.rules");
-    for prefix in [tokens(&["git", ""]), tokens(&[" \t", "status"])] {
+    for prefix in [tokens(&["", "status"]), tokens(&[" \t", "status"])] {
         let error = blocking_append_allow_prefix_rule(&path, &prefix).expect_err("invalid token");
         assert!(error.to_string().contains("tokens cannot be empty"));
         assert!(!path.parent().unwrap().exists());
@@ -425,7 +425,7 @@ fn add_prefix_rule_rejects_empty_prefix() -> Result<()> {
 fn add_prefix_rule_rejects_empty_tokens() {
     let mut policy = Policy::empty();
 
-    for prefix in [tokens(&[""]), tokens(&["git", " "])] {
+    for prefix in [tokens(&[""]), tokens(&[" ", "status"])] {
         assert!(matches!(
             policy.add_prefix_rule(&prefix, Decision::Allow),
             Err(Error::InvalidPattern(message)) if message == "token cannot be empty"
@@ -437,7 +437,7 @@ fn add_prefix_rule_rejects_empty_tokens() {
 fn starlark_rules_reject_empty_pattern_tokens() {
     for source in [
         r#"prefix_rule(pattern = [""], decision = "allow")"#,
-        r#"prefix_rule(pattern = ["git", [""]], decision = "allow")"#,
+        r#"prefix_rule(pattern = [["git", ""]], decision = "allow")"#,
     ] {
         let mut parser = PolicyParser::new();
         let err = parser
@@ -1130,6 +1130,120 @@ host_executable(name = "git", paths = ["{git_path_literal}"])
                 justification: None,
             }],
         }
+    );
+    Ok(())
+}
+
+#[test]
+fn literal_blank_arguments_round_trip_and_match_exactly() -> Result<()> {
+    for argument in ["", " ", "\t"] {
+        let command = tokens(&["printf", "%s", argument]);
+        let mut policy = Policy::empty();
+        policy.add_prefix_rule(&command, Decision::Allow)?;
+        assert_eq!(
+            policy.check(&command, &prompt_all).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            policy
+                .check(&tokens(&["printf", "%s", "other"]), &prompt_all)
+                .decision,
+            Decision::Prompt
+        );
+        let tmp = tempdir()?;
+        let path = tmp.path().join("test.rules");
+        blocking_append_allow_prefix_rule(&path, &command)?;
+        let mut parser = PolicyParser::new();
+        parser.parse("test.rules", &fs::read_to_string(path)?)?;
+        assert_eq!(
+            parser.build().check(&command, &prompt_all).decision,
+            Decision::Allow
+        );
+    }
+    let mut parser = PolicyParser::new();
+    parser.parse(
+        "alternatives.rules",
+        r#"prefix_rule(pattern=["printf", ["", " ", "\t"]], decision="allow")"#,
+    )?;
+    let policy = parser.build();
+    for argument in ["", " ", "\t"] {
+        assert_eq!(
+            policy
+                .check(&tokens(&["printf", argument]), &prompt_all)
+                .decision,
+            Decision::Allow
+        );
+    }
+    assert_eq!(
+        policy
+            .check(&tokens(&["printf", "other"]), &prompt_all)
+            .decision,
+        Decision::Prompt
+    );
+    Ok(())
+}
+
+#[test]
+fn amendment_does_not_confuse_string_contents_with_declaration() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("test.rules");
+    fs::write(
+        &path,
+        "unused = \"\"\"\nprefix_rule(pattern=[\"git\", \"status\"], decision=\"allow\")\n\"\"\"\n",
+    )?;
+    blocking_append_allow_prefix_rule(&path, &tokens(&["git", "status"]))?;
+    let contents = fs::read_to_string(&path)?;
+    let mut parser = PolicyParser::new();
+    parser.parse("test.rules", &contents)?;
+    assert_eq!(
+        parser
+            .build()
+            .check(&tokens(&["git", "status"]), &prompt_all)
+            .decision,
+        Decision::Allow
+    );
+    blocking_append_allow_prefix_rule(&path, &tokens(&["git", "status"]))?;
+    assert_eq!(fs::read_to_string(path)?, contents);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn suffixed_windows_rules_resolve_without_authorizing_other_suffixes() -> Result<()> {
+    let exe = host_absolute_path(&["trusted", "git.exe"]);
+    let cmd = host_absolute_path(&["trusted", "git.cmd"]);
+    let mut policy = Policy::empty();
+    policy.add_prefix_rule(&tokens(&["Git.EXE", "status"]), Decision::Allow)?;
+    policy.add_prefix_rule(&tokens(&["git.cmd", "status"]), Decision::Forbidden)?;
+    policy.set_host_executable_paths("git".into(), vec![absolute_path(&exe), absolute_path(&cmd)]);
+    let options = MatchOptions {
+        resolve_host_executables: true,
+    };
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&exe, "status"]), &prompt_all, &options)
+            .decision,
+        Decision::Allow
+    );
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&cmd, "status"]), &prompt_all, &options)
+            .decision,
+        Decision::Forbidden
+    );
+    let untrusted = host_absolute_path(&["untrusted", "git.exe"]);
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&untrusted, "status"]), &prompt_all, &options)
+            .decision,
+        Decision::Prompt
+    );
+    policy.add_prefix_rule(&tokens(&["git", "status"]), Decision::Forbidden)?;
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&exe, "status"]), &prompt_all, &options)
+            .decision,
+        Decision::Forbidden
     );
     Ok(())
 }

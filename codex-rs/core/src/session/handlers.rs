@@ -146,6 +146,27 @@ async fn thread_settings_update(
     }
 }
 
+/// Preparation owns the acknowledgement after it leaves the pending map.
+/// Cancelling that future must reject the start rather than drop its reply.
+struct TurnStartAdmission(Option<tokio::sync::oneshot::Sender<CodexResult<()>>>);
+
+impl TurnStartAdmission {
+    fn send(mut self, result: CodexResult<()>) -> Result<(), CodexResult<()>> {
+        self.0
+            .take()
+            .expect("admission sender is owned")
+            .send(result)
+    }
+}
+
+impl Drop for TurnStartAdmission {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(Err(CodexErr::TurnAborted));
+        }
+    }
+}
+
 pub(super) async fn user_input_or_turn_inner(
     sess: &Arc<Session>,
     sub_id: String,
@@ -172,7 +193,7 @@ pub(super) async fn user_input_or_turn_inner(
     let mut start_only_admission = {
         let mut task_start = sess.task_start_state.lock().await;
         match task_start.pending_start_only_admissions.remove(&sub_id) {
-            Some(admission) => Some((task_start_permit, admission)),
+            Some(admission) => Some((task_start_permit, TurnStartAdmission(Some(admission)))),
             None => {
                 drop(task_start_permit);
                 None
@@ -830,130 +851,106 @@ pub(super) async fn submission_loop(
         .services
         .agent_control
         .execution_permit_thread_cleanup(sess.thread_id);
-    // To break out of this loop, send Op::Shutdown.
+    // A single owned future preserves settings/start order. Control messages
+    // can bypass slow preparation; dropping that future prevents cancelled
+    // preparation from installing a task later. The deferred queue is bounded
+    // by the submission channel's own capacity.
+    let mut ordered = std::collections::VecDeque::new();
+    let deferred_limit = rx_sub.capacity().unwrap_or(1024).max(1);
+    let mut pending: Option<(String, bool, futures::future::BoxFuture<'static, bool>)> = None;
     let mut shutdown_received = false;
-    while let Ok(super::QueuedSubmission {
-        submission: sub,
-        mailbox_admission,
-    }) = rx_sub.recv().await
-    {
-        let _execution_permit_cleanup = sess
-            .services
-            .agent_control
-            .execution_permit_cleanup(sess.thread_id, &sub.id);
-        debug!(?sub, "Submission");
-        let dispatch_span = submission_dispatch_span(&sub);
-        let should_exit = async {
-            match sub.op.clone() {
-                Op::Interrupt => {
-                    interrupt(&sess).await;
-                    false
-                }
-                Op::CleanBackgroundTerminals => {
-                    clean_background_terminals(&sess).await;
-                    false
-                }
-                Op::UserInput { .. } => {
-                    user_input_or_turn(&sess, sub.id.clone(), sub.op, sub.client_user_message_id)
-                        .await;
-                    false
-                }
-                Op::ThreadSettings { thread_settings } => {
-                    update_thread_settings(&sess, sub.id.clone(), thread_settings).await;
-                    false
-                }
-                Op::InterAgentCommunication { communication } => {
-                    inter_agent_communication(
-                        &sess,
-                        sub.id.clone(),
-                        communication,
-                        mailbox_admission,
-                    )
-                    .await;
-                    false
-                }
-                Op::ExecApproval {
-                    id: approval_id,
-                    turn_id,
-                    decision,
-                } => {
-                    exec_approval(&sess, approval_id, turn_id, decision).await;
-                    false
-                }
-                Op::PatchApproval { id, decision } => {
-                    patch_approval(&sess, id, decision).await;
-                    false
-                }
-                Op::UserInputAnswer { id, response } => {
-                    request_user_input_response(&sess, id, response).await;
-                    false
-                }
-                Op::RequestPermissionsResponse { id, response } => {
-                    request_permissions_response(&sess, id, response).await;
-                    false
-                }
-                Op::DynamicToolResponse { id, response } => {
-                    dynamic_tool_response(&sess, id, response).await;
-                    false
-                }
-                Op::RefreshMcpServers { config } => {
-                    refresh_mcp_servers(&sess, config).await;
-                    false
-                }
-                Op::ReloadUserConfig => {
-                    reload_user_config(&sess).await;
-                    false
-                }
-                Op::Compact => {
-                    compact(&sess, sub.id.clone()).await;
-                    false
-                }
-                Op::ThreadRollback { num_turns } => {
-                    thread_rollback(&sess, sub.id.clone(), num_turns).await;
-                    false
-                }
-                Op::SetThreadMemoryMode { mode } => {
-                    set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
-                    false
-                }
-                Op::RunUserShellCommand { command } => {
-                    run_user_shell_command(&sess, sub.id.clone(), command).await;
-                    false
-                }
-                Op::ResolveElicitation {
-                    server_name,
-                    request_id,
-                    decision,
-                    content,
-                    meta,
-                } => {
-                    resolve_elicitation(
-                        &sess,
-                        sub.id.clone(),
-                        server_name,
-                        request_id,
-                        decision,
-                        content,
-                        meta,
-                    )
-                    .await;
-                    false
-                }
-                Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
-                Op::Review { review_request } => {
-                    review(&sess, &config, sub.id.clone(), review_request).await;
-                    false
-                }
-
-                _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
-            }
+    loop {
+        if pending.is_none()
+            && let Some(queued) = ordered.pop_front()
+        {
+            let queued: super::QueuedSubmission = queued;
+            let cancellable = matches!(
+                queued.submission.op,
+                Op::UserInput { .. } | Op::Review { .. }
+            );
+            pending = Some((
+                queued.submission.id.clone(),
+                cancellable,
+                Box::pin(dispatch_submission(
+                    Arc::clone(&sess),
+                    Arc::clone(&config),
+                    queued,
+                )),
+            ));
         }
-        .instrument(dispatch_span)
-        .await;
-        if should_exit {
+        let queued = if let Some((_, _, preparation)) = pending.as_mut() {
+            tokio::select! {
+                biased;
+                should_exit = preparation => {
+                    pending = None;
+                    if should_exit { shutdown_received = true; break; }
+                    continue;
+                }
+                received = rx_sub.recv(), if ordered.len() < deferred_limit => received,
+            }
+        } else {
+            rx_sub.recv().await
+        };
+        let Ok(queued) = queued else {
+            break;
+        };
+        let control = matches!(
+            queued.submission.op,
+            Op::Interrupt
+                | Op::Shutdown
+                | Op::ExecApproval { .. }
+                | Op::PatchApproval { .. }
+                | Op::UserInputAnswer { .. }
+                | Op::RequestPermissionsResponse { .. }
+                | Op::DynamicToolResponse { .. }
+                | Op::ResolveElicitation { .. }
+        );
+        if !control {
+            ordered.push_back(queued);
+            continue;
+        }
+        if matches!(queued.submission.op, Op::Interrupt | Op::Shutdown) {
+            let shutting_down = matches!(queued.submission.op, Op::Shutdown);
+            if shutting_down
+                || pending
+                    .as_ref()
+                    .is_some_and(|(_, cancellable, _)| *cancellable)
+            {
+                if let Some((id, cancellable, preparation)) = pending.take() {
+                    drop(preparation);
+                    cancel_queued_preparation(&sess, id, cancellable).await;
+                }
+            }
+            let mut retained = std::collections::VecDeque::new();
+            while let Some(deferred) = ordered.pop_front() {
+                let cancellable = matches!(
+                    deferred.submission.op,
+                    Op::UserInput { .. } | Op::Review { .. }
+                );
+                if shutting_down || cancellable {
+                    cancel_queued_preparation(&sess, deferred.submission.id, cancellable).await;
+                } else {
+                    retained.push_back(deferred);
+                }
+            }
+            ordered = retained;
+        }
+        if dispatch_submission(Arc::clone(&sess), Arc::clone(&config), queued).await {
             shutdown_received = true;
             break;
         }
+    }
+    // Teardown owns preparation as well as installed tasks, including EOF.
+    if let Some((id, cancellable, preparation)) = pending.take() {
+        drop(preparation);
+        cancel_queued_preparation(&sess, id, cancellable).await;
+    }
+    for queued in ordered {
+        let cancellable = matches!(
+            queued.submission.op,
+            Op::UserInput { .. } | Op::Review { .. }
+        );
+        cancel_queued_preparation(&sess, queued.submission.id, cancellable).await;
     }
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
@@ -971,6 +968,153 @@ pub(super) async fn submission_loop(
         }
     }
     debug!("Agent loop exited");
+}
+
+async fn cancel_queued_preparation(sess: &Session, id: String, emit_aborted: bool) {
+    let _permit_cleanup = sess
+        .services
+        .agent_control
+        .execution_permit_cleanup(sess.thread_id, &id);
+    if let Some(admission) = sess
+        .task_start_state
+        .lock()
+        .await
+        .pending_start_only_admissions
+        .remove(&id)
+    {
+        let _ = admission.send(Err(CodexErr::TurnAborted));
+    }
+    if emit_aborted && sess.active_turn.lock().await.is_none() {
+        sess.send_event_raw(Event {
+            id: id.clone(),
+            msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+                turn_id: Some(id),
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+                timing: None,
+            }),
+        })
+        .await;
+    }
+}
+
+async fn dispatch_submission(
+    sess: Arc<Session>,
+    config: Arc<Config>,
+    queued: super::QueuedSubmission,
+) -> bool {
+    let super::QueuedSubmission {
+        submission: sub,
+        mailbox_admission,
+    } = queued;
+    let _execution_permit_cleanup = sess
+        .services
+        .agent_control
+        .execution_permit_cleanup(sess.thread_id, &sub.id);
+    debug!(?sub, "Submission");
+    let dispatch_span = submission_dispatch_span(&sub);
+    async {
+        match sub.op {
+            Op::Interrupt => {
+                interrupt(&sess).await;
+                false
+            }
+            Op::CleanBackgroundTerminals => {
+                clean_background_terminals(&sess).await;
+                false
+            }
+            op @ Op::UserInput { .. } => {
+                user_input_or_turn(&sess, sub.id.clone(), op, sub.client_user_message_id).await;
+                false
+            }
+            Op::ThreadSettings { thread_settings } => {
+                update_thread_settings(&sess, sub.id.clone(), thread_settings).await;
+                false
+            }
+            Op::InterAgentCommunication { communication } => {
+                inter_agent_communication(&sess, sub.id.clone(), communication, mailbox_admission)
+                    .await;
+                false
+            }
+            Op::ExecApproval {
+                id: approval_id,
+                turn_id,
+                decision,
+            } => {
+                exec_approval(&sess, approval_id, turn_id, decision).await;
+                false
+            }
+            Op::PatchApproval { id, decision } => {
+                patch_approval(&sess, id, decision).await;
+                false
+            }
+            Op::UserInputAnswer { id, response } => {
+                request_user_input_response(&sess, id, response).await;
+                false
+            }
+            Op::RequestPermissionsResponse { id, response } => {
+                request_permissions_response(&sess, id, response).await;
+                false
+            }
+            Op::DynamicToolResponse { id, response } => {
+                dynamic_tool_response(&sess, id, response).await;
+                false
+            }
+            Op::RefreshMcpServers { config } => {
+                refresh_mcp_servers(&sess, config).await;
+                false
+            }
+            Op::ReloadUserConfig => {
+                reload_user_config(&sess).await;
+                false
+            }
+            Op::Compact => {
+                compact(&sess, sub.id.clone()).await;
+                false
+            }
+            Op::ThreadRollback { num_turns } => {
+                thread_rollback(&sess, sub.id.clone(), num_turns).await;
+                false
+            }
+            Op::SetThreadMemoryMode { mode } => {
+                set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
+                false
+            }
+            Op::RunUserShellCommand { command } => {
+                run_user_shell_command(&sess, sub.id.clone(), command).await;
+                false
+            }
+            Op::ResolveElicitation {
+                server_name,
+                request_id,
+                decision,
+                content,
+                meta,
+            } => {
+                resolve_elicitation(
+                    &sess,
+                    sub.id.clone(),
+                    server_name,
+                    request_id,
+                    decision,
+                    content,
+                    meta,
+                )
+                .await;
+                false
+            }
+            Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
+            Op::Review { review_request } => {
+                review(&sess, &config, sub.id.clone(), review_request).await;
+                false
+            }
+
+            _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
+        }
+    }
+    .instrument(dispatch_span)
+    .await
 }
 
 pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
@@ -991,4 +1135,152 @@ pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
         );
     }
     dispatch_span
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preparation_acknowledgement_reports_cancellation_or_actual_result() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(TurnStartAdmission(Some(sender)));
+        assert!(matches!(
+            receiver.await.unwrap(),
+            Err(CodexErr::TurnAborted)
+        ));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        TurnStartAdmission(Some(sender)).send(Ok(())).unwrap();
+        assert!(receiver.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn controls_bypass_blocked_startup_and_cancel_its_owned_future() {
+        let (session, context, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let permit = session.task_start_gate.acquire().await.unwrap();
+        let active = crate::state::ActiveTurn::default();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        active
+            .turn_state
+            .lock()
+            .await
+            .try_insert_pending_dynamic_tool("tool".to_string(), reply_tx)
+            .unwrap();
+        *session.active_turn.lock().await = Some(active);
+        let (sender, receiver) = async_channel::bounded(8);
+        let submit = |id: &str, op| super::super::QueuedSubmission {
+            submission: Submission {
+                id: id.to_string(),
+                op,
+                client_user_message_id: None,
+                trace: None,
+            },
+            mailbox_admission: None,
+        };
+        sender
+            .send(submit(
+                "blocked",
+                Op::UserInput {
+                    items: Vec::new(),
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: ThreadSettingsOverrides::default(),
+                },
+            ))
+            .await
+            .unwrap();
+        let mut dispatcher = Box::pin(submission_loop(
+            Arc::clone(&session),
+            Arc::clone(&context.config),
+            receiver,
+        ));
+        assert!(futures::poll!(dispatcher.as_mut()).is_pending());
+        let response = DynamicToolResponse {
+            content_items: Vec::new(),
+            success: true,
+        };
+        sender
+            .send(submit(
+                "reply",
+                Op::DynamicToolResponse {
+                    id: "tool".to_string(),
+                    response: response.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! { result = reply_rx => result.unwrap(), _ = dispatcher.as_mut() => panic!("dispatcher exited") }
+        }).await.expect("reply must bypass held startup gate");
+        assert_eq!(delivered, response);
+        *session.active_turn.lock().await = None;
+        let (admission, rejected) = tokio::sync::oneshot::channel();
+        session
+            .task_start_state
+            .lock()
+            .await
+            .pending_start_only_admissions
+            .insert("deferred".to_string(), admission);
+        sender
+            .send(submit(
+                "deferred",
+                Op::UserInput {
+                    items: Vec::new(),
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: ThreadSettingsOverrides::default(),
+                },
+            ))
+            .await
+            .unwrap();
+        sender
+            .send(submit("interrupt", Op::Interrupt))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut aborted_ids = Vec::new();
+            loop {
+                tokio::select! {
+                    event = events.recv() => {
+                        let event = event.unwrap();
+                        if let EventMsg::TurnAborted(aborted) = event.msg {
+                            aborted_ids.push(aborted.turn_id.unwrap());
+                            if aborted_ids.len() == 2 {
+                                assert_eq!(aborted_ids, ["blocked", "deferred"]);
+                                break;
+                            }
+                        }
+                    }
+                    _ = dispatcher.as_mut() => panic!("dispatcher exited"),
+                }
+            }
+        })
+        .await
+        .expect("interrupt must cancel preparation while the gate is held");
+        assert!(matches!(
+            rejected.await.unwrap(),
+            Err(CodexErr::TurnAborted)
+        ));
+        assert!(
+            session
+                .task_start_state
+                .lock()
+                .await
+                .pending_start_only_admissions
+                .is_empty()
+        );
+        drop(permit);
+        assert!(futures::poll!(dispatcher.as_mut()).is_pending());
+        assert!(
+            session.active_turn.lock().await.is_none(),
+            "cancelled preparation cannot install a task"
+        );
+        sender.send(submit("shutdown", Op::Shutdown)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dispatcher)
+            .await
+            .unwrap();
+    }
 }

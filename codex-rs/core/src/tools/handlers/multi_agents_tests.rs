@@ -248,6 +248,7 @@ struct ListAgentsResult {
 #[derive(Debug, Deserialize)]
 struct ListedAgentResult {
     agent_name: String,
+    runtime_loaded: bool,
     agent_status: serde_json::Value,
     last_task_message: Option<String>,
 }
@@ -1021,6 +1022,14 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(c
             .expect("typed binding should retain the child thread id"),
     )
     .expect("typed binding thread id should parse");
+    let runtime_child = manager.get_thread(child_thread_id).await.unwrap();
+    let runtime_turn = runtime_child.codex.session.new_default_turn().await;
+    let lifecycle = runtime_turn
+        .developer_instructions
+        .as_deref()
+        .unwrap_or_default();
+    assert!(lifecycle.contains("Before your final response, call submit_agent_receipt"));
+    assert!(lifecycle.contains("report missing validation honestly"));
     let child_source = agent_control
         .get_agent_config_snapshot(child_thread_id)
         .await
@@ -1449,6 +1458,21 @@ async fn multi_agent_v2_spawn_does_not_reuse_completed_explorer_without_input_fi
             .expect("first explorer binding has a thread id"),
     )
     .expect("first explorer thread id parses");
+    // Reusing the same task name would fail registry reservation if reuse were
+    // still checked only after capacity/identity admission.
+    let reused = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            assignment(&first_name),
+        ))
+        .await
+        .expect("active explorer reuses before reserving its occupied name");
+    let (content, _) = expect_text_output(reused);
+    let reused: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(reused["reused"], true);
+    assert_eq!(reused["assignment_id"], assignment_id.to_string());
     agent_control
         .task_coordinator()
         .store()
@@ -3079,6 +3103,13 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
         .await
         .expect("child thread should exist");
     let child_turn = child_thread.codex.session.new_default_turn().await;
+    let binding = session
+        .services
+        .agent_control
+        .task_coordinator()
+        .binding_for_source(&child_turn.session_source)
+        .expect("spawned child has an exact task binding");
+    child_turn.agent_task_binding.set(Some(binding)).unwrap();
     child_thread
         .codex
         .session
@@ -3097,10 +3128,31 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
         )
         .await;
 
+    let coordinator = session.services.agent_control.task_coordinator();
+    let binding = coordinator
+        .binding_for_agent_path(&AgentPath::root().join("worker").unwrap())
+        .expect("ordinary task retains durable identity");
+    let task = coordinator
+        .get_agent_task(binding.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        task.current_attempt.state,
+        codex_agent_task_store::AttemptState::Completed
+    );
+    let receipt = task
+        .receipt
+        .expect("host persists plain-message completion");
+    assert_eq!(receipt.summary, "done");
+    assert!(receipt.validation_call_ids.is_empty());
+    assert!(receipt.criterion_results.iter().all(|result| result.status
+        == codex_agent_task_store::CriterionStatus::NotRun
+        && result.evidence_ref.is_none()));
+
     let output = ListAgentsHandlerV2
         .handle(invocation(
-            session,
-            turn,
+            session.clone(),
+            turn.clone(),
             "list_agents",
             function_payload(json!({})),
         ))
@@ -3130,11 +3182,101 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
     assert_eq!(
         worker.agent_status,
         json!({
-            "errored": "durable typed receipt status: needs_main: typed agent /root/worker finished with status Completed(Some(\"done\")) without submitting a receipt"
+            "completed": "Agent-reported result (behavior unverified): done"
         })
     );
     assert_eq!(worker.last_task_message.as_deref(), Some("TaskCapsuleV1"));
     assert_eq!(success, Some(true));
+
+    let mut previous_attempt = binding.attempt_id;
+    for ordinal in 1..=2 {
+        let followup = FollowupTaskHandlerV2
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "followup_task",
+                function_payload(
+                    json!({"target": "worker", "message": format!("followup {ordinal}")}),
+                ),
+            ))
+            .await
+            .expect("completed plain child accepts followup");
+        assert_eq!(expect_text_output(followup).1, Some(true));
+        assert_eq!(
+            coordinator
+                .binding_for_agent_path(&AgentPath::root().join("worker").unwrap())
+                .unwrap()
+                .attempt_id,
+            previous_attempt,
+            "queued followup delivery does not retire an attempt before the next turn"
+        );
+        assert!(manager.captured_ops().iter().any(|(id, op)| *id == agent_id && matches!(op, Op::InterAgentCommunication { communication } if communication.trigger_turn && communication.recipient.as_str() == "/root/worker")));
+        let next_turn = child_thread.codex.session.new_default_turn().await;
+        // The manager records operations without running model turns. Exercise the same
+        // preparation boundary run_turn uses before any tool or model work.
+        coordinator
+            .prepare_legacy_agent_turn(&next_turn.session_source, agent_id)
+            .await
+            .unwrap();
+        next_turn
+            .agent_task_binding
+            .set(Some(
+                coordinator
+                    .binding_for_source(&next_turn.session_source)
+                    .expect("followup turn has its renewed task binding"),
+            ))
+            .unwrap();
+        let active = coordinator
+            .get_agent_task(binding.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(active.current_attempt.ordinal, ordinal);
+        assert_ne!(active.current_attempt.attempt_id, previous_attempt);
+        assert!(active.receipt.is_none());
+        previous_attempt = active.current_attempt.attempt_id;
+        let summary = format!("followup result {ordinal}");
+        child_thread
+            .codex
+            .session
+            .send_event(
+                next_turn.as_ref(),
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    surfaced_result: None,
+                    turn_id: next_turn.sub_id.clone(),
+                    last_agent_message: Some(summary.clone()),
+                    error: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                }),
+            )
+            .await;
+        let latest = coordinator
+            .get_agent_task(binding.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(latest.receipt.unwrap().summary, summary);
+        let listed = ListAgentsHandlerV2
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "list_agents",
+                function_payload(json!({})),
+            ))
+            .await
+            .unwrap();
+        let listed: ListAgentsResult = serde_json::from_str(&expect_text_output(listed).0).unwrap();
+        assert_eq!(
+            listed
+                .agents
+                .iter()
+                .find(|agent| agent.agent_name == "/root/worker")
+                .unwrap()
+                .agent_status,
+            json!({"completed": format!("Agent-reported result (behavior unverified): {summary}")})
+        );
+    }
 }
 
 #[test_case::test_case("worker"; "relative")]
@@ -5115,6 +5257,7 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
     assert_eq!(
         result,
         wait::WaitAgentResult {
+            interruption: None,
             status: HashMap::from([
                 (id_a.to_string(), AgentStatus::NotFound),
                 (id_b.to_string(), AgentStatus::NotFound),
@@ -5158,6 +5301,7 @@ async fn wait_agent_times_out_when_status_is_not_final() {
     assert_eq!(
         result,
         wait::WaitAgentResult {
+            interruption: None,
             status: HashMap::new(),
             timed_out: true
         }
@@ -5237,6 +5381,7 @@ async fn wait_agent_returns_final_status_without_timeout() {
     assert_eq!(
         result,
         wait::WaitAgentResult {
+            interruption: None,
             status: HashMap::from([(agent_id.to_string(), AgentStatus::Shutdown)]),
             timed_out: false
         }
@@ -5315,6 +5460,7 @@ async fn wait_agent_all_waits_for_every_unique_target_and_includes_initial_final
     assert_eq!(
         result,
         wait::WaitAgentResult {
+            interruption: None,
             status: HashMap::from([
                 (first.thread_id.to_string(), AgentStatus::Shutdown),
                 (second.thread_id.to_string(), AgentStatus::Shutdown),
@@ -5898,8 +6044,11 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
     let (content, _) = expect_text_output(output);
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
-    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents.len(), 2);
     assert_eq!(result.agents[0].agent_name, "/root");
+    assert!(result.agents[0].runtime_loaded);
+    assert_eq!(result.agents[1].agent_name, "/root/worker");
+    assert!(!result.agents[1].runtime_loaded);
 }
 
 #[tokio::test]
@@ -6754,4 +6903,61 @@ async fn registered_legacy_wait_completion_preserves_requested_target_order() {
                 .all(|status| *status == AgentStatus::NotFound)
         );
     }
+}
+
+#[tokio::test]
+async fn legacy_all_wait_preserves_new_completion_when_mailbox_interrupts() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.features.disable(Feature::MultiAgentV2).unwrap();
+    set_turn_config(&mut turn, config.clone());
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let first = manager.start_thread(config.clone()).await.unwrap();
+    let second = manager.start_thread(config).await.unwrap();
+    let session = Arc::new(session);
+    let handler = WaitAgentHandler::default();
+    let mut waiting = Box::pin(handler.handle(invocation(Arc::clone(&session), Arc::new(turn), "wait_agent", function_payload(json!({
+        "targets": [first.thread_id.to_string(), second.thread_id.to_string()], "return_when": "all"
+    })))));
+    assert!(
+        timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err()
+    );
+    first.thread.submit(Op::Shutdown {}).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err(),
+        "one result must not end all mode"
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::root().join("sender").unwrap(),
+            AgentPath::root(),
+            Vec::new(),
+            "ready mail".into(),
+            false,
+        ))
+        .await
+        .unwrap();
+    let output = timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        output.outcome_for_logging(),
+        codex_tools::ToolOutputOutcome::Yielded
+    );
+    let (content, _) = expect_text_output(output);
+    let result: wait::WaitAgentResult = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        result.status.get(&first.thread_id.to_string()),
+        Some(&AgentStatus::Shutdown)
+    );
+    assert!(!result.status.contains_key(&second.thread_id.to_string()));
+    assert!(!result.timed_out);
+    assert!(result.interruption.unwrap().contains("mailbox"));
 }

@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -125,7 +126,8 @@ fn remote_status_to_error(status: tonic::Status) -> ThreadConfigLoadError {
                 ThreadConfigLoadErrorCode::Timeout,
                 None,
                 format!("remote thread config request timed out: {status}"),
-            );
+            )
+            .with_grpc_code(status.code());
         }
         source = error.source();
     }
@@ -154,6 +156,7 @@ fn remote_status_to_error(status: tonic::Status) -> ThreadConfigLoadError {
         /*status_code*/ None,
         format!("remote thread config request failed: {status}"),
     )
+    .with_grpc_code(status.code())
 }
 
 fn thread_config_source_from_proto(
@@ -227,7 +230,10 @@ fn model_provider_from_proto(
             .auth
             .map(model_provider_auth_from_proto)
             .transpose()?,
-        aws: None,
+        aws: provider.aws.map(|aws| ModelProviderAwsAuthInfo {
+            profile: aws.profile,
+            region: aws.region,
+        }),
         wire_api,
         query_params: provider.query_params.map(|map| map.values),
         http_headers: provider.http_headers.map(|map| map.values),
@@ -238,7 +244,7 @@ fn model_provider_from_proto(
         websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
-        supports_standalone_web_search: false,
+        supports_standalone_web_search: provider.supports_standalone_web_search,
     };
     Ok((id, info))
 }
@@ -255,7 +261,7 @@ fn model_provider_to_proto(
         env_key_instructions,
         experimental_bearer_token,
         auth,
-        aws: _,
+        aws,
         wire_api,
         query_params,
         http_headers,
@@ -266,7 +272,7 @@ fn model_provider_to_proto(
         websocket_connect_timeout_ms,
         requires_openai_auth,
         supports_websockets,
-        supports_standalone_web_search: _,
+        supports_standalone_web_search,
     } = provider;
 
     proto::ModelProvider {
@@ -287,6 +293,11 @@ fn model_provider_to_proto(
         websocket_connect_timeout_ms,
         requires_openai_auth,
         supports_websockets,
+        supports_standalone_web_search,
+        aws: aws.map(|aws| proto::ModelProviderAwsAuthInfo {
+            profile: aws.profile,
+            region: aws.region,
+        }),
     }
 }
 
@@ -495,7 +506,15 @@ mod tests {
 
     #[test]
     fn model_provider_proto_roundtrips_through_domain_type() {
-        let expected = expected_provider();
+        let mut expected = expected_provider();
+        expected.auth = None;
+        expected.supports_websockets = false;
+        expected.supports_standalone_web_search = true;
+        expected.aws = Some(ModelProviderAwsAuthInfo {
+            profile: Some("test-profile".to_string()),
+            region: Some("us-east-1".to_string()),
+        });
+        expected.validate().unwrap();
         let proto = model_provider_to_proto("local", expected.clone());
         let (id, actual) = model_provider_from_proto(proto).expect("model provider from proto");
 
@@ -570,6 +589,20 @@ mod tests {
     }
 
     #[test]
+    fn remote_errors_preserve_distinct_grpc_statuses() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::InvalidArgument,
+            tonic::Code::FailedPrecondition,
+        ] {
+            let error = remote_status_to_error(Status::new(code, "test"));
+            assert_eq!(error.code(), ThreadConfigLoadErrorCode::RequestFailed);
+            assert_eq!(error.grpc_code(), Some(code));
+            assert_eq!(error.status_code(), None);
+        }
+    }
+
+    #[test]
     fn server_cancellation_is_not_a_timeout() {
         assert_eq!(
             remote_status_to_error(Status::cancelled("cancelled by server")).code(),
@@ -627,6 +660,8 @@ mod tests {
                             websocket_connect_timeout_ms: Some(10_000),
                             requires_openai_auth: false,
                             supports_websockets: true,
+                            supports_standalone_web_search: false,
+                            aws: None,
                         }],
                         features: HashMap::from([
                             ("plugins".to_string(), false),

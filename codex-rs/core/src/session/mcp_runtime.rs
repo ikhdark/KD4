@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(tools[0].tool.name.as_ref(), "echo");
         let step = session
             .capture_step_context(Arc::clone(&turn_context))
-            .await;
+            .await?;
         assert!(Arc::ptr_eq(&step.mcp, &old_runtime));
 
         let mut removed = configured.clone();

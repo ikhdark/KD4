@@ -42,6 +42,12 @@ pub use runtime_projection::installed_connector_runtime;
 pub use snapshot::ConnectorSnapshot;
 pub use snapshot::PluginConnectorSource;
 
+/// Connector identity is case-sensitive; whitespace is never part of an ID.
+pub fn canonical_connector_id(id: &str) -> Option<&str> {
+    let id = id.trim();
+    (!id.is_empty()).then_some(id)
+}
+
 pub const CONNECTORS_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,13 +76,31 @@ impl ConnectorDirectoryCacheKey {
 
 #[derive(Clone)]
 struct CachedConnectorDirectory {
-    key: ConnectorDirectoryCacheKey,
     expires_at: Instant,
     connectors: Vec<AppInfo>,
 }
 
-static CONNECTOR_DIRECTORY_CACHE: LazyLock<StdMutex<Option<CachedConnectorDirectory>>> =
-    LazyLock::new(|| StdMutex::new(None));
+const MAX_DIRECTORY_CACHE_SCOPES: usize = 16;
+static CONNECTOR_DIRECTORY_CACHE: LazyLock<
+    StdMutex<HashMap<ConnectorDirectoryCacheKey, CachedConnectorDirectory>>,
+> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn insert_directory_cache(
+    cache: &mut HashMap<ConnectorDirectoryCacheKey, CachedConnectorDirectory>,
+    key: ConnectorDirectoryCacheKey,
+    entry: CachedConnectorDirectory,
+) {
+    if !cache.contains_key(&key)
+        && cache.len() >= MAX_DIRECTORY_CACHE_SCOPES
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(key, entry);
+}
 
 static DIRECTORY_REFRESH_LOCKS: LazyLock<
     StdMutex<HashMap<ConnectorDirectoryCacheKey, Weak<tokio::sync::Mutex<()>>>>,
@@ -148,22 +172,16 @@ fn promote_disk_directory_connectors(
     connectors: Vec<AppInfo>,
 ) -> Vec<AppInfo> {
     let entry = CachedConnectorDirectory {
-        key: cache_key.clone(),
         expires_at: Instant::now(),
         connectors: connectors.clone(),
     };
     let mut cache_guard = CONNECTOR_DIRECTORY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cached) = cache_guard
-        .as_ref()
-        .filter(|cached| cached.key == *cache_key)
-    {
+    if let Some(cached) = cache_guard.get(cache_key) {
         return cached.connectors.clone();
     }
-    let previous = cache_guard.replace(entry);
-    drop(cache_guard);
-    drop(previous);
+    insert_directory_cache(&mut cache_guard, cache_key.clone(), entry);
     connectors
 }
 
@@ -174,8 +192,7 @@ fn cached_directory_connectors_in_memory(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     cache_guard
-        .as_ref()
-        .filter(|cached| cached.key == *cache_key)
+        .get(cache_key)
         .map(|cached| cached.connectors.clone())
 }
 
@@ -185,8 +202,8 @@ fn unexpired_directory_connectors_in_memory(
     let cache_guard = CONNECTOR_DIRECTORY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cached = cache_guard.as_ref()?;
-    if cached.key == *cache_key && Instant::now() < cached.expires_at {
+    let cached = cache_guard.get(cache_key)?;
+    if Instant::now() < cached.expires_at {
         return Some(cached.connectors.clone());
     }
     None
@@ -273,16 +290,13 @@ fn write_cached_directory_connectors_in_memory(
     ttl: Duration,
 ) {
     let entry = CachedConnectorDirectory {
-        key: cache_key,
         expires_at: Instant::now() + ttl,
         connectors: connectors.to_vec(),
     };
     let mut cache_guard = CONNECTOR_DIRECTORY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let previous = cache_guard.replace(entry);
-    drop(cache_guard);
-    drop(previous);
+    insert_directory_cache(&mut cache_guard, cache_key, entry);
 }
 
 async fn list_directory_connectors<F, Fut>(fetch_page: &mut F) -> anyhow::Result<Vec<DirectoryApp>>
@@ -584,6 +598,36 @@ mod tests {
     static CONNECTOR_DIRECTORY_CACHE_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+    #[tokio::test]
+    async fn alternating_scopes_keep_independent_fresh_snapshots_with_bounded_storage() {
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        clear_directory_memory_cache();
+        for id in ["account-a", "account-b"] {
+            write_cached_directory_connectors_in_memory(
+                cache_key(id, false),
+                &[],
+                CONNECTORS_CACHE_TTL,
+            );
+        }
+        for id in ["account-a", "account-b"] {
+            assert_eq!(
+                unexpired_directory_connectors_in_memory(&cache_key(id, false)),
+                Some(Vec::new())
+            );
+        }
+        for id in 0..MAX_DIRECTORY_CACHE_SCOPES * 2 {
+            write_cached_directory_connectors_in_memory(
+                cache_key(&format!("bounded-{id}"), false),
+                &[],
+                CONNECTORS_CACHE_TTL,
+            );
+        }
+        assert_eq!(
+            CONNECTOR_DIRECTORY_CACHE.lock().unwrap().len(),
+            MAX_DIRECTORY_CACHE_SCOPES
+        );
+    }
+
     fn cache_key(id: &str, is_workspace_account: bool) -> ConnectorDirectoryCacheKey {
         ConnectorDirectoryCacheKey::new(
             "https://chatgpt.example".to_string(),
@@ -608,7 +652,7 @@ mod tests {
         let mut cache_guard = CONNECTOR_DIRECTORY_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *cache_guard = None;
+        cache_guard.clear();
     }
 
     #[tokio::test]
@@ -651,7 +695,7 @@ mod tests {
         let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
         clear_directory_memory_cache();
         let home = TempDir::new()?;
-        for workspace in [false, true, false] {
+        for (index, workspace) in [false, true, false].into_iter().enumerate() {
             let context = cache_context(&home, "scope", workspace);
             let mut paths = Vec::new();
             let connectors = list_all_connectors_with_options(context, false, |path| {
@@ -681,7 +725,16 @@ mod tests {
                     vec!["global"]
                 }
             );
-            assert_eq!(paths.len(), if workspace { 2 } else { 1 });
+            assert_eq!(
+                paths.len(),
+                if index == 2 {
+                    0
+                } else if workspace {
+                    2
+                } else {
+                    1
+                }
+            );
         }
         Ok(())
     }

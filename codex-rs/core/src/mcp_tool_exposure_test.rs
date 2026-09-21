@@ -220,7 +220,7 @@ fn selected_skill_promotes_only_declared_mcp_entrypoints() {
 }
 
 #[test]
-fn selected_skill_without_declaration_preserves_whole_server_promotion() {
+fn selected_skill_without_declaration_keeps_tools_deferred() {
     let tools = example_plugin_tools();
     let exposure = resolve_selected_skill_mcp_exposure(
         &[selected_plugin_skill("example-plugin", "example-plugin")],
@@ -228,19 +228,8 @@ fn selected_skill_without_declaration_preserves_whole_server_promotion() {
         &tools,
     );
 
-    assert_eq!(
-        exposure.direct_entrypoints,
-        vec![
-            DirectMcpToolEntrypoint {
-                server_name: "example-plugin".to_string(),
-                tool_name: "task".to_string(),
-            },
-            DirectMcpToolEntrypoint {
-                server_name: "example-plugin".to_string(),
-                tool_name: "trace".to_string(),
-            },
-        ]
-    );
+    assert!(exposure.direct_entrypoints.is_empty());
+    assert!(tools.iter().all(|tool| !exposure.selection.includes(tool)));
     assert!(exposure.diagnostics.is_empty());
 }
 
@@ -534,4 +523,41 @@ async fn defers_apps_and_non_app_mcp_tools() {
         "mcp__codex_apps__calendar",
         "_create_event"
     )));
+}
+
+#[tokio::test]
+async fn invalid_app_policy_withholds_apps_and_keeps_native_mcp_tools() {
+    let mut config = test_config().await;
+    let config_path =
+        AbsolutePathBuf::try_from(std::env::temp_dir().join(CONFIG_TOML_FILE)).unwrap();
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(
+            &config_path,
+            serde_json::from_value(
+                serde_json::json!({"apps": {"calendar": {"enabled": "invalid"}}}),
+            )
+            .unwrap(),
+        )
+        .into();
+    let native = make_mcp_tool("native", "read", "mcp__native", "read", None, None);
+    let app = make_mcp_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "read",
+        "mcp__codex_apps__calendar",
+        "read",
+        Some(" calendar "),
+        Some("Calendar"),
+    );
+    let tools = [native.clone(), app];
+    let connectors = [make_connector("calendar", "Calendar")];
+    let exposure = build_mcp_tool_exposure(
+        &tools,
+        Some(&connectors),
+        &config,
+        false,
+        &DirectMcpToolSelection::default(),
+    );
+    assert_eq!(tool_names(&exposure.direct_tools), tool_names(&[native]));
+    assert!(exposure.deferred_tools.is_none());
 }

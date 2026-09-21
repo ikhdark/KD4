@@ -484,7 +484,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         .as_deref()
         .expect("PowerShell failure should expose model recovery guidance");
     assert!(repair_notice.starts_with(existing_repair_notice));
-    assert!(repair_notice.contains("retry with `kind: \"powershell_script\"`"));
+    assert!(repair_notice.contains("retry with `script_body`"));
     assert!(projection.fragments.iter().any(|fragment| {
         fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ErrorOrDiagnostic
             && fragment.text == repair_notice
@@ -502,7 +502,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         !code_mode["output"]
             .as_str()
             .expect("code-mode output should be text")
-            .contains("retry with `kind: \"powershell_script\"`")
+            .contains("retry with `script_body`")
     );
 }
 
@@ -552,7 +552,7 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
         output.code_mode_result(&payload)["repair"]
             .as_str()
             .expect("visible hint")
-            .contains("retry with `kind: \"powershell_script\"`")
+            .contains("retry with `script_body`")
     );
 }
 

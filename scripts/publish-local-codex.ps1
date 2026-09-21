@@ -29,6 +29,7 @@ param(
     [string]$RustyV8Archive,
     [switch]$ConfigureDesktopLocalCli,
     [switch]$RestartDesktop,
+    [switch]$RestartDesktopIfNeeded,
     [ValidateSet("User", "Process")]
     [string]$DesktopCliEnvironmentTarget = "User",
     [string]$LocalCodexHome = $env:CODEX_LOCAL_CODEX_HOME,
@@ -3446,6 +3447,26 @@ if ($TestRun -and $SkipBuild) {
     throw "-TestRun cannot be combined with -SkipBuild."
 }
 
+$buildLease = $null
+try {
+if (-not $DryRun) {
+    # Keep ownership metadata outside source status/fingerprints, including
+    # minimal checkouts whose target directory is not yet ignored.
+    $leaseHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $leaseKey = [BitConverter]::ToString($leaseHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($buildStampPath).ToLowerInvariant()))).Replace("-", "").ToLowerInvariant()
+    }
+    finally { $leaseHasher.Dispose() }
+    $buildLeasePath = Join-Path ([IO.Path]::GetTempPath()) "codex-publish-build-$leaseKey.lock"
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $buildLeasePath))
+    try {
+        $buildLease = [IO.File]::Open($buildLeasePath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    }
+    catch {
+        throw "Publish build target is already owned or unavailable: $buildLeasePath. $($_.Exception.Message)"
+    }
+}
+
 $sourceBuildStampMustRemainValid = $false
 $buildInputSnapshotBefore = $null
 if ($AutoSkipBuild -and -not $SkipBuild) {
@@ -3909,6 +3930,16 @@ if ($ConfigureDesktopLocalCli) {
     }
 }
 
+if ($RestartDesktopIfNeeded -and -not $RestartDesktop) {
+    $RestartDesktop = $binaryChanged -or $desktopRoutingResult.RestartRequired
+    if (-not $RestartDesktop -and -not $DryRun) {
+        $RestartDesktop = -not (Test-DesktopRuntimeProof -TargetPath $targetPath)
+    }
+    if (-not $RestartDesktop) {
+        Write-ProofLine "desktopRestart" "skipped: current runtime or dry-run no-op"
+    }
+}
+
 if ($DryRun) {
     $staleSourceBuildFailureMessage = $null
     if ($skipBuildBlockedByStaleSource) {
@@ -4241,4 +4272,8 @@ catch {
 }
 finally {
     Exit-CodexLocalPublishMutex -Lock $publishLock
+}
+
+} finally {
+    if ($null -ne $buildLease) { $buildLease.Dispose() }
 }

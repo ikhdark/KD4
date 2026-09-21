@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 from concurrent.futures import as_completed
-from concurrent.futures import ThreadPoolExecutor
+from scripts.process_owner import (
+    OwnedThreadPoolExecutor as ThreadPoolExecutor,
+    run_owned,
+    check_operation,
+)
 from contextlib import contextmanager
 import errno
 import hashlib
@@ -12,7 +16,6 @@ import os
 from pathlib import Path
 import shutil
 import stat
-import subprocess
 import sys
 import tarfile
 import threading
@@ -63,6 +66,7 @@ def exclusive_file_lock(
             os.write(fd, b"\0")
             os.fsync(fd)
         while not acquired:
+            check_operation()
             os.lseek(fd, 0, os.SEEK_SET)
             try:
                 _acquire_file_lock(fd)
@@ -558,8 +562,9 @@ def extract_zstd_archive(archive_path: Path, dest: Path) -> None:
     temp_path = dest.parent / f".{dest.name}.{uuid.uuid4().hex}.tmp"
     try:
         try:
-            subprocess.check_call(
-                ["zstd", "-f", "-d", str(archive_path), "-o", str(temp_path)]
+            run_owned(
+                ["zstd", "-f", "-d", str(archive_path), "-o", str(temp_path)],
+                check=True,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(

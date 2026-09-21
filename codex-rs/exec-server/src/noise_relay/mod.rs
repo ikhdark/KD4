@@ -1,7 +1,7 @@
 pub(crate) mod executor_stream;
 mod harness;
 mod message_framing;
-mod ordered_ciphertext;
+pub(crate) mod ordered_ciphertext;
 
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 

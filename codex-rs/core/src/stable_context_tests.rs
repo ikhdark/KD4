@@ -309,26 +309,8 @@ fn selected_skill_compacts_each_catalog_without_collapsing_authority() {
 
     let visible = visible_text(&first.items);
     assert_eq!(
-        visible
-            .iter()
-            .filter(|text| text.contains("active_catalog"))
-            .count(),
-        3
-    );
-    assert!(
-        visible
-            .iter()
-            .any(|text| text.starts_with("<skills_instructions>"))
-    );
-    assert!(
-        visible
-            .iter()
-            .any(|text| text.starts_with("<extension_skills_instructions>"))
-    );
-    assert!(
-        visible
-            .iter()
-            .any(|text| text.starts_with("<environment_skills_instructions>"))
+        visible,
+        vec![host, extension, environment, &selected, "use one"]
     );
 
     let second = project_stable_context(first.items.clone(), StableContextTarget::Sampling);
@@ -485,7 +467,7 @@ fn environment_permissions_are_accounted_separately_and_replace_prior_variant() 
 }
 
 #[test]
-fn selected_skills_gate_catalog_until_the_next_user_turn() {
+fn selected_skills_preserve_usage_and_same_turn_discovery() {
     let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
     let usage = "<skills_usage_instructions>\nusage\n</skills_usage_instructions>";
     let selected_a = skill("a");
@@ -502,12 +484,8 @@ fn selected_skills_gate_catalog_until_the_next_user_turn() {
         StableContextTarget::Sampling,
     );
     let active_text = visible_text(&active.items);
-    assert!(!active_text.contains(&usage));
-    assert!(
-        active_text
-            .iter()
-            .any(|text| text.contains("active_catalog"))
-    );
+    assert!(active_text.contains(&usage));
+    assert!(active_text.contains(&catalog));
     assert!(active_text.contains(&selected_a.as_str()));
     assert!(active_text.contains(&selected_b.as_str()));
 
@@ -531,7 +509,7 @@ fn selected_skills_gate_catalog_until_the_next_user_turn() {
 }
 
 #[test]
-fn stronger_role_selected_skills_still_gate_catalog() {
+fn stronger_role_selected_skills_preserve_catalog() {
     let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
     let selected = skill("admin-skill");
 
@@ -548,7 +526,7 @@ fn stronger_role_selected_skills_still_gate_catalog() {
 
         assert!(projection.manifest.components().iter().any(|component| {
             component.kind == StableContextKind::SkillCatalog
-                && component.disposition == StableContextDisposition::Gated
+                && component.disposition == StableContextDisposition::Unchanged
         }));
         assert!(
             projection
@@ -594,11 +572,7 @@ fn selected_skill_change_and_resolution_failure_replace_then_restore_catalog() {
     let changed_text = visible_text(&changed.items);
     assert!(!changed_text.contains(&selected_a.as_str()));
     assert!(changed_text.contains(&selected_b.as_str()));
-    assert!(
-        changed_text
-            .iter()
-            .any(|text| text.contains("active_catalog"))
-    );
+    assert!(changed_text.contains(&catalog));
 
     let unresolved = project_stable_context(
         vec![
@@ -1012,4 +986,27 @@ fn runtime_context_variants_are_stable_and_replace_by_semantic_slot() {
                 && component.disposition == StableContextDisposition::Replaced
         }));
     }
+}
+
+#[test]
+fn freshness_only_repository_notice_keeps_the_substantive_instructions() {
+    let body = repository("Preserve the offline database and run the scoped acceptance check.");
+    let observation = UserInstructions {
+        directory: Some("/repo".to_string()),
+        text: "The previously provided instruction body is unchanged.".to_string(),
+    }
+    .with_observation("Instruction sources were refreshed for this sampling step.")
+    .render();
+    let projection = project_stable_context(
+        vec![
+            text_message("user", &body),
+            text_message("user", "continue the work"),
+            text_message("user", &observation),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+    let texts = visible_text(&projection.items);
+    assert_eq!(texts.iter().filter(|text| **text == body).count(), 1);
+    assert_eq!(texts.iter().filter(|text| **text == observation).count(), 1);
 }

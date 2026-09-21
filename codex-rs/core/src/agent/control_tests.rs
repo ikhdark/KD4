@@ -2438,7 +2438,8 @@ fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                         spawn_agent_call(&parent_spawn_call_id),
                     ],
                 )
-                .await;
+                .await
+                .unwrap();
             let parent_reference_context_item = turn_context.to_turn_context_item();
             parent_thread
                 .codex
@@ -2757,7 +2758,8 @@ fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
                         spawn_agent_call(&parent_spawn_call_id),
                     ],
                 )
-                .await;
+                .await
+                .unwrap();
 
             let child_thread_id = harness
                 .control
@@ -2899,7 +2901,8 @@ fn spawn_agent_fork_last_n_turns_excludes_rolled_back_tokens() {
                         turn_context.as_ref(),
                         &[spawn_agent_call(&parent_spawn_call_id)],
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 let mut config = harness.config.clone();
                 config.model_auto_compact_token_limit = Some(1024);
                 let child_id = harness
@@ -2981,7 +2984,8 @@ fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
                     queued_turn_context.as_ref(),
                     &[queued_communication.to_response_input_item().into()],
                 )
-                .await;
+                .await
+                .unwrap();
 
             let triggered_communication = InterAgentCommunication::new(
                 AgentPath::root(),
@@ -2998,7 +3002,8 @@ fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
                     triggered_turn_context.as_ref(),
                     &[triggered_communication.to_response_input_item().into()],
                 )
-                .await;
+                .await
+                .unwrap();
             parent_thread
                 .inject_user_message_without_turn("current parent task".to_string())
                 .await;
@@ -3011,7 +3016,8 @@ fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
                     spawn_turn_context.as_ref(),
                     &[spawn_agent_call(&parent_spawn_call_id)],
                 )
-                .await;
+                .await
+                .unwrap();
             parent_thread
                 .codex
                 .session
@@ -3150,7 +3156,8 @@ fn spawn_agent_fork_last_n_turns_drops_parent_startup_prefix_when_under_limit() 
                         internal_chat_message_metadata_passthrough: None,
                     }],
                 )
-                .await;
+                .await
+                .unwrap();
             parent_thread
                 .inject_user_message_without_turn("current parent task".to_string())
                 .await;
@@ -3163,7 +3170,8 @@ fn spawn_agent_fork_last_n_turns_drops_parent_startup_prefix_when_under_limit() 
                     spawn_turn_context.as_ref(),
                     &[spawn_agent_call(&parent_spawn_call_id)],
                 )
-                .await;
+                .await
+                .unwrap();
             parent_thread
                 .codex
                 .session
@@ -3287,7 +3295,8 @@ fn spawn_agent_fork_last_n_turns_strips_parent_usage_hints() {
                         spawn_agent_call(&parent_spawn_call_id),
                     ],
                 )
-                .await;
+                .await
+                .unwrap();
             parent_thread
                 .codex
                 .session
@@ -4022,6 +4031,46 @@ async fn completion_watcher_seals_missing_typed_receipt_and_retires_metrics() {
             .lock()
             .await
             .is_none()
+    );
+    // Eviction removes only residency; the registry and durable outcome remain queryable.
+    let mut reservation = harness.control.state.reserve_spawn_slot(None).unwrap();
+    let (_, mut metadata) = harness
+        .control
+        .prepare_thread_spawn(
+            &mut reservation,
+            &harness.config,
+            parent_thread_id,
+            1,
+            Some(child_agent_path.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+    metadata.agent_id = Some(child_thread_id);
+    reservation.commit(metadata).unwrap();
+    child_thread.submit(Op::Shutdown).await.unwrap();
+    child_thread.wait_until_terminated().await;
+    harness
+        .manager
+        .remove_thread(&child_thread_id)
+        .await
+        .unwrap();
+    let cold_status = harness.control.get_status(child_thread_id).await;
+    assert!(
+        matches!(&cold_status, AgentStatus::Errored(message) if message.contains("needs_main"))
+    );
+    let listed = harness
+        .control
+        .list_agents(&SessionSource::Cli, Some(child_agent_path.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].agent_name, child_agent_path.to_string());
+    assert_eq!(listed[0].agent_status, cold_status);
+    assert!(!listed[0].runtime_loaded);
+    assert!(
+        harness.manager.get_thread(child_thread_id).await.is_err(),
+        "status lookup must not reload the actor"
     );
 }
 
@@ -6146,21 +6195,11 @@ fn registered_v2_child_publication_panic_preserves_parent_result() {
             let requests = server.requests().await;
             assert_eq!(
                 requests.len(),
-                3,
-                "one child request, the initial user generation, then queued mailbox consumption"
+                2,
+                "one child request and one parent request that already includes ready mail"
             );
-            let initial_parent_request: serde_json::Value =
-                serde_json::from_slice(&requests[1]).expect("initial actual parent request");
-            assert!(
-                initial_parent_request["input"]
-                    .as_array()
-                    .expect("initial parent input")
-                    .iter()
-                    .all(|item| item["type"] != "agent_message"),
-                "a nonempty user turn drains its queued mailbox after the first generation"
-            );
-            let parent_request: serde_json::Value =
-                serde_json::from_slice(&requests[2]).expect("actual mailbox consumer request");
+            let parent_request: serde_json::Value = serde_json::from_slice(&requests[1])
+                .expect("initial parent request consumes ready mail");
             let mail = parent_request["input"]
                 .as_array()
                 .expect("parent request input")

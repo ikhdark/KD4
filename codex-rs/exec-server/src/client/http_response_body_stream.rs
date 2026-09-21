@@ -110,12 +110,19 @@ impl HttpResponseBodyStream {
                     return Ok(None);
                 }
                 if pending_terminal.is_none() {
-                    let outcome = match rx.recv().await {
-                        Some(delta) if delta.seq != *next_seq => Err(format!(
+                    let delta = match rx.recv().await {
+                        Some(delta) => Ok(delta),
+                        None => inner
+                            .take_http_body_stream_terminal(request_id)
+                            .await
+                            .unwrap_or_else(|| Err("body channel closed before EOF".to_string())),
+                    };
+                    let outcome = match delta {
+                        Ok(delta) if delta.seq != *next_seq => Err(format!(
                             "http response stream `{request_id}` received seq {}, expected {}",
                             delta.seq, *next_seq
                         )),
-                        Some(delta) => {
+                        Ok(delta) => {
                             *next_seq += 1;
                             if let Some(error) = delta.error {
                                 Err(format!(
@@ -129,15 +136,9 @@ impl HttpResponseBodyStream {
                                 Ok((!chunk.is_empty()).then_some(chunk))
                             }
                         }
-                        None => {
-                            let error = inner
-                                .take_http_body_stream_failure(request_id)
-                                .await
-                                .unwrap_or_else(|| "body channel closed before EOF".to_string());
-                            Err(format!(
-                                "http response stream `{request_id}` failed: {error}"
-                            ))
-                        }
+                        Err(error) => Err(format!(
+                            "http response stream `{request_id}` failed: {error}"
+                        )),
                     };
                     // Retain the consumed outcome before awaiting cleanup so a cancelled
                     // recv can be retried without losing the final chunk or error.
@@ -232,35 +233,32 @@ impl Inner {
         let params: HttpRequestBodyDeltaNotification = from_value(params.unwrap_or(Value::Null))?;
         // Unknown request ids are ignored intentionally: a stream may have already
         // reached EOF and released its route.
-        let tx = self
-            .http_body_streams
-            .lock()
-            .await
-            .streams
-            .get(&params.request_id)
-            .cloned();
-        if let Some(tx) = tx {
-            let request_id = params.request_id.clone();
-            let terminal_delta = params.done || params.error.is_some();
-            match tx.try_send(params) {
-                Ok(()) => {
-                    if terminal_delta {
-                        self.remove_http_body_stream(&request_id).await;
+        let request_id = params.request_id.clone();
+        let mut state = self.http_body_streams.lock().await;
+        if let Some(tx) = state.streams.get(&request_id) {
+            if params.done || params.error.is_some() {
+                if !tx.is_closed() {
+                    // Publish before closing data admission, independently of queue capacity.
+                    state.terminals.insert(request_id.clone(), Ok(params));
+                }
+                state.streams.remove(&request_id);
+            } else {
+                match tx.try_send(params) {
+                    Ok(()) => {}
+                    Err(TrySendError::Closed(_)) => {
+                        state.streams.remove(&request_id);
                     }
-                }
-                Err(TrySendError::Closed(_)) => {
-                    self.abandon_http_body_stream(&request_id).await;
-                    debug!("http response stream receiver dropped before body delta delivery");
-                }
-                Err(TrySendError::Full(_)) => {
-                    self.record_http_body_stream_failure(
-                        &request_id,
-                        "body delta channel filled before delivery".to_string(),
-                    )
-                    .await;
-                    debug!(
-                        "closing http response stream `{request_id}` after body delta backpressure"
-                    );
+                    Err(TrySendError::Full(_)) => {
+                        state.terminals.insert(
+                            request_id.clone(),
+                            Err("body delta channel filled before delivery".into()),
+                        );
+                        state.streams.remove(&request_id);
+                        self.cancel_remote_http_body(&request_id);
+                        debug!(
+                            "closing http response stream `{request_id}` after body delta backpressure"
+                        );
+                    }
                 }
             }
         }
@@ -271,10 +269,10 @@ impl Inner {
     /// transport disconnect or notification handling failure.
     pub(crate) async fn fail_all_http_body_streams(&self, message: String) {
         let mut state = self.http_body_streams.lock().await;
-        let HttpBodyStreams { streams, failures } = &mut *state;
+        let HttpBodyStreams { streams, terminals } = &mut *state;
         for (request_id, tx) in streams.drain() {
             if !tx.is_closed() {
-                failures.insert(request_id, message.clone());
+                terminals.insert(request_id, Err(message.clone()));
             }
         }
     }
@@ -299,12 +297,13 @@ impl Inner {
                 "http response stream already registered for request {request_id}"
             )));
         }
-        state.failures.remove(&request_id);
+        state.terminals.remove(&request_id);
         state.streams.insert(request_id, tx);
         Ok(())
     }
 
     /// Removes a request id after EOF, terminal error, or request failure.
+    #[cfg(test)]
     pub(super) async fn remove_http_body_stream(
         &self,
         request_id: &str,
@@ -316,6 +315,7 @@ impl Inner {
             .remove(request_id)
     }
 
+    #[cfg(test)]
     async fn record_http_body_stream_failure(&self, request_id: &str, message: String) {
         let mut state = self.http_body_streams.lock().await;
         // An abandonment may already have removed this route while delivery was in flight.
@@ -323,22 +323,58 @@ impl Inner {
             return;
         };
         if !tx.is_closed() {
-            state.failures.insert(request_id.to_string(), message);
+            state.terminals.insert(request_id.to_string(), Err(message));
         }
     }
 
     /// Consumer abandonment clears both routing and any undelivered failure atomically.
     pub(super) async fn abandon_http_body_stream(&self, request_id: &str) {
-        let mut state = self.http_body_streams.lock().await;
-        state.streams.remove(request_id);
-        state.failures.remove(request_id);
+        let active = {
+            let mut state = self.http_body_streams.lock().await;
+            let active = state.streams.remove(request_id).is_some();
+            state.terminals.remove(request_id);
+            active
+        };
+        if active {
+            self.cancel_remote_http_body(request_id);
+        }
     }
 
-    async fn take_http_body_stream_failure(&self, request_id: &str) -> Option<String> {
+    fn cancel_remote_http_body(&self, request_id: &str) {
+        let rpc_client = {
+            let state = self
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &state.status {
+                crate::client::ConnectionStatus::Connected(client) => Arc::clone(client),
+                _ => return,
+            }
+        };
+        let params = crate::protocol::HttpRequestCancelParams {
+            request_id: request_id.to_string(),
+        };
+        // A request, rather than an unknown notification, keeps older peers compatible.
+        // Do not recover or replay a connection just to cancel obsolete work.
+        tokio::spawn(async move {
+            let _: Result<(), _> = rpc_client
+                .call_for_cleanup(
+                    crate::protocol::HTTP_REQUEST_CANCEL_METHOD,
+                    &params,
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+        });
+    }
+
+    async fn take_http_body_stream_terminal(
+        &self,
+        request_id: &str,
+    ) -> Option<Result<HttpRequestBodyDeltaNotification, String>> {
         self.http_body_streams
             .lock()
             .await
-            .failures
+            .terminals
             .remove(request_id)
     }
 }
@@ -359,6 +395,9 @@ mod tests {
 
     fn inner() -> Arc<Inner> {
         Arc::new(Inner {
+            file_read_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::file_read::MAX_OPEN_FILE_READS,
+            )),
             connection: StdMutex::new(ConnectionState {
                 status: ConnectionStatus::Failed("test has no transport".into()),
                 active_process_starts: 0,
@@ -432,7 +471,7 @@ mod tests {
             }
             assert_eq!(stream.recv().await.expect("closed stream"), None);
             assert!(inner.http_body_streams.lock().await.streams.is_empty());
-            assert!(inner.http_body_streams.lock().await.failures.is_empty());
+            assert!(inner.http_body_streams.lock().await.terminals.is_empty());
         }
     }
 
@@ -458,9 +497,9 @@ mod tests {
                     .http_body_streams
                     .lock()
                     .await
-                    .failures
+                    .terminals
                     .get("test")
-                    .map(String::as_str),
+                    .and_then(|terminal| terminal.as_ref().err().map(String::as_str)),
                 Some("body delta channel filled before delivery")
             );
             stream
@@ -468,7 +507,7 @@ mod tests {
         drop(stream);
         runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !inner.http_body_streams.lock().await.failures.is_empty() {
+                while !inner.http_body_streams.lock().await.terminals.is_empty() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -477,7 +516,7 @@ mod tests {
             inner
                 .record_http_body_stream_failure("test", "late failure".into())
                 .await;
-            assert!(inner.http_body_streams.lock().await.failures.is_empty());
+            assert!(inner.http_body_streams.lock().await.terminals.is_empty());
             assert!(inner.http_body_streams.lock().await.streams.is_empty());
         });
     }
@@ -514,7 +553,7 @@ mod tests {
             );
             assert_eq!(stream.recv().await.expect("closed"), None);
         }
-        assert!(inner.http_body_streams.lock().await.failures.is_empty());
+        assert!(inner.http_body_streams.lock().await.terminals.is_empty());
     }
 
     #[tokio::test]
@@ -531,5 +570,57 @@ mod tests {
                 .contains("body channel closed before EOF")
         );
         assert_eq!(stream.recv().await.expect("closed"), None);
+    }
+    #[tokio::test]
+    async fn full_data_queue_preserves_eof_error_and_final_bytes() {
+        for (error, bytes, seq) in [
+            (None, vec![], 257),
+            (None, b"final".to_vec(), 257),
+            (Some("remote error"), vec![], 257),
+            (None, vec![], 258),
+        ] {
+            let inner = inner();
+            let (tx, rx) = mpsc::channel(256);
+            inner
+                .insert_http_body_stream("test".into(), tx)
+                .await
+                .unwrap();
+            let mut stream = HttpResponseBodyStream::remote(inner.clone(), "test".into(), rx);
+            for seq in 1..=256 {
+                inner
+                    .handle_http_body_delta_notification(delta(seq, false, None))
+                    .await
+                    .unwrap();
+            }
+            inner
+                .handle_http_body_delta_notification(Some(
+                    serde_json::to_value(HttpRequestBodyDeltaNotification {
+                        request_id: "test".into(),
+                        seq,
+                        delta: bytes.clone().into(),
+                        done: true,
+                        error: error.map(str::to_string),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            inner
+                .fail_all_http_body_streams("later disconnect".into())
+                .await;
+            for _ in 1..=256 {
+                assert_eq!(stream.recv().await.unwrap(), Some(b"last".to_vec()));
+            }
+            let terminal = stream.recv().await;
+            if seq != 257 {
+                assert!(terminal.unwrap_err().to_string().contains("expected 257"));
+            } else if let Some(error) = error {
+                assert!(terminal.unwrap_err().to_string().contains(error));
+            } else {
+                assert_eq!(terminal.unwrap(), (!bytes.is_empty()).then_some(bytes));
+            }
+            assert_eq!(stream.recv().await.unwrap(), None);
+            assert!(inner.http_body_streams.lock().await.terminals.is_empty());
+        }
     }
 }

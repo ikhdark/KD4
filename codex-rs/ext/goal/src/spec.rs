@@ -58,7 +58,7 @@ Set token_budget only when an explicit token budget is requested. Fails if an un
 }
 
 pub fn create_update_goal_tool() -> ToolSpec {
-    let properties = BTreeMap::from([(
+    let mut properties = BTreeMap::from([(
         "status".to_string(),
         JsonSchema::string_enum(
             vec![json!("complete"), json!("blocked")],
@@ -68,6 +68,10 @@ pub fn create_update_goal_tool() -> ToolSpec {
             ),
         ),
     )]);
+
+    properties.insert("goal_ref".to_string(), JsonSchema::string(Some(
+        "Required goal_ref from get_goal, create_goal, or the latest goal context. It identifies the objective you actually completed or found blocked. Reassess changed objectives before updating.".to_string()
+    )));
 
     ToolSpec::Function(ResponsesApiTool {
         name: UPDATE_GOAL_TOOL_NAME.to_string(),
@@ -81,13 +85,13 @@ Once these conditions are met, set status to `blocked` instead of repeatedly rep
 Do not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
 Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.
 You cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.
-When marking a budgeted goal achieved with status `complete`, report the final token usage from the tool result to the user."#
+When marking a budgeted goal achieved with status `complete`, report the final token usage from the tool result to the user. If accountingPending is true, explain that usage is pending instead of reporting it as final."#
             .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            /*required*/ Some(vec!["status".to_string()]),
+            /*required*/ Some(vec!["status".to_string(), "goal_ref".to_string()]),
             Some(false.into()),
         ),
         output_schema: None,

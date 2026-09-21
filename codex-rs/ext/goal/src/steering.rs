@@ -11,12 +11,20 @@ pub(crate) fn budget_limit_steering_item(goal: &ThreadGoal) -> ResponseItem {
     goal_context_input_item(budget_limit_prompt(goal))
 }
 
-pub(crate) fn objective_updated_steering_item(goal: &ThreadGoal) -> ResponseItem {
-    goal_context_input_item(objective_updated_prompt(goal))
+pub(crate) fn objective_updated_steering_item(goal: &codex_state::ThreadGoal) -> ResponseItem {
+    let reference = crate::tool::goal_reference(goal);
+    let prompt = objective_updated_prompt(&crate::tool::protocol_goal_from_state(goal.clone()));
+    goal_context_input_item(format!(
+        "{prompt}\nGoal reference for update_goal: {reference}"
+    ))
 }
 
-pub(crate) fn continuation_steering_item(goal: &ThreadGoal) -> ResponseItem {
-    goal_context_input_item(continuation_prompt(goal))
+pub(crate) fn continuation_steering_item(goal: &codex_state::ThreadGoal) -> ResponseItem {
+    let reference = crate::tool::goal_reference(goal);
+    let prompt = continuation_prompt(&crate::tool::protocol_goal_from_state(goal.clone()));
+    goal_context_input_item(format!(
+        "{prompt}\nGoal reference for update_goal: {reference}"
+    ))
 }
 
 fn goal_context_input_item(prompt: String) -> ResponseItem {

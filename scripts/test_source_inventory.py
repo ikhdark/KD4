@@ -107,7 +107,7 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(output["count"], 0)
         self.assertEqual(output["unresolved"][0]["unresolved"], "runtime consumer requires inspection")
 
-    def test_cli_retains_records_and_emits_only_summary_or_exact_paths(self):
+    def test_cli_retains_records_and_keeps_summary_with_exact_paths(self):
         self.file("src/a.rs", "PROMPT " + "body" * 10000)
         query = Path(self.temp.name) / "query.json"
         state = Path(self.temp.name) / "state.json"
@@ -122,7 +122,13 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(saved["records"][0]["evidence"]["line"], 1)
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             inventory.main(args + ["--paths"])
-        self.assertEqual(stdout.getvalue(), "src/a.rs\n")
+        path_summary = json.loads(stdout.getvalue())
+        self.assertEqual(path_summary["paths"], ["src/a.rs"])
+        self.assertIsNone(path_summary["paths_next_offset"])
+        self.assertEqual(path_summary["count"], 1)
+        self.assertEqual(path_summary["query_id"], summary["query_id"])
+        self.assertTrue(path_summary["ready_to_render"])
+        self.assertEqual(path_summary["format"], "source_inventory_result_v1")
         self.assertEqual(json.loads(state.read_text())["output"]["searched_records"], 0)
 
     def decision(self, path, consumer, disposition="include"):
@@ -338,6 +344,138 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertNotIn(body, json.dumps(bounded))
         self.assertLess(len(json.dumps(bounded)), 1000)
         self.assertEqual(bounded["fields"]["many"]["omitted"], 4997)
+
+    def test_public_contract_example_returns_successful_json_evidence_and_delivery(self):
+        with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("must not scan")),
+              mock.patch.object(Path, "read_text", side_effect=AssertionError("must not read state")),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            self.assertEqual(inventory.main(["--describe"]), 0)
+        contract = json.loads(stdout.getvalue())
+        self.assertEqual(contract["format"], "source_inventory_result_v1")
+        self.assertIn("json_summaries", contract["result"])
+        self.file("src/templates/a.md")
+        body = "PRIVATE PROMPT CONTENT" * 2000
+        catalog = self.file("src/models.json", json.dumps({"models": [{"prompt": body}]}))
+        query = Path(self.temp.name) / "query.json"
+        query.write_text(json.dumps(contract["example"]), encoding="utf-8")
+        state = Path(self.temp.name) / "state.json"
+        report = Path(self.temp.name) / "report.md"
+        result = subprocess.run([sys.executable, str(Path(inventory.__file__).resolve()),
+                                 "--root", str(self.root), "--query", str(query),
+                                 "--state", str(state), "--report", str(report), "--paths"],
+                                check=True, capture_output=True, text=True)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["paths"], ["src/models.json", "src/templates/a.md"])
+        self.assertEqual(summary["count"], 2)
+        self.assertTrue(summary["ready_to_render"])
+        self.assertEqual(summary["next_action"], "deliver_report")
+        self.assertEqual(summary["json_summary_count"], 1)
+        self.assertIsNone(summary["json_summary_next_offset"])
+        evidence = summary["json_summaries"][0]
+        self.assertEqual((evidence["path"], evidence["category"], evidence["status"]),
+                         ("src/models.json", "catalog", "matched"))
+        self.assertEqual(evidence["sha256"], inventory.digest(catalog.read_bytes()))
+        self.assertEqual(evidence["structure"]["fields"]["models"]["items"]["0"]["fields"]["prompt"],
+                         {"type": "string", "length": len(body)})
+        delivered = json.loads(Path(summary["canonical_paths"]).read_text(encoding="utf-8"))
+        self.assertEqual(delivered["json_summaries"], summary["json_summaries"])
+        self.assertEqual(delivered["paths"], summary["paths"])
+        for text in (result.stdout, Path(summary["canonical_paths"]).read_text(encoding="utf-8"), report.read_text(encoding="utf-8")):
+            self.assertNotIn("PRIVATE PROMPT CONTENT", text)
+        self.assertLess(len(result.stdout), 3000)
+
+    def test_successful_evidence_excludes_unresolved_and_reviewed_exclusions(self):
+        self.file("include.json", '{"prompt":"included"}')
+        self.file("exclude.json", '{"prompt":"excluded"}')
+        self.file("unresolved.json", '{"prompt":"unknown"}')
+        self.file("consumer.rs", "load_prompt();")
+        query = {"categories": [{"name": "runtime", "paths": ["*.json"], "json_summary": True}],
+                 "decisions": [self.decision("include.json", "consumer.rs"),
+                               self.decision("exclude.json", "consumer.rs", "exclude")]}
+        _, state = inventory.inventory(self.root, query)
+        state_path = Path(self.temp.name) / "state.json"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            inventory.main(["--state", str(state_path), "--render-only", "--remaining"])
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual([record["path"] for record in summary["json_summaries"]], ["include.json"])
+        self.assertEqual(summary["json_summaries"][0]["status"], "verified")
+        self.assertEqual([record["path"] for record in summary["remaining"]], ["unresolved.json"])
+        self.assertFalse(summary["ready_to_render"])
+
+    def test_json_evidence_pages_reuse_snapshot_with_exact_coverage_and_byte_target(self):
+        # One source in many categories exercises both byte and record bounds.
+        source = self.file("catalog.json", json.dumps({f"field_{index}": "body" * 500 for index in range(32)}))
+        query = {"categories": [{"name": f"catalog_{index:02}", "paths": ["catalog.json"],
+                                  "verification": "path", "json_summary": True} for index in range(55)]}
+        _, state = inventory.inventory(self.root, query)
+        state_path = Path(self.temp.name) / "state.json"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        saved = state_path.read_bytes()
+        source.unlink()
+        seen = []
+        offset = 0
+        while offset is not None:
+            with (mock.patch.object(inventory, "repository_source_records", side_effect=AssertionError("must not rescan")),
+                  contextlib.redirect_stdout(io.StringIO()) as stdout):
+                inventory.main(["--state", str(state_path), "--render-only", "--offset", str(offset)])
+            page = json.loads(stdout.getvalue())
+            self.assertEqual(page["json_summary_count"], 55)
+            self.assertEqual(page["count"], 1)
+            self.assertTrue(page["ready_to_render"])
+            self.assertLessEqual(len(json.dumps(page["json_summaries"], ensure_ascii=False).encode("utf-8")), inventory.SUMMARY_PAGE_BYTES)
+            seen.extend(record["category"] for record in page["json_summaries"])
+            next_offset = page["json_summary_next_offset"]
+            if next_offset is not None:
+                self.assertGreater(next_offset, offset)
+                self.assertLessEqual(next_offset - offset, inventory.PAGE_RECORDS)
+            offset = next_offset
+        self.assertEqual(seen, [f"catalog_{index:02}" for index in range(55)])
+        self.assertEqual(state_path.read_bytes(), saved)
+
+    def test_oversized_summary_without_report_explains_retained_recovery(self):
+        self.file("catalog.json", '{"prompt":"private body"}')
+        query = {"categories": [{"name": "catalog", "paths": ["catalog.json"],
+                                  "verification": "path", "json_summary": True}]}
+        _, state = inventory.inventory(self.root, query)
+        state_path = Path(self.temp.name) / "state.json"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        with (mock.patch.object(inventory, "SUMMARY_PAGE_BYTES", 1),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            inventory.main(["--state", str(state_path), "--render-only"])
+        summary = json.loads(stdout.getvalue())
+        self.assertNotIn("canonical_paths", summary)
+        self.assertIsNone(summary["json_summary_next_offset"])
+        self.assertIn("--report PATH", summary["json_summaries"][0]["structure"]["detail_omitted"])
+        report = Path(self.temp.name) / "report.md"
+        with (mock.patch.object(inventory, "repository_source_records", side_effect=AssertionError("must not rescan")),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            inventory.main(["--state", str(state_path), "--render-only", "--report", str(report)])
+        delivery = json.loads(Path(json.loads(stdout.getvalue())["canonical_paths"]).read_text(encoding="utf-8"))
+        self.assertEqual(delivery["json_summaries"][0]["structure"]["fields"]["prompt"],
+                         {"type": "string", "length": len("private body")})
+
+    def test_path_pages_keep_counts_readiness_and_report_links(self):
+        for index in range(52):
+            self.file(f"prompts/{index:02}.md")
+        query = {"categories": [{"name": "prompts", "paths": ["prompts/*.md"], "verification": "path"}]}
+        _, state = inventory.inventory(self.root, query)
+        state_path = Path(self.temp.name) / "state.json"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        report = Path(self.temp.name) / "report.md"
+        seen = []
+        for offset, expected_next in [(0, 50), (50, None)]:
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                inventory.main(["--state", str(state_path), "--render-only", "--paths",
+                                "--report", str(report), "--offset", str(offset)])
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["count"], 52)
+            self.assertTrue(summary["ready_to_render"])
+            self.assertEqual(summary["next_action"], "deliver_report")
+            self.assertEqual(summary["paths_next_offset"], expected_next)
+            self.assertTrue(Path(summary["canonical_paths"]).is_file())
+            seen.extend(summary["paths"])
+        self.assertEqual(seen, [f"prompts/{index:02}.md" for index in range(52)])
 
     def test_report_rejects_source_or_state_overwrite(self):
         self.file("a.rs")

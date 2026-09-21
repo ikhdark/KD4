@@ -811,7 +811,7 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
 }
 
 #[tokio::test]
-async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Result<()> {
+async fn dynamic_tool_remote_image_preserves_text_and_marks_partial_output() -> Result<()> {
     let call_id = "dyn-call-remote-image";
     let PendingDynamicToolCall {
         mut mcp,
@@ -821,9 +821,14 @@ async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Res
     } = start_function_dynamic_tool_call(call_id).await?;
 
     let response = DynamicToolCallResponse {
-        content_items: vec![DynamicToolCallOutputContentItem::InputImage {
-            image_url: "https://example.com/tool.png".to_string(),
-        }],
+        content_items: vec![
+            DynamicToolCallOutputContentItem::InputText {
+                text: "operation receipt 123".to_string(),
+            },
+            DynamicToolCallOutputContentItem::InputImage {
+                image_url: "https://example.com/tool.png".to_string(),
+            },
+        ],
         success: true,
     };
     mcp.send_response(request_id, serde_json::to_value(response)?)
@@ -841,14 +846,16 @@ async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Res
     else {
         panic!("expected dynamic tool call item");
     };
-    assert_eq!(status, DynamicToolCallStatus::Failed);
-    assert_eq!(
-        content_items,
-        Some(vec![DynamicToolCallOutputContentItem::InputText {
-            text: REMOTE_IMAGE_URL_ERROR.to_string(),
-        }])
+    assert_eq!(status, DynamicToolCallStatus::Completed);
+    let content_items = content_items.expect("partial content survives");
+    assert_eq!(content_items.len(), 2);
+    assert!(
+        matches!(&content_items[0], DynamicToolCallOutputContentItem::InputText { text } if text == "operation receipt 123")
     );
-    assert_eq!(success, Some(false));
+    assert!(
+        matches!(&content_items[1], DynamicToolCallOutputContentItem::InputText { text } if text.contains("Partial dynamic tool output") && text.contains(REMOTE_IMAGE_URL_ERROR))
+    );
+    assert_eq!(success, Some(true));
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -861,7 +868,11 @@ async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Res
         .iter()
         .find_map(|body| function_call_output_raw_output(body, call_id))
         .context("expected function_call_output output in follow-up request")?;
-    assert_eq!(output, json!(REMOTE_IMAGE_URL_ERROR));
+    let output = output.to_string();
+    assert!(output.contains("operation receipt 123"));
+    assert!(output.contains("Partial dynamic tool output"));
+    assert!(output.contains(REMOTE_IMAGE_URL_ERROR));
+    assert!(!output.contains("https://example.com/tool.png"));
 
     Ok(())
 }

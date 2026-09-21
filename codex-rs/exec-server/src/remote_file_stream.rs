@@ -18,7 +18,7 @@ struct FileReadRegistration {
     client: ExecServerClient,
     handle_id: String,
     runtime: Option<tokio::runtime::Handle>,
-    active: bool,
+    cleanup_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub(super) async fn open(
@@ -26,11 +26,17 @@ pub(super) async fn open(
     path: PathUri,
     sandbox: Option<FileSystemSandboxContext>,
 ) -> FileSystemResult<FileSystemReadStream> {
+    // Hold admission through deferred close, bounding both open handles and
+    // cleanup tasks even when a caller rapidly consumes many small files.
+    let cleanup_slot = client
+        .reserve_file_stream()
+        .await
+        .map_err(map_remote_error)?;
     let registration = FileReadRegistration {
         client,
         handle_id: Uuid::new_v4().simple().to_string(),
         runtime: tokio::runtime::Handle::try_current().ok(),
-        active: true,
+        cleanup_slot: Some(cleanup_slot),
     };
     registration
         .client
@@ -44,7 +50,7 @@ pub(super) async fn open(
     Ok(FileSystemReadStream::new(futures::stream::try_unfold(
         Some((registration, 0_u64)),
         |state| async move {
-            let Some((mut registration, offset)) = state else {
+            let Some((registration, offset)) = state else {
                 return Ok(None);
             };
             let response = registration
@@ -68,16 +74,9 @@ pub(super) async fn open(
                 ));
             }
             if response.eof {
-                if registration
-                    .client
-                    .fs_close(FsCloseParams {
-                        handle_id: registration.handle_id.clone(),
-                    })
-                    .await
-                    .is_ok()
-                {
-                    registration.active = false;
-                }
+                // Drop transfers the reservation to the existing bounded close
+                // path; already-received bytes need not wait for its response.
+                drop(registration);
                 return if chunk.is_empty() {
                     Ok(None)
                 } else {
@@ -103,9 +102,7 @@ pub(super) async fn open(
 
 impl Drop for FileReadRegistration {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
+        let cleanup_slot = self.cleanup_slot.take();
         let client = self.client.clone();
         let handle_id = self.handle_id.clone();
         let runtime = self
@@ -114,6 +111,7 @@ impl Drop for FileReadRegistration {
             .or_else(|| tokio::runtime::Handle::try_current().ok());
         if let Some(runtime) = runtime {
             runtime.spawn(async move {
+                let _cleanup_slot = cleanup_slot;
                 let _ = client.fs_close(FsCloseParams { handle_id }).await;
             });
         }

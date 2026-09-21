@@ -308,6 +308,8 @@ pub enum WireRuntimeResponse {
         cell_id: WireCellId,
         content_items: Vec<WireContentItem>,
         error_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_loss: Option<crate::OutputLoss>,
     },
 }
 
@@ -339,10 +341,12 @@ impl From<RuntimeResponse> for WireRuntimeResponse {
                 cell_id,
                 content_items,
                 error_text,
+                output_loss,
             } => Self::Result {
                 cell_id: cell_id.into(),
                 content_items: content_items.into_iter().map(Into::into).collect(),
                 error_text,
+                output_loss,
             },
         }
     }
@@ -376,10 +380,12 @@ impl From<WireRuntimeResponse> for RuntimeResponse {
                 cell_id,
                 content_items,
                 error_text,
+                output_loss,
             } => Self::Result {
                 cell_id: cell_id.into(),
                 content_items: content_items.into_iter().map(Into::into).collect(),
                 error_text,
+                output_loss,
             },
         }
     }

@@ -1552,100 +1552,112 @@ fn main() {
 
     #[tokio::test]
     async fn reusable_evidence_does_not_cross_authorization_scopes() {
-        let root = TempDir::new().unwrap();
-        let repo = root.path().join("repo");
-        let home = root.path().join("home");
-        init_repo(&repo, "immutable\n");
-        let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
-        let args = ["show".to_string(), blob];
-        let cwd = codex_utils_path_uri::PathUri::from_abs_path(
-            &codex_utils_absolute_path::AbsolutePathBuf::try_from(repo.clone()).unwrap(),
-        );
-        let read_only = FileSystemSandboxContext::from_legacy_sandbox_policy(
-            codex_protocol::protocol::SandboxPolicy::ReadOnly {
-                network_access: false,
-            },
-            cwd.clone(),
-        )
-        .unwrap();
-        let full_access = FileSystemSandboxContext::from_legacy_sandbox_policy(
-            codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
-            cwd,
-        )
-        .unwrap();
-        let read_only_scope =
-            authorization_scope_fingerprint(&read_only, SandboxPermissions::UseDefault).unwrap();
-        let full_access_scope =
-            authorization_scope_fingerprint(&full_access, SandboxPermissions::UseDefault).unwrap();
-        let escalated_scope =
-            authorization_scope_fingerprint(&read_only, SandboxPermissions::RequireEscalated)
+        test_observation::with_profitability_costs(
+            async {
+                let root = TempDir::new().unwrap();
+                let repo = root.path().join("repo");
+                let home = root.path().join("home");
+                init_repo(&repo, "immutable\n");
+                let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
+                let args = ["show".to_string(), blob];
+                let cwd = codex_utils_path_uri::PathUri::from_abs_path(
+                    &codex_utils_absolute_path::AbsolutePathBuf::try_from(repo.clone()).unwrap(),
+                );
+                let read_only = FileSystemSandboxContext::from_legacy_sandbox_policy(
+                    codex_protocol::protocol::SandboxPolicy::ReadOnly {
+                        network_access: false,
+                    },
+                    cwd.clone(),
+                )
                 .unwrap();
-        let identity = immutable_git_show_identity_with_authorization_scope(
-            &repo,
-            "git",
-            &args,
-            ProjectNamespaceHint::Discover,
-            &read_only_scope,
-        )
-        .await
-        .expect("immutable identity");
-        assert_eq!(
-            record_success(
-                &home,
-                &identity,
-                None,
-                b"immutable output",
-                Duration::from_secs(1),
-            )
-            .await,
-            Observation::Published
-        );
-        let candidate = lookup(&home, &identity).await.expect("shadow candidate");
-        assert_eq!(
-            record_success(
-                &home,
-                &identity,
-                Some(&candidate),
-                b"immutable output",
-                Duration::from_secs(1),
-            )
-            .await,
-            Observation::Unchanged {
-                reuse_enabled: true
-            }
-        );
+                let full_access = FileSystemSandboxContext::from_legacy_sandbox_policy(
+                    codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+                    cwd,
+                )
+                .unwrap();
+                let read_only_scope =
+                    authorization_scope_fingerprint(&read_only, SandboxPermissions::UseDefault)
+                        .unwrap();
+                let full_access_scope =
+                    authorization_scope_fingerprint(&full_access, SandboxPermissions::UseDefault)
+                        .unwrap();
+                let escalated_scope = authorization_scope_fingerprint(
+                    &read_only,
+                    SandboxPermissions::RequireEscalated,
+                )
+                .unwrap();
+                let identity = immutable_git_show_identity_with_authorization_scope(
+                    &repo,
+                    "git",
+                    &args,
+                    ProjectNamespaceHint::Discover,
+                    &read_only_scope,
+                )
+                .await
+                .expect("immutable identity");
+                assert_eq!(
+                    record_success(
+                        &home,
+                        &identity,
+                        None,
+                        b"immutable output",
+                        Duration::from_secs(1),
+                    )
+                    .await,
+                    Observation::Published
+                );
+                let candidate = lookup(&home, &identity).await.expect("shadow candidate");
+                assert_eq!(
+                    record_success(
+                        &home,
+                        &identity,
+                        Some(&candidate),
+                        b"immutable output",
+                        Duration::from_secs(1),
+                    )
+                    .await,
+                    Observation::Unchanged {
+                        reuse_enabled: true
+                    }
+                );
 
-        for scope in [&full_access_scope, &escalated_scope] {
-            let different_scope = prepare_immutable_git_show_with_authorization_scope(
-                &home,
-                "thread-b",
-                &repo,
-                "git",
-                &args,
-                ProjectNamespaceHint::Discover,
-                scope,
-                false,
-            )
-            .await
-            .expect("prepared lookup");
-            assert!(!different_scope.has_candidate());
-            assert!(!different_scope.is_hit());
-        }
+                for scope in [&full_access_scope, &escalated_scope] {
+                    let different_scope = prepare_immutable_git_show_with_authorization_scope(
+                        &home,
+                        "thread-b",
+                        &repo,
+                        "git",
+                        &args,
+                        ProjectNamespaceHint::Discover,
+                        scope,
+                        false,
+                    )
+                    .await
+                    .expect("prepared lookup");
+                    assert!(!different_scope.has_candidate());
+                    assert!(!different_scope.is_hit());
+                }
 
-        let same_scope = prepare_immutable_git_show_with_authorization_scope(
-            &home,
-            "thread-a",
-            &repo,
-            "git",
-            &args,
-            ProjectNamespaceHint::Discover,
-            &read_only_scope,
-            false,
+                let same_scope = prepare_immutable_git_show_with_authorization_scope(
+                    &home,
+                    "thread-a",
+                    &repo,
+                    "git",
+                    &args,
+                    ProjectNamespaceHint::Discover,
+                    &read_only_scope,
+                    false,
+                )
+                .await
+                .expect("prepared lookup");
+                assert!(same_scope.has_candidate());
+                assert!(same_scope.is_hit());
+            },
+            Duration::from_micros(1),
+            Duration::from_micros(1),
+            Duration::from_secs(1),
         )
-        .await
-        .expect("prepared lookup");
-        assert!(same_scope.has_candidate());
-        assert!(same_scope.is_hit());
+        .await;
     }
 
     #[tokio::test]

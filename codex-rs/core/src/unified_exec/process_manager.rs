@@ -835,31 +835,51 @@ fn terminate_process_on_network_denial(
 
 async fn finish_exited_process_result(
     process: Option<&Arc<UnifiedExecProcess>>,
-    result: Result<ExecCommandToolOutput, UnifiedExecError>,
+    mut result: Result<ExecCommandToolOutput, UnifiedExecError>,
     duration: Duration,
+    hard_deadline: Option<Instant>,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     if let Some(process) = process
         && match &result {
             Ok(response) => response.process_exited,
             Err(_) => process.has_exited(),
         }
-        && let Err(message) = process.wait_for_terminal_completion().await
     {
-        if matches!(
-            &result,
-            Err(UnifiedExecError::ToolHistoryPersistence { .. })
-        ) {
-            return result;
+        let completion = match hard_deadline {
+            Some(bound)
+                if result
+                    .as_ref()
+                    .is_ok_and(|response| response.process_id.is_some()) =>
+            {
+                match tokio::time::timeout_at(bound, process.wait_for_terminal_completion()).await {
+                    Ok(completion) => completion,
+                    Err(_) => {
+                        if let Ok(response) = &mut result {
+                            response.repair_notice = Some("Process exited; completion bookkeeping is pending. Poll the retained session; do not rerun the command.".to_string());
+                        }
+                        return result;
+                    }
+                }
+            }
+            _ => process.wait_for_terminal_completion().await,
+        };
+        if let Err(message) = completion {
+            if matches!(
+                &result,
+                Err(UnifiedExecError::ToolHistoryPersistence { .. })
+            ) {
+                return result;
+            }
+            return Err(UnifiedExecError::ToolHistoryPersistence {
+                message,
+                exit_code: process.exit_code().unwrap_or(-1),
+                duration,
+                event_call_id: result
+                    .as_ref()
+                    .ok()
+                    .map(|response| response.event_call_id.clone()),
+            });
         }
-        return Err(UnifiedExecError::ToolHistoryPersistence {
-            message,
-            exit_code: process.exit_code().unwrap_or(-1),
-            duration,
-            event_call_id: result
-                .as_ref()
-                .ok()
-                .map(|response| response.event_call_id.clone()),
-        });
     }
     result
 }
@@ -920,7 +940,7 @@ impl UnifiedExecProcessManager {
                 };
                 process_id
             } else {
-                // production mode → random
+                // production mode â†’ random
                 rand::rng().random_range(1_000..100_000)
             };
 
@@ -958,6 +978,26 @@ impl UnifiedExecProcessManager {
         let removed = {
             let mut store = self.process_store.lock().await;
             store.remove(process_id)
+        };
+        if let Some(entry) = removed {
+            unregister_network_approval_for_entry(&entry).await;
+        }
+    }
+
+    pub(super) async fn release_failed_completion(
+        &self,
+        process_id: u32,
+        process: &Arc<UnifiedExecProcess>,
+    ) {
+        let removed = {
+            let mut store = self.process_store.lock().await;
+            let matches = store
+                .processes
+                .get(&process_id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
+            (matches && process.has_exited())
+                .then(|| store.remove(process_id))
+                .flatten()
         };
         if let Some(entry) = removed {
             unregister_network_approval_for_entry(&entry).await;
@@ -1083,6 +1123,7 @@ impl UnifiedExecProcessManager {
             registration.primary_process.as_ref(),
             result,
             Instant::now().saturating_duration_since(request_started_at),
+            nested_poll_bound(context.source.nested_deadline()),
         )
         .await
     }
@@ -1249,7 +1290,8 @@ impl UnifiedExecProcessManager {
         // Persist live sessions before the initial yield wait so handler cancellation cannot
         // orphan the process. Mutating sessions are explicitly terminated when their owning turn
         // reaches a terminal state; non-mutating sessions remain resumable across turns.
-        let process_started_alive = !process.has_exited() && process.exit_code().is_none();
+        let process_started_alive = (!process.has_exited() && process.exit_code().is_none())
+            || context.source.nested_deadline().is_some();
         let _initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
             registration.set_initial_exec_command_active(Arc::clone(&initial_exec_command_active));
@@ -1321,6 +1363,7 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             Some(context.session.subscribe_elicitation_pause_state()),
             deadline,
+            poll_bound,
             quiet_period,
             &mut None,
         )
@@ -1534,7 +1577,13 @@ impl UnifiedExecProcessManager {
             search_no_match: request.attempt_key.is_search_no_match(exit_code),
             original_token_count: Some(original_token_count),
             hook_command: Some(request.hook_command.clone()),
-            raw_output_artifact: process.raw_output_artifact().await,
+            raw_output_artifact: match poll_bound {
+                Some(bound) => tokio::time::timeout_at(bound, process.raw_output_artifact())
+                    .await
+                    .ok()
+                    .flatten(),
+                None => process.raw_output_artifact().await,
+            },
             raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
@@ -1543,12 +1592,17 @@ impl UnifiedExecProcessManager {
         if process_started_alive
             && let Some(finalized_artifact) = response.raw_output_artifact.clone()
         {
-            context
+            let update = context
                 .session
                 .services
                 .command_execution
-                .update_running_artifact(process_id, finalized_artifact)
-                .await;
+                .update_running_artifact(process_id, finalized_artifact);
+            match poll_bound {
+                Some(bound) => {
+                    let _ = tokio::time::timeout_at(bound, update).await;
+                }
+                None => update.await,
+            }
         }
 
         if response.process_id.is_none()
@@ -1573,7 +1627,26 @@ impl UnifiedExecProcessManager {
                 event_call_id: Some(response.event_call_id.clone()),
             });
         }
-        Ok(response.with_prepared_reduction_notice().await)
+        let mut response = response;
+        match poll_bound {
+            Some(bound) => {
+                let _ = tokio::time::timeout_at(bound, response.prepare_reduction_notice()).await;
+            }
+            None => response.prepare_reduction_notice().await,
+        }
+        let mut response =
+            finish_exited_process_result(Some(&process), Ok(response), start.elapsed(), poll_bound)
+                .await?;
+        if !response.process_exited || process.terminal_completion_is_ready() {
+            let commit = self.acknowledge_output(&process, &output_buffer, &mut response);
+            match poll_bound {
+                Some(bound) => {
+                    let _ = tokio::time::timeout_at(bound, commit).await;
+                }
+                None => commit.await,
+            }
+        }
+        Ok(response)
     }
 
     pub(crate) async fn write_stdin(
@@ -1591,11 +1664,13 @@ impl UnifiedExecProcessManager {
                 process_id: request.process_id,
             })?;
         let started_at = Instant::now();
+        let hard_deadline = nested_poll_bound(request.nested_deadline);
         let result = self.write_stdin_inner(request, &process).await;
         finish_exited_process_result(
             Some(&process),
             result,
             Instant::now().saturating_duration_since(started_at),
+            hard_deadline,
         )
         .await
     }
@@ -1766,6 +1841,7 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             pause_state,
             deadline,
+            poll_bound,
             // Polling a noninteractive command continues through progress
             // bursts until exit, handoff, or the existing bounded deadline.
             (request.input.is_empty() && tty && !validation_launch)
@@ -1864,13 +1940,66 @@ impl UnifiedExecProcessManager {
             search_no_match: search_exit_one_is_no_match && exit_code == Some(1),
             original_token_count: Some(original_token_count),
             hook_command: Some(hook_command),
-            raw_output_artifact: process.raw_output_artifact().await,
+            raw_output_artifact: match poll_bound {
+                Some(bound) => tokio::time::timeout_at(bound, process.raw_output_artifact())
+                    .await
+                    .ok()
+                    .flatten(),
+                None => process.raw_output_artifact().await,
+            },
             raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
 
-        Ok(response.with_prepared_reduction_notice().await)
+        let mut response = response;
+        match poll_bound {
+            Some(bound) => {
+                let _ = tokio::time::timeout_at(bound, response.prepare_reduction_notice()).await;
+            }
+            None => response.prepare_reduction_notice().await,
+        }
+        let mut response =
+            finish_exited_process_result(Some(&process), Ok(response), start.elapsed(), poll_bound)
+                .await?;
+        if !response.process_exited || process.terminal_completion_is_ready() {
+            let commit = self.acknowledge_output(&process, &output_buffer, &mut response);
+            match poll_bound {
+                Some(bound) => {
+                    let _ = tokio::time::timeout_at(bound, commit).await;
+                }
+                None => commit.await,
+            }
+        }
+        Ok(response)
+    }
+
+    async fn acknowledge_output(
+        &self,
+        process: &Arc<UnifiedExecProcess>,
+        output_buffer: &OutputBuffer,
+        response: &mut ExecCommandToolOutput,
+    ) {
+        // Acquire both owners before acknowledging. No await follows the commit,
+        // so cancellation cannot consume evidence and then lose the result.
+        let mut store = self.process_store.lock().await;
+        let mut buffer = output_buffer.lock().await;
+        buffer.acknowledge_pending_output();
+        if response.process_exited
+            && process.terminal_completion_is_ready()
+            && process.has_exited()
+            && process.output_is_closed()
+            && !buffer.has_unreported_output()
+            && let Some(id) = response.process_id
+            && store
+                .processes
+                .get(&id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.process, process))
+        {
+            store.remove(id);
+            response.process_id = None;
+            response.session_capabilities = None;
+        }
     }
 
     async fn refresh_process_state(
@@ -2559,7 +2688,7 @@ impl UnifiedExecProcessManager {
         pause_state: Option<watch::Receiver<bool>>,
         deadline: Instant,
     ) -> Vec<u8> {
-        Self::collect_output_until_deadline_with_quiet_yield(
+        let collected = Self::collect_output_until_deadline_with_quiet_yield(
             output_buffer,
             output_notify,
             output_closed,
@@ -2568,10 +2697,12 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             None,
+            None,
             &mut None,
         )
-        .await
-        .bytes
+        .await;
+        output_buffer.lock().await.acknowledge_pending_output();
+        collected.bytes
     }
 
     #[cfg(test)]
@@ -2584,7 +2715,7 @@ impl UnifiedExecProcessManager {
         pause_state: Option<watch::Receiver<bool>>,
         deadline: Instant,
     ) -> Vec<u8> {
-        Self::collect_output_until_deadline_with_quiet_yield(
+        let collected = Self::collect_output_until_deadline_with_quiet_yield(
             output_buffer,
             output_notify,
             output_closed,
@@ -2592,11 +2723,13 @@ impl UnifiedExecProcessManager {
             cancellation_token,
             pause_state,
             deadline,
+            None,
             Some(INITIAL_OUTPUT_QUIET_PERIOD),
             &mut None,
         )
-        .await
-        .bytes
+        .await;
+        output_buffer.lock().await.acknowledge_pending_output();
+        collected.bytes
     }
 
     #[cfg(test)]
@@ -2609,7 +2742,7 @@ impl UnifiedExecProcessManager {
         pause_state: Option<watch::Receiver<bool>>,
         deadline: Instant,
     ) -> Vec<u8> {
-        Self::collect_output_until_deadline_with_quiet_yield(
+        let collected = Self::collect_output_until_deadline_with_quiet_yield(
             output_buffer,
             output_notify,
             output_closed,
@@ -2617,11 +2750,13 @@ impl UnifiedExecProcessManager {
             cancellation_token,
             pause_state,
             deadline,
+            None,
             Some(INITIAL_OUTPUT_QUIET_PERIOD),
             &mut None,
         )
-        .await
-        .bytes
+        .await;
+        output_buffer.lock().await.acknowledge_pending_output();
+        collected.bytes
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2633,12 +2768,13 @@ impl UnifiedExecProcessManager {
         cancellation_token: &CancellationToken,
         mut pause_state: Option<watch::Receiver<bool>>,
         mut deadline: Instant,
+        hard_deadline: Option<Instant>,
         quiet_period: Option<Duration>,
         handoff: &mut Option<std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>>,
     ) -> CollectedOutput {
+        output_buffer.lock().await.begin_output_report();
         // Draining frees producer capacity, so the entire collection window needs
         // its own bound. Raw output is still captured by the process artifact writer.
-        let mut collected = HeadTailBuffer::default();
         let tool_dispatch_timing = active_tool_dispatch_timing();
         let mut wait_attempt = 0_u32;
         let mut exit_signal_received = cancellation_token.is_cancelled();
@@ -2650,12 +2786,21 @@ impl UnifiedExecProcessManager {
             tokio::select! {
                 biased;
                 _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
+                _ = async {
+                    match hard_deadline {
+                        Some(bound) => tokio::time::sleep_until(bound).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => break ToolLifecycleWakeReason::Timeout,
                 _ = Self::extend_deadlines_while_paused(
                     &mut pause_state,
                     &mut deadline,
                     &mut post_exit_deadline,
                     &mut early_yield_deadline,
                 ) => {}
+            }
+            if let Some(bound) = hard_deadline {
+                deadline = deadline.min(bound);
             }
             // Register before inspecting the buffer. `notify_waiters` does not
             // retain a permit, so registering after an empty drain would leave
@@ -2673,8 +2818,8 @@ impl UnifiedExecProcessManager {
                 // Observe closure before the drain under the producer's buffer
                 // lock. If it is closed, this drain includes every final byte.
                 let closed = output_closed.load(Ordering::Acquire);
-                let arrived = guard.has_unreported_output();
-                let meaningful = guard.drain_into(&mut collected);
+                let arrived = guard.has_uncollected_output();
+                let meaningful = guard.collect_pending_output();
                 (arrived, meaningful && quiet_period.is_some(), closed)
             };
 
@@ -2831,12 +2976,18 @@ impl UnifiedExecProcessManager {
             }
         };
 
-        let lag_marker = if collected.lagged_chunks() > 0 {
-            lagged_output_marker(collected.lagged_chunks())
-        } else {
-            Vec::new()
-        };
-        let output = collected.to_bytes_with_loss_notice(&lag_marker);
+        let guard = output_buffer.lock().await;
+        let output = guard
+            .pending_output()
+            .map(|collected| {
+                let lag_marker = if collected.lagged_chunks() > 0 {
+                    lagged_output_marker(collected.lagged_chunks())
+                } else {
+                    Vec::new()
+                };
+                collected.to_bytes_with_loss_notice(&lag_marker)
+            })
+            .unwrap_or_default();
         CollectedOutput {
             bytes: output,
             wake_reason,

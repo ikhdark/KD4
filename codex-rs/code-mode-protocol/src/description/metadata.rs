@@ -3,7 +3,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-use super::schema_ts::render_json_schema_to_typescript;
+use super::schema_ts::SharedFragments;
+use super::schema_ts::hoist_shared_fragments;
+use super::schema_ts::render_json_schema_to_typescript_recording;
+
+const MCP_RESULT_ENVELOPE: &str = "type CallToolResult<T = unknown> = { content: Array<Record<string, unknown>>; structuredContent?: T; isError?: boolean; _meta?: Record<string, unknown>; };\n";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,24 +98,34 @@ pub fn render_code_mode_sample(
     format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```")
 }
 
-fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
-    let description = definition.description.trim();
-    let input_name = match definition.kind {
-        CodeModeToolKind::Function => "args",
-        CodeModeToolKind::Freeform => "input",
-    };
+struct RenderedToolTypes {
+    input_type: String,
+    output_type: String,
+    input_fragments: SharedFragments,
+    output_fragments: SharedFragments,
+}
+
+fn render_tool_types(definition: &ToolDefinition) -> RenderedToolTypes {
+    let mut input_fragments = SharedFragments::default();
     let input_type = match definition.kind {
         CodeModeToolKind::Function => definition
             .input_schema
             .as_ref()
-            .map(render_json_schema_to_typescript)
+            .map(|schema| {
+                let (rendered, fragments) = render_json_schema_to_typescript_recording(schema);
+                input_fragments = fragments;
+                rendered
+            })
             .unwrap_or_else(|| "unknown".to_string()),
         CodeModeToolKind::Freeform => "string".to_string(),
     };
+    let mut output_fragments = SharedFragments::default();
     let output_type = if let Some(structured_content_schema) =
         mcp_structured_content_schema(definition.output_schema.as_ref())
     {
-        let structured_content_type = render_json_schema_to_typescript(structured_content_schema);
+        let (structured_content_type, fragments) =
+            render_json_schema_to_typescript_recording(structured_content_schema);
+        output_fragments = fragments;
         if structured_content_type == "unknown" {
             "CallToolResult".to_string()
         } else {
@@ -121,12 +135,50 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         definition
             .output_schema
             .as_ref()
-            .map(render_json_schema_to_typescript)
+            .map(|schema| {
+                let (rendered, fragments) = render_json_schema_to_typescript_recording(schema);
+                output_fragments = fragments;
+                rendered
+            })
             .unwrap_or_else(|| "unknown".to_string())
     };
+    RenderedToolTypes {
+        input_type,
+        output_type,
+        input_fragments,
+        output_fragments,
+    }
+}
+
+fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
+    let description = definition.description.trim();
+    let input_name = match definition.kind {
+        CodeModeToolKind::Function => "args",
+        CodeModeToolKind::Freeform => "input",
+    };
+    let RenderedToolTypes {
+        mut input_type,
+        mut output_type,
+        input_fragments,
+        output_fragments,
+    } = render_tool_types(definition);
+    // One shape reached from several properties, or from both the argument and
+    // result schemas, is described once and referenced by name afterwards.
+    let aliases = hoist_shared_fragments(
+        &[&input_fragments, &output_fragments],
+        &mut [&mut input_type, &mut output_type],
+    );
+    let mut preamble = String::new();
+    if mcp_structured_content_schema(definition.output_schema.as_ref()).is_some() {
+        preamble.push_str(MCP_RESULT_ENVELOPE);
+    }
+    for alias in &aliases {
+        preamble.push_str(alias);
+        preamble.push('\n');
+    }
     if definition.name == "tool_search" {
         let declaration = format!(
-            "type CodeModeToolSearchResult = {output_type};\ndeclare const tools: {{ {} }};",
+            "{preamble}type CodeModeToolSearchResult = {output_type};\ndeclare const tools: {{ {} }};",
             render_code_mode_tool_declaration(
                 &definition.name,
                 input_name,
@@ -136,13 +188,74 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         );
         return format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```");
     }
-    render_code_mode_sample(
-        description,
-        &definition.name,
-        input_name,
-        input_type,
-        output_type,
-    )
+    let declaration = format!(
+        "{preamble}declare const tools: {{ {} }};",
+        render_code_mode_tool_declaration(&definition.name, input_name, input_type, output_type)
+    );
+    format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```")
+}
+
+/// Render one model-visible contract bundle. Shared shapes are named once across
+/// tools as well as within each tool, and all aliases use the same name scope.
+/// Individual lazy descriptions remain self-contained through augment_tool_definition.
+pub fn render_code_mode_tool_bundle(definitions: &[ToolDefinition]) -> String {
+    let mut types = Vec::with_capacity(definitions.len());
+    let mut fragments = Vec::with_capacity(definitions.len() * 2);
+    for definition in definitions {
+        let rendered = render_tool_types(definition);
+        types.push((rendered.input_type, rendered.output_type));
+        fragments.extend([rendered.input_fragments, rendered.output_fragments]);
+    }
+    let fragment_refs = fragments.iter().collect::<Vec<_>>();
+    let mut type_refs = types
+        .iter_mut()
+        .flat_map(|(input, output)| [input, output])
+        .collect::<Vec<_>>();
+    let aliases = hoist_shared_fragments(&fragment_refs, &mut type_refs);
+    let mut output = String::new();
+    for definition in definitions {
+        if !definition.description.trim().is_empty() {
+            output.push_str(&format!(
+                "### {}\n{}\n\n",
+                definition.name,
+                definition.description.trim()
+            ));
+        }
+    }
+    output.push_str("exec tool declarations:\n```ts\n");
+    if definitions.iter().any(|definition| {
+        mcp_structured_content_schema(definition.output_schema.as_ref()).is_some()
+    }) {
+        output.push_str(MCP_RESULT_ENVELOPE);
+    }
+    for alias in aliases {
+        output.push_str(&alias);
+        output.push('\n');
+    }
+    let mut declarations = Vec::with_capacity(definitions.len());
+    for (definition, (input_type, mut output_type)) in definitions.iter().zip(types) {
+        if definition.name == "tool_search" {
+            output.push_str(&format!("type CodeModeToolSearchResult = {output_type};\n"));
+            output_type = "CodeModeToolSearchResult".to_string();
+        }
+        let input_name = match definition.kind {
+            CodeModeToolKind::Function => "args",
+            CodeModeToolKind::Freeform => "input",
+        };
+        declarations.push(render_code_mode_tool_declaration(
+            &definition.name,
+            input_name,
+            input_type,
+            output_type,
+        ));
+    }
+    output.push_str("declare const tools: {\n");
+    for declaration in declarations {
+        output.push_str(&declaration);
+        output.push('\n');
+    }
+    output.push_str("};\n```");
+    output
 }
 
 fn render_code_mode_tool_declaration(
@@ -173,6 +286,77 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    fn referenced_tool(name: &str, marker: &str) -> ToolDefinition {
+        let schema = json!({
+            "$defs": {"selector": {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": marker},
+                    "start": {"type": "integer", "description": "The exact start coordinate of the selected source range."},
+                    "end": {"type": "integer", "description": "The exact end coordinate of the selected source range."}
+                },
+                "required": ["kind", "start", "end"], "additionalProperties": false
+            }},
+            "$ref": "#/$defs/selector"
+        });
+        ToolDefinition {
+            name: name.to_string(),
+            tool_name: ToolName::plain(name),
+            description: format!("Call {name}."),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(schema.clone()),
+            output_schema: Some(schema),
+            default_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn bundled_contracts_share_shapes_across_tools_without_alias_collisions() {
+        let definitions = [
+            referenced_tool("read_file", "file"),
+            referenced_tool("read_output", "file"),
+            referenced_tool("another_selector", "different"),
+        ];
+        let rendered = render_code_mode_tool_bundle(&definitions);
+        assert_eq!(rendered.matches("declare const tools").count(), 1);
+        assert_eq!(rendered.matches("type CodeModeSelector = ").count(), 1);
+        assert_eq!(rendered.matches("type CodeModeSelector2 = ").count(), 1);
+        assert_eq!(rendered.matches("kind: \"file\";").count(), 1);
+        assert_eq!(rendered.matches("kind: \"different\";").count(), 1);
+        for name in ["read_file", "read_output", "another_selector"] {
+            assert!(
+                rendered.contains(&format!("{name}(args: CodeModeSelector")),
+                "{rendered}"
+            );
+        }
+        // Both argument and result must use the same alias for each independent
+        // schema root; different roots sharing a $defs name cannot be conflated.
+        let declarations = rendered.split("declare const tools").nth(1).unwrap();
+        for declaration in declarations.lines().filter(|line| line.contains("(args:")) {
+            let argument = declaration
+                .split("args: ")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap();
+            assert!(
+                declaration.contains(&format!("Promise<{argument}>")),
+                "{declaration}"
+            );
+        }
+        let separate_bytes: usize = definitions
+            .iter()
+            .cloned()
+            .map(augment_tool_definition)
+            .map(|tool| tool.description.len())
+            .sum();
+        assert!(
+            rendered.len() < separate_bytes,
+            "bundling must reduce the actual emitted contract"
+        );
+    }
 
     #[test]
     fn envelope_selection_requires_a_boolean_registration_marker_and_payload() {
@@ -247,7 +431,8 @@ mod tests {
                     default_timeout_ms: None,
                     kind: CodeModeToolKind::Function,
                     description: format!(
-                        "Answer.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ answer(args: unknown, options?: {{ timeout_ms?: number }}): Promise<{expected_output}>; }};\n```"
+                        "Answer.\n\nexec tool declaration:\n```ts\n{envelope}declare const tools: {{ answer(args: unknown, options?: {{ timeout_ms?: number }}): Promise<{expected_output}>; }};\n```",
+                        envelope = if marker { MCP_RESULT_ENVELOPE } else { "" },
                     ),
                 }
             );

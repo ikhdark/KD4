@@ -135,12 +135,20 @@ pub(crate) async fn execute_user_shell_command(
         // Standalone shell turns bypass model sampling, but their rollout still
         // needs the same model-visible context baseline as a regular turn. Stage
         // it after TurnStarted without committing a new reference item.
-        let step_context = session
-            .capture_step_context(Arc::clone(&turn_context))
-            .await;
-        session
-            .record_context_updates_and_set_reference_context_item(&step_context)
-            .await;
+        let publication: codex_protocol::error::Result<()> = async {
+            let step_context = session
+                .capture_step_context(Arc::clone(&turn_context))
+                .await?;
+            session
+                .record_context_updates_and_set_reference_context_item(&step_context)
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = publication {
+            send_user_shell_error(&session, &turn_context, &error.to_string()).await;
+            return;
+        }
     }
 
     let Some((turn_environment, environment_shell)) = turn_context
@@ -498,7 +506,7 @@ async fn execute_remote_user_shell_command(
     );
     let process_id = call_id.into();
     let exec_backend = turn_environment.environment.get_exec_backend();
-    let start = exec_backend.start(ExecParams {
+    let params = ExecParams {
         process_id,
         argv: display_command,
         cwd: turn_environment.cwd().clone(),
@@ -510,13 +518,25 @@ async fn execute_remote_user_shell_command(
         sandbox: None,
         enforce_managed_network: false,
         managed_network: None,
+    };
+    let cleanup_tasks = session.terminal_tasks.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    // The session owns startup even if the caller is cancelled before a handle
+    // arrives. A late process is then terminated by the same cleanup guard.
+    session.terminal_tasks.spawn(async move {
+        let started = exec_backend
+            .start(params)
+            .await
+            .map(|started| RemoteShellCleanup::new(cleanup_tasks, started.process));
+        let _ = started_tx.send(started);
     });
-    let started = match start.or_cancel(cancellation_token).await {
+    let cleanup = match started_rx.or_cancel(cancellation_token).await {
         Err(CancelErr::Cancelled) => return Err(UserShellExecError::Cancelled),
         Ok(Err(err)) => return Err(UserShellExecError::Failed(format!("{err:?}"))),
-        Ok(Ok(started)) => started,
+        Ok(Ok(Err(err))) => return Err(UserShellExecError::Failed(format!("{err:?}"))),
+        Ok(Ok(Ok(cleanup))) => cleanup,
     };
-    let process = started.process;
+    let process = Arc::clone(cleanup.process.as_ref().expect("startup owns process"));
     let collect =
         collect_remote_user_shell_output(session, turn_context, Arc::clone(&process), call_id);
     let result = tokio::select! {
@@ -526,7 +546,35 @@ async fn execute_remote_user_shell_command(
             Err(UserShellExecError::Failed("command timed out".to_string()))
         }
     };
+    cleanup.disarm();
     terminate_remote_process_after_error(&session.terminal_tasks, process, result).await
+}
+
+struct RemoteShellCleanup {
+    tasks: tokio_util::task::TaskTracker,
+    process: Option<Arc<dyn ExecProcess>>,
+}
+
+impl RemoteShellCleanup {
+    fn new(tasks: tokio_util::task::TaskTracker, process: Arc<dyn ExecProcess>) -> Self {
+        Self {
+            tasks,
+            process: Some(process),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.process = None;
+    }
+}
+
+impl Drop for RemoteShellCleanup {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            self.tasks
+                .spawn(retry_remote_user_shell_termination(process));
+        }
+    }
 }
 
 async fn terminate_remote_process_after_error(
@@ -538,25 +586,27 @@ async fn terminate_remote_process_after_error(
         return result;
     }
 
-    if let Err(err) = process.terminate().await {
-        warn!(
-            process_id = %process.process_id(),
-            error = %err,
-            "remote user shell termination was not confirmed; retaining cleanup ownership"
-        );
-        cleanup_tasks.spawn(retry_remote_user_shell_termination(process));
-    }
+    let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+    cleanup_tasks.spawn(async move {
+        let attempt = tokio::time::timeout(Duration::from_secs(1), process.terminate()).await;
+        let confirmed = matches!(attempt, Ok(Ok(())));
+        let _ = attempt_tx.send(());
+        if !confirmed {
+            retry_remote_user_shell_termination(process).await;
+        }
+    });
+    let _ = attempt_rx.await;
     result
 }
 
 async fn retry_remote_user_shell_termination(process: Arc<dyn ExecProcess>) {
     loop {
-        match process.terminate().await {
-            Ok(()) => return,
-            Err(err) => {
+        match tokio::time::timeout(Duration::from_secs(1), process.terminate()).await {
+            Ok(Ok(())) => return,
+            result => {
                 warn!(
                     process_id = %process.process_id(),
-                    error = %err,
+                    error = ?result,
                     "remote user shell cleanup termination retry failed"
                 );
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -573,14 +623,14 @@ async fn collect_remote_user_shell_output(
 ) -> Result<ExecToolCallOutput, UserShellExecError> {
     let started_at = Instant::now();
     let mut after_seq = None;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut aggregated = Vec::new();
+    let mut stdout = crate::unified_exec::head_tail_buffer::HeadTailBuffer::default();
+    let mut stderr = crate::unified_exec::head_tail_buffer::HeadTailBuffer::default();
+    let mut aggregated = crate::unified_exec::head_tail_buffer::HeadTailBuffer::default();
     let mut exit_code = None;
 
     loop {
         let response = process
-            .read(after_seq, /*max_bytes*/ None, Some(1_000))
+            .read(after_seq, Some(64 * 1024), Some(1_000))
             .await
             .map_err(|err| UserShellExecError::Failed(format!("{err:?}")))?;
         if let Some(failure) = response.failure {
@@ -591,15 +641,15 @@ async fn collect_remote_user_shell_output(
             let bytes = chunk.chunk.into_inner();
             let stream = match chunk.stream {
                 ServerExecOutputStream::Stdout | ServerExecOutputStream::Pty => {
-                    stdout.extend_from_slice(&bytes);
+                    stdout.push_chunk(&bytes);
                     ExecOutputStream::Stdout
                 }
                 ServerExecOutputStream::Stderr => {
-                    stderr.extend_from_slice(&bytes);
+                    stderr.push_chunk(&bytes);
                     ExecOutputStream::Stderr
                 }
             };
-            aggregated.extend_from_slice(&bytes);
+            aggregated.push_chunk(&bytes);
             session
                 .send_event(
                     turn_context,
@@ -616,10 +666,15 @@ async fn collect_remote_user_shell_output(
         if response.closed {
             return Ok(ExecToolCallOutput {
                 exit_code: exit_code.unwrap_or(-1),
-                stdout: StreamOutput::new(String::from_utf8_lossy(&stdout).into_owned()),
-                stderr: StreamOutput::new(String::from_utf8_lossy(&stderr).into_owned()),
+                stdout: StreamOutput::new(
+                    String::from_utf8_lossy(&stdout.to_bytes_with_loss_notice(&[])).into_owned(),
+                ),
+                stderr: StreamOutput::new(
+                    String::from_utf8_lossy(&stderr.to_bytes_with_loss_notice(&[])).into_owned(),
+                ),
                 aggregated_output: StreamOutput::new(
-                    String::from_utf8_lossy(&aggregated).into_owned(),
+                    String::from_utf8_lossy(&aggregated.to_bytes_with_loss_notice(&[]))
+                        .into_owned(),
                 ),
                 duration: started_at.elapsed(),
                 timed_out: false,
@@ -679,18 +734,35 @@ async fn persist_user_shell_output(
     );
 
     if mode == UserShellCommandMode::StandaloneTurn {
-        session
+        if let Err(error) = session
             .record_conversation_items(turn_context, std::slice::from_ref(&output_item))
+            .await
+        {
+            send_user_shell_error(
+                session,
+                turn_context,
+                &format!("Shell output was not recorded: {error}"),
+            )
             .await;
+            return;
+        }
         // Standalone shell turns can run before any regular user turn, so
         // explicitly materialize rollout persistence after recording output.
         session.ensure_rollout_materialized().await;
         return;
     }
 
-    session
+    if let Err(error) = session
         .inject_no_new_turn(vec![output_item], Some(turn_context))
+        .await
+    {
+        send_user_shell_error(
+            session,
+            turn_context,
+            &format!("Shell output was not delivered: {error}"),
+        )
         .await;
+    }
 }
 
 #[cfg(test)]

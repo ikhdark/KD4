@@ -14,6 +14,7 @@ use crate::protocol::ExecParams;
 use crate::protocol::InitializeParams;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
+use crate::protocol::RequestId;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
 use crate::rpc::RpcNotificationSender;
@@ -361,4 +362,35 @@ async fn read_process_until_closed(
             "process should close within 5s"
         );
     }
+}
+
+#[tokio::test]
+async fn http_cancellation_is_request_scoped_and_idempotent() {
+    let (handler, _outgoing) = initialized_handler().await;
+    handler
+        .reserve_http_body_stream("one", &RequestId::Integer(1))
+        .await
+        .unwrap();
+    handler
+        .reserve_http_body_stream("two", &RequestId::Integer(2))
+        .await
+        .unwrap();
+    let first = handler.active_body_stream_ids.lock().await["one"].clone();
+    let second = handler.active_body_stream_ids.lock().await["two"].clone();
+    handler.cancel_http_body_stream("one").await.unwrap();
+    handler.cancel_http_body_stream("one").await.unwrap();
+    handler.cancel_http_body_stream("missing").await.unwrap();
+    assert!(first.1.is_cancelled());
+    assert!(!second.1.is_cancelled());
+    handler.release_http_body_stream("one").await;
+    handler
+        .reserve_http_body_stream("one", &RequestId::Integer(1))
+        .await
+        .unwrap();
+    assert!(
+        !handler.active_body_stream_ids.lock().await["one"]
+            .1
+            .is_cancelled()
+    );
+    handler.shutdown().await;
 }

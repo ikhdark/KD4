@@ -2693,7 +2693,7 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
     model.supports_reasoning_summaries = true;
     model.default_reasoning_summary = ReasoningSummary::Detailed;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_model("gpt-5.4")
         .with_config(move |config| {
             config.model_reasoning_summary = Some(ReasoningSummary::None);
@@ -2702,21 +2702,7 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
         .build(&server)
         .await?;
 
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    test.submit_turn("hello").await?;
 
     let request_body = resp_mock.single_request().body_json();
     pretty_assertions::assert_eq!(
@@ -3529,6 +3515,7 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
                 "object": "response",
                 "status": "incomplete",
                 "error": null,
+                "usage": {"input_tokens": 100, "output_tokens": 23, "total_tokens": 123},
                 "incomplete_details": {
                     "reason": "content_filter"
                 }
@@ -3540,7 +3527,7 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.model_provider.stream_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(3);
         })
         .build(&server)
         .await?;
@@ -3557,26 +3544,44 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
         })
         .await?;
 
+    let token_event = wait_for_event(&codex, |ev| {
+        matches!(ev,
+            EventMsg::TokenCount(count) if count.info.as_ref().is_some_and(|info|
+                info.last_token_usage.total_tokens == 123)
+        )
+    })
+    .await;
+    let EventMsg::TokenCount(count) = token_event else {
+        unreachable!()
+    };
+    let usage = count
+        .info
+        .expect("incomplete response usage must be retained");
+    assert_eq!(usage.last_token_usage.input_tokens, 100);
+    assert_eq!(usage.last_token_usage.output_tokens, 23);
+    assert_eq!(usage.total_token_usage.total_tokens, 123);
+
     let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
     assert!(
         matches!(
             error_event,
             EventMsg::Error(ref err)
                 if err.message
-                    == "Error while reading the server response: Incomplete response returned, reason: content_filter"
+                    == CodexErr::IncompleteResponse(Box::new(codex_protocol::error::IncompleteResponse {
+                        response_id: Some("resp_incomplete".to_string()),
+                        reason: "content_filter".to_string(),
+                        token_usage: None,
+                    })).to_string()
                     && matches!(
                         err.codex_error_info,
-                        Some(codex_protocol::protocol::CodexErrorInfo::ResponseStreamConnectionFailed {
-                            http_status_code: None
-                        })
+                        Some(codex_protocol::protocol::CodexErrorInfo::Other)
                     )
         ),
         "expected incomplete content filter error; got {error_event:?}"
     );
 
-    assert_eq!(responses_mock.requests().len(), 1);
-
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(responses_mock.requests().len(), 1);
     Ok(())
 }
 

@@ -348,18 +348,18 @@ async fn same_manager_serializes_refresh_and_cache_publication() {
     );
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
 
-    let cached = manager.list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY);
-    tokio::pin!(cached);
-    assert!(
-        timeout(Duration::from_millis(100), cached.as_mut())
-            .await
-            .is_err()
-    );
+    let cached = timeout(
+        Duration::from_millis(100),
+        manager.list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY),
+    )
+    .await
+    .expect("offline snapshot must not wait for network")
+    .expect("bundled snapshot");
+    assert!(!cached.is_empty());
     endpoint.release_one();
     first.await.expect("first task").expect("first refresh");
     endpoint.release_one();
     second.await.expect("second refresh");
-    cached.await.expect("cache load after publication");
 
     let model = manager
         .get_model_info("ordered-model", &ModelsManagerConfig::default())
@@ -378,7 +378,7 @@ async fn same_manager_serializes_refresh_and_cache_publication() {
 }
 
 #[tokio::test]
-async fn online_if_uncached_recovers_corruption_but_offline_preserves_the_error() {
+async fn cache_corruption_keeps_offline_fallback_and_recovers_online() {
     for contents in [
         b"{not-json".to_vec(),
         serde_json::to_vec(&json!({
@@ -391,10 +391,11 @@ async fn online_if_uncached_recovers_corruption_but_offline_preserves_the_error(
         let endpoint =
             TestModelsEndpoint::new(vec![vec![remote_model("recovered-model", "Recovered", 1)]]);
         let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
-        assert!(
-            matches!(manager.list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY).await,
-            Err(CodexErr::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData)
-        );
+        let fallback = manager
+            .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+            .expect("optional cache failure must preserve bundled models");
+        assert!(!fallback.is_empty());
         assert_eq!(endpoint.fetch_count(), 0);
         let models = manager
             .list_models(
@@ -808,33 +809,63 @@ fn openai_manager_for_tests_with_auth(
 
 #[tokio::test]
 async fn offline_refresh_revalidates_identity_at_cache_and_catalog_boundaries() {
-    let codex_home = tempdir().expect("temp dir");
-    let identity_reads = Arc::new(AtomicUsize::new(0));
-    let identity_reads_for_cache = Arc::clone(&identity_reads);
-    let endpoint = TestModelsEndpoint::without_refresh(Vec::new());
-    let manager = OpenAiModelsManager::new(
-        codex_home.path().to_path_buf(),
-        endpoint.clone(),
-        None,
-        Arc::new(move || {
-            identity_reads_for_cache.fetch_add(1, Ordering::SeqCst);
-            "counted-provider-identity".to_string()
-        }),
-    );
-    identity_reads.store(0, Ordering::SeqCst);
+    // Switch identity at different read boundaries during one offline refresh.
+    // An obsolete account's disk catalog must never become the returned catalog.
+    for switch_after in 0..=5 {
+        let codex_home = tempdir().expect("temp dir");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let threshold = Arc::new(AtomicUsize::new(usize::MAX));
+        let endpoint = TestModelsEndpoint::without_refresh(Vec::new());
+        let manager = OpenAiModelsManager::new(
+            codex_home.path().to_path_buf(),
+            endpoint.clone(),
+            None,
+            Arc::new({
+                let reads = Arc::clone(&reads);
+                let threshold = Arc::clone(&threshold);
+                move || {
+                    if reads.fetch_add(1, Ordering::SeqCst) < threshold.load(Ordering::SeqCst) {
+                        "account-a".to_string()
+                    } else {
+                        "account-b".to_string()
+                    }
+                }
+            }),
+        );
+        manager
+            .cache_manager
+            .persist_cache(
+                &[remote_model("account-a-only", "Account A", 0)],
+                Some("account-a-etag".to_string()),
+                crate::client_version_to_whole(),
+            )
+            .await;
+        reads.store(0, Ordering::SeqCst);
+        threshold.store(switch_after, Ordering::SeqCst);
 
-    let catalog = ModelsManager::raw_model_catalog(
-        &manager,
-        RefreshStrategy::Offline,
-        DEFAULT_HTTP_CLIENT_FACTORY,
-    )
-    .await
-    .expect("offline cache refresh should succeed");
+        let catalog = ModelsManager::raw_model_catalog(
+            &manager,
+            RefreshStrategy::Offline,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("offline cache refresh should succeed");
 
-    // Validate before loading, after acquiring cache I/O, and before publishing the catalog.
-    assert_eq!(identity_reads.load(Ordering::SeqCst), 3);
-    assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 0);
-    assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.4"));
+        assert!(
+            reads.load(Ordering::SeqCst) > switch_after,
+            "identity switch must occur"
+        );
+        assert!(
+            !catalog
+                .models
+                .iter()
+                .any(|model| model.slug == "account-a-only"),
+            "obsolete account catalog escaped after boundary {switch_after}"
+        );
+        assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 0);
+        assert_eq!(endpoint.fetch_count(), 0);
+        assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.4"));
+    }
 }
 
 #[tokio::test]
@@ -953,7 +984,7 @@ async fn static_manager_falls_back_from_unsupported_requested_model_when_allowed
 }
 
 #[tokio::test]
-async fn static_manager_preserves_requested_sol_when_fallback_is_allowed() {
+async fn static_manager_falls_back_for_unlisted_sol() {
     let manager = static_manager_for_tests(ModelsResponse {
         models: vec![remote_model(
             "provider-default",
@@ -973,7 +1004,7 @@ async fn static_manager_preserves_requested_sol_when_fallback_is_allowed() {
             .await
             .expect("default model");
 
-        assert_eq!(model, requested_model);
+        assert_eq!(model, "provider-default");
     }
 }
 
@@ -1875,6 +1906,7 @@ async fn refresh_available_models_refetches_when_cache_stale() {
         })
         .await
         .expect("cache manipulation succeeds");
+    manager.state.write().await.fresh_until = Some(tokio::time::Instant::now());
 
     manager
         .refresh_available_models(
@@ -1915,6 +1947,7 @@ async fn refresh_available_models_refetches_when_version_mismatch() {
         })
         .await
         .expect("cache mutation succeeds");
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
 
     manager
         .refresh_available_models(
@@ -2510,5 +2543,103 @@ fn bundled_api_models_advertise_none_reasoning_effort() {
                 .any(|preset| preset.effort == ReasoningEffort::None),
             "{slug} should advertise the provider-supported none reasoning effort"
         );
+    }
+}
+
+#[tokio::test]
+async fn audit_cache_io_failure_recovers_and_fresh_memory_avoids_disk() {
+    let home = tempdir().unwrap();
+    let blocked_home = home.path().join("not-a-directory");
+    std::fs::write(&blocked_home, "file").unwrap();
+    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model("recovered", "Recovered", 0)]]);
+    let manager = openai_manager_for_tests(blocked_home, endpoint.clone());
+    for _ in 0..3 {
+        let models = manager
+            .list_models(
+                RefreshStrategy::OnlineIfUncached,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .expect("cache failure must not prevent discovery or warm reuse");
+        assert!(models.iter().any(|model| model.model == "recovered"));
+    }
+    assert_eq!(endpoint.fetch_count(), 1);
+    // Holding the cache transaction proves warm reads perform no disk operation.
+    let _refresh = manager.refresh_gate.lock().await;
+    let models = timeout(
+        Duration::from_millis(100),
+        manager.list_models(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        ),
+    )
+    .await
+    .expect("fresh reads must bypass the transaction gate")
+    .unwrap();
+    assert!(models.iter().any(|model| model.model == "recovered"));
+}
+
+#[tokio::test]
+async fn audit_concurrent_cache_misses_share_one_fetch() {
+    let home = tempdir().unwrap();
+    let endpoint = ControlledModelsEndpoint::new(vec![ControlledResponse::Models(
+        vec![remote_model("shared", "Shared", 0)],
+        None,
+    )]);
+    let manager = Arc::new(openai_manager_for_tests(
+        home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+    let mut requests = Vec::new();
+    for _ in 0..6 {
+        let manager = Arc::clone(&manager);
+        requests.push(tokio::spawn(async move {
+            manager
+                .list_models(
+                    RefreshStrategy::OnlineIfUncached,
+                    DEFAULT_HTTP_CLIENT_FACTORY,
+                )
+                .await
+        }));
+    }
+    endpoint.wait_for_fetches(1).await;
+    endpoint.release_one();
+    for request in requests {
+        let models = timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(models.iter().any(|model| model.model == "shared"));
+    }
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn audit_sol_catalog_membership_and_explicit_pinning() {
+    for slug in ["gpt-5.6-sol", "openai.gpt-5.6-sol"] {
+        for (listed, fallback, expected) in [
+            (false, true, "provider-default"),
+            (false, false, slug),
+            (true, true, slug),
+        ] {
+            let mut models = vec![remote_model("provider-default", "Default", 0)];
+            if listed {
+                models.push(remote_model(slug, "Requested", 1));
+            }
+            let manager = static_manager_for_tests(ModelsResponse { models });
+            assert_eq!(
+                manager
+                    .get_default_model(
+                        &Some(slug.into()),
+                        fallback,
+                        RefreshStrategy::Offline,
+                        DEFAULT_HTTP_CLIENT_FACTORY
+                    )
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
     }
 }

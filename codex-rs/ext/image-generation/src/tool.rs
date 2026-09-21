@@ -42,6 +42,7 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::ToolExposure;
 use codex_tools::default_namespace_description;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_for_prompt_bytes;
 use codex_utils_path_uri::PathUri;
@@ -200,53 +201,88 @@ impl ImageGenerationTool {
             }
             Some(Ok(result)) => result,
         };
-        // Once the provider returned image bytes, cancellation must not discard them.
-        // Finish any local write we start so cancellation cannot leave a partial artifact.
-        let saved_path = match self.save_root.as_ref() {
-            Some(save_root) => match save_image_generation_result(
-                LOCAL_FS.as_ref(),
-                save_root,
-                &self.thread_id,
-                &call.call_id,
-                &result,
-            )
-            .await
-            {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    let output_path =
-                        image_generation_artifact_path(save_root, &self.thread_id, &call.call_id);
-                    let output_dir = output_path.parent().unwrap_or_else(|| save_root.clone());
-                    tracing::warn!(
-                        call_id = %call.call_id,
-                        output_dir = %output_dir.display(),
-                        "failed to save generated image: {error}"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-        let item = ImageGenerationItem {
-            id: call.call_id.clone(),
-            status: "completed".to_string(),
-            revised_prompt: Some(args.prompt),
-            result: result.clone(),
-            saved_path: saved_path.clone(),
-        };
-        let legacy_event = legacy_end_event(&item);
-        call.turn_item_emitter
-            .emit_completed(extension_turn_item(item, legacy_event))
-            .await;
-        let output_hint = saved_path.as_ref().and_then(|output_path| {
-            let output_dir = output_path.parent()?;
-            extension_image_generation_output_hint(output_dir.display(), output_path.display())
-        });
-        Ok(Box::new(GeneratedImageOutput {
+        complete_image_generation(
+            &call.call_id,
+            call.turn_item_emitter.as_ref(),
+            args.prompt,
             result,
-            output_hint,
-        }))
+            self.save_root.as_ref(),
+            &self.thread_id,
+        )
+        .await
     }
+}
+
+async fn complete_image_generation(
+    call_id: &str,
+    emitter: &dyn codex_extension_api::TurnItemEmitter,
+    prompt: String,
+    result: String,
+    save_root: Option<&AbsolutePathBuf>,
+    thread_id: &str,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    let validation = tokio::task::spawn_blocking(move || validate_generated_image(result))
+        .await
+        .map_err(|error| format!("image validation failed: {error}"))
+        .and_then(|result| result);
+    let (result, bytes) = match validation {
+        Ok(image) => image,
+        Err(message) => {
+            emit_failed_result(call_id, emitter, &prompt).await;
+            return Err(FunctionCallError::RespondToModel(message));
+        }
+    };
+    // Once the provider returned image bytes, cancellation must not discard them.
+    // Finish any local write we start so cancellation cannot leave a partial artifact.
+    let (saved_path, delivery_hint) =
+        persist_generated_image(LOCAL_FS.as_ref(), save_root, thread_id, call_id, bytes).await;
+    let item = ImageGenerationItem {
+        id: call_id.to_string(),
+        status: "completed".to_string(),
+        revised_prompt: Some(prompt),
+        result: result.clone(),
+        saved_path: saved_path.clone(),
+    };
+    let legacy_event = legacy_end_event(&item);
+    emitter
+        .emit_completed(extension_turn_item(item, legacy_event))
+        .await;
+    let saved_hint = saved_path.as_ref().and_then(|output_path| {
+        let output_dir = output_path.parent()?;
+        extension_image_generation_output_hint(output_dir.display(), output_path.display())
+    });
+    let output_hint = Some(match saved_hint {
+        Some(hint) => format!("{delivery_hint}\n{hint}"),
+        None => delivery_hint.to_string(),
+    });
+    Ok(Box::new(GeneratedImageOutput {
+        result,
+        output_hint,
+    }))
+}
+
+/// Validate provider bytes even when persistence is disabled or fails.
+fn validate_generated_image(result: String) -> Result<(String, Vec<u8>), String> {
+    let result = result.trim();
+    if result.len() > MAX_PROMPT_IMAGE_SOURCE_BYTES.div_ceil(3) * 4 {
+        return Err("generated image exceeds the image byte limit".to_string());
+    }
+    let bytes = BASE64_STANDARD
+        .decode(result)
+        .map_err(|error| format!("generated image contains invalid base64: {error}"))?;
+    if bytes.len() > MAX_PROMPT_IMAGE_SOURCE_BYTES {
+        return Err("generated image exceeds the image byte limit".to_string());
+    }
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("generated image is not a PNG image".to_string());
+    }
+    let image = load_for_prompt_bytes(
+        std::path::Path::new("generated.png"),
+        bytes,
+        PromptImageMode::Original,
+    )
+    .map_err(|error| format!("generated image is not a valid PNG: {error}"))?;
+    Ok((result.to_string(), image.bytes.to_vec()))
 }
 
 fn cancelled_error() -> FunctionCallError {
@@ -275,17 +311,61 @@ fn image_history_requirement(payload: &ToolPayload) -> ConversationHistoryRequir
 }
 
 async fn emit_failed_item(call: &ToolCall, prompt: &str) {
+    emit_failed_result(&call.call_id, call.turn_item_emitter.as_ref(), prompt).await;
+}
+
+async fn emit_failed_result(
+    call_id: &str,
+    emitter: &dyn codex_extension_api::TurnItemEmitter,
+    prompt: &str,
+) {
     let item = ImageGenerationItem {
-        id: call.call_id.clone(),
+        id: call_id.to_string(),
         status: "failed".to_string(),
         revised_prompt: Some(prompt.to_string()),
         result: String::new(),
         saved_path: None,
     };
     let legacy_event = legacy_end_event(&item);
-    call.turn_item_emitter
+    emitter
         .emit_completed(extension_turn_item(item, legacy_event))
         .await;
+}
+
+async fn persist_generated_image(
+    fs: &dyn ExecutorFileSystem,
+    save_root: Option<&AbsolutePathBuf>,
+    thread_id: &str,
+    call_id: &str,
+    bytes: Vec<u8>,
+) -> (Option<AbsolutePathBuf>, &'static str) {
+    match save_root {
+        Some(save_root) => {
+            match save_image_generation_result(fs, save_root, thread_id, call_id, bytes).await {
+                Ok(path) => (
+                    Some(path),
+                    "The generated image was saved on the Codex host filesystem. This path may not be accessible in a remote primary environment; use conversation-image selection for subsequent edits there.",
+                ),
+                Err(error) => {
+                    let output_path = image_generation_artifact_path(save_root, thread_id, call_id);
+                    let output_dir = output_path.parent().unwrap_or_else(|| save_root.clone());
+                    tracing::warn!(
+                        call_id = %call_id,
+                        output_dir = %output_dir.display(),
+                        "failed to save generated image: {error}"
+                    );
+                    (
+                        None,
+                        "The image was generated successfully, but saving it on the Codex host failed. The returned image remains available; use conversation-image selection to edit it without regenerating it.",
+                    )
+                }
+            }
+        }
+        None => (
+            None,
+            "The image was generated successfully. Local saving is not configured; the returned image remains available through conversation-image selection.",
+        ),
+    }
 }
 
 async fn save_image_generation_result(
@@ -293,11 +373,8 @@ async fn save_image_generation_result(
     save_root: &AbsolutePathBuf,
     session_id: &str,
     call_id: &str,
-    result: &str,
+    bytes: Vec<u8>,
 ) -> io::Result<AbsolutePathBuf> {
-    let bytes = BASE64_STANDARD
-        .decode(result.trim().as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let path = image_generation_artifact_path(save_root, session_id, call_id);
     if let Some(parent) = path.parent() {
         fs.create_directory(
@@ -509,22 +586,32 @@ async fn image_url(
     let sandbox = environment.file_system_sandbox_context.clone();
     let bytes = environment
         .file_system
-        .read_file(&path_uri, Some(&sandbox))
+        .read_file_bounded(&path_uri, MAX_PROMPT_IMAGE_SOURCE_BYTES, Some(&sandbox))
         .await
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(
                 "unable to read referenced image at `{}`: {error}",
                 path.display()
             ))
-        })?;
-    let image = load_for_prompt_bytes(path.as_path(), bytes, PromptImageMode::Original).map_err(
-        |error| {
-            FunctionCallError::RespondToModel(format!(
-                "unable to process referenced image at `{}`: {error}",
-                path.display()
-            ))
-        },
-    )?;
+        })?
+        .ok_or_else(|| FunctionCallError::RespondToModel(format!(
+            "referenced image at `{}` changed while being read or exceeds the {MAX_PROMPT_IMAGE_SOURCE_BYTES} byte limit",
+            path.display()
+        )))?;
+    let image_path = path.clone();
+    let image = tokio::task::spawn_blocking(move || {
+        load_for_prompt_bytes(image_path.as_path(), bytes, PromptImageMode::Original)
+    })
+    .await
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!("image preparation failed: {error}"))
+    })?
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "unable to process referenced image at `{}`: {error}",
+            path.display()
+        ))
+    })?;
     Ok(ImageUrl {
         image_url: image.into_data_url(),
     })

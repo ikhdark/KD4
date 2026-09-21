@@ -310,7 +310,11 @@ impl ToolOutput for LegacyShellToolOutput {
             const VALIDATION_DIAGNOSTICS_ID: &str = "validation:diagnostics";
             let range = validation_diagnostic_range(VALIDATION_DIAGNOSTICS_ID, canonical_output);
             let diagnostics = range.as_ref().map_or_else(
-                || diagnostics.to_string(),
+                || {
+                    const NOTICE: &str = "\n[diagnostic excerpt truncated; full output retained]";
+                    let end = diagnostics.floor_char_boundary(12 * 1024 - NOTICE.len());
+                    format!("{}{NOTICE}", &diagnostics[..end])
+                },
                 |range| {
                     diagnostics
                         .lines()

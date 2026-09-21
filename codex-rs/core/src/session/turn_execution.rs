@@ -37,6 +37,8 @@ const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
 const DISTINCT_FAILURE_RECOVERY_ADVISORY_THRESHOLD: u32 = 2;
 const SUCCESSFUL_REPLAY_GATE_LIMIT: usize = 32;
 const SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT: usize = 64 * 1024;
+const SOFT_CONVERGENCE_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+const SOFT_CONVERGENCE_DIRECTIVE: &str = "Soft convergence intervention: Use existing evidence and stop optional exploration. Continue only to satisfy an unresolved requirement, complete required implementation or validation, or resolve a correctness-relevant uncertainty. Preserve the requested scope. This is not a completion test or a hard deadline: do not cancel running work, truncate the answer, claim unfinished work is complete, or abandon obtainable required evidence. Report limitations only when evidence is genuinely unavailable or work is blocked. This instruction takes effect on this already-needed continuation; it does not interrupt an in-flight request.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ContinuationDisposition {
@@ -68,57 +70,13 @@ impl GenerationRequestDisposition {
             SamplingGenerationDisposition::DecisionBearing => {
                 TurnTimingGenerationDisposition::DecisionBearing
             }
-            SamplingGenerationDisposition::ResidualDeterministic(proof) => {
-                debug_assert_eq!(
-                    proof.relevant_state_fingerprint,
-                    self.relevant_state_fingerprint
-                );
-                debug_assert!(matches!(
-                    proof.exact_action,
-                    ResidualDeterministicAction::CompleteProtocolTurn
-                ));
-                TurnTimingGenerationDisposition::Deterministic
-            }
         }
-    }
-
-    /// Returns true when the control has proved that the protocol-requested
-    /// continuation has exactly one host-owned outcome. In that case another
-    /// model generation cannot add a decision and must be elided.
-    pub(crate) fn completes_protocol_turn_deterministically(&self) -> bool {
-        matches!(
-            &self.sampling,
-            SamplingGenerationDisposition::ResidualDeterministic(
-                ResidualDeterministicSamplingProof {
-                    exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
-                    ..
-                }
-            )
-        )
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SamplingGenerationDisposition {
     DecisionBearing,
-    ResidualDeterministic(ResidualDeterministicSamplingProof),
-}
-
-impl SamplingGenerationDisposition {
-    pub(crate) fn is_residual_deterministic(&self) -> bool {
-        matches!(self, Self::ResidualDeterministic(_))
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResidualDeterministicSamplingProof {
-    relevant_state_fingerprint: String,
-    exact_action: ResidualDeterministicAction,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResidualDeterministicAction {
-    CompleteProtocolTurn,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,11 +264,12 @@ pub(crate) struct SuppressedFailureGuard {
 pub(crate) struct SuccessfulReplayGuard {
     response: ResponseInputItem,
     mutation_revision: u64,
+    requires_fresh_observation: bool,
 }
 
 impl SuccessfulReplayGuard {
     pub(crate) fn is_fresh(&self, mutation_revision: u64) -> bool {
-        self.mutation_revision == mutation_revision
+        !self.requires_fresh_observation && self.mutation_revision == mutation_revision
     }
 
     pub(crate) fn response_for_call(&self, call_id: &str) -> Option<ResponseInputItem> {
@@ -414,6 +373,7 @@ struct SamplingRequestSignalState {
     recovery_action_identities: BTreeMap<u64, RecoveryActionIdentity>,
     evidence_items: BTreeMap<u64, String>,
     successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
+    replayed_ordinals: BTreeSet<u64>,
     validation_ordinals: BTreeSet<u64>,
     validation_proof_ordinals: BTreeSet<u64>,
     test_validation_ordinals: BTreeSet<u64>,
@@ -478,7 +438,6 @@ pub(crate) struct ExecutedValidationSummary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FreshSuccessfulValidation {
-    observed_mutation_before_validation: bool,
     mutation_revision: Option<u64>,
 }
 
@@ -516,6 +475,30 @@ pub(crate) struct SamplingToolCallRegistration {
 }
 
 impl SamplingRequestSignalCollector {
+    pub(crate) fn completion_evidence_key(&self) -> Option<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evidence = state
+            .outcomes
+            .iter()
+            .filter(|outcome| !state.replayed_ordinals.contains(&outcome.ordinal))
+            .map(|outcome| {
+                format!(
+                    "{:?}:{:?}:{:?}:{}:{:?}",
+                    outcome.kind,
+                    outcome.source_evidence,
+                    outcome.failure_fingerprint,
+                    outcome.tests_executed,
+                    state.evidence_items.get(&outcome.ordinal)
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        (!evidence.is_empty())
+            .then(|| format!("{:x}", Sha256::digest(format!("{evidence:?}").as_bytes())))
+    }
+
     #[cfg(test)]
     pub(crate) fn register_tool_call(&self) -> u64 {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
@@ -594,6 +577,10 @@ impl SamplingRequestSignalCollector {
                             .map(|gate| SuccessfulReplayGuard {
                                 response: gate.response.clone(),
                                 mutation_revision: self.request_mutation_revision,
+                                // All current replay classes observe mutable source,
+                                // validation, or final-verification state. The ledger
+                                // does not retain their original dependency proof.
+                                requires_fresh_observation: replayable_action,
                             })
                     });
                 (blocked_wait_guard, suppressed_failure, replayed_success)
@@ -1039,6 +1026,25 @@ impl SamplingRequestSignalCollector {
         }
     }
 
+    pub(crate) fn record_replayed_response_result(
+        &self,
+        ordinal: u64,
+        response: &ResponseInputItem,
+    ) {
+        self.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            response,
+            false,
+        );
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replayed_ordinals
+            .insert(ordinal);
+    }
+
     fn successful_replay_candidates(&self) -> Vec<(String, ResponseInputItem)> {
         let state = self
             .state
@@ -1344,6 +1350,7 @@ impl SamplingRequestSignalCollector {
                     outcome.ordinal == **ordinal
                         && outcome.kind != SamplingToolOutcomeKind::Skipped
                         && !outcome.failure_diagnosis_reused
+                        && !state.replayed_ordinals.contains(ordinal)
                 })
             })
             .count();
@@ -1351,7 +1358,10 @@ impl SamplingRequestSignalCollector {
         let completed_outcome_count = state
             .outcomes
             .iter()
-            .filter(|outcome| !outcome.failure_diagnosis_reused)
+            .filter(|outcome| {
+                !outcome.failure_diagnosis_reused
+                    && !state.replayed_ordinals.contains(&outcome.ordinal)
+            })
             .count();
         let duration_is_validation_only = state.child_runtime_sample_count
             == executed_validation_count
@@ -1369,6 +1379,14 @@ impl SamplingRequestSignalCollector {
                 0
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_workspace_revision_for_test(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .validation_mutation_revision
     }
 
     pub(crate) fn record_validation_workspace_revision(
@@ -1507,7 +1525,6 @@ impl SamplingRequestSignalCollector {
         }
 
         Some(FreshSuccessfulValidation {
-            observed_mutation_before_validation: !state.mutation_ordinals.is_empty(),
             mutation_revision: state.validation_mutation_revision,
         })
     }
@@ -1586,7 +1603,11 @@ impl SamplingRequestSignalCollector {
         if settled.mutation_revision != baselines.mutation_revision {
             progress.push(TurnTimingProgressKind::WorkspaceMutation);
         }
-        if state.saw_validation {
+        if state
+            .validation_ordinals
+            .iter()
+            .any(|ordinal| !state.replayed_ordinals.contains(ordinal))
+        {
             progress.push(TurnTimingProgressKind::ValidationResult);
         }
         if state
@@ -2488,6 +2509,8 @@ fn tool_name_matches(tool_name: &ToolName, candidate: &str) -> bool {
 }
 
 pub(crate) struct TurnExecutionControl {
+    soft_convergence_started_at: tokio::time::Instant,
+    soft_convergence_issued: bool,
     plan: Option<UpdatePlanArgs>,
     plan_revision: u64,
     input_revision: u64,
@@ -2522,6 +2545,8 @@ impl TurnExecutionControl {
 
     pub(crate) fn new_with_timing(timing: Arc<TurnTimingState>) -> Self {
         Self {
+            soft_convergence_started_at: tokio::time::Instant::now(),
+            soft_convergence_issued: false,
             plan: None,
             plan_revision: 0,
             input_revision: 0,
@@ -2539,6 +2564,20 @@ impl TurnExecutionControl {
             turn_efficiency_child_runtime_ms: 0,
             unresolved_failures: BTreeSet::new(),
         }
+    }
+
+    pub(crate) fn take_soft_convergence_directive(
+        &mut self,
+        is_continuation: bool,
+    ) -> Option<String> {
+        if !is_continuation
+            || self.soft_convergence_issued
+            || self.soft_convergence_started_at.elapsed() < SOFT_CONVERGENCE_AFTER
+        {
+            return None;
+        }
+        self.soft_convergence_issued = true;
+        Some(SOFT_CONVERGENCE_DIRECTIVE.to_string())
     }
 
     #[cfg(test)]
@@ -2591,70 +2630,21 @@ impl TurnExecutionControl {
         collector: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
         has_pending_input: bool,
-        protocol_requests_resample: bool,
     ) -> GenerationRequestDisposition {
         let relevant_state_fingerprint = format!(
             "{:x}",
             Sha256::digest(self.settled_revision_key(settled).as_bytes())
         );
-        let residual_proof = self.residual_deterministic_sampling_proof(
-            baselines,
-            collector,
-            settled,
-            has_pending_input,
-            protocol_requests_resample,
-            &relevant_state_fingerprint,
-        );
         GenerationRequestDisposition {
-            // Owners drain before returning a tool result. Once execution has
-            // returned ambiguous or new evidence, unknown cases must fail open.
-            purpose: collector.generation_purpose(
-                baselines,
-                settled,
-                has_pending_input,
-                residual_proof.is_some(),
-            ),
-            sampling: residual_proof
-                .map(SamplingGenerationDisposition::ResidualDeterministic)
-                .unwrap_or(SamplingGenerationDisposition::DecisionBearing),
+            // A server-requested continuation can finish reasoning or issue a
+            // tool even when the preceding response changed no tracked state.
+            // Only an explicit owner result may complete work without sampling.
+            purpose: collector.generation_purpose(baselines, settled, has_pending_input, false),
+            sampling: SamplingGenerationDisposition::DecisionBearing,
             relevant_state_fingerprint,
             failure_fingerprint: collector.failure_fingerprint(),
             terminal_completion_only: false,
         }
-    }
-
-    fn residual_deterministic_sampling_proof(
-        &self,
-        baselines: &SamplingRequestBaselines,
-        collector: &SamplingRequestSignalCollector,
-        settled: &SamplingRequestSettledState,
-        has_pending_input: bool,
-        protocol_requests_resample: bool,
-        relevant_state_fingerprint: &str,
-    ) -> Option<ResidualDeterministicSamplingProof> {
-        if has_pending_input
-            || settled.mutation_revision != baselines.mutation_revision
-            || self.plan_revision != baselines.plan_revision
-            || self.input_revision != baselines.input_revision
-            || settled.tool_exposure_revision != baselines.tool_exposure_revision
-        {
-            return None;
-        }
-
-        let state = collector
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.registered_count == 0 && state.outcomes.is_empty() {
-            if !protocol_requests_resample {
-                return None;
-            }
-            return Some(ResidualDeterministicSamplingProof {
-                relevant_state_fingerprint: relevant_state_fingerprint.to_string(),
-                exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
-            });
-        }
-        None
     }
 
     pub(crate) fn accepted_user_input(&mut self) {
@@ -2677,29 +2667,8 @@ impl TurnExecutionControl {
         settled: &SamplingRequestSettledState,
     ) -> SamplingConvergenceDecision {
         let settled_revision = self.settled_revision_key(settled);
-        if let Some(validation) = collector.fresh_successful_validation()
-            && validation.mutation_revision == Some(settled.mutation_revision)
-            && self.unresolved_failures.is_empty()
-            && self.input_revision == baselines.input_revision
-            && settled.tool_exposure_revision == baselines.tool_exposure_revision
-            && self
-                .plan
-                .as_ref()
-                .map_or(settled.mutation_revision > 0, |plan| {
-                    !plan.plan.is_empty() && !plan_is_unfinished(plan)
-                })
-            && (settled.mutation_revision == baselines.mutation_revision
-                || validation.observed_mutation_before_validation)
-        {
-            self.reset_convergence();
-            self.last_state_revision = Some(settled_revision);
-            return SamplingConvergenceDecision {
-                continuation: ContinuationDisposition::TerminalCompletionRequired,
-                directive: None,
-                proven_loop_activated: false,
-                authoritative_wait: None,
-            };
-        }
+        // Validation proves only its observed execution. It cannot prove that
+        // all user-requested changes, checks, or child lifecycle actions are done.
         if settled.mutation_revision != baselines.mutation_revision
             || self.plan_revision != baselines.plan_revision
             || self.input_revision != baselines.input_revision
@@ -2805,9 +2774,9 @@ impl TurnExecutionControl {
             self.directive_issued = true;
             self.proven_loop_active = true;
             return SamplingConvergenceDecision {
-                continuation: ContinuationDisposition::TerminalCompletionRequired,
+                continuation: ContinuationDisposition::ModelRequired,
                 directive: Some(
-                    "Turn-efficiency guard: the same deterministic tool cycle repeated after the consolidation directive while state stayed unchanged. Complete now from the returned evidence; do not call another tool."
+                    "Turn-efficiency guard: the same deterministic tool cycle repeated. Reuse its retained result rather than re-executing the unchanged operation. Reuse adds no new external evidence, but may support useful analysis or context recovery. It does not establish task completion; other actions remain available for required work."
                         .to_string(),
                 ),
                 proven_loop_activated: true,
@@ -2832,9 +2801,7 @@ impl TurnExecutionControl {
             && self.turn_efficiency_child_runtime_ms <= negligible_runtime_limit_ms;
         if exceeds_turn_efficiency_guard && self.turn_efficiency_guard.is_none() {
             // The first high-volume negligible-runtime observation is only a
-            // consolidation signal. Preserve its exact cycle and settled state
-            // so only a subsequent identical deterministic cycle can enforce
-            // the terminal boundary.
+            // consolidation signal, not proof of semantic completeness.
             self.turn_efficiency_guard = Some(TurnEfficiencyGuardHandle {
                 settled_revision: settled_revision.clone(),
                 deterministic_cycle: request_deterministic_cycle,
@@ -2844,7 +2811,7 @@ impl TurnExecutionControl {
             return SamplingConvergenceDecision {
                 continuation: ContinuationDisposition::ModelRequired,
                 directive: Some(
-                    "Turn-efficiency guard: this turn accumulated many tool calls with negligible child runtime while state stayed unchanged. Consolidate the returned evidence now; use another tool only when additional evidence or state change is necessary."
+                    "Turn-efficiency guard: repeated equivalent calls are a loop signal, not a completion test. Use existing evidence and stop optional exploration. Continue only to satisfy an unresolved requirement, complete required implementation or validation, or resolve a correctness-relevant uncertainty. Preserve the requested scope."
                         .to_string(),
                 ),
                 proven_loop_activated: false,
@@ -2950,9 +2917,9 @@ impl TurnExecutionControl {
             self.directive_issued = true;
             self.proven_loop_active = true;
             return SamplingConvergenceDecision {
-                continuation: ContinuationDisposition::TerminalCompletionRequired,
+                continuation: ContinuationDisposition::ModelRequired,
                 directive: Some(
-                    "Convergence enforced: the unchanged authoritative wait was repeated after its blocker was surfaced. No further tools are available for this turn. Act from existing evidence in the final response and truthfully report the blocker if it remains unresolved."
+                    "The unchanged authoritative wait remains suppressed because its blocker was already surfaced. Use another action to resolve the blocker or finish the remaining work; report it if no in-scope recovery exists."
                         .to_string(),
                 ),
                 proven_loop_activated: true,
@@ -3021,10 +2988,8 @@ impl TurnExecutionControl {
             return SamplingConvergenceDecision::default();
         }
 
-        // Even an exact repeated failure gets one model-visible convergence
-        // advisory before tools are removed. This keeps the terminal boundary
-        // deterministic without turning the second failed recovery attempt
-        // directly into forced completion.
+        // An exact repeated failure can suppress that action, but says nothing
+        // about the availability of a different recovery or remaining task work.
         let proven_loop_activated =
             self.directive_issued && repeated_cycle && !self.proven_loop_active;
         if proven_loop_activated {
@@ -3032,24 +2997,20 @@ impl TurnExecutionControl {
         }
         self.directive_issued = true;
         let directive = if proven_loop_activated {
-            "Convergence enforced: an ordered deterministic action/result cycle repeated after the convergence directive against identical state. No further tools are available for this turn. Provide the final response now using existing evidence, truthfully reporting any blocker or incomplete validation."
+            "Convergence advisory: an ordered deterministic action/result cycle repeated against identical state. Reuse the existing result rather than re-executing the unchanged operation. Reuse adds no new external evidence, but may support useful analysis or restore evidence after context compaction. It does not establish completion or lack of useful reasoning progress. Other tools remain available for unfinished work and recovery."
         } else if cycle.kind == DeterministicCycleKind::BroadSourcePass {
-            "Convergence required: the broad source pass repeated against the same obligation and returned the same evidence for the same action. Use the evidence already returned. Make another observation only to answer a specific unresolved question, not to repeat an answered one; otherwise synthesize the result, begin implementation, or truthfully complete."
+            "Convergence advisory: the broad source pass returned the same evidence for the same action. Reuse retained evidence rather than re-executing the unchanged operation. Continue required coverage, implementation, validation, and correctness-relevant investigation; runtime bookkeeping cannot establish semantic completeness."
         } else if self.consecutive_no_progress == threshold
             || self.consecutive_obligation_no_progress == threshold
         {
-            "Convergence required: repeated deterministic evidence produced no obligation-level state progress. Do not repeat an unchanged observation without a relevant input change or pending transition. Resolve a named remaining question through different evidence, synthesize the answer, or report the blocker. Take state-changing actions only when authorized and necessary."
+            "Convergence advisory: repeated deterministic evidence adds no new external evidence; it does not establish that analysis made no useful progress. Reuse retained results and stop optional exploration. Continue to satisfy unresolved requirements, complete required implementation or validation, or resolve correctness-relevant uncertainty. Preserve the requested scope."
         } else if self.proven_loop_active {
             "Convergence escalation: an ordered deterministic action/result cycle has repeated after the convergence directive against identical state. Do not repeat it. Change the hypothesis or state, narrow the observation, or truthfully complete; existing task lifecycle rules still govern termination."
         } else {
             "Convergence escalation: structured state still has not changed. Equivalent completed actions remain blocked. Choose a new hypothesis, change state, narrow the observation, or truthfully complete; a no-progress count alone never ends the task."
         };
         SamplingConvergenceDecision {
-            continuation: if proven_loop_activated {
-                ContinuationDisposition::TerminalCompletionRequired
-            } else {
-                ContinuationDisposition::ModelRequired
-            },
+            continuation: ContinuationDisposition::ModelRequired,
             directive: Some(directive.to_string()),
             proven_loop_activated,
             authoritative_wait: None,
@@ -3078,7 +3039,7 @@ impl TurnExecutionControl {
         self.turn_efficiency_child_runtime_ms = 0;
     }
 
-    fn settled_revision_key(&self, settled: &SamplingRequestSettledState) -> String {
+    pub(crate) fn settled_revision_key(&self, settled: &SamplingRequestSettledState) -> String {
         format!(
             "mutation={};plan={};input={};tool_exposure={}",
             settled.mutation_revision,
@@ -3274,6 +3235,120 @@ mod tests {
             Some(plan),
         ));
         control.settle(&baselines, &collector, &settled(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn soft_convergence_is_once_per_turn_and_only_on_a_needed_continuation() {
+        let mut control = TurnExecutionControl::new();
+        assert!(control.take_soft_convergence_directive(true).is_none());
+        tokio::time::advance(SOFT_CONVERGENCE_AFTER - std::time::Duration::from_millis(1)).await;
+        assert!(control.take_soft_convergence_directive(true).is_none());
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert!(control.take_soft_convergence_directive(false).is_none());
+        let directive = control
+            .take_soft_convergence_directive(true)
+            .expect("soft intervention");
+        assert_eq!(directive, SOFT_CONVERGENCE_DIRECTIVE);
+        assert!(directive.contains("complete required implementation or validation"));
+        assert!(directive.contains("Preserve the requested scope"));
+        assert!(directive.contains("do not cancel running work"));
+        assert!(directive.contains("abandon obtainable required evidence"));
+        assert!(directive.contains("does not interrupt an in-flight request"));
+        control.reset_convergence();
+        tokio::time::advance(SOFT_CONVERGENCE_AFTER).await;
+        assert!(control.take_soft_convergence_directive(true).is_none());
+        assert!(
+            !control
+                .initial_generation_request(&control.baselines(0))
+                .terminal_completion_only
+        );
+        let mut next_turn = TurnExecutionControl::new();
+        assert!(next_turn.take_soft_convergence_directive(true).is_none());
+        tokio::time::advance(SOFT_CONVERGENCE_AFTER).await;
+        assert_eq!(
+            next_turn.take_soft_convergence_directive(true).as_deref(),
+            Some(SOFT_CONVERGENCE_DIRECTIVE)
+        );
+    }
+
+    #[test]
+    fn replayed_validation_is_not_new_execution_or_external_progress() {
+        let control = TurnExecutionControl::new();
+        let baselines = control.baselines(0);
+        let collector = control.collector(&baselines);
+        let registration = collector.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"),
+            &validation_proof_payload(),
+            "reused-validation",
+        );
+        let response = runner_tool_response("reused-validation", "Ran 1 test in 0.01s\n\nOK\n");
+        collector.record_replayed_response_result(registration.ordinal, &response);
+        assert_eq!(collector.executed_validation_summary().count, 0);
+        assert!(
+            !collector
+                .progress_kinds(&baselines, &settled(0))
+                .contains(&TurnTimingProgressKind::ValidationResult)
+        );
+        assert_eq!(
+            collector.successful_replay_candidates().len(),
+            1,
+            "retained output stays reusable"
+        );
+
+        let executed = control.collector(&baselines);
+        let registration = executed.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"),
+            &validation_proof_payload(),
+            "executed-validation",
+        );
+        executed.record_response_result(
+            registration.ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            &response,
+            false,
+        );
+        assert_eq!(executed.executed_validation_summary().count, 1);
+        assert!(
+            executed
+                .progress_kinds(&baselines, &settled(0))
+                .contains(&TurnTimingProgressKind::ValidationResult)
+        );
+    }
+
+    #[test]
+    fn completion_evidence_tracks_result_changes_without_call_id_noise() {
+        let control = TurnExecutionControl::new();
+        let baseline = control.baselines(0);
+        let evidence = |call_id: &str, output: &str, replayed: bool| {
+            let collector = control.collector(&baseline);
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                call_id,
+            );
+            let response = runner_tool_response(call_id, output);
+            if replayed {
+                collector.record_replayed_response_result(registration.ordinal, &response);
+            } else {
+                collector.record_response_result(
+                    registration.ordinal,
+                    ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                    None,
+                    &response,
+                    false,
+                );
+            }
+            collector.completion_evidence_key()
+        };
+        let first = evidence("first", "observed state A", false);
+        assert!(first.is_some());
+        assert_eq!(
+            first,
+            evidence("different-call-id", "observed state A", false)
+        );
+        assert_ne!(first, evidence("first", "observed state B", false));
+        assert_eq!(evidence("replayed", "observed state A", true), None);
     }
 
     #[test]
@@ -3535,7 +3610,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_successful_validation_requires_one_terminal_completion() {
+    fn fresh_successful_validation_preserves_model_decisions() {
         let mut control = TurnExecutionControl::new();
         settle_plan(&mut control, plan(&[StepStatus::Completed]));
         let baselines = control.baselines(0);
@@ -3544,24 +3619,21 @@ mod tests {
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &collector, &settled_state);
 
+        assert!(collector.fresh_successful_validation().is_some());
+        assert!(control.unresolved_failures.is_empty());
         let decision = control.evaluate_convergence(&baselines, &collector, &settled_state);
         assert_eq!(
             decision.continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
         assert!(decision.directive.is_none());
         assert!(!decision.proven_loop_activated);
 
-        let completion = control
-            .continuation_generation_request(&baselines, &collector, &settled_state, false, false)
-            .require_terminal_completion();
-        assert!(completion.terminal_completion_only);
+        let continuation =
+            control.continuation_generation_request(&baselines, &collector, &settled_state, false);
+        assert!(!continuation.terminal_completion_only);
         assert_eq!(
-            completion.purpose,
-            Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
-        );
-        assert_eq!(
-            completion.sampling,
+            continuation.sampling,
             SamplingGenerationDisposition::DecisionBearing
         );
     }
@@ -3630,10 +3702,11 @@ mod tests {
                 },
                 "{tool}: {arguments}"
             );
+            assert!(collector.fresh_successful_validation().is_some());
             let decision = control.evaluate_convergence(&baselines, &collector, &settled_state);
             assert_eq!(
                 decision.continuation,
-                ContinuationDisposition::TerminalCompletionRequired,
+                ContinuationDisposition::ModelRequired,
                 "{tool}: {arguments}"
             );
             assert!(decision.directive.is_none());
@@ -3642,7 +3715,7 @@ mod tests {
     }
 
     #[test]
-    fn masked_or_skipped_validation_cannot_terminalize_or_replay_success() {
+    fn masked_or_skipped_validation_cannot_create_proof_or_replay_success() {
         let temp = tempfile::tempdir().expect("validation fixture");
         std::fs::write(
             temp.path().join("test_failing.py"),
@@ -3719,11 +3792,8 @@ mod tests {
                         );
                     }
                     control.settle(&baselines, &collector, &settled(0));
-                    assert_ne!(
-                        control
-                            .evaluate_convergence(&baselines, &collector, &settled(0))
-                            .continuation,
-                        ContinuationDisposition::TerminalCompletionRequired,
+                    assert!(
+                        collector.fresh_successful_validation().is_none(),
                         "{arguments}; nested={nested}"
                     );
                     let next = control.collector(&control.baselines(0));
@@ -3770,11 +3840,8 @@ mod tests {
             );
             control.settle(&baselines, &collector, &settled_state);
             assert_eq!(collector.executed_validation_summary().count, 0);
-            assert_ne!(
-                control
-                    .evaluate_convergence(&baselines, &collector, &settled_state)
-                    .continuation,
-                ContinuationDisposition::TerminalCompletionRequired,
+            assert!(
+                collector.fresh_successful_validation().is_none(),
                 "{command}"
             );
         }
@@ -3814,10 +3881,7 @@ mod tests {
             });
             control.settle(&baselines, &collector, &settled_state);
             assert_eq!(
-                control
-                    .evaluate_convergence(&baselines, &collector, &settled_state)
-                    .continuation
-                    == ContinuationDisposition::TerminalCompletionRequired,
+                collector.fresh_successful_validation().is_some(),
                 outcome == ToolOutputOutcome::Success,
                 "{outcome:?}"
             );
@@ -3825,7 +3889,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_skipped_or_incomplete_validation_cannot_terminalize() {
+    fn failed_skipped_or_incomplete_validation_cannot_create_proof() {
         for outcome in [ToolOutputOutcome::Failure, ToolOutputOutcome::Skipped] {
             let mut control = TurnExecutionControl::new();
             settle_plan(&mut control, plan(&[StepStatus::Completed]));
@@ -3834,12 +3898,7 @@ mod tests {
             let collector = recorded_validation_collector(&control, &baselines, outcome);
             control.settle(&baselines, &collector, &settled_state);
 
-            assert_ne!(
-                control
-                    .evaluate_convergence(&baselines, &collector, &settled_state)
-                    .continuation,
-                ContinuationDisposition::TerminalCompletionRequired
-            );
+            assert!(collector.fresh_successful_validation().is_none());
         }
 
         let mut control = TurnExecutionControl::new();
@@ -3853,17 +3912,12 @@ mod tests {
             "incomplete-validation",
         );
         control.settle(&baselines, &collector, &settled_state);
-        assert_ne!(
-            control
-                .evaluate_convergence(&baselines, &collector, &settled_state)
-                .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
-        );
+        assert!(collector.fresh_successful_validation().is_none());
     }
 
     #[test]
     fn final_diff_status_observation_requires_exact_git_executable() {
-        for (program, terminalizes) in [
+        for (program, preserves_validation) in [
             ("git", true),
             ("git.exe", true),
             ("GIT.EXE", true),
@@ -3890,11 +3944,8 @@ mod tests {
             let settled_state = settled(0);
             control.settle(&baselines, &collector, &settled_state);
             assert_eq!(
-                control
-                    .evaluate_convergence(&baselines, &collector, &settled_state)
-                    .continuation
-                    == ContinuationDisposition::TerminalCompletionRequired,
-                terminalizes,
+                collector.fresh_successful_validation().is_some(),
+                preserves_validation,
                 "executable: {program}"
             );
         }
@@ -3934,7 +3985,7 @@ mod tests {
                             .directive
                             .as_deref()
                             .is_some_and(|directive| directive.starts_with(
-                                "Convergence required: the broad source pass repeated"
+                                "Convergence advisory: the broad source pass returned the same evidence"
                             )),
                         generation == 1 && matches!(program, "rg.exe" | "RG.EXE"),
                         "program={program}, direct_argv={direct_argv}, generation={generation}"
@@ -3945,7 +3996,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_final_observations_do_not_terminalize() {
+    fn unsafe_final_observations_do_not_preserve_validation_proof() {
         {
             let extra_payload = ToolPayload::Function {
                 arguments:
@@ -3974,12 +4025,7 @@ mod tests {
             let settled_state = settled(0);
             control.settle(&baselines, &collector, &settled_state);
 
-            assert_ne!(
-                control
-                    .evaluate_convergence(&baselines, &collector, &settled_state)
-                    .continuation,
-                ContinuationDisposition::TerminalCompletionRequired
-            );
+            assert!(collector.fresh_successful_validation().is_none());
         }
         assert!(!final_diff_status_script_is_read_only(
             "git diff --check | Out-File result.txt; git status --short"
@@ -3995,7 +4041,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_validation_resolves_prior_failure_before_terminal_completion() {
+    fn a_fresh_validation_resolves_prior_failure_without_forcing_completion() {
         let mut control = TurnExecutionControl::new();
         settle_plan(&mut control, plan(&[StepStatus::Completed]));
         let failed_baselines = control.baselines(0);
@@ -4016,7 +4062,7 @@ mod tests {
             control
                 .evaluate_convergence(&recovery_baselines, &recovered, &settled(0))
                 .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
     }
 
@@ -4504,7 +4550,7 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_plan_blocks_fresh_validation_terminalization() {
+    fn unfinished_plan_does_not_invalidate_fresh_validation_evidence() {
         let mut control = TurnExecutionControl::new();
         settle_plan(&mut control, plan(&[StepStatus::Completed]));
         settle_plan(&mut control, plan(&[StepStatus::InProgress]));
@@ -4514,16 +4560,17 @@ mod tests {
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &collector, &settled_state);
 
-        assert_ne!(
+        assert!(collector.fresh_successful_validation().is_some());
+        assert_eq!(
             control
                 .evaluate_convergence(&baselines, &collector, &settled_state)
                 .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired,
         );
     }
 
     #[test]
-    fn validation_completion_requires_confirmed_work_and_current_workspace() {
+    fn validation_never_completes_the_task_with_or_without_a_plan() {
         for scenario in [
             "no plan",
             "no plan after edit",
@@ -4564,6 +4611,15 @@ mod tests {
             if scenario == "missing revision" {
                 collector.state.lock().unwrap().validation_mutation_revision = None;
             }
+            assert_eq!(
+                collector
+                    .fresh_successful_validation()
+                    .is_some_and(|validation| {
+                        validation.mutation_revision == Some(settled_state.mutation_revision)
+                    }),
+                !matches!(scenario, "stale validation" | "missing revision"),
+                "{scenario}",
+            );
             control.settle(&baselines, &collector, &settled_state);
             if scenario == "new input" {
                 control.input_revision += 1;
@@ -4571,9 +4627,8 @@ mod tests {
             assert_eq!(
                 control
                     .evaluate_convergence(&baselines, &collector, &settled_state)
-                    .continuation
-                    == ContinuationDisposition::TerminalCompletionRequired,
-                matches!(scenario, "complete" | "no plan after edit"),
+                    .continuation,
+                ContinuationDisposition::ModelRequired,
                 "{scenario}"
             );
         }
@@ -4800,9 +4855,8 @@ mod tests {
                         control.evaluate_convergence(&baselines, &collector, &settled),
                         SamplingConvergenceDecision::default()
                     );
-                    let request = control.continuation_generation_request(
-                        &baselines, &collector, &settled, false, false,
-                    );
+                    let request = control
+                        .continuation_generation_request(&baselines, &collector, &settled, false);
                     assert!(!request.terminal_completion_only);
                     assert_eq!(
                         request.sampling,
@@ -5214,7 +5268,7 @@ mod tests {
         );
         assert_eq!(
             control
-                .continuation_generation_request(&baselines, &first, &settled, false, false,)
+                .continuation_generation_request(&baselines, &first, &settled, false)
                 .sampling,
             SamplingGenerationDisposition::DecisionBearing
         );
@@ -5227,7 +5281,7 @@ mod tests {
         );
         assert!(repeated_decision.directive.is_some());
         let repeated_request =
-            control.continuation_generation_request(&baselines, &repeated, &settled, false, false);
+            control.continuation_generation_request(&baselines, &repeated, &settled, false);
         assert_eq!(
             repeated_request.sampling,
             SamplingGenerationDisposition::DecisionBearing
@@ -5242,13 +5296,7 @@ mod tests {
         );
         assert_eq!(
             control
-                .continuation_generation_request(
-                    &baselines,
-                    &changed_evidence,
-                    &settled,
-                    false,
-                    false,
-                )
+                .continuation_generation_request(&baselines, &changed_evidence, &settled, false)
                 .sampling,
             SamplingGenerationDisposition::DecisionBearing
         );
@@ -5271,9 +5319,7 @@ mod tests {
                 // it does not establish a single host-owned protocol outcome.
                 assert_eq!(
                     control
-                        .continuation_generation_request(
-                            &baselines, &collector, &settled, false, false,
-                        )
+                        .continuation_generation_request(&baselines, &collector, &settled, false)
                         .timing_disposition(),
                     TurnTimingGenerationDisposition::DecisionBearing
                 );
@@ -5299,13 +5345,17 @@ mod tests {
         let directive =
             directive.expect("a repeated broad source pass issues a convergence directive");
         assert!(
-            directive.starts_with("Convergence required: the broad source pass repeated"),
+            directive.starts_with(
+                "Convergence advisory: the broad source pass returned the same evidence"
+            ),
             "unexpected directive: {directive}"
         );
         assert!(
             !directive.contains("suppress"),
             "the directive must not promise suppression the host does not perform: {directive}"
         );
+        assert!(directive.contains("Continue required coverage, implementation, validation"));
+        assert!(directive.contains("runtime bookkeeping cannot establish semantic completeness"));
     }
 
     #[test]
@@ -5573,7 +5623,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_continuation_failure_gets_an_advisory_before_tool_free_completion() {
+    fn stable_continuation_failure_keeps_other_recovery_actions_available() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
 
@@ -5589,17 +5639,12 @@ mod tests {
             assert_eq!(decision.proven_loop_activated, generation == 3);
             assert_eq!(
                 decision.continuation,
-                if generation == 3 {
-                    ContinuationDisposition::TerminalCompletionRequired
-                } else {
-                    ContinuationDisposition::ModelRequired
-                }
+                ContinuationDisposition::ModelRequired
             );
             if generation == 3 {
                 let completion = control
-                    .continuation_generation_request(&baselines, &collector, &settled, false, false)
-                    .require_terminal_completion();
-                assert!(completion.terminal_completion_only);
+                    .continuation_generation_request(&baselines, &collector, &settled, false);
+                assert!(!completion.terminal_completion_only);
             }
         }
     }
@@ -5827,11 +5872,7 @@ mod tests {
             assert_eq!(decision.proven_loop_activated, generation == 3);
             assert_eq!(
                 decision.continuation,
-                if generation == 3 {
-                    ContinuationDisposition::TerminalCompletionRequired
-                } else {
-                    ContinuationDisposition::ModelRequired
-                }
+                ContinuationDisposition::ModelRequired
             );
         }
 
@@ -6179,7 +6220,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_efficiency_repeated_high_tool_count_cycle_requires_terminal_completion() {
+    fn turn_efficiency_repeated_high_tool_count_cycle_preserves_other_actions() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
 
@@ -6222,7 +6263,7 @@ mod tests {
         let terminal = control.evaluate_convergence(&baselines, &repeated_after_advisory, &settled);
         assert_eq!(
             terminal.continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
         assert!(terminal.directive.is_some());
         assert!(terminal.proven_loop_activated);
@@ -6288,7 +6329,7 @@ mod tests {
     }
 
     #[test]
-    fn proven_loop_requests_one_shot_terminal_completion() {
+    fn proven_loop_preserves_a_different_required_action() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
 
@@ -6300,32 +6341,24 @@ mod tests {
                 "same-result",
             );
             let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-            if generation < 3 {
-                assert_eq!(
-                    decision.continuation,
-                    ContinuationDisposition::ModelRequired
-                );
-                continue;
-            }
-
-            assert!(decision.proven_loop_activated);
             assert_eq!(
                 decision.continuation,
-                ContinuationDisposition::TerminalCompletionRequired
+                ContinuationDisposition::ModelRequired
             );
-            let request = control
-                .continuation_generation_request(&baselines, &collector, &settled, false, false)
-                .require_terminal_completion();
-            assert!(request.terminal_completion_only);
-            assert_eq!(
-                request.purpose,
-                Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
-            );
-            assert_eq!(
-                request.sampling,
-                SamplingGenerationDisposition::DecisionBearing
-            );
+            assert_eq!(decision.proven_loop_activated, generation == 3);
+            let request =
+                control.continuation_generation_request(&baselines, &collector, &settled, false);
+            assert!(!request.terminal_completion_only);
         }
+
+        let different = structured_tool_pass_collector(
+            &control,
+            &baselines,
+            r#"{"command":"inspect-required-dependency"}"#,
+            "new-result",
+        );
+        let decision = control.evaluate_convergence(&baselines, &different, &settled);
+        assert_eq!(decision, SamplingConvergenceDecision::default());
     }
 
     #[test]
@@ -6427,7 +6460,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_suppressed_blocked_wait_reaches_terminal_completion() {
+    fn repeated_suppressed_blocked_wait_keeps_recovery_tools_available() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
 
@@ -6469,7 +6502,7 @@ mod tests {
         assert!(decision.proven_loop_activated);
         assert_eq!(
             decision.continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
     }
 
@@ -6555,72 +6588,27 @@ mod tests {
     }
 
     #[test]
-    fn protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged() {
+    fn protocol_continuation_preserves_sampling_without_new_tool_or_state_evidence() {
         let control = TurnExecutionControl::new();
         let baselines = control.baselines(7);
-        let unchanged = settled(7);
-
-        let empty_collector = control.collector(&baselines);
-        let proven = control.continuation_generation_request(
-            &baselines,
-            &empty_collector,
-            &unchanged,
-            false,
-            true,
-        );
-        assert!(matches!(
-            &proven.sampling,
-            SamplingGenerationDisposition::ResidualDeterministic(_)
-        ));
-        assert!(proven.completes_protocol_turn_deterministically());
-        assert_eq!(
-            proven.timing_disposition(),
-            TurnTimingGenerationDisposition::Deterministic
-        );
-
-        let with_tool_evidence = control.collector(&baselines);
-        with_tool_evidence.register_tool_call();
-        let tool_result = control.continuation_generation_request(
-            &baselines,
-            &with_tool_evidence,
-            &unchanged,
-            false,
-            true,
-        );
-        assert_eq!(
-            tool_result.sampling,
-            SamplingGenerationDisposition::DecisionBearing
-        );
-        assert!(!tool_result.completes_protocol_turn_deterministically());
-        assert_eq!(
-            tool_result.timing_disposition(),
-            TurnTimingGenerationDisposition::DecisionBearing
-        );
-
-        let with_input = control.continuation_generation_request(
-            &baselines,
-            &empty_collector,
-            &unchanged,
-            true,
-            true,
-        );
-        assert_eq!(
-            with_input.sampling,
-            SamplingGenerationDisposition::DecisionBearing
-        );
-
-        let changed = settled(8);
-        let changed_state = control.continuation_generation_request(
-            &baselines,
-            &empty_collector,
-            &changed,
-            false,
-            true,
-        );
-        assert_eq!(
-            changed_state.sampling,
-            SamplingGenerationDisposition::DecisionBearing
-        );
+        let collector = control.collector(&baselines);
+        for (mutation_revision, has_pending_input) in [(7, false), (7, true), (8, false)] {
+            let request = control.continuation_generation_request(
+                &baselines,
+                &collector,
+                &settled(mutation_revision),
+                has_pending_input,
+            );
+            assert_eq!(
+                request.sampling,
+                SamplingGenerationDisposition::DecisionBearing
+            );
+            assert_eq!(
+                request.timing_disposition(),
+                TurnTimingGenerationDisposition::DecisionBearing
+            );
+            assert!(!request.terminal_completion_only);
+        }
     }
 
     #[test]
@@ -6790,11 +6778,12 @@ mod tests {
         );
         let mutation_settled = settled(1);
         validated_after_mutation.settle(&baselines, &collector, &mutation_settled);
+        assert!(collector.fresh_successful_validation().is_some());
         assert_eq!(
             validated_after_mutation
                 .evaluate_convergence(&baselines, &collector, &mutation_settled)
                 .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
 
         let mut mutated_after_validation = TurnExecutionControl::new();
@@ -6822,12 +6811,7 @@ mod tests {
         );
         let mutation_settled = settled(1);
         mutated_after_validation.settle(&baselines, &collector, &mutation_settled);
-        assert_ne!(
-            mutated_after_validation
-                .evaluate_convergence(&baselines, &collector, &mutation_settled)
-                .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
-        );
+        assert!(collector.fresh_successful_validation().is_none());
 
         let mut observed_after_validation = TurnExecutionControl::new();
         settle_plan(
@@ -6851,11 +6835,12 @@ mod tests {
         );
         let settled_state = settled(0);
         observed_after_validation.settle(&baselines, &collector, &settled_state);
+        assert!(collector.fresh_successful_validation().is_some());
         assert_eq!(
             observed_after_validation
                 .evaluate_convergence(&baselines, &collector, &settled_state)
                 .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
     }
 
@@ -6880,21 +6865,17 @@ mod tests {
             ToolOutputOutcome::Success,
         );
         control.settle(&baselines, &unrelated, &settled(0));
-        assert_ne!(
-            control
-                .evaluate_convergence(&baselines, &unrelated, &settled(0))
-                .continuation,
-            ContinuationDisposition::TerminalCompletionRequired,
-        );
+        assert!(!control.unresolved_failures.is_empty());
 
         let recovered =
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &recovered, &settled(0));
+        assert!(control.unresolved_failures.is_empty());
         assert_eq!(
             control
                 .evaluate_convergence(&baselines, &recovered, &settled(0))
                 .continuation,
-            ContinuationDisposition::TerminalCompletionRequired,
+            ContinuationDisposition::ModelRequired,
         );
     }
 
@@ -6945,11 +6926,12 @@ mod tests {
             ToolOutputOutcome::Success,
         );
         control.settle(&baselines, &retry, &settled(0));
+        assert!(control.unresolved_failures.is_empty());
         assert_eq!(
             control
                 .evaluate_convergence(&baselines, &retry, &settled(0))
                 .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
     }
 
@@ -6975,11 +6957,12 @@ mod tests {
         let validation =
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &validation, &settled(0));
+        assert!(control.unresolved_failures.is_empty());
         assert_eq!(
             control
                 .evaluate_convergence(&baselines, &validation, &settled(0))
                 .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            ContinuationDisposition::ModelRequired
         );
     }
 
@@ -7015,11 +6998,15 @@ mod tests {
                 );
             }
             control.settle(&baselines, &collector, &settled(0));
+            assert!(
+                collector.fresh_successful_validation().is_some(),
+                "{commands:?}"
+            );
             assert_eq!(
                 control
                     .evaluate_convergence(&baselines, &collector, &settled(0))
                     .continuation,
-                ContinuationDisposition::TerminalCompletionRequired,
+                ContinuationDisposition::ModelRequired,
                 "{commands:?}",
             );
         }
@@ -7127,9 +7114,8 @@ mod tests {
                 assert_eq!(
                     control
                         .evaluate_convergence(&baselines, &collector, &settled(1))
-                        .continuation
-                        == ContinuationDisposition::TerminalCompletionRequired,
-                    completed,
+                        .continuation,
+                    ContinuationDisposition::ModelRequired,
                     "{scenario}, nested={nested}"
                 );
             }

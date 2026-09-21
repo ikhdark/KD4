@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use codex_code_mode_protocol::OutputLoss;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -207,6 +208,7 @@ async fn runtime_thread_panic_remains_a_cell_error_without_owner_supervision() {
     assert_eq!(
         harness.initial_event_rx.await.expect("initial event"),
         Ok(CellEvent::Completed {
+            output_loss: None,
             content_items: Vec::new(),
             error_text: Some("exec runtime ended unexpectedly".to_string()),
         })
@@ -340,6 +342,7 @@ async fn state_change_observer_coalesces_output_with_imminent_completion() {
         .send(RuntimeEvent::Result {
             stored_value_writes: HashMap::new(),
             error_text: None,
+            output_loss: None,
         })
         .unwrap();
     assert_eq!(
@@ -348,6 +351,7 @@ async fn state_change_observer_coalesces_output_with_imminent_completion() {
             .expect("coalesced completion timed out")
             .unwrap(),
         Ok(CellEvent::Completed {
+            output_loss: None,
             content_items: vec![OutputItem::Text {
                 text: "tool output".to_string(),
             }],
@@ -456,6 +460,7 @@ async fn queued_termination_preempts_unobserved_runtime_completion() {
         .send(RuntimeEvent::Result {
             stored_value_writes: HashMap::new(),
             error_text: None,
+            output_loss: None,
         })
         .unwrap();
     let termination = harness.handle.terminate();
@@ -596,6 +601,7 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
 async fn only_the_first_termination_claims_a_buffered_completion() {
     let cell_state = CellState::new(CancellationToken::new());
     let completion = CellEvent::Completed {
+        output_loss: None,
         content_items: Vec::new(),
         error_text: None,
     };
@@ -632,6 +638,7 @@ async fn termination_claim_prevents_stored_value_commit() {
     let termination = cell_state.request_termination();
     let mut commit_ran = false;
     let completion = CellEvent::Completed {
+        output_loss: None,
         content_items: Vec::new(),
         error_text: None,
     };
@@ -660,6 +667,7 @@ async fn termination_claim_prevents_stored_value_commit() {
 fn failed_completion_delivery_rebuffers_the_event() {
     let cell_state = CellState::new(CancellationToken::new());
     let event = CellEvent::Completed {
+        output_loss: None,
         content_items: Vec::new(),
         error_text: None,
     };
@@ -691,6 +699,10 @@ fn failed_completion_delivery_rebuffers_the_event() {
 fn buffered_initial_explicit_yield_precedes_buffered_completion_for_yield_observer() {
     let cell_state = CellState::new(CancellationToken::new());
     let completion = CellEvent::Completed {
+        output_loss: Some(OutputLoss {
+            discarded_items: 1,
+            discarded_bytes_lower_bound: 2048,
+        }),
         content_items: vec![OutputItem::Text {
             text: "after".to_string(),
         }],

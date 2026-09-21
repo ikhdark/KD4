@@ -285,13 +285,16 @@ impl ConfigManager {
     ) -> std::io::Result<Config> {
         let mut request_overrides = request_overrides.unwrap_or_default();
         // RPC maps have no last-write order, unlike the ordered CLI flags below.
-        // Match build_cli_overrides_layer's literal-dot path splitting: quoting
-        // and escaping do not change which dots are segment separators.
-        let keys = request_overrides.keys().collect::<BTreeSet<_>>();
-        for key in keys {
-            for (separator, _) in key.match_indices('.') {
-                let ancestor = &key[..separator];
-                if request_overrides.contains_key(ancestor) {
+        // Compare parsed paths so quoted dots are literal, and equivalent
+        // spellings cannot bypass the ambiguity check.
+        let mut keys = request_overrides
+            .keys()
+            .map(|key| Ok((key, codex_config::parse_override_key(key)?)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        keys.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (index, (key, path)) in keys.iter().enumerate() {
+            for (ancestor, ancestor_path) in &keys[..index] {
+                if path.starts_with(ancestor_path) || ancestor_path.starts_with(path) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
@@ -638,6 +641,35 @@ mod tests {
             after.permissions.shell_environment_policy.inherit,
             codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rpc_config_rejects_equivalent_quoted_paths_before_loading() -> std::io::Result<()> {
+        let home = TempDir::new()?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        for alias in ["'model'", "\"model\""] {
+            let error = manager
+                .load_with_overrides(
+                    Some(HashMap::from([
+                        ("model".to_string(), serde_json::json!("one")),
+                        (alias.to_string(), serde_json::json!("two")),
+                    ])),
+                    ConfigOverrides {
+                        cwd: Some(home.path().to_path_buf()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("equivalent TOML keys are unordered duplicate assignments");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("ambiguous configuration overrides")
+            );
+            assert_eq!(manager.config_build_count(), 0);
+        }
         Ok(())
     }
 

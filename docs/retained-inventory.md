@@ -31,12 +31,56 @@ tool.
   record, with exact artifact/JSON-pointer or artifact/line-range evidence.
   References are validated and hashed; semantic relevance remains the model's
   responsibility.
+  An inventory reference must select a classified record or an exact evidence
+  link, not just descriptive bookkeeping. Its evidence chain
+  resolves to retained source evidence for the same scope, candidate revision,
+  and classification. Bookkeeping-only references, mismatches, changed evidence
+  digests, cycles, and chains exceeding 64 references are rejected. The new
+  snapshot stores resolved source references, not another bookkeeping link.
+  This mechanical check does not prove semantic support: existence or an
+  enumeration alone cannot establish production runtime use.
+  Unresolved decisions may cite bookkeeping to explain missing evidence, but an
+  unresolved record cannot serve as proof of a resolved classification. A record
+  selected from an inventory page or standalone retained object is subject to
+  the same chain checks as a record selected from a full inventory snapshot.
 - **read** returns bounded pages of candidate facts and record references, with
   counts, an explicit continuation, and unresolved required categories.
+  With `unresolved_only: true`, classified and removed records are skipped.
+  `matching_records`, offsets, and continuation describe that filtered immutable
+  snapshot; `summary` still describes the entire inventory. Continue with the
+  same inventory ID and filter. Classification or refresh returns a new snapshot;
+  restart its filtered pagination at offset zero.
 - **render** writes sorted, deduplicated identifiers and their derived count to
   an exact artifact/file. The document includes the scope, profile,
   classification filter, and unresolved work. The model can link this document
   and explain it without reconstructing the identifier list.
+  `/coverage` retains each category's outcome (`not_enumerated`, `incomplete`,
+  `complete_empty`, or `complete_with_candidates`), required flag, non-removed
+  candidate count, unresolved reason, and enumeration provenance. The receipt's
+  `coverage_source` points to those details without inlining an unbounded report.
+
+An empty filtered report is not necessarily an empty enumeration. Failed,
+interrupted, truncated, or budget-exhausted discovery must remain incomplete,
+with its reason, rather than being imported as a complete empty result. Import
+validates the declared state but cannot certify a producer's claim of coverage.
+
+Update receipts expose `progress`: required categories completed/reopened and
+records resolved/reopened since the input snapshot. A classified record becoming
+stale or unresolved is reopened; removal is not resolution. Combine these
+counters with the existing added/changed/removed change counts and retained
+evidence, not tool-call counts. Repeating an identical classification reports
+zero progress. These are structural state transitions, not a semantic quality
+score or proof that the user's request has been satisfied.
+
+For targeted repair, inspect `/coverage` for missing categories and use bounded
+`read` pages with `unresolved_only: true` for outstanding classifications.
+Resolve only those omissions; do not restart an unchanged enumeration or loop
+until a partial result appears complete. Preserve a truthful partial result if
+the missing evidence cannot be obtained. Before completion, compare scope and
+coverage with the original request and its corrections, not just the model's
+checklist: `summary.complete` covers the declared profile only. The shared base
+instructions own this request-grounded judgment; the tool does not infer an
+arbitrary natural-language task contract or add another task-state store.
 
 The rendered file is the authoritative final enumeration. Deliver its returned
 `rendered_path` as a link when exact identifiers are required. The count and

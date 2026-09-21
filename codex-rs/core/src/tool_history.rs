@@ -290,6 +290,8 @@ impl ToolHistoryCandidate {
         Some(serde_json::json!({
             "version": 1,
             "kind": "tool_history_artifact_pin",
+            "successful": self.successful,
+            "digest": truncate_text_to_token_ceiling(&self.bounded_model_output, RECEIPT_DIGEST_TARGET_TOKENS),
             "artifact_id": self.artifact_id,
             "bytes": self.artifact_bytes,
             "sha256": self.artifact_sha256,
@@ -583,8 +585,13 @@ impl WorkspaceEvidenceObservation {
                 .revision
                 .as_ref()
                 .is_none_or(|identity| !identity.unavailable)
-            && (self.revision.as_ref() == workspace_identity
-                || self.source_paths_are_current(workspace_identity, git_workspace))
+            && if self.source_path_observations.is_empty() {
+                self.revision.as_ref() == workspace_identity
+            } else {
+                // A Git-visible digest can stay unchanged when an ignored input
+                // changes. Never let it override the captured dependency watcher.
+                self.source_paths_are_current(workspace_identity, git_workspace)
+            }
     }
 
     #[cfg(test)]
@@ -1466,6 +1473,15 @@ impl ToolHistoryState {
                     representation: AdmissionRepresentation::ArtifactPin { text: text.clone() },
                     retain_raw_fallback: false,
                 }
+            } else if candidate.consumed_by_generation.is_none()
+                && let Some((text, _)) = artifact_pin
+            {
+                // Let the final budget owner compact/admit unread outcomes and
+                // report explicit overflow if even their receipts cannot fit.
+                AdmissionDecision {
+                    representation: AdmissionRepresentation::ArtifactPin { text: text.clone() },
+                    retain_raw_fallback: false,
+                }
             } else {
                 AdmissionDecision {
                     representation: AdmissionRepresentation::Drop,
@@ -1486,6 +1502,16 @@ impl ToolHistoryState {
             decisions.insert(call_id, decision);
         }
 
+        let unread_outputs = projected
+            .iter()
+            .filter_map(output_call_id)
+            .filter(|id| {
+                self.candidates
+                    .get(*id)
+                    .is_none_or(|candidate| candidate.consumed_by_generation.is_none())
+            })
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
         let mut unreplaced_projected = projected.clone();
         unreplaced_projected.retain(|item| {
             item_call_id(item).is_none_or(|call_id| {
@@ -1640,6 +1666,19 @@ impl ToolHistoryState {
                 replace_model_visible_output_text(body, text.clone());
             }
         }
+        // Admission can remove a pair before aggregate enforcement sees it.
+        // Those unread omissions need the same explicit notice in both forms.
+        for items in [&mut projected, &mut unreplaced_projected] {
+            let retained = items
+                .iter()
+                .filter_map(output_call_id)
+                .collect::<BTreeSet<_>>();
+            let unread_drops = unread_outputs
+                .iter()
+                .filter(|id| !retained.contains(id.as_str()))
+                .count();
+            Self::append_unread_overflow_notice(items, unread_drops);
+        }
         let items_budget_drops = self.enforce_tool_result_budget(&mut projected);
         let unreplaced_items_budget_drops =
             self.enforce_tool_result_budget(&mut unreplaced_projected);
@@ -1651,7 +1690,9 @@ impl ToolHistoryState {
         substitutions.retain_mut(|substitution| {
             if let Some(index) = retained_indices.get(substitution.call_id.as_str()) {
                 substitution.item_index = *index;
-                true
+                canonical_textual_output_identity(&projected[*index]).is_some_and(|(_, output)| {
+                    sha256(output.as_bytes()) == substitution.substituted_output_sha256
+                })
             } else {
                 false
             }
@@ -1662,6 +1703,20 @@ impl ToolHistoryState {
             substitutions: Arc::from(substitutions),
             items_budget_drops,
             unreplaced_items_budget_drops,
+        }
+    }
+
+    fn append_unread_overflow_notice(items: &mut ProjectedResponseItems, unread_drops: usize) {
+        if unread_drops > 0 {
+            items.make_owned().push(ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![codex_protocol::models::ContentItem::InputText { text: format!(
+                    "Tool result budget overflow: {unread_drops} unread outcomes could not fit even as compact receipts. Those outcomes are unresolved. Do not infer success or repeat state-changing operations because their results are absent. Recover retained evidence before claiming completion."
+                ) }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            });
         }
     }
 
@@ -1685,8 +1740,16 @@ impl ToolHistoryState {
                 }
                 // Dispatch failures and running-process receipts can lack a saved artifact.
                 // They still occupy the model prompt and must share its output budget.
-                let priority =
-                    candidate.map_or(1, |candidate| admission_priority(candidate, &output));
+                // Already-observed detail must not evict a newly returned
+                // outcome or continuation handle before its first exposure.
+                let priority = candidate.map_or(1, |candidate| {
+                    admission_priority(candidate, &output)
+                        + if candidate.consumed_by_generation.is_some() {
+                            3
+                        } else {
+                            0
+                        }
+                });
                 candidates.push((
                     priority,
                     std::cmp::Reverse(index),
@@ -1717,6 +1780,40 @@ impl ToolHistoryState {
         {
             return ToolOutputBudgetDrops::default();
         }
+        // Reserve compact outcome information before any large output consumes
+        // the aggregate budget. This also covers failures without an artifact.
+        for (priority, index, call_id, cost) in &mut candidates {
+            let candidate = self.candidates.get(call_id);
+            if candidate.is_some_and(|candidate| candidate.consumed_by_generation.is_some()) {
+                continue;
+            }
+            let item = &items[index.0];
+            if non_text_output_token_cost(item) > 0 {
+                continue;
+            }
+            let Some((_, output)) = canonical_textual_output_identity(item) else {
+                continue;
+            };
+            let receipt = candidate.and_then(ToolHistoryCandidate::artifact_pin)
+                .map(|(text, _)| text).unwrap_or_else(|| serde_json::json!({
+                    "kind": "unconsumed_tool_outcome",
+                    "call_id": call_id,
+                    "successful": response_item_output_success(item),
+                    "digest": truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS),
+                    "control": truncate_text_to_token_ceiling(&output.lines().filter(|line| line.contains("session ID") || line.contains("Session ID") || line.contains("session_id") || line.contains("Exit code")).collect::<Vec<_>>().join("\n"), RECEIPT_DIGEST_TARGET_TOKENS),
+                    "output_omitted": true
+                }).to_string());
+            if response_item_output_success(item) == Some(false) {
+                *priority = 0;
+            }
+            let receipt_cost = approx_token_count(&receipt);
+            if receipt_cost < *cost {
+                if let Some((_, body)) = textual_output_body_mut(&mut items.make_owned()[index.0]) {
+                    replace_model_visible_output_text(body, receipt);
+                    *cost = receipt_cost;
+                }
+            }
+        }
         candidates.sort();
         let mut remaining = model_visible_tool_result_token_budget();
         let mut dropped = BTreeSet::new();
@@ -1731,6 +1828,15 @@ impl ToolHistoryState {
         }
         // Remove complete pairs so transport normalization cannot restore orphaned calls.
         items.retain(|item| item_call_id(item).is_none_or(|id| !dropped.contains(id)));
+        let unread_drops = dropped
+            .iter()
+            .filter(|id| {
+                self.candidates
+                    .get(*id)
+                    .is_none_or(|candidate| candidate.consumed_by_generation.is_none())
+            })
+            .count();
+        Self::append_unread_overflow_notice(items, unread_drops);
         ToolOutputBudgetDrops {
             count: u32::try_from(dropped.len()).unwrap_or(u32::MAX),
             tokens: dropped_tokens,
@@ -1776,22 +1882,42 @@ impl ToolHistoryState {
                         "missing_observation",
                         "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
                     )
-                } else if observation
-                    .is_some_and(|observation| !observation.source_dependencies_current)
-                {
+                } else if observation.is_some_and(|observation| {
+                    !observation.source_dependencies_current
+                        && observation
+                            .revision
+                            .as_ref()
+                            .is_none_or(|identity| !identity.unavailable)
+                }) {
                     (
-                        "source_dependency_changed",
-                        "a source dependency changed after this tool result was captured; rerun the tool before relying on it",
+                        "source_dependencies_invalidated",
+                        "source dependencies were invalidated after capture; this does not establish which dependency changed; obtain or revalidate current evidence before relying on it",
                     )
                 } else if !output_matches {
                     (
                         "output_mismatch",
                         "the tool output does not match its recorded workspace observation; rerun the tool before relying on it",
                     )
-                } else {
+                } else if observation
+                    .and_then(|observation| observation.revision.as_ref())
+                    .is_none_or(|identity| identity.unavailable)
+                    || workspace_identity.is_none_or(|identity| identity.unavailable)
+                {
+                    (
+                        "workspace_identity_unavailable",
+                        "a repository identity is unavailable; freshness is unknown, not proof of a source change; obtain or revalidate current evidence before relying on it",
+                    )
+                } else if observation.and_then(|observation| observation.revision.as_ref())
+                    != workspace_identity
+                {
                     (
                         "workspace_identity_changed",
-                        "the repository identity is unavailable or changed after this tool result was captured; rerun the tool before relying on it",
+                        "the repository identity changed after capture; rerun the evidence-producing read before relying on it",
+                    )
+                } else {
+                    (
+                        "workspace_freshness_unverified",
+                        "matching repository identities do not verify this result's dependencies; obtain or revalidate current evidence before relying on it",
                     )
                 };
                 tracing::debug!(
@@ -1825,7 +1951,9 @@ impl ToolHistoryState {
                 };
                 let mut notice = serde_json::json!({
                     "call_id": call_id,
-                    "rerun": { "force_fresh": true },
+                    "rerun": {
+                        "instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."
+                    },
                     "reason": reason,
                     "reason_code": reason_code,
                     "stale_workspace_evidence": true,
@@ -1842,16 +1970,31 @@ impl ToolHistoryState {
                         truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS)
                     );
                 }
-                if items.iter().any(|item| {
-                    matches!(
-                        item,
-                        ResponseItem::FunctionCall { name, call_id, .. }
-                            if name == "read_file" && call_id == origin_call_id
-                    )
+                if origin_call_id != call_id {
+                    // read_tool_output authenticates retained artifacts before returning
+                    // this bounded excerpt. Freshness controls current proof, not access
+                    // to historical bytes requested explicitly by the model.
+                    notice["historical_output"] = serde_json::json!(output);
+                }
+                if let Some((name, arguments)) = items.iter().find_map(|item| match item {
+                    ResponseItem::FunctionCall {
+                        name,
+                        call_id,
+                        arguments,
+                        ..
+                    } if matches!(name.as_str(), "read_file" | "list_files")
+                        && call_id == origin_call_id =>
+                    {
+                        serde_json::from_str::<serde_json::Value>(arguments)
+                            .ok()
+                            .map(|arguments| (name, arguments))
+                    }
+                    _ => None,
                 }) {
                     notice["rerun"] = serde_json::json!({
-                        "tool": "read_file",
-                        "instruction": "Repeat the original read_file call to read current disk contents; read_tool_output recovers only the old snapshot.",
+                        "tool": name,
+                        "arguments": arguments,
+                        "instruction": "Repeat this read-only call to read current filesystem state; read_tool_output recovers only the old snapshot.",
                     });
                 }
                 if !current_nested_results.is_empty() {
@@ -3095,7 +3238,9 @@ fn json_object_matches_artifact_reference(
         })
 }
 
-fn canonical_textual_output_identity(item: &ResponseItem) -> Option<(&str, Cow<'_, str>)> {
+pub(crate) fn canonical_textual_output_identity(
+    item: &ResponseItem,
+) -> Option<(&str, Cow<'_, str>)> {
     match item {
         ResponseItem::FunctionCallOutput {
             call_id, output, ..
@@ -3290,8 +3435,10 @@ fn receipt_id_for(
 }
 
 fn admission_priority(candidate: &ToolHistoryCandidate, output: &str) -> u8 {
-    if candidate.semantic_class.contains("validation") {
+    if !candidate.successful {
         0
+    } else if candidate.semantic_class.contains("validation") {
+        1
     } else if matches!(
         candidate.semantic_class.as_str(),
         "tool_failure" | "tool_timeout"
@@ -4311,9 +4458,12 @@ fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
                     .collect();
             }
             Some(serde_json::Value::String(command))
-                if !command
-                    .chars()
-                    .any(|ch| matches!(ch, '|' | ';' | '&' | '>' | '<' | '"' | '\'' | '`')) =>
+                if !command.chars().any(|ch| {
+                    matches!(
+                        ch,
+                        '|' | ';' | '&' | '>' | '<' | '"' | '\'' | '`' | '\n' | '\r'
+                    )
+                }) =>
             {
                 return Some(command.split_whitespace().map(str::to_string).collect());
             }

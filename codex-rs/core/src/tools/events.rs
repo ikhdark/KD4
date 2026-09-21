@@ -507,6 +507,10 @@ impl ToolEmitter {
         out: Result<ExecToolCallOutput, ToolError>,
         applied_patch_delta: Option<&AppliedPatchDelta>,
     ) -> Result<String, FunctionCallError> {
+        let execution_summary = match &out {
+            Ok(output) => format!("Command completed with exit code {}.", output.exit_code),
+            Err(_) => "The tool's execution outcome follows.".to_string(),
+        };
         let (event, result) = match out {
             Ok(output) => {
                 let content = self.format_exec_output_for_model(&output, ctx);
@@ -589,13 +593,20 @@ impl ToolEmitter {
                     message: bounded.clone(),
                     applied_patch_delta,
                 });
-                let result = Err(FunctionCallError::DeniedToModel(bounded));
+                let result = Err(FunctionCallError::RespondToModel(bounded));
                 (event, result)
             }
         };
-        self.emit(ctx, event)
-            .await
-            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+        if let Err(error) = self.emit(ctx, event).await {
+            let outcome = match &result {
+                Ok(content) => content.as_str(),
+                Err(FunctionCallError::RespondToModel(content)) => content.as_str(),
+                _ => "The tool outcome was recorded in the completion event.",
+            };
+            return Err(FunctionCallError::Fatal(format!(
+                "{execution_summary} Do not repeat completed effects.\n{outcome}\n\nTool-history persistence failed; continuation stopped because durability is unavailable: {error}"
+            )));
+        }
         result
     }
 
@@ -1084,7 +1095,8 @@ async fn emit_exec_end(
     };
     if let Some(message) = invalidation_warning {
         // A UI warning alone cannot constrain the model's clean-workspace claim.
-        ctx.session
+        let warning_persistence = ctx
+            .session
             .record_conversation_items(
                 ctx.turn,
                 &[codex_protocol::models::ResponseItem::Message {
@@ -1098,6 +1110,9 @@ async fn emit_exec_end(
                 }],
             )
             .await;
+        if persistence_result.is_ok() {
+            persistence_result = warning_persistence.map_err(Into::into);
+        }
         ctx.session
             .send_event(
                 ctx.turn,
@@ -1842,7 +1857,7 @@ mod tests {
             )
             .await
             .expect_err("rejection should be returned to the model");
-        let FunctionCallError::DeniedToModel(model_text) = error else {
+        let FunctionCallError::RespondToModel(model_text) = error else {
             panic!("expected structured model-visible denial");
         };
 
@@ -2490,12 +2505,24 @@ mod tests {
             .expect("begin event should publish");
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            emitter.finish(ctx, Ok(ExecToolCallOutput::default()), delta.as_ref()),
+            emitter.finish(
+                ctx,
+                Ok(ExecToolCallOutput {
+                    aggregated_output: StreamOutput::new("committed outcome marker".to_string()),
+                    ..Default::default()
+                }),
+                delta.as_ref(),
+            ),
         )
         .await
         .expect("permanent persistence failure must finish promptly")
         .expect_err("a successful external mutation must not hide failed durability");
-        assert!(matches!(error, FunctionCallError::Fatal(_)));
+        let FunctionCallError::Fatal(message) = error else {
+            panic!("durability failure must stop safely");
+        };
+        assert!(message.contains("Command completed with exit code 0"));
+        assert!(message.contains("committed outcome marker"));
+        assert!(message.contains("Do not repeat completed effects"));
         assert_eq!(
             tokio::fs::read_to_string(workspace.path().join("changed.txt"))
                 .await

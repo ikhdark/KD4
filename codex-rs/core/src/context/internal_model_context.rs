@@ -1,6 +1,7 @@
 //! Hidden user-context fragment for extension-owned model steering.
 
 use super::ContextualUserFragment;
+use super::escape_fragment_delimiters;
 use std::error::Error;
 use std::fmt;
 
@@ -104,21 +105,31 @@ impl ContextualUserFragment for InternalModelContextFragment {
             return false;
         };
 
-        is_valid_source(source) && body_and_close.ends_with(CONTEXT_END_MARKER)
+        is_valid_source(source)
+            && body_and_close
+                .strip_suffix(CONTEXT_END_MARKER)
+                .is_some_and(|body| {
+                    !body.contains(CONTEXT_START_MARKER) && !body.contains(CONTEXT_END_MARKER)
+                })
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned({
             let source = self.source.as_str();
-            let body = &self.body;
+            let body =
+                escape_fragment_delimiters(&self.body, &[CONTEXT_START_MARKER, CONTEXT_END_MARKER]);
             format!(" source=\"{source}\">\n{body}\n")
         })
     }
 }
 
 fn matches_legacy_goal_context(text: &str) -> bool {
-    text.starts_with(LEGACY_GOAL_CONTEXT_START_MARKER)
-        && text.ends_with(LEGACY_GOAL_CONTEXT_END_MARKER)
+    text.strip_prefix(LEGACY_GOAL_CONTEXT_START_MARKER)
+        .and_then(|body| body.strip_suffix(LEGACY_GOAL_CONTEXT_END_MARKER))
+        .is_some_and(|body| {
+            !body.contains(LEGACY_GOAL_CONTEXT_START_MARKER)
+                && !body.contains(LEGACY_GOAL_CONTEXT_END_MARKER)
+        })
 }
 
 fn is_valid_source(source: &str) -> bool {

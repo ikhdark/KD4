@@ -30,6 +30,8 @@ try:
         _tool_relay_report,
         analyze_startup_timing,
         analyze_timing,
+        TerminalProfiles,
+        timing_profile_error,
     )
     from scripts.kd4_timing_analysis import (
         _token_report as _token_report,
@@ -51,6 +53,8 @@ except ImportError:
         _tool_relay_report,
         analyze_startup_timing,
         analyze_timing,
+        TerminalProfiles,
+        timing_profile_error,
     )
     from kd4_timing_analysis import (
         _token_report as _token_report,
@@ -302,7 +306,8 @@ def _source_discovery_event(
     # Scope/options stay significant because a glob changes the search.
     signature = hashlib.sha256(source.strip().encode("utf-8")).hexdigest()
     evidence_output = re.sub(
-        r"\AScript [^\n]*\nWall time [^\n]*\nOutput:\s*\n?", "",
+        r"\AScript [^\n]*\nWall time [^\n]*\nOutput:\s*\n?",
+        "",
         output.replace("\r\n", "\n"),
     )
     # Execution receipts change on every invocation even when evidence does not.
@@ -312,7 +317,9 @@ def _source_discovery_event(
     evidence_output = re.sub(
         r"\AChunk ID: [^\n]*\nWall time: [^\n]*\n"
         r"(?:Process exited with code [^\n]*|Process running with session ID [^\n]*)\n"
-        r"(?:Final output:\n|Output:\n)", "", evidence_output,
+        r"(?:Final output:\n|Output:\n)",
+        "",
+        evidence_output,
     ).strip()
     return {
         "ordinal": ordinal,
@@ -329,10 +336,12 @@ def _source_discovery_event(
         "evidence": _ordered_unique(evidence),
         "signature": signature,
         "evidenceIdentity": hashlib.sha256(evidence_output.encode("utf-8")).hexdigest(),
-        "outputReduced": bool(re.search(
-            r"Warning: (?:truncated output|output summarized)|\[omitted |\[command output reduced;",
-            evidence_output,
-        )),
+        "outputReduced": bool(
+            re.search(
+                r"Warning: (?:truncated output|output summarized)|\[omitted |\[command output reduced;",
+                evidence_output,
+            )
+        ),
     }
 
 
@@ -354,12 +363,15 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
             search_key = (event.get("turnId"), event["signature"])
             signatures[search_key] += 1
             if last_search.get(search_key, {}).get("outputReduced"):
-                signals.append({
-                    "code": "repeated_search_after_reduced_output",
-                    "turnId": event.get("turnId"), "ordinal": event["ordinal"],
-                    "previousOrdinal": last_search[search_key]["ordinal"],
-                    "causallyEstablished": False,
-                })
+                signals.append(
+                    {
+                        "code": "repeated_search_after_reduced_output",
+                        "turnId": event.get("turnId"),
+                        "ordinal": event["ordinal"],
+                        "previousOrdinal": last_search[search_key]["ordinal"],
+                        "causallyEstablished": False,
+                    }
+                )
             last_search[search_key] = event
             if event["scope"] == "repository":
                 signals.append(
@@ -453,7 +465,9 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
         "omittedEvents": max(0, len(events) - len(bounded_events)),
         "eventCount": len(events),
         "evidenceProgressCount": sum(event["newEvidence"] is True for event in events),
-        "unchangedEvidenceCount": sum(event["newEvidence"] is False for event in events),
+        "unchangedEvidenceCount": sum(
+            event["newEvidence"] is False for event in events
+        ),
         "evidenceProgressScope": "new output for a recognized discovery action within a turn; independent of workspace mutation and not proof that a question was resolved",
         "searchCount": sum("search" in event["operations"] for event in events),
         "readCount": sum("read" in event["operations"] for event in events),
@@ -607,6 +621,8 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
     blockers: list[str] = []
     if coverage["validCompleteProfiles"] == 0:
         blockers.append("no_valid_complete_timing_profile")
+    if coverage.get("invalidProfiles", 0):
+        blockers.append("invalid_or_conflicting_terminal_profiles")
     if coverage["parseErrorCount"]:
         blockers.append("rollout_parse_errors")
     if coverage.get("terminalTurnsWithUnresolvedToolCalls", 0):
@@ -1351,7 +1367,8 @@ def analyze_session_path(
     unresolved_tools_by_turn: dict[str, list[str]] = collections.defaultdict(list)
     terminal_turns: set[str] = set()
     terminal_without_timing: set[str] = set()
-    timed_records: dict[str, dict[str, Any]] = {}
+    terminal_profiles = TerminalProfiles()
+    timed_records = terminal_profiles.records
     duplicate_timed_terminal_events = 0
     parse_error_count = 0
     parse_errors: list[dict[str, Any]] = []
@@ -1621,9 +1638,10 @@ def analyze_session_path(
                 if not isinstance(timing, dict):
                     terminal_without_timing.add(turn_id)
                     continue
-                if turn_id in timed_records:
+                key = (str(file), turn_id)
+                if key in timed_records:
                     duplicate_timed_terminal_events += 1
-                timed_records[turn_id] = record
+                terminal_profiles.add(key, record)
                 schema_versions[str(timing.get("schemaVersion", "missing"))] += 1
         for pending in pending_tool_calls.values():
             pending_turn_id = pending.get("turnId")
@@ -1645,10 +1663,17 @@ def analyze_session_path(
                 execution_loop_counts["singleToolCallSamplingPasses"] += 1
 
     records = list(timed_records.values())
+    for key, record in timed_records.items():
+        record["exclusionReason"] = (
+            "conflicting_terminal_profiles"
+            if key in terminal_profiles.conflicts
+            else timing_profile_error(record["timing"], include_tokens=include_tokens)
+        )
+    timed_turn_ids = {record["turn_id"] for record in records}
     valid = [
         record
         for record in records
-        if record["timing"].get("profileValid") is True
+        if record["exclusionReason"] is None
         and record["timing"].get("classificationComplete") is True
     ]
     populations = {
@@ -1719,7 +1744,7 @@ def analyze_session_path(
                 commands_by_turn[record["turn_id"]],
                 include_tokens=include_tokens,
             )
-            for record in records
+            for record in valid
         ),
         key=lambda turn: turn["inclusiveDurationNs"],
         reverse=True,
@@ -1763,13 +1788,14 @@ def analyze_session_path(
         "duplicateTimedTerminalEvents": duplicate_timed_terminal_events,
         "validCompleteProfiles": len(valid),
         "invalidProfiles": sum(
-            record["timing"].get("profileValid") is not True for record in records
+            record["exclusionReason"] is not None for record in records
         ),
+        "conflictingTerminalProfiles": len(terminal_profiles.conflicts),
         "classificationIncompleteProfiles": sum(
             record["timing"].get("classificationComplete") is not True
             for record in records
         ),
-        "terminalTurnsWithoutTiming": len(terminal_without_timing - set(timed_records)),
+        "terminalTurnsWithoutTiming": len(terminal_without_timing - timed_turn_ids),
         "startedTurnsWithoutTerminal": len(started_turns - terminal_turns),
         "terminalTurnsWithoutStart": len(terminal_turns - started_turns),
         "openTurnStateCounts": dict(sorted(open_turn_state_counts.items())),
@@ -1783,7 +1809,7 @@ def analyze_session_path(
         "omittedTerminalTurnInvariantViolations": max(
             0, len(terminal_invariant_violations) - _MAX_OPEN_TURN_DETAILS
         ),
-        "timedTerminalTurnsWithoutStart": len(set(timed_records) - started_turns),
+        "timedTerminalTurnsWithoutStart": len(timed_turn_ids - started_turns),
         "statusCounts": dict(sorted(status_counts.items())),
         "timingSchemaVersions": dict(sorted(schema_versions.items())),
         "unpairedToolCalls": execution_loop["unpairedToolCalls"],
@@ -1791,6 +1817,7 @@ def analyze_session_path(
             {
                 "turnId": record["turn_id"],
                 "file": record["file"],
+                "reason": record["exclusionReason"],
                 "profileValid": record["timing"].get("profileValid"),
                 "classificationComplete": record["timing"].get(
                     "classificationComplete"
@@ -2225,18 +2252,38 @@ def render_report(report: dict[str, Any]) -> str:
         f"{decision['dominantNs'] / 1e9:.1f}s/{dominant_share_text}; "
         f"codes={','.join(codes) or 'none'}. {decision['instruction']}"
     )
-    runner = report.get("runnerDiagnostics", {})
-    lines.append("runner diagnostics: " + json.dumps(runner, sort_keys=True))
+    runner = bounded_summary(report).get("runnerDiagnostics", {})
+    encoded = json.dumps(runner, sort_keys=True)
+    if len(encoded.encode("utf-8")) > 16384:
+        encoded = json.dumps(
+            {
+                "detailOmitted": True,
+                "reason": "runner diagnostics exceed 16 KiB; use JSON report for full evidence",
+                "failureCount": len(
+                    report.get("runnerDiagnostics", {}).get("failures", [])
+                ),
+            }
+        )
+    lines.append("runner diagnostics: " + encoded)
     return "\n".join(lines)
 
 
 def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
-    token_definitions = {"accountingScope", "promptCategoryScope", "accountingNote",
-                         "billableDefinition", "blendedDefinition", "rankedPromptConsumers"}
+    token_definitions = {
+        "accountingScope",
+        "promptCategoryScope",
+        "accountingNote",
+        "billableDefinition",
+        "blendedDefinition",
+        "rankedPromptConsumers",
+    }
+
     def compact_token_field(key: str, value: Any) -> bool:
         return key not in token_definitions and not (
-            key in {"deduplicatedRequestRecords", "conflictingUsageRequestIds"} and not value
+            key in {"deduplicatedRequestRecords", "conflictingUsageRequestIds"}
+            and not value
         )
+
     coverage = report["coverage"]
     coverage_keys = (
         "files",
@@ -2293,7 +2340,8 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         # Definitions repeat across populations and intervals. Keep them once
         # in the full report; the compact view retains counts and discrepancies.
         bounded_turn["tokens"] = {
-            key: value for key, value in bounded_turn["tokens"].items()
+            key: value
+            for key, value in bounded_turn["tokens"].items()
             if compact_token_field(key, value)
         }
         # Keep category totals once per turn; per-interval category detail and
@@ -2304,9 +2352,14 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "tokens": {
                     key: value
                     for key, value in interval["tokens"].items()
-                    if compact_token_field(key, value) and key not in {
-                        "promptCategories", "promptCategoryAttempts", "promptCategoryEvidence",
-                        "promptCategoryBasis", "promptCategoryCoverage",
+                    if compact_token_field(key, value)
+                    and key
+                    not in {
+                        "promptCategories",
+                        "promptCategoryAttempts",
+                        "promptCategoryEvidence",
+                        "promptCategoryBasis",
+                        "promptCategoryCoverage",
                     }
                 },
             }
@@ -2336,7 +2389,8 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         bounded_population = dict(population)
         if isinstance(bounded_population.get("tokens"), dict):
             bounded_population["tokens"] = {
-                key: value for key, value in bounded_population["tokens"].items()
+                key: value
+                for key, value in bounded_population["tokens"].items()
                 if compact_token_field(key, value)
             }
         for key in (
@@ -2466,9 +2520,14 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 key: value
                 for key, value in report["sourceDiscovery"].items()
                 if key not in ("events", "candidateSignals", "evidenceProgressScope")
-                and not (not report["sourceDiscovery"]["eventCount"] and key in (
-                    "evidenceProgressCount", "unchangedEvidenceCount",
-                ))
+                and not (
+                    not report["sourceDiscovery"]["eventCount"]
+                    and key
+                    in (
+                        "evidenceProgressCount",
+                        "unchangedEvidenceCount",
+                    )
+                )
             },
             "events": [
                 {

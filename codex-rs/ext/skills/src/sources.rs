@@ -177,7 +177,8 @@ impl SkillProviders {
                     if result.resource != request.resource {
                         return Err(SkillProviderError::new(
                             "skill provider returned a different resource",
-                        ));
+                        )
+                        .with_kind(crate::catalog::SkillProviderErrorKind::InvalidResponse));
                     }
                     return Ok(result);
                 }

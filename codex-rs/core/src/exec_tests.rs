@@ -643,13 +643,12 @@ async fn retained_output_truncation_preserves_utf8_at_both_cuts() {
 }
 
 #[test]
-fn full_buffer_capture_policy_disables_caps_and_exec_expiration() {
+fn full_buffer_capture_policy_disables_only_caps() {
     assert_eq!(ExecCapturePolicy::FullBuffer.retained_bytes_cap(), None);
     assert_eq!(
         ExecCapturePolicy::FullBuffer.io_drain_timeout(),
         Duration::from_millis(IO_DRAIN_TIMEOUT_MS)
     );
-    assert!(!ExecCapturePolicy::FullBuffer.uses_expiration());
 }
 
 #[tokio::test]
@@ -674,7 +673,7 @@ async fn combined_exec_cancellation_waits_inline_for_every_source() {
 }
 
 #[tokio::test]
-async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
+async fn exec_full_buffer_capture_honors_expiration() -> Result<()> {
     let command = vec![
         "powershell.exe".to_string(),
         "-NonInteractive".to_string(),
@@ -706,8 +705,8 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(output.stdout.from_utf8_lossy().text.trim(), "hello");
-    assert!(!output.timed_out);
+    assert!(output.timed_out);
+    assert!(!output.stdout.from_utf8_lossy().text.contains("hello"));
 
     Ok(())
 }
@@ -970,7 +969,7 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
             command,
             codex_home: cwd.clone(),
             cwd: cwd.clone(),
-            expiration: 1.into(),
+            expiration: 30_000.into(),
             capture_policy: ExecCapturePolicy::FullBuffer,
             env: std::env::vars().collect(),
             network: None,
@@ -1879,4 +1878,27 @@ fn long_running_command() -> Vec<String> {
         "-Command".to_string(),
         "Start-Sleep -Seconds 30".to_string(),
     ]
+}
+
+#[tokio::test]
+async fn audit_reader_failure_preserves_partial_capture() {
+    let stdout = Arc::new(std::sync::Mutex::new(OutputCapture::new(None)));
+    let stderr = Arc::new(std::sync::Mutex::new(OutputCapture::new(None)));
+    let aggregate = Arc::new(std::sync::Mutex::new(OutputCapture::new(None)));
+    stdout.lock().unwrap().append(b"committed output");
+    aggregate.lock().unwrap().append(b"committed output");
+    let output = await_captured_output_until_deadline(
+        tokio::spawn(async { Err(io::Error::other("injected reader failure")) }),
+        tokio::spawn(async { Ok(()) }),
+        stdout,
+        stderr,
+        Arc::clone(&aggregate),
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .expect("capture failures retain execution evidence");
+    assert!(output.0.truncated);
+    assert!(String::from_utf8_lossy(&output.0.text).contains("committed output"));
+    assert!(String::from_utf8_lossy(&output.0.text).contains("injected reader failure"));
+    assert!(aggregate.lock().unwrap().snapshot().truncated);
 }

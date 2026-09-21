@@ -194,7 +194,8 @@ async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
         .find(|text| text.contains("<model_switch>"))
         .expect("expected model switch message in developer input");
     assert!(
-        model_switch_text.contains("Continue following the session's existing base instructions."),
+        model_switch_text
+            .contains("Use the active instructions and tool declarations in this request."),
         "expected compatibility guidance, got: {model_switch_text:?}"
     );
     assert!(

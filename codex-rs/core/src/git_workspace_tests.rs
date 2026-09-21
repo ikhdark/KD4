@@ -2023,3 +2023,85 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn audit_directory_entries_cannot_certify_workspace_content() {
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir(root.path().join("submodule")).unwrap();
+    std::fs::write(root.path().join("submodule/source"), "dirty contents").unwrap();
+    let result = capture_workspace_metadata(
+        root.path().to_path_buf(),
+        vec![WorkspaceGenerationPath {
+            path: "submodule".into(),
+            deleted: false,
+        }],
+        WorkspaceCaptureControl {
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        },
+    )
+    .await;
+    assert!(
+        result.is_none(),
+        "directory metadata does not cover its contents"
+    );
+}
+
+#[tokio::test]
+async fn audit_unknown_executor_cannot_fall_back_to_host_evidence() {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let identity = cache
+        .workspace_evidence_for_uri(
+            &turn,
+            &PathUri::from_abs_path(&turn.config.cwd),
+            "missing-environment",
+        )
+        .await;
+    assert_eq!(identity, Some(WorkspaceEvidenceIdentity::unavailable(None)));
+}
+
+#[tokio::test]
+async fn audit_excluded_paths_do_not_receive_freshness_observations() {
+    let root = TempDir::new().unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    assert!(
+        cache
+            .begin_source_path_change_observation(
+                root.path(),
+                &root.path().join(".codex/evals/output"),
+                false
+            )
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn audit_source_generation_is_published_after_its_journal_entry() {
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let journal = cache.source_change_journal.lock().unwrap();
+    let before = cache.source_watcher_generation.load(Ordering::Acquire);
+    let writer_cache = Arc::clone(&cache);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        writer_cache.record_filtered_source_change_event(None)
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        cache.source_watcher_generation.load(Ordering::Acquire),
+        before
+    );
+    drop(journal);
+    assert_eq!(writer.join().unwrap(), before + 1);
+    assert_eq!(
+        cache
+            .source_change_journal
+            .lock()
+            .unwrap()
+            .latest_generation,
+        before + 1
+    );
+}

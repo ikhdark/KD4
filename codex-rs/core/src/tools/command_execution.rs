@@ -303,14 +303,14 @@ impl CommandAttemptBlocked {
                     |id| format!("read_tool_output artifact `{id}`"),
                 );
                 format!(
-                    "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, {evidence}); execution was suppressed. Correct the invocation, or use `force_fresh` to retry explicitly.",
+                    "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, {evidence}); execution was suppressed. Correct the invocation before retrying. For current filesystem evidence, use read_file or list_files when available; recovering the original artifact does not refresh it.",
                     prior_failure.proof.outcome_class(),
                     self.fingerprint,
                     prior_failure.exit_code,
                 )
             }
             CommandAttemptBlockedReason::SearchMiss => format!(
-                "Search returned no matches: an equivalent search already produced a negative result under the unchanged repository and execution context (fingerprint `{}`); execution was suppressed. Change the query or scope, or use `force_fresh` when external state changed.",
+                "Search returned no matches: an equivalent search already produced a negative result under the unchanged repository and execution context (fingerprint `{}`); execution was suppressed. Change the query or scope, or use read_file or list_files when available to revalidate current filesystem evidence when external state changed.",
                 self.fingerprint,
             ),
         }
@@ -1870,7 +1870,10 @@ mod tests {
             .begin_attempt(&equivalent, false)
             .await
             .expect_err("equivalent miss should be reused");
-        assert!(blocked.render_for_model().contains("equivalent search"));
+        let message = blocked.render_for_model();
+        assert!(message.contains("equivalent search"));
+        assert!(message.contains("read_file or list_files"));
+        assert!(!message.contains("force_fresh"));
         ledger
             .begin_attempt(&compound, false)
             .await
@@ -2231,7 +2234,9 @@ mod tests {
             .expect_err("the closed production proof blocks an exact retry");
         let message = blocked.render_for_model();
         assert!(message.contains("original output artifact unavailable"));
-        assert!(message.contains("force_fresh"));
+        assert!(!message.contains("force_fresh"));
+        assert!(message.contains("Correct the invocation"));
+        assert!(message.contains("read_file or list_files"));
         assert!(!message.contains("Failed {"));
         ledger
             .begin_attempt(&attempt_key, true)
@@ -2275,7 +2280,8 @@ mod tests {
         let blocked = ledger.begin_attempt(&attempt_key, false).await.unwrap_err();
         let message = blocked.render_for_model();
         assert!(message.contains(&format!("read_tool_output artifact `{artifact_id}`")));
-        assert!(message.contains("force_fresh"));
+        assert!(!message.contains("force_fresh"));
+        assert!(message.contains("does not refresh it"));
         assert!(!message.contains(home.path().to_string_lossy().as_ref()));
         assert!(!message.contains("Stored {"));
     }

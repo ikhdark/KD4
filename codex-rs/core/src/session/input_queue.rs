@@ -53,12 +53,13 @@ pub(crate) struct PendingInputAdmissionError {
 #[derive(Default)]
 pub(crate) struct TurnInputQueue {
     items: Vec<TurnInput>,
+    bytes: usize,
 }
 
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
-    startup_recovery_items: Mutex<VecDeque<TurnInput>>,
+    startup_recovery_items: Mutex<TurnInputQueue>,
     mailbox: Mutex<MailboxState>,
     max_pending_mailbox_communications: usize,
     max_seen_mailbox_communication_ids: usize,
@@ -68,7 +69,8 @@ pub(crate) struct InputQueue {
 
 #[derive(Default)]
 struct MailboxState {
-    pending_mails: VecDeque<InterAgentCommunication>,
+    pending_mails: VecDeque<(InterAgentCommunication, usize)>,
+    bytes: usize,
     seen_communication_ids: HashSet<codex_protocol::ResponseItemId>,
     seen_communication_id_order: VecDeque<codex_protocol::ResponseItemId>,
 }
@@ -78,7 +80,7 @@ impl InputQueue {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
             activity_tx,
-            startup_recovery_items: Mutex::new(VecDeque::new()),
+            startup_recovery_items: Mutex::new(TurnInputQueue::default()),
             mailbox: Mutex::new(MailboxState::default()),
             max_pending_mailbox_communications: MAX_PENDING_MAILBOX_COMMUNICATIONS,
             max_seen_mailbox_communication_ids: MAX_SEEN_MAILBOX_COMMUNICATION_IDS,
@@ -169,6 +171,7 @@ impl InputQueue {
         &self,
         communication: InterAgentCommunication,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
+        let bytes = serialized_size(&communication);
         let mut mailbox = self.mailbox.lock().await;
         if communication
             .id
@@ -177,10 +180,12 @@ impl InputQueue {
         {
             return Ok(false);
         }
-        if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications {
+        if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications
+            || mailbox.bytes.saturating_add(bytes) > self.max_pending_turn_input_bytes
+        {
             return Err(codex_protocol::error::CodexErr::InvalidRequest(format!(
-                "session mailbox is full ({} pending messages); retry after messages are consumed",
-                self.max_pending_mailbox_communications
+                "session mailbox is full ({} messages or {} bytes); retry after messages are consumed",
+                self.max_pending_mailbox_communications, self.max_pending_turn_input_bytes
             )));
         }
         if let Some(id) = communication.id.as_ref() {
@@ -188,7 +193,8 @@ impl InputQueue {
             mailbox.seen_communication_id_order.push_back(id.clone());
             compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
         }
-        mailbox.pending_mails.push_back(communication);
+        mailbox.bytes += bytes;
+        mailbox.pending_mails.push_back((communication, bytes));
         drop(mailbox);
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
         Ok(true)
@@ -237,6 +243,7 @@ impl InputQueue {
         clippy::await_holding_invalid_type,
         reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
     )]
+    #[cfg(test)]
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
         let recovered = self.startup_recovery_items.lock().await;
         recovered.iter().any(
@@ -247,7 +254,7 @@ impl InputQueue {
             .await
             .pending_mails
             .iter()
-            .any(|mail| mail.trigger_turn)
+            .any(|(mail, _)| mail.trigger_turn)
     }
 
     /// Whether recovered input should start a new turn once the current turn releases its
@@ -273,7 +280,7 @@ impl InputQueue {
             .await
             .pending_mails
             .iter()
-            .any(|mail| mail.trigger_turn)
+            .any(|(mail, _)| mail.trigger_turn)
     }
 
     /// Restores already-admitted input owned by a taskless startup placeholder
@@ -283,8 +290,8 @@ impl InputQueue {
         if input.is_empty() {
             return;
         }
+        let mut restored = TurnInputQueue::from_items(input);
         let mut recovered = self.startup_recovery_items.lock().await;
-        let mut restored = VecDeque::from(input);
         restored.append(&mut recovered);
         *recovered = restored;
         let activity = if recovered.iter().any(TurnInput::is_steering_input) {
@@ -321,7 +328,7 @@ impl InputQueue {
     pub(crate) async fn clear_pending_for_turn_state(&self, turn_state: &Mutex<TurnState>) {
         let mut turn_state = turn_state.lock().await;
         turn_state.clear_pending_waiters();
-        turn_state.pending_input.items.clear();
+        turn_state.pending_input = TurnInputQueue::default();
     }
 
     pub(crate) async fn defer_mailbox_delivery_to_next_turn(
@@ -377,19 +384,25 @@ impl InputQueue {
         input: &[TurnInput],
         commit_context: impl FnOnce(),
     ) -> Result<(), PendingInputAdmissionError> {
+        let bytes = input
+            .iter()
+            .map(turn_input_size_bytes)
+            .fold(0usize, usize::saturating_add);
         {
             let recovered = self.startup_recovery_items.lock().await;
             let mut turn_state = turn_state.lock().await;
             self.check_pending_turn_input_capacity(
-                recovered.iter(),
-                turn_state.pending_input.items.iter(),
-                input,
+                &recovered,
+                &turn_state.pending_input,
+                input.len(),
+                bytes,
             )?;
             // All fallible admission checks are complete. The caller already
             // holds its context guards; commit them without another await before
             // publishing input or waking its consumers.
             commit_context();
             turn_state.pending_input.items.extend_from_slice(input);
+            turn_state.pending_input.bytes += bytes;
             turn_state.accept_mailbox_delivery_for_current_turn();
         }
         self.activity_tx.send_replace(InputQueueActivity::Steer);
@@ -403,14 +416,20 @@ impl InputQueue {
         turn_state: &Mutex<TurnState>,
         input: &[TurnInput],
     ) -> Result<(), PendingInputAdmissionError> {
+        let bytes = input
+            .iter()
+            .map(turn_input_size_bytes)
+            .fold(0usize, usize::saturating_add);
         let recovered = self.startup_recovery_items.lock().await;
         let mut turn_state = turn_state.lock().await;
         self.check_pending_turn_input_capacity(
-            recovered.iter(),
-            turn_state.pending_input.items.iter(),
-            input,
+            &recovered,
+            &turn_state.pending_input,
+            input.len(),
+            bytes,
         )?;
         turn_state.pending_input.items.extend_from_slice(input);
+        turn_state.pending_input.bytes += bytes;
         Ok(())
     }
 
@@ -456,34 +475,119 @@ impl InputQueue {
 
         // Keep accepted items in their owning queues until every lock is held.
         // No cancellation point may separate removal from destination insertion.
-        let mut input: Vec<TurnInput> = recovered.drain(..).collect();
-        input.append(&mut turn_state.pending_input.items);
+        let mut input = std::mem::take(&mut *recovered);
+        input.append(&mut turn_state.pending_input);
         if let Some(mailbox) = mailbox.as_mut() {
-            input.extend(
-                mailbox
-                    .pending_mails
-                    .drain(..)
-                    .map(TurnInput::InterAgentCommunication),
-            );
+            self.transfer_mailbox_prefix(mailbox, &mut input);
         }
-        turn_state.pending_input.items = input;
+        turn_state.pending_input = input;
         true
     }
 
-    fn check_pending_turn_input_capacity<'a>(
-        &self,
-        recovered: impl Iterator<Item = &'a TurnInput>,
-        active: impl Iterator<Item = &'a TurnInput>,
-        input: &[TurnInput],
-    ) -> Result<(), PendingInputAdmissionError> {
-        let mut item_count = input.len();
-        let mut byte_count = input.iter().fold(0usize, |total, item| {
-            total.saturating_add(turn_input_size_bytes(item))
-        });
-        for item in recovered.chain(active) {
-            item_count = item_count.saturating_add(1);
-            byte_count = byte_count.saturating_add(turn_input_size_bytes(item));
+    fn transfer_mailbox_prefix(&self, mailbox: &mut MailboxState, input: &mut TurnInputQueue) {
+        while let Some((_, bytes)) = mailbox.pending_mails.front() {
+            if input.items.len() >= self.max_pending_turn_input_items
+                || input.bytes.saturating_add(*bytes) > self.max_pending_turn_input_bytes
+            {
+                break;
+            }
+            let (mail, bytes) = mailbox.pending_mails.pop_front().expect("front exists");
+            mailbox.bytes -= bytes;
+            input.bytes += bytes;
+            input.items.push(TurnInput::InterAgentCommunication(mail));
         }
+    }
+
+    /// Takes already-ready mail for an initial user request, leaving later
+    /// steering and recovered user work in their owning queues.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Acquire all owners before moving accepted mail"
+    )]
+    pub(crate) async fn take_mailbox_for_initial_input(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        initial_input: &[TurnInput],
+    ) -> Vec<TurnInput> {
+        let mut output = TurnInputQueue {
+            items: Vec::new(),
+            bytes: initial_input
+                .iter()
+                .map(turn_input_size_bytes)
+                .fold(0usize, usize::saturating_add),
+        };
+        let active = active_turn.lock().await;
+        let mut recovered = self.startup_recovery_items.lock().await;
+        let mut turn = match active.as_ref() {
+            Some(turn) => Some(turn.turn_state.lock().await),
+            None => None,
+        };
+        if turn
+            .as_ref()
+            .is_some_and(|turn| !turn.accepts_mailbox_delivery_for_current_turn())
+        {
+            return Vec::new();
+        }
+        let mut mailbox = self.mailbox.lock().await;
+        let take_owned_mail = |source: &mut TurnInputQueue, output: &mut TurnInputQueue| {
+            let mut index = 0;
+            while index < source.items.len() {
+                if !matches!(source.items[index], TurnInput::InterAgentCommunication(_)) {
+                    index += 1;
+                    continue;
+                }
+                let bytes = turn_input_size_bytes(&source.items[index]);
+                if initial_input.len().saturating_add(output.items.len())
+                    >= self.max_pending_turn_input_items
+                    || output.bytes.saturating_add(bytes) > self.max_pending_turn_input_bytes
+                {
+                    return false;
+                }
+                output.items.push(source.items.remove(index));
+                source.bytes -= bytes;
+                output.bytes += bytes;
+            }
+            true
+        };
+        if !take_owned_mail(&mut recovered, &mut output) {
+            return output.items;
+        }
+        if let Some(turn) = turn.as_mut()
+            && !take_owned_mail(&mut turn.pending_input, &mut output)
+        {
+            return output.items;
+        }
+        while let Some((_, bytes)) = mailbox.pending_mails.front() {
+            if initial_input.len().saturating_add(output.items.len())
+                >= self.max_pending_turn_input_items
+                || output.bytes.saturating_add(*bytes) > self.max_pending_turn_input_bytes
+            {
+                break;
+            }
+            let (mail, bytes) = mailbox.pending_mails.pop_front().expect("front exists");
+            mailbox.bytes -= bytes;
+            output.bytes += bytes;
+            output.items.push(TurnInput::InterAgentCommunication(mail));
+        }
+        output.items
+    }
+
+    fn check_pending_turn_input_capacity(
+        &self,
+        recovered: &TurnInputQueue,
+        active: &TurnInputQueue,
+        incoming_items: usize,
+        incoming_bytes: usize,
+    ) -> Result<(), PendingInputAdmissionError> {
+        let item_count = recovered
+            .items
+            .len()
+            .saturating_add(active.items.len())
+            .saturating_add(incoming_items);
+        let byte_count = recovered
+            .bytes
+            .saturating_add(active.bytes)
+            .saturating_add(incoming_bytes);
         if item_count > self.max_pending_turn_input_items
             || byte_count > self.max_pending_turn_input_bytes
         {
@@ -500,7 +604,7 @@ impl InputQueue {
         &self,
         turn_state: &Mutex<TurnState>,
     ) -> Vec<TurnInput> {
-        turn_state.lock().await.pending_input.items.split_off(0)
+        std::mem::take(&mut turn_state.lock().await.pending_input).items
     }
 
     #[expect(
@@ -514,7 +618,7 @@ impl InputQueue {
         let mut recovered = self.startup_recovery_items.lock().await;
         let mut turn_state = turn_state.lock().await;
         let has_input = !turn_state.pending_input.items.is_empty();
-        recovered.extend(turn_state.pending_input.items.drain(..));
+        recovered.append(&mut turn_state.pending_input);
         has_input
     }
 
@@ -544,19 +648,14 @@ impl InputQueue {
             None
         };
 
-        let mut input: Vec<TurnInput> = recovered.drain(..).collect();
+        let mut input = std::mem::take(&mut *recovered);
         if let Some(turn_state) = turn_state.as_mut() {
-            input.append(&mut turn_state.pending_input.items);
+            input.append(&mut turn_state.pending_input);
         }
         if let Some(mailbox) = mailbox.as_mut() {
-            input.extend(
-                mailbox
-                    .pending_mails
-                    .drain(..)
-                    .map(TurnInput::InterAgentCommunication),
-            );
+            self.transfer_mailbox_prefix(mailbox, &mut input);
         }
-        input
+        input.items
     }
 
     #[expect(
@@ -609,7 +708,12 @@ fn compact_seen_mailbox_ids(mailbox: &mut MailboxState, max_seen_ids: usize) {
     }
 }
 
+#[cfg(test)]
+thread_local! { static INPUT_SIZE_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn turn_input_size_bytes(input: &TurnInput) -> usize {
+    #[cfg(test)]
+    INPUT_SIZE_MEASUREMENTS.with(|count| count.set(count.get() + 1));
     match input {
         TurnInput::UserInput { content, client_id } => serialized_size(&(content, client_id)),
         TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
@@ -641,6 +745,33 @@ impl io::Write for ByteCounter {
 }
 
 impl TurnInputQueue {
+    fn from_items(items: Vec<TurnInput>) -> Self {
+        let bytes = items
+            .iter()
+            .map(turn_input_size_bytes)
+            .fold(0usize, usize::saturating_add);
+        Self { items, bytes }
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        self.bytes = self.bytes.saturating_add(std::mem::take(&mut other.bytes));
+        self.items.append(&mut other.items);
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, TurnInput> {
+        self.items.iter()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[cfg(test)]
+    fn front(&self) -> Option<&TurnInput> {
+        self.items.first()
+    }
+
     fn has_steering_input(&self) -> bool {
         self.items.iter().any(TurnInput::is_steering_input)
     }
@@ -662,6 +793,34 @@ mod tests {
     use codex_protocol::AgentPath;
     use pretty_assertions::assert_eq;
 
+    #[tokio::test]
+    async fn admission_measures_only_new_input_not_the_existing_queue() {
+        let queue = InputQueue::new();
+        let turn = Mutex::new(TurnState::default());
+        let input = TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "large existing input".repeat(1024),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        };
+        queue
+            .extend_pending_input_for_turn_state(&turn, &vec![input.clone(); 32])
+            .await
+            .unwrap();
+        INPUT_SIZE_MEASUREMENTS.set(0);
+        queue
+            .extend_pending_input_for_turn_state(&turn, std::slice::from_ref(&input))
+            .await
+            .unwrap();
+        assert_eq!(
+            INPUT_SIZE_MEASUREMENTS.get(),
+            1,
+            "admission must not serialize the 32 retained items again"
+        );
+        assert_eq!(turn.lock().await.pending_input.items.len(), 33);
+    }
+
     fn make_mail(
         author: AgentPath,
         recipient: AgentPath,
@@ -675,6 +834,82 @@ mod tests {
             content.to_string(),
             trigger_turn,
         )
+    }
+
+    #[tokio::test]
+    async fn initial_mailbox_respects_capacity_and_leaves_steering_owned() {
+        let queue = InputQueue::with_pending_turn_input_limits(3, usize::MAX);
+        let turn = ActiveTurn::default();
+        let turn_state = Arc::clone(&turn.turn_state);
+        let active = Mutex::new(Some(turn));
+        let user = |text: &str| TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        };
+        let mail = |text| {
+            make_mail(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").unwrap(),
+                text,
+                false,
+            )
+        };
+        let recovered = mail("recovered");
+        let pending = mail("pending");
+        let queued = mail("mailbox");
+        queue
+            .restore_transferred_startup_input(vec![
+                user("recovered user"),
+                TurnInput::InterAgentCommunication(recovered.clone()),
+            ])
+            .await;
+        // Seed already-owned inputs to exercise extraction independently of admission.
+        turn_state.lock().await.pending_input = TurnInputQueue::from_items(vec![
+            user("steer"),
+            TurnInput::InterAgentCommunication(pending.clone()),
+        ]);
+        queue
+            .enqueue_mailbox_communication(queued.clone())
+            .await
+            .unwrap();
+        let first = queue
+            .take_mailbox_for_initial_input(&active, &[user("fresh")])
+            .await;
+        assert_eq!(
+            first,
+            vec![
+                TurnInput::InterAgentCommunication(recovered),
+                TurnInput::InterAgentCommunication(pending)
+            ]
+        );
+        assert_eq!(
+            queue.startup_recovery_items.lock().await.items,
+            vec![user("recovered user")]
+        );
+        assert_eq!(
+            turn_state.lock().await.pending_input.items,
+            vec![user("steer")]
+        );
+        assert!(queue.has_pending_mailbox_items().await);
+        assert_eq!(
+            queue
+                .take_mailbox_for_initial_input(&active, &[user("fresh")])
+                .await,
+            vec![TurnInput::InterAgentCommunication(queued)]
+        );
+        assert!(!queue.has_pending_mailbox_items().await);
+        let recovered = queue.startup_recovery_items.lock().await;
+        assert_eq!(
+            recovered.bytes,
+            turn_input_size_bytes(&user("recovered user"))
+        );
+        assert_eq!(
+            turn_state.lock().await.pending_input.bytes,
+            turn_input_size_bytes(&user("steer"))
+        );
     }
 
     #[tokio::test]
@@ -1438,5 +1673,130 @@ mod tests {
                 max_bytes: input_size,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn mailbox_bytes_bound_admission_and_fifo_transfer_without_poisoning_retry() {
+        let mail = |text: &str| make_mail(AgentPath::root(), AgentPath::root(), text, false);
+        let first = mail("first");
+        let mut second = mail("second");
+        second.id = Some(codex_protocol::ResponseItemId::from_server(
+            "retry-byte-limit".to_string(),
+        ));
+        let budget = serialized_size(&first) + serialized_size(&second);
+        let queue = InputQueue::with_pending_turn_input_limits(10, budget);
+        let turn = ActiveTurn::default();
+        let turn_state = Arc::clone(&turn.turn_state);
+        let active = Mutex::new(Some(turn));
+        let steering = TurnInput::ResponseItem(ResponseItem::Other);
+        queue
+            .extend_pending_input_for_turn_state(&turn_state, std::slice::from_ref(&steering))
+            .await
+            .unwrap();
+        queue
+            .enqueue_mailbox_communication(first.clone())
+            .await
+            .unwrap();
+        queue
+            .enqueue_mailbox_communication(second.clone())
+            .await
+            .unwrap();
+        let mut retry = mail("retry");
+        retry.id = Some(codex_protocol::ResponseItemId::from_server(
+            "rejected-mail".to_string(),
+        ));
+        assert!(
+            queue
+                .enqueue_mailbox_communication(retry.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            queue
+                .transfer_pending_input_to_turn_state(&active, &turn_state)
+                .await
+        );
+        {
+            let state = turn_state.lock().await;
+            assert_eq!(
+                state.pending_input.items,
+                vec![
+                    steering.clone(),
+                    TurnInput::InterAgentCommunication(first.clone())
+                ]
+            );
+            assert_eq!(
+                state.pending_input.bytes,
+                state
+                    .pending_input
+                    .items
+                    .iter()
+                    .map(turn_input_size_bytes)
+                    .sum::<usize>()
+            );
+        }
+        assert_eq!(queue.mailbox.lock().await.bytes, serialized_size(&second));
+        assert_eq!(
+            queue.get_pending_input(&active).await,
+            vec![steering, TurnInput::InterAgentCommunication(first)]
+        );
+        assert_eq!(
+            queue.get_pending_input(&active).await,
+            vec![TurnInput::InterAgentCommunication(second)]
+        );
+        assert_eq!(queue.mailbox.lock().await.bytes, 0);
+        assert!(queue.enqueue_mailbox_communication(retry).await.unwrap());
+        assert!(
+            queue
+                .enqueue_mailbox_communication(mail(&"x".repeat(budget)))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_bytes_follow_recovery_transfer_drain_and_clear() {
+        let queue = InputQueue::new();
+        let turn = ActiveTurn::default();
+        let turn_state = Arc::clone(&turn.turn_state);
+        let active = Mutex::new(Some(turn));
+        let input = TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "escaped \"quotes\"\n\\ unicode cafÃ©".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: Some("client".to_string()),
+        };
+        let expected = match &input {
+            TurnInput::UserInput { content, client_id } => {
+                serde_json::to_vec(&(content, client_id)).unwrap().len()
+            }
+            _ => unreachable!(),
+        };
+        queue
+            .extend_pending_input_for_turn_state(&turn_state, std::slice::from_ref(&input))
+            .await
+            .unwrap();
+        assert_eq!(turn_state.lock().await.pending_input.bytes, expected);
+        queue
+            .recover_pending_input_for_turn_state(&turn_state)
+            .await;
+        assert_eq!(turn_state.lock().await.pending_input.bytes, 0);
+        assert_eq!(queue.startup_recovery_items.lock().await.bytes, expected);
+        assert!(
+            queue
+                .transfer_pending_input_to_turn_state(&active, &turn_state)
+                .await
+        );
+        assert_eq!(turn_state.lock().await.pending_input.bytes, expected);
+        assert_eq!(queue.startup_recovery_items.lock().await.bytes, 0);
+        assert_eq!(queue.get_pending_input(&active).await, vec![input.clone()]);
+        assert_eq!(turn_state.lock().await.pending_input.bytes, 0);
+        queue
+            .extend_pending_input_for_turn_state(&turn_state, &[input])
+            .await
+            .unwrap();
+        queue.clear_pending_for_turn_state(&turn_state).await;
+        assert_eq!(turn_state.lock().await.pending_input.bytes, 0);
     }
 }

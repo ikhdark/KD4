@@ -62,6 +62,43 @@ def timing_profile_valid(timing: Any) -> bool:
     return isinstance(timing, dict) and timing.get("profileValid") is True
 
 
+def timing_profile_error(timing: Any, *, include_tokens: bool = True) -> str | None:
+    if not timing_profile_valid(timing):
+        return "profile_invalid"
+    if (
+        type(timing.get("inclusiveDurationNs")) is not int
+        or timing["inclusiveDurationNs"] < 0
+    ):
+        return "invalid_inclusive_duration"
+    try:
+        analyze_timing(timing, include_tokens=include_tokens)
+    except (TypeError, ValueError, KeyError, OverflowError, AttributeError):
+        return "malformed_timing_fields"
+    return None
+
+
+class TerminalProfiles:
+    """Frozen terminal evidence; conflicting versions never select a winner."""
+
+    def __init__(self):
+        self.records = {}
+        self.conflicts = set()
+        self.duplicates = 0
+
+    def add(self, key, record):
+        if key in self.records:
+            old = self.records[key]
+            if (old["timing"], old.get("status")) == (
+                record["timing"],
+                record.get("status"),
+            ):
+                self.duplicates += 1
+            else:
+                self.conflicts.add(key)
+            return
+        self.records[key] = record
+
+
 def analyze_startup_timing(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Analyze frozen startup trace fields, independently of terminal turn timing."""
     duration_fields = {
@@ -354,7 +391,9 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
     conflicting_usage: set[str] = set()
     for request in requests:
         request_id = request.get("samplingRequestId")
-        scope = json.dumps(request.get("_turnKey", request.get("_turnId")), sort_keys=True)
+        scope = json.dumps(
+            request.get("_turnKey", request.get("_turnId")), sort_keys=True
+        )
         if not isinstance(request_id, str) or not request_id:
             # Missing identity is missing evidence, not permission to merge
             # independent requests that happen to have identical token counts.
@@ -368,9 +407,11 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
         duplicate_records += 1
         index = identified[identity]
         previous = request_list[index]
-        if (previous.get("tokenUsage") is not None
-                and request.get("tokenUsage") is not None
-                and previous["tokenUsage"] != request["tokenUsage"]):
+        if (
+            previous.get("tokenUsage") is not None
+            and request.get("tokenUsage") is not None
+            and previous["tokenUsage"] != request["tokenUsage"]
+        ):
             conflicting_usage.add(request_id)
         # A later snapshot may supply usage that an earlier one lacked.
         if request.get("tokenUsage") is not None:
@@ -460,7 +501,8 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
     observed_billable_tokens = totals["inputTokens"] + totals["outputTokens"]
     input_tokens = totals["inputTokens"]
     usage_complete = (
-        physical_attempts > 0 and covered_attempts == physical_attempts
+        physical_attempts > 0
+        and covered_attempts == physical_attempts
         and not conflicting_usage
     )
     return {
@@ -1088,7 +1130,9 @@ def _population_report(
         local = timing.get("local", {})
         counters = timing.get("counters", {})
         requests = _selected_requests(timing)
-        all_requests.extend({**request, "_turnId": record["turn_id"]} for request in requests)
+        all_requests.extend(
+            {**request, "_turnId": record["turn_id"]} for request in requests
+        )
         all_tool_calls.extend(
             {
                 **call,
@@ -1547,6 +1591,7 @@ def analyze_runner_evidence(
     if not isinstance(events, list) or any(not isinstance(row, dict) for row in events):
         raise ValueError("runner evidence events must be objects")
     profiles: dict[tuple[str | None, str], dict[str, Any]] = {}
+    terminal_profiles = TerminalProfiles()
     pending: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     calls: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     failures: list[dict[str, Any]] = []
@@ -1624,13 +1669,18 @@ def analyze_runner_evidence(
                 )
         timing = params.get("timing", turn.get("timing"))
         if isinstance(timing, dict):
-            profiles[turn_key] = {
+            record = {
                 "timing": timing,
                 "turn_id": active_turn,
                 "thread_id": thread_id,
                 "status": terminal.get(turn_key, "unfinished"),
                 "eventIndex": index,
             }
+            if turn_key in terminal:
+                terminal_profiles.add(turn_key, record)
+                profiles[turn_key] = terminal_profiles.records[turn_key]
+            elif turn_key not in terminal_profiles.records:
+                profiles[turn_key] = record
         if include_tokens and method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage", {})
             if isinstance(usage, dict):
@@ -1796,6 +1846,18 @@ def analyze_runner_evidence(
                 "evidence": verifier,
             }
         )
+    native_profile_count = len(profiles)
+    for key, record in list(profiles.items()):
+        reason = (
+            "conflicting_terminal_profiles"
+            if key in terminal_profiles.conflicts
+            else timing_profile_error(record["timing"], include_tokens=include_tokens)
+        )
+        record["exclusionReason"] = reason
+        if reason:
+            failures.append({"kind": reason, "turnId": key[1], "threadId": key[0]})
+            if reason not in {"profile_invalid", "invalid_inclusive_duration"}:
+                del profiles[key]
     # Preserve legacy labels for unique turn IDs; qualify all labels when threads
     # reuse an ID so compatibility fields cannot silently overwrite a thread.
     turn_keys = set(profiles) | set(terminal)
@@ -1807,7 +1869,7 @@ def analyze_runner_evidence(
     valid_profiles = [
         record
         for record in profiles.values()
-        if timing_profile_valid(record["timing"])
+        if record["exclusionReason"] is None
         and record["timing"].get("classificationComplete") is True
     ]
     runtime_profiles = [
@@ -2114,7 +2176,7 @@ def analyze_runner_evidence(
         },
         "coverage": {
             "events": len(events),
-            "nativeTimingProfiles": len(profiles),
+            "nativeTimingProfiles": native_profile_count,
             "validCompleteTimingProfiles": len(valid_profiles),
             "terminalTurns": len(terminal),
             "tokenAnalysisEnabled": include_tokens,

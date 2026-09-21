@@ -108,7 +108,7 @@ fn read_file_workspace_evidence_tracks_paths_and_preserves_skill_reads() {
     let stale = state.project_with_workspace_identity(canonical, Some(&captured));
     let (_, text) = textual_output_identity(&stale.items[1]).unwrap();
     let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(notice["reason_code"], "source_dependency_changed");
+    assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
     assert_eq!(notice["rerun"]["tool"], "read_file");
     assert!(notice["rerun"].get("force_fresh").is_none());
 
@@ -463,7 +463,13 @@ fn workspace_evidence_remains_visible_only_for_its_captured_revision() {
         notice["current_revision"],
         serde_json::to_value(&changed).unwrap()
     );
-    assert_eq!(notice["rerun"]["force_fresh"], true);
+    assert!(notice["rerun"].get("force_fresh").is_none());
+    assert!(
+        notice["rerun"]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("supported arguments")
+    );
     assert_eq!(
         notice["if_rerun_unavailable"],
         "Report the affected claim as unverified; this result does not validate the current workspace."
@@ -512,6 +518,53 @@ fn completed_command_evidence_uses_the_post_execution_revision() {
     let stale = state.project_with_workspace_identity(canonical, Some(&before));
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
     assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+}
+
+#[test]
+fn workspace_freshness_notice_distinguishes_unknown_from_changed_identity() {
+    let call_id = "freshness-reasons";
+    let captured = workspace_identity("captured");
+    let changed = workspace_identity("changed");
+    let unavailable = WorkspaceEvidenceIdentity {
+        unavailable: true,
+        ..captured.clone()
+    };
+    let output = text_output(call_id, "source evidence".to_string());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
+    for (observed, current, expected) in [
+        (
+            Some(captured.clone()),
+            None,
+            "workspace_identity_unavailable",
+        ),
+        (
+            Some(unavailable.clone()),
+            Some(&captured),
+            "workspace_identity_unavailable",
+        ),
+        (
+            Some(captured.clone()),
+            Some(&unavailable),
+            "workspace_identity_unavailable",
+        ),
+        (
+            Some(captured.clone()),
+            Some(&changed),
+            "workspace_identity_changed",
+        ),
+    ] {
+        let mut state = ToolHistoryState::default();
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(observed, &output, BTreeSet::new())
+                .unwrap(),
+        );
+        let projected = state.project_with_workspace_identity(Arc::clone(&canonical), current);
+        let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
+        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(notice["reason_code"], expected);
+        assert_eq!(notice["valid_for_current_workspace"], false);
+        assert!(notice["rerun"].get("force_fresh").is_none());
+    }
 }
 
 #[test]
@@ -600,7 +653,7 @@ fn workspace_evidence_output_mismatch_does_not_claim_the_repository_changed() {
     let notice: serde_json::Value = serde_json::from_str(output).expect("freshness notice");
     assert_eq!(notice["stale_workspace_evidence"], true);
     assert_eq!(notice["reason_code"], "output_mismatch");
-    assert_eq!(notice["rerun"]["force_fresh"], true);
+    assert!(notice["rerun"].get("force_fresh").is_none());
     assert_eq!(
         notice["reason"],
         "the tool output does not match its recorded workspace observation; rerun the tool before relying on it"
@@ -641,7 +694,12 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
     let (_, output) = textual_output_identity(&projection.items[1]).expect("stale recovery");
     assert!(output.contains("\"stale_workspace_evidence\":true"));
     let notice: serde_json::Value = serde_json::from_str(output).unwrap();
-    assert!(notice.get("historical_digest").is_none());
+    assert_eq!(notice["historical_output"], "old file contents");
+    assert_eq!(notice["valid_for_current_workspace"], false);
+    assert!(
+        !state.workspace_evidence[origin_call_id]
+            .is_current(Some(&workspace_identity("changed")), None)
+    );
 }
 
 #[test]
@@ -671,13 +729,13 @@ fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
         state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after_unrelated));
     assert_eq!(unrelated.items, canonical);
 
-    assert!(state.invalidate_source_dependencies(
-        Some(&BTreeSet::from([foo])),
-        Some(&workspace_identity("after-overlap")),
-    ));
-    let stale = state.project_with_workspace_identity(canonical, Some(&after_unrelated));
+    let after_overlap = workspace_identity("after-overlap");
+    assert!(
+        state.invalidate_source_dependencies(Some(&BTreeSet::from([foo])), Some(&after_overlap),)
+    );
+    let stale = state.project_with_workspace_identity(canonical, Some(&after_overlap));
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("a source dependency changed"));
+    assert!(stale_output.contains("source dependencies were invalidated after capture"));
 }
 
 #[test]
@@ -730,7 +788,6 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
     let call_id = "stale-search";
     let dependency = PathBuf::from("/repo/src/foo.rs");
     let arguments = serde_json::json!({
-        "kind": "argv",
         "program": "rg",
         "args": ["needle", "src/foo.rs"]
     });
@@ -775,7 +832,7 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
     let attempt_key = CommandAttemptKey::new("exec_command", "local", "/repo", &command)
         .with_repository_epoch(1)
         .with_workspace_identity(Some("workspace-a"))
-        .with_search_narrowing("turn-a", "repo-a", Some(search));
+        .with_search_narrowing("turn-a", "repo-a", Some(search.clone()));
     let ledger = CommandExecutionLedger::default();
     ledger
         .begin_attempt_with_freshness(&attempt_key, false, false)
@@ -810,13 +867,25 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
     );
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
     let notice: serde_json::Value = serde_json::from_str(stale_output).expect("stale notice");
-    let force_fresh = notice["rerun"]["force_fresh"].as_bool().unwrap_or(false);
-    assert!(force_fresh);
-    assert!(stale_output.contains("\"rerun\":{\"force_fresh\":true}"));
+    assert!(notice["rerun"].get("force_fresh").is_none());
+    assert!(
+        notice["rerun"]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("supported arguments")
+    );
+    let refreshed_key = attempt_key.with_repository_epoch(2).with_search_narrowing(
+        "turn-a",
+        "repo-a",
+        Some(RgSearchNarrowing {
+            scope_state_identity: Some("changed-scope-state".to_string()),
+            ..search
+        }),
+    );
     ledger
-        .begin_attempt_with_freshness(&attempt_key, false, force_fresh)
+        .begin_attempt_with_freshness(&refreshed_key, false, false)
         .await
-        .expect("stale projection bypasses unchanged-failure suppression");
+        .expect("a changed workspace runs the supported arguments without a freshness override");
 }
 
 #[test]
@@ -1279,10 +1348,10 @@ fn cargo_configuration_changes_invalidate_observed_validation() {
                 serde_json::from_str(text).expect("stale evidence notice");
             assert_eq!(notice["stale_workspace_evidence"], true, "{path:?}");
             assert_eq!(
-                notice["reason_code"], "source_dependency_changed",
+                notice["reason_code"], "source_dependencies_invalidated",
                 "{path:?}"
             );
-            assert_eq!(notice["rerun"]["force_fresh"], true, "{path:?}");
+            assert!(notice["rerun"].get("force_fresh").is_none(), "{path:?}");
         }
     }
 }
@@ -1807,20 +1876,23 @@ fn aggregate_budget_drops_are_recorded_per_representation() {
         let output = format!("result-{index} {}", "evidence ".repeat(500));
         let mut tracked = candidate(&call_id, output.clone());
         tracked.artifact_id = format!("artifact-{index:03}");
+        tracked.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "prior-turn".into(),
+            ordinal: 0,
+        });
         tracked.refresh_derived();
         state.register(tracked);
         items.push(function_call(&call_id));
         items.push(text_output(&call_id, output));
     }
-    // Dispatch failures and running-process receipts have no saved artifact, so
-    // admission cannot shrink them. They still occupy the prompt, and the
-    // aggregate budget is the only stage that can evict them.
-    for index in 0..30 {
+    // Short untracked outcomes are already cheaper than a compact receipt.
+    // Enough of them must still exhaust both representations' aggregate budget.
+    for index in 0..130 {
         let call_id = format!("unsaved-{index:03}");
         items.push(function_call(&call_id));
         items.push(text_output(
             &call_id,
-            format!("unsaved-{index} {}", "pending ".repeat(200)),
+            format!("unsaved-{index} {}", "pending ".repeat(30)),
         ));
     }
     let canonical: Arc<[ResponseItem]> = Arc::from(items);
@@ -2235,7 +2307,11 @@ fn tool_history_admission_budgets_structured_tool_search_pairs() {
             && receipt.ordered_tool_identities.len() == 1
             && receipt.arguments["query"] == "example"
     }));
-    assert!(projection.unreplaced_items.is_empty());
+    assert_eq!(projection.unreplaced_items.len(), 1);
+    assert!(
+        matches!(&projection.unreplaced_items[0], ResponseItem::Message { role, content, .. }
+        if role == "developer" && format!("{content:?}").contains("2 unread outcomes"))
+    );
 }
 
 #[test]
@@ -3639,10 +3715,10 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
                     value,
                     serde_json::json!({
                         "call_id": case,
-                        "rerun": { "force_fresh": true },
-                        "reason": "a source dependency changed after this tool result was captured; rerun the tool before relying on it",
+                        "rerun": { "instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence." },
+                        "reason": "source dependencies were invalidated after capture; this does not establish which dependency changed; obtain or revalidate current evidence before relying on it",
                         "stale_workspace_evidence": true,
-                        "reason_code": "source_dependency_changed",
+                        "reason_code": "source_dependencies_invalidated",
                         "valid_for_current_workspace": false,
                         "observed_revision": if complete { &changed } else { &captured },
                         "current_revision": changed,
@@ -3703,14 +3779,18 @@ fn tool_history_admission_recovers_legacy_non_text_cost_from_response_content() 
         }
         let expected: Arc<[ResponseItem]> = Arc::from(canonical[2..].to_vec());
         let projection = state.project(Arc::from(canonical));
-        assert_eq!(
-            projection.items, expected,
-            "legacy_missing_cost={legacy_missing_cost}"
-        );
-        assert_eq!(
-            projection.unreplaced_items, expected,
-            "legacy_missing_cost={legacy_missing_cost}"
-        );
+        for items in [&projection.items, &projection.unreplaced_items] {
+            assert_eq!(
+                &items[..expected.len()],
+                expected.as_ref(),
+                "legacy_missing_cost={legacy_missing_cost}"
+            );
+            assert_eq!(items.len(), expected.len() + 1);
+            assert!(
+                matches!(&items[expected.len()], ResponseItem::Message { role, content, .. }
+                if role == "developer" && format!("{content:?}").contains("1 unread outcomes"))
+            );
+        }
         assert!(projection.substitutions.is_empty());
     }
 
@@ -3855,5 +3935,171 @@ fn workspace_dependencies_preserve_powershell_parser_host() {
         let (command, _) = dependency_search_command(&serde_json::json!({"cmd": script}))
             .expect("default shell command");
         assert_eq!(command[0], shell.shell_path.to_string_lossy());
+    }
+}
+
+#[test]
+fn unread_failure_and_live_handle_survive_aggregate_pressure() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
+    let state = ToolHistoryState::default();
+    let mut failure = text_output(
+        "failed-write",
+        format!(
+            "write failed: permission denied\n{}",
+            "details ".repeat(2000)
+        ),
+    );
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut failure {
+        output.success = Some(false);
+    }
+    let live = text_output(
+        "running",
+        format!(
+            "Process running with session ID 12345\n{}",
+            "output ".repeat(2000)
+        ),
+    );
+    let mut items = ProjectedResponseItems::Owned(vec![failure, live]);
+    let drops = state.enforce_tool_result_budget(&mut items);
+    assert_eq!(drops.count, 0);
+    let combined = items
+        .iter()
+        .filter_map(canonical_textual_output_identity)
+        .map(|(_, text)| text.into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined.contains("permission denied"));
+    assert!(combined.contains("12345"));
+    assert!(combined.contains("\"successful\":false"));
+    assert!(
+        items
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .map(|(_, output)| approx_token_count(&output))
+            .sum::<usize>()
+            <= 700
+    );
+}
+
+#[test]
+fn observed_failure_detail_does_not_evict_an_unread_live_handle() {
+    let old_output = "previously observed failure detail ".repeat(100);
+    let _budget =
+        override_model_visible_tool_result_token_budget_for_test(approx_token_count(&old_output));
+    let mut old = candidate("old-failure", old_output.clone());
+    old.successful = false;
+    old.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "observed-turn".to_string(),
+        ordinal: 1,
+    });
+    let mut state = ToolHistoryState::default();
+    state.candidates.insert(old.call_id.clone(), old);
+    let mut items = ProjectedResponseItems::Owned(vec![
+        text_output("old-failure", old_output),
+        text_output(
+            "new-live",
+            format!(
+                "Process running with session ID 12345\n{}",
+                "output ".repeat(2000),
+            ),
+        ),
+    ]);
+    let drops = state.enforce_tool_result_budget(&mut items);
+    assert_eq!(drops.count, 1);
+    assert!(
+        items
+            .iter()
+            .all(|item| item_call_id(item) != Some("old-failure"))
+    );
+    let live = items
+        .iter()
+        .find(|item| item_call_id(item) == Some("new-live"))
+        .expect("new continuation must survive previously observed detail");
+    assert!(
+        canonical_textual_output_identity(live)
+            .unwrap()
+            .1
+            .contains("12345")
+    );
+    assert_eq!(
+        items.len(),
+        1,
+        "only observed output was dropped; no unresolved overflow"
+    );
+}
+
+#[test]
+fn impossible_unread_receipt_budget_reports_unresolved_overflow() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(1);
+    let state = ToolHistoryState::default();
+    let mut items = ProjectedResponseItems::Owned(vec![
+        function_call("unread"),
+        text_output("unread", "operation failed".into()),
+    ]);
+    let dropped = state.enforce_tool_result_budget(&mut items);
+    assert_eq!(dropped.count, 1);
+    assert!(
+        items
+            .iter()
+            .all(|item| item_call_id(item) != Some("unread"))
+    );
+    assert!(
+        matches!(&items[0], ResponseItem::Message { content, .. } if format!("{content:?}").contains("1 unread outcomes"))
+    );
+}
+
+#[tokio::test]
+async fn audit_equal_git_identity_does_not_override_dependency_watcher() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("ignored-input.txt");
+    std::fs::write(&source, "before").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let proof = cache
+        .begin_source_path_change_observation(root.path(), &source, false)
+        .await
+        .unwrap();
+    let mut revision = workspace_identity("unchanged-git-visible-state");
+    revision.repository_root = Some(root.path().to_string_lossy().into_owned());
+    let output = text_output("ignored-read", "before".to_owned());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call("ignored-read"), output.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(revision.clone()),
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        )
+        .unwrap()
+        .with_source_path_observations(vec![proof]),
+    );
+    assert_eq!(
+        state
+            .project_with_workspace_cache(Arc::clone(&canonical), Some(&revision), &cache)
+            .items,
+        canonical
+    );
+    std::fs::write(&source, "after!").unwrap();
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["ignored-input.txt".to_owned()])
+        .await;
+    let projected = state.project_with_workspace_cache(canonical, Some(&revision), &cache);
+    let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
+    assert!(text.contains("stale_workspace_evidence"));
+    assert!(text.contains("workspace_freshness_unverified"));
+}
+
+#[test]
+fn unread_structured_admission_overflow_is_explicit_in_both_projections() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(1);
+    let projection =
+        ToolHistoryState::default().project(Arc::from(tool_search_pair("unread-search", 1000)));
+    for items in [&projection.items, &projection.unreplaced_items] {
+        assert!(
+            items
+                .iter()
+                .all(|item| item_call_id(item) != Some("unread-search"))
+        );
+        assert!(items.iter().any(|item| matches!(item,
+            ResponseItem::Message { content, .. } if format!("{content:?}").contains("1 unread outcomes"))));
     }
 }

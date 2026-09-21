@@ -10,9 +10,43 @@ const INVALID_IMAGE_URL_ERROR: &str =
     "Tool call failed: invalid image output. Pass a base64 data URI instead";
 const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
 
+// These bound Rust conversion copies, not V8 allocations or buffered output.
+pub(super) const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_NOTIFICATION_BYTES: usize = 1024 * 1024;
+
+pub(super) fn bounded_string(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::String>,
+    max_bytes: usize,
+) -> Result<String, String> {
+    if value.utf8_length(scope) > max_bytes {
+        return Err(format!("payload exceeds its limit of {max_bytes} bytes"));
+    }
+    Ok(copy_string(scope, value))
+}
+
+fn copy_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::String>) -> String {
+    #[cfg(test)]
+    {
+        let bytes = value.utf8_length(scope);
+        if let Some(state) = scope.get_slot_mut::<super::RuntimeState>() {
+            state.rust_conversion_bytes += bytes;
+        }
+    }
+    value.to_rust_string_lossy(scope)
+}
+
 pub(super) fn serialize_output_text(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
+) -> Result<String, String> {
+    serialize_output_text_with_limit(scope, value, MAX_PAYLOAD_BYTES)
+}
+
+pub(super) fn serialize_output_text_with_limit(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
 ) -> Result<String, String> {
     if value.is_undefined()
         || value.is_null()
@@ -21,13 +55,14 @@ pub(super) fn serialize_output_text(
         || value.is_big_int()
         || value.is_string()
     {
-        return Ok(value.to_rust_string_lossy(scope));
+        let value = value.to_string(scope).ok_or_else(|| "failed to format text".to_string())?;
+        return bounded_string(scope, value, max_bytes);
     }
 
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     if let Some(stringified) = v8::json::stringify(&tc, value) {
-        return Ok(stringified.to_rust_string_lossy(&tc));
+        return bounded_string(&mut tc, stringified, max_bytes);
     }
     if tc.has_caught() {
         return Err(tc
@@ -35,7 +70,36 @@ pub(super) fn serialize_output_text(
             .map(|exception| value_to_error_text(&mut tc, exception))
             .unwrap_or_else(|| "unknown code mode exception".to_string()));
     }
-    Ok(value.to_rust_string_lossy(&tc))
+    let value = value.to_string(&tc).ok_or_else(|| "failed to format text".to_string())?;
+    bounded_string(&mut tc, value, max_bytes)
+}
+
+pub(super) fn serialize_console_text(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    if value.is_native_error()
+        && let Ok(object) = v8::Local::<v8::Object>::try_from(value)
+        && let Some(key) = v8::String::new(&tc, "stack")
+        && let Some(stack) = object.get(&tc, key.into())
+        && let Ok(stack) = v8::Local::<v8::String>::try_from(stack)
+    {
+        return bounded_string(&mut tc, stack, max_bytes);
+    }
+    tc.reset();
+    if value.is_object() {
+        if let Some(stringified) = v8::json::stringify(&tc, value) {
+            return bounded_string(&mut tc, stringified, max_bytes);
+        }
+        if tc.has_caught() && max_bytes >= 24 {
+            tc.reset();
+            return Ok("[unserializable object]".to_string());
+        }
+    }
+    serialize_output_text_with_limit(&mut tc, value, max_bytes)
 }
 
 pub(super) fn normalize_output_image(
@@ -67,7 +131,7 @@ pub(super) fn normalize_output_image(
         if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
             return Err(REMOTE_IMAGE_URL_ERROR.to_string());
         }
-        if !scheme.eq_ignore_ascii_case("data") {
+        if !scheme.eq_ignore_ascii_case("data") || !valid_image_data_uri(&image_url) {
             return Err(INVALID_IMAGE_URL_ERROR.to_string());
         }
 
@@ -149,7 +213,7 @@ fn parse_mcp_output_image(
         return Err("image expected MCP image data".to_string());
     }
 
-    let image_url = if data.to_ascii_lowercase().starts_with("data:") {
+    let image_url = if data.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:")) {
         data.to_string()
     } else {
         let mime_type = result
@@ -186,20 +250,39 @@ pub(super) fn v8_value_to_json(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> Result<Option<JsonValue>, String> {
+    v8_value_to_json_with_limit(scope, value, MAX_PAYLOAD_BYTES).map_err(|error| match error {
+        JsonConversionError::TooLarge => format!("payload exceeds its limit of {MAX_PAYLOAD_BYTES} bytes"),
+        JsonConversionError::Invalid(message) => message,
+    })
+}
+
+pub(super) enum JsonConversionError {
+    TooLarge,
+    Invalid(String),
+}
+
+pub(super) fn v8_value_to_json_with_limit(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+) -> Result<Option<JsonValue>, JsonConversionError> {
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     let Some(stringified) = v8::json::stringify(&tc, value) else {
         if tc.has_caught() {
-            return Err(tc
+            return Err(JsonConversionError::Invalid(tc
                 .exception()
                 .map(|exception| value_to_error_text(&mut tc, exception))
-                .unwrap_or_else(|| "unknown code mode exception".to_string()));
+                .unwrap_or_else(|| "unknown code mode exception".to_string())));
         }
         return Ok(None);
     };
-    serde_json::from_str(&stringified.to_rust_string_lossy(&tc))
+    if stringified.utf8_length(&tc) > max_bytes {
+        return Err(JsonConversionError::TooLarge);
+    }
+    serde_json::from_str(&copy_string(&mut tc, stringified))
         .map(Some)
-        .map_err(|err| format!("failed to serialize JavaScript value: {err}"))
+        .map_err(|err| JsonConversionError::Invalid(format!("failed to serialize JavaScript value: {err}")))
 }
 
 pub(super) fn json_to_v8<'s>(
@@ -228,6 +311,40 @@ pub(super) fn value_to_error_text(
 
 pub(super) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     if let Some(message) = v8::String::new(scope, message) {
-        scope.throw_exception(message.into());
+        let error = v8::Exception::type_error(scope, message);
+        scope.throw_exception(error);
     }
+}
+
+pub(super) fn error_value<'s>(scope: &mut v8::PinScope<'s, '_>, message: &str) -> v8::Local<'s, v8::Value> {
+    match v8::String::new(scope, message) {
+        Some(message) => v8::Exception::error(scope, message),
+        None => v8::undefined(scope).into(),
+    }
+}
+
+fn valid_image_data_uri(uri: &str) -> bool {
+    let Some((header, payload)) = uri.split_once(',') else { return false; };
+    let Some((mime, encoding)) = header.get(5..).and_then(|header| header.split_once(';')) else { return false; };
+    // view_image and MCP blocks without a MIME type return opaque source bytes.
+    // The history insertion path decodes and validates those bytes as an image.
+    if !["image/png", "image/jpeg", "image/webp", "image/gif", "application/octet-stream"].iter().any(|supported| mime.eq_ignore_ascii_case(supported))
+        || !encoding.eq_ignore_ascii_case("base64") || payload.is_empty() || payload.len() % 4 != 0 {
+        return false;
+    }
+    // Validate canonical base64 in place; decoding would allocate another image.
+    let unpadded = payload.trim_end_matches('=');
+    let padding = payload.len() - unpadded.len();
+    if padding > 2 || !unpadded.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/') {
+        return false;
+    }
+    let last = match unpadded.as_bytes().last().copied() {
+        Some(b'A'..=b'Z') => unpadded.as_bytes()[unpadded.len() - 1] - b'A',
+        Some(b'a'..=b'z') => unpadded.as_bytes()[unpadded.len() - 1] - b'a' + 26,
+        Some(b'0'..=b'9') => unpadded.as_bytes()[unpadded.len() - 1] - b'0' + 52,
+        Some(b'+') => 62,
+        Some(b'/') => 63,
+        _ => return false,
+    };
+    match padding { 1 => last & 3 == 0, 2 => last & 15 == 0, _ => true }
 }

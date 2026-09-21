@@ -9,11 +9,12 @@ use indexmap::IndexMap;
 const ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET: usize = 160_000;
 const ADDITIONAL_CONTEXT_MAX_ITEMS: usize = 256;
 const ADDITIONAL_CONTEXT_RESET_SOURCE: &str = "__codex_additional_context_reset__";
-const ADDITIONAL_CONTEXT_RESET: &str = "Additional context budget exceeded. All previously supplied additional context values are obsolete (previous_value_obsolete=\"true\"). Only additional-context entries following this reset in the current update remain available. Do not infer omitted values from earlier messages.";
+const ADDITIONAL_CONTEXT_RESET: &str = "Additional context snapshot replaced. All previously supplied additional context values are obsolete (previous_value_obsolete=\"true\"). Only additional-context entries following this reset in the current update remain available. Do not infer omitted values from earlier messages.";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AdditionalContextStore {
     values: IndexMap<String, AdditionalContextEntry>,
+    delivered: IndexMap<String, AdditionalContextEntry>,
 }
 
 impl AdditionalContextStore {
@@ -21,12 +22,22 @@ impl AdditionalContextStore {
         &mut self,
         values: IndexMap<String, AdditionalContextEntry>,
     ) -> Vec<ResponseInputItem> {
+        if self.values == values {
+            return Vec::new();
+        }
         let mut fragments = Vec::new();
         // Include the JSON array brackets and each message's serialized envelope.
         let mut retained_bytes = 2;
-        let mut overflowed = false;
+        let mut overflowed = self
+            .delivered
+            .iter()
+            .any(|(key, old)| values.get(key).is_none_or(|new| new.kind != old.kind));
+        let mut delivered = self.delivered.clone();
         for (key, entry) in &values {
-            if self.values.get(key) == Some(entry) {
+            if overflowed {
+                break;
+            }
+            if self.delivered.get(key) == Some(entry) {
                 continue;
             }
             if !push_bounded_item(
@@ -37,6 +48,7 @@ impl AdditionalContextStore {
                 overflowed = true;
                 break;
             }
+            delivered.insert(key.clone(), entry.clone());
         }
 
         if overflowed {
@@ -46,7 +58,7 @@ impl AdditionalContextStore {
             // A developer-level prior value must also be invalidated at that role
             // when its replacement has been downgraded to untrusted context.
             let kind = if self
-                .values
+                .delivered
                 .values()
                 .any(|entry| entry.kind == AdditionalContextKind::Application)
             {
@@ -62,6 +74,7 @@ impl AdditionalContextStore {
                 },
             );
             fragments.clear();
+            delivered.clear();
             retained_bytes = 2 + serialized_item_bytes(&reset) + 1;
             fragments.push(reset);
             for (key, entry) in &values {
@@ -70,17 +83,20 @@ impl AdditionalContextStore {
                 }
                 // An oversized entry does not consume the remaining budget: a
                 // later, smaller entry may still fit the replacement snapshot.
-                push_bounded_item(
+                if push_bounded_item(
                     &mut fragments,
                     &mut retained_bytes,
                     render_entry(key, entry),
-                );
+                ) {
+                    delivered.insert(key.clone(), entry.clone());
+                }
             }
         }
 
         // The supplied map remains authoritative even for omitted entries.
         // An unchanged remerge must not restore or repeatedly emit older values.
         self.values = values;
+        self.delivered = delivered;
         fragments
     }
 }
@@ -273,6 +289,65 @@ mod tests {
         assert!(input_text(fragments.last().unwrap()).contains("source-0254"));
         assert_eq!(store.values, values);
         assert!(store.merge(values).is_empty());
+    }
+
+    #[test]
+    fn deleted_and_downgraded_context_invalidates_the_delivered_role() {
+        let entry = AdditionalContextEntry {
+            value: "old".to_string(),
+            kind: AdditionalContextKind::Application,
+        };
+        let mut store = AdditionalContextStore::default();
+        store.merge(IndexMap::from([("source".to_string(), entry.clone())]));
+        let removed = store.merge(IndexMap::new());
+        assert_eq!(removed.len(), 1);
+        assert!(
+            matches!(&removed[0], ResponseInputItem::Message { role, .. } if role == "developer")
+        );
+        assert!(input_text(&removed[0]).contains("previous_value_obsolete"));
+        assert!(store.merge(IndexMap::new()).is_empty());
+        store.merge(IndexMap::from([("source".to_string(), entry)]));
+        let downgraded = store.merge(IndexMap::from([(
+            "source".to_string(),
+            AdditionalContextEntry {
+                value: "new".to_string(),
+                kind: AdditionalContextKind::Untrusted,
+            },
+        )]));
+        assert_eq!(downgraded.len(), 2);
+        assert!(
+            matches!(&downgraded[0], ResponseInputItem::Message { role, .. } if role == "developer")
+        );
+        assert!(
+            matches!(&downgraded[1], ResponseInputItem::Message { role, .. } if role == "user")
+        );
+    }
+
+    #[test]
+    fn previously_omitted_context_becomes_deliverable_after_shrink() {
+        let values = (0..1024)
+            .map(|index| {
+                (
+                    format!("source-{index:04}"),
+                    AdditionalContextEntry {
+                        value: "unchanged".to_string(),
+                        kind: AdditionalContextKind::Untrusted,
+                    },
+                )
+            })
+            .collect::<IndexMap<_, _>>();
+        let retained = IndexMap::from([("source-0500".to_string(), values["source-0500"].clone())]);
+        let mut store = AdditionalContextStore::default();
+        assert_eq!(store.merge(values.clone()).len(), 256);
+        assert!(store.merge(values).is_empty());
+        let fragments = store.merge(retained.clone());
+        assert!(
+            fragments
+                .iter()
+                .any(|item| input_text(item).contains("source-0500"))
+        );
+        assert_eq!(store.delivered, retained);
+        assert!(store.merge(retained).is_empty());
     }
 
     fn input_text(item: &ResponseInputItem) -> &str {

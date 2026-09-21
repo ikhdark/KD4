@@ -117,6 +117,7 @@ struct CodeModeNestedTerminal {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CodeModeNestedResultEvidence {
+    failed: bool,
     #[serde(skip)]
     command_state: Option<JsonValue>,
     #[serde(skip)]
@@ -366,6 +367,12 @@ impl CodeModeService {
             .extend(post_tool_use_feedback);
         if let Some(nested_result) = nested_result {
             if let Some(state) = &nested_result.command_state {
+                let session = command_state_session(state);
+                if let Some(session) = session {
+                    metrics
+                        .command_states
+                        .retain(|previous| command_state_session(previous) != Some(session));
+                }
                 metrics.command_states.push(state.clone());
             }
             if metrics.nested_results.len() == MAX_RETAINED_NESTED_RESULTS {
@@ -378,8 +385,8 @@ impl CodeModeService {
                 .nested_results
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, result)| result.ordinal)
-                && nested_result.ordinal < latest.ordinal
+                .max_by_key(|(_, result)| (!result.failed, result.ordinal))
+                && (!nested_result.failed, nested_result.ordinal) < (!latest.failed, latest.ordinal)
             {
                 metrics.nested_results[latest_index] = nested_result;
             }
@@ -573,8 +580,35 @@ pub(super) fn handle_runtime_response(
         }
         packet.nested_results
     } else {
-        Vec::new()
+        packet
+            .nested_results
+            .into_iter()
+            .filter(|result| result.failed)
+            .collect()
     };
+    // Budget receipts together with script output and diagnostics. Keep the full
+    // set in canonical storage, while inline control state favors live handles.
+    let mut command_states = packet.command_states;
+    let canonical_states = command_states.clone();
+    command_states.sort_by_key(|state| {
+        state.get("process_exited").and_then(JsonValue::as_bool) != Some(false)
+    });
+    command_states.truncate(crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES);
+    for state in &mut command_states {
+        if let Some(object) = state.as_object_mut() {
+            object.remove("raw_output_artifact_error");
+        }
+    }
+    let inline_receipt =
+        (!command_states.is_empty()).then(|| FunctionCallOutputContentItem::InputText {
+            text: format!(
+                "Nested command states (independent of script completion):\n{}",
+                JsonValue::Array(command_states.clone())
+            ),
+        });
+    if let Some(receipt) = &inline_receipt {
+        post_tool_use_feedback.push(receipt.clone());
+    }
     let mut output = format_runtime_response(
         response,
         max_output_tokens,
@@ -585,12 +619,7 @@ pub(super) fn handle_runtime_response(
         nested_results,
         packet.first_required_terminal,
     );
-    if !packet.command_states.is_empty() {
-        // Script text is a presentation choice, not an acknowledgement that a
-        // child process finished. Keep these receipts outside the text budget
-        // and in the projection's essential fields, including when JS prints
-        // only result.output or the fallback-result retention cap is reached.
-        let mut command_states = packet.command_states;
+    if let Some(receipt) = inline_receipt {
         if output
             .canonical_body
             .as_ref()
@@ -601,17 +630,20 @@ pub(super) fn handle_runtime_response(
                 state["output_complete"] = JsonValue::Bool(false);
             }
         }
-        let states = JsonValue::Array(command_states);
-        let item = FunctionCallOutputContentItem::InputText {
-            text: format!("Nested command states (independent of script completion):\n{states}"),
-        };
-        output.body.push(item.clone());
         if let Some(canonical) = &mut output.canonical_body {
-            canonical.push(item);
+            if let Some(item) = canonical.iter_mut().find(|item| **item == receipt) {
+                *item = FunctionCallOutputContentItem::InputText {
+                    text: format!(
+                        "Nested command states (independent of script completion):\n{}",
+                        JsonValue::Array(canonical_states)
+                    ),
+                };
+            }
         }
-        output
-            .essential_inline
-            .insert("nested_commands".to_string(), states);
+        output.essential_inline.insert(
+            "nested_commands".to_string(),
+            JsonValue::Array(command_states),
+        );
     }
     Ok(output)
 }
@@ -709,13 +741,6 @@ fn fold_nested_required_terminal(
         RequiredToolTerminalCause::Failure => {
             (output.with_outcome(ToolOutputOutcome::Failure), "failure")
         }
-        RequiredToolTerminalCause::TimedOut => {
-            (output.with_outcome(ToolOutputOutcome::TimedOut), "timeout")
-        }
-        RequiredToolTerminalCause::RecoverableCancellation => (
-            output.with_outcome(ToolOutputOutcome::Failure),
-            "recoverable_cancellation",
-        ),
     };
     merge_code_mode_signal(
         output,
@@ -730,9 +755,7 @@ fn required_nested_tool_terminal_cause(
     outcome_context: ToolOutputOutcomeContext,
     signal: Option<&JsonValue>,
 ) -> Option<RequiredToolTerminalCause> {
-    let failed = outcome_context.outcome == ToolOutputOutcome::Failure;
     required_tool_terminal_cause(outcome_context, signal)
-        .or_else(|| failed.then_some(RequiredToolTerminalCause::Failure))
 }
 
 fn runtime_response_cell_id(response: &RuntimeResponse) -> &str {
@@ -793,6 +816,10 @@ fn format_runtime_response(
         | RuntimeResponse::Result { cell_id, .. } => cell_id.to_string(),
     };
     let script_status = format_script_status(&response);
+    let output_loss = match &response {
+        RuntimeResponse::Result { output_loss, .. } => output_loss.clone(),
+        _ => None,
+    };
     let yielded = matches!(
         &response,
         RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. }
@@ -832,9 +859,7 @@ fn format_runtime_response(
         success = false;
         outcome = match terminal.cause {
             RequiredToolTerminalCause::Blocked => OutputOutcome::Skipped,
-            RequiredToolTerminalCause::TimedOut => OutputOutcome::TimedOut,
-            RequiredToolTerminalCause::Failure
-            | RequiredToolTerminalCause::RecoverableCancellation => OutputOutcome::Failure,
+            RequiredToolTerminalCause::Failure => OutputOutcome::Failure,
         };
         format!("Required nested tool outcome: {}", terminal.message)
     });
@@ -865,7 +890,20 @@ fn format_runtime_response(
     let semantic_evidence = serde_json::json!({
         "status": &script_status,
         "content_items": &content_items,
+        "output_loss": &output_loss,
     });
+    if let Some(output_loss) = output_loss {
+        let metadata = FunctionCallOutputContentItem::InputText {
+            text: serde_json::json!({
+                "output_complete": false,
+                "output_loss": output_loss,
+                "discarded_output_recoverable": false,
+            })
+            .to_string(),
+        };
+        content_items.insert(0, metadata.clone());
+        canonical_content_items.insert(0, metadata);
+    }
     let elapsed = started_at.elapsed();
     prepend_script_status(&mut content_items, &script_status, elapsed);
     prepend_script_status(&mut canonical_content_items, &script_status, elapsed);
@@ -1042,6 +1080,10 @@ async fn call_nested_tool(
         return Err(FunctionCallError::RespondToModel(message));
     }
 
+    let nested_call_id = format!(
+        "{PUBLIC_TOOL_NAME}-{}-{runtime_tool_call_id}",
+        cell_id.as_str()
+    );
     let payload = match build_nested_tool_payload(tool_kind, &tool_name, input) {
         Ok(payload) => payload,
         Err(error) => {
@@ -1060,8 +1102,22 @@ async fn call_nested_tool(
                     false,
                     0,
                     Vec::new(),
+                    Some(CodeModeNestedResultEvidence {
+                        failed: true,
+                        command_state: None,
+                        ordinal: packet_ordinal,
+                        call_id: nested_call_id,
+                        parent_call_id: parent_tool_call_id,
+                        parent_cell_id: cell_id.to_string(),
+                        runtime_tool_call_id,
+                        tool_name: tool_name.to_string(),
+                        output: error
+                            .chars()
+                            .take(MAX_RETAINED_NESTED_RESULT_BYTES / 4)
+                            .collect(),
+                        output_truncated: error.len() > MAX_RETAINED_NESTED_RESULT_BYTES / 4,
+                    }),
                     None,
-                    Some((RequiredToolTerminalCause::Failure, error.clone())),
                 );
             return Err(FunctionCallError::RespondToModel(error));
         }
@@ -1092,10 +1148,6 @@ async fn call_nested_tool(
         return Err(FunctionCallError::RespondToModel(message));
     }
 
-    let nested_call_id = format!(
-        "{PUBLIC_TOOL_NAME}-{}-{runtime_tool_call_id}",
-        cell_id.as_str()
-    );
     let call = ToolCall {
         tool_name: tool_name.clone(),
         call_id: nested_call_id.clone(),
@@ -1122,8 +1174,7 @@ async fn call_nested_tool(
         Ok(result) => result,
         Err(error) => {
             let message = error.to_string();
-            let terminal_cause = required_tool_error_terminal_cause(&error)
-                .or(Some(RequiredToolTerminalCause::Failure));
+            let terminal_cause = required_tool_error_terminal_cause(&error);
             tool_runtime.record_code_mode_failure(
                 cell_id.as_str(),
                 &tool_name,
@@ -1139,7 +1190,21 @@ async fn call_nested_tool(
                     false,
                     0,
                     Vec::new(),
-                    None,
+                    Some(CodeModeNestedResultEvidence {
+                        failed: true,
+                        command_state: None,
+                        ordinal: packet_ordinal,
+                        call_id: nested_call_id,
+                        parent_call_id: parent_tool_call_id,
+                        parent_cell_id: cell_id.to_string(),
+                        runtime_tool_call_id,
+                        tool_name: tool_name.to_string(),
+                        output: message
+                            .chars()
+                            .take(MAX_RETAINED_NESTED_RESULT_BYTES / 4)
+                            .collect(),
+                        output_truncated: message.len() > MAX_RETAINED_NESTED_RESULT_BYTES / 4,
+                    }),
                     terminal_cause.map(|cause| (cause, message)),
                 );
             return Err(error);
@@ -1172,6 +1237,10 @@ async fn call_nested_tool(
             .await;
     }
     let nested_result = CodeModeNestedResultEvidence {
+        failed: !matches!(
+            outcome_context.outcome,
+            codex_tools::ToolOutputOutcome::Success | codex_tools::ToolOutputOutcome::Yielded
+        ),
         command_state: nested_command_state(&tool_name, &nested_call_id, &payload, &result_value),
         ordinal: packet_ordinal,
         call_id: nested_call_id,
@@ -1187,8 +1256,6 @@ async fn call_nested_tool(
             let label = match cause {
                 RequiredToolTerminalCause::Blocked => "blocked",
                 RequiredToolTerminalCause::Failure => "failed",
-                RequiredToolTerminalCause::TimedOut => "timed out",
-                RequiredToolTerminalCause::RecoverableCancellation => "was cancelled",
             };
             (
                 cause,
@@ -1221,6 +1288,12 @@ async fn call_nested_tool(
         },
         &receipts,
     );
+    if matches!(
+        outcome_context.outcome,
+        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
+    ) {
+        return Err(FunctionCallError::RespondToModel(result_value.to_string()));
+    }
     Ok(result_value)
 }
 
@@ -1487,6 +1560,13 @@ fn nested_command_state(
         });
     }
     Some(state)
+}
+
+fn command_state_session(state: &JsonValue) -> Option<&JsonValue> {
+    state
+        .get("polled_session_id")
+        .filter(|value| !value.is_null())
+        .or_else(|| state.get("session_id").filter(|value| !value.is_null()))
 }
 
 fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
@@ -2092,6 +2172,51 @@ mod tests {
     }
 
     #[test]
+    fn late_failure_displaces_success_in_bounded_packet_evidence() {
+        let service = test_service();
+        let cell = CellId::new("late-failure-cell".to_string());
+        service.record_cell_parent_call_id(&cell, "outer-exec");
+        for index in 0..10 {
+            let ordinal = service.begin_packet_call(&cell).unwrap();
+            service.complete_packet_call(
+                &cell,
+                ordinal,
+                false,
+                10,
+                Vec::new(),
+                Some(super::CodeModeNestedResultEvidence {
+                    failed: index == 9,
+                    command_state: None,
+                    ordinal,
+                    call_id: format!("call-{index}"),
+                    parent_call_id: Some("outer-exec".into()),
+                    parent_cell_id: cell.to_string(),
+                    runtime_tool_call_id: index.to_string(),
+                    tool_name: "test".into(),
+                    output: if index == 9 {
+                        "late failure"
+                    } else {
+                        "success"
+                    }
+                    .into(),
+                    output_truncated: false,
+                }),
+                None,
+            );
+        }
+        let packet = service.finish_packet("late-failure-cell", false);
+        assert_eq!(packet.nested_results.len(), 8);
+        assert_eq!(packet.omitted_nested_result_count, 2);
+        assert!(packet.nested_results.iter().any(|result| result.failed
+            && result.call_id == "call-9"
+            && result.output == "late failure"));
+        assert!(
+            packet.first_required_terminal.is_none(),
+            "diagnostics must not turn a handled error into a sticky failure"
+        );
+    }
+
+    #[test]
     fn nested_terminal_fold_uses_registration_order_and_preserves_blocked_status() {
         let service = test_service();
         let cell = CellId::new("terminal-cell".to_string());
@@ -2147,13 +2272,13 @@ mod tests {
     }
 
     #[test]
-    fn nested_terminal_classification_promotes_failed_tool_results() {
+    fn nested_terminal_classification_preserves_recoverable_failures() {
         assert_eq!(
             required_nested_tool_terminal_cause(
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
                 None,
             ),
-            Some(RequiredToolTerminalCause::Failure),
+            None,
         );
         assert_eq!(
             required_nested_tool_terminal_cause(
@@ -2440,7 +2565,7 @@ mod tests {
         let home = tempfile::tempdir().expect("artifact home");
         // Both fixtures fit automatic direct recovery. The larger body exceeds the
         // nested aggregate budget, exercising the outer envelope reserve itself.
-        for size in [9_000, 14_000] {
+        for size in [9_000, 38_000] {
             let text = "x".repeat(size);
             let artifact = create_canonical_output_artifact(
                 home.path(),
@@ -2471,12 +2596,12 @@ mod tests {
             );
             if size == 9_000 {
                 assert!(
-                    direct_tokens <= 3_000,
+                    direct_tokens <= 9_000,
                     "fitting body must enter nested exact recovery"
                 );
             } else {
                 assert!(
-                    direct_tokens > 3_128 && direct_tokens <= 10_000,
+                    direct_tokens > 9_128 && direct_tokens <= 10_000,
                     "actual serialized body must exceed nested recovery plus retry margin while fitting direct recovery"
                 );
             }
@@ -2502,6 +2627,7 @@ mod tests {
             let rendered = serde_json::to_string(&nested).expect("serialize nested recovery");
             let outer = format_runtime_response(
                 RuntimeResponse::Result {
+                    output_loss: None,
                     cell_id: CellId::new("recovery-envelope".to_string()),
                     content_items: vec![
                         codex_code_mode::FunctionCallOutputContentItem::InputText {
@@ -2510,8 +2636,8 @@ mod tests {
                     ],
                     error_text: None,
                 },
-                Some(4_000),
-                4_000,
+                Some(10_000),
+                10_000,
                 false,
                 std::time::Instant::now(),
                 Vec::new(),
@@ -2527,7 +2653,7 @@ mod tests {
             );
             assert!(!projected.contains("Warning: truncated output"));
             assert!(
-                codex_utils_string::approx_token_count(&projected) <= 4_000,
+                codex_utils_string::approx_token_count(&projected) <= 10_000,
                 "actual outer status plus recovery must fit the requested exec budget"
             );
         }
@@ -2538,6 +2664,7 @@ mod tests {
         let sentinel = "CANONICAL_SENTINEL_AFTER_THE_MODEL_LIMIT";
         let output = format_runtime_response(
             RuntimeResponse::Result {
+                output_loss: None,
                 cell_id: CellId::new("canonical-cell".to_string()),
                 content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText {
                     text: format!("{}{}", "x".repeat(400), sentinel),

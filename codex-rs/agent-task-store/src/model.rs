@@ -435,7 +435,9 @@ impl Assignment {
                 if self.write_scope.is_empty() {
                     return invalid("workers require a non-empty owned write scope");
                 }
-                if self.required_evidence.is_empty() {
+                if self.admission_origin == AssignmentAdmissionOrigin::Typed
+                    && self.required_evidence.is_empty()
+                {
                     return invalid("workers require at least one proof obligation");
                 }
             }
@@ -1247,6 +1249,7 @@ impl AgentTask {
                     && calls.get(reference.call_id.as_str()).is_some_and(|call| {
                         call.attempt_id == receipt.attempt_id
                             && call.status == ValidationCallStatus::Succeeded
+                            && call.evidence.start_epoch == reference.evidence_epoch
                             && call.evidence.end_epoch == Some(reference.evidence_epoch)
                     })
             });

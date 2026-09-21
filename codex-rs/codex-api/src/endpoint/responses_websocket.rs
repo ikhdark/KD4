@@ -23,6 +23,7 @@ use serde_json::Value;
 use serde_json::map::Map as JsonMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -282,8 +283,7 @@ impl WsStream {
                     failure = rx_failure => {
                         self.rx_failure = None;
                         match failure {
-                            Ok(WsIngressFailure::Overflow(error)) => return Some(Err(error)),
-                            Ok(WsIngressFailure::Transport(error)) => {
+                            Ok(WsIngressFailure::Overflow(error) | WsIngressFailure::Transport(error)) => {
                                 self.pending_failure = Some(error);
                                 continue;
                             }
@@ -299,7 +299,7 @@ impl WsStream {
     }
 
     fn is_closed(&self) -> bool {
-        self.pump_task.is_finished()
+        self.pending_failure.is_some() || self.pump_task.is_finished()
     }
 }
 
@@ -316,6 +316,8 @@ const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE: &str =
     "Previous response was not found. Retrying the full request.";
 
 pub struct ResponsesWebsocketConnection {
+    pump_handle: tokio::task::AbortHandle,
+    retired: Arc<AtomicBool>,
     stream: Arc<Mutex<Option<WsStream>>>,
     // TODO (pakrym): is this the right place for timeout?
     idle_timeout: Duration,
@@ -342,6 +344,8 @@ impl ResponsesWebsocketConnection {
         telemetry: Option<Arc<dyn WebsocketTelemetry>>,
     ) -> Self {
         Self {
+            pump_handle: stream.pump_task.abort_handle(),
+            retired: Arc::new(AtomicBool::new(false)),
             stream: Arc::new(Mutex::new(Some(stream))),
             idle_timeout,
             metadata,
@@ -350,10 +354,7 @@ impl ResponsesWebsocketConnection {
     }
 
     pub async fn is_closed(&self) -> bool {
-        match self.stream.lock().await.as_ref() {
-            Some(stream) => stream.is_closed(),
-            None => true,
-        }
+        self.retired.load(Ordering::Acquire) || self.pump_handle.is_finished()
     }
 
     pub async fn stream_request(
@@ -391,6 +392,7 @@ impl ResponsesWebsocketConnection {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let stream = Arc::clone(&self.stream);
+        let retired = Arc::clone(&self.retired);
         let idle_timeout = self.idle_timeout;
         let metadata = self.metadata.clone();
         let upstream_request_id = metadata.upstream_request_id().map(str::to_string);
@@ -472,10 +474,16 @@ impl ResponsesWebsocketConnection {
                 if let Err(err) = result {
                     // A terminal stream error should reach the caller immediately. Waiting for a
                     // graceful close handshake here can stall indefinitely and mask the error.
+                    retired.store(true, Ordering::Release);
                     let failed_stream = guard.take();
                     drop(guard);
                     drop(failed_stream);
                     let _ = tx_event.send(Err(err)).await;
+                } else if guard.as_ref().is_some_and(WsStream::is_closed) {
+                    retired.store(true, Ordering::Release);
+                    let failed_stream = guard.take();
+                    drop(guard);
+                    drop(failed_stream);
                 }
             }
             .instrument(current_span),
@@ -869,10 +877,15 @@ async fn run_websocket_response_stream(
                             column = error.column(),
                             "failed to parse websocket event"
                         );
-                        return Err(ApiError::Stream(format!(
-                            "failed to parse websocket event ({} payload bytes): {error}",
-                            text.len()
-                        )));
+                        return Err(ApiError::Stream(
+                            crate::responses_stream::decode_diagnostic(
+                                &format!(
+                                    "failed to parse websocket event ({} payload bytes)",
+                                    text.len()
+                                ),
+                                &error,
+                            ),
+                        ));
                     }
                     Err(ResponsesEventError::Api(error)) => return Err(error),
                 };
@@ -1579,7 +1592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_ingress_failure_preempts_staged_messages() {
+    async fn websocket_ingress_failure_follows_staged_messages() {
         let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
         let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
         tx_message
@@ -1600,6 +1613,18 @@ mod tests {
             pump_task,
         };
 
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("accepted prefix")
+                .expect("queued message"),
+            Message::Text("queued".into())
+        );
+        assert!(
+            stream.is_closed(),
+            "failure-marked connection must not be reusable"
+        );
         let error = stream
             .next()
             .await
@@ -1642,6 +1667,82 @@ mod tests {
             stream.next().await.expect("failure should be emitted"),
             Err(WsError::ConnectionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn audit_overflow_preserves_only_a_valid_accepted_completion_and_retires_connection() {
+        let completed =
+            json!({"type":"response.completed","response":{"id":"accepted"}}).to_string();
+        let delta = json!({"type":"response.output_text.delta","delta":"partial"}).to_string();
+        let malformed =
+            json!({"type":"response.output_item.done","item":{"type":"message"}}).to_string();
+        for (prefix, success) in [
+            (vec![delta.clone(), completed.clone()], true),
+            (vec![delta.clone()], false),
+            (vec![malformed, completed.clone()], false),
+        ] {
+            let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+            let (tx_message, rx_message) = ws_ingress_channel(prefix.len(), 4096);
+            for frame in prefix {
+                tx_message.try_send(Message::Text(frame.into())).unwrap();
+            }
+            assert_eq!(
+                tx_message.try_send(Message::Text(completed.clone().into())),
+                Err(WsIngressSendError::Full)
+            );
+            let (tx_failure, rx_failure) = oneshot::channel();
+            tx_failure
+                .send(WsIngressFailure::Overflow(WsError::Io(
+                    std::io::Error::other(WEBSOCKET_INGRESS_OVERFLOW_MESSAGE),
+                )))
+                .unwrap();
+            drop(tx_message);
+            let pump_task = tokio::spawn(async move {
+                if let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await {
+                    let _ = tx_result.send(Ok(()));
+                }
+                std::future::pending::<()>().await;
+            });
+            let connection = ResponsesWebsocketConnection::new(
+                WsStream {
+                    tx_command,
+                    rx_message,
+                    rx_failure: Some(rx_failure),
+                    pending_failure: None,
+                    pump_task,
+                },
+                Duration::from_secs(1),
+                ResponsesStreamMetadata::default(),
+                None,
+            );
+            // Health inspection is independent of active response ownership.
+            let guard = connection.stream.lock().await;
+            assert!(
+                !tokio::time::timeout(Duration::from_millis(100), connection.is_closed())
+                    .await
+                    .unwrap()
+            );
+            drop(guard);
+            let mut stream = connection
+                .stream_request(test_response_request("test"), false, None)
+                .await
+                .unwrap();
+            let mut completions = 0;
+            let mut errors = 0;
+            while let Some(event) = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+            {
+                match event {
+                    Ok(ResponseEvent::Completed { .. }) => completions += 1,
+                    Err(_) => errors += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(completions, usize::from(success));
+            assert_eq!(errors, usize::from(!success));
+            assert!(connection.is_closed().await);
+        }
     }
 
     #[tokio::test]
@@ -1704,7 +1805,7 @@ mod tests {
                     );
                     if case == "malformed json" {
                         assert!(message.contains(&format!("({} payload bytes)", payload.len())));
-                        assert!(message.contains("EOF while parsing an object at line 1 column"));
+                        assert!(message.contains("Eof at line 1 column"));
                     }
                 }
                 other => panic!("unexpected error for {case}: {other:?}"),

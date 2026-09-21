@@ -80,6 +80,9 @@ pub struct SkillInjectionMetric {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InjectedHostSkillPrompts {
     paths: HashSet<String>,
+    // Selection precedence, a failed load, or a prompt budget can suppress
+    // legacy host injection without implying successful instruction delivery.
+    suppressed_paths: HashSet<String>,
 }
 
 impl InjectedHostSkillPrompts {
@@ -90,11 +93,23 @@ impl InjectedHostSkillPrompts {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.paths.is_empty() && self.suppressed_paths.is_empty()
+    }
+
+    pub fn suppress_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        self.suppressed_paths
+            .insert(normalize_host_skill_path(&path));
+        self.suppressed_paths.insert(path);
     }
 
     pub fn contains_path(&self, path: &str) -> bool {
-        self.paths.contains(path) || self.paths.contains(&normalize_host_skill_path(path))
+        self.paths.contains(path)
+            || self.paths.contains(&normalize_host_skill_path(path))
+            || self.suppressed_paths.contains(path)
+            || self
+                .suppressed_paths
+                .contains(&normalize_host_skill_path(path))
     }
 }
 

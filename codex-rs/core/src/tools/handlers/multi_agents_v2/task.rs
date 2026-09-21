@@ -260,6 +260,11 @@ async fn handle_submit_agent_receipt(
         crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await;
     let draft = args.into_receipt_draft(&task)?;
     if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
+        if draft.status == AgentStatusClaim::Completed {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "{SUBMIT_AGENT_RECEIPT_TOOL}: evidence_unavailable: mutation finalization failed: {error}. Retry evidence collection; do not repeat edits or passing validation."
+            )));
+        }
         tracing::warn!(
             %error,
             attempt_id = %binding.attempt_id,
@@ -268,26 +273,23 @@ async fn handle_submit_agent_receipt(
     }
     // Risk derivation and cold-review evidence must cover the complete attempt, including writes
     // that another runtime path finalized before receipt submission.
-    let observed_writes = match list_all_mutation_evidence(store.as_ref(), binding.attempt_id).await
-    {
-        Ok(observed_writes) => observed_writes,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                attempt_id = %binding.attempt_id,
-                "typed mutation evidence could not be read; continuing receipt submission"
-            );
-            Vec::new()
-        }
+    let review_reason = if draft.status == AgentStatusClaim::Completed {
+        let observed_writes = list_all_mutation_evidence(store.as_ref(), binding.attempt_id)
+            .await
+            .map_err(|error| FunctionCallError::RespondToModel(format!(
+                "{SUBMIT_AGENT_RECEIPT_TOOL}: evidence_unavailable: mutation evidence could not be read: {error}. Retry evidence collection; do not repeat edits or passing validation."
+            )))?;
+        derive_review_reason(
+            store.as_ref(),
+            turn.config.cwd.as_path(),
+            &task,
+            &draft,
+            &observed_writes,
+        )
+        .await?
+    } else {
+        None
     };
-    let review_reason = derive_review_reason(
-        store.as_ref(),
-        turn.config.cwd.as_path(),
-        &task,
-        &draft,
-        &observed_writes,
-    )
-    .await?;
     let receipt = match review_reason {
         Some(review_reason) => {
             store
@@ -337,9 +339,14 @@ async fn derive_review_reason(
     }
 
     let cwd = cwd.to_path_buf();
-    let diff = build_attempt_diff(store, task.current_attempt.attempt_id, observed_writes)
-        .await
-        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    let diff = build_attempt_diff(
+        store,
+        task.current_attempt.attempt_id,
+        observed_writes,
+        false,
+    )
+    .await
+    .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     let risk_hints = parse_risk_hints(&task.assignment.risk_hints);
     let successful_validation_ids = task
         .validation_calls
@@ -452,6 +459,7 @@ async fn build_evaluation_context(
         store.as_ref(),
         target.current_attempt.attempt_id,
         &observed_writes,
+        true,
     )
     .await
     .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
@@ -574,6 +582,7 @@ async fn build_attempt_diff(
     store: &LocalAgentTaskStore,
     attempt_id: codex_agent_task_store::AttemptId,
     observed_writes: &[MutationEvidence],
+    include_text: bool,
 ) -> Result<AttemptDiffSummary, StoreError> {
     let mut summary = AttemptDiffSummary::default();
     let mut truncated = false;
@@ -600,7 +609,17 @@ async fn build_attempt_diff(
                 MutationSnapshotVersion::Final,
             )
             .await?;
-            render_snapshot_diff(&evidence.path, &before, &after)
+            let path = evidence.path.clone();
+            let remaining = if include_text {
+                MAX_COLD_REVIEW_DIFF_BYTES.saturating_sub(summary.text.len())
+            } else {
+                0
+            };
+            tokio::task::spawn_blocking(move || {
+                render_snapshot_diff_bounded(&path, &before, &after, remaining)
+            })
+            .await
+            .map_err(|error| StoreError::CorruptData(format!("diff worker failed: {error}")))?
         } else {
             (
                 format!(
@@ -618,7 +637,9 @@ async fn build_attempt_diff(
                 .non_generated_changed_lines
                 .saturating_add(changed_lines);
         }
-        push_bounded_diff(&mut summary.text, &section, &mut truncated);
+        if include_text {
+            push_bounded_diff(&mut summary.text, &section, &mut truncated);
+        }
     }
     if truncated {
         const NOTICE: &str = "\n[attempt-specific diff truncated; write hashes remain available]\n";
@@ -681,10 +702,20 @@ async fn read_snapshot(
     })
 }
 
+#[cfg(test)]
 fn render_snapshot_diff(
     path: &str,
     before: &SnapshotContent,
     after: &SnapshotContent,
+) -> (String, u32, bool) {
+    render_snapshot_diff_bounded(path, before, after, MAX_COLD_REVIEW_DIFF_BYTES)
+}
+
+fn render_snapshot_diff_bounded(
+    path: &str,
+    before: &SnapshotContent,
+    after: &SnapshotContent,
+    max_bytes: usize,
 ) -> (String, u32, bool) {
     let (Some(before_bytes), Some(after_bytes)) = (&before.bytes, &after.bytes) else {
         return (
@@ -714,6 +745,9 @@ fn render_snapshot_diff(
         .count()
         .try_into()
         .unwrap_or(u32::MAX);
+    if max_bytes == 0 {
+        return (String::new(), changed_lines, generated);
+    }
     let old_header = if before.existed {
         format!("a/{path}")
     } else {
@@ -725,13 +759,40 @@ fn render_snapshot_diff(
         "/dev/null".to_string()
     };
     let mut section = format!("diff --git a/{path} b/{path}\n");
-    section.push_str(
-        &text_diff
-            .unified_diff()
-            .context_radius(3)
-            .header(&old_header, &new_header)
-            .to_string(),
-    );
+    struct BoundedDiff<'a> {
+        text: &'a mut String,
+        limit: usize,
+    }
+    impl std::fmt::Write for BoundedDiff<'_> {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let remaining = self.limit.saturating_sub(self.text.len());
+            let end = value.floor_char_boundary(remaining.min(value.len()));
+            self.text.push_str(&value[..end]);
+            if end < value.len() {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut writer = BoundedDiff {
+        text: &mut section,
+        limit: max_bytes,
+    };
+    let truncated = std::fmt::write(
+        &mut writer,
+        format_args!(
+            "{}",
+            text_diff
+                .unified_diff()
+                .context_radius(3)
+                .header(&old_header, &new_header)
+        ),
+    )
+    .is_err();
+    if truncated {
+        section.push_str("\n[diff presentation truncated]\n");
+    }
     if !section.ends_with('\n') {
         section.push('\n');
     }
@@ -2809,5 +2870,37 @@ mod projection_tests {
                 .iter()
                 .all(|selector| canonical.json_pointers.contains_key(&selector.pointer))
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_diff_tests {
+    use super::*;
+    #[test]
+    fn risk_only_diff_keeps_line_counts_without_rendering_large_presentation() {
+        let before_bytes = "old line\n".repeat(10_000).into_bytes();
+        let after_bytes = "new line\n".repeat(10_000).into_bytes();
+        let before = SnapshotContent {
+            existed: true,
+            total_bytes: before_bytes.len() as u64,
+            bytes: Some(before_bytes),
+        };
+        let after = SnapshotContent {
+            existed: true,
+            total_bytes: after_bytes.len() as u64,
+            bytes: Some(after_bytes),
+        };
+        let (risk_text, risk_count, generated) =
+            render_snapshot_diff_bounded("file.rs", &before, &after, 0);
+        assert!(risk_text.is_empty());
+        assert_eq!(risk_count, 20_000);
+        assert!(!generated);
+        let (text, count, _) = render_snapshot_diff("file.rs", &before, &after);
+        assert_eq!(count, risk_count);
+        assert!(text.contains("diff --git"));
+        let (bounded, count, _) = render_snapshot_diff_bounded("file.rs", &before, &after, 1024);
+        assert_eq!(count, risk_count);
+        assert!(bounded.len() <= 1024 + 40);
+        assert!(bounded.contains("presentation truncated"));
     }
 }

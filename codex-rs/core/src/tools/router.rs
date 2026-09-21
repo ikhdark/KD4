@@ -540,6 +540,21 @@ impl ToolRouter {
         }
     }
 
+    pub(crate) async fn prepare_hook_input(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<(ToolCall, Option<String>), FunctionCallError> {
+        let (invocation, notice) = self.registry.prepare_hook_input(invocation).await?;
+        Ok((
+            ToolCall {
+                tool_name: invocation.tool_name,
+                call_id: invocation.call_id,
+                payload: invocation.payload,
+            },
+            notice,
+        ))
+    }
+
     #[instrument(level = "trace", skip_all, err)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_tool_call_with_terminal_outcome(
@@ -704,8 +719,8 @@ fn authorize_independent_review_tool_call(
     if allowed {
         Ok(())
     } else {
-        Err(FunctionCallError::DeniedToModel(format!(
-            "{}: independent review capability denied: only read-only repository inspection tools are available",
+        Err(FunctionCallError::RespondToModel(format!(
+            "{}: independent review capability denied: no tool was run; only read-only repository inspection tools are available. Do not retry the mutation under the current permissions",
             call.tool_name.name
         )))
     }
@@ -734,7 +749,7 @@ async fn authorize_bound_typed_tool_call(
     if authorization.current_attempt.attempt_id != binding.attempt_id
         || authorization.current_attempt.state != AttemptState::Active
     {
-        return Err(FunctionCallError::DeniedToModel(format!(
+        return Err(FunctionCallError::RequiredOperationBlocked(format!(
             "{}: the bound typed assignment attempt is no longer active",
             call.tool_name.name
         )));
@@ -764,7 +779,7 @@ async fn authorize_bound_typed_tool_call(
             ))
         })?;
     if !heartbeated {
-        return Err(FunctionCallError::DeniedToModel(format!(
+        return Err(FunctionCallError::RequiredOperationBlocked(format!(
             "{}: the bound typed assignment attempt is no longer active",
             call.tool_name.name
         )));
