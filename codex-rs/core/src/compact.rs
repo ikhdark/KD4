@@ -580,6 +580,9 @@ async fn run_compact_task_inner_impl(
     {
         content.push(ContentItem::InputText { text });
     }
+    if let Some(plan) = retained_plan_context(sess.as_ref()).await? {
+        unresolved_history.push(plan);
+    }
     unresolved_history.push(summary_item);
     let mut new_history = unresolved_history;
     if let Some(summary_item) = new_history.last_mut() {
@@ -1204,6 +1207,20 @@ pub(crate) fn collect_unresolved_agent_messages(items: &[ResponseItem]) -> Vec<R
 }
 
 fn unresolved_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    let start = unresolved_compaction_start(items);
+    strip_compaction_startup_envelopes(
+        items
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                *index >= start || crate::session::is_unified_exec_resume_invalidation(item)
+            })
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn unresolved_compaction_start(items: &[ResponseItem]) -> usize {
     let base_start = items
         .iter()
         .rposition(is_compaction_model_generated_item)
@@ -1212,7 +1229,7 @@ fn unresolved_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
         .iter()
         .filter_map(compaction_output_call_id)
         .collect::<BTreeSet<_>>();
-    let start = items[..base_start]
+    items[..base_start]
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
@@ -1221,8 +1238,7 @@ fn unresolved_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
                 .map(|_| index)
         })
         .min()
-        .unwrap_or(base_start);
-    strip_compaction_startup_envelopes(items[start..].to_vec())
+        .unwrap_or(base_start)
 }
 
 fn compaction_call_id(item: &ResponseItem) -> Option<&str> {
@@ -1356,6 +1372,7 @@ pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<Resp
     (history, retained_images)
 }
 
+#[cfg(test)]
 pub(crate) fn build_unresolved_input_checkpoint(
     items: &[ResponseItem],
 ) -> (Vec<ResponseItem>, usize, bool) {
@@ -1375,10 +1392,72 @@ pub(crate) fn build_unresolved_input_checkpoint(
     (history, retained_image_count, omitted_text)
 }
 
+/// Remote compaction is opaque: preserve the actual user requests and the latest
+/// assistant handoff as well as the unconsumed tail. A model-generated boundary
+/// means input was observed, not that the requested work was completed.
+pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    let unresolved_start = unresolved_compaction_start(items);
+    let latest_assistant = items.iter().rposition(
+        |item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"),
+    );
+    let latest_summary = items.iter().rposition(is_compaction_summary_item);
+    let mut retained = strip_compaction_startup_envelopes(
+        items
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                *index >= unresolved_start
+                    || crate::session::is_unified_exec_resume_invalidation(item)
+                    || Some(*index) == latest_assistant
+                    || Some(*index) == latest_summary
+                    || (matches!(item, ResponseItem::Message { role, .. } if role == "user")
+                        && !is_compaction_summary_item(item))
+            })
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>(),
+    );
+    retained.retain_mut(|item| {
+        if let ResponseItem::Message { content, .. } = item {
+            content.retain(|part| {
+                !matches!(part, ContentItem::InputText { text }
+                if text.starts_with("<codex_internal_context source=\"compaction_plan\">"))
+            });
+            return !content.is_empty();
+        }
+        true
+    });
+    retained
+}
+
+pub(crate) fn build_task_input_checkpoint(
+    items: &[ResponseItem],
+) -> (Vec<ResponseItem>, usize, bool) {
+    let (mut history, retained_images, omitted_images, _, omitted_text) =
+        build_bounded_input_history(task_compaction_items(items), true);
+    if omitted_images > 0 {
+        history.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: compaction_image_omission_marker(omitted_images),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        });
+    }
+    (history, retained_images, omitted_text)
+}
+
 fn build_bounded_unresolved_input_history(
     items: &[ResponseItem],
 ) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
-    let unresolved = unresolved_compaction_items(items);
+    build_bounded_input_history(unresolved_compaction_items(items), false)
+}
+
+fn build_bounded_input_history(
+    unresolved: Vec<ResponseItem>,
+    retain_handoff: bool,
+) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
     let (user_source_indices, messages): (Vec<_>, Vec<_>) = unresolved
         .iter()
         .enumerate()
@@ -1425,6 +1504,65 @@ fn build_bounded_unresolved_input_history(
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut omission_receipts = Vec::new();
+    // Preserve the runtime boundary in source order. Moving it after post-resume
+    // command receipts could incorrectly invalidate a newly returned handle.
+    indexed_items.extend(
+        unresolved
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| crate::session::is_unified_exec_resume_invalidation(item))
+            .map(|(index, item)| (index, item.clone())),
+    );
+    let latest_assistant = unresolved.iter().rposition(
+        |item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"),
+    );
+    let latest_summary = unresolved.iter().rposition(is_compaction_summary_item);
+    for (source_index, item) in unresolved.iter().enumerate().filter(|(index, _)| {
+        retain_handoff && (Some(*index) == latest_assistant || Some(*index) == latest_summary)
+    }) {
+        let ResponseItem::Message { role, content, .. } = item else {
+            continue;
+        };
+        if role != "assistant" && !is_compaction_summary_item(item) {
+            continue;
+        }
+        let Some(text) = content_items_to_text(content) else {
+            continue;
+        };
+        let bounded = truncate_text_to_token_ceiling(&text, COMPACT_TASK_STATE_MAX_TOKENS);
+        let mut retained = item.clone();
+        if bounded != text
+            && let ResponseItem::Message { content, .. } = &mut retained
+        {
+            *content = vec![if role == "assistant" {
+                ContentItem::OutputText {
+                    text: bounded.clone(),
+                }
+            } else {
+                ContentItem::InputText {
+                    text: bounded.clone(),
+                }
+            }];
+        }
+        indexed_items.push((source_index, retained));
+        if bounded != text {
+            omission_receipts.push((
+                source_index,
+                compaction_text_omission_receipt(
+                    if role == "assistant" {
+                        "assistant"
+                    } else {
+                        "user"
+                    },
+                    item.id().map(ToString::to_string),
+                    source_index,
+                    item.turn_id().map(str::to_string),
+                    approx_token_count(&text),
+                    approx_token_count(&bounded),
+                ),
+            ));
+        }
+    }
     let mut omitted_user_text = false;
     for (user_index, message) in messages.iter().enumerate() {
         let source_index = user_source_indices[user_index];
@@ -1627,6 +1765,60 @@ pub(crate) async fn persist_compaction_text_recovery(
     let Some(canonical) = compaction_text_recovery_canonical(source_items, omitted_text) else {
         return Ok(None);
     };
+    persist_compaction_recovery(sess, canonical).await.map(Some)
+}
+
+pub(crate) async fn persist_task_compaction_text_recovery(
+    sess: &Session,
+    source_items: &[ResponseItem],
+    omitted_text: bool,
+) -> CodexResult<Option<String>> {
+    if !omitted_text {
+        return Ok(None);
+    }
+    let canonical = compaction_text_recovery_for_items(task_compaction_items(source_items));
+    persist_compaction_recovery(sess, canonical).await.map(Some)
+}
+
+pub(crate) async fn retained_plan_context(sess: &Session) -> CodexResult<Option<ResponseItem>> {
+    use crate::context::ContextualUserFragment;
+    use crate::context::InternalContextSource;
+    use crate::context::InternalModelContextFragment;
+
+    let Some(plan) = sess.services.plan_store.snapshot().await else {
+        return Ok(None);
+    };
+    let serialized = serde_json::to_string(&plan)
+        .map_err(|error| CodexErr::Fatal(format!("could not preserve compaction plan: {error}")))?;
+    let bounded = truncate_text_to_token_ceiling(&serialized, COMPACT_TASK_STATE_MAX_TOKENS);
+    let mut body = format!(
+        "Retained checklist from before compaction, not a new request or proof of completion. \
+Match remaining work to the original user requirements and latest corrections; \
+completed plan steps do not establish acceptance.\n{bounded}"
+    );
+    if bounded != serialized {
+        let recovery = persist_compaction_recovery(
+            sess,
+            CanonicalToolResult::json(serde_json::json!({"items": [{"current_plan": plan}]})),
+        )
+        .await?;
+        body.push_str(
+            "\nChecklist excerpt is incomplete. Recover the full plan at /items/0/current_plan.\n",
+        );
+        body.push_str(&recovery);
+    }
+    Ok(Some(ContextualUserFragment::into(
+        InternalModelContextFragment::new(
+            InternalContextSource::from_static("compaction_plan"),
+            body,
+        ),
+    )))
+}
+
+async fn persist_compaction_recovery(
+    sess: &Session,
+    canonical: CanonicalToolResult,
+) -> CodexResult<String> {
     let codex_home = sess.codex_home().await;
     let artifact = create_canonical_output_artifact(
         codex_home.as_path(),
@@ -1640,14 +1832,12 @@ pub(crate) async fn persist_compaction_text_recovery(
                 .to_string(),
         ));
     }
-    compaction_text_recovery_sidecar(&canonical, &artifact)
-        .map(Some)
-        .ok_or_else(|| {
-            CodexErr::Fatal(
-                "Compaction recovery artifact is unavailable; original history was retained."
-                    .to_string(),
-            )
-        })
+    compaction_text_recovery_sidecar(&canonical, &artifact).ok_or_else(|| {
+        CodexErr::Fatal(
+            "Compaction recovery artifact is unavailable; original history was retained."
+                .to_string(),
+        )
+    })
 }
 
 fn compaction_text_recovery_canonical(
@@ -1657,7 +1847,13 @@ fn compaction_text_recovery_canonical(
     if !omitted_text {
         return None;
     }
-    let exact_items = unresolved_compaction_items(source_items)
+    Some(compaction_text_recovery_for_items(
+        unresolved_compaction_items(source_items),
+    ))
+}
+
+fn compaction_text_recovery_for_items(items: Vec<ResponseItem>) -> CanonicalToolResult {
+    let exact_items = items
         .into_iter()
         .filter(|item| {
             matches!(
@@ -1666,12 +1862,12 @@ fn compaction_text_recovery_canonical(
             )
         })
         .collect::<Vec<_>>();
-    Some(CanonicalToolResult::json(serde_json::json!({
+    CanonicalToolResult::json(serde_json::json!({
         "version": 1,
         "kind": "local_compaction_text_recovery",
         "instruction": "Recover exact unresolved text with read_tool_output and a json_pointer under /items; do not ask the user to repeat it.",
         "items": exact_items,
-    })))
+    }))
 }
 
 fn compaction_text_recovery_sidecar(

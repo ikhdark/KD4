@@ -21,4 +21,4 @@
 * Every test must assert an expected result and fail for a plausible incorrect implementation of the behavior or logic under test.
 * Repair weak tests covering the changed behavior or blocking its validation. Report unrelated weaknesses encountered without starting a broader test audit.
 * When validation or tests report errors, warnings, or failures, let the current run finish and diagnose all reported issues before making repair edits. Apply related fixes in consolidated batches and rerun affected tests or validation checks that have not yet passed. Repeat only if failures remain or new evidence requires it.
-* Do not rerun tests or validation checks that have already passed during the current session; reuse their recorded results.
+* Do not rerun tests or validation checks that have already passed in your current validation session.

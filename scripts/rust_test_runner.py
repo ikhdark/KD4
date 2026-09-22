@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import fnmatch
 import json
 import math
@@ -14,9 +15,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,7 @@ class Target:
     selector_kind: str
     selector_value: str | None
     helpers: tuple[str, ...]
+    helpers_by_test_prefix: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def selection_args(self) -> list[str]:
         args = ["-p", self.package]
@@ -151,7 +154,7 @@ class Manifest:
             table = _require_table(value, f"targets.{target_name}")
             _reject_unknown(
                 table,
-                {"package", "lib", "test", "bin", "helpers"},
+                {"package", "lib", "test", "bin", "helpers", "helpers_by_test_prefix"},
                 f"targets.{target_name}",
             )
             package = _require_string(
@@ -181,12 +184,32 @@ class Manifest:
                     raise RunnerError(
                         f"targets.{target_name}.helpers references unknown helper {helper_name!r}"
                     )
+            prefix_helpers = {}
+            for prefix, names in _require_table(
+                table.get("helpers_by_test_prefix", {}),
+                f"targets.{target_name}.helpers_by_test_prefix",
+            ).items():
+                if not re.fullmatch(r"[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*::", prefix):
+                    raise RunnerError(f"invalid test module prefix {prefix!r}")
+                names = _require_string_list(names, f"helper prefix {prefix}")
+                _reject_duplicates(names, f"helper prefix {prefix}")
+                if not set(names).issubset(helper_names):
+                    raise RunnerError(
+                        f"helper prefix {prefix} must be a subset of target helpers"
+                    )
+                if any(
+                    prefix.startswith(other) or other.startswith(prefix)
+                    for other in prefix_helpers
+                ):
+                    raise RunnerError(f"overlapping helper prefix {prefix!r}")
+                prefix_helpers[prefix] = tuple(names)
             targets[target_name] = Target(
                 target_name,
                 package,
                 selector_kind,
                 selector_value,
                 tuple(helper_names),
+                prefix_helpers,
             )
 
         gates: dict[str, Gate] = {}
@@ -379,9 +402,10 @@ class MetadataIndex:
 Executor = Callable[..., subprocess.CompletedProcess[str]]
 
 # Cargo and nextest put machine-readable output on stdout and build progress,
-# rendered diagnostics, and test status on stderr. Capturing both streams hides
-# every "Compiling ..." line, so a narrow run that still has to build looks
-# hung. Capture only the stream the runner has to parse.
+# rendered diagnostics, and test status on stderr. Keep streams the runner does
+# not parse visible while retaining their full contents for failure recovery.
+# Capture policy controls live display, not retention: every child stream is
+# retained so failures and interruption do not require another test execution.
 CAPTURE_NONE = "none"
 CAPTURE_STDOUT = "stdout"
 CAPTURE_BOTH = "both"
@@ -433,6 +457,30 @@ def _stop_process_tree(process: subprocess.Popen) -> None:
     process.wait(timeout=15)
 
 
+def _stream_retained_log(
+    path: Path, destination: Any, stopped: threading.Event
+) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    with path.open("rb") as output:
+        while True:
+            chunk = output.read(8192)
+            if chunk:
+                text = decoder.decode(chunk)
+            elif stopped.is_set():
+                text = decoder.decode(b"", final=True)
+            else:
+                stopped.wait(0.05)
+                continue
+            try:
+                destination.write(text)
+                destination.flush()
+            except (OSError, ValueError):
+                # A closed terminal must not prevent durable result retention.
+                return
+            if not chunk:
+                return
+
+
 def _default_executor(
     args: Sequence[str],
     *,
@@ -452,13 +500,12 @@ def _default_executor(
     paths: dict[str, Path] = {}
     with ExitStack() as stack:
         streams = {}
+        followers = []
+        stopped = threading.Event()
         for name, enabled in (
             ("stdout", capture != CAPTURE_NONE),
             ("stderr", capture == CAPTURE_BOTH),
         ):
-            if not enabled:
-                streams[name] = None
-                continue
             log_dir = Path(env.get("CODEX_RUST_TEST_LOG_DIR", tempfile.gettempdir()))
             log_dir.mkdir(parents=True, exist_ok=True)
             log = stack.enter_context(
@@ -471,6 +518,22 @@ def _default_executor(
             )
             paths[name] = Path(log.name)
             streams[name] = log
+            if not enabled:
+                follower = threading.Thread(
+                    target=_stream_retained_log,
+                    args=(paths[name], getattr(sys, name), stopped),
+                    daemon=True,
+                )
+                follower.start()
+                followers.append(follower)
+
+        def finish_streams() -> None:
+            stopped.set()
+            for follower in followers:
+                follower.join()
+
+        # The process owner exits first, so final output is drained before logs close.
+        stack.callback(finish_streams)
         process = stack.enter_context(
             owned_process(
                 list(args),
@@ -573,6 +636,7 @@ class RustTestRunner:
         # Ordinary acceptance must never update its expected outputs implicitly.
         self.base_env["INSTA_UPDATE"] = "no"
         self.base_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
+        self._sccache_disabled = False
         # CARGO_INCREMENTAL stays untouched on purpose. `scripts/just-shell.py`
         # points RUSTC_WRAPPER at sccache for every recipe, and sccache aborts
         # the whole build when that variable asks for incremental compilation
@@ -708,10 +772,25 @@ class RustTestRunner:
         args = validate_filtering_args(filter_args)
         require_core_lib_filter(name, args, allow_all=allow_all)
         target = self.target(name)
-        env = self._build_helper_environment(self.active_helpers([name]))
-        # No discovery pass here: it would build the same test binary through a
-        # second Cargo invocation to learn what `--no-tests=fail` already
-        # enforces on the run itself.
+        helpers = self.active_helpers([name])
+        if target.helpers_by_test_prefix:
+            # Let nextest interpret filters, exclusions and ignored tests. Listing
+            # builds the unit binary without building unrelated helper binaries.
+            selected = self._list_tests(target, args)
+            required = []
+            for test in selected:
+                required.extend(
+                    next(
+                        (
+                            names
+                            for prefix, names in target.helpers_by_test_prefix.items()
+                            if test.startswith(prefix)
+                        ),
+                        target.helpers,
+                    )
+                )
+            helpers = self._active_helper_names(required)
+        env = self._build_helper_environment(helpers)
         self._checked(
             self._run_command(target, args, no_fail_fast=no_fail_fast),
             env=env,
@@ -1166,16 +1245,32 @@ class RustTestRunner:
         env: Mapping[str, str],
         capture: str,
     ) -> subprocess.CompletedProcess[str]:
-        try:
-            result = self.executor(
-                list(args),
-                cwd=self.cwd,
-                env=env,
-                capture=capture,
+        effective_env = dict(env)
+        if self._sccache_disabled:
+            effective_env["RUSTC_WRAPPER"] = ""
+        for attempt in range(2):
+            try:
+                result = self.executor(
+                    list(args),
+                    cwd=self.cwd,
+                    env=dict(effective_env),
+                    capture=capture,
+                )
+            except CleanupFailed as error:
+                (self.target_dir / ".lane-cleanup-unconfirmed").write_text(str(error))
+                raise RunnerError(str(error), outcome="cleanup_failed") from error
+            if attempt or not self._cache_transport_failure(
+                args, effective_env, result
+            ):
+                break
+            print(
+                "Compiler cache connection failed; retrying compilation once without sccache.\n"
+                + self._failure_detail(result, include_stdout=False),
+                file=sys.stderr,
             )
-        except CleanupFailed as error:
-            (self.target_dir / ".lane-cleanup-unconfirmed").write_text(str(error))
-            raise RunnerError(str(error), outcome="cleanup_failed") from error
+            self._sccache_disabled = True
+            self.base_env["RUSTC_WRAPPER"] = ""
+            effective_env["RUSTC_WRAPPER"] = ""
         if result.returncode != 0:
             # A CAPTURE_STDOUT command captured only machine-readable output and
             # already streamed its diagnostics to the terminal.
@@ -1184,9 +1279,47 @@ class RustTestRunner:
             )
             rendered = subprocess.list2cmdline(list(args))
             if detail:
-                raise RunnerError(f"command failed ({rendered}):\n{detail}")
-            raise RunnerError(f"command failed ({rendered})")
+                raise RunnerError(
+                    f"command failed ({rendered}), exit code {result.returncode}:\n{detail}"
+                )
+            raise RunnerError(
+                f"command failed ({rendered}), exit code {result.returncode}"
+            )
         return result
+
+    @staticmethod
+    def _cache_transport_failure(
+        args: Sequence[str],
+        env: Mapping[str, str],
+        result: subprocess.CompletedProcess[str],
+    ) -> bool:
+        wrapper = (
+            env.get("RUSTC_WRAPPER", "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        )
+        if not result.returncode or wrapper not in {"sccache", "sccache.exe"}:
+            return False
+        if list(args[:2]) != ["cargo", "build"] and list(args[:3]) not in (
+            ["cargo", "nextest", "list"],
+            ["cargo", "nextest", "run"],
+        ):
+            return False
+        transport = compile_failed = False
+        for stream in ("stdout", "stderr"):
+            for line in _output_lines(result, stream):
+                # Never replay tests or retry ordinary compiler diagnostics.
+                if (
+                    "Nextest run ID" in line
+                    or "error[E" in line
+                    or '"level":"error"' in line
+                ):
+                    return False
+                compile_failed |= "error: could not compile" in line
+                transport |= (
+                    "sccache: caused by: error reading compile response from server"
+                    in line
+                )
+                transport |= "sccache: caused by: failed to connect to server" in line
+        return transport and compile_failed
 
     def _failure_detail(
         self,

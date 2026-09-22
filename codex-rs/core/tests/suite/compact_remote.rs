@@ -13,12 +13,117 @@ use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::sync::Arc;
 use tokio::time::Duration;
 use wiremock::ResponseTemplate;
 
 const DUMMY_FUNCTION_NAME: &str = "test_tool";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_handle_invalidation_reaches_requests_after_repeated_compaction() -> Result<()> {
+    use std::io::Write;
+    const ORIGINAL_TASK: &str =
+        "Implement model, tool, network, IPC, database, and subprocess support.";
+    const USER_CONSTRAINT: &str = "Finish the work; do not rerun tests.";
+    const HANDOFF: &str = "Filesystem reads work; network and subprocess support are unfinished.";
+    require_network!();
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let initial = builder.build(&server).await?;
+    let home = Arc::clone(&initial.home);
+    let path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("initial-message", HANDOFF),
+            responses::ev_completed("initial-turn"),
+        ]),
+    )
+    .await;
+    initial
+        .submit_turn(&format!("{ORIGINAL_TASK}\n{USER_CONSTRAINT}"))
+        .await?;
+    initial.codex.shutdown_and_wait().await?;
+    // Persist an old nested command without launching an OS process. Resume must
+    // establish the real runtime invalidation boundary from these receipts.
+    let mut rollout = std::fs::OpenOptions::new().append(true).open(&path)?;
+    for payload in [
+        json!({"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({cmd: 'old work'})","call_id":"old-exec"}),
+        json!({"type":"custom_tool_call_output","call_id":"old-exec","output":"Nested command states (independent of script completion):\n[{\"tool\":\"exec_command\",\"session_id\":50820,\"process_exited\":false}]"}),
+    ] {
+        writeln!(
+            rollout,
+            "{}",
+            json!({"timestamp":"2026-09-21T23:00:00Z","type":"response_item","payload":payload})
+        )?;
+    }
+    drop(rollout);
+    let resumed = builder.resume(&server, home, path).await?;
+    let mock = responses::mount_sse_sequence(&server, (0..2).flat_map(|index| [
+        responses::sse(vec![json!({"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":format!("checkpoint-{index}")}}), responses::ev_completed(&format!("compact-{index}"))]),
+        responses::sse(vec![responses::ev_assistant_message(&format!("message-{index}"), "Continue the original work."), responses::ev_completed(&format!("turn-{index}"))]),
+    ]).collect()).await;
+    for _ in 0..2 {
+        resumed.codex.submit(Op::Compact).await?;
+        wait_for_turn_complete(&resumed.codex).await;
+        resumed
+            .submit_turn("Continue the existing task without polling pre-resume handles.")
+            .await?;
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    for (index, request) in [&requests[1], &requests[3]].into_iter().enumerate() {
+        let body = request.body_json();
+        let input = body["input"].as_array().expect("input");
+        let retained_task = input
+            .iter()
+            .filter(|item| item["role"] == "user" && item.to_string().contains(ORIGINAL_TASK))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained_task.len(),
+            1,
+            "the original task must survive each checkpoint"
+        );
+        assert!(retained_task[0].to_string().contains(USER_CONSTRAINT));
+        let expected_handoff = if index == 0 {
+            HANDOFF
+        } else {
+            "Continue the original work."
+        };
+        assert!(input.iter().any(|item| {
+            item["role"] == "assistant" && item.to_string().contains(expected_handoff)
+        }));
+        let notices = body["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .filter(|item| {
+                item["role"] == "developer"
+                    && item
+                        .to_string()
+                        .contains("<unified_exec_resume_invalidated>")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .to_string()
+                .contains("Do not poll those old sessions")
+        );
+        assert!(
+            notices[0]
+                .to_string()
+                .contains("Newly returned session IDs are valid")
+        );
+    }
+    Ok(())
+}
 
 fn test_codex() -> TestCodexBuilder {
     base_test_codex()
@@ -309,9 +414,10 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         "expected follow-up request to include the compaction payload"
     );
     assert!(
-        !follow_up_body.contains("hello remote compact"),
-        "expected v2 follow-up request to evict original user history consumed by compaction"
+        follow_up_body.contains("hello remote compact"),
+        "expected v2 follow-up request to retain the original task after compaction"
     );
+    assert!(follow_up_body.contains("FIRST_REMOTE_REPLY"));
 
     Ok(())
 }
@@ -439,7 +545,8 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
         assert!(replacement.iter().any(|item| item["type"] == "compaction"
             && item["encrypted_content"] == "RETRIED_COMPACT_SUMMARY"));
         assert!(!serde_json::to_string(replacement)?.contains("FAILED_COMPACT_SUMMARY"));
-        assert!(!serde_json::to_string(replacement)?.contains("hello remote compact"));
+        assert!(serde_json::to_string(replacement)?.contains("hello remote compact"));
+        assert!(serde_json::to_string(replacement)?.contains("FIRST_REMOTE_REPLY"));
 
         let replay = codex_rollout_trace::replay_bundle(bundle)?;
         assert_eq!(replay.compactions.len(), 1);

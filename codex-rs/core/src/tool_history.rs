@@ -38,8 +38,16 @@ const RECEIPT_DIGEST_TARGET_TOKENS: usize = 96;
 // Aggregate raw tool-result tokens kept model-visible before consumed results
 // are compacted to receipts. A 10k budget compacted a 5k-token read after one
 // generation, so the model re-ran identical reads instead of reusing evidence;
-// keep roughly a quarter of the window so an investigation turn stays raw.
-const DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 60_000;
+// Keep a bounded working set of source and validation evidence across an
+// investigation. The complete prompt still obeys the model context limit.
+const DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 75_000;
+// When consumed results must be compacted, compact past the ceiling by this
+// share of the budget. Each request otherwise squeezes out exactly the next
+// oldest result, rewriting the provider-cached prefix at that item on nearly
+// every generation; sessions showed 41/58 and 48/66 requests re-sending the
+// history from its first tool output. Only results older than the newest
+// consumed one pay for the headroom.
+const TOOL_RESULT_BUDGET_DEGRADATION_HEADROOM_PERCENT: usize = 20;
 
 #[cfg(test)]
 thread_local! {
@@ -54,6 +62,19 @@ pub(crate) fn model_visible_tool_result_token_budget() -> usize {
         return budget;
     }
     DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+}
+
+/// Raw tool results may keep about half of the model context window. The
+/// fixed default applies only while the window is unknown; a 75k working set
+/// inside a 258k window evicted evidence read a few generations earlier while
+/// most of the window stayed empty, so the model re-read the same files.
+pub(crate) fn model_visible_tool_result_token_budget_for_context_window(
+    context_window: Option<i64>,
+) -> usize {
+    context_window
+        .and_then(|window| usize::try_from(window).ok())
+        .filter(|window| *window > 0)
+        .map_or_else(model_visible_tool_result_token_budget, |window| window / 2)
 }
 
 /// Restores the previous test budget when dropped.
@@ -77,6 +98,12 @@ pub(crate) fn override_model_visible_tool_result_token_budget_for_test(
         MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(|cell| cell.replace(Some(budget))),
     )
 }
+fn tool_result_budget_degradation_headroom() -> usize {
+    model_visible_tool_result_token_budget()
+        .saturating_mul(TOOL_RESULT_BUDGET_DEGRADATION_HEADROOM_PERCENT)
+        / 100
+}
+
 const COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET: usize = 2_000;
 const COMPACTION_ARTIFACT_PIN_MAX_ITEMS: usize = 32;
 const MINIMUM_RAW_TOKENS: u64 = 256;
@@ -89,6 +116,51 @@ const JOURNAL_VERSION: u8 = 1;
 pub(crate) struct ModelGenerationId {
     pub(crate) turn_id: String,
     pub(crate) ordinal: u32,
+}
+
+/// Model-visible form in which a tool result last reached the provider.
+///
+/// Recorded from the request input that was actually sent, never from a
+/// projection that was only prepared. Later requests keep or lower the form
+/// but never raise it: a result the provider already saw compacted or omitted
+/// is not re-expanded when pressure eases, so the cached prefix survives.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ExposedRepresentation {
+    Raw,
+    Compact { sha256: String },
+    Omitted,
+}
+
+impl ExposedRepresentation {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Raw => 0,
+            Self::Compact { .. } => 1,
+            Self::Omitted => 2,
+        }
+    }
+
+    fn compact_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Compact { sha256 } => Some(sha256),
+            Self::Raw | Self::Omitted => None,
+        }
+    }
+}
+
+/// Consumption state changed by one sent request: newly consumed results and
+/// exposure-ledger entries that were created or lowered.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ToolHistoryConsumptionDelta {
+    pub(crate) call_ids: BTreeSet<String>,
+    pub(crate) exposed_representations: BTreeMap<String, ExposedRepresentation>,
+}
+
+impl ToolHistoryConsumptionDelta {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.call_ids.is_empty() && self.exposed_representations.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -462,6 +534,16 @@ pub(crate) struct ToolOutputBudgetDrops {
     pub(crate) tokens: u64,
 }
 
+/// The projection sent in the previous sampling request of the current turn,
+/// keyed by the prepared (pre-projection) items it was computed from. Later
+/// requests in the turn extend it instead of re-budgeting it; see
+/// [`ToolHistoryState::project_continuation_with_workspace_cache`].
+#[derive(Clone, Debug)]
+pub(crate) struct SamplingProjectionAnchor {
+    pub(crate) prepared_items: Arc<[ResponseItem]>,
+    pub(crate) projection: ToolHistoryProjection,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolHistoryProjection {
     pub(crate) items: Arc<[ResponseItem]>,
@@ -537,6 +619,14 @@ impl Deref for ProjectedResponseItems {
 pub(crate) struct ToolHistoryState {
     #[serde(default)]
     candidates: BTreeMap<String, ToolHistoryCandidate>,
+    /// Exposure is independent of artifact retention. Otherwise old results
+    /// without artifacts keep unread priority and evict newer source evidence.
+    #[serde(default)]
+    untracked_consumption: BTreeMap<String, ModelGenerationId>,
+    /// The most complete representation of each output a sent request has
+    /// exposed to the model. Entries only move toward a more complete form.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    exposed_representations: BTreeMap<String, ExposedRepresentation>,
     #[serde(default)]
     workspace_evidence: BTreeMap<String, WorkspaceEvidenceObservation>,
     /// Current runtimes record completed code-mode carriers that authoritatively
@@ -552,6 +642,10 @@ pub(crate) struct ToolHistoryState {
     internal_artifact_origins: BTreeMap<String, (String, u64, String)>,
     #[serde(skip)]
     artifact_call_ids: BTreeMap<String, String>,
+    /// Derived from the active model context window by the owning history;
+    /// not part of the persisted ledger.
+    #[serde(skip)]
+    model_visible_tool_result_token_budget: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -694,6 +788,10 @@ pub(crate) enum ToolHistoryMutation {
     MarkConsumed {
         call_ids: BTreeSet<String>,
         generation: ModelGenerationId,
+        // Omitted when empty so records written before the exposure ledger
+        // existed keep their journal checksums.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        exposed_representations: BTreeMap<String, ExposedRepresentation>,
     },
 }
 
@@ -772,7 +870,12 @@ impl ToolHistoryMutation {
             Self::MarkConsumed {
                 call_ids,
                 generation,
-            } => state.mark_call_ids_consumed(call_ids, generation),
+                exposed_representations,
+            } => {
+                let consumed = state.mark_call_ids_consumed(call_ids, generation);
+                let exposed = state.record_exposed_representations(exposed_representations);
+                consumed || exposed
+            }
         }
     }
 }
@@ -780,13 +883,20 @@ impl ToolHistoryMutation {
 impl ToolHistoryState {
     fn is_persisted_empty(&self) -> bool {
         self.candidates.is_empty()
+            && self.untracked_consumption.is_empty()
             && self.internal_artifact_origins.is_empty()
             && self.workspace_evidence.is_empty()
             && self.non_workspace_code_mode_calls.is_empty()
             && self.code_mode_nested_evidence.is_empty()
+            && self.exposed_representations.is_empty()
     }
 
     pub(crate) fn register(&mut self, mut candidate: ToolHistoryCandidate) {
+        if let Some(generation) = self.untracked_consumption.remove(&candidate.call_id)
+            && candidate.consumed_by_generation.is_none()
+        {
+            candidate.consumed_by_generation = Some(generation);
+        }
         candidate.refresh_derived();
         let call_id = candidate.call_id.clone();
         let artifact_id = candidate.artifact_id.clone();
@@ -928,6 +1038,25 @@ impl ToolHistoryState {
         changed
     }
 
+    pub(crate) fn configured_model_visible_tool_result_token_budget(&self) -> Option<usize> {
+        self.model_visible_tool_result_token_budget
+    }
+
+    pub(crate) fn set_model_visible_tool_result_token_budget(&mut self, budget: Option<usize>) {
+        self.model_visible_tool_result_token_budget = budget;
+    }
+
+    fn tool_result_token_budget(&self) -> usize {
+        #[cfg(test)]
+        if let Some(budget) =
+            MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(std::cell::Cell::get)
+        {
+            return budget;
+        }
+        self.model_visible_tool_result_token_budget
+            .unwrap_or(DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET)
+    }
+
     pub(crate) fn register_workspace_evidence(
         &mut self,
         observation: WorkspaceEvidenceObservation,
@@ -950,6 +1079,27 @@ impl ToolHistoryState {
     pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
         self.workspace_evidence.remove(&call_id);
         self.non_workspace_code_mode_calls.insert(call_id);
+    }
+
+    /// Records exposure-ledger entries that were created or lowered in rank by
+    /// a sent request. A later, less complete exposure never hides that the
+    /// model already saw a more complete form.
+    fn record_exposed_representations(
+        &mut self,
+        exposed_representations: &BTreeMap<String, ExposedRepresentation>,
+    ) -> bool {
+        let mut changed = false;
+        for (call_id, representation) in exposed_representations {
+            match self.exposed_representations.get(call_id) {
+                Some(existing) if existing.rank() <= representation.rank() => {}
+                _ => {
+                    self.exposed_representations
+                        .insert(call_id.clone(), representation.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     #[cfg(test)]
@@ -991,9 +1141,10 @@ impl ToolHistoryState {
             .iter()
             .filter_map(canonical_textual_output_identity)
             .filter(|(call_id, _)| {
-                self.candidates
-                    .get(*call_id)
-                    .is_some_and(|candidate| candidate.consumed_by_generation.is_none())
+                self.candidates.get(*call_id).map_or_else(
+                    || !self.untracked_consumption.contains_key(*call_id),
+                    |candidate| candidate.consumed_by_generation.is_none(),
+                )
             })
             .map(|(call_id, text)| {
                 let output_sha256 = sha256(text.as_bytes());
@@ -1007,6 +1158,13 @@ impl ToolHistoryState {
             })
             .collect::<BTreeMap<_, _>>();
         let mut changed_call_ids = BTreeSet::new();
+        for call_id in exposed.keys() {
+            if !self.candidates.contains_key(*call_id) {
+                self.untracked_consumption
+                    .insert((*call_id).to_string(), generation.clone());
+                changed_call_ids.insert((*call_id).to_string());
+            }
+        }
         for candidate in self.candidates.values_mut() {
             if candidate.consumed_by_generation.is_some() {
                 continue;
@@ -1033,17 +1191,32 @@ impl ToolHistoryState {
     ) -> bool {
         let mut changed = false;
         for call_id in call_ids {
-            if let Some(candidate) = self.candidates.get_mut(call_id)
-                && candidate.consumed_by_generation.is_none()
+            if let Some(candidate) = self.candidates.get_mut(call_id) {
+                if candidate.consumed_by_generation.is_none() {
+                    candidate.consumed_by_generation = Some(generation.clone());
+                    changed = true;
+                }
+            } else if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.untracked_consumption.entry(call_id.clone())
             {
-                candidate.consumed_by_generation = Some(generation.clone());
+                entry.insert(generation.clone());
                 changed = true;
             }
         }
         changed
     }
 
-    #[cfg(test)]
+    fn output_was_consumed(&self, call_id: &str) -> bool {
+        self.untracked_consumption.contains_key(call_id)
+            || self
+                .candidates
+                .get(call_id)
+                .is_some_and(|candidate| candidate.consumed_by_generation.is_some())
+    }
+
+    /// Projects receipts and the aggregate budget without workspace freshness
+    /// checks. Prompt-size estimates use this so they measure the prompt the
+    /// model will actually receive rather than the raw canonical history.
     pub(crate) fn project(&self, items: Arc<[ResponseItem]>) -> ToolHistoryProjection {
         self.project_inner(items, None, None)
     }
@@ -1086,6 +1259,111 @@ impl ToolHistoryState {
             items_budget_drops: ToolOutputBudgetDrops::default(),
             unreplaced_items_budget_drops: ToolOutputBudgetDrops::default(),
         }
+    }
+
+    /// Extend the projection sent in the previous sampling request by the items
+    /// prepared since, instead of re-running the budget over items the model
+    /// already received.
+    ///
+    /// Consumption marks change after every generation, so a fresh budget pass
+    /// rewrote or dropped earlier outputs on nearly every continuation request.
+    /// Each rewrite moved the provider's prompt-prefix cache boundary back to
+    /// that item, and evicting evidence the model had just read made it re-read
+    /// the same files. Within a turn the earlier items therefore keep exactly the
+    /// representation they were sent with. Only workspace freshness still applies
+    /// to them, and only where their raw output is still exposed, so a read that
+    /// a later write invalidated is still flagged without disturbing anything
+    /// else. Returns `None` when the anchor no longer prefixes the prepared
+    /// items, in which case the caller runs the full projection.
+    pub(crate) fn project_continuation_with_workspace_cache(
+        &self,
+        anchor: &SamplingProjectionAnchor,
+        prepared_items: Arc<[ResponseItem]>,
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        git_workspace: &GitWorkspaceCache,
+    ) -> Option<ToolHistoryProjection> {
+        let anchored_len = anchor.prepared_items.len();
+        if prepared_items.len() < anchored_len
+            || prepared_items[..anchored_len] != anchor.prepared_items[..]
+        {
+            return None;
+        }
+        // Freshness runs over the canonical items so an earlier read is still
+        // invalidated by a later write, wherever that write appears.
+        let mut fresh = ProjectedResponseItems::Shared(Arc::clone(&prepared_items));
+        self.invalidate_stale_workspace_evidence(
+            &mut fresh,
+            workspace_identity,
+            Some(git_workspace),
+        );
+        let fresh = fresh.into_shared();
+        let stale_prefix = fresh[..anchored_len]
+            .iter()
+            .zip(prepared_items[..anchored_len].iter())
+            .filter(|(fresh_item, original)| fresh_item != original)
+            .filter_map(|(fresh_item, original)| {
+                let (call_id, original_output) = canonical_textual_output_identity(original)?;
+                Some((
+                    call_id.to_string(),
+                    (original_output.into_owned(), fresh_item.clone()),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let tail = &fresh[anchored_len..];
+        let extend = |base: &Arc<[ResponseItem]>| -> Arc<[ResponseItem]> {
+            let mut items = Vec::with_capacity(base.len().saturating_add(tail.len()));
+            for item in base.iter() {
+                // A receipt or pin already says the output is not current
+                // detail; only a still-raw output is replaced by its notice.
+                let stale =
+                    canonical_textual_output_identity(item).and_then(|(call_id, output)| {
+                        stale_prefix.get(call_id).filter(|(original_output, _)| {
+                            original_output.as_str() == output.as_ref()
+                        })
+                    });
+                items.push(match stale {
+                    Some((_, fresh_item)) => fresh_item.clone(),
+                    None => item.clone(),
+                });
+            }
+            items.extend(tail.iter().cloned());
+            items.into()
+        };
+        let items = extend(&anchor.projection.items);
+        let unreplaced_items = if Arc::ptr_eq(
+            &anchor.projection.unreplaced_items,
+            &anchor.projection.items,
+        ) {
+            Arc::clone(&items)
+        } else {
+            extend(&anchor.projection.unreplaced_items)
+        };
+        // Indices are stable because nothing before the tail was removed; a
+        // substitution only lapses when a freshness notice replaced its receipt.
+        let substitutions = anchor
+            .projection
+            .substitutions
+            .iter()
+            .filter(|substitution| {
+                items
+                    .get(substitution.item_index)
+                    .and_then(canonical_textual_output_identity)
+                    .is_some_and(|(call_id, output)| {
+                        call_id == substitution.call_id
+                            && sha256(output.as_bytes()) == substitution.substituted_output_sha256
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Some(ToolHistoryProjection {
+            items,
+            unreplaced_items,
+            substitutions: Arc::from(substitutions),
+            // No budget ran, so the attribution of the anchored request carries
+            // forward unchanged, as it does for cached prepared-history appends.
+            items_budget_drops: anchor.projection.items_budget_drops,
+            unreplaced_items_budget_drops: anchor.projection.unreplaced_items_budget_drops,
+        })
     }
 
     pub(crate) fn requires_workspace_evidence_validation(&self, items: &[ResponseItem]) -> bool {
@@ -1239,7 +1517,7 @@ impl ToolHistoryState {
                 })
             })
             .fold(0usize, usize::saturating_add)
-            <= model_visible_tool_result_token_budget();
+            <= self.tool_result_token_budget();
         let newest_unconsumed_non_text_item = admission_candidates
             .iter()
             .filter(|admission| {
@@ -1301,7 +1579,7 @@ impl ToolHistoryState {
                             )
                         })
                         .map(|(_, receipt_tokens)| raw_tokens.min(receipt_tokens))
-                        .filter(|tokens| *tokens <= model_visible_tool_result_token_budget())
+                        .filter(|tokens| *tokens <= self.tool_result_token_budget())
                         .unwrap_or(0);
                 }
 
@@ -1324,11 +1602,11 @@ impl ToolHistoryState {
                             .saturating_add(non_text_tokens);
                         raw_tokens.min(receipt_tokens)
                     })
-                    .filter(|tokens| *tokens <= model_visible_tool_result_token_budget());
+                    .filter(|tokens| *tokens <= self.tool_result_token_budget());
                 let pin_tokens = artifact_pins
                     .get(&admission_candidate.call_id)
                     .map(|(_, tokens)| *tokens)
-                    .filter(|tokens| *tokens <= model_visible_tool_result_token_budget());
+                    .filter(|tokens| *tokens <= self.tool_result_token_budget());
                 [Some(raw_tokens), receipt_tokens, pin_tokens]
                     .into_iter()
                     .flatten()
@@ -1373,8 +1651,8 @@ impl ToolHistoryState {
             .copied()
             .fold(0usize, usize::saturating_add);
         let mut decisions = BTreeMap::<String, AdmissionDecision>::new();
-        let mut remaining_tokens = model_visible_tool_result_token_budget();
-        let mut remaining_fallback_tokens = model_visible_tool_result_token_budget();
+        let mut remaining_tokens = self.tool_result_token_budget();
+        let mut remaining_fallback_tokens = self.tool_result_token_budget();
         for ((admission_candidate, reservation), fallback_reservation) in admission_candidates
             .into_iter()
             .zip(reservations)
@@ -1515,11 +1793,7 @@ impl ToolHistoryState {
         let unread_outputs = projected
             .iter()
             .filter_map(output_call_id)
-            .filter(|id| {
-                self.candidates
-                    .get(*id)
-                    .is_none_or(|candidate| candidate.consumed_by_generation.is_none())
-            })
+            .filter(|id| !self.output_was_consumed(id))
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
         let mut unreplaced_projected = projected.clone();
@@ -1743,9 +2017,7 @@ impl ToolHistoryState {
             if let Some((call_id, output)) = canonical_textual_output_identity(item) {
                 let candidate = self.candidates.get(call_id);
                 let non_text_tokens = non_text_output_token_cost(item);
-                if non_text_tokens > 0
-                    && candidate.is_none_or(|candidate| candidate.consumed_by_generation.is_none())
-                {
+                if non_text_tokens > 0 && !self.output_was_consumed(call_id) {
                     newest_unconsumed_image = Some(call_id.to_string());
                 }
                 // Dispatch failures and running-process receipts can lack a saved artifact.
@@ -1757,18 +2029,15 @@ impl ToolHistoryState {
                         if response_item_output_success(item) == Some(false) {
                             0
                         } else {
-                            1
+                            2
                         }
                     },
-                    |candidate| {
-                        admission_priority(candidate, &output)
-                            + if candidate.consumed_by_generation.is_some() {
-                                3
-                            } else {
-                                0
-                            }
-                    },
-                );
+                    |candidate| admission_priority(candidate, &output),
+                ) + if self.output_was_consumed(call_id) {
+                    3
+                } else {
+                    0
+                };
                 candidates.push((
                     priority,
                     std::cmp::Reverse(index),
@@ -1795,62 +2064,49 @@ impl ToolHistoryState {
             .iter()
             .map(|(_, _, _, cost)| *cost)
             .fold(0usize, usize::saturating_add)
-            <= model_visible_tool_result_token_budget()
+            <= self.tool_result_token_budget()
         {
             return ToolOutputBudgetDrops::default();
         }
         candidates.sort();
-        let mut remaining = model_visible_tool_result_token_budget();
+        // This final pass also sees untracked outputs and replayed receipts,
+        // which the earlier admission pass cannot reserve. Protect their
+        // cheapest representations before spending the budget on raw detail.
+        let receipts = candidates
+            .iter()
+            .map(|(_, index, call_id, cost)| {
+                self.tool_result_budget_receipt(&items[index.0], call_id)
+                    .filter(|(_, receipt_cost)| receipt_cost < cost)
+            })
+            .collect::<Vec<_>>();
+        let minimum_costs = candidates
+            .iter()
+            .zip(&receipts)
+            .map(|((_, _, _, cost), receipt)| receipt.as_ref().map_or(*cost, |(_, cost)| *cost))
+            .collect::<Vec<_>>();
+        let minimum_total = minimum_costs
+            .iter()
+            .copied()
+            .fold(0usize, usize::saturating_add);
+        // If even the compact forms cannot coexist, retain the existing
+        // priority-based eviction policy rather than starving newest outcomes.
+        let mut reserved =
+            (minimum_total <= self.tool_result_token_budget()).then_some(minimum_total);
+        let mut remaining = self.tool_result_token_budget();
         let mut dropped = BTreeSet::new();
         let mut dropped_tokens = 0_u64;
-        for (_, index, call_id, mut cost) in candidates {
-            if cost > remaining && newest_unconsumed_image.as_ref() != Some(&call_id) {
-                let item = &items[index.0];
-                // Preserve full diagnostics whenever they fit. Under pressure,
-                // an unread failure or live handle must survive even when no
-                // artifact was saved; mark its omitted detail explicitly.
-                if non_text_output_token_cost(item) == 0
-                    && let Some((receipt, receipt_cost)) = self.candidates.get(&call_id)
-                        .and_then(ToolHistoryCandidate::artifact_pin)
-                        .or_else(|| {
-                            if self.candidates.get(&call_id).is_some_and(|candidate| candidate.consumed_by_generation.is_some()) {
-                                return None;
-                            }
-                            let (_, output) = canonical_textual_output_identity(item)?;
-                            let receipt = serde_json::json!({
-                                "kind": "unconsumed_tool_outcome",
-                                "call_id": call_id,
-                                "successful": response_item_output_success(item),
-                                "digest": truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS),
-                                "control": truncate_text_to_token_ceiling(&output.lines().filter(|line| line.contains("session ID") || line.contains("Session ID") || line.contains("session_id") || line.contains("Exit code")).collect::<Vec<_>>().join("\n"), RECEIPT_DIGEST_TARGET_TOKENS),
-                                "output_omitted": true
-                            }).to_string();
-                            let cost = approx_token_count(&receipt);
-                            Some((receipt, cost))
-                        })
-                        .map(|(receipt, receipt_cost)| {
-                            let notice = canonical_textual_output_identity(item)
-                                .and_then(|(_, text)| serde_json::from_str::<serde_json::Value>(&text).ok());
-                            if let Some(notice) = notice.filter(|notice| notice["stale_workspace_evidence"] == true)
-                                && let Ok(mut compact) = serde_json::from_str::<serde_json::Value>(&receipt)
-                            {
-                                // Budgeting runs after freshness projection. A
-                                // historical artifact pin must not erase that warning.
-                                for key in ["stale_workspace_evidence", "valid_for_current_workspace", "reason_code", "rerun"] {
-                                    if let Some(value) = notice.get(key) {
-                                        compact[key] = value.clone();
-                                    }
-                                }
-                                let receipt = compact.to_string();
-                                let cost = approx_token_count(&receipt);
-                                (receipt, cost)
-                            } else {
-                                (receipt, receipt_cost)
-                            }
-                        })
-                    && receipt_cost < cost
-                    && receipt_cost <= remaining
-                    && let Some((_, body)) = textual_output_body_mut(&mut items.make_owned()[index.0])
+        for (((_, index, call_id, mut cost), receipt), minimum_cost) in
+            candidates.into_iter().zip(receipts).zip(minimum_costs)
+        {
+            if let Some(reserved) = reserved.as_mut() {
+                *reserved = reserved.saturating_sub(minimum_cost);
+            }
+            let available = remaining.saturating_sub(reserved.unwrap_or(0));
+            if cost > available && newest_unconsumed_image.as_ref() != Some(&call_id) {
+                if let Some((receipt, receipt_cost)) = receipt
+                    && receipt_cost <= available
+                    && let Some((_, body)) =
+                        textual_output_body_mut(&mut items.make_owned()[index.0])
                 {
                     replace_model_visible_output_text(body, receipt);
                     cost = receipt_cost;
@@ -1867,16 +2123,68 @@ impl ToolHistoryState {
         items.retain(|item| item_call_id(item).is_none_or(|id| !dropped.contains(id)));
         let unread_drops = dropped
             .iter()
-            .filter(|id| {
-                self.candidates
-                    .get(*id)
-                    .is_none_or(|candidate| candidate.consumed_by_generation.is_none())
-            })
+            .filter(|id| !self.output_was_consumed(id))
             .count();
         Self::append_unread_overflow_notice(items, unread_drops);
         ToolOutputBudgetDrops {
             count: u32::try_from(dropped.len()).unwrap_or(u32::MAX),
             tokens: dropped_tokens,
+        }
+    }
+
+    fn tool_result_budget_receipt(
+        &self,
+        item: &ResponseItem,
+        call_id: &str,
+    ) -> Option<(String, usize)> {
+        if non_text_output_token_cost(item) != 0 {
+            return None;
+        }
+        let candidate = self.candidates.get(call_id);
+        let (receipt, receipt_cost) = candidate
+            .and_then(ToolHistoryCandidate::artifact_pin)
+            .or_else(|| {
+                if candidate.is_some_and(|candidate| candidate.consumed_by_generation.is_some()) {
+                    return None;
+                }
+                let (_, output) = canonical_textual_output_identity(item)?;
+                let receipt = serde_json::json!({
+                    "kind": if self.output_was_consumed(call_id) {
+                        "observed_tool_outcome"
+                    } else {
+                        "unconsumed_tool_outcome"
+                    },
+                    "call_id": call_id,
+                    "successful": response_item_output_success(item),
+                    "digest": truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS),
+                    "control": truncate_text_to_token_ceiling(&output.lines().filter(|line| line.contains("session ID") || line.contains("Session ID") || line.contains("session_id") || line.contains("Exit code")).collect::<Vec<_>>().join("\n"), RECEIPT_DIGEST_TARGET_TOKENS),
+                    "output_omitted": true
+                }).to_string();
+                let cost = approx_token_count(&receipt);
+                Some((receipt, cost))
+            })?;
+        let notice = canonical_textual_output_identity(item)
+            .and_then(|(_, text)| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(notice) = notice.filter(|notice| notice["stale_workspace_evidence"] == true)
+            && let Ok(mut compact) = serde_json::from_str::<serde_json::Value>(&receipt)
+        {
+            // Budgeting runs after freshness projection. A historical artifact
+            // pin must not erase that warning, including its token cost.
+            for key in [
+                "stale_workspace_evidence",
+                "valid_for_current_workspace",
+                "reason_code",
+                "rerun",
+            ] {
+                if let Some(value) = notice.get(key) {
+                    compact[key] = value.clone();
+                }
+            }
+            let receipt = compact.to_string();
+            let cost = approx_token_count(&receipt);
+            Some((receipt, cost))
+        } else {
+            Some((receipt, receipt_cost))
         }
     }
 
@@ -2216,6 +2524,10 @@ impl ToolHistoryState {
         self.internal_artifact_origins
             .retain(|_, (call_id, _, _)| live.contains(call_id));
         self.candidates.retain(|call_id, _| live.contains(call_id));
+        self.untracked_consumption
+            .retain(|call_id, _| live.contains(call_id));
+        self.exposed_representations
+            .retain(|call_id, _| live.contains(call_id));
         self.workspace_evidence
             .retain(|call_id, _| live.contains(call_id));
         self.non_workspace_code_mode_calls
@@ -2895,11 +3207,14 @@ pub(crate) async fn remint_tool_history_state_for_fork(
     }
     let mut reminted_state = ToolHistoryState {
         candidates: reminted_candidates,
+        untracked_consumption: state.untracked_consumption,
+        exposed_representations: state.exposed_representations,
         workspace_evidence,
         non_workspace_code_mode_calls,
         code_mode_nested_evidence,
         internal_artifact_origins,
         artifact_call_ids: BTreeMap::new(),
+        model_visible_tool_result_token_budget: state.model_visible_tool_result_token_budget,
     };
     reminted_state.rebuild_artifact_index();
     (reminted_state, dropped_candidates)
@@ -3800,7 +4115,7 @@ fn tool_search_receipt(item: &ResponseItem) -> Option<ToolSearchReceiptV1> {
         .flatten()
 }
 
-fn item_call_id(item: &ResponseItem) -> Option<&str> {
+pub(crate) fn item_call_id(item: &ResponseItem) -> Option<&str> {
     match item {
         ResponseItem::FunctionCall { call_id, .. }
         | ResponseItem::CustomToolCall { call_id, .. }
@@ -4009,19 +4324,17 @@ fn source_dependencies_from_arguments(
         let shell_type = shell_type.or_else(|| infer_direct_shell_type(&command));
         match rg_argv_commands(&command, shell_type) {
             Ok(commands) if !commands.is_empty() => {
-                if let Some(scopes) =
-                    crate::tools::handlers::command_search::rg_search_path_operands(&commands)
-                {
-                    return dependencies_for_search_scopes(scopes, cwd);
-                }
                 // Reuse the already parsed argv for quoted paths and batches of
                 // reads. Every command must have a known scope: retaining only
-                // part of an opaque batch could preserve stale evidence.
+                // part of an opaque batch could preserve stale evidence. Pure
+                // pipeline stages and host queries read no workspace files, so
+                // they neither add a scope nor make the batch opaque; a search
+                // and a file read in one batch both keep their scopes.
                 let mut dependencies = BTreeSet::new();
-                for command in commands {
+                for index in 0..commands.len() {
                     // These parsers retain cmd expansions and bare POSIX word
                     // escapes rather than resolving them to literal paths.
-                    if command.iter().any(|arg| match shell_type {
+                    if commands[index].iter().any(|arg| match shell_type {
                         Some(crate::shell::ShellType::Cmd) => arg.contains(['%', '!']),
                         Some(
                             crate::shell::ShellType::Bash
@@ -4032,11 +4345,11 @@ fn source_dependencies_from_arguments(
                     }) {
                         return BTreeSet::new();
                     }
-                    let command_dependencies = dependencies_for_command(&command, cwd);
-                    if command_dependencies.is_empty() {
-                        return BTreeSet::new();
+                    match plain_command_source_dependencies(&commands, index, shell_type, cwd) {
+                        PlainCommandDependencies::Transparent => {}
+                        PlainCommandDependencies::Scoped(scoped) => dependencies.extend(scoped),
+                        PlainCommandDependencies::Unknown => return BTreeSet::new(),
                     }
-                    dependencies.extend(command_dependencies);
                 }
                 return dependencies;
             }
@@ -4841,6 +5154,349 @@ fn dependencies_for_read_command(
         })
         .map(|path| SourceDependencyV1::new(&path, false))
         .collect()
+}
+
+enum PlainCommandDependencies {
+    /// A pipeline stage or host query that reads no workspace files itself.
+    Transparent,
+    Scoped(BTreeSet<SourceDependencyV1>),
+    /// The command may read anywhere; the whole batch stays opaque.
+    Unknown,
+}
+
+fn plain_command_source_dependencies(
+    commands: &[Vec<String>],
+    index: usize,
+    shell_type: Option<crate::shell::ShellType>,
+    cwd: &Path,
+) -> PlainCommandDependencies {
+    let command = &commands[index];
+    let Some(program) = command.first().map(|value| command_basename(value)) else {
+        return PlainCommandDependencies::Unknown;
+    };
+    let arguments = &command[1..];
+    let powershell = matches!(shell_type, Some(crate::shell::ShellType::PowerShell));
+    if matches!(program.as_str(), "rg" | "rga" | "ripgrep") {
+        return match crate::tools::handlers::command_search::rg_search_path_operands(
+            &commands[index..=index],
+        ) {
+            Some(scopes) => {
+                PlainCommandDependencies::Scoped(dependencies_for_search_scopes(scopes, cwd))
+            }
+            // `rg --version` and other non-search invocations read nothing.
+            None => PlainCommandDependencies::Transparent,
+        };
+    }
+    if is_transparent_pipeline_stage(&program, arguments, powershell)
+        || is_host_query_command(&program)
+    {
+        return if arguments_mention_workspace_reader(arguments) {
+            PlainCommandDependencies::Unknown
+        } else {
+            PlainCommandDependencies::Transparent
+        };
+    }
+    match program.as_str() {
+        "head" | "tail" if !read_command_has_path_operands(arguments) => {
+            PlainCommandDependencies::Transparent
+        }
+        "get-childitem" | "gci" => directory_listing_dependencies(arguments, true, cwd),
+        "ls" | "dir" => directory_listing_dependencies(arguments, powershell, cwd),
+        "get-item" | "gi" | "test-path" if powershell => literal_path_dependencies(
+            powershell_path_operands(arguments, &[], /*positional_pattern*/ false),
+            cwd,
+        )
+        .unwrap_or(PlainCommandDependencies::Unknown),
+        "select-string" | "sls" if powershell => literal_path_dependencies(
+            powershell_path_operands(arguments, &["-pattern"], /*positional_pattern*/ true),
+            cwd,
+        )
+        // Without a path the cmdlet filters its pipeline input.
+        .unwrap_or(PlainCommandDependencies::Transparent),
+        "git" if crate::turn_diff_tracker::command_is_read_only_git(command) => {
+            PlainCommandDependencies::Scoped(BTreeSet::from([SourceDependencyV1::new(cwd, true)]))
+        }
+        _ => {
+            let dependencies = dependencies_for_command(command, cwd);
+            if dependencies.is_empty() {
+                PlainCommandDependencies::Unknown
+            } else {
+                PlainCommandDependencies::Scoped(dependencies)
+            }
+        }
+    }
+}
+
+fn is_transparent_pipeline_stage(program: &str, arguments: &[String], powershell: bool) -> bool {
+    if powershell
+        && matches!(
+            program,
+            "select-object"
+                | "select"
+                | "where-object"
+                | "where"
+                | "?"
+                | "sort-object"
+                | "sort"
+                | "measure-object"
+                | "measure"
+                | "format-table"
+                | "ft"
+                | "format-list"
+                | "fl"
+                | "format-wide"
+                | "fw"
+                | "format-custom"
+                | "fc"
+                | "out-string"
+                | "out-null"
+                | "out-default"
+                | "out-host"
+                | "group-object"
+                | "group"
+                | "get-unique"
+                | "gu"
+                | "foreach-object"
+                | "foreach"
+                | "%"
+                | "write-output"
+                | "write"
+                | "echo"
+                | "write-host"
+                | "write-verbose"
+                | "write-information"
+                | "write-warning"
+                | "write-error"
+                | "convertto-json"
+                | "convertfrom-json"
+                | "convertto-csv"
+                | "set-strictmode"
+        )
+    {
+        return true;
+    }
+    // POSIX filters read a file only when given an operand; `tr`, `echo`, and
+    // `printf` never do.
+    matches!(program, "tr" | "echo" | "printf" | "true" | "false")
+        || (matches!(program, "sort" | "uniq" | "wc" | "cut" | "nl" | "column")
+            && !read_command_has_path_operands(arguments))
+}
+
+fn is_host_query_command(program: &str) -> bool {
+    matches!(
+        program,
+        "get-ciminstance"
+            | "get-wmiobject"
+            | "get-process"
+            | "gps"
+            | "get-date"
+            | "get-location"
+            | "gl"
+            | "pwd"
+            | "hostname"
+            | "whoami"
+            | "get-host"
+            | "get-command"
+            | "gcm"
+            | "get-service"
+            | "get-psdrive"
+            | "get-module"
+            | "get-alias"
+            | "gal"
+            | "get-variable"
+            | "gv"
+            | "start-sleep"
+            | "sleep"
+            | "date"
+            | "uname"
+            | "id"
+            | "printenv"
+    )
+}
+
+/// Parsed argv holds literal words only, but keep script-block style
+/// arguments that name a reader opaque rather than transparent.
+fn arguments_mention_workspace_reader(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        let lower = argument.to_ascii_lowercase();
+        lower.contains('{')
+            || [
+                "get-content",
+                "get-childitem",
+                "get-item",
+                "select-string",
+                "import-csv",
+                "test-path",
+                "[io.file]",
+                "readall",
+            ]
+            .iter()
+            .any(|reader| lower.contains(reader))
+    })
+}
+
+fn read_command_has_path_operands(arguments: &[String]) -> bool {
+    let mut option_value = false;
+    for argument in arguments {
+        if option_value {
+            option_value = false;
+            continue;
+        }
+        if matches!(argument.as_str(), "-n" | "--lines" | "-c" | "--bytes") {
+            option_value = true;
+            continue;
+        }
+        if !argument.starts_with('-') {
+            return true;
+        }
+    }
+    false
+}
+
+fn directory_listing_dependencies(
+    arguments: &[String],
+    powershell: bool,
+    cwd: &Path,
+) -> PlainCommandDependencies {
+    let paths = if powershell {
+        let Some(paths) = powershell_path_operands(
+            arguments,
+            &["-filter", "-include", "-exclude", "-depth", "-attributes"],
+            /*positional_pattern*/ false,
+        ) else {
+            return PlainCommandDependencies::Unknown;
+        };
+        paths
+    } else {
+        arguments
+            .iter()
+            .filter(|argument| !argument.starts_with('-'))
+            .cloned()
+            .collect()
+    };
+    if paths.is_empty() {
+        // A listing depends on the entries of the listed directory, so it is
+        // recorded recursively even without `-Recurse`.
+        return PlainCommandDependencies::Scoped(BTreeSet::from([SourceDependencyV1::new(
+            cwd, true,
+        )]));
+    }
+    literal_path_dependencies(Some(paths), cwd)
+        .map(|dependencies| match dependencies {
+            PlainCommandDependencies::Scoped(scoped) => PlainCommandDependencies::Scoped(
+                scoped
+                    .into_iter()
+                    .map(|dependency| SourceDependencyV1 {
+                        recursive: true,
+                        ..dependency
+                    })
+                    .collect(),
+            ),
+            other => other,
+        })
+        .unwrap_or(PlainCommandDependencies::Unknown)
+}
+
+/// Returns the literal path operands of a PowerShell cmdlet, or `None` when an
+/// operand is a wildcard or another dynamic form the parser cannot scope.
+fn powershell_path_operands(
+    arguments: &[String],
+    value_parameters: &[&str],
+    positional_pattern: bool,
+) -> Option<Vec<String>> {
+    const COMMON_VALUE_PARAMETERS: &[&str] = &[
+        "-erroraction",
+        "-ea",
+        "-warningaction",
+        "-wa",
+        "-informationaction",
+        "-ia",
+        "-errorvariable",
+        "-ev",
+        "-warningvariable",
+        "-wv",
+        "-informationvariable",
+        "-iv",
+        "-outvariable",
+        "-ov",
+        "-outbuffer",
+        "-ob",
+        "-pipelinevariable",
+        "-pv",
+        "-pathtype",
+        "-encoding",
+        "-credential",
+        "-stream",
+        "-context",
+        "-culture",
+    ];
+    let mut paths = Vec::new();
+    let mut expecting = None::<bool>;
+    let mut positional_skipped = false;
+    for argument in arguments {
+        if let Some(is_path) = expecting.take() {
+            if is_path {
+                paths.push(argument.clone());
+            } else if argument.starts_with('-') {
+                // A flag following a value parameter means the value was omitted.
+                return None;
+            }
+            continue;
+        }
+        let lower = argument.to_ascii_lowercase();
+        if argument.starts_with('-') && !argument.starts_with("--") {
+            if matches!(lower.as_str(), "-path" | "-literalpath" | "-lp") {
+                expecting = Some(true);
+            } else if value_parameters.contains(&lower.as_str())
+                || COMMON_VALUE_PARAMETERS.contains(&lower.as_str())
+            {
+                expecting = Some(false);
+            }
+            continue;
+        }
+        if positional_pattern && !positional_skipped {
+            // `Select-String pattern path...`: the first positional operand is the pattern.
+            positional_skipped = true;
+            continue;
+        }
+        paths.push(argument.clone());
+    }
+    if expecting.is_some() {
+        return None;
+    }
+    Some(paths)
+}
+
+/// Scopes literal path operands as non-recursive dependencies. Returns `None`
+/// when there are no operands and `Some(Unknown)` for wildcard or dynamic forms.
+fn literal_path_dependencies(
+    paths: Option<Vec<String>>,
+    cwd: &Path,
+) -> Option<PlainCommandDependencies> {
+    let paths = paths?;
+    if paths.is_empty() {
+        return None;
+    }
+    if paths
+        .iter()
+        .any(|path| path.starts_with(['~', '$']) || path.contains(['*', '?', '[', ']', ',']))
+    {
+        return Some(PlainCommandDependencies::Unknown);
+    }
+    Some(PlainCommandDependencies::Scoped(
+        paths
+            .into_iter()
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                }
+            })
+            .map(|path| SourceDependencyV1::new(&path, false))
+            .collect(),
+    ))
 }
 
 fn command_basename(value: &str) -> String {

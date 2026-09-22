@@ -2589,6 +2589,36 @@ struct SnapshotTurnState {
     active_turn_start_index: Option<usize>,
 }
 
+/// The turn a persisted rollout ends inside when the process stopped before
+/// recording a completion or an interruption, as `Some(explicit turn id)`.
+///
+/// Unlike fork snapshots, a resumed rollout with only response items and no
+/// lifecycle events is treated as finished: older rollouts recorded completed
+/// exchanges that way, and no evidence says the last request was cut short.
+pub(crate) fn resumed_rollout_unfinished_turn(
+    rollout_items: &[RolloutItem],
+) -> Option<Option<String>> {
+    let mut builder = ThreadHistoryBuilder::new();
+    for item in rollout_items {
+        builder.handle_rollout_item(item);
+    }
+    if !builder.has_active_turn() {
+        return None;
+    }
+    let active_turn_id = builder.active_turn_id_if_explicit();
+    if active_turn_id.is_some() {
+        let finished = builder
+            .active_turn_snapshot()
+            .as_ref()
+            .is_some_and(|turn| turn.status != TurnStatus::InProgress);
+        return (!finished).then_some(active_turn_id);
+    }
+    builder
+        .active_turn_start_index()
+        .filter(|index| implicit_legacy_turn_is_unfinished(rollout_items, *index))
+        .map(|_| None)
+}
+
 fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
     let rollout_items = history.get_rollout_items();
     let mut builder = ThreadHistoryBuilder::new();

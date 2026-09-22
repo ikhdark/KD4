@@ -115,15 +115,38 @@ impl InterruptedTurnHistoryMarker {
 pub(crate) fn interrupted_turn_history_marker(
     marker: InterruptedTurnHistoryMarker,
 ) -> Option<ResponseItem> {
+    turn_boundary_history_marker(
+        marker,
+        crate::context::TurnAborted::INTERRUPTED_GUIDANCE,
+        crate::context::TurnAborted::INTERRUPTED_DEVELOPER_GUIDANCE,
+    )
+}
+
+/// Marker for a resumed rollout whose last turn recorded neither a completion
+/// nor an interruption: the process stopped mid-turn, so nothing establishes
+/// that the request was worked on.
+pub(crate) fn unfinished_turn_history_marker(
+    marker: InterruptedTurnHistoryMarker,
+) -> Option<ResponseItem> {
+    turn_boundary_history_marker(
+        marker,
+        crate::context::TurnAborted::UNFINISHED_GUIDANCE,
+        crate::context::TurnAborted::UNFINISHED_DEVELOPER_GUIDANCE,
+    )
+}
+
+fn turn_boundary_history_marker(
+    marker: InterruptedTurnHistoryMarker,
+    user_guidance: &str,
+    developer_guidance: &str,
+) -> Option<ResponseItem> {
     match marker {
         InterruptedTurnHistoryMarker::Disabled => None,
         InterruptedTurnHistoryMarker::ContextualUser => Some(ContextualUserFragment::into(
-            crate::context::TurnAborted::new(crate::context::TurnAborted::INTERRUPTED_GUIDANCE),
+            crate::context::TurnAborted::new(user_guidance),
         )),
         InterruptedTurnHistoryMarker::Developer => {
-            let marker = crate::context::TurnAborted::new(
-                crate::context::TurnAborted::INTERRUPTED_DEVELOPER_GUIDANCE,
-            );
+            let marker = crate::context::TurnAborted::new(developer_guidance);
             Some(ResponseItem::Message {
                 id: None,
                 role: "developer".to_string(),

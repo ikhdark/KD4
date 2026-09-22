@@ -1530,6 +1530,54 @@ async fn ordered_append_waits_for_in_memory_acceptance_without_materializing() -
 }
 
 #[tokio::test]
+async fn ordered_append_reaches_disk_before_a_terminal_barrier() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            None,
+            SessionSource::Exec,
+            None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    // Materialize the rollout the way the first user turn does.
+    recorder.persist().await?;
+
+    let items = [RolloutItem::EventMsg(EventMsg::AgentMessage(
+        AgentMessageEvent {
+            message: "persisted-without-barrier".to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+    ))];
+    recorder.record_canonical_items_ordered(&items).await?;
+
+    // No flush, persist, or shutdown: a turn that is killed before its terminal
+    // barrier must not lose every item it recorded.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read_to_string(&rollout_path)?.contains("persisted-without-barrier") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ordered append must reach the materialized rollout without an explicit barrier"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    recorder.shutdown().await
+}
+
+#[tokio::test]
 async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");

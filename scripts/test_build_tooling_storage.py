@@ -23,6 +23,100 @@ from scripts.build_tooling_test_support import ps_single_quote
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+class WarmLaneReservationTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.root = self.repo / "codex-rs" / "target" / "lanes"
+        rust_build_status.initialize_cargo_lanes_root(self.repo, self.root)
+
+    def warm(self, name):
+        lane = self.root / name
+        for part in (".fingerprint", "deps", "incremental"):
+            (lane / "debug" / part).mkdir(parents=True)
+        return lane
+
+    def reserve(self, **kwargs):
+        return rust_build_status.reserve_cargo_lane(
+            repo_root=self.repo,
+            lane_root=self.root,
+            requested_lane="core-tests",
+            command=["cargo", "nextest", "run"],
+            **kwargs,
+        )
+
+    def test_reuses_busy_warm_lane_after_release_without_holding_coordination_lock(
+        self,
+    ):
+        lane = self.warm("core-tests")
+        owner = rust_build_status._try_acquire_binary_file_lock(
+            lane / ".lane-active.lock"
+        )
+        self.assertIsNotNone(owner)
+
+        def release_owner(_delay):
+            with rust_build_status.cargo_lane_coordination_lock(
+                self.root, timeout_seconds=0.01
+            ):
+                rust_build_status._release_binary_file_lock(owner)
+                owner.close()
+
+        try:
+            with (
+                mock.patch.object(
+                    rust_build_status.time, "sleep", side_effect=release_owner
+                ) as sleep,
+                self.reserve() as (name, target),
+            ):
+                self.assertEqual((name, target), ("core-tests", lane))
+                self.assertTrue(rust_build_status.lane_active_lock_is_held(target))
+            self.assertEqual(sleep.call_count, 1)
+            self.assertFalse((self.root / "core-tests-2").exists())
+        finally:
+            if not owner.closed:
+                rust_build_status._release_binary_file_lock(owner)
+                owner.close()
+
+    def test_idle_warm_sibling_wins_without_waiting(self):
+        base = self.warm("core-tests")
+        sibling = self.warm("core-tests-2")
+        with (
+            self.reserve(),
+            mock.patch.object(rust_build_status.time, "sleep") as sleep,
+        ):
+            with self.reserve() as (name, target):
+                self.assertEqual((name, target), ("core-tests-2", sibling))
+            sleep.assert_not_called()
+        self.assertTrue(base.is_dir())
+
+    def test_wait_deadline_falls_back_to_cold_lane(self):
+        self.warm("core-tests")
+        now = [0.0]
+
+        def advance(delay):
+            now[0] += delay
+
+        with (
+            self.reserve(),
+            mock.patch.object(
+                rust_build_status.time, "monotonic", side_effect=lambda: now[0]
+            ),
+            mock.patch.object(rust_build_status.time, "sleep", side_effect=advance),
+        ):
+            with self.reserve(warm_wait_seconds=0.5) as (name, _):
+                self.assertEqual(name, "core-tests-2")
+            self.assertEqual(now[0], 0.5)
+
+    def test_unconfirmed_cleanup_and_cold_lanes_do_not_delay_work(self):
+        lane = self.warm("core-tests")
+        (lane / ".lane-cleanup-unconfirmed").touch()
+        with mock.patch.object(rust_build_status.time, "sleep") as sleep:
+            with self.reserve() as (name, _):
+                self.assertEqual(name, "core-tests-2")
+            sleep.assert_not_called()
+
+
 class BuildToolingStorageTest(unittest.TestCase):
     def test_lane_timing_cli_separates_phases_and_preserves_failed_child(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -30,7 +124,9 @@ class BuildToolingStorageTest(unittest.TestCase):
             output = repo / "timing.json"
             target = repo / "codex-rs" / "target" / "lanes" / "unit"
 
-            def child(command, *, env, check):
+            def child(command, *, env, check, stdout, stderr):
+                self.assertIs(stdout, sys.stdout)
+                self.assertIs(stderr, sys.stderr)
                 self.assertTrue(rust_build_status.lane_active_lock_is_held(target))
                 self.assertNotIn("CARGO_TARGET_DIR", env)
                 self.assertEqual(
@@ -1017,7 +1113,9 @@ class BuildToolingStorageTest(unittest.TestCase):
                     mock.patch.object(rust_build_status, "run_owned") as run,
                 ):
 
-                    def child(command, *, env, check):
+                    def child(command, *, env, check, stdout, stderr):
+                        self.assertIs(stdout, sys.stdout)
+                        self.assertIs(stderr, sys.stderr)
                         self.assertTrue(
                             rust_build_status.lane_active_lock_is_held(target)
                         )

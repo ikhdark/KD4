@@ -1444,6 +1444,19 @@ fn git_subcommand(tokens: &[String]) -> Option<&str> {
     None
 }
 
+/// True for a plain `git` invocation whose subcommand only reads repository state.
+pub(crate) fn command_is_read_only_git(command: &[String]) -> bool {
+    if command
+        .iter()
+        .any(|token| token.contains([';', '&', '|', '>', '<', '`', '$', '\n', '\r']))
+    {
+        return false;
+    }
+    let normalized = normalized_command_tokens(command);
+    let unwrapped = unwrap_command_tokens(&normalized);
+    git_subcommand(unwrapped).is_some_and(is_read_only_git_subcommand)
+}
+
 fn is_read_only_git_subcommand(subcommand: &str) -> bool {
     matches!(
         subcommand,

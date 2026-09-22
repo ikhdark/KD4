@@ -251,14 +251,21 @@ fn ordinary_try_prose_does_not_displace_diagnostics() {
     assert!(!summary.contains("try another example"), "{summary}");
 }
 
+/// An oversized first line that is also a diagnostic, so the successful output
+/// still has something to rank and reaches the summarizer's line cap logic.
+fn oversized_warning_line(total_bytes: usize) -> String {
+    const LABEL: &str = "warning: ";
+    format!("{LABEL}{}", "x".repeat(total_bytes - LABEL.len()))
+}
+
 #[test]
 fn oversized_first_line_reserves_room_for_the_tail() {
     let mut lines = vec![String::new(); 700];
-    lines[0] = "x".repeat(SUMMARY_MAX_BYTES);
+    lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES);
     let probe =
         summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000))).unwrap();
     let prefix_bytes = probe.find("    1: ").unwrap() + "    1: ".len();
-    lines[0] = "x".repeat(SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes);
+    lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes);
     let summary =
         summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000))).unwrap();
     assert!(summary.ends_with("[summary capped]"), "{summary}");
@@ -272,10 +279,13 @@ fn oversized_first_line_reserves_room_for_the_tail() {
 
 #[test]
 fn summary_reports_gap_sizes_and_source_line_counts() {
-    let output = (0..700)
+    let mut lines = (0..700)
         .map(|index| format!("line {index}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    // A diagnostic inside the retained head keeps the selection unchanged
+    // while giving a successful run something to rank.
+    lines[0] = "warning: line 0".to_string();
+    let output = lines.join("\n");
     let summary = summarize_shell_output_for_model(&output, 0, false, options(None, Some(1_000))).unwrap();
     assert!(summary.contains("... [612 lines omitted]"));
     assert!(summary.contains("- emitted_source_lines: 88\n"));
@@ -286,13 +296,13 @@ fn summary_reports_gap_sizes_and_source_line_counts() {
 #[test]
 fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
     let mut lines = vec!["ordinary".to_string(); 700];
-    lines[0] = "x".repeat(SUMMARY_MAX_BYTES);
+    lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES);
     let probe = summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000)))
         .expect("large output summary");
     let prefix_bytes = probe.find("    1: ").expect("first source line") + "    1: ".len();
     let following_head_bytes = (SUCCESS_HEAD_LINES - 1) * "\n    2: ordinary".len();
     let gap_bytes = "\n... [612 lines omitted]".len();
-    lines[0] = "x".repeat(
+    lines[0] = oversized_warning_line(
         SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes - following_head_bytes - gap_bytes,
     );
 
@@ -645,20 +655,84 @@ fn passing_validation_retains_status_with_a_short_tail() {
 
 #[test]
 fn applied_budget_summarizes_output_below_the_default_threshold() {
+    let mut lines = (0..200)
+        .map(|index| format!("guard line {index}"))
+        .collect::<Vec<_>>();
+    lines[100] = "warning: guard line 100 needs review".to_string();
+    let output = lines.join("\n");
+
+    assert_eq!(
+        summarize_shell_output_for_model(&output, 0, false, options(None, None)),
+        None
+    );
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(None, Some(400))).unwrap();
+    assert!(summary.contains("guard line 199"), "{summary}");
+    assert!(
+        summary.contains("warning: guard line 100 needs review"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn diagnostic_free_output_over_the_applied_budget_falls_through_to_truncation() {
+    // A successful listing that merely exceeds the caller's budget is source
+    // material. Summarizing it drops the middle and reads as complete, which
+    // sent the model back to re-read the same file in the recorded sessions.
     let output = (0..200)
         .map(|index| format!("guard line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
 
     assert_eq!(
-        summarize_shell_output_for_model(&output, 0, false, options(None, None)),
+        summarize_shell_output_for_model(&output, 0, false, options(None, Some(400))),
         None
     );
-    assert!(
-        summarize_shell_output_for_model(&output, 0, false, options(None, Some(400)))
-            .unwrap()
-            .contains("guard line 199")
+    assert_eq!(
+        summarize_shell_output_for_model(
+            &output,
+            0,
+            false,
+            options(Some("custom-listing --all"), Some(400))
+        ),
+        None
     );
+}
+
+#[test]
+fn powershell_read_pipelines_use_ordered_truncation() {
+    let mut lines = (0..300)
+        .map(|index| format!("source line {index:04}: {}", "x".repeat(40)))
+        .collect::<Vec<_>>();
+    lines[150] = "// error: this comment is source text, not a diagnostic".to_string();
+    let output = lines.join("\n");
+
+    for command in [
+        "Get-Content src/lib.rs | Select-Object -Skip 10 -First 500; rg -n 'fn ' src",
+        "$s = Get-Content src/lib.rs; $s[10..40]; git diff --stat",
+        "foreach ($p in @('a','b')) { if (Test-Path $p) { Get-Content -Raw $p } }",
+        "Get-ChildItem src -Recurse -File | Where-Object { $_.Name -match 'test' } | Select-Object FullName",
+    ] {
+        assert_eq!(
+            summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400))),
+            None,
+            "{command}"
+        );
+    }
+
+    // A script that also mutates or builds is not a read; its diagnostics still rank.
+    for command in [
+        "Get-Content src/lib.rs; Remove-Item src/old.rs",
+        "Get-Content src/lib.rs; cargo build",
+        "git checkout -- src/lib.rs; Get-Content src/lib.rs",
+        "Get-ChildItem src | ForEach-Object { Set-Content $_ '' }",
+    ] {
+        assert!(
+            summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400)))
+                .is_some(),
+            "{command}"
+        );
+    }
 }
 
 #[test]
@@ -705,7 +779,12 @@ fn disabled_summarizer_returns_unchanged_signal() {
 
 #[test]
 fn oversized_single_line_retains_bounded_head_and_tail() {
-    let output = format!("HEAD{}TAIL", "x".repeat(DEFAULT_SUMMARY_AFTER_BYTES + 1024));
+    // The diagnostic label keeps a successful single-line output eligible for
+    // summarization; the head and tail of the line must both survive.
+    let output = format!(
+        "warning: HEAD{}TAIL",
+        "x".repeat(DEFAULT_SUMMARY_AFTER_BYTES + 1024)
+    );
 
     let summary = summarize_shell_output_for_model(&output, 0, false, options(None, Some(4_000))).unwrap();
 

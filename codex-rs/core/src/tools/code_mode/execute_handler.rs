@@ -19,6 +19,7 @@ use super::is_exec_tool_name;
 use super::wait_handler::OwnerHeldCodeModeExit;
 use super::wait_handler::attach_drained_wait_evidence;
 use super::wait_handler::hold_until_state_change;
+use super::wait_handler::idle_timeout_response;
 use super::wait_handler::input_activity_response;
 use super::wait_handler::record_internally_drained_waits;
 use super::wait_handler::terminate_interrupted_cell;
@@ -298,7 +299,7 @@ impl CodeModeExecuteHandler {
                 Err(mut error) => {
                     error.drained_observations = error.drained_observations.saturating_add(1);
                     record_internally_drained_waits(&exec, error.drained_observations);
-                    if error.timed_out || cancellation_token.is_cancelled() {
+                    if cancellation_token.is_cancelled() {
                         terminate_interrupted_cell(&exec, &cell_id, dispatch_lease.clone()).await;
                     }
                     return Err(FunctionCallError::RespondToModel(error.message));
@@ -317,6 +318,9 @@ impl CodeModeExecuteHandler {
                     true,
                     drained_observations,
                 ),
+                OwnerHeldCodeModeExit::IdleTimeout => {
+                    (idle_timeout_response(&cell_id), true, drained_observations)
+                }
             }
         } else {
             (initial_response, true, 0)

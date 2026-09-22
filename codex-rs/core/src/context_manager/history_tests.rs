@@ -2879,6 +2879,150 @@ fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_op
 }
 
 #[test]
+fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
+    let _budget =
+        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    let evidence = |index: usize| format!("result-{index} {}", "evidence ".repeat(500));
+    let budget_candidate = |call_id: &str, output: String| ToolHistoryCandidate {
+        call_id: call_id.to_string(),
+        tool_identity: "functions.exec".to_string(),
+        semantic_class: "tool_output".to_string(),
+        successful: true,
+        source_dependencies: BTreeSet::new(),
+        source_dependencies_current: true,
+        artifact_id: format!("artifact-{call_id}"),
+        artifact_bytes: 96_000,
+        artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
+        original_output_sha256: crate::tool_history::sha256(output.as_bytes()),
+        original_tokens: 24_000,
+        preserved_non_text_tokens: Some(0),
+        bounded_model_output: output,
+        complete: true,
+        projection_eligible: true,
+        proof_identity: None,
+        supersession_identity: None,
+        consumed_by_generation: None,
+        derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+    };
+    let call = |call_id: &str| ResponseItem::FunctionCall {
+        id: None,
+        name: "functions.exec".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = |call_id: &str, text: String| ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(text),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let prepare = |history: &ContextManager| {
+        history
+            .clone()
+            .prepare_for_sampling_prompt_with_completed_tool_projection(
+                &default_input_modalities(),
+                StableContextTarget::Sampling,
+                None,
+                &workspace,
+            )
+    };
+
+    // These synthetic code-mode results have no workspace dependencies. Record
+    // that classification just as dispatch does, so freshness validation keeps
+    // their text and only the aggregate budget shapes the projection.
+    let register = |history: &mut ContextManager, call_id: &str, output: String| {
+        assert!(history.apply_tool_history_mutation(
+            &crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: call_id.to_string(),
+            },
+        ));
+        assert!(history.apply_tool_history_mutation(
+            &crate::tool_history::ToolHistoryMutation::RegisterCandidate {
+                candidate: budget_candidate(call_id, output),
+            },
+        ));
+    };
+
+    let mut history = ContextManager::new();
+    history.record_items(
+        [&user_input_text_msg("implement the feature")],
+        TruncationPolicy::Tokens(10_000),
+    );
+    for index in 0..20 {
+        let call_id = format!("saved-{index:03}");
+        register(&mut history, &call_id, evidence(index));
+        history.record_items(
+            [&call(&call_id), &output(&call_id, evidence(index))],
+            TruncationPolicy::Tokens(10_000),
+        );
+    }
+    assert_eq!(history.sampling_projection_anchor_len(), None);
+
+    let first = prepare(&history);
+    assert_eq!(
+        history.sampling_projection_anchor_len(),
+        Some(history.raw_items().len()),
+        "the first sampling request of a turn anchors its projection"
+    );
+
+    // The model observed every output; the next request only adds one result.
+    assert!(
+        !history
+            .mark_tool_history_consumed_with_delta(
+                first.items(),
+                ModelGenerationId {
+                    turn_id: "turn".to_string(),
+                    ordinal: 1,
+                },
+            )
+            .is_empty()
+    );
+    register(&mut history, "saved-020", evidence(20));
+    let appended = [call("saved-020"), output("saved-020", evidence(20))];
+    history.record_items(appended.iter(), TruncationPolicy::Tokens(10_000));
+    let second = prepare(&history);
+    assert_eq!(
+        &second.items()[..first.items().len()],
+        first.items(),
+        "a continuation request must keep the previous request's input as its prefix"
+    );
+    assert_eq!(&second.items()[first.items().len()..], &appended[..]);
+    assert_eq!(
+        second.tool_output_budget_drops(),
+        first.tool_output_budget_drops()
+    );
+
+    // Compaction prompts are budgeted in full and leave the sampling anchor alone.
+    let anchor_before_compaction = history.sampling_projection_anchor_len();
+    let _ = history
+        .clone()
+        .for_compaction_prompt_with_completed_tool_projection(&default_input_modalities(), None);
+    assert_eq!(
+        history.sampling_projection_anchor_len(),
+        anchor_before_compaction
+    );
+
+    // The next user turn re-budgets once, then anchors again.
+    history.record_items(
+        [&user_input_text_msg("now finish it")],
+        TruncationPolicy::Tokens(10_000),
+    );
+    assert_eq!(history.sampling_projection_anchor_len(), None);
+    let third = prepare(&history);
+    assert_eq!(
+        history.sampling_projection_anchor_len(),
+        Some(history.raw_items().len())
+    );
+    assert_eq!(
+        third.items().last(),
+        Some(&user_input_text_msg("now finish it"))
+    );
+}
+
+#[test]
 fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context() {
     let old_repository =
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
@@ -3259,6 +3403,218 @@ async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
 }
 
 #[test]
+fn recorded_context_window_scales_the_tool_result_budget() {
+    let mut history = ContextManager::new();
+    assert_eq!(
+        history
+            .tool_history_state()
+            .configured_model_visible_tool_result_token_budget(),
+        None
+    );
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        Some(258_400),
+    );
+    assert_eq!(
+        history
+            .tool_history_state()
+            .configured_model_visible_tool_result_token_budget(),
+        Some(129_200)
+    );
+    // A reloaded ledger has no window of its own; the derived budget carries over.
+    history.set_tool_history_state(ToolHistoryState::default());
+    assert_eq!(
+        history
+            .tool_history_state()
+            .configured_model_visible_tool_result_token_budget(),
+        Some(129_200)
+    );
+    history.set_token_info(None);
+    assert_eq!(
+        history
+            .tool_history_state()
+            .configured_model_visible_tool_result_token_budget(),
+        None
+    );
+}
+
+/// The prompt estimate that gates compaction must measure the projected
+/// prompt. Session `4ab1` was compacted at turn start because its raw tool
+/// outputs exceeded the limit while the projected prompt was a third of it.
+#[test]
+fn prompt_estimates_measure_the_projected_tool_history() {
+    let _budget =
+        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
+    let base = BaseInstructions {
+        text: "base".to_string(),
+    };
+    let mut history = create_history_with_items(vec![user_input_text_msg("instruction")]);
+    let mut canonical = Vec::new();
+    for index in 0..4 {
+        let call_id = format!("call-{index}");
+        let bounded_output = format!("{index}\n{}", "evidence line\n".repeat(1_200));
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            name: "functions.exec".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: call_id.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let output = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.clone(),
+            output: FunctionCallOutputPayload::from_text(bounded_output.clone()),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        history.record_items([&call, &output], TruncationPolicy::Tokens(24_000));
+        canonical.push(call);
+        canonical.push(output);
+        // Classified as dispatch does, so workspace freshness leaves these
+        // results alone and only the aggregate budget shapes the prompt.
+        assert!(history.apply_tool_history_mutation(
+            &crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: call_id.clone(),
+            },
+        ));
+        let candidate = ToolHistoryCandidate {
+            call_id: call_id.clone(),
+            tool_identity: "functions.exec".to_string(),
+            semantic_class: "tool_output".to_string(),
+            successful: true,
+            source_dependencies: BTreeSet::new(),
+            source_dependencies_current: true,
+            artifact_id: format!("00000000-0000-7000-8000-{index:012}"),
+            artifact_bytes: 96_000,
+            artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
+            original_output_sha256: crate::tool_history::sha256(bounded_output.as_bytes()),
+            original_tokens: 24_000,
+            preserved_non_text_tokens: Some(0),
+            bounded_model_output: bounded_output,
+            complete: true,
+            projection_eligible: true,
+            proof_identity: None,
+            supersession_identity: None,
+            consumed_by_generation: Some(crate::tool_history::ModelGenerationId {
+                turn_id: "turn".to_string(),
+                ordinal: 1,
+            }),
+            derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+        };
+        assert!(history.apply_tool_history_mutation(
+            &crate::tool_history::ToolHistoryMutation::RegisterCandidate { candidate },
+        ));
+    }
+    // The pending user turn whose pressure check decides whether to compact.
+    history.record_items(
+        [&user_input_text_msg("continue")],
+        TruncationPolicy::Tokens(24_000),
+    );
+    let raw_estimate =
+        ContextManager::estimate_items_token_count_with_base_instructions(history.raw_items(), &base)
+            .expect("raw estimate");
+    let single_output_tokens = i64::try_from(codex_utils_string::approx_token_count(
+        &format!("0\n{}", "evidence line\n".repeat(1_200)),
+    ))
+    .unwrap();
+    assert!(
+        raw_estimate > 12_000,
+        "fixture must exceed the budget as raw output: {raw_estimate}"
+    );
+    // The prompt the model receives: receipts replace consumed outputs that
+    // no longer fit the aggregate budget.
+    let sent_prompt = history
+        .clone()
+        .prepare_for_prompt_with_completed_tool_projection_target(
+            &default_input_modalities(),
+            StableContextTarget::Sampling,
+            None,
+            None,
+        );
+    let sent_estimate = ContextManager::estimate_items_token_count_with_base_instructions(
+        sent_prompt.items(),
+        &base,
+    )
+    .expect("sent prompt estimate");
+    assert!(
+        sent_estimate + single_output_tokens <= raw_estimate,
+        "fixture must compact at least one output: sent={sent_estimate} raw={raw_estimate}"
+    );
+    let unchanged_items = sent_prompt
+        .items()
+        .iter()
+        .filter(|item| history.raw_items().contains(item))
+        .count();
+    assert!(unchanged_items < history.raw_items().len());
+    for _ in 0..2 {
+        let projected_estimate = history
+            .estimate_prepared_token_count_with_base_instructions(
+                &default_input_modalities(),
+                &base,
+            )
+            .expect("projected estimate");
+        assert_eq!(projected_estimate, sent_estimate);
+        assert_eq!(
+            history.estimate_token_count_after_pending_user_boundary(
+                &default_input_modalities(),
+                &base
+            ),
+            Some(sent_estimate)
+        );
+        // The instruction-boundary path of the active context estimate uses
+        // the same projection instead of the raw canonical history.
+        assert_eq!(history.get_total_token_usage(false, &base), sent_estimate);
+        // Only the unchanged source items are cached, by their prepared and
+        // raw positions; receipts are measured directly each time.
+        assert_eq!(history.cached_item_token_estimate_namespace_count(), 2);
+        assert_eq!(
+            history.cached_item_token_estimate_count(),
+            2 * unchanged_items
+        );
+    }
+    // A smaller recorded context window tightens the projection without
+    // rewriting the history, so the estimate must follow the projection
+    // rather than a cached measurement of the earlier receipts.
+    drop(_budget);
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        Some(8_000),
+    );
+    let tightened_prompt = history
+        .clone()
+        .prepare_for_prompt_with_completed_tool_projection_target(
+            &default_input_modalities(),
+            StableContextTarget::Sampling,
+            None,
+            None,
+        );
+    let tightened_estimate = ContextManager::estimate_items_token_count_with_base_instructions(
+        tightened_prompt.items(),
+        &base,
+    )
+    .expect("tightened prompt estimate");
+    assert!(
+        tightened_estimate + single_output_tokens <= sent_estimate,
+        "a 4k budget must compact another output: tightened={tightened_estimate} sent={sent_estimate}"
+    );
+    assert_eq!(
+        history.estimate_prepared_token_count_with_base_instructions(
+            &default_input_modalities(),
+            &base
+        ),
+        Some(tightened_estimate)
+    );
+    assert_eq!(history.get_total_token_usage(false, &base), tightened_estimate);
+    assert_eq!(history.raw_items()[1..=canonical.len()], canonical);
+}
+
+#[test]
 fn tool_history_budget_compacts_unread_local_shell_pairs() {
     let _budget =
         crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
@@ -3423,6 +3779,7 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
                 turn_id: "turn-cached-tool-history".to_string(),
                 ordinal: 1,
             },
+            exposed_representations: std::collections::BTreeMap::new(),
         },
     ));
     assert_eq!(history.projection_revision, initial_revision);

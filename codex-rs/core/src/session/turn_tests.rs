@@ -2236,6 +2236,26 @@ async fn soft_convergence_records_one_instruction_without_requesting_a_generatio
         session.clone_history().await.raw_items(),
         before.raw_items()
     );
+    // Elapsed time alone does not qualify a continuation: the directive waits
+    // for generations that completed without new evidence or mutations.
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        before.raw_items()
+    );
+    for _ in 0..crate::session::turn_execution::SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
+        let baselines = control.baselines(0);
+        assert!(!control.observe_budget_progress(
+            &baselines,
+            &SamplingRequestSignalCollector::default(),
+            &SamplingRequestSettledState {
+                mutation_revision: 0,
+                tool_exposure_revision: 0,
+            },
+        ));
+    }
     record_soft_convergence_directive(&session, &turn_context, &mut control, true)
         .await
         .unwrap();

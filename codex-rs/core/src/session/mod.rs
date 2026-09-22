@@ -133,6 +133,7 @@ use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnContextNetworkItem;
 use codex_protocol::protocol::TurnContextProvenance;
@@ -259,6 +260,7 @@ pub(crate) use self::input_queue::TurnInputQueue;
 pub(crate) use self::mcp_runtime::McpManagerLifecycle;
 pub use self::mcp_runtime::McpRuntimeSnapshot;
 use self::review::spawn_review_thread;
+pub(crate) use self::rollout_reconstruction::is_unified_exec_resume_invalidation;
 use self::session::AppServerClientMetadata;
 pub(crate) use self::session::Session;
 use self::session::SessionConfiguration;
@@ -1427,6 +1429,35 @@ impl StartupRolloutFacts {
     }
 }
 
+/// Boundary items for a resumed rollout whose last turn never completed:
+/// the interrupted-turn marker followed by the abort event the live path records.
+fn unfinished_turn_boundary_items(
+    rollout_items: &[RolloutItem],
+    turn_context: &TurnContext,
+) -> Vec<RolloutItem> {
+    let Some(turn_id) = crate::thread_manager::resumed_rollout_unfinished_turn(rollout_items)
+    else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    if let Some(marker) = crate::tasks::unfinished_turn_history_marker(
+        crate::tasks::InterruptedTurnHistoryMarker::from_config_and_version(
+            turn_context.config.as_ref(),
+            turn_context.multi_agent_version,
+        ),
+    ) {
+        items.push(RolloutItem::ResponseItem(marker));
+    }
+    items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+        turn_id,
+        reason: TurnAbortReason::Interrupted,
+        completed_at: None,
+        duration_ms: None,
+        timing: None,
+    })));
+    items
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ThreadSettingsUpdateError {
     #[error("invalid thread settings override: {0}")]
@@ -1878,7 +1909,14 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let turn_context = self.new_default_turn().await;
-                let rollout_items = resumed_history.history;
+                let mut rollout_items = Arc::unwrap_or_clone(resumed_history.history);
+                // The process can stop inside a turn before any completion or
+                // interruption is recorded. Append the same boundary the live
+                // interrupt path persists, so the model does not treat that
+                // request as worked on when the user continues.
+                let unfinished_turn_boundary =
+                    unfinished_turn_boundary_items(&rollout_items, &turn_context);
+                rollout_items.extend(unfinished_turn_boundary.iter().cloned());
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction_with_provider(
                         &turn_context,
@@ -1887,6 +1925,9 @@ impl Session {
                         reconstructed_provider_id.as_deref(),
                     )
                     .await;
+                if !unfinished_turn_boundary.is_empty() {
+                    self.persist_rollout_items(&unfinished_turn_boundary).await;
+                }
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -5562,6 +5603,7 @@ impl Session {
                 crate::tool_history::ToolHistoryMutation::MarkConsumed {
                     call_ids,
                     generation,
+                    exposed_representations: std::collections::BTreeMap::new(),
                 },
                 "completed-tool consumption state",
             ) {

@@ -7,8 +7,6 @@ use crate::client_common::ResponseEvent;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
-#[cfg(test)]
-use crate::compact::build_unresolved_user_history;
 use crate::compact::compaction_status_from_result;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
@@ -544,9 +542,10 @@ async fn prepare_v2_retained_input(
     prompt_input: &[ResponseItem],
 ) -> CodexResult<(Vec<ResponseItem>, usize)> {
     let (mut retained_input, retained_images, omitted_text) =
-        crate::compact::build_unresolved_input_checkpoint(prompt_input);
+        crate::compact::build_task_input_checkpoint(prompt_input);
     if let Some(text) =
-        crate::compact::persist_compaction_text_recovery(sess, prompt_input, omitted_text).await?
+        crate::compact::persist_task_compaction_text_recovery(sess, prompt_input, omitted_text)
+            .await?
     {
         retained_input.push(ResponseItem::Message {
             id: None,
@@ -556,6 +555,9 @@ async fn prepare_v2_retained_input(
             internal_chat_message_metadata_passthrough: None,
         });
     }
+    if let Some(plan) = crate::compact::retained_plan_context(sess).await? {
+        retained_input.push(plan);
+    }
     Ok((retained_input, retained_images))
 }
 
@@ -564,10 +566,8 @@ fn build_v2_compacted_history(
     prompt_input: Vec<ResponseItem>,
     compaction_output: ResponseItem,
 ) -> (Vec<ResponseItem>, usize) {
-    // The opaque compaction item owns the consumed transcript. Preserve only the bounded exact
-    // user tail after the last model-generated boundary; current instructions and durable task
-    // state are re-injected by `process_compacted_history`.
-    let (mut history, retained_image_count) = build_unresolved_user_history(&prompt_input);
+    let (mut history, retained_image_count, _) =
+        crate::compact::build_task_input_checkpoint(&prompt_input);
     history.push(compaction_output);
     (history, retained_image_count)
 }
@@ -950,11 +950,18 @@ mod tests {
 
         let (history, _) = build_v2_compacted_history(input, output.clone());
 
-        assert_eq!(history, vec![output]);
+        assert_eq!(
+            history,
+            vec![
+                message("user", "user", None),
+                message("assistant", "final", Some(MessagePhase::FinalAnswer)),
+                output
+            ]
+        );
     }
 
     #[test]
-    fn build_v2_compacted_history_retains_only_unresolved_user_tail() {
+    fn build_v2_compacted_history_retains_task_and_handoff_before_unresolved_tail() {
         let huge_contextual_message = format!(
             "<environment_context>\n{}\n</environment_context>",
             "c".repeat(20_000)
@@ -977,7 +984,19 @@ mod tests {
 
         let (history, _) = build_v2_compacted_history(input, output.clone());
 
-        assert_eq!(history, vec![message("user", "new", None), output]);
+        assert_eq!(
+            history,
+            vec![
+                message("user", "old", None),
+                message(
+                    "assistant",
+                    "consumed old request",
+                    Some(MessagePhase::FinalAnswer)
+                ),
+                message("user", "new", None),
+                output,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1028,7 +1047,15 @@ mod tests {
             &InitialContextInjection::DoNotInject,
         )
         .await;
-        assert_eq!(replacement, vec![pending, agent, opaque]);
+        assert_eq!(
+            replacement,
+            vec![
+                message("assistant", "consumed", Some(MessagePhase::FinalAnswer)),
+                pending,
+                agent,
+                opaque
+            ]
+        );
         let persisted = persisted_v2_compacted_item(replacement.clone());
         assert_eq!(persisted.replacement_history.as_ref(), Some(&replacement));
         session
@@ -1042,10 +1069,84 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            session.clone_history().await.raw_items(),
-            replacement.as_slice()
+        let mut installed = session.clone_history().await.raw_items().to_vec();
+        assert!(installed.iter().all(|item| item.id().is_some()));
+        for item in &mut installed {
+            item.set_id(None);
+        }
+        assert_eq!(installed, replacement);
+    }
+
+    #[tokio::test]
+    async fn installed_v2_checkpoint_preserves_task_constraints_and_current_plan() {
+        use codex_protocol::plan_tool::PlanItemArg;
+        use codex_protocol::plan_tool::StepStatus;
+        use codex_protocol::plan_tool::UpdatePlanArgs;
+
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let request = message("user", "Implement all external-call categories.", None);
+        let correction = message("user", "Finish the work; do not rerun tests.", None);
+        let handoff = message(
+            "assistant",
+            "Network modeling is still missing.",
+            Some(MessagePhase::FinalAnswer),
         );
+        let input = vec![request.clone(), correction.clone(), handoff.clone()];
+        let plan = UpdatePlanArgs {
+            explanation: Some("The full contract is not yet satisfied.".to_string()),
+            plan: vec![PlanItemArg {
+                step: "Finish network modeling".to_string(),
+                status: StepStatus::InProgress,
+            }],
+        };
+        session.services.plan_store.update(plan.clone()).await;
+        session
+            .record_conversation_items(&turn, &input)
+            .await
+            .unwrap();
+        let opaque = ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "opaque checkpoint".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let (retained, _) = prepare_v2_retained_input(&session, &input).await.unwrap();
+        let (replacement, _, _) = process_compacted_history_with_retained_input(
+            &session,
+            &turn,
+            vec![opaque.clone()],
+            retained,
+            &InitialContextInjection::DoNotInject,
+        )
+        .await;
+        assert_eq!(&replacement[..3], &[request, correction, handoff]);
+        let ResponseItem::Message { content, .. } = &replacement[3] else {
+            panic!("expected the current plan in the model checkpoint");
+        };
+        let text = crate::compact::content_items_to_text(content).unwrap();
+        assert!(text.contains(&serde_json::to_string(&plan).unwrap()));
+        assert!(text.contains("not a new request or proof of completion"));
+        assert_eq!(replacement.last(), Some(&opaque));
+
+        // A second compaction must replace the plan fragment rather than accumulate it.
+        let mut updated = plan;
+        updated.plan[0].step = "Validate the combined implementation".to_string();
+        session.services.plan_store.update(updated.clone()).await;
+        let (second, _) = prepare_v2_retained_input(&session, &replacement)
+            .await
+            .unwrap();
+        let plans = second
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::Message { content, .. } => {
+                    crate::compact::content_items_to_text(content)
+                }
+                _ => None,
+            })
+            .filter(|text| text.contains("source=\"compaction_plan\""))
+            .collect::<Vec<_>>();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].contains(&serde_json::to_string(&updated).unwrap()));
+        assert!(!plans[0].contains("Finish network modeling"));
     }
 
     #[tokio::test]
@@ -1056,13 +1157,17 @@ mod tests {
             .record_conversation_items(&turn, &input)
             .await
             .unwrap();
+        let original = session.clone_history().await.raw_items().to_vec();
         std::fs::create_dir_all(&turn.config.codex_home).unwrap();
         std::fs::write(turn.config.codex_home.join("tool-output"), "blocked").unwrap();
         let result = prepare_v2_retained_input(&session, &input).await;
         assert!(
             matches!(result, Err(CodexErr::Fatal(message)) if message.contains("could not preserve exact unresolved text"))
         );
-        assert_eq!(session.clone_history().await.raw_items(), input.as_slice());
+        assert_eq!(
+            session.clone_history().await.raw_items(),
+            original.as_slice()
+        );
     }
 
     #[test]
@@ -1088,7 +1193,14 @@ mod tests {
 
         let (history, _) = build_v2_compacted_history(input, output.clone());
 
-        assert_eq!(history, vec![agent_message, output]);
+        assert_eq!(
+            history,
+            vec![
+                message("assistant", "consumed", Some(MessagePhase::FinalAnswer)),
+                agent_message,
+                output
+            ]
+        );
     }
 
     #[test]

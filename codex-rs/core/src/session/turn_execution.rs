@@ -38,6 +38,11 @@ const DISTINCT_FAILURE_RECOVERY_ADVISORY_THRESHOLD: u32 = 2;
 const SUCCESSFUL_REPLAY_GATE_LIMIT: usize = 32;
 const SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT: usize = 64 * 1024;
 const SOFT_CONVERGENCE_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+// Elapsed time alone does not distinguish a long investigation from a stall:
+// the intervention fired two minutes into recorded implementation turns that
+// were still reading new files. Require that this many completed generations
+// in a row added no new evidence, mutation, or plan change first.
+pub(crate) const SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS: u32 = 3;
 const SOFT_CONVERGENCE_DIRECTIVE: &str = "Soft convergence intervention: Use existing evidence and stop optional exploration. Continue only to satisfy an unresolved requirement, complete required implementation or validation, or resolve a correctness-relevant uncertainty. Preserve the requested scope. This is not a completion test or a hard deadline: do not cancel running work, truncate the answer, claim unfinished work is complete, or abandon obtainable required evidence. Report limitations only when evidence is genuinely unavailable or work is blocked. This instruction takes effect on this already-needed continuation; it does not interrupt an in-flight request.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2582,6 +2587,9 @@ fn tool_name_matches(tool_name: &ToolName, candidate: &str) -> bool {
 pub(crate) struct TurnExecutionControl {
     soft_convergence_started_at: tokio::time::Instant,
     soft_convergence_issued: bool,
+    /// Completed generations since the last one that produced new evidence,
+    /// a workspace mutation, or a plan/input change.
+    continuations_without_progress: u32,
     plan: Option<UpdatePlanArgs>,
     plan_revision: u64,
     input_revision: u64,
@@ -2619,6 +2627,7 @@ impl TurnExecutionControl {
         Self {
             soft_convergence_started_at: tokio::time::Instant::now(),
             soft_convergence_issued: false,
+            continuations_without_progress: 0,
             plan: None,
             plan_revision: 0,
             input_revision: 0,
@@ -2646,6 +2655,7 @@ impl TurnExecutionControl {
         if !is_continuation
             || self.soft_convergence_issued
             || self.soft_convergence_started_at.elapsed() < SOFT_CONVERGENCE_AFTER
+            || self.continuations_without_progress < SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS
         {
             return None;
         }
@@ -2709,6 +2719,12 @@ impl TurnExecutionControl {
                 };
                 progressed |= self.budget_progress_evidence.insert(evidence);
             }
+        }
+        if progressed {
+            self.continuations_without_progress = 0;
+        } else {
+            self.continuations_without_progress =
+                self.continuations_without_progress.saturating_add(1);
         }
         progressed
     }
@@ -3153,6 +3169,7 @@ impl TurnExecutionControl {
     fn reset_convergence(&mut self) {
         self.consecutive_no_progress = 0;
         self.consecutive_obligation_no_progress = 0;
+        self.continuations_without_progress = 0;
         self.last_cycle = None;
         self.last_state_revision = None;
         self.directive_issued = false;
@@ -3387,11 +3404,23 @@ mod tests {
         control.settle(&baselines, &collector, &settled(0));
     }
 
+    fn observe_no_progress(control: &mut TurnExecutionControl) {
+        let baselines = control.baselines(0);
+        assert!(!control.observe_budget_progress(
+            &baselines,
+            &SamplingRequestSignalCollector::default(),
+            &settled(0),
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn soft_convergence_is_once_per_turn_and_only_on_a_needed_continuation() {
         let mut control = TurnExecutionControl::new();
         assert!(control.take_soft_convergence_directive(true).is_none());
         tokio::time::advance(SOFT_CONVERGENCE_AFTER - std::time::Duration::from_millis(1)).await;
+        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
+            observe_no_progress(&mut control);
+        }
         assert!(control.take_soft_convergence_directive(true).is_none());
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
         assert!(control.take_soft_convergence_directive(false).is_none());
@@ -3415,8 +3444,41 @@ mod tests {
         let mut next_turn = TurnExecutionControl::new();
         assert!(next_turn.take_soft_convergence_directive(true).is_none());
         tokio::time::advance(SOFT_CONVERGENCE_AFTER).await;
+        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
+            observe_no_progress(&mut next_turn);
+        }
         assert_eq!(
             next_turn.take_soft_convergence_directive(true).as_deref(),
+            Some(SOFT_CONVERGENCE_DIRECTIVE)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn soft_convergence_waits_for_generations_without_progress() {
+        let mut control = TurnExecutionControl::new();
+        tokio::time::advance(SOFT_CONVERGENCE_AFTER).await;
+        // Time alone is not a stall: an investigation that keeps producing new
+        // evidence or mutations must not be told to stop exploring.
+        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS - 1 {
+            observe_no_progress(&mut control);
+        }
+        assert!(control.take_soft_convergence_directive(true).is_none());
+        let baselines = control.baselines(0);
+        assert!(control.observe_budget_progress(
+            &baselines,
+            &SamplingRequestSignalCollector::default(),
+            &settled(1),
+        ));
+        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS - 1 {
+            observe_no_progress(&mut control);
+        }
+        assert!(
+            control.take_soft_convergence_directive(true).is_none(),
+            "a mutation resets the no-progress streak"
+        );
+        observe_no_progress(&mut control);
+        assert_eq!(
+            control.take_soft_convergence_directive(true).as_deref(),
             Some(SOFT_CONVERGENCE_DIRECTIVE)
         );
     }

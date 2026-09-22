@@ -201,6 +201,118 @@ fn checklist(step: &str) -> codex_protocol::plan_tool::UpdatePlanArgs {
     }
 }
 
+#[test]
+fn compaction_preserves_resume_boundary_before_reused_live_handle() {
+    use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
+    let call = |id: &str| ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = |id: &str| ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: id.to_string(),
+        output: FunctionCallOutputPayload::from_text(
+            "Process running with session ID 1000".to_string(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut source = vec![call("old"), output("old")];
+    append_unified_exec_resume_invalidation(&mut source);
+    let notice = source.last().unwrap().clone();
+    // Seeing the notice must not consume the runtime boundary. Reusing the same
+    // numeric handle after it must not turn that newly returned handle stale.
+    source.extend([
+        assistant_message("Old handles are invalid."),
+        call("new"),
+        output("new"),
+    ]);
+    for build in [
+        crate::compact::build_task_input_checkpoint,
+        crate::compact::build_unresolved_input_checkpoint,
+    ] {
+        let (checkpoint, _, _) = build(&source);
+        let boundary = checkpoint
+            .iter()
+            .position(is_unified_exec_resume_invalidation)
+            .unwrap();
+        assert_eq!(checkpoint[boundary], notice);
+        let current = checkpoint
+            .iter()
+            .position(|item| item == &call("new"))
+            .unwrap();
+        assert!(current > boundary);
+        assert_eq!(checkpoint[current + 1], output("new"));
+        assert_eq!(
+            checkpoint
+                .iter()
+                .filter(|item| is_unified_exec_resume_invalidation(item))
+                .count(),
+            1
+        );
+        let mut consumed = checkpoint;
+        consumed.push(assistant_message("The new command is still running."));
+        let (again, _, _) = build(&consumed);
+        assert_eq!(
+            again
+                .iter()
+                .filter(|item| is_unified_exec_resume_invalidation(item))
+                .collect::<Vec<_>>(),
+            vec![&notice]
+        );
+    }
+}
+
+#[tokio::test]
+async fn resumed_opaque_checkpoint_keeps_original_task_and_plan() {
+    let (session, _) = make_session_and_context().await;
+    let request =
+        user_message("Reconcile compatible edits and finish all external-call categories.");
+    let handoff =
+        assistant_message("Filesystem reads work; network and subprocess support are unfinished.");
+    let plan = checklist("Finish remaining categories");
+    session.services.plan_store.update(plan.clone()).await;
+    let (mut replacement, _, omitted) =
+        crate::compact::build_task_input_checkpoint(&[request.clone(), handoff.clone()]);
+    assert!(!omitted);
+    replacement.push(
+        crate::compact::retained_plan_context(&session)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    replacement.push(ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "opaque".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let (resumed, _) = make_session_and_context().await;
+    resume_rollout(
+        &resumed,
+        vec![
+            RolloutItem::EventMsg(EventMsg::PlanUpdate(plan.clone())),
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(replacement.clone()),
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resumed.clone_history().await.raw_items(),
+        replacement.as_slice()
+    );
+    assert_eq!(resumed.services.plan_store.snapshot().await, Some(plan));
+    assert_eq!(&replacement[..2], &[request, handoff]);
+}
+
 #[tokio::test]
 async fn nested_plan_handler_persists_checklist_for_resume() {
     use crate::tools::context::ToolInvocation;
@@ -606,6 +718,132 @@ async fn legacy_user_boundaries_rollback_history_and_metadata_together() {
 }
 
 #[test]
+fn resume_invalidates_nested_process_handles_without_losing_failure_evidence() {
+    use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
+    let states = json!([{
+        "tool": "exec_command",
+        "process_exited": false,
+        "session_id": 50820,
+        "raw_output_artifact_id": "retained-failure-output"
+    }]);
+    let bodies = [
+        format!("Script completed\nassertion failed: expected 2, got 1\nNested command states (independent of script completion):\n{states}"),
+        json!({"essential": {"nested_commands": states}, "output": "assertion failed: expected 2, got 1"}).to_string(),
+    ];
+    for body in bodies {
+        let mut history = vec![
+            ResponseItem::CustomToolCall {
+                id: None,
+                name: "exec".to_string(),
+                namespace: None,
+                input: "await tools.exec_command({cmd: 'test'})".to_string(),
+                call_id: "nested-exec".to_string(),
+                status: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "nested-exec".to_string(),
+                output: FunctionCallOutputPayload::from_text(body),
+                name: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let original = history.clone();
+        append_unified_exec_resume_invalidation(&mut history);
+        assert_eq!(&history[..2], original.as_slice());
+        assert_eq!(history.len(), 3);
+        let ResponseItem::Message { role, content, .. } = &history[2] else {
+            panic!("expected resume notice");
+        };
+        assert_eq!(role, "developer");
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("expected resume guidance");
+        };
+        assert!(text.contains("Do not poll those old sessions"));
+        assert!(text.contains("retain its recorded output and recovery references"));
+        assert!(text.contains("does not establish"));
+    }
+}
+
+#[test]
+fn resume_does_not_invalidate_completed_or_unrelated_nested_results() {
+    use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
+    for state in [
+        json!({"tool": "exec_command", "process_exited": true, "session_id": 1}),
+        json!({"tool": "other", "process_exited": false, "session_id": 1}),
+        json!({"tool": "exec_command", "process_exited": false}),
+    ] {
+        let mut history = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "wait".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "wait-call".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "wait-call".to_string(),
+                output: FunctionCallOutputPayload::from_text(
+                    json!({"nested_commands": [state]}).to_string(),
+                ),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let original = history.clone();
+        append_unified_exec_resume_invalidation(&mut history);
+        assert_eq!(history, original);
+    }
+}
+
+#[tokio::test]
+async fn record_initial_history_invalidates_nested_wait_with_only_polled_session() {
+    let (session, _) = make_session_and_context().await;
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "wait".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "nested-wait".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "nested-wait".to_string(),
+        output: FunctionCallOutputPayload::from_text(
+            json!({"result": {"essential": {"nested_commands": [{
+                "tool": "write_stdin", "session_id": null, "polled_session_id": 50820,
+                "process_exited": false, "raw_output_artifact_id": "recover-partial-output"
+            }]}}})
+            .to_string(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    resume_rollout(
+        &session,
+        vec![
+            RolloutItem::ResponseItem(call.clone()),
+            RolloutItem::ResponseItem(output.clone()),
+        ],
+    )
+    .await;
+    let history = session.clone_history().await;
+    assert_eq!(&history.raw_items()[..2], &[call, output]);
+    assert_eq!(history.raw_items().len(), 3);
+    let ResponseItem::Message { role, content, .. } = &history.raw_items()[2] else {
+        panic!("missing resume notice");
+    };
+    assert_eq!(role, "developer");
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("missing notice text");
+    };
+    assert!(text.contains("Do not poll those old sessions"));
+    assert!(text.contains("does not establish"));
+}
+
+#[test]
 fn resume_notice_is_scoped_and_ignores_other_namespaces() {
     use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
     let call = ResponseItem::FunctionCall {
@@ -696,12 +934,12 @@ async fn record_initial_history_restores_world_state_baseline() {
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
         .await;
-    let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    session
-        .record_context_updates_and_set_reference_context_item(&step_context)
-        .await.unwrap();
-
-    assert_eq!(session.clone_history().await.raw_items(), &[]);
+    // Compare the restored baseline directly. A fixture without the original
+    // rendered startup items can legitimately refresh environment context.
+    assert_eq!(
+        serde_json::to_value(session.clone_history().await.world_state_baseline()).unwrap(),
+        serde_json::to_value(world_state.snapshot()).unwrap(),
+    );
 }
 
 #[tokio::test]

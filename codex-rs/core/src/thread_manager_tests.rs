@@ -2020,6 +2020,92 @@ fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
     );
 }
 
+/// Two recorded sessions ended a turn with only `TurnStarted` and the user's
+/// request before the process stopped. Resume must recognize that turn as
+/// unfinished, but must not treat lifecycle-free legacy transcripts that way.
+#[test]
+fn resumed_rollout_reports_only_explicitly_unfinished_turns() {
+    let started = RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: "turn-2".to_string(),
+        trace_id: None,
+        started_at: None,
+        model_context_window: None,
+        collaboration_mode_kind: Default::default(),
+    }));
+    let request = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        client_id: None,
+        message: "now do it.".to_string(),
+        images: None,
+        text_elements: Vec::new(),
+        local_images: Vec::new(),
+        ..Default::default()
+    }));
+    let unfinished = vec![
+        RolloutItem::ResponseItem(user_msg("read fully")),
+        RolloutItem::ResponseItem(assistant_msg("read it")),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                surfaced_result: None,
+                turn_id: "turn-1".to_string(),
+                last_agent_message: Some("read it".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            },
+        )),
+        started.clone(),
+        RolloutItem::ResponseItem(user_msg("now do it.")),
+        request.clone(),
+    ];
+    assert_eq!(
+        resumed_rollout_unfinished_turn(&unfinished),
+        Some(Some("turn-2".to_string()))
+    );
+
+    let mut completed = unfinished.clone();
+    completed.push(RolloutItem::ResponseItem(assistant_msg("done")));
+    completed.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
+        codex_protocol::protocol::TurnCompleteEvent {
+            surfaced_result: None,
+            turn_id: "turn-2".to_string(),
+            last_agent_message: Some("done".to_string()),
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: None,
+        },
+    )));
+    assert_eq!(resumed_rollout_unfinished_turn(&completed), None);
+
+    let mut interrupted = unfinished.clone();
+    interrupted.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
+        TurnAbortedEvent {
+            turn_id: Some("turn-2".to_string()),
+            reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+            timing: None,
+        },
+    )));
+    assert_eq!(resumed_rollout_unfinished_turn(&interrupted), None);
+
+    // A legacy event-only turn without any response is still unfinished.
+    let legacy_unfinished = vec![request];
+    assert_eq!(resumed_rollout_unfinished_turn(&legacy_unfinished), Some(None));
+
+    // Response items alone recorded completed exchanges in older rollouts;
+    // fork snapshots may treat them as mid-turn, a resume must not.
+    let legacy_transcript = vec![
+        RolloutItem::ResponseItem(user_msg("hello")),
+        RolloutItem::ResponseItem(assistant_msg("hi")),
+    ];
+    assert_eq!(resumed_rollout_unfinished_turn(&legacy_transcript), None);
+    assert!(snapshot_turn_state(&InitialHistory::Forked(legacy_transcript)).ends_mid_turn);
+}
+
 #[test]
 fn interrupted_snapshot_is_not_mid_turn() {
     let interrupted_history = InitialHistory::Forked(vec![

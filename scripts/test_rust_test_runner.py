@@ -312,7 +312,254 @@ class RunnerTestCase(unittest.TestCase):
         return runner, executor
 
 
+class WallClockRunnerTest(RunnerTestCase):
+    def test_cache_fallback_with_real_children_retains_both_attempts(self):
+        runner, _ = self.runner()
+        child = (
+            "import os,sys; cached=bool(os.environ.get('RUSTC_WRAPPER')); "
+            "print('sccache: caused by: error reading compile response from server\\n"
+            "error: could not compile `dep` (lib)' if cached else 'compiled', file=sys.stderr); "
+            "sys.exit(101 if cached else 0)"
+        )
+
+        def execute(args, **kwargs):
+            return rust_test_runner._default_executor(
+                [sys.executable, "-c", child], **kwargs
+            )
+
+        runner.executor = execute
+        with contextlib.redirect_stderr(io.StringIO()) as notice:
+            result = runner._checked(
+                ["cargo", "build"],
+                env={
+                    **os.environ,
+                    "RUSTC_WRAPPER": "sccache",
+                    "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+                },
+                capture=rust_test_runner.CAPTURE_BOTH,
+            )
+        self.assertEqual(result.returncode, 0)
+        logs = list(self.temp_dir.glob("rust-test-stderr-*.log"))
+        self.assertEqual(len(logs), 2)
+        self.assertEqual(
+            sum("sccache: caused by:" in path.read_text() for path in logs), 1
+        )
+        self.assertEqual(sum(path.read_text() == "compiled\n" for path in logs), 1)
+        self.assertIn("retrying compilation once", notice.getvalue())
+
+    def test_verified_group_builds_only_its_declared_helper(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {
+            "mod::tests::": ["codex"]
+        }
+        runner, executor = self.runner(
+            manifest=Manifest.from_data(data),
+            executor=FakeExecutor(artifacts={"codex": self.helper_executable("codex")}),
+        )
+        runner.run_target("core_lib", ["alpha"])
+        builds = executor.commands(["cargo", "build"])
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(builds[0].count("--bin"), 1)
+        self.assertEqual(builds[0][-2:], ["--bin", "codex"])
+        self.assertNotIn("CARGO_BIN_EXE_codex-command-runner", executor.last_env())
+
+    def test_verified_selection_skips_helpers_and_keeps_original_filter(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
+        runner, executor = self.runner(manifest=Manifest.from_data(data))
+        filters = ["-E", "test(mod::tests::) - test(beta)"]
+        runner.run_target("core_lib", filters)
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "list"])), 1)
+        self.assertEqual(executor.commands(["cargo", "build"]), [])
+        self.assertEqual(
+            executor.commands(["cargo", "nextest", "run"])[0][-2:], filters
+        )
+
+    def test_mixed_unknown_selection_keeps_fallback_helpers(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
+        executor = FakeExecutor(
+            artifacts={"codex": self.helper_executable("codex")},
+            default_listing={"mod::tests::alpha": False, "other::beta": False},
+        )
+        runner, executor = self.runner(
+            manifest=Manifest.from_data(data), executor=executor, platform="linux"
+        )
+        runner.run_target("core_lib", ["-E", "all()"])
+        self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
+        self.assertIn("CARGO_BIN_EXE_codex", executor.last_env())
+
+    def test_prefix_requires_module_boundary_valid_helpers_and_no_overlap(self):
+        for prefixes in (
+            {"mod": []},
+            {"mod::": ["unknown"]},
+            {"mod::": [], "mod::tests::": []},
+            {"mod::": ["codex", "codex"]},
+        ):
+            with self.subTest(prefixes=prefixes):
+                data = copy.deepcopy(MANIFEST_DATA)
+                data["targets"]["core_lib"]["helpers_by_test_prefix"] = prefixes
+                with self.assertRaises(RunnerError):
+                    Manifest.from_data(data)
+
+    def test_empty_verified_selection_fails_before_helpers_or_execution(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
+        runner, executor = self.runner(
+            manifest=Manifest.from_data(data), executor=FakeExecutor(default_listing={})
+        )
+        with self.assertRaisesRegex(RunnerError, "zero tests"):
+            runner.run_target("core_lib", ["missing"])
+        self.assertEqual(len(executor.calls), 1)
+
+    def test_cache_transport_failure_retries_once_and_disables_later_cache_use(self):
+        runner, _ = self.runner()
+        failed = subprocess.CompletedProcess(
+            [],
+            101,
+            "",
+            "sccache: caused by: error reading compile response from server\n"
+            "error: could not compile `dep` (lib)",
+        )
+        log = self.temp_dir / "first-failure.log"
+        log.write_text(failed.stderr)
+        failed.stderr_path = log
+        original_log = log.read_text()
+        failed.stderr = "tail without the cache diagnostic"
+        executor = mock.Mock(
+            side_effect=[
+                failed,
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+        )
+        runner.executor = executor
+        env = {"RUSTC_WRAPPER": "C:/tools/sccache.exe", "KEEP": "same"}
+        with contextlib.redirect_stderr(io.StringIO()) as notice:
+            runner._checked(
+                ["cargo", "build"], env=env, capture=rust_test_runner.CAPTURE_STDOUT
+            )
+        runner._checked(
+            ["cargo", "nextest", "run"], env=env, capture=rust_test_runner.CAPTURE_NONE
+        )
+        self.assertEqual(
+            [call.kwargs["env"]["RUSTC_WRAPPER"] for call in executor.call_args_list],
+            ["C:/tools/sccache.exe", "", ""],
+        )
+        self.assertEqual(env["RUSTC_WRAPPER"], "C:/tools/sccache.exe")
+        self.assertIn(str(log), notice.getvalue())
+        self.assertEqual(log.read_text(), original_log)
+
+    def test_cache_failure_does_not_replay_tests_or_compiler_errors(self):
+        transport = (
+            "sccache: caused by: error reading compile response from server\n"
+            "error: could not compile `dep` (lib)\n"
+        )
+        for stderr in (
+            "ordinary failure",
+            transport + "Nextest run ID abc",
+            transport + "error[E0308]: mismatched types",
+        ):
+            with self.subTest(stderr=stderr):
+                runner, _ = self.runner()
+                executor = mock.Mock(
+                    return_value=subprocess.CompletedProcess([], 101, "", stderr)
+                )
+                runner.executor = executor
+                with self.assertRaises(RunnerError):
+                    runner._checked(
+                        ["cargo", "nextest", "run"],
+                        env={"RUSTC_WRAPPER": "sccache"},
+                        capture=rust_test_runner.CAPTURE_NONE,
+                    )
+                self.assertEqual(executor.call_count, 1)
+
+    def test_failed_cache_retry_is_reported_without_a_third_attempt(self):
+        runner, _ = self.runner()
+        failed = subprocess.CompletedProcess(
+            [],
+            101,
+            "",
+            (
+                "sccache: caused by: error reading compile response from server\n"
+                "error: could not compile `dep` (lib)"
+            ),
+        )
+        runner.executor = mock.Mock(return_value=failed)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RunnerError):
+            runner._checked(
+                ["cargo", "build"],
+                env={"RUSTC_WRAPPER": "sccache"},
+                capture=rust_test_runner.CAPTURE_STDOUT,
+            )
+        self.assertEqual(runner.executor.call_count, 2)
+
+
 class RealExecutorTest(RunnerTestCase):
+    def test_live_streams_are_also_retained_with_failure_status(self):
+        for capture in (rust_test_runner.CAPTURE_NONE, rust_test_runner.CAPTURE_STDOUT):
+            with self.subTest(capture=capture):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(sys, "stdout", stdout),
+                    mock.patch.object(sys, "stderr", stderr),
+                ):
+                    result = rust_test_runner._default_executor(
+                        [
+                            sys.executable,
+                            "-c",
+                            "import sys; print('test output'); print('assertion: expected 2, got 1', file=sys.stderr); sys.exit(7)",
+                        ],
+                        cwd=self.temp_dir,
+                        env={
+                            **os.environ,
+                            "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+                        },
+                        capture=capture,
+                    )
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(result.stdout_path.read_text(), "test output\n")
+                self.assertEqual(
+                    result.stderr_path.read_text(), "assertion: expected 2, got 1\n"
+                )
+                self.assertEqual(
+                    stderr.getvalue().replace("\r\n", "\n"),
+                    "assertion: expected 2, got 1\n",
+                )
+                self.assertEqual(
+                    stdout.getvalue().replace("\r\n", "\n"),
+                    "test output\n" if capture == rust_test_runner.CAPTURE_NONE else "",
+                )
+
+    def test_interrupted_live_run_keeps_partial_logs(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(sys, "stdout", stdout),
+            mock.patch.object(sys, "stderr", stderr),
+            self.assertRaises(RunnerError) as failure,
+        ):
+            rust_test_runner._default_executor(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; print('failure before interruption', flush=True); time.sleep(60)",
+                ],
+                cwd=self.temp_dir,
+                env={
+                    **os.environ,
+                    "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+                    "CODEX_RUST_TEST_TIMEOUT_SECS": "2",
+                },
+                capture=rust_test_runner.CAPTURE_NONE,
+            )
+        self.assertEqual(failure.exception.outcome, "timed_out")
+        self.assertIn("Full stdout:", str(failure.exception))
+        self.assertIn("Full stderr:", str(failure.exception))
+        logs = list(self.temp_dir.glob("rust-test-stdout-*.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].read_text(), "failure before interruption\n")
+        self.assertIn("failure before interruption", stdout.getvalue())
+
     def test_metadata_failure_preserves_full_log_recovery(self):
         results = []
 

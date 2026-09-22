@@ -79,15 +79,16 @@ pub(crate) async fn process_compacted_history_with_retained_input(
     let (initial_context, world_state_baseline, fragment_digests) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
-    // Only provider output is subject to the consumed-transcript filter. The local
-    // unresolved tail has already been selected against its own retention budget.
+    // Only provider output is subject to the consumed-transcript filter. Local
+    // task context has already been selected against its own retention budget.
     let retained_input_len = retained_input.len();
     retained_input.extend(compacted_history);
-    let artifact_pin_payload = sess
-        .clone_history()
-        .await
+    let history = sess.clone_history().await;
+    let mut reference_items = history.raw_items().to_vec();
+    reference_items.extend(retained_input.iter().cloned());
+    let artifact_pin_payload = history
         .tool_history_state()
-        .artifact_pin_payload_for_items(&retained_input);
+        .artifact_pin_payload_for_items(&reference_items);
     // Recover exact registered references before the provider-output filter
     // removes consumed tool pairs. Their sidecar must survive that removal.
     let provider_output = retained_input.split_off(retained_input_len);

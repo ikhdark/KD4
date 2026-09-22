@@ -770,6 +770,7 @@ def reserve_cargo_lane(
     command: Sequence[str],
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
+    warm_wait_seconds: float = 30.0,
 ) -> Iterator[tuple[str, Path]]:
     explicit = requested_lane != "auto"
     base_lane = _safe_lane_name(
@@ -782,35 +783,62 @@ def reserve_cargo_lane(
     active_handle: BinaryIO | None = None
     target_dir: Path | None = None
     resolved_lane: str | None = None
-    with cargo_lane_coordination_lock(
-        root,
-        timeout_seconds=lock_timeout_seconds,
-    ):
-        for candidate in _lane_reservation_candidates(
-            root,
-            base_lane,
-            prefer_warm=not explicit,
-        ):
-            candidate_name = _safe_lane_name(candidate.name)
-            candidate_dir = candidate.path
-            observation = _lane_path_observation(candidate_dir)
-            if observation is not None and _observation_is_indirect(observation):
-                raise CargoLanesRootValidationError(
-                    f"refusing indirect Cargo lane path {candidate_dir}"
-                )
-            candidate_dir.mkdir(exist_ok=True)
-            if (
-                cargo_lock_is_busy(candidate_dir)
-                or (candidate_dir / ".lane-cleanup-unconfirmed").exists()
-            ):
-                continue
-            active_handle = _try_acquire_binary_file_lock(
-                candidate_dir / ".lane-active.lock"
+    deadline = time.monotonic() + max(0.0, warm_wait_seconds)
+    announced_wait = False
+    while active_handle is None:
+        busy_warm = False
+        deferred_cold = False
+        with cargo_lane_coordination_lock(root, timeout_seconds=lock_timeout_seconds):
+            candidates = _lane_reservation_candidates(
+                root, base_lane, prefer_warm=not explicit
             )
-            if active_handle is not None:
-                target_dir = candidate_dir.resolve()
-                resolved_lane = candidate_name
-                break
+            # Existing directories alone are not evidence of reusable build work.
+            warm_paths = {
+                candidate.path
+                for candidate in candidates
+                if any(
+                    is_cargo_artifact_dir(candidate.path / profile)
+                    for profile in ("debug", "release", "dev-small")
+                )
+            }
+            candidates.sort(key=lambda candidate: candidate.path not in warm_paths)
+            for candidate in candidates:
+                candidate_name = _safe_lane_name(candidate.name)
+                candidate_dir = candidate.path
+                observation = _lane_path_observation(candidate_dir)
+                if observation is not None and _observation_is_indirect(observation):
+                    raise CargoLanesRootValidationError(
+                        f"refusing indirect Cargo lane path {candidate_dir}"
+                    )
+                if (candidate_dir / ".lane-cleanup-unconfirmed").exists():
+                    continue
+                warm = candidate_dir in warm_paths
+                if not warm and busy_warm and time.monotonic() < deadline:
+                    deferred_cold = True
+                    break
+                candidate_dir.mkdir(exist_ok=True)
+                if cargo_lock_is_busy(candidate_dir):
+                    busy_warm |= warm
+                    continue
+                active_handle = _try_acquire_binary_file_lock(
+                    candidate_dir / ".lane-active.lock"
+                )
+                if active_handle is not None:
+                    target_dir = candidate_dir.resolve()
+                    resolved_lane = candidate_name
+                    break
+                busy_warm |= warm
+        if active_handle is not None or not deferred_cold:
+            break
+        if not announced_wait:
+            print(
+                f"waiting up to {warm_wait_seconds:g}s for a warm Cargo lane for {base_lane!r}",
+                file=sys.stderr,
+            )
+            announced_wait = True
+        # Release the coordination lock while waiting so owners can finish and
+        # other work can reserve unrelated lanes.
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
     if active_handle is None or target_dir is None or resolved_lane is None:
         raise RuntimeError(f"unable to reserve an idle Cargo lane for {base_lane!r}")
     stamp = target_dir / LANE_LAST_USED_STAMP
@@ -1302,7 +1330,9 @@ def request_cargo_lane_maintenance(repo_root: Path, lane_root: Path) -> None:
         return
     worker = repo_root / "scripts" / "cargo-lane-trash-cleanup.ps1"
     if not worker.is_file():
-        print(f"warning: Cargo maintenance worker is missing: {worker}", file=sys.stderr)
+        print(
+            f"warning: Cargo maintenance worker is missing: {worker}", file=sys.stderr
+        )
         return
     command = [
         shell,
@@ -1412,7 +1442,10 @@ def run_in_cargo_lane(
             try:
                 request_cargo_lane_maintenance(repo_root, target_dir.parent)
             except OSError as error:
-                print(f"warning: could not request Cargo maintenance: {error}", file=sys.stderr)
+                print(
+                    f"warning: could not request Cargo maintenance: {error}",
+                    file=sys.stderr,
+                )
             next_phase("command")
             try:
                 try:

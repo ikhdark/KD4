@@ -61,6 +61,16 @@ helpers = [
   "codex-command-runner",
 ]
 
+# These modules use pure data or the in-process session fixture. Unknown test
+# modules retain the conservative helper set above. Nextest resolves filters.
+[targets.core_lib.helpers_by_test_prefix]
+"compact::tests::" = []
+"compact_remote::tests::" = []
+"compact_remote_v2::tests::" = []
+"plan_store::tests::" = []
+"session::rollout_reconstruction_tests::" = []
+"tool_history::tests::" = []
+
 [targets.available_skills_instructions]
 package = "codex-core"
 test = "available_skills_instructions"

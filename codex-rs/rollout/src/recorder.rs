@@ -1017,13 +1017,16 @@ impl RolloutRecorder {
             .await
     }
 
-    /// Queue canonical items in writer order without forcing the writer to flush. A later
-    /// persist/flush/shutdown command is the write-completion barrier for the queued prefix.
+    /// Queue canonical items in writer order and return once the writer has accepted them.
+    /// A materialized rollout is appended to promptly afterwards, off the caller's path, so a
+    /// turn that never reaches its terminal barrier still leaves its items on disk. A later
+    /// persist/flush/shutdown command remains the write-completion barrier for the queued
+    /// prefix; an unmaterialized rollout keeps waiting for that barrier.
     pub async fn record_canonical_items_ordered(
         &self,
         items: &[RolloutItem],
     ) -> std::io::Result<()> {
-        self.record_canonical_items_with_flush(items, false, true)
+        self.record_canonical_items_with_flush(items, true, true)
             .await
     }
 

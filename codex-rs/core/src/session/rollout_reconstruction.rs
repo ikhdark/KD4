@@ -10,6 +10,13 @@ use uuid::Uuid;
 const UNIFIED_EXEC_RESUME_INVALIDATION_START: &str = "<unified_exec_resume_invalidated>";
 const UNIFIED_EXEC_SESSION_ID_PREFIX: &str = "Process running with session ID ";
 
+pub(crate) fn is_unified_exec_resume_invalidation(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { role, content, .. }
+        if role == "developer" && matches!(content.as_slice(),
+            [ContentItem::InputText { text }]
+                if text.starts_with(UNIFIED_EXEC_RESUME_INVALIDATION_START)))
+}
+
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
 // the resume/fork hydration metadata derived from the same replay.
 #[derive(Debug)]
@@ -38,11 +45,29 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
             _ => None,
         })
         .collect::<HashSet<_>>();
+    let code_mode_call_ids = history
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::CustomToolCall {
+                name,
+                namespace: None,
+                call_id,
+                ..
+            } if name == "exec" => Some(call_id.as_str()),
+            ResponseItem::FunctionCall {
+                name,
+                namespace: None,
+                call_id,
+                ..
+            } if matches!(name.as_str(), "exec" | "wait") => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let has_old_sessions = history.iter().any(|item| match item {
         ResponseItem::FunctionCallOutput {
             call_id, output, ..
         } if unified_exec_call_ids.contains(call_id.as_str()) => {
-            output.text_content().is_some_and(|output| {
+            output.body.to_text().is_some_and(|output| {
                 output.lines().any(|line| {
                     line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
                         .is_some_and(|status| {
@@ -52,16 +77,22 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
                 })
             })
         }
+        ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        }
+        | ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } if code_mode_call_ids.contains(call_id.as_str()) => output
+            .body
+            .to_text()
+            .is_some_and(|text| has_live_nested_command(&text)),
         _ => false,
     });
     // Replace earlier runtime notices so this notice scopes invalidation to the
     // current resume boundary, including when a numeric process ID is reused.
     let mut had_notice = false;
     history.retain(|item| {
-        let is_notice = matches!(item, ResponseItem::Message { role, content, .. }
-            if role == "developer" && matches!(content.as_slice(),
-                [ContentItem::InputText { text }]
-                    if text.starts_with(UNIFIED_EXEC_RESUME_INVALIDATION_START)));
+        let is_notice = is_unified_exec_resume_invalidation(item);
         had_notice |= is_notice;
         !is_notice
     });
@@ -72,6 +103,9 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
         "{UNIFIED_EXEC_RESUME_INVALIDATION_START}\n\
 Process session IDs in the pre-resume history are no longer live. Do not poll those old sessions. \
 Newly returned session IDs are valid, even when a number is reused. \
+This includes sessions in nested code-mode command receipts. Invalidation does not establish \
+whether a command completed or was terminated; retain its recorded output and recovery references, \
+and re-establish uncertain effects before repeating it. \
 Start another process only when the current task still requires execution; \
 do not rerun completed commands merely because this conversation resumed.\n\
 </unified_exec_resume_invalidated>"
@@ -83,6 +117,44 @@ do not rerun completed commands merely because this conversation resumed.\n\
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     });
+}
+
+fn has_live_nested_command(text: &str) -> bool {
+    fn live(states: &serde_json::Value) -> bool {
+        states.as_array().is_some_and(|states| {
+            states.iter().any(|state| {
+                matches!(state["tool"].as_str(), Some("exec_command" | "write_stdin"))
+                    && state["process_exited"].as_bool() == Some(false)
+                    && state
+                        .get("session_id")
+                        .filter(|id| !id.is_null())
+                        .or_else(|| state.get("polled_session_id"))
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|id| u32::try_from(id).is_ok())
+            })
+        })
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && [
+            "/nested_commands",
+            "/essential/nested_commands",
+            "/result/essential/nested_commands",
+        ]
+        .iter()
+        .any(|pointer| value.pointer(pointer).is_some_and(live))
+    {
+        return true;
+    }
+    let marker = "Nested command states (independent of script completion):\n";
+    text.match_indices(marker).any(|(index, _)| {
+        if index != 0 && !text[..index].ends_with('\n') {
+            return false;
+        }
+        serde_json::Deserializer::from_str(&text[index + marker.len()..])
+            .into_iter::<serde_json::Value>()
+            .next()
+            .is_some_and(|value| value.as_ref().is_ok_and(live))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

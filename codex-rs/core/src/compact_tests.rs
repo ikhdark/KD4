@@ -1087,6 +1087,33 @@ fn bounded_agent_history_emits_text_omission_receipt() {
 }
 
 #[test]
+fn task_checkpoint_bounds_handoff_and_preserves_exact_recovery_text() {
+    let request =
+        user_message("Implement model, tool, network, IPC, database, and subprocess handling.");
+    let text = format!(
+        "Open acceptance requirements:\n{}\nNetwork handling is unfinished.",
+        "evidence ".repeat(8_000)
+    );
+    let handoff = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText { text: text.clone() }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let input = vec![request.clone(), handoff];
+    let (checkpoint, _, omitted_text) = build_task_input_checkpoint(&input);
+    assert!(omitted_text);
+    assert_eq!(checkpoint[0], request);
+    assert!(response_item_text_tokens(&checkpoint[1]) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    let canonical = compaction_text_recovery_for_items(task_compaction_items(&input));
+    assert_eq!(
+        canonical.value.as_ref().unwrap()["items"][1]["content"][0]["text"],
+        text
+    );
+}
+
+#[test]
 fn unresolved_tool_output_survives_local_compaction_as_typed_receipt() {
     let call = ResponseItem::FunctionCall {
         id: None,
@@ -1912,4 +1939,62 @@ async fn compaction_recovery_failure_keeps_unresolved_text() {
         session.clone_history().await.raw_items(),
         history.raw_items()
     );
+}
+
+#[tokio::test]
+async fn local_compaction_keeps_consumed_resume_invalidation() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let notice = ResponseItem::Message {
+        id: None, role: "developer".to_string(),
+        content: vec![ContentItem::InputText { text: "<unified_exec_resume_invalidated>\nOld process handles are invalid; newly returned handles remain valid.\n</unified_exec_resume_invalidated>".to_string() }],
+        phase: None, internal_chat_message_metadata_passthrough: None,
+    };
+    session
+        .record_conversation_items(
+            &turn,
+            &[
+                notice.clone(),
+                summary_message("settled state"),
+                user_message("continue"),
+            ],
+        )
+        .await
+        .unwrap();
+    let session = Arc::new(session);
+    run_compact_task_inner_impl(
+        Arc::clone(&session),
+        Arc::new(turn),
+        None,
+        Some(&None),
+        Vec::new(),
+        InitialContextInjection::DoNotInject,
+        CompactionTurnMetadata::new(
+            CompactionTrigger::Manual,
+            CompactionReason::UserRequested,
+            CompactionImplementation::Responses,
+            CompactionPhase::StandaloneTurn,
+        ),
+        &mut CompactionAnalyticsDetails::default(),
+        true,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let history = session.clone_history().await;
+    let retained = history
+        .raw_items()
+        .iter()
+        .filter(|item| crate::session::is_unified_exec_resume_invalidation(item))
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 1);
+    let mut retained = retained[0].clone();
+    retained.set_id(None);
+    if let ResponseItem::Message {
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &mut retained
+    {
+        *internal_chat_message_metadata_passthrough = None;
+    }
+    assert_eq!(retained, notice);
 }

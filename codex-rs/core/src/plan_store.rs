@@ -77,6 +77,10 @@ pub(crate) struct PlanStore {
 }
 
 impl PlanStore {
+    pub(crate) async fn snapshot(&self) -> Option<UpdatePlanArgs> {
+        self.current.lock().await.clone()
+    }
+
     pub(crate) async fn restore_from_history(&self, items: &[ResponseItem]) -> bool {
         let update_call_ids = items
             .iter()
@@ -167,7 +171,7 @@ impl PlanStore {
 
     #[cfg(test)]
     pub(crate) async fn current_for_test(&self) -> Option<UpdatePlanArgs> {
-        self.current.lock().await.clone()
+        self.snapshot().await
     }
 }
 

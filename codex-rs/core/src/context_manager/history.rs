@@ -12,12 +12,14 @@ use crate::stable_context::StableContextManifest;
 use crate::stable_context::StableContextTarget;
 use crate::stable_context::project_stable_context;
 use crate::tool_history::ModelGenerationId;
+use crate::tool_history::SamplingProjectionAnchor;
 #[cfg(test)]
 use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryProjection;
 use crate::tool_history::ToolHistoryState;
 use crate::tool_history::ToolHistorySubstitution;
 use crate::tool_history::ToolOutputBudgetDrops;
+use crate::tool_history::item_call_id;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::BaseInstructions;
@@ -563,6 +565,12 @@ pub(crate) struct ContextManager {
     projection_revision: u64,
     tool_history: Arc<ToolHistoryState>,
     prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
+    /// The tool-history projection sent by the latest sampling request of the
+    /// current turn. Continuation requests extend it so their input keeps the
+    /// previous request as an exact prefix; a new user turn, compaction,
+    /// rollback, or replaced tool-history state starts over. Shared like the
+    /// prepared cache so a prompt prepared from a snapshot publishes it back.
+    sampling_projection_anchor: Arc<StdMutex<Option<SamplingProjectionAnchor>>>,
     item_token_estimates:
         Arc<StdMutex<HashMap<ItemTokenEstimateCacheNamespace, HashMap<usize, i64>>>>,
     token_info: Option<TokenUsageInfo>,
@@ -589,6 +597,7 @@ impl ContextManager {
             projection_revision: 0,
             tool_history: Arc::new(ToolHistoryState::default()),
             prepared_history: Arc::new(StdMutex::new(None)),
+            sampling_projection_anchor: Arc::new(StdMutex::new(None)),
             item_token_estimates: Arc::new(StdMutex::new(HashMap::new())),
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
@@ -604,6 +613,28 @@ impl ContextManager {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.token_info = info;
+        self.sync_tool_result_token_budget();
+    }
+
+    /// The raw tool-result working set scales with the active model context
+    /// window, which is only known from recorded usage or a resumed rollout.
+    fn sync_tool_result_token_budget(&mut self) {
+        let budget = self
+            .token_info
+            .as_ref()
+            .and_then(|info| info.model_context_window)
+            .map(|window| {
+                crate::tool_history::model_visible_tool_result_token_budget_for_context_window(
+                    Some(window),
+                )
+            });
+        if self
+            .tool_history
+            .configured_model_visible_tool_result_token_budget()
+            != budget
+        {
+            Arc::make_mut(&mut self.tool_history).set_model_visible_tool_result_token_budget(budget);
+        }
     }
 
     pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
@@ -704,6 +735,11 @@ impl ContextManager {
             .collect::<Vec<_>>();
         if appended.is_empty() {
             return;
+        }
+        // A new user turn re-budgets consumed results once, at its first
+        // request; everything after that extends what was sent.
+        if appended.iter().any(is_user_turn_boundary) {
+            self.clear_sampling_projection_anchor();
         }
         // Clones may prepare the same snapshot together, but a divergent append
         // must not reuse another branch's positional estimates or consume its cache.
@@ -945,17 +981,50 @@ impl ContextManager {
         git_workspace: Option<&crate::git_workspace::GitWorkspaceCache>,
     ) -> PreparedPromptInput {
         let tool_history = Arc::clone(&self.tool_history);
+        // Only sampling requests anchor: compaction prompts and generic
+        // preparation must see the fully budgeted projection.
+        let anchor_slot = match (target, git_workspace) {
+            (StableContextTarget::Sampling, Some(_)) => {
+                Some(Arc::clone(&self.sampling_projection_anchor))
+            }
+            _ => None,
+        };
         let prepared = self.prepare_for_prompt_target(input_modalities, target);
+        let items = prepared.shared_items();
+        let fallback_items = prepared.shared_fallback_items();
+        let shares_input = Arc::ptr_eq(&items, &fallback_items);
+        if let (Some(anchor_slot), Some(git_workspace), true) =
+            (anchor_slot.as_ref(), git_workspace, shares_input)
+        {
+            let anchor = anchor_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(projection) = anchor.as_ref().and_then(|anchor| {
+                tool_history.project_continuation_with_workspace_cache(
+                    anchor,
+                    Arc::clone(&items),
+                    workspace_identity,
+                    git_workspace,
+                )
+            }) {
+                *anchor_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(SamplingProjectionAnchor {
+                        prepared_items: items,
+                        projection: projection.clone(),
+                    });
+                return apply_tool_history_projection(prepared, projection.clone(), projection);
+            }
+        }
         let project = |items| match git_workspace {
             Some(cache) => {
                 tool_history.project_with_workspace_cache(items, workspace_identity, cache)
             }
             None => tool_history.project_with_workspace_identity(items, workspace_identity),
         };
-        let items = prepared.shared_items();
-        let fallback_items = prepared.shared_fallback_items();
-        let shares_input = Arc::ptr_eq(&items, &fallback_items);
-        let projection = project(items);
+        let projection = project(Arc::clone(&items));
         // Most prompts have identical sampling and fallback input. Reuse this
         // request's projection, including freshness checks and substitutions;
         // a distinct fallback must still be projected independently.
@@ -964,11 +1033,40 @@ impl ContextManager {
         } else {
             project(fallback_items)
         };
+        if let Some(anchor_slot) = anchor_slot
+            && shares_input
+        {
+            *anchor_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(SamplingProjectionAnchor {
+                    prepared_items: items,
+                    projection: projection.clone(),
+                });
+        }
         apply_tool_history_projection(prepared, projection, fallback_projection)
+    }
+
+    fn clear_sampling_projection_anchor(&mut self) {
+        // Detach rather than clear in place: a snapshot that is still preparing
+        // a prompt may publish into the old slot, and that stale anchor must not
+        // prefix the next request.
+        self.sampling_projection_anchor = Arc::new(StdMutex::new(None));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sampling_projection_anchor_len(&self) -> Option<usize> {
+        self.sampling_projection_anchor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|anchor| anchor.prepared_items.len())
     }
 
     pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
         self.tool_history = Arc::new(state);
+        self.sync_tool_result_token_budget();
+        self.clear_sampling_projection_anchor();
     }
 
     pub(crate) fn tool_history_state(&self) -> ToolHistoryState {
@@ -1033,14 +1131,108 @@ impl ContextManager {
         input_modalities: &[InputModality],
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
+        self.estimate_projected_prompt_token_count(
+            input_modalities,
+            base_instructions,
+            /*pending_user_boundary*/ false,
+        )
+    }
+
+    /// Estimates the prompt after tool-result receipts and the aggregate output
+    /// budget are applied. Compaction pressure compared the raw canonical
+    /// history against the limit, which compacted a 93k-token prompt whose raw
+    /// tool outputs alone exceeded the limit and discarded the task.
+    fn estimate_projected_prompt_token_count(
+        &self,
+        input_modalities: &[InputModality],
+        base_instructions: &BaseInstructions,
+        pending_user_boundary: bool,
+    ) -> Option<i64> {
+        let tool_history = Arc::clone(&self.tool_history);
         let prepared = self
             .clone()
             .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
-        self.estimate_prepared_items_token_count(
-            prepared.items(),
+        let prepared_items = prepared.shared_items();
+        let projected = tool_history.project(Arc::clone(&prepared_items));
+        self.estimate_projected_items_token_count(
+            &prepared_items,
+            &projected.items,
             base_instructions,
-            /*pending_user_boundary*/ false,
-            prepared.policy,
+            pending_user_boundary,
+            Some(prepared.policy),
+        )
+    }
+
+    /// Sums the projected prompt from the per-position cache of its source
+    /// items. The projection keeps source order, replaces outputs in place,
+    /// removes budget-dropped pairs, and appends notices, so every projected
+    /// item either equals a source item, whose cached estimate is reused, or
+    /// is a receipt or notice that is measured directly. Projected items are
+    /// never cached by position: tool-history mutations change them without
+    /// advancing the projection revision that keys the cache.
+    fn estimate_projected_items_token_count(
+        &self,
+        source_items: &Arc<[ResponseItem]>,
+        projected_items: &Arc<[ResponseItem]>,
+        base_instructions: &BaseInstructions,
+        pending_user_boundary: bool,
+        policy: Option<PreparedHistoryPolicy>,
+    ) -> Option<i64> {
+        let base_tokens =
+            i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
+        let last_instruction_boundary = pending_user_boundary
+            .then_some(projected_items.len())
+            .or_else(|| projected_items.iter().rposition(is_user_turn_boundary));
+        let unchanged = Arc::ptr_eq(source_items, projected_items);
+        let mut retained = Vec::with_capacity(projected_items.len());
+        let mut introduced_tokens = 0i64;
+        let mut source_index = 0usize;
+        for (projected_index, item) in projected_items.iter().enumerate() {
+            let counted = !is_resolved_reasoning(projected_index, item, last_instruction_boundary);
+            if unchanged {
+                if counted {
+                    retained.push((projected_index, item));
+                }
+                continue;
+            }
+            // Skip source items the projection removed until this item's
+            // source position, or its in-place replacement, is reached.
+            let source_position = loop {
+                let Some(source) = source_items.get(source_index) else {
+                    break None;
+                };
+                if source == item {
+                    break Some(source_index);
+                }
+                let replaced_in_place = matches!(
+                    (item_call_id(source), item_call_id(item)),
+                    (Some(source_call_id), Some(call_id)) if source_call_id == call_id
+                );
+                source_index = source_index.saturating_add(1);
+                if replaced_in_place {
+                    break None;
+                }
+            };
+            if let Some(position) = source_position {
+                source_index = position.saturating_add(1);
+            }
+            if !counted {
+                continue;
+            }
+            match source_position {
+                Some(position) => retained.push((position, item)),
+                None => {
+                    introduced_tokens =
+                        introduced_tokens.saturating_add(estimate_item_token_count(item));
+                }
+            }
+        }
+        let retained_tokens =
+            self.estimate_indexed_items_token_count_cached(retained.into_iter(), policy);
+        Some(
+            base_tokens
+                .saturating_add(retained_tokens)
+                .saturating_add(introduced_tokens),
         )
     }
 
@@ -1057,52 +1249,11 @@ impl ContextManager {
         input_modalities: &[InputModality],
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
-        let prepared = self
-            .clone()
-            .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
-        self.estimate_prepared_items_token_count(
-            prepared.items(),
+        self.estimate_projected_prompt_token_count(
+            input_modalities,
             base_instructions,
             /*pending_user_boundary*/ true,
-            prepared.policy,
         )
-    }
-
-    fn estimate_prepared_items_token_count(
-        &self,
-        items: &[ResponseItem],
-        base_instructions: &BaseInstructions,
-        pending_user_boundary: bool,
-        policy: PreparedHistoryPolicy,
-    ) -> Option<i64> {
-        self.estimate_cached_items_token_count(
-            items,
-            base_instructions,
-            pending_user_boundary,
-            Some(policy),
-        )
-    }
-
-    fn estimate_cached_items_token_count(
-        &self,
-        items: &[ResponseItem],
-        base_instructions: &BaseInstructions,
-        pending_user_boundary: bool,
-        policy: Option<PreparedHistoryPolicy>,
-    ) -> Option<i64> {
-        let base_tokens =
-            i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
-        let last_instruction_boundary = pending_user_boundary
-            .then_some(items.len())
-            .or_else(|| items.iter().rposition(is_user_turn_boundary));
-        let items_tokens = self.estimate_indexed_items_token_count_cached(
-            items.iter().enumerate().filter(|(index, item)| {
-                !is_resolved_reasoning(*index, item, last_instruction_boundary)
-            }),
-            policy,
-        );
-
-        Some(base_tokens.saturating_add(items_tokens))
     }
 
     fn estimate_indexed_items_token_count_cached<'a>(
@@ -1317,6 +1468,7 @@ impl ContextManager {
             &Some(usage.clone()),
             model_context_window,
         );
+        self.sync_tool_result_token_budget();
     }
 
     // These are local items added after the most recent model-emitted item.
@@ -1351,9 +1503,14 @@ impl ContextManager {
                 },
             );
         if local_tail_contains_instruction_boundary {
+            // Server usage is stale across an instruction boundary, so estimate
+            // the whole prompt; receipts and the output budget still apply.
+            let raw_items: Arc<[ResponseItem]> = Arc::from(self.raw_items());
+            let projected = self.tool_history.project(Arc::clone(&raw_items));
             return self
-                .estimate_cached_items_token_count(
-                    self.raw_items(),
+                .estimate_projected_items_token_count(
+                    &raw_items,
+                    &projected.items,
                     base_instructions,
                     /*pending_user_boundary*/ false,
                     /*policy*/ None,
@@ -1852,6 +2009,7 @@ impl ContextManager {
         // while a tool dispatch holds the session state lock.
         self.prepared_history = Arc::new(StdMutex::new(None));
         self.item_token_estimates = Arc::new(StdMutex::new(HashMap::new()));
+        self.clear_sampling_projection_anchor();
     }
 }
 

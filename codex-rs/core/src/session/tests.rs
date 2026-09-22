@@ -2915,6 +2915,98 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
 }
 
 #[tokio::test]
+async fn resumed_history_marks_a_turn_that_never_completed() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let completed_turn = vec![
+        RolloutItem::ResponseItem(user_message("read fully")),
+        RolloutItem::ResponseItem(assistant_message("Read it.")),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                surfaced_result: None,
+                turn_id: "turn-1".to_string(),
+                last_agent_message: Some("Read it.".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            },
+        )),
+    ];
+    let mut cut_short = completed_turn.clone();
+    cut_short.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
+        TurnStartedEvent {
+            turn_id: "turn-2".to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        },
+    )));
+    cut_short.push(RolloutItem::ResponseItem(user_message("now do it.")));
+    cut_short.push(RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        client_id: None,
+        message: "now do it.".to_string(),
+        images: None,
+        text_elements: Vec::new(),
+        local_images: Vec::new(),
+        ..Default::default()
+    })));
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: Arc::new(cut_short),
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+        }))
+        .await;
+
+    let history = session.state.lock().await.clone_history();
+    let items = history.raw_items();
+    let last = items.last().expect("resumed history keeps the request");
+    let ResponseItem::Message { role, content, .. } = last else {
+        panic!("expected a turn boundary marker after the unfinished request, got {last:?}");
+    };
+    assert!(role == "developer" || role == "user");
+    assert!(
+        matches!(
+            content.as_slice(),
+            [ContentItem::InputText { text }]
+                if text.contains("ended before it completed")
+                    && text.contains("Do not assume any part of that request was carried out")
+        ),
+        "unfinished-turn marker must tell the model the request was not worked on: {content:?}"
+    );
+    assert!(
+        matches!(
+            &items[items.len() - 2],
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && matches!(content.as_slice(), [ContentItem::InputText { text }] if text == "now do it.")
+        ),
+        "the unfinished request itself is retained ahead of the marker"
+    );
+
+    // A rollout whose last turn completed gets no marker.
+    let (session, _turn_context) = make_session_and_context().await;
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: Arc::new(completed_turn),
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+        }))
+        .await;
+    let history = session.state.lock().await.clone_history();
+    assert!(
+        matches!(
+            history.raw_items().last(),
+            Some(ResponseItem::Message { role, .. }) if role == "assistant"
+        ),
+        "completed history must end with the recorded assistant reply"
+    );
+}
+
+#[tokio::test]
 async fn record_initial_history_reconstructs_resumed_transcript() {
     let (session, turn_context) = make_session_and_context().await;
     let (rollout_items, expected) = sample_rollout(&session, &turn_context).await;

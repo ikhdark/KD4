@@ -52,18 +52,7 @@ pub(crate) fn summarize_shell_output_for_model(
     {
         return None;
     }
-    if options.command_text.is_some_and(|command| {
-        let commands = codex_shell_command::parse_command::parse_shell_script(command);
-        !commands.is_empty()
-            && commands.iter().all(|command| {
-                matches!(
-                    command,
-                    codex_protocol::parse_command::ParsedCommand::Read { .. }
-                        | codex_protocol::parse_command::ParsedCommand::Search { .. }
-                        | codex_protocol::parse_command::ParsedCommand::ListFiles { .. }
-                )
-            })
-    }) {
+    if options.command_text.is_some_and(is_read_only_command) {
         // Preserve the requested source order and the existing truncation/raw
         // artifact recovery path instead of ranking code as diagnostic prose.
         return None;
@@ -80,9 +69,11 @@ pub(crate) fn summarize_shell_output_for_model(
     // head/warning/tail policy degenerates to positional truncation that drops
     // the middle of a flat list. A summary also reads as complete in a way a
     // truncation notice does not. Leave those to ordinary truncation, which
-    // retains the artifact and reports exactly what it withheld.
-    if !exceeds_token_budget
-        && !failed
+    // retains the artifact and reports exactly what it withheld. This holds
+    // when the output exceeds the caller's token budget as well: the budget is
+    // still enforced by that truncation, and a ranked excerpt of source or
+    // listing text only sends the model back to re-read what it withheld.
+    if !failed
         && !validation
         && !output.lines().any(|line| {
             let classification = classify_line(line);
@@ -197,6 +188,172 @@ pub(crate) fn summarize_shell_output_for_model(
     builder
         .finish(emitted_source_lines, line_count)
         .filter(|summary| summary.len() < output.len())
+}
+
+/// Reads, searches, and listings are source material, not diagnostics: ranking
+/// their lines hoists incidental "error" text above the code around it, and
+/// the model then re-reads the file to recover the order. Bash scripts are
+/// classified by the shared parser; PowerShell scripts, which that parser does
+/// not understand, are accepted only when every command position is a known
+/// read-only cmdlet, alias, or control-flow keyword.
+fn is_read_only_command(command: &str) -> bool {
+    let commands = codex_shell_command::parse_command::parse_shell_script(command);
+    if !commands.is_empty()
+        && commands.iter().all(|command| {
+            matches!(
+                command,
+                codex_protocol::parse_command::ParsedCommand::Read { .. }
+                    | codex_protocol::parse_command::ParsedCommand::Search { .. }
+                    | codex_protocol::parse_command::ParsedCommand::ListFiles { .. }
+            )
+        })
+    {
+        return true;
+    }
+    is_read_only_powershell_script(command)
+}
+
+fn is_read_only_powershell_script(script: &str) -> bool {
+    const READ_ONLY_COMMANDS: &[&str] = &[
+        "get-content",
+        "gc",
+        "cat",
+        "type",
+        "select-string",
+        "sls",
+        "get-childitem",
+        "gci",
+        "ls",
+        "dir",
+        "get-item",
+        "gi",
+        "get-itemproperty",
+        "test-path",
+        "resolve-path",
+        "get-location",
+        "pwd",
+        "set-location",
+        "cd",
+        "push-location",
+        "pop-location",
+        "select-object",
+        "select",
+        "where-object",
+        "where",
+        "?",
+        "foreach-object",
+        "%",
+        "sort-object",
+        "sort",
+        "measure-object",
+        "measure",
+        "group-object",
+        "format-list",
+        "fl",
+        "format-table",
+        "ft",
+        "out-string",
+        "out-null",
+        "write-output",
+        "write-host",
+        "echo",
+        "get-date",
+        "get-process",
+        "get-ciminstance",
+        "get-command",
+        "get-member",
+        "rg",
+        "grep",
+        "findstr",
+        "head",
+        "tail",
+        "wc",
+        "find",
+        "fd",
+        "git",
+        // Control flow only sequences the commands above; it emits nothing itself.
+        "if",
+        "elseif",
+        "else",
+        "foreach",
+        "for",
+        "while",
+        "do",
+        "try",
+        "catch",
+        "finally",
+        "switch",
+        "return",
+    ];
+    const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
+        "diff",
+        "show",
+        "log",
+        "status",
+        "grep",
+        "blame",
+        "ls-files",
+        "rev-parse",
+        "branch",
+    ];
+    let mut saw_command = false;
+    // Every position that can start a command: statement separators, pipes,
+    // conditional chains, script blocks, and sub-expressions. Splitting inside
+    // quoted patterns only makes the check more conservative.
+    for segment in script
+        .split(|character: char| matches!(character, ';' | '|' | '\n' | '\r' | '{' | '('))
+        .flat_map(|segment| segment.split("&&"))
+    {
+        let segment = segment
+            .trim()
+            .trim_matches(|character: char| matches!(character, ')' | '}' | '&'))
+            .trim();
+        if segment.is_empty() {
+            continue;
+        }
+        // Literals, array/hash constructors, parameters, and numbers follow a
+        // split point without starting a command: `@('a','b')` splits into an
+        // `@` tail and a quoted list, and `-Recurse` may trail a line break.
+        if segment.starts_with(|character: char| {
+            matches!(character, '\'' | '"' | '@' | '-' | ']' | ',' | '.')
+                || character.is_ascii_digit()
+        }) {
+            continue;
+        }
+        let segment = if let Some(rest) = segment.strip_prefix('$') {
+            // `$x = <command>` runs its right-hand side; other `$` forms are
+            // variable expressions that produce no command output of their own.
+            match rest.split_once('=') {
+                Some((name, rest)) if !name.ends_with('-') && !name.contains(' ') => rest.trim(),
+                _ => continue,
+            }
+        } else {
+            segment
+        };
+        let mut tokens = segment.split_whitespace();
+        let Some(command) = tokens.next() else {
+            continue;
+        };
+        let command = command
+            .trim_start_matches('&')
+            .trim_matches(|character: char| matches!(character, '"' | '\''))
+            .to_ascii_lowercase();
+        if command.is_empty() {
+            continue;
+        }
+        if !READ_ONLY_COMMANDS.contains(&command.as_str()) {
+            return false;
+        }
+        if command == "git"
+            && !tokens.next().is_some_and(|subcommand| {
+                READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand.to_ascii_lowercase().as_str())
+            })
+        {
+            return false;
+        }
+        saw_command = true;
+    }
+    saw_command
 }
 
 #[derive(Clone, Copy, Default)]
