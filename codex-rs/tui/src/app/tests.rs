@@ -2947,25 +2947,26 @@ async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
     );
     assert!(
         developer_instructions
-            .contains("Inherited task objectives, plans, pending actions, and task-specific approvals are reference context.")
-    );
-    assert!(
-        developer_instructions.contains(
-            "Only user messages after the side-conversation boundary define the side task. Applicable higher-priority instructions, repository constraints, and this thread's live permissions remain in force."
-        )
-    );
-    assert!(developer_instructions.contains("Do not continue, execute, or complete any task"));
-    assert!(
-        developer_instructions
-            .contains("External tools may be available according to this thread's current")
+            .contains("Inherited objectives, plans, pending actions, approvals, and tool history are reference material")
     );
     assert!(
         developer_instructions
-            .contains("Any MCP or external tool calls or outputs visible in the inherited")
+            .contains("Only user messages after the side-conversation boundary define this task.")
     );
-    assert!(developer_instructions.contains("Non-mutating inspection"));
-    assert!(developer_instructions.contains("Do not modify files"));
-    assert!(developer_instructions.contains("Do not request escalated permissions"));
+    assert!(developer_instructions.contains("do not execute or complete them"));
+    assert!(
+        developer_instructions
+            .contains("Higher-priority instructions, repository constraints, and this thread's live permissions remain active; external tools follow those permissions.")
+    );
+    assert!(developer_instructions.contains("tool history are reference material"));
+    assert!(
+        developer_instructions
+            .contains("Inspection must not mutate the workspace, including untracked files.")
+    );
+    assert!(
+        developer_instructions.contains("only when explicitly requested in this side conversation")
+    );
+    assert!(developer_instructions.contains("Request escalation or broader sandbox access only for such a requested mutation that requires it."));
     assert!(app.transcript_cells.is_empty());
 }
 

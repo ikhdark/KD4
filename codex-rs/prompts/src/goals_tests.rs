@@ -219,5 +219,5 @@ fn protocol_maximum_objective_survives_worst_case_escaping() {
 
 #[test]
 fn continuation_template_stays_within_size_ceiling() {
-    assert!(include_str!("../templates/goals/continuation.md").len() <= 3_500);
+    assert!(include_str!("../templates/goals/continuation.md").len() <= 1_800);
 }

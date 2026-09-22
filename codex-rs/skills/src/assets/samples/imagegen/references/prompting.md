@@ -79,6 +79,7 @@ Do not add:
 - Ask for crisp edges, generous padding, and no use of the key color inside the subject.
 - After generation, remove the background locally with `python "${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/scripts/remove_chroma_key.py" --input <source> --out <final.png> --auto-key border --soft-matte --transparent-threshold 12 --opaque-threshold 220 --despill` and validate the alpha result before shipping it.
 - Use soft matte and despill for antialiased edges; hard tolerance-only removal is mainly for flat pixel-art or exact-color fixtures.
+- Copy the source into the workspace or `tmp/imagegen/` before removal. Verify an alpha channel, transparent corners, plausible subject coverage, and no key-color fringe. For a thin fringe, retry once with `--edge-contract 1`; add `--edge-feather 0.25` only for visibly stair-stepped edges on a non-shiny, non-reflective subject. Save the final alpha PNG/WebP using the skill's destination policy.
 - Use CLI `gpt-image-1.5 --background transparent --output-format png` only after the user explicitly confirms the fallback, or when the user already explicitly requested `gpt-image-1.5`, `scripts/image_gen.py`, or CLI fallback. Ask first for true/native transparency requests, failed chroma-key validation, or complex transparent subjects such as hair, fur, glass, smoke, liquids, translucent materials, reflective objects, or soft shadows.
 
 ## Fallback-only execution controls

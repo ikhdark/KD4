@@ -45,8 +45,9 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(description.contains("without treating truncated results as complete"));
         assert!(!description.contains("then `rg -n"));
         assert!(!description.contains("is rejected"));
-        assert!(description.contains(
-            "Before editing, read the complete enclosing function, type, or configuration unit"
+        assert!(!description.contains("read the complete enclosing"));
+        assert!(codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.contains(
+            "Read the complete enclosing function, type, or configuration unit before changing it."
         ));
         assert!(
             description.contains(

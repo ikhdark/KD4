@@ -23,40 +23,23 @@ impl ContextualUserFragment for TaskModelGuidance {
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(concat!(
-            "Maintain the task state needed for the current request and higher-priority ",
-            "instructions: desired outcome, active requirements and constraints, material ",
-            "unknowns, and the next necessary action. Form competing hypotheses only when ",
-            "uncertainty between explanations affects the next action. Track repository ",
-            "ownership and runtime relationships only as needed to establish the requested ",
-            "behavior. Preserve applicable provenance kinds for each material claim: direct_file_read, search_hit, ",
-            "generated_summary, cached_observation, inferred_relationship, or test_result. Preserve ",
-            "those labels through summaries and durable state; cached search evidence retains both its source and freshness. Storage or repetition never upgrades ",
-            "its evidence strength. Treat direct file reads as observations of the exact content ",
-            "read at that time. Discovery-only hits identify candidates. Complete search results establish ",
-            "the exact matching facts they report for their recorded scope and snapshot, but not omitted ",
-            "context or broader behavior. Treat generated summaries ",
-            "as derived and potentially lossy, cached observations as potentially stale, inferred ",
-            "relationships as hypotheses, and test results as proof only for the exact exercised ",
-            "contract. These are internal evidence labels, not a mandatory user-facing reporting ",
-            "format. Reuse current exact values and enumerations already returned by tools ",
-            "instead of rediscovering them. Batch independent read-only checks in one tool ",
-            "generation when their tool contracts allow it. For actionable coding tasks, begin ",
-            "with the responsible owner, implementation, and direct test when available; expand ",
-            "the inspection as evidence requires, and pause only when genuinely blocked. Do not repeat ",
-            "an unchanged observation without a relevant input change or pending transition. Instead, ",
-            "resolve a named remaining question through different evidence, synthesize the answer, ",
-            "or report the blocker. Take state-changing actions only when authorized and necessary. ",
-            "Before final synthesis, compare every ",
-            "version, ",
-            "edition, name, count, path, subcommand, or other literal attributed to a direct file ",
-            "read against the retained evidence. If that evidence is unavailable or stale, mark ",
-            "the value unknown or refresh it; never substitute a remembered value while citing ",
-            "the earlier read. Resolve contradictions using runtime ",
-            "reachability, ownership, freshness, and generated-source contracts. Revise the model ",
-            "when new evidence disagrees with it. Inspect implementation detail when needed to ",
-            "establish the requested behavior; expand beyond the relevant runtime path only for ",
-            "a material reason. Never fill an unknown with an ",
-            "unstated assumption."
+            "Maintain the current outcome, requirements, constraints, unknowns, and next action. ",
+            "Form competing hypotheses only when uncertainty between explanations affects the next action. ",
+            "Track repository ownership and runtime relationships only as needed to establish the requested behavior. ",
+            "Preserve applicable provenance kinds: direct_file_read, search_hit, generated_summary, ",
+            "cached_observation, inferred_relationship, and test_result. Keep labels through summaries ",
+            "and durable state; cached search evidence retains both its source and freshness. ",
+            "Storage or repetition never upgrades evidence strength. Direct reads observe exact content at that time; ",
+            "discovery-only hits identify candidates. Complete search results establish the exact matching facts ",
+            "for their recorded scope and snapshot, not omitted context or broader behavior. Treat ",
+            "generated summaries as derived and potentially lossy, cached observations as potentially stale, ",
+            "inferred relationships as hypotheses, and tests as proof only of the exercised contract. ",
+            "These are internal evidence labels, not a mandatory user-facing reporting format. ",
+            "Before synthesis, check every version, edition, name, count, path, subcommand, or other ",
+            "literal attributed to a direct read against retained evidence. If unavailable or stale, ",
+            "refresh it or mark it unknown; never substitute a remembered value while citing the earlier read. ",
+            "Resolve contradictions by runtime reachability, ownership, freshness, and generated-source contracts. ",
+            "Revise conclusions when evidence disagrees; never fill an unknown with an unstated assumption."
         ))
     }
 
@@ -85,18 +68,11 @@ mod tests {
         }
         assert!(rendered.contains("Storage or repetition never upgrades"));
         assert!(rendered.contains("generated summaries as derived and potentially lossy"));
-        assert!(rendered.contains("Reuse current exact values and enumerations"));
-        assert!(rendered.contains("Batch independent read-only checks"));
-        assert!(rendered.contains("relevant input change or pending transition"));
-        assert!(rendered.contains("resolve a named remaining question through different evidence"));
-        assert!(
-            rendered.contains("Take state-changing actions only when authorized and necessary")
-        );
         assert!(rendered.contains("cached search evidence retains both its source and freshness"));
         assert!(rendered.contains("Complete search results establish the exact matching facts"));
         assert!(rendered.contains("edition, name, count, path, subcommand"));
         assert!(rendered.contains("never substitute a remembered value"));
-        assert!(rendered.contains("Never fill an unknown"));
+        assert!(rendered.contains("never fill an unknown"));
         assert!(rendered.ends_with(TASK_MODEL_GUIDANCE_CLOSE_TAG));
     }
 
@@ -120,7 +96,6 @@ mod tests {
             "Form competing hypotheses only when uncertainty between explanations affects the next action.",
             "Track repository ownership and runtime relationships only as needed to establish the requested behavior.",
             "These are internal evidence labels, not a mandatory user-facing reporting format.",
-            "Inspect implementation detail when needed to establish the requested behavior; expand beyond the relevant runtime path only for a material reason.",
         ] {
             assert!(
                 text.contains(required),
@@ -140,14 +115,14 @@ mod tests {
     }
 
     #[test]
-    fn renders_action_first_contract_for_actionable_coding_tasks() {
+    fn provenance_fragment_leaves_execution_policy_with_the_base() {
         let rendered = TaskModelGuidance.render();
-
-        assert!(rendered.contains(
-            "For actionable coding tasks, begin with the responsible owner, implementation, and \
-             direct test when available; expand the inspection as evidence requires, and pause \
-             only when genuinely blocked."
-        ));
+        let base = include_str!("../../../protocol/src/prompts/base_instructions/default.md");
+        assert!(base.contains("Batch independent calls"));
+        assert!(base.contains("Do not request authorization already provided."));
+        assert!(!rendered.contains("Batch independent"));
+        assert!(!rendered.contains("Take state-changing actions"));
+        assert!(rendered.len() < 2_000);
     }
 
     #[test]

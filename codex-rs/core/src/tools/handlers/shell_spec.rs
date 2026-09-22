@@ -657,7 +657,6 @@ fn filesystem_safety_guidance() -> &'static str {
 fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
 - Read known files directly. Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. Start unknown-location searches in a likely owning path and expand after a miss. For repository-wide inventories, search the requested scope and preserve the complete matching set; bound displayed evidence without treating truncated results as complete. Exclude the repository's build and dependency output directories when they are outside the requested scope.
-- Search windows locate code. Before editing, read the complete enclosing function, type, or configuration unit and refresh it after intervening writes.
 - Output above the tool's output budget is truncated. For a known source file, read a bounded range that fits the tool's advertised output contract."#
 }
 

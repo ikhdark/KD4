@@ -255,9 +255,11 @@ mod tests {
             panic!("web must expose exactly one function");
         };
         assert_eq!(run.name, RUN_TOOL_NAME);
-        assert!(run.description.contains(
-            "Follow these special cases unless a higher-priority instruction conflicts."
-        ));
+        assert!(
+            run.description.contains(
+                "Follow higher-priority instructions if they conflict with this guidance."
+            )
+        );
         assert!(
             !run.description
                 .contains("conflict with any other instructions")

@@ -7,13 +7,13 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - `text(...)` emits values; on failure/no output, the host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions. Emit needed results explicitly.
 - Reuse current schemas and results; resolve missing/stale schemas before calls.
 - Nested tools: use a present schema; else `resolve_tool(name)` when the name is known, or inspect `ALL_TOOL_NAMES`. Never scan/filter/stringify/print `ALL_TOOLS`.
-- Await `Promise.allSettled` for independent known calls and inspect every result. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results.
+- Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results.
 - Choose tools whose scope, evidence, and cost fit the task. Process returned results in JavaScript rather than spawning subprocesses to re-filter them.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
-- Cells yield on `yield_control()`, input, or their initial 10s budget. Keep long commands in the same awaited evaluation; yield explicitly only for a new model decision.
+- Cells yield on `yield_control()`, input, or their initial 10s budget. Keep already-planned calls and long commands in the same awaited evaluation; yield explicitly only for a new model decision or dependency resolution.
 - An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
 - Parallelize only when tools permit and build locks, outputs, and services are independent. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
-- Output defaults to the 10000-token hard cap. Set the smallest useful budget with first-line `// @exec: {"max_output_tokens": 2000}`. This limits model-visible output separately from nested tools' output budgets. Select relevant results before emitting them; use retained-artifact selectors after truncation. Nested-call deadlines use the documented `{ timeout_ms }` option.
+- Output defaults to the 10000-token hard cap. Set the smallest useful budget with first-line `// @exec: {"max_output_tokens": 2000}`. This limits model-visible output separately from nested tools' output budgets. Select relevant results before emitting them; use retained-artifact selectors after truncation.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
@@ -95,7 +95,7 @@ mod tests {
                     assert_eq!(parsed.max_output_tokens, Some(2000));
                     assert_eq!(parsed.code, "text('budget applied');");
                     assert!(description.contains(
-                        "Nested-call deadlines use the documented `{ timeout_ms }` option."
+                        "override it with the documented `{ timeout_ms }` option when needed."
                     ));
                 }
             }
@@ -125,6 +125,12 @@ mod tests {
                 for required in [
                     "Sequence dependent calls only after checking prerequisite results.",
                     "Await `Promise.allSettled`",
+                    "for independent known calls in the same exec and inspect every result.",
+                    "Do not split a known independent batch into one-call execs.",
+                    "Keep already-planned calls and long commands in the same awaited evaluation;",
+                    "yield explicitly only for a new model decision or dependency resolution.",
+                    "still await the batch. At evaluation end, unawaited work is discarded.",
+                    "Parallelize only when tools permit and build locks, outputs, and services are independent.",
                     "Reuse current schemas and results;",
                     "A resolved `exec_command` call may still return a running command session.",
                     "continue that session within the current evaluation.",

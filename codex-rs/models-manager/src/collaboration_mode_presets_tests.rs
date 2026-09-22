@@ -57,11 +57,11 @@ fn plan_mode_instructions_preserve_planning_contract() {
     assert!(normalized_instructions.contains("mutually exclusive options allowed by its schema"));
     assert!(plan_instructions.contains("<proposed_plan>"));
     assert!(plan_instructions.contains("completely replace the prior plan"));
-    assert!(plan_instructions.len() < 6_000);
+    assert!(plan_instructions.len() < 3_000);
 }
 
 #[test]
 fn collaboration_mode_templates_stay_within_prompt_budgets() {
     assert!(COLLABORATION_MODE_DEFAULT.len() < 3_000);
-    assert!(COLLABORATION_MODE_PLAN.len() < 6_000);
+    assert!(COLLABORATION_MODE_PLAN.len() < 3_000);
 }

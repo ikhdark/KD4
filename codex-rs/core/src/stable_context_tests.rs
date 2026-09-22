@@ -233,6 +233,27 @@ fn repository_replacement_keeps_only_the_current_variant() {
 }
 
 #[test]
+fn default_root_guidance_retains_stable_context_classification() {
+    let config = crate::config::MultiAgentV2Config::default();
+    let guidance = config
+        .root_agent_usage_hint_text
+        .expect("default root guidance");
+    let projection = project_stable_context(
+        vec![text_message("developer", &guidance)].into(),
+        StableContextTarget::Sampling,
+    );
+
+    assert_eq!(visible_text(&projection.items), vec![guidance.as_str()]);
+    assert!(
+        projection
+            .manifest
+            .components()
+            .iter()
+            .any(|component| { component.kind == StableContextKind::RootCoordinator })
+    );
+}
+
+#[test]
 fn tagged_root_orchestration_replaces_the_previous_variant() {
     let old = "<root_orchestration_instructions>old root policy</root_orchestration_instructions>";
     let current =

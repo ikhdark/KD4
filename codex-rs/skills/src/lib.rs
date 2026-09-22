@@ -249,6 +249,22 @@ mod tests {
         install_system_skills(&home).expect("initial install");
         let dest = system_cache_root_dir(&home);
         let skill = dest.join("skill-creator/SKILL.md");
+        for path in [
+            "imagegen/SKILL.md",
+            "imagegen/references/prompting.md",
+            "plugin-creator/SKILL.md",
+            "openai-docs/SKILL.md",
+            "openai-docs/references/codex-self-knowledge.md",
+        ] {
+            assert_eq!(
+                fs::read(dest.join(path).as_path()).expect("installed instructions"),
+                SYSTEM_SKILLS_DIR
+                    .get_file(path)
+                    .expect("embedded instructions")
+                    .contents(),
+                "installation must preserve selected skill instructions and linked references: {path}"
+            );
+        }
         assert_eq!(
             fs::read(skill.as_path()).expect("installed skill"),
             SYSTEM_SKILLS_DIR
