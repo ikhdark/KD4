@@ -143,7 +143,6 @@ mod turn_metadata;
 mod turn_timing;
 mod validation_admission;
 mod workspace_operation_gate;
-mod workspace_transaction;
 pub(crate) use codex_tools::FunctionCallError;
 
 pub async fn init_state_db(config: &config::Config) -> Option<StateDbHandle> {

@@ -2781,60 +2781,6 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
     );
 }
 
-#[tokio::test]
-async fn validation_snapshot_receipt_survives_polls_and_rejects_changed_source()
--> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let repo = root.path().join("repo");
-    std::fs::create_dir_all(&repo)?;
-    let status = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .arg(&repo)
-        .status()?;
-    assert!(status.success());
-    std::fs::write(repo.join("source.txt"), "captured\n")?;
-    let home = root.path().join("home");
-    crate::workspace_transaction::begin(&home, "poll-test", &repo)?;
-    let snapshot = crate::workspace_transaction::validation_snapshot(&home, "poll-test")?;
-    let python = which::which("python").or_else(|_| which::which("python3"))?;
-    let spawned = codex_utils_pty::spawn_pipe_process_no_stdin(
-        &python.to_string_lossy(),
-        &["-c".into(), "print('completed')".into()],
-        &snapshot.workdir,
-        &HashMap::new(),
-        &None,
-    )
-    .await?;
-    let process = UnifiedExecProcess::from_spawned(
-        spawned,
-        codex_sandboxing::SandboxType::None,
-        Box::new(crate::unified_exec::NoopSpawnLifecycle),
-        None,
-        &PendingSpawnRegistration::default(),
-    )
-    .await?;
-    process.set_workspace_snapshot(Some(snapshot.clone()));
-    let pending = process.workspace_snapshot_receipt(false).await.unwrap();
-    assert!(pending.contains(&snapshot.revision));
-    assert!(pending.contains("pending"));
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        process.cancellation_token().cancelled(),
-    )
-    .await?;
-    std::fs::write(snapshot.workdir.join("source.txt"), "changed\n")?;
-    let completed = process.workspace_snapshot_receipt(true).await.unwrap();
-    assert!(completed.contains(&snapshot.revision));
-    assert!(completed.contains("INVALID VALIDATION"));
-    std::fs::write(snapshot.workdir.join("source.txt"), "captured\n")?;
-    assert_eq!(
-        process.workspace_snapshot_receipt(true).await.unwrap(),
-        completed,
-        "later polls must preserve the terminal integrity finding"
-    );
-    Ok(())
-}
-
 #[cfg(windows)]
 #[test]
 fn pending_remote_exec_dropped_outside_runtime_terminates_native_child() {

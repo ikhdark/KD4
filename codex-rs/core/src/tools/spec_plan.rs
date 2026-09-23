@@ -28,7 +28,6 @@ use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::RetainedInventoryHandler;
-use crate::tools::handlers::SemanticContextHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
@@ -36,7 +35,6 @@ use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
-use crate::tools::handlers::WorkspaceTransactionHandler;
 use crate::tools::handlers::WriteStdinHandler;
 use crate::tools::handlers::agent_jobs::ReportAgentJobResultHandler;
 use crate::tools::handlers::agent_jobs::SpawnAgentsOnCsvHandler;
@@ -980,40 +978,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     // Host skill locators remain readable even when no execution environment exists.
     // The handler still requires an environment for ordinary filesystem paths.
     planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
-    if turn_context.config.codex_self_exe.is_some()
-        && matches!(
-            shell_type_for_model_and_features(
-                &turn_context.model_info,
-                turn_context.config.features.get()
-            ),
-            ConfigShellToolType::UnifiedExec
-        )
-        && context
-            .step_context
-            .environments
-            .primary()
-            .is_some_and(|env| !env.environment.is_remote())
-    {
-        planned_tools.add_with_authorization_class(SemanticContextHandler, TypedToolClass::Shell);
-        planned_tools.add_with_authorization_class(
-            crate::tools::handlers::WorkspaceValidationHandler,
-            TypedToolClass::Shell,
-        );
-    }
-    if matches!(
-        turn_context.sandbox_policy(),
-        codex_protocol::protocol::SandboxPolicy::DangerFullAccess
-    ) && context
-        .step_context
-        .environments
-        .primary()
-        .is_some_and(|env| !env.environment.is_remote())
-    {
-        planned_tools.add_with_authorization_class(
-            WorkspaceTransactionHandler,
-            TypedToolClass::StructuredEdit,
-        );
-    }
     if !context
         .step_context
         .environments

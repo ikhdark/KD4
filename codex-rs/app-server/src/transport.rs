@@ -108,6 +108,7 @@ pub(crate) struct OutboundConnectionState {
     pub(crate) opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
     pub(crate) writer: mpsc::Sender<QueuedOutgoingMessage>,
     disconnect_sender: Option<CancellationToken>,
+    transport_shutdown: CancellationToken,
 }
 
 impl OutboundConnectionState {
@@ -117,6 +118,7 @@ impl OutboundConnectionState {
         experimental_api_enabled: Arc<AtomicBool>,
         opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
         disconnect_sender: Option<CancellationToken>,
+        transport_shutdown: CancellationToken,
     ) -> Self {
         Self {
             initialized,
@@ -124,6 +126,7 @@ impl OutboundConnectionState {
             opted_out_notification_methods,
             writer,
             disconnect_sender,
+            transport_shutdown,
         }
     }
 
@@ -132,9 +135,10 @@ impl OutboundConnectionState {
     }
 
     pub(crate) fn request_disconnect(&self) {
-        if let Some(disconnect_sender) = &self.disconnect_sender {
-            disconnect_sender.cancel();
-        }
+        self.disconnect_sender
+            .as_ref()
+            .unwrap_or(&self.transport_shutdown)
+            .cancel();
     }
 }
 
@@ -222,10 +226,21 @@ async fn send_message_to_connection(
                 disconnect_connection(connections, connection_id)
             }
         }
-    } else if writer.send(queued_message).await.is_err() {
-        disconnect_connection(connections, connection_id)
     } else {
-        false
+        // Stdio applies backpressure even though its failure shuts down the runtime.
+        // A shutdown must still release a router waiting for an unread pipe.
+        let shutdown = connection_state.transport_shutdown.clone();
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => disconnect_connection(connections, connection_id),
+            result = writer.send(queued_message) => {
+                if result.is_err() {
+                    disconnect_connection(connections, connection_id)
+                } else {
+                    false
+                }
+            }
+        }
     }
 }
 

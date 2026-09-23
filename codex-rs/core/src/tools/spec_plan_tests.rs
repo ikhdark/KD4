@@ -328,51 +328,42 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
 }
 
 #[tokio::test]
-async fn semantic_context_requires_local_worker_and_command_runtime() {
+async fn retired_workspace_tools_are_absent_while_normal_tools_remain_available() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+        turn.permission_profile = PermissionProfile::Disabled;
         Arc::make_mut(&mut turn.config).codex_self_exe =
             Some(turn.config.cwd.join("codex.exe").to_path_buf());
     })
     .await;
     plan.assert_visible_contains(&[
-        "semantic_context",
-        "workspace_validation",
+        "read_file",
+        "list_files",
         "exec_command",
+        "write_stdin",
         "context_checkpoint",
     ]);
     plan.assert_registered_contains(&[
-        "semantic_context",
-        "workspace_validation",
+        "read_file",
+        "list_files",
         "exec_command",
+        "write_stdin",
         "context_checkpoint",
     ]);
-    assert_eq!(
-        plan.authorization_class("semantic_context"),
-        TypedToolClass::Shell
-    );
-    assert_eq!(
-        plan.authorization_class("workspace_validation"),
-        TypedToolClass::Shell
-    );
+    plan.assert_visible_lacks(&[
+        "semantic_context",
+        "workspace_validation",
+        "workspace_transaction",
+    ]);
+    plan.assert_registered_lacks(&[
+        "semantic_context",
+        "workspace_validation",
+        "workspace_transaction",
+    ]);
     assert_eq!(
         plan.authorization_class("context_checkpoint"),
         TypedToolClass::OwnTask
     );
-    for missing in ["executable", "runtime", "environment"] {
-        let plan = probe(|turn| {
-            set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
-            Arc::make_mut(&mut turn.config).codex_self_exe =
-                Some(turn.config.cwd.join("codex.exe").to_path_buf());
-            match missing {
-                "executable" => Arc::make_mut(&mut turn.config).codex_self_exe = None,
-                "runtime" => set_feature(turn, Feature::ShellTool, false),
-                _ => turn.environments.turn_environments.clear(),
-            }
-        })
-        .await;
-        plan.assert_registered_lacks(&["semantic_context", "workspace_validation"]);
-    }
 }
 
 #[tokio::test]

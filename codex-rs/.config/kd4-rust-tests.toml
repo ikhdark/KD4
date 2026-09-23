@@ -66,8 +66,6 @@ helpers = [
 [targets.core_lib.helpers_by_test_prefix]
 "tools::command_output_artifact::tests::" = []
 "tools::handlers::read_tool_output::tests::" = []
-"tools::handlers::semantic_context::tests::" = []
-"tools::handlers::workspace_validation::tests::" = []
 "tools::handlers::context_checkpoint::tests::" = []
 "tools::handlers::apply_patch_retries::tests::" = []
 "tools::handlers::apply_patch::tests::" = []
@@ -78,7 +76,6 @@ helpers = [
 "plan_store::tests::" = []
 "session::rollout_reconstruction_tests::" = []
 "tool_history::tests::" = []
-"workspace_transaction::tests::" = []
 
 [targets.available_skills_instructions]
 package = "codex-core"
@@ -161,7 +158,7 @@ lib = true
 helpers = []
 
 [gates.workspace-transactions]
-description = "Sampling freshness integration and validation snapshot receipts."
+description = "Sampling freshness integration retained after workspace transaction removal."
 
 [[gates.workspace-transactions.steps]]
 target = "core_lib"
@@ -169,7 +166,6 @@ helpers = []
 tests = [
   "context_manager::history::tests::sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context",
   "session::turn::tests::workspace_evidence_coalesces_mutating_calls_at_generation_boundary",
-  "unified_exec::process_manager::tests::validation_snapshot_receipt_survives_polls_and_rejects_changed_source",
 ]
 
 # ---------------------------------------------------------------------------
