@@ -31,6 +31,7 @@ use crate::message_processor::MessageProcessorArgs;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::thread_state::ConnectionCapabilities;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionState;
@@ -189,7 +190,11 @@ enum OutboundControlEvent {
     /// Register a new writer for an opened connection.
     Opened {
         connection_id: ConnectionId,
-        state: OutboundConnectionState,
+        writer: mpsc::Sender<QueuedOutgoingMessage>,
+        disconnect_sender: Option<CancellationToken>,
+        initialized: Arc<AtomicBool>,
+        experimental_api_enabled: Arc<AtomicBool>,
+        opted_out_notification_methods: Arc<transport::OutboundNotificationOptOuts>,
     },
     /// Remove state for a closed/disconnected connection.
     Closed { connection_id: ConnectionId },
@@ -785,9 +790,22 @@ pub async fn run_main(
                         match event {
                             OutboundControlEvent::Opened {
                                 connection_id,
-                                state,
+                                writer,
+                                disconnect_sender,
+                                initialized,
+                                experimental_api_enabled,
+                                opted_out_notification_methods,
                             } => {
-                                outbound_connections.insert(connection_id, state);
+                                outbound_connections.insert(
+                                    connection_id,
+                                    OutboundConnectionState::new(
+                                        writer,
+                                        initialized,
+                                        experimental_api_enabled,
+                                        opted_out_notification_methods,
+                                        disconnect_sender,
+                                    ),
+                                );
                             }
                             OutboundControlEvent::Closed { connection_id } => {
                                 outbound_connections.remove(&connection_id);
@@ -921,13 +939,14 @@ pub async fn run_main(
                                 if outbound_control_tx
                                     .send(OutboundControlEvent::Opened {
                                         connection_id,
-                                        state: OutboundConnectionState::new(
-                                            writer,
-                                            Arc::clone(&outbound_initialized),
-                                            Arc::clone(&outbound_experimental_api_enabled),
-                                            Arc::clone(&outbound_opted_out_notification_methods),
-                                            disconnect_sender,
-                                            transport_shutdown_token.clone(),
+                                        writer,
+                                        disconnect_sender: Some(disconnect_sender.unwrap_or_else(|| transport_shutdown_token.clone())),
+                                        initialized: Arc::clone(&outbound_initialized),
+                                        experimental_api_enabled: Arc::clone(
+                                            &outbound_experimental_api_enabled,
+                                        ),
+                                        opted_out_notification_methods: Arc::clone(
+                                            &outbound_opted_out_notification_methods,
                                         ),
                                     })
                                     .await

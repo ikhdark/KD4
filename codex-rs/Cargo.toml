@@ -15,6 +15,7 @@ members = [
     "app-server-test-client",
     "apply-patch",
     "arg0",
+    "workspace-tools",
     "feedback",
     "features",
     "install-context",
@@ -145,6 +146,7 @@ codex-app-server-protocol = { path = "app-server-protocol" }
 codex-app-server-test-client = { path = "app-server-test-client" }
 codex-apply-patch = { path = "apply-patch" }
 codex-arg0 = { path = "arg0" }
+codex-workspace-tools = { path = "workspace-tools" }
 codex-async-utils = { path = "async-utils" }
 codex-backend-client = { path = "backend-client" }
 codex-chatgpt = { path = "chatgpt" }

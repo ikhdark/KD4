@@ -589,6 +589,45 @@ impl ToolRouter {
         dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let _completion_guard = ToolDispatchCompletionGuard(Arc::clone(&dispatch_state));
+        let mut call = call;
+        if call.tool_name.namespace.is_none()
+            && matches!(
+                call.tool_name.name.as_str(),
+                "read_file"
+                    | "list_files"
+                    | "semantic_context"
+                    | "exec_command"
+                    | "shell_command"
+                    | "apply_patch"
+            )
+            && matches!(
+                step_context.turn.sandbox_policy(),
+                codex_protocol::protocol::SandboxPolicy::DangerFullAccess
+            )
+            && step_context
+                .environments
+                .primary()
+                .is_some_and(|env| !env.environment.is_remote())
+        {
+            let home = step_context.turn.config.codex_home.clone();
+            let thread = session.thread_id.to_string();
+            let cwd = step_context.turn.config.cwd.to_path_buf();
+            let name = call.tool_name.name.clone();
+            let mut payload = call.payload;
+            call.payload = tokio::task::spawn_blocking(move || {
+                crate::workspace_transaction::route_call(
+                    &home,
+                    &thread,
+                    &cwd,
+                    &name,
+                    &mut payload,
+                )?;
+                Ok::<_, anyhow::Error>(payload)
+            })
+            .await
+            .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+            .map_err(|e| FunctionCallError::RespondToModel(format!("workspace routing: {e:#}")))?;
+        }
         let registered = self.registry.registered_tool(&call.tool_name);
         if registered.map(RegisteredTool::exposure)
             == Some(crate::tools::registry::ToolExposure::Deferred)

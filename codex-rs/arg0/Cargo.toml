@@ -16,6 +16,7 @@ workspace = true
 anyhow = { workspace = true }
 codex-apply-patch = { workspace = true }
 codex-exec-server = { workspace = true }
+codex-workspace-tools = { workspace = true }
 codex-install-context = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-home-dir = { workspace = true }

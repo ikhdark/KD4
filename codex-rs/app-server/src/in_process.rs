@@ -519,14 +519,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 let (tx, mut rx) = mpsc::channel(1);
                 let mut connections = HashMap::from([(
                     IN_PROCESS_CONNECTION_ID,
-                    OutboundConnectionState::new(
-                        tx,
-                        initialized,
-                        experimental,
-                        opt_outs,
-                        None,
-                        delivery_failure.clone(),
-                    ),
+                    OutboundConnectionState::new(tx, initialized, experimental, opt_outs, None),
                 )]);
                 let mut skipped = 0;
                 loop {
@@ -563,7 +556,6 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 Arc::clone(&outbound_experimental_api_enabled),
                 Arc::clone(&outbound_opted_out_notification_methods),
                 Some(delivery_failure.clone()),
-                delivery_failure.clone(),
             ),
         );
         let mut outbound_handle = tokio::spawn(async move {

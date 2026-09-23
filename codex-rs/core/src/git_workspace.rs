@@ -1523,6 +1523,25 @@ impl GitWorkspaceCache {
         turn: &crate::session::turn_context::TurnContext,
         cwd: &Path,
     ) -> WorkspaceEvidenceCapture {
+        if turn
+            .environments
+            .primary()
+            .is_some_and(|env| !env.environment.is_remote())
+        {
+            return match crate::workspace_transaction::evidence_cwd(turn, cwd) {
+                Ok(cwd) => {
+                    self.workspace_evidence_identity_with_attribution(&cwd)
+                        .await
+                }
+                Err(error) => {
+                    warn!(%error, "task workspace evidence is unavailable");
+                    WorkspaceEvidenceCapture {
+                        identity: Some(WorkspaceEvidenceIdentity::unavailable(None)),
+                        timed_out_git_dependencies: Vec::new(),
+                    }
+                }
+            };
+        }
         self.workspace_evidence_for_environment(&turn.environments, turn.config.cwd.as_path(), cwd)
             .await
     }
