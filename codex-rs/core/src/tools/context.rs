@@ -37,7 +37,6 @@ use codex_utils_output_truncation::classify_diagnostic;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_projected_output_limits;
-use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -742,6 +741,7 @@ pub struct ApplyPatchToolOutput {
     pub changes: Vec<JsonValue>,
     pub changes_exact: bool,
     pub environment_id: Option<String>,
+    pub retry: Option<JsonValue>,
 }
 
 impl ApplyPatchToolOutput {
@@ -776,17 +776,39 @@ impl ApplyPatchToolOutput {
             changes,
             changes_exact: delta.is_exact(),
             environment_id,
+            retry: None,
+        }
+    }
+
+    pub(crate) fn with_retry(mut self, retry: Option<JsonValue>) -> Self {
+        if let Some(receipt) = &retry {
+            self.text
+                .push_str(&format!("\nRetained patch retry: {receipt}"));
+        }
+        self.retry = retry;
+        self
+    }
+
+    fn model_text(&self) -> String {
+        if self.success {
+            "Success. Updated the files.".to_string()
+        } else {
+            self.text.clone()
         }
     }
 
     fn structured_result(&self) -> JsonValue {
-        serde_json::json!({
+        let mut result = serde_json::json!({
             "success": self.success,
             "text": self.text,
             "changes": self.changes,
             "changes_exact": self.changes_exact,
             "environment_id": self.environment_id,
-        })
+        });
+        if let Some(retry) = &self.retry {
+            result["retry"] = retry.clone();
+        }
+        result
     }
 }
 
@@ -812,12 +834,13 @@ impl ToolOutput for ApplyPatchToolOutput {
             },
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: Vec::new(),
-            spillable_text: vec![self.text.clone()],
+            spillable_text: vec![self.model_text()],
             essential_inline: serde_json::json!({
                 "success": self.success,
                 "changes_count": self.changes.len(),
                 "changes_exact": self.changes_exact,
                 "environment_id": self.environment_id,
+                "retry": self.retry,
             }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
@@ -831,7 +854,7 @@ impl ToolOutput for ApplyPatchToolOutput {
             call_id,
             payload,
             vec![FunctionCallOutputContentItem::InputText {
-                text: self.text.clone(),
+                text: self.model_text(),
             }],
             Some(self.success),
         )
@@ -954,6 +977,10 @@ pub struct ExecCommandToolOutput {
 }
 
 impl ToolOutput for ExecCommandToolOutput {
+    fn code_mode_failure_is_error(&self) -> bool {
+        false
+    }
+
     fn log_preview(&self) -> String {
         telemetry_preview(String::from_utf8_lossy(&self.raw_output).as_ref())
     }
@@ -1108,7 +1135,7 @@ impl ToolOutput for ExecCommandToolOutput {
         let raw_output = String::from_utf8_lossy(&self.raw_output);
         let model_output = self.projected_model_output(raw_output.as_ref());
         let output_reduced = model_output.reduced;
-        let output = self.output_with_reduction_notice(model_output);
+        let output = model_output.text;
 
         let result = UnifiedExecCodeModeResult {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
@@ -1490,10 +1517,8 @@ impl ExecCommandToolOutput {
             ToolOutputProjectionFragment::new(
                 ToolOutputProjectionFragmentKind::ProcessFinalStatus,
                 format!(
-                    "process final status: exit_code={:?}, session_id={:?}, wall_time_seconds={:.4}",
-                    self.exit_code,
-                    self.process_id,
-                    self.wall_time.as_secs_f64(),
+                    "process final status: exit_code={:?}, session_id={:?}",
+                    self.exit_code, self.process_id,
                 ),
             )
             .with_id("process_status"),
@@ -1567,13 +1592,21 @@ impl ExecCommandToolOutput {
                 }
                 metadata
             },
-            requested_limit: self.max_output_tokens,
+            requested_limit: self.requested_model_output_tokens(),
             predetermined_ranges: predetermined_validation_ranges(
                 raw_output,
                 self.hook_command.as_deref(),
             ),
             predetermined_json_pointers: Vec::new(),
         }
+    }
+
+    fn requested_model_output_tokens(&self) -> Option<usize> {
+        self.max_output_tokens.or_else(|| {
+            self.hook_command
+                .as_deref()
+                .and_then(crate::tools::shell_output_summary::source_read_output_budget)
+        })
     }
 
     fn model_output_limits(&self, raw_output: &str) -> OutputLimitResolution {
@@ -1584,10 +1617,10 @@ impl ExecCommandToolOutput {
             ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
         };
         resolve_projected_output_limits(
-            self.max_output_tokens,
+            self.requested_model_output_tokens(),
             outcome,
             classify_diagnostic(self.hook_command.as_deref(), raw_output),
-            self.truncation_policy.token_budget(),
+            self.truncation_policy.token_budget().max(25_000),
         )
     }
 
@@ -1649,19 +1682,6 @@ impl ExecCommandToolOutput {
         }
     }
 
-    fn output_with_reduction_notice(&self, projected: ProjectedModelOutput) -> String {
-        let mut output = projected.text;
-        if projected.reduced
-            && let Some(notice) = self.raw_output_reduction_notice.as_deref()
-        {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(notice);
-        }
-        output
-    }
-
     #[cfg(test)]
     pub(crate) fn response_text(&self) -> String {
         let raw_output = String::from_utf8_lossy(&self.raw_output);
@@ -1672,105 +1692,34 @@ impl ExecCommandToolOutput {
         #[cfg(test)]
         EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(|calls| calls.set(calls.get() + 1));
 
-        let max_tokens = self.model_output_limits(raw_output).applied_limit;
-        let mut sections = Vec::new();
-
-        let wall_time_seconds = self.wall_time.as_secs_f64();
-        let process_status = match (
-            self.exit_code,
-            self.process_id.as_ref(),
-            self.process_exited,
-        ) {
-            (Some(exit_code), _, _) => format!(
-                "Process exited with code {exit_code}; wall time: {wall_time_seconds:.4} seconds"
-            ),
-            (None, _, true) => format!(
-                "Process exited without an available exit code; wall time: {wall_time_seconds:.4} seconds"
-            ),
-            (None, Some(process_id), false) => format!(
-                "Process running with session ID {process_id}; wall time: {wall_time_seconds:.4} seconds"
-            ),
-            (None, None, false) => {
-                format!("Process state unavailable; wall time: {wall_time_seconds:.4} seconds")
-            }
-        };
-        let mandatory_status = process_status.clone();
-        sections.push(process_status);
-        if let Some(capabilities) = self.session_capabilities {
-            sections.push(format!(
-                "Session capabilities: stdin={}, interrupt={}, cancellation={}, polling={}",
-                capabilities.stdin,
-                capabilities.interrupt,
-                capabilities.cancellation,
-                capabilities.polling
-            ));
+        let projected = self.projected_model_output(raw_output);
+        let mut fields = serde_json::Map::new();
+        if let Some(code) = self.exit_code {
+            fields.insert("exit_code".into(), code.into());
+        }
+        if let Some(id) = self.process_id {
+            fields.insert("session_id".into(), id.into());
+        }
+        if projected.reduced
+            && let Some(id) = self
+                .raw_output_artifact
+                .as_ref()
+                .and_then(|a| a.model_projection().0)
+        {
+            fields.insert("artifact_id".into(), id.to_string().into());
+        }
+        let mut text = projected.text;
+        if self.process_exited && self.exit_code.is_none() {
+            text.push_str("\nProcess exited without an available exit code");
+        }
+        if let Some(repair) = &self.repair_notice {
+            text.push_str(&format!("\n{repair}"));
         }
         if let Some(notice) = self.output_decoding_notice() {
-            sections.push(notice.to_string());
+            text.push_str(&format!("\n{notice}"));
         }
-        if let Some(validation) = self.declared_validation_metadata() {
-            sections.push(format!(
-                "Declared validation attribution (coverage unverified): {validation}"
-            ));
-        }
-
-        if let Some(repair_notice) = &self.repair_notice {
-            sections.push(repair_notice.clone());
-        }
-
-        let artifact_section_index = sections.len();
-        if let Some(raw_output_artifact) = &self.raw_output_artifact {
-            sections.push(raw_output_artifact.render_for_model());
-        }
-
-        sections.push("Output:".to_string());
-        let projected = self.projected_model_output(raw_output);
-        let reduction_notice = projected
-            .reduced
-            .then_some(self.raw_output_reduction_notice.as_deref());
-        sections.push(projected.text);
-
-        let response = sections.join("\n");
-        let Some(Some(notice)) = reduction_notice else {
-            let budget = max_tokens.max(codex_utils_string::approx_token_count(&mandatory_status));
-            return truncate_text_to_token_ceiling(&response, budget);
-        };
-        // The notice carries its own identifier and selector. Remove the
-        // redundant header so recovery still fits a small output budget.
-        let artifact_header = if self.raw_output_artifact.is_some() {
-            sections.remove(artifact_section_index)
-        } else {
-            String::new()
-        };
-        let notice = notice.to_string();
-        let notice_tokens = codex_utils_string::approx_token_count(&notice);
-        let status_tokens = codex_utils_string::approx_token_count(&mandatory_status);
-        if notice_tokens.saturating_add(status_tokens + 1) >= max_tokens {
-            // Execution controls have priority over optional recovery prose.
-            let locator_budget = max_tokens.saturating_sub(status_tokens + 1);
-            let locator = truncate_text_to_token_ceiling(&artifact_header, locator_budget);
-            return if locator.is_empty() {
-                mandatory_status
-            } else {
-                format!("{mandatory_status}\n{locator}")
-            };
-        }
-        let response = sections.join("\n");
-        let mut response_budget = max_tokens.saturating_sub(notice_tokens + 1);
-        loop {
-            let response = truncate_text_to_token_ceiling(&response, response_budget);
-            let candidate = if response.is_empty() {
-                notice.clone()
-            } else {
-                format!("{response}\n{notice}")
-            };
-            if codex_utils_string::approx_token_count(&candidate) <= max_tokens
-                || response_budget == 0
-            {
-                return candidate;
-            }
-            response_budget = response_budget.saturating_sub(1);
-        }
+        fields.insert("output".into(), text.into());
+        JsonValue::Object(fields).to_string()
     }
 
     #[cfg(test)]

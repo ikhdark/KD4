@@ -1507,7 +1507,11 @@ impl GitWorkspaceCache {
                     .identity
             }
             Some(_) => match cwd.to_abs_path() {
-                Ok(cwd) => self.workspace_evidence_identity(cwd.as_path()).await,
+                Ok(cwd) => {
+                    self.workspace_evidence_for_turn(turn, cwd.as_path())
+                        .await
+                        .identity
+                }
                 Err(_) => Some(WorkspaceEvidenceIdentity::unavailable(None)),
             },
             None => Some(WorkspaceEvidenceIdentity::unavailable(None)),
@@ -1519,6 +1523,25 @@ impl GitWorkspaceCache {
         turn: &crate::session::turn_context::TurnContext,
         cwd: &Path,
     ) -> WorkspaceEvidenceCapture {
+        if turn
+            .environments
+            .primary()
+            .is_some_and(|env| !env.environment.is_remote())
+        {
+            return match crate::workspace_transaction::evidence_cwd(turn, cwd) {
+                Ok(cwd) => {
+                    self.workspace_evidence_identity_with_attribution(&cwd)
+                        .await
+                }
+                Err(error) => {
+                    warn!(%error, "task workspace evidence is unavailable");
+                    WorkspaceEvidenceCapture {
+                        identity: Some(WorkspaceEvidenceIdentity::unavailable(None)),
+                        timed_out_git_dependencies: Vec::new(),
+                    }
+                }
+            };
+        }
         self.workspace_evidence_for_environment(&turn.environments, turn.config.cwd.as_path(), cwd)
             .await
     }
@@ -1657,6 +1680,7 @@ impl GitWorkspaceCache {
     /// cannot prove that an external edit is not still waiting in the event
     /// queue. Authoritative evidence therefore never reuses watcher-backed
     /// metadata caches.
+    #[cfg(test)]
     pub(crate) async fn workspace_evidence_identity(
         &self,
         cwd: &Path,

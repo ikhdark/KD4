@@ -434,6 +434,10 @@ fn normalized_context_component_semantic_id(value: &str) -> Option<&str> {
 }
 
 impl SessionTelemetry {
+    pub fn conversation_id(&self) -> ThreadId {
+        self.metadata.conversation_id
+    }
+
     pub fn with_auth_env(mut self, auth_env: AuthEnvTelemetryMetadata) -> Self {
         self.metadata.auth_env = auth_env;
         self

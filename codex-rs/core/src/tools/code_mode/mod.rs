@@ -53,11 +53,8 @@ use codex_tools::can_request_original_image_detail;
 use codex_tools::sanitize_original_image_detail as sanitize_image_detail_items;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::resolve_output_limits;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
-use codex_utils_output_truncation::truncate_text_to_token_ceiling;
-use codex_utils_string::approx_token_count;
 
 use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
@@ -248,13 +245,13 @@ impl CodeModeService {
         self.session().await?.wait(request).await
     }
 
-    pub(crate) async fn wait_for_state_change(
+    pub(crate) async fn wait_for_decision(
         &self,
         cell_id: codex_code_mode::CellId,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
         self.wait(codex_code_mode::WaitRequest {
             cell_id,
-            yield_time_ms: codex_code_mode::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS,
+            yield_time_ms: codex_code_mode::OWNER_HELD_DECISION_YIELD_TIME_MS,
         })
         .await
     }
@@ -558,8 +555,7 @@ pub(super) fn handle_runtime_response(
     // Nested tool results have already crossed their owning tool boundary. Keep
     // one coherent, model-safe exec packet here instead of applying the much
     // smaller generic per-tool diagnostic budget a second time.
-    let hard_limit = codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
-        .min(TruncationPolicy::from(exec.turn.model_info.truncation_policy).token_budget());
+    let hard_limit = codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
     let cell_id = runtime_response_cell_id(&response);
@@ -593,34 +589,17 @@ pub(super) fn handle_runtime_response(
         }
         packet.nested_results
     } else {
-        packet
-            .nested_results
-            .into_iter()
-            .filter(|result| result.failed)
-            .collect()
+        Vec::new()
     };
-    // Budget receipts together with script output and diagnostics. Keep the full
-    // set in canonical storage, while inline control state favors live handles.
-    let mut command_states = packet.command_states;
-    let canonical_states = command_states.clone();
-    command_states.sort_by_key(|state| {
-        state.get("process_exited").and_then(JsonValue::as_bool) != Some(false)
-    });
-    command_states.truncate(crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES);
-    for state in &mut command_states {
-        if let Some(object) = state.as_object_mut() {
-            object.remove("raw_output_artifact_error");
+    // Host lifecycle state stays in the canonical record. Only live handles
+    // need a separate inline receipt when the script did not print them.
+    let canonical_states = packet.command_states;
+    for state in &canonical_states {
+        if state["process_exited"] == false && !state["session_id"].is_null() {
+            post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
+                text: format!("Running command session_id: {}", state["session_id"]),
+            });
         }
-    }
-    let inline_receipt =
-        (!command_states.is_empty()).then(|| FunctionCallOutputContentItem::InputText {
-            text: format!(
-                "Nested command states (independent of script completion):\n{}",
-                JsonValue::Array(command_states.clone())
-            ),
-        });
-    if let Some(receipt) = &inline_receipt {
-        post_tool_use_feedback.push(receipt.clone());
     }
     let mut output = format_runtime_response(
         response,
@@ -632,31 +611,16 @@ pub(super) fn handle_runtime_response(
         nested_results,
         packet.first_required_terminal,
     );
-    if let Some(receipt) = inline_receipt {
-        if output
-            .canonical_body
-            .as_ref()
-            .is_some_and(|canonical| *canonical != output.body)
-        {
-            for state in &mut command_states {
-                state["wrapper_output_reduced"] = JsonValue::Bool(true);
-                state["output_complete"] = JsonValue::Bool(false);
-            }
-        }
-        if let Some(canonical) = &mut output.canonical_body {
-            if let Some(item) = canonical.iter_mut().find(|item| **item == receipt) {
-                *item = FunctionCallOutputContentItem::InputText {
-                    text: format!(
-                        "Nested command states (independent of script completion):\n{}",
-                        JsonValue::Array(canonical_states)
-                    ),
-                };
-            }
-        }
-        output.essential_inline.insert(
-            "nested_commands".to_string(),
-            JsonValue::Array(command_states),
-        );
+    output.essential_inline.insert(
+        "nested_commands".into(),
+        JsonValue::Array(canonical_states.clone()),
+    );
+    if !canonical_states.is_empty()
+        && let Some(canonical) = &mut output.canonical_body
+    {
+        canonical.push(FunctionCallOutputContentItem::InputText {
+            text: serde_json::json!({"nested_commands": canonical_states}).to_string(),
+        });
     }
     Ok(output)
 }
@@ -799,10 +763,14 @@ fn nested_result_content_items(
     nested_results
         .into_iter()
         .map(|result| {
-            let encoded = serde_json::to_string(&result)
-                .unwrap_or_else(|_| "{\"output\":\"<unavailable>\"}".to_string());
+            let value = serde_json::from_str(&result.output)
+                .unwrap_or_else(|_| JsonValue::String(result.output));
+            let value = model_visible_nested_result(&ToolName::plain(&result.tool_name), value);
             FunctionCallOutputContentItem::InputText {
-                text: format!("Nested tool result:\n{encoded}"),
+                text: value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string()),
             }
         })
         .collect()
@@ -866,6 +834,12 @@ fn format_runtime_response(
         }
     };
 
+    let canonical_nested = nested_results
+        .iter()
+        .map(|result| FunctionCallOutputContentItem::InputText {
+            text: serde_json::to_string(result).unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
     content_items.extend(nested_result_content_items(nested_results));
     content_items.extend(post_tool_use_feedback);
     let mut diagnostic = required_terminal.as_ref().map(|terminal| {
@@ -893,6 +867,7 @@ fn format_runtime_response(
     });
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
     let mut canonical_content_items = content_items.clone();
+    canonical_content_items.extend(canonical_nested);
     let mut content_items = truncate_code_mode_result(
         content_items,
         max_output_tokens,
@@ -918,7 +893,14 @@ fn format_runtime_response(
         canonical_content_items.insert(0, metadata);
     }
     let elapsed = started_at.elapsed();
-    prepend_script_status(&mut content_items, &script_status, elapsed);
+    if yielded || !success {
+        content_items.insert(
+            0,
+            FunctionCallOutputContentItem::InputText {
+                text: script_status.clone(),
+            },
+        );
+    }
     prepend_script_status(&mut canonical_content_items, &script_status, elapsed);
     let typed_outcome = match (yielded, outcome) {
         (true, _) => codex_tools::ToolOutputOutcome::Yielded,
@@ -1003,9 +985,10 @@ fn truncate_code_mode_result(
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
-        let (truncated_items, _) =
-            formatted_truncate_text_content_items_with_policy(&items, policy);
-        return truncated_items;
+        let text = code_mode_text_content(&items);
+        return vec![FunctionCallOutputContentItem::InputText {
+            text: codex_utils_output_truncation::truncate_model_text(&text, limits.applied_limit),
+        }];
     }
 
     truncate_function_output_items_with_policy(&items, policy)
@@ -1020,21 +1003,26 @@ fn truncate_code_mode_failure(
     else {
         unreachable!("the caller identifies a script-error text item")
     };
-    let error_tokens = approx_token_count(&error_text);
+    let error_tokens = codex_utils_output_truncation::model_token_count(&error_text);
     let reserved_error_tokens = error_tokens.min(token_limit);
     let other_policy = TruncationPolicy::Tokens(token_limit.saturating_sub(reserved_error_tokens));
     let mut projected = if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
-        formatted_truncate_text_content_items_with_policy(&items, other_policy).0
+        vec![FunctionCallOutputContentItem::InputText {
+            text: codex_utils_output_truncation::truncate_model_text(
+                &code_mode_text_content(&items),
+                other_policy.token_budget(),
+            ),
+        }]
     } else {
         truncate_function_output_items_with_policy(&items, other_policy)
     };
     let error_text = if error_tokens <= reserved_error_tokens {
         error_text
     } else {
-        truncate_text_to_token_ceiling(&error_text, reserved_error_tokens)
+        codex_utils_output_truncation::truncate_model_text(&error_text, reserved_error_tokens)
     };
     if !error_text.is_empty() {
         projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
@@ -1238,6 +1226,7 @@ async fn call_nested_tool(
             .record_owner_drained_continuation(&cell_id, continuation);
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
+    let failure_is_error = result.code_mode_failure_is_error();
     let result_value = result.code_mode_result();
     let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
     if let Some(parent_call_id) = parent_tool_call_id.as_ref()
@@ -1303,10 +1292,22 @@ async fn call_nested_tool(
         parent_cell_id: cell_id.to_string(),
         runtime_tool_call_id,
         tool_name: tool_name.to_string(),
-        output: retained_output,
+        output: if tool_name.namespace.is_none()
+            && matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
+            && let Some(text) = result_value["output"].as_str()
+        {
+            let rendered = format!("exit_code: {}\n{}", result_value["exit_code"], text);
+            codex_utils_string::truncate_middle_chars(
+                &rendered,
+                MAX_RETAINED_NESTED_RESULT_BYTES - 128,
+            )
+        } else {
+            retained_output
+        },
         output_truncated,
     };
     let required_terminal = required_nested_tool_terminal_cause(outcome_context, signal.as_ref())
+        .filter(|cause| failure_is_error || matches!(cause, RequiredToolTerminalCause::Blocked))
         .map(|cause| {
             let label = match cause {
                 RequiredToolTerminalCause::Blocked => "blocked",
@@ -1343,13 +1344,48 @@ async fn call_nested_tool(
         },
         &receipts,
     );
-    if matches!(
-        outcome_context.outcome,
-        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
-    ) {
+    if failure_is_error
+        && matches!(
+            outcome_context.outcome,
+            ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
+        )
+    {
         return Err(FunctionCallError::RespondToModel(result_value.to_string()));
     }
+    // This value is consumed by JavaScript, not rendered directly to the model.
+    // Preserve the owning tool's structured contract so a cell can inspect
+    // process completion, recover omitted output, and use patch change metadata
+    // without returning to the model for another decision.
     Ok(result_value)
+}
+
+// Presentation only: never use this projection for a JavaScript tool return.
+fn model_visible_nested_result(tool: &ToolName, value: JsonValue) -> JsonValue {
+    if tool.namespace.is_some() || !value.is_object() {
+        return value;
+    }
+    if matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
+        let mut compact = serde_json::Map::new();
+        for key in ["exit_code", "output", "session_id"] {
+            if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
+                compact.insert(key.to_string(), value.clone());
+            }
+        }
+        if value["output_reduced"] == true
+            && let Some(id) = value.get("raw_output_artifact_id").filter(|v| !v.is_null())
+        {
+            compact.insert("artifact_id".to_string(), id.clone());
+        }
+        return JsonValue::Object(compact);
+    }
+    if tool.name == "apply_patch" {
+        return JsonValue::String(if value["success"] == true {
+            "Success. Updated the files.".to_string()
+        } else {
+            value["text"].as_str().unwrap_or("Patch failed").to_string()
+        });
+    }
+    value
 }
 
 fn nested_command_argv(tool_name: &ToolName, payload: &ToolPayload) -> Option<Vec<String>> {
@@ -2678,6 +2714,25 @@ mod tests {
     }
 
     #[test]
+    fn nested_execution_projection_keeps_only_result_and_live_handles() {
+        let raw = serde_json::json!({"exit_code": 7, "output": "assertion failed: left 3 right 7",
+            "wall_time_seconds": 1.5, "process_exited": true, "chunk_id": "chunk",
+            "output_reduced": false, "session_id": null});
+        assert_eq!(
+            super::model_visible_nested_result(&ToolName::plain("exec_command"), raw),
+            serde_json::json!({"exit_code": 7, "output": "assertion failed: left 3 right 7"})
+        );
+        assert_eq!(
+            super::model_visible_nested_result(
+                &ToolName::plain("exec_command"),
+                serde_json::json!({"session_id": 12, "output": "building", "output_reduced": true,
+                "raw_output_artifact_id": "artifact"})
+            ),
+            serde_json::json!({"session_id": 12, "output": "building", "artifact_id": "artifact"})
+        );
+    }
+
+    #[test]
     fn small_truncated_text_output_respects_the_complete_token_budget() {
         let items = vec![FunctionCallOutputContentItem::InputText {
             text: "0123456789012345678901234567890123456789".to_string(),
@@ -2685,12 +2740,12 @@ mod tests {
 
         let truncated_items =
             truncate_code_mode_result(items, Some(5), OutputOutcome::Success, usize::MAX, None);
-        assert_eq!(
-            truncated_items,
-            vec![FunctionCallOutputContentItem::InputText {
-                text: "01234567…23456789".to_string(),
-            }]
-        );
+        let [FunctionCallOutputContentItem::InputText { text }] = truncated_items.as_slice() else {
+            panic!("expected text");
+        };
+        assert!(codex_utils_output_truncation::model_token_count(text) <= 5);
+        assert!(text.contains('\u{2026}'));
+        assert!(text.ends_with('9'));
     }
 
     #[tokio::test]
@@ -2906,7 +2961,7 @@ mod tests {
         assert_eq!(projected_text, &text);
 
         let oversized = vec![FunctionCallOutputContentItem::InputText {
-            text: "x".repeat(48_000),
+            text: "source line test\n".repeat(6_000),
         }];
         let capped =
             truncate_code_mode_result(oversized, None, OutputOutcome::Success, usize::MAX, None);
@@ -2914,8 +2969,8 @@ mod tests {
         else {
             panic!("expected one capped text item");
         };
-        assert!(capped_text.starts_with("Warning: truncated output"));
-        let capped_tokens = codex_utils_string::approx_token_count(capped_text);
+        assert!(capped_text.contains("Warning: truncated output"));
+        let capped_tokens = codex_utils_output_truncation::model_token_count(capped_text);
         assert!(
             capped_tokens <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
             "the complete output must honor the hard limit; got {capped_tokens} tokens"

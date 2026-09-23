@@ -165,7 +165,7 @@ fn prepared_prompt_truncation_releases_large_discarded_storage() {
 }
 
 #[test]
-fn tool_search_compaction_preserves_metadata_and_nested_identities() {
+fn tool_search_acknowledgement_preserves_full_schema_bytes() {
     let original = ResponseItem::ToolSearchOutput {
         id: None,
         call_id: Some("lookup".into()),
@@ -181,11 +181,7 @@ fn tool_search_compaction_preserves_metadata_and_nested_identities() {
     let compact = compact_acknowledged_tool_search_outputs(
         vec![original.clone(), agent_message("acknowledged")].into(),
     );
-    let mut expected = serde_json::to_value(&original).unwrap();
-    expected["tools"] = serde_json::json!([{
-        "type": "namespace", "name": "calendar",
-        "tools": [{"type": "function", "name": "create"}]
-    }]);
+    let expected = serde_json::to_value(&original).unwrap();
     assert_eq!(serde_json::to_value(&compact[0]).unwrap(), expected);
     assert_eq!(compact[1], agent_message("acknowledged"));
     assert_eq!(
@@ -255,11 +251,7 @@ fn prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append()
     let original = first.compacted_tool_search_outputs(compact_acknowledged_tool_search_outputs);
     assert_eq!(original[0].as_ref(), std::slice::from_ref(&search));
 
-    let mut compacted_search = search;
-    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut compacted_search {
-        *tools = vec![serde_json::json!({"type": "function", "name": "read_resource"})];
-    }
-    let mut expected = vec![compacted_search];
+    let mut expected = vec![search];
     for text in ["first append", "second append"] {
         let reasoning = reasoning_msg(text);
         history.record_items([&reasoning], TruncationPolicy::Tokens(10_000));
@@ -425,7 +417,7 @@ fn context_pressure_estimate_uses_the_prepared_plan_projection() {
         .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
         .expect("prepared estimate");
 
-    assert!(prepared < raw);
+    assert_eq!(prepared, raw);
     let expected_items = history
         .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling)
         .items()
@@ -524,10 +516,7 @@ fn total_token_usage_caches_raw_items_without_reusing_projected_estimates() {
     let projected = history
         .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
         .unwrap();
-    assert!(
-        projected < expected_raw,
-        "projection must change same-ID item content"
-    );
+    assert_eq!(projected, expected_raw, "sampling must retain plan bytes");
     for _ in 0..2 {
         assert_eq!(history.get_total_token_usage(false, &base), expected_raw);
         assert_eq!(history.cached_item_token_estimate_namespace_count(), 2);
@@ -1383,7 +1372,7 @@ fn pending_user_boundary_estimate_uses_sampling_projection() {
         )
         .unwrap();
 
-    assert!(projected < raw);
+    assert_eq!(projected, raw);
 }
 
 #[test]
@@ -2821,7 +2810,7 @@ fn tool_search_compaction_uses_projection_identity_without_content_scans() {
 }
 
 #[test]
-fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_open() {
+fn sampling_preparation_preserves_stable_context_in_original_positions() {
     let old_repository =
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
     let current_repository =
@@ -2870,10 +2859,10 @@ fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_op
             };
             assert_eq!(
                 sampled.items(),
-                &[user_input_text_msg(current_repository), dynamic.clone()],
+                items.as_slice(),
                 "replace_history={replace_history}, completed_tool_projection={completed_tool_projection}"
             );
-            assert!(sampled.stable_context_manifest().projection_enabled());
+            assert!(sampled.stable_context_manifest().fail_open());
         }
     }
 }
@@ -3005,13 +2994,17 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
         anchor_before_compaction
     );
 
-    // The next user turn re-budgets once, then anchors again.
+    // The next user turn extends the same prefix.
     history.record_items(
         [&user_input_text_msg("now finish it")],
         TruncationPolicy::Tokens(10_000),
     );
-    assert_eq!(history.sampling_projection_anchor_len(), None);
+    assert_eq!(
+        history.sampling_projection_anchor_len(),
+        Some(history.raw_items().len() - 1)
+    );
     let third = prepare(&history);
+    assert_eq!(&third.items()[..second.items().len()], second.items());
     assert_eq!(
         history.sampling_projection_anchor_len(),
         Some(history.raw_items().len())
@@ -3080,8 +3073,8 @@ fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context(
             };
             let sampling = prepared.shared_items();
             let fallback = prepared.shared_fallback_items();
-            assert_eq!(Arc::ptr_eq(&sampling, &fallback), !fail_open);
-            assert_eq!(prepared.stable_context_manifest().fail_open(), fail_open);
+            assert!(Arc::ptr_eq(&sampling, &fallback));
+            assert!(prepared.stable_context_manifest().fail_open());
             for projected in [&sampling, &fallback] {
                 let call_index = projected
                     .iter()
@@ -3098,20 +3091,26 @@ fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context(
                 else {
                     panic!("tool output must remain paired");
                 };
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(output.text_content().unwrap())
-                        .unwrap(),
-                    serde_json::json!({
-                        "call_id": "read-source", "rerun": {"instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."},
-                        "reason": "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
-                        "reason_code": "missing_observation",
-                        "valid_for_current_workspace": false,
-                        "observed_revision": null,
-                        "current_revision": null,
-                        "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
-                        "stale_workspace_evidence": true,
+                assert_eq!(output.text_content(), Some("unverified source contents"));
+                let notice = projected
+                    .iter()
+                    .find_map(|item| match item {
+                        ResponseItem::Message { role, content, .. } if role == "developer" => {
+                            content.iter().find_map(|part| match part {
+                                ContentItem::InputText { text }
+                                    if text.contains("<workspace_evidence_invalidation>") =>
+                                {
+                                    Some(text)
+                                }
+                                _ => None,
+                            })
+                        }
+                        _ => None,
                     })
-                );
+                    .expect("missing observation must append an invalidation");
+                assert!(notice.contains("missing_observation"));
+                assert!(notice.contains("read-source"));
+                assert!(!notice.contains("unverified source contents"));
                 let context = projected
                     .iter()
                     .filter(
@@ -3119,15 +3118,8 @@ fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context(
                     )
                     .cloned()
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    context,
-                    if fail_open {
-                        items[2..].to_vec()
-                    } else {
-                        vec![user_input_text_msg(current_repository)]
-                    }
-                );
-                assert_eq!(projected.len(), 2 + context.len());
+                assert_eq!(context, items[2..].to_vec());
+                assert_eq!(projected.len(), 3 + context.len());
             }
         }
         assert_eq!(history.raw_items(), items);
@@ -3445,7 +3437,7 @@ fn recorded_context_window_scales_the_tool_result_budget() {
 /// prompt. Session `4ab1` was compacted at turn start because its raw tool
 /// outputs exceeded the limit while the projected prompt was a third of it.
 #[test]
-fn prompt_estimates_measure_the_projected_tool_history() {
+fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
     let _budget =
         crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
     let base = BaseInstructions {
@@ -3513,19 +3505,16 @@ fn prompt_estimates_measure_the_projected_tool_history() {
         [&user_input_text_msg("continue")],
         TruncationPolicy::Tokens(24_000),
     );
-    let raw_estimate =
-        ContextManager::estimate_items_token_count_with_base_instructions(history.raw_items(), &base)
-            .expect("raw estimate");
-    let single_output_tokens = i64::try_from(codex_utils_string::approx_token_count(
-        &format!("0\n{}", "evidence line\n".repeat(1_200)),
-    ))
-    .unwrap();
+    let raw_estimate = ContextManager::estimate_items_token_count_with_base_instructions(
+        history.raw_items(),
+        &base,
+    )
+    .expect("raw estimate");
     assert!(
         raw_estimate > 12_000,
         "fixture must exceed the budget as raw output: {raw_estimate}"
     );
-    // The prompt the model receives: receipts replace consumed outputs that
-    // no longer fit the aggregate budget.
+    // Pressure must reflect full preserved output, not hypothetical receipts.
     let sent_prompt = history
         .clone()
         .prepare_for_prompt_with_completed_tool_projection_target(
@@ -3533,22 +3522,21 @@ fn prompt_estimates_measure_the_projected_tool_history() {
             StableContextTarget::Sampling,
             None,
             None,
+            true,
         );
     let sent_estimate = ContextManager::estimate_items_token_count_with_base_instructions(
         sent_prompt.items(),
         &base,
     )
     .expect("sent prompt estimate");
-    assert!(
-        sent_estimate + single_output_tokens <= raw_estimate,
-        "fixture must compact at least one output: sent={sent_estimate} raw={raw_estimate}"
-    );
+    assert_eq!(sent_estimate, raw_estimate);
+    assert_eq!(sent_prompt.items(), history.raw_items());
     let unchanged_items = sent_prompt
         .items()
         .iter()
         .filter(|item| history.raw_items().contains(item))
         .count();
-    assert!(unchanged_items < history.raw_items().len());
+    assert_eq!(unchanged_items, history.raw_items().len());
     for _ in 0..2 {
         let projected_estimate = history
             .estimate_prepared_token_count_with_base_instructions(
@@ -3575,9 +3563,7 @@ fn prompt_estimates_measure_the_projected_tool_history() {
             2 * unchanged_items
         );
     }
-    // A smaller recorded context window tightens the projection without
-    // rewriting the history, so the estimate must follow the projection
-    // rather than a cached measurement of the earlier receipts.
+    // Changing the window must not hide pressure by silently rewriting outputs.
     drop(_budget);
     history.update_token_info(
         &TokenUsage {
@@ -3593,16 +3579,15 @@ fn prompt_estimates_measure_the_projected_tool_history() {
             StableContextTarget::Sampling,
             None,
             None,
+            true,
         );
     let tightened_estimate = ContextManager::estimate_items_token_count_with_base_instructions(
         tightened_prompt.items(),
         &base,
     )
     .expect("tightened prompt estimate");
-    assert!(
-        tightened_estimate + single_output_tokens <= sent_estimate,
-        "a 4k budget must compact another output: tightened={tightened_estimate} sent={sent_estimate}"
-    );
+    assert_eq!(tightened_estimate, sent_estimate);
+    assert_eq!(tightened_prompt.items(), sent_prompt.items());
     assert_eq!(
         history.estimate_prepared_token_count_with_base_instructions(
             &default_input_modalities(),
@@ -3610,7 +3595,10 @@ fn prompt_estimates_measure_the_projected_tool_history() {
         ),
         Some(tightened_estimate)
     );
-    assert_eq!(history.get_total_token_usage(false, &base), tightened_estimate);
+    assert_eq!(
+        history.get_total_token_usage(false, &base),
+        tightened_estimate
+    );
     assert_eq!(history.raw_items()[1..=canonical.len()], canonical);
 }
 
@@ -3651,6 +3639,7 @@ fn tool_history_budget_compacts_unread_local_shell_pairs() {
                 target,
                 None,
                 None,
+                true,
             );
         for items in [
             prepared.shared_items(),
@@ -3659,6 +3648,10 @@ fn tool_history_budget_compacts_unread_local_shell_pairs() {
             prepared.shared_unreplaced_fallback_items(),
         ] {
             assert_eq!(items.len(), 4);
+            if target == StableContextTarget::Sampling {
+                assert_eq!(items.as_ref(), canonical.as_slice());
+                continue;
+            }
             let mut output_tokens = 0;
             for (pair, call_id) in items.chunks_exact(2).zip(["older-shell", "newer-shell"]) {
                 assert!(
@@ -3677,6 +3670,10 @@ fn tool_history_budget_compacts_unread_local_shell_pairs() {
                 else {
                     panic!("compact text receipt");
                 };
+                if text == &"x".repeat(24_000) {
+                    output_tokens += codex_utils_string::approx_token_count(text);
+                    continue;
+                }
                 let receipt: serde_json::Value = serde_json::from_str(text).unwrap();
                 assert_eq!(receipt["kind"], "unconsumed_tool_outcome");
                 assert_eq!(receipt["call_id"], call_id);
@@ -3688,7 +3685,7 @@ fn tool_history_budget_compacts_unread_local_shell_pairs() {
         }
         assert_eq!(
             Arc::ptr_eq(&prepared.shared_items(), &prepared.shared_fallback_items()),
-            target == StableContextTarget::Sampling
+            true
         );
     }
     assert_eq!(history.raw_items(), canonical);
@@ -4576,4 +4573,35 @@ fn idless_token_estimates_are_cached_and_invalidated_on_rewrite() {
         expected
     );
     assert_eq!(history.cached_item_token_estimate_count(), 1);
+}
+
+#[test]
+fn tokenizer_bounded_cell_output_is_not_truncated_again_by_history() {
+    let text = codex_utils_output_truncation::truncate_model_text(
+        &"let content = read_source_file(path).await?;\n".repeat(2000),
+        10_000,
+    );
+    assert!(text.len() > 30_000);
+    assert!(codex_utils_output_truncation::model_token_count(&text) <= 10_000);
+    let mut history = ContextManager::new();
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "exec".into(),
+        namespace: None,
+        arguments: "{}".into(),
+        call_id: "cell-output".into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items([&call], TruncationPolicy::Tokens(100));
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "cell-output".into(),
+        output: FunctionCallOutputPayload::from_text(text),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items([&output], TruncationPolicy::Tokens(100));
+    assert_eq!(history.raw_items()[1], output);
+    let prepared = history
+        .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
+    assert_eq!(prepared.items()[1], output);
 }

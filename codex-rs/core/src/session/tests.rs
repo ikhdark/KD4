@@ -2944,14 +2944,16 @@ async fn resumed_history_marks_a_turn_that_never_completed() {
         },
     )));
     cut_short.push(RolloutItem::ResponseItem(user_message("now do it.")));
-    cut_short.push(RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-        client_id: None,
-        message: "now do it.".to_string(),
-        images: None,
-        text_elements: Vec::new(),
-        local_images: Vec::new(),
-        ..Default::default()
-    })));
+    cut_short.push(RolloutItem::EventMsg(EventMsg::UserMessage(
+        UserMessageEvent {
+            client_id: None,
+            message: "now do it.".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+            ..Default::default()
+        },
+    )));
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
@@ -9678,6 +9680,7 @@ where
             config.background_terminal_max_timeout,
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
+        retained_patches: Default::default(),
         plan_store: crate::plan_store::PlanStore::default(),
         elicitations: crate::elicitation::ElicitationService::new(),
         analytics_events_client: AnalyticsEventsClient::new(

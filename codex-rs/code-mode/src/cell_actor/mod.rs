@@ -138,6 +138,9 @@ async fn run_cell<H: CellHost>(
     let mut runtime_closed = false;
     let mut runtime_failure_reported = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    // Keep the item and byte boundary while no observer owns an explicit yield.
+    // Output produced afterward belongs to the subsequent observation.
+    let mut pending_explicit_yield: Option<(usize, usize)> = None;
     let mut notification_tasks = JoinSet::new();
     let mut tool_tasks = JoinSet::new();
     let mut command_rx = Some(command_rx);
@@ -205,6 +208,23 @@ async fn run_cell<H: CellHost>(
                     continue;
                 }
                 observer = Some(Observer { mode, response_tx });
+                if let Some((item_count, byte_count)) = pending_explicit_yield.take() {
+                    let later_items = content_items.split_off(item_count);
+                    let delivery = send_observer_event(
+                        observer.take(),
+                        CellEvent::ExplicitYield {
+                            content_items: std::mem::replace(&mut content_items, later_items),
+                        },
+                    );
+                    let mut delivered_bytes = byte_count;
+                    if delivery.is_ok() {
+                        output_admission.release_yield();
+                        admitted_output_bytes = admitted_output_bytes.saturating_sub(byte_count);
+                    } else {
+                        pending_explicit_yield = Some((item_count, byte_count));
+                    }
+                    finish_yield_delivery(delivery, &mut content_items, &mut delivered_bytes, output_admission.as_ref());
+                }
                 yield_timer = observer
                     .as_ref()
                     .and_then(|observer| observer_timer(observer, !content_items.is_empty()));
@@ -332,25 +352,22 @@ async fn run_cell<H: CellHost>(
                         }
                     }
                     RuntimeEvent::YieldRequested => {
-                        output_admission.release_yield();
-                        let yield_observer = matches!(
-                            observer.as_ref().map(|observer| observer.mode),
-                            Some(ObserveMode::YieldAfter(_) | ObserveMode::StateChange)
+                        // An owner may be moving between observations (or
+                        // steering may drop one). Retain the explicit boundary
+                        // until delivery, including when the cell completes.
+                        yield_timer = None;
+                        let boundary = (content_items.len(), admitted_output_bytes);
+                        let delivery = send_observer_event(
+                            observer.take(),
+                            CellEvent::ExplicitYield {
+                                content_items: std::mem::take(&mut content_items),
+                            },
                         );
-                        if yield_observer {
-                            yield_timer = None;
-                            finish_yield_delivery(
-                                send_observer_event(
-                                    observer.take(),
-                                    CellEvent::ExplicitYield {
-                                        content_items: std::mem::take(&mut content_items),
-                                    },
-                                ),
-                                &mut content_items,
-                                &mut admitted_output_bytes,
-                                output_admission.as_ref(),
-                            );
+                        pending_explicit_yield = delivery.is_err().then_some(boundary);
+                        if pending_explicit_yield.is_none() {
+                            output_admission.release_yield();
                         }
+                        finish_yield_delivery(delivery, &mut content_items, &mut admitted_output_bytes, output_admission.as_ref());
                     }
                     RuntimeEvent::Notify { id, call_id, text } => {
                         spawn_notification(
@@ -412,6 +429,10 @@ async fn run_cell<H: CellHost>(
                             task_failure_handler.as_ref(),
                         )
                         .await;
+                        let pending_yield_items = pending_explicit_yield.map(|(item_count, _)| {
+                            let later_items = content_items.split_off(item_count);
+                            std::mem::replace(&mut content_items, later_items)
+                        });
                         let event = CellEvent::Completed {
                             content_items: std::mem::take(&mut content_items),
                             error_text,
@@ -421,13 +442,20 @@ async fn run_cell<H: CellHost>(
                             .commit_completion(
                                 stored_value_writes,
                                 event,
-                                /*pending_initial_yield_items*/ None,
+                                pending_yield_items.clone(),
                                 Arc::clone(&cell_state),
                             )
                             .await
                         {
                             CompletionCommit::Committed => None,
-                            CompletionCommit::Rejected(event) => Some(event),
+                            CompletionCommit::Rejected(mut event) => {
+                                if let Some(mut pending) = pending_yield_items
+                                    && let CellEvent::Completed { content_items, .. } = &mut event {
+                                    pending.append(content_items);
+                                    *content_items = pending;
+                                }
+                                Some(event)
+                            },
                         };
                         match cell_state.deliver_completion(
                             observer.take().map(|observer| observer.response_tx),
@@ -549,7 +577,7 @@ fn observer_timer(
         ObserveMode::StateChange if has_buffered_output => {
             Some(Box::pin(tokio::time::sleep(STATE_CHANGE_COMPLETION_GRACE)))
         }
-        ObserveMode::StateChange => None,
+        ObserveMode::StateChange | ObserveMode::Decision => None,
     }
 }
 

@@ -15,6 +15,7 @@ members = [
     "app-server-test-client",
     "apply-patch",
     "arg0",
+    "workspace-tools",
     "feedback",
     "features",
     "install-context",
@@ -145,6 +146,7 @@ codex-app-server-protocol = { path = "app-server-protocol" }
 codex-app-server-test-client = { path = "app-server-test-client" }
 codex-apply-patch = { path = "apply-patch" }
 codex-arg0 = { path = "arg0" }
+codex-workspace-tools = { path = "workspace-tools" }
 codex-async-utils = { path = "async-utils" }
 codex-backend-client = { path = "backend-client" }
 codex-chatgpt = { path = "chatgpt" }
@@ -431,6 +433,7 @@ tokio-tungstenite = { version = "0.28.0", features = [
     "rustls-tls-native-roots",
 ] }
 tokio-util = "0.7.18"
+tiktoken-rs = "0.12.0"
 toml = "0.9.5"
 toml_edit = "0.24.0"
 tonic-prost-build = { version = "=0.14.3", default-features = false }

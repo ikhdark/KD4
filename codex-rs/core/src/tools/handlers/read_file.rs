@@ -49,6 +49,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         let mut output = read_tool_output_output_schema(file_selector_schema());
         output["properties"]["path"] = json!({"type": "string"});
         output["properties"]["total_lines"] = json!({"type": "integer", "minimum": 0});
+        output["properties"]["source_sha256"] = json!({"type": "string", "description": "SHA-256 of the complete source file, including bytes outside this selection. Use with revision-bound codex-range patch handles."});
         output["properties"]["artifact_id"] = json!({"type": ["string", "null"], "description": "Immutable snapshot identity when retained; null for complete inline reads or unavailable storage."});
         output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned default page contains the entire file. Explicit selectors do not imply whole-file coverage."});
         output["properties"]["continuation"] =
@@ -203,6 +204,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["retained_artifact_complete"] = json!(artifact_id.is_some());
             output["path"] = json!(resolved_path);
             output["total_lines"] = json!(total_lines);
+            output["source_sha256"] = json!(canonical.sha256);
             output["file_complete"] = json!(file_complete);
             if let Some(continuation) = continuation {
                 output["continuation"] = json!(continuation);
@@ -455,7 +457,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             history
-                .project_with_workspace_identity(canonical.clone(), revision.as_ref())
+                .project_with_workspace_cache(
+                    canonical.clone(),
+                    revision.as_ref(),
+                    &session.services.git_workspace
+                )
                 .items,
             canonical
         );
@@ -537,6 +543,10 @@ mod tests {
                 .unwrap()
                 .code_mode_result(&payload);
             assert_eq!(result["canonical_bytes"], text.len());
+            assert_eq!(
+                result["source_sha256"],
+                CanonicalToolResult::text(text.clone()).sha256
+            );
             assert_eq!(result["total_lines"], text.lines().count());
             let delivered = result["results"][0]["text"].as_str().unwrap();
             assert!(text.starts_with(delivered));

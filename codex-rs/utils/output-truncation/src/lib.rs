@@ -8,6 +8,10 @@ pub use codex_utils_string::approx_tokens_from_byte_count;
 use std::borrow::Cow;
 use std::fmt::Write;
 
+mod tokenizer;
+pub use tokenizer::model_token_count;
+pub use tokenizer::truncate_model_text;
+
 pub use codex_protocol::protocol::TruncationPolicy;
 
 /// Conservative coherent-packet model-projection defaults. Formation happens before token
@@ -465,19 +469,22 @@ fn is_high_signal_diagnostic(command_text: Option<&str>, output_text: &str) -> b
                 .peek()
                 .is_some_and(|next| next.len() > next.trim_start().len())
         };
-        let compiler_error = line
-            .split_inclusive(':')
-            .filter_map(|part| part.strip_suffix(':'))
-            .any(|part| {
-                let part = part.trim_start();
-                part.eq_ignore_ascii_case("error")
-                    || part.eq_ignore_ascii_case("warning")
-                    || ["error ts", "error msb"].iter().any(|prefix| {
-                        strip_prefix_ascii_case(part, prefix).is_some_and(|code| {
-                            !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit())
-                        })
+        let compiler_error = line.match_indices(':').any(|(index, _)| {
+            let (before, after) = line.split_at(index);
+            // Rust paths such as serde::de::Error::custom are source text,
+            // not diagnostic labels. Keep location-prefixed single colons.
+            if before.ends_with(':') || after.starts_with("::") {
+                return false;
+            }
+            let part = before.rsplit(':').next().unwrap_or_default().trim_start();
+            part.eq_ignore_ascii_case("error")
+                || part.eq_ignore_ascii_case("warning")
+                || ["error ts", "error msb"].iter().any(|prefix| {
+                    strip_prefix_ascii_case(part, prefix).is_some_and(|code| {
+                        !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit())
                     })
-            });
+                })
+        });
         let rust_panic = strip_prefix_ascii_case(line, "thread '").is_some_and(|rest| {
             rest.split_once('\'').is_some_and(|(name, message)| {
                 !name.is_empty() && strip_prefix_ascii_case(message, " panicked at").is_some()

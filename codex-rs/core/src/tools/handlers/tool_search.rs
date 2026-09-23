@@ -762,6 +762,7 @@ impl ToolSearchHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
+            session,
             payload,
             step_context,
             cancellation_token,
@@ -804,7 +805,71 @@ impl ToolSearchHandler {
         if cancellation_token.is_cancelled() {
             return Err(cancelled());
         }
+        let already_active = turn.activated_deferred_tools();
         turn.activate_deferred_tools(result.activation_tools.iter().cloned());
+        if crate::tools::effective_tool_mode(&turn)
+            == codex_protocol::openai_models::ToolMode::CodeModeOnly
+            && turn.config.code_mode.excluded_tool_namespaces.is_empty()
+            && result
+                .activation_tools
+                .iter()
+                .any(|name| !already_active.contains(name))
+        {
+            // Search receipts can omit oversized schemas. Append authoritative
+            // definitions, filtered to the newly activated callable identities.
+            let newly_active = result
+                .activation_tools
+                .iter()
+                .filter(|name| !already_active.contains(*name))
+                .cloned()
+                .collect::<HashSet<_>>();
+            let mut definitions = Vec::new();
+            for info in self.search_infos.iter() {
+                match &info.entry.output {
+                    LoadableToolSpec::Function(tool) => {
+                        let spec = LoadableToolSpec::Function(tool.clone());
+                        if loadable_tool_names(&spec)
+                            .iter()
+                            .any(|name| newly_active.contains(name))
+                        {
+                            definitions.push(spec);
+                        }
+                    }
+                    LoadableToolSpec::Namespace(namespace) => {
+                        for tool in &namespace.tools {
+                            let spec = LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                                name: namespace.name.clone(),
+                                description: namespace.description.clone(),
+                                tools: vec![tool.clone()],
+                            });
+                            if loadable_tool_names(&spec)
+                                .iter()
+                                .any(|name| newly_active.contains(name))
+                            {
+                                definitions.push(spec);
+                            }
+                        }
+                    }
+                }
+            }
+            let item = codex_protocol::models::ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![codex_protocol::models::ContentItem::InputText {
+                    text: format!(
+                        "Activated tool schemas (callable through exec):\n{}",
+                        serde_json::to_string(&definitions)
+                            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+                    ),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            session
+                .record_conversation_items(&turn, &[item])
+                .await
+                .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+        }
 
         Ok(boxed_tool_output(ToolSearchOutput {
             tools: result.serialized_tools.clone(),
@@ -1418,7 +1483,11 @@ mod tests {
                 vec!["create_event", "delete_event"],
             ),
         ] {
-            let (session, turn, _events) = make_session_and_context_with_rx().await;
+            let (session, mut turn, _events) = make_session_and_context_with_rx().await;
+            Arc::get_mut(&mut turn)
+                .expect("unique fixture turn")
+                .model_info
+                .tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
             turn.refresh_deferred_tool_capabilities(Arc::new(
                 ["create_event", "delete_event"]
                     .into_iter()
@@ -1438,7 +1507,7 @@ mod tests {
             };
             let output = handler
                 .handle(ToolInvocation {
-                    session,
+                    session: Arc::clone(&session),
                     step_context: StepContext::for_test(Arc::clone(&turn)),
                     cancellation_token: CancellationToken::new(),
                     tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
@@ -1455,6 +1524,42 @@ mod tests {
                 panic!("expected search response");
             };
             assert_eq!(tools, vec![expected], "query: {query}");
+            let history = session.clone_history().await;
+            let schema_text = history
+                .raw_items()
+                .iter()
+                .find_map(|item| match item {
+                    codex_protocol::models::ResponseItem::Message { role, content, .. }
+                        if role == "developer" =>
+                    {
+                        content.iter().find_map(|content| match content {
+                            codex_protocol::models::ContentItem::InputText { text } => text
+                                .strip_prefix("Activated tool schemas (callable through exec):\n"),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("activation appends schemas for the registered exec dispatcher");
+            let definitions: Vec<serde_json::Value> = serde_json::from_str(schema_text).unwrap();
+            let advertised = definitions
+                .iter()
+                .flat_map(|namespace| {
+                    namespace["tools"].as_array().unwrap().iter().map(|tool| {
+                        ToolName::namespaced(
+                            namespace["name"].as_str().unwrap(),
+                            tool["name"].as_str().unwrap(),
+                        )
+                    })
+                })
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                advertised,
+                names
+                    .iter()
+                    .map(|name| ToolName::namespaced("mcp__calendar", *name))
+                    .collect()
+            );
             assert_eq!(
                 turn.activated_deferred_tools(),
                 names

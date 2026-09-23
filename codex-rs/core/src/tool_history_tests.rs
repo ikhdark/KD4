@@ -1,6 +1,190 @@
 use super::*;
 
 #[test]
+fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
+    let mut state = ToolHistoryState::default();
+    let source = bounded_output();
+    let mut done = candidate("done", source.clone());
+    done.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "phase-one".into(),
+        ordinal: 0,
+    });
+    state.register(done);
+    state.register(candidate("active", source.clone()));
+    state.register_non_workspace_code_mode_call("done".into());
+    state.register_non_workspace_code_mode_call("active".into());
+    assert!(state.phase_checkpoint_receipts(&["active".into()]).is_err());
+    assert!(
+        state
+            .phase_checkpoint_receipts(&["missing".into()])
+            .is_err()
+    );
+    let receipts = state.phase_checkpoint_receipts(&["done".into()]).unwrap();
+    assert!(receipts["done"].get("digest").is_none());
+    let checkpoint = ResponseItem::Message {
+        id: None,
+        role: "developer".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!(
+                "<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts":receipts,"active_work":"keep active source"})
+            ),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let items: Arc<[ResponseItem]> = Arc::from([
+        function_call("done"),
+        text_output("done", source.clone()),
+        function_call("active"),
+        text_output("active", source.clone()),
+        checkpoint.clone(),
+    ]);
+    let projection = state.project_inner(Arc::clone(&items), None, None);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let before: Arc<[ResponseItem]> = Arc::from(items[..items.len() - 1].to_vec());
+    let anchor = SamplingProjectionAnchor {
+        projection: state.project_inner(Arc::clone(&before), None, None),
+        prepared_items: before,
+    };
+    assert!(
+        state
+            .project_continuation_with_workspace_cache(&anchor, Arc::clone(&items), None, &cache)
+            .is_none(),
+        "a newly appended checkpoint must rebuild the cached projection"
+    );
+    let anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&items),
+        projection: projection.clone(),
+    };
+    assert_eq!(
+        state
+            .project_continuation_with_workspace_cache(&anchor, Arc::clone(&items), None, &cache)
+            .unwrap()
+            .items,
+        projection.items,
+        "an existing checkpoint must preserve the newly cached prefix"
+    );
+    let done = projection
+        .items
+        .iter()
+        .filter_map(canonical_textual_output_identity)
+        .find(|(id, _)| *id == "done")
+        .unwrap()
+        .1;
+    assert!(done.contains("tool_history_artifact_pin"));
+    assert!(done.len() < source.len() / 10);
+    assert!(
+        projection
+            .items
+            .contains(&text_output("active", source.clone()))
+    );
+    assert!(projection.items.contains(&checkpoint));
+    assert!(items.contains(&text_output("done", source)));
+}
+
+#[test]
+fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_history() {
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let captured = workspace_identity("captured");
+    let changed = workspace_identity("changed");
+    let later = workspace_identity("later-unrelated-edit");
+    let output = text_output("read-old", "original source evidence".into());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call("read-old"), output.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(captured.clone()),
+            &output,
+            BTreeSet::new(),
+        )
+        .unwrap(),
+    );
+    let initial = state.project_sampling_with_workspace_cache(
+        Arc::clone(&canonical),
+        Some(&captured),
+        &cache,
+    );
+    assert_eq!(initial.items, canonical);
+    let anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&canonical),
+        projection: initial.clone(),
+    };
+    let invalidated = state
+        .project_continuation_with_workspace_cache(
+            &anchor,
+            Arc::clone(&canonical),
+            Some(&changed),
+            &cache,
+        )
+        .unwrap();
+    for items in [&invalidated.items, &invalidated.unreplaced_items] {
+        assert!(
+            items.starts_with(&initial.items),
+            "previously delivered source bytes must remain identical"
+        );
+        assert_eq!(items.len(), initial.items.len() + 1);
+        let ResponseItem::Message { role, content, .. } = items.last().unwrap() else {
+            panic!("invalidation message")
+        };
+        assert_eq!(role, "developer");
+        let text = serde_json::to_string(content).unwrap();
+        assert!(text.contains("read-old"));
+        assert!(text.contains("stale_workspace_evidence"));
+        assert!(
+            !text.contains("original source evidence"),
+            "do not duplicate old output in a higher-trust message"
+        );
+    }
+    let anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&canonical),
+        projection: invalidated.clone(),
+    };
+    let repeated = state
+        .project_continuation_with_workspace_cache(
+            &anchor,
+            Arc::clone(&canonical),
+            Some(&later),
+            &cache,
+        )
+        .unwrap();
+    assert_eq!(
+        repeated.items, invalidated.items,
+        "unrelated workspace revisions must not repeat the warning"
+    );
+
+    let new_output = text_output("read-new", "current source evidence".into());
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(later.clone()),
+            &new_output,
+            BTreeSet::new(),
+        )
+        .unwrap(),
+    );
+    let mut extended = canonical.to_vec();
+    extended.extend([function_call("read-new"), new_output.clone()]);
+    let next = state
+        .project_continuation_with_workspace_cache(&anchor, extended.into(), Some(&later), &cache)
+        .unwrap();
+    assert!(next.items.starts_with(&invalidated.items));
+    assert_eq!(
+        next.items.last(),
+        Some(&new_output),
+        "fresh replacement evidence must remain current"
+    );
+    assert_eq!(next.items.len(), invalidated.items.len() + 2);
+
+    let without_budget = state.project_workspace_freshness_with_cache(
+        Arc::clone(&canonical),
+        Some(&changed),
+        &cache,
+    );
+    assert!(without_budget.items.starts_with(&canonical));
+    assert_eq!(without_budget.items.len(), canonical.len() + 1);
+}
+
+#[test]
 fn stale_receipt_keeps_a_bounded_historical_digest() {
     let mut tracked = candidate("historical-receipt", "old finding: ".repeat(2000));
     tracked.source_dependencies_current = false;
@@ -1566,7 +1750,11 @@ fn tool_result_budget_scales_with_the_model_context_window() {
     state.set_model_visible_tool_result_token_budget(Some(3_000));
     assert!(raw_count(&state) < 8, "a small window budget must compact");
     state.set_model_visible_tool_result_token_budget(Some(129_200));
-    assert_eq!(raw_count(&state), 8, "a large window keeps the evidence raw");
+    assert_eq!(
+        raw_count(&state),
+        8,
+        "a large window keeps the evidence raw"
+    );
 }
 
 #[test]

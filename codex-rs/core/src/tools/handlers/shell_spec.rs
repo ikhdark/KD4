@@ -123,10 +123,9 @@ pub(crate) fn create_exec_command_tool_for_policy(
         ),
         (
             "max_output_tokens".to_string(),
-            bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
-                adaptive_output_budget_description()
-            ), 0, usize::MAX as u64),
+            bounded_integer(
+                "Output token budget. Source reads and searches default to 25000 tokens; other commands use the standard output policy. Larger requests may be capped by policy. Zero returns only execution controls.".to_string(),
+                0, usize::MAX as u64),
         ),
     ]);
     if include_shell_parameter {

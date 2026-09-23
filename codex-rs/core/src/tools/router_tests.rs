@@ -276,10 +276,11 @@ async fn model_visible_schema_lookup_does_not_materialize_rollout_manifest() -> 
     turn.refresh_deferred_tool_capabilities(first_capability_revisions);
     turn.activate_deferred_tools([hidden_name.clone()]);
     let activated_schemas = router.model_visible_schemas_for_turn(turn.as_ref());
-    assert_eq!(router.schema_snapshot_build_count(), 2);
+    assert!(Arc::ptr_eq(&base_schemas, &activated_schemas));
+    assert_eq!(router.schema_snapshot_build_count(), 1);
     assert_eq!(router.manifest_snapshot_build_count(), 1);
     assert!(
-        namespace_function_names(activated_schemas.specs(), "codex_app")
+        !namespace_function_names(activated_schemas.specs(), "codex_app")
             .iter()
             .any(|name| name == hidden_tool)
     );
@@ -847,7 +848,7 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
             })
     );
     assert!(
-        activated_manifest["model_visible"]
+        activated_manifest["activated_schemas"]
             .to_string()
             .contains(hidden_tool),
         "the manifest and activated schema snapshot must expose the same deferred tool"
@@ -2473,4 +2474,50 @@ fn large_tool_schemas_warn_without_removing_callable_contracts() {
             assert!(router.planning_warnings()[0].contains("model-visible tool schemas"));
         }
     }
+}
+
+#[tokio::test]
+async fn code_mode_activation_keeps_provider_schemas_but_registers_dispatch_tools() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.model_info.supports_search_tool = true;
+    turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
+    let turn = Arc::new(turn);
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let dynamic_tools = vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+        name: "deferred_reader".into(),
+        description: "Read a resource".into(),
+        input_schema: json!({"type":"object","properties":{}}),
+        defer_loading: true,
+    })];
+    let router = ToolRouter::from_context(
+        step.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &dynamic_tools,
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    );
+    let before = router.model_visible_schemas_for_turn(&turn);
+    let name = ToolName::plain("deferred_reader");
+    assert!(router.has_registered_tool(&name));
+    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+    turn.activate_deferred_tools([name.clone()]);
+    assert!(turn.deferred_tool_is_activated(&name));
+    let after = router.model_visible_schemas_for_turn(&turn);
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(before.serialized(), after.serialized());
+    let manifest = router.tool_manifest(&turn).manifest.unwrap();
+    assert_eq!(
+        manifest["model_visible"],
+        serde_json::to_value(after.specs()).unwrap()
+    );
+    assert!(
+        manifest["activated_schemas"]
+            .to_string()
+            .contains("deferred_reader")
+    );
 }

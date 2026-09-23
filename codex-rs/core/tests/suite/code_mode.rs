@@ -1,5 +1,23 @@
 #![allow(clippy::unwrap_used)]
 
+#[path = "code_mode_owned_continuation.rs"]
+mod owned_continuation;
+
+fn workspace_invalidation(request: &ResponsesRequest, call_id: &str) -> Option<Value> {
+    request.body_json()["input"]
+        .as_array()?
+        .iter()
+        .rev()
+        .filter(|item| item["role"] == "developer")
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter_map(|content| content["text"].as_str())
+        .filter(|text| text.starts_with("<workspace_evidence_invalidation>"))
+        .flat_map(str::lines)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|notice| notice["call_id"] == call_id)
+}
+
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -1111,18 +1129,21 @@ text(reads.map(read => read.value).join(""));"#
             "model request {index}"
         );
     }
-    let stale = custom_tool_output_last_non_empty_text(&final_request.single_request(), "call-0")
-        .expect("changed source must leave a freshness notice");
-    assert!(
-        stale.contains(r#""stale_workspace_evidence":true"#),
-        "{stale}"
+    let final_raw = final_request.single_request();
+    let stale = workspace_invalidation(&final_raw, "call-0")
+        .expect("changed source must append a freshness notice");
+    assert_eq!(stale["stale_workspace_evidence"], true);
+    assert!(stale.get("current_nested_results").is_some());
+    assert_eq!(
+        custom_tool_output_last_non_empty_text(&final_raw, "call-0")
+            .unwrap()
+            .replace("\r\n", "\n")
+            .trim(),
+        expected_read.trim(),
+        "invalidating a read must preserve the provider-cached tool result",
     );
-    assert!(!stale.contains("Reject non-ASCII"));
-    assert!(
-        stale.contains("Keep empty-input behavior unchanged."),
-        "{stale}"
-    );
-    assert!(stale.contains("current_nested_results"), "{stale}");
+    let preceding = requests.last().unwrap().single_request().input();
+    assert!(final_raw.input().starts_with(&preceding));
     let final_request = final_request.single_request();
     assert_eq!(
         custom_tool_output_last_non_empty_text(&final_request, "call-1").as_deref(),
@@ -1217,25 +1238,24 @@ async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads
         !validated.contains("stale_workspace_evidence"),
         "{validated}"
     );
-    let initial = custom_tool_output_last_non_empty_text(&after_validation, "call-0")
-        .expect("the old read must retain a freshness notice");
-    assert!(
-        initial.contains(r#""stale_workspace_evidence":true"#),
-        "{initial}"
-    );
+    let initial = workspace_invalidation(&after_validation, "call-0")
+        .expect("the old read must have an appended freshness notice");
+    assert_eq!(initial["stale_workspace_evidence"], true);
 
     let final_request = final_request.single_request();
     for call_id in ["call-1", "call-2"] {
-        let stale = custom_tool_output_last_non_empty_text(&final_request, call_id)
+        let notice = workspace_invalidation(&final_request, call_id)
             .expect("an observation preceding a later mutation must become stale");
-        assert!(
-            stale.contains(r#""stale_workspace_evidence":true"#),
-            "{call_id}: {stale}"
-        );
-        let notice: Value = serde_json::from_str(&stale).expect("stale evidence notice");
         assert_eq!(notice["valid_for_current_workspace"], false);
-        assert!(notice["historical_digest"].as_str().is_some());
+        let historical = custom_tool_output_last_non_empty_text(&final_request, call_id)
+            .expect("historical output remains available");
+        assert!(!historical.contains("stale_workspace_evidence"));
     }
+    assert_eq!(
+        custom_tool_output_last_non_empty_text(&final_request, "call-1").unwrap(),
+        validated,
+        "subsequent invalidation must leave the original validation receipt unchanged",
+    );
     assert_eq!(
         fs::read_to_string(test.cwd_path().join("source.txt"))?,
         "later\n"
@@ -3065,6 +3085,7 @@ text("phase 1");
 yield_control();
 {phase_2_wait}
 text("phase 2");
+yield_control();
 {phase_3_wait}
 text("phase 3");
 "#
@@ -3091,17 +3112,12 @@ text("phase 3");
     test.submit_turn("start the long exec").await?;
 
     let first_request = first_completion.single_request();
-    let first_items = custom_tool_output_items(&first_request, "call-1");
-    assert_eq!(first_items.len(), 2);
+    let first_output = raw_custom_tool_output_text(&first_request, "call-1");
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script running with cell ID \d+(?: after explicit yield)?\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
-        ),
-        text_item(&first_items, /*index*/ 0),
+        r"\AScript running with cell ID \d+ after explicit yield\nphase 1\z",
+        &first_output,
     );
-    assert_eq!(text_item(&first_items, /*index*/ 1), "phase 1");
-    let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
+    let cell_id = extract_running_cell_id(&first_output);
 
     responses::mount_sse_once(
         &server,
@@ -3133,19 +3149,13 @@ text("phase 3");
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 2);
+    assert_eq!(second_items.len(), 1);
+    let second_output = text_item(&second_items, 0);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script running with cell ID \d+(?: after explicit yield)?\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
-        ),
-        text_item(&second_items, /*index*/ 0),
+        r"\AScript running with cell ID \d+ after explicit yield\nphase 2\z",
+        second_output,
     );
-    assert_eq!(
-        extract_running_cell_id(text_item(&second_items, /*index*/ 0)),
-        cell_id
-    );
-    assert_eq!(text_item(&second_items, /*index*/ 1), "phase 2");
+    assert_eq!(extract_running_cell_id(second_output), cell_id);
 
     responses::mount_sse_once(
         &server,
@@ -3177,15 +3187,8 @@ text("phase 3");
 
     let third_request = third_completion.single_request();
     let third_items = function_tool_output_items(&third_request, "call-3");
-    assert_eq!(third_items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
-        ),
-        text_item(&third_items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&third_items, /*index*/ 1), "phase 3");
+    assert_eq!(third_items.len(), 1);
+    assert_eq!(text_item(&third_items, 0), "phase 3");
 
     Ok(())
 }
@@ -4805,6 +4808,53 @@ image(imageItem);
         Some("original")
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_retries_only_rejected_patch_hunks() -> Result<()> {
+    require_network!();
+    let server = responses::start_mock_server().await;
+    let patch = "*** Begin Patch\n*** Add File: retained.txt\n+unchanged generated contents\n*** Update File: missing.txt\n@@\n-old\n+corrected\n*** End Patch";
+    let code = format!(
+        r#"
+const failed = await tools.apply_patch({patch:?});
+if (failed.success !== false || !failed.retry?.patch_id) throw new Error("Missing retained patch receipt");
+const amendment = "*** Begin Patch\n*** Retry Patch: " + failed.retry.patch_id + "\n*** Replace Hunk: 2\n*** Add File: missing.txt\n+corrected\n*** End Patch";
+const repaired = await tools.apply_patch(amendment);
+const duplicate = await tools.apply_patch(amendment);
+text({{ failed: failed.success, retained_hunks: failed.retry.remaining_hunks.length, repaired, duplicate }});
+"#
+    );
+    let (test, response) = run_code_mode_turn(
+        &server,
+        "Apply the patch and repair only its rejected file hunk using its retained receipt.",
+        &code,
+    )
+    .await?;
+    let (output, success) =
+        custom_tool_output_body_and_success(&response.single_request(), "call-1");
+    assert_ne!(success, Some(false), "{output}");
+    let output: Value = serde_json::from_str(&output)?;
+    assert_eq!(output["failed"], false);
+    assert_eq!(output["retained_hunks"], 2);
+    assert_eq!(output["repaired"]["success"], true);
+    assert_eq!(output["repaired"]["changes"].as_array().unwrap().len(), 2);
+    assert_eq!(output["duplicate"]["success"], false);
+    assert!(
+        output["duplicate"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("already used")
+    );
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("retained.txt"))?,
+        "unchanged generated contents\n"
+    );
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("missing.txt"))?,
+        "corrected\n"
+    );
     Ok(())
 }
 

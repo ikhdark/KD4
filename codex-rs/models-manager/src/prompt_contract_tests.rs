@@ -1,7 +1,7 @@
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
 use codex_protocol::openai_models::ModelsResponse;
-use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::model_token_count;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 
@@ -49,16 +49,16 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Read the complete enclosing function, type, or configuration unit before changing it",
             "Current file content overrides summaries, plans, and stale reads",
             "entrypoint through registration, dispatch, feature flags or config defaults to consumers",
-            "Partial wiring is forbidden.",
+            "Partial wiring of implemented code is forbidden. End-to-end wiring is mandatory.",
             "Resolve contradictions by runtime reachability, ownership, and freshness.",
             "Cargo commands sharing a target directory",
             "do not evade denials",
-            "combine compatible behavior and verify it as one runtime path",
+            "combine compatible behavior against the requested contract. Verify the combined runtime path",
             "Cancellation need not roll back effects",
             "without weakening required invariants or assertions",
             "match every explicit requirement, prohibition, and preserved invariant to current evidence",
             "Ending a turn or exhausting a budget does not prove completion.",
-            "distinguish missing capability, failure to follow existing guidance, and interface friction",
+            "Distinguish missing capability, failure to follow existing guidance, and interface friction",
             "Check the supported reuse path",
             "Failed, interrupted, budget-exhausted, or truncated discovery is not a negative finding.",
             "Measure progress by new evidence, resolved requirements, and validated outcomes",
@@ -109,14 +109,16 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         expectation: AnchorExpectation::All,
         anchors: &[
             "Implement the smallest coherent change that fully satisfies the requested behavior.",
-            "avoid unrelated refactors, renames, file moves, dependencies, and redesigns.",
+            "avoid unrelated refactors, renames, file moves, and dependencies.",
         ],
     },
     PromptContract {
         id: "nearest-sufficient-completion",
         scope: PromptScope::FallbackAndBundled,
         expectation: AnchorExpectation::Any,
-        anchors: &["nearest sufficient completion point"],
+        anchors: &[
+            "Once all requested changes and affected validation pass, inspect the diff and deliver the result without repeating passing checks.",
+        ],
     },
     PromptContract {
         id: "user-work-protection",
@@ -187,12 +189,10 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "If neither applies, skip it.",
             "This is an internal decision, not a narrated checklist or extra tool call.",
             "Never skip required validation to save time.",
-            "Bound displayed output while retaining complete results when coverage requires them.",
-            "Preserve a recovery route for omitted evidence, failures, and uncertainty; disclose retention failures.",
-            "Recover needed original-snapshot content through the advertised artifact route",
-            "use a bounded fresh read for a current-source question",
-            "If historical evidence is unavailable, mark the historical claim unverified.",
-            "Do not replace one oversized read with repeated tiny reads",
+            "Read complete useful regions instead of repeatedly requesting tiny slices.",
+            "Preserve a recovery route when output exceeds the requested budget.",
+            "A receipt does not prove omitted content, and recovery does not refresh stale evidence.",
+            "If freshness cannot be established, disclose the limitation instead of validating current state from stale results.",
             "Use asynchronous sessions for commands that outlive the initial wait or require interaction.",
         ],
     },
@@ -222,7 +222,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "do not serialize whole categories of independent work",
             "Change locking only with evidence of conflict or unnecessary exclusion.",
             "Prefer existing code mode or a measured extension to the owning handler over a second scheduler.",
-            "Once reached, deliver the result without another confirmation read or test round.",
+            "Once all requested changes and affected validation pass, inspect the diff and deliver the result without repeating passing checks.",
         ],
     },
     PromptContract {
@@ -265,11 +265,12 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "avoid checklist-only absence searches",
             "Run validation required by the user or repository, including a full suite only when explicitly required.",
             "For changed behavior and mechanical refactors, run the tests that exercise the new or preserved contract and its affected consumers.",
-            "A validating test must assert the intended result and fail when the behavior is absent, wrong, or not reached through the intended path.",
+            "Every validation test must assert an expected result and fail for a plausible incorrect implementation of the behavior or logic under test.",
+            "A validating test must fail when the behavior is absent, wrong, or not reached through the intended path.",
             "Strengthen the smallest relevant test",
             "include required rejection and absent-side-effect cases",
-            "Repair weak tests covering changed behavior or blocking validation",
-            "report unrelated weaknesses without starting a broader audit",
+            "Repair weak tests covering the changed behavior or blocking its validation.",
+            "Report unrelated weaknesses encountered without starting a broader test audit.",
             "Validate the final relevant source state.",
             "dependencies, lockfiles, build configuration, or feature flags invalidate affected evidence",
             "Do not substitute compilation, formatting, linting, static analysis, inspection, or unrelated tests for behavior validation.",
@@ -282,7 +283,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Prompt contract tests establish guidance delivery, not model compliance.",
             "validation and what it proved, failures, unvalidated behavior",
             "Do not run additional validation solely for extra confidence.",
-            "rerun only affected checks that have not passed for the final state",
+            "rerun only affected checks that failed or whose prior results were invalidated by relevant changes",
             "If a gap remains, report the specific partial, blocked, or unverified result",
         ],
     },
@@ -293,7 +294,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "Existing and newly observed changes belong to the user",
             "Preserve concurrent work",
-            "Compare overlapping versions once",
+            "When edits overlap, preserve independent changes and combine compatible behavior against the requested contract.",
             "do not discard unrelated changes",
             "Do not hard-code machine-specific paths.",
         ],
@@ -462,10 +463,12 @@ fn local_policy_models_use_one_canonical_prompt_within_size_limit() {
 
     assert!(prompts.iter().all(|prompt| *prompt == prompts[0]));
     assert_eq!(prompts[0], BASE_INSTRUCTIONS_DEFAULT.trim());
-    let tokens = approx_token_count(prompts[0]);
+    // Enforce the budget with the existing model tokenizer, not the conservative
+    // lexical estimate used to bound arbitrary tool output.
+    let tokens = model_token_count(prompts[0]);
     assert!(
         tokens <= PROMPT_TOKEN_LIMIT,
-        "default.md uses approximately {tokens} tokens; limit is {PROMPT_TOKEN_LIMIT}"
+        "default.md uses {tokens} o200k tokens; limit is {PROMPT_TOKEN_LIMIT}"
     );
 }
 
@@ -501,7 +504,7 @@ fn bundled_local_policy_models_match_prompt_policy_registration() {
         .filter(|slug| {
             matches!(
                 *slug,
-                "gpt-6-astra" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.2"
+                "gpt-6-astra" | "gpt-6-sol" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.2"
             ) || slug.starts_with("gpt-5.6-")
         })
         .collect::<BTreeSet<_>>();

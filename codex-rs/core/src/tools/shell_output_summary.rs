@@ -47,8 +47,7 @@ pub(crate) fn summarize_shell_output_for_model(
         .is_some_and(|limit| codex_utils_string::approx_token_count_exceeds(output, limit));
     if !exceeds_token_budget
         && output.len() <= DEFAULT_SUMMARY_AFTER_BYTES
-        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES).count()
-            < DEFAULT_SUMMARY_AFTER_LINES
+        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES).count() < DEFAULT_SUMMARY_AFTER_LINES
     {
         return None;
     }
@@ -119,7 +118,7 @@ pub(crate) fn summarize_shell_output_for_model(
     // Borrow only the bounded selection; never copy oversized source lines.
     let mut lines = output.lines();
     let mut next_index = 0;
-    let selected = selection
+    let mut selected = selection
         .indexes
         .iter()
         .filter_map(|&index| {
@@ -155,10 +154,70 @@ pub(crate) fn summarize_shell_output_for_model(
             high = mid - 1;
         }
     }
-    let line_budget = low;
+    let mut line_budget = low;
+    let mut summary = render_selected_lines(builder.clone(), &selected, line_budget, line_count)?;
+    if let Some(limit) = options.applied_token_limit
+        && codex_utils_string::approx_token_count_exceeds(&summary, limit)
+    {
+        // The byte ceiling does not honor a caller's smaller token budget (or
+        // punctuation-dense diagnostics). Fit the entire selected summary so
+        // downstream truncation cannot discard a middle diagnostic region.
+        // Give diagnostic context priority over extra head/tail lines before
+        // shortening diagnostics themselves. Every omission remains explicit.
+        let diagnostic_indexes = selected
+            .iter()
+            .filter_map(|(index, line)| {
+                let kind = classify_line(line);
+                (kind.critical || kind.advisory || kind.status).then_some(*index)
+            })
+            .collect::<Vec<_>>();
+        selected.retain(|(index, _)| {
+            *index < FOCUS_CONTEXT_LINES
+                || *index >= line_count.saturating_sub(FOCUS_CONTEXT_LINES)
+                || diagnostic_indexes
+                    .iter()
+                    .any(|diagnostic| index.abs_diff(*diagnostic) <= FOCUS_CONTEXT_LINES)
+        });
+        summary = render_selected_lines(builder.clone(), &selected, line_budget, line_count)?;
+        if !codex_utils_string::approx_token_count_exceeds(&summary, limit) {
+            return (summary.len() < output.len()).then_some(summary);
+        }
+        let minimum = render_selected_lines(builder.clone(), &selected, 0, line_count)?;
+        if codex_utils_string::approx_token_count_exceeds(&minimum, limit) {
+            // Even metadata does not fit. Use ordinary truncation/recovery.
+            return None;
+        }
+        let mut low = 0;
+        let mut high = line_budget;
+        summary = minimum;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let candidate = render_selected_lines(builder.clone(), &selected, mid, line_count)?;
+            if codex_utils_string::approx_token_count_exceeds(&candidate, limit) {
+                high = mid - 1;
+            } else {
+                low = mid;
+                summary = candidate;
+            }
+        }
+        line_budget = low;
+        // An empty line selection is less useful than ordinary truncation.
+        if line_budget == 0 {
+            return None;
+        }
+    }
+    (summary.len() < output.len()).then_some(summary)
+}
+
+fn render_selected_lines(
+    mut builder: SummaryBuilder,
+    selected: &[(usize, &str)],
+    line_budget: usize,
+    line_count: usize,
+) -> Option<String> {
     let mut previous = None;
     let mut emitted_source_lines = 0;
-    for (index, line) in selected {
+    for &(index, line) in selected {
         let before_gap = (builder.text.len(), builder.lines);
         if let Some(previous_index) = previous
             && index != previous_index + 1
@@ -185,9 +244,7 @@ pub(crate) fn summarize_shell_output_for_model(
         }
         previous = Some(index);
     }
-    builder
-        .finish(emitted_source_lines, line_count)
-        .filter(|summary| summary.len() < output.len())
+    builder.finish(emitted_source_lines, line_count)
 }
 
 /// Reads, searches, and listings are source material, not diagnostics: ranking
@@ -196,7 +253,32 @@ pub(crate) fn summarize_shell_output_for_model(
 /// classified by the shared parser; PowerShell scripts, which that parser does
 /// not understand, are accepted only when every command position is a known
 /// read-only cmdlet, alias, or control-flow keyword.
-fn is_read_only_command(command: &str) -> bool {
+pub(crate) fn source_read_output_budget(command: &str) -> Option<usize> {
+    let has_source_reader = command
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "rg" | "grep"
+                    | "cat"
+                    | "head"
+                    | "tail"
+                    | "sed"
+                    | "ls"
+                    | "find"
+                    | "get-content"
+                    | "gc"
+                    | "select-string"
+                    | "sls"
+                    | "get-childitem"
+                    | "gci"
+                    | "dir"
+            )
+        });
+    (has_source_reader && is_read_only_command(command)).then_some(25_000)
+}
+
+pub(crate) fn is_read_only_command(command: &str) -> bool {
     let commands = codex_shell_command::parse_command::parse_shell_script(command);
     if !commands.is_empty()
         && commands.iter().all(|command| {
@@ -550,6 +632,7 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
     }
 }
 
+#[derive(Clone)]
 struct SummaryBuilder {
     text: String,
     lines: usize,

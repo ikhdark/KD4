@@ -280,6 +280,110 @@ async fn small_admission_only_output_stays_inline_without_an_artifact() {
 }
 
 #[tokio::test]
+async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
+    for (exit_code, line_count, limit) in [(0, 300, 10_000), (1, 300, 10_000), (1, 2_000, 3_000)] {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let invocation = test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "fitting-preset-output",
+            ToolName::plain("exec_command"),
+        );
+        // Source reads can contain diagnostic syntax; real diagnostics must also
+        // remain complete when the caller has already allowed enough space.
+        let raw_output = (1..=line_count)
+            .map(|line| format!("error: exact evidence {line:03}\n"))
+            .collect::<String>();
+        let output = crate::tools::context::ExecCommandToolOutput {
+            validation: None,
+            event_call_id: invocation.call_id.clone(),
+            chunk_id: "fitting-preset-chunk".to_string(),
+            wall_time: Duration::from_millis(1),
+            raw_output: raw_output.as_bytes().to_vec(),
+            truncation_policy: codex_protocol::protocol::TruncationPolicy::Tokens(10_000),
+            max_output_tokens: Some(limit),
+            process_id: None,
+            session_capabilities: None,
+            exit_code: Some(exit_code),
+            process_exited: true,
+            search_no_match: false,
+            original_token_count: None,
+            hook_command: Some(if exit_code == 0 {
+                "Get-Content source.rs".to_string()
+            } else {
+                "cargo test".to_string()
+            }),
+            raw_output_artifact: None,
+            raw_output_reduction_notice: None,
+            repair_notice: None,
+            pending_deferred_completions: Vec::new(),
+        };
+        if exit_code == 1 {
+            assert!(
+                !output
+                    .projection_metadata()
+                    .unwrap()
+                    .predetermined_ranges
+                    .is_empty()
+            );
+        }
+        let mut result = AnyToolResult {
+            call_id: invocation.call_id.clone(),
+            payload: invocation.payload.clone(),
+            result: Box::new(output),
+            model_projection: None,
+            source_dependencies: None,
+            code_mode_feedback: Vec::new(),
+        };
+        let original = result.response();
+        if let Some(input) =
+            prepare_model_projection(&invocation, &mut result, None, None, false, true).await
+        {
+            result.install_model_projection(project_model_output(input).await, None);
+        }
+        if line_count == 2_000 {
+            let projection = result
+                .model_projection
+                .as_ref()
+                .expect("oversized result projection");
+            assert!(projection.projection_truncated);
+            assert!(!result.deterministic_continuation_receipts().is_empty());
+            let candidate = projection
+                .candidate
+                .as_ref()
+                .expect("retained oversized result");
+            let recovered =
+                crate::tools::handlers::execute_recovery_transaction_with_continuations(
+                    &invocation.step_context.turn.config.codex_home,
+                    &invocation.session.thread_id.to_string(),
+                    &candidate.artifact_id,
+                    vec![ToolOutputSelector::Lines {
+                        start: 700,
+                        end: 700,
+                    }],
+                    false,
+                    &invocation.cancellation_token,
+                )
+                .await
+                .expect("omitted diagnostic is still recoverable");
+            assert!(recovered.output.complete);
+            assert_eq!(
+                recovered.output.results[0].text.as_deref(),
+                Some("error: exact evidence 700\n")
+            );
+            continue;
+        }
+        assert_eq!(
+            result.response(),
+            original,
+            "fitting output must reach the model intact"
+        );
+        assert!(result.deterministic_continuation_receipts().is_empty());
+        assert_eq!(result.code_mode_result()["output"], raw_output);
+    }
+}
+
+#[tokio::test]
 async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
     let _budget =
         crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
@@ -662,7 +766,8 @@ fn complete_projection_envelope_respects_applied_limit() {
         approx_token_count(rendered) as u64
     );
     let (header, selected_text) = model_projection_parts(rendered);
-    assert_eq!(header["outcome"], "success");
+    assert_eq!(envelope.outcome, "success");
+    assert!(header.get("outcome").is_none());
     assert_eq!(
         selected_text,
         envelope.result["selected_text"]
@@ -710,7 +815,7 @@ fn projection_model_render_is_compact_and_keeps_selected_text_unescaped() {
     assert!(rendered.ends_with(output));
     assert_eq!(header["artifact_id"], "artifact-123");
     assert_eq!(
-        header["selection"]["selected_ids"],
+        projected.envelope().unwrap().result["selection"]["selected_ids"],
         serde_json::json!(["selected-1"])
     );
     for internal_field in [
@@ -777,16 +882,18 @@ fn projection_fallback_preserves_essential_inline() {
     assert_eq!(envelope.result["selected_text"], "");
     assert!(envelope.result.get("large_metadata").is_none());
     let (header, selected_text) = model_projection_parts(&rendered);
-    assert_eq!(header["essential"], essential);
+    assert_eq!(header["session_id"], 41);
+    assert!(header.get("essential").is_none());
+    assert!(header.get("chunk_id").is_none());
     assert!(selected_text.is_empty());
 }
 
 fn model_projection_parts(rendered: &str) -> (Value, &str) {
     let (header, selected_text) = rendered.split_once('\n').unwrap_or((rendered, ""));
-    (
-        serde_json::from_str(header).expect("valid compact projection header"),
-        selected_text,
-    )
+    match serde_json::from_str(header) {
+        Ok(header) => (header, selected_text),
+        Err(_) => (serde_json::json!({}), rendered),
+    }
 }
 
 #[tokio::test]
@@ -1133,9 +1240,9 @@ async fn structured_projection_artifact_recovers_original_bytes() {
     assert!(rendered.len() < full_output.len());
     assert!(!rendered.contains("remaining coverage: integration tests"));
     let (header, _) = model_projection_parts(rendered);
-    assert_eq!(header["outcome"], "failure");
-    assert_eq!(header["essential"]["coverage_status"], "partial");
-    assert_eq!(header["canonical_complete"], true);
+    assert!(header.get("outcome").is_none());
+    assert_eq!(header["coverage_status"], "partial");
+    assert!(header.get("canonical_complete").is_none());
     let artifact_id = header["artifact_id"]
         .as_str()
         .expect("recovery handle must be visible to the model");
@@ -1422,11 +1529,11 @@ async fn projection_owner_recovery_drains_exact_json_pointer_in_original_return(
         }
         other => panic!("unexpected response: {other:?}"),
     };
-    let (header, _) = model_projection_parts(&rendered);
-    let recovery = header["preserved_content"]
-        .as_array()
-        .and_then(|items| items.first())
-        .expect("deterministic recovery");
+    let recovery = rendered
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value.get("predetermined_json_pointers").is_some())
+        .expect("inline deterministic recovery");
     assert_eq!(
         recovery["predetermined_json_pointers"],
         serde_json::json!([{
@@ -1620,16 +1727,11 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         }
         other => panic!("unexpected response: {other:?}"),
     };
-    let (header, _) = model_projection_parts(&rendered);
-    let recovery = header["preserved_content"]
-        .as_array()
-        .and_then(|items| {
-            items.iter().find(|item| {
-                item.get("type").and_then(Value::as_str)
-                    == Some("deterministic_tool_output_recovery")
-            })
-        })
-        .expect("preserved deterministic recovery");
+    let recovery = rendered
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["type"] == "deterministic_tool_output_recovery")
+        .expect("inline deterministic recovery");
     for expected in [
         "line-001", "line-002", "line-150", "line-151", "line-299", "line-300",
     ] {
@@ -2026,22 +2128,10 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         panic!("expected outer custom tool output");
     };
     let rendered = output.body.to_text().expect("outer projection text");
-    let (header, _) = model_projection_parts(&rendered);
-    assert!(
-        header["preserved_content"]
-            .to_string()
-            .contains("exact nested evidence")
-    );
-    assert!(
-        header["preserved_content"]
-            .to_string()
-            .contains("exact pointer evidence")
-    );
-    assert!(
-        !header["preserved_content"]
-            .to_string()
-            .contains(&"x".repeat(8_000))
-    );
+    assert!(rendered.contains("exact nested evidence"));
+    assert!(rendered.contains("exact pointer evidence"));
+    assert!(!rendered.contains(&"x".repeat(8_000)));
+    assert!(!rendered.contains("preserved_content"));
 }
 
 #[tokio::test]
@@ -4082,7 +4172,8 @@ fn final_envelope_fitting_revokes_complete_fragment_inclusion() {
         result: serde_json::json!({"selection":{"selected_ids":["evidence"],"partial_ids":[],"omitted_inline_ids":[]}}),
     };
     let bounded =
-        serialize_projection_with_limit(envelope, &output, approx_token_count(&output)).unwrap();
+        serialize_projection_with_limit(envelope, &output, approx_token_count(&output) - 20)
+            .unwrap();
     assert!(approx_token_count(bounded.rendered()) <= approx_token_count(&output));
     let envelope = bounded.envelope().unwrap();
     assert_ne!(envelope.result["selected_text"], output);

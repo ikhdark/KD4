@@ -216,10 +216,10 @@ impl CodeModeExecuteHandler {
                 tool_call_id: call_id.clone(),
                 enabled_tools,
                 source: args.code.to_owned(),
-                // Give ordinary awaited cells the runtime's completion budget.
-                // If that budget expires, the owner takes over and waits for a
-                // material state change without another model-mediated poll.
-                yield_time_ms: None,
+                // Hand observation to the steerable owner immediately. Output
+                // from an awaited script is buffered until its next decision
+                // boundary, rather than turning a timer into a model call.
+                yield_time_ms: Some(0),
                 max_output_tokens: args.max_output_tokens,
                 default_tool_timeout_ms: Some(codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS),
             })
@@ -265,7 +265,7 @@ impl CodeModeExecuteHandler {
         // Consume the immediate initial observation before making the held
         // wait steerable. This clears the runtime's initial observer, so
         // steering cannot leave a stale observer that rejects a later wait.
-        let initial_response = tokio::select! {
+        let mut initial_response = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
                 terminate_interrupted_cell(&exec, &cell_id, dispatch_lease.clone()).await;
@@ -275,18 +275,23 @@ impl CodeModeExecuteHandler {
                 response.map_err(FunctionCallError::RespondToModel)?
             }
         };
-        let initial_is_empty = matches!(
+        let initial_is_automatic_yield = matches!(
             &initial_response,
-            codex_code_mode::RuntimeResponse::Yielded { content_items, .. }
-                if content_items.is_empty()
+            codex_code_mode::RuntimeResponse::Yielded { .. }
         );
-        let (response, live_cell, drained_observations) = if initial_is_empty {
+        let mut initial_output = match &mut initial_response {
+            codex_code_mode::RuntimeResponse::Yielded { content_items, .. } => {
+                std::mem::take(content_items)
+            }
+            _ => Vec::new(),
+        };
+        let (mut response, live_cell, drained_observations) = if initial_is_automatic_yield {
             let held = hold_until_state_change(
                 || {
                     exec.session
                         .services
                         .code_mode_service
-                        .wait_for_state_change(cell_id.clone())
+                        .wait_for_decision(cell_id.clone())
                 },
                 &cancellation_token,
                 activity_rx,
@@ -325,6 +330,16 @@ impl CodeModeExecuteHandler {
         } else {
             (initial_response, true, 0)
         };
+        if !initial_output.is_empty() {
+            let tail = match &mut response {
+                codex_code_mode::RuntimeResponse::Yielded { content_items, .. }
+                | codex_code_mode::RuntimeResponse::ExplicitYield { content_items, .. }
+                | codex_code_mode::RuntimeResponse::Terminated { content_items, .. }
+                | codex_code_mode::RuntimeResponse::Result { content_items, .. } => content_items,
+            };
+            initial_output.append(tail);
+            *tail = initial_output;
+        }
         // Record the raw runtime boundary. The model-visible custom-tool output
         // is produced by `handle_runtime_response` and later linked through
         // `CodeCell.output_item_ids` in the reduced trace.
@@ -531,8 +546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_code_cells_persist_ordered_initial_and_terminal_traces()
-    -> anyhow::Result<()> {
+    async fn registered_code_cells_persist_ordered_initial_and_terminal_traces() -> anyhow::Result<()> {
         use crate::session::step_context::StepContext;
         use crate::tools::context::ToolDispatchState;
         use crate::tools::router::ToolCall;
@@ -680,14 +694,42 @@ mod tests {
                     RawTraceEventPayload::CodeCellEnded { runtime_cell_id, .. } if runtime_cell_id == &cell_id)));
                 let state = Arc::new(ToolDispatchState::new());
                 assert!(state.try_admit());
-                let result = router.dispatch_tool_call_with_terminal_outcome(
-                    Arc::clone(&session), Arc::clone(&step), tokio_util::sync::CancellationToken::new(), Arc::clone(&tracker),
-                    ToolCall { tool_name: codex_tools::ToolName::plain("wait"), call_id: format!("wait-{case}"),
-                        payload: ToolPayload::Function { arguments: serde_json::json!({"cell_id":cell_id,"terminate":case == "terminated"}).to_string() } },
-                    ToolCallSource::Direct, state,
-                ).await?;
+                let wait_payload = ToolPayload::Function {
+                    arguments: serde_json::json!({"cell_id":cell_id,"terminate":case == "terminated"})
+                        .to_string(),
+                };
+                let result = router
+                    .dispatch_tool_call_with_terminal_outcome(
+                        Arc::clone(&session),
+                        Arc::clone(&step),
+                        tokio_util::sync::CancellationToken::new(),
+                        Arc::clone(&tracker),
+                        ToolCall {
+                            tool_name: codex_tools::ToolName::plain("wait"),
+                            call_id: format!("wait-{case}"),
+                            payload: wait_payload.clone(),
+                        },
+                        ToolCallSource::Direct,
+                        state,
+                    )
+                    .await?;
                 if case == "waited" {
-                    assert!(result.result.log_preview().contains("second"));
+                    let waited_preview = result.result.log_preview();
+                    let observed = format!("{preview}\n{waited_preview}");
+                    assert_eq!(
+                        observed
+                            .lines()
+                            .filter(|line| matches!(*line, "first" | "second"))
+                            .collect::<Vec<_>>(),
+                        vec!["first", "second"],
+                        "initial={preview:?}; wait={waited_preview:?}; signal={:?}; canonical={:?}",
+                        result.result.sampling_request_signal(),
+                        result.result.canonical_result(&wait_payload)
+                    );
+                    assert_eq!(
+                        result.result.outcome_for_logging(),
+                        codex_tools::ToolOutputOutcome::Success
+                    );
                 }
             }
             session.terminal_tasks.close();
@@ -702,6 +744,7 @@ mod tests {
             );
             let events = read_events()?;
             let mut sequence = Vec::new();
+            let mut yielded_trace_output = Vec::new();
             for event in &events {
                 match &event.payload {
                     RawTraceEventPayload::CodeCellStarted {
@@ -733,22 +776,27 @@ mod tests {
                                 ..
                             } if case == "completed" => content_items,
                             codex_code_mode::RuntimeResponse::ExplicitYield {
-                                content_items,
-                                ..
+                                content_items, ..
                             } if case != "completed" => content_items,
                             other => panic!("unexpected initial response: {other:?}"),
                         };
-                        assert_eq!(
-                            content_items,
-                            vec![FunctionCallOutputContentItem::InputText {
-                                text: if case == "completed" {
-                                    "ready"
-                                } else {
-                                    "first"
-                                }
-                                .to_string()
-                            }]
-                        );
+                        if case == "waited" {
+                            // The script continues after yielding; already-buffered output
+                            // may be delivered with either response, but never lost or repeated.
+                            yielded_trace_output.extend(content_items);
+                        } else {
+                            assert_eq!(
+                                content_items,
+                                vec![FunctionCallOutputContentItem::InputText {
+                                    text: if case == "completed" {
+                                        "ready"
+                                    } else {
+                                        "first"
+                                    }
+                                    .to_string()
+                                }]
+                            );
+                        }
                     }
                     RawTraceEventPayload::CodeCellEnded {
                         runtime_cell_id,
@@ -762,32 +810,50 @@ mod tests {
                         )?)?;
                         let response: codex_code_mode::RuntimeResponse =
                             serde_json::from_value(raw["response"].clone())?;
-                        let content_items = match response {
-                            codex_code_mode::RuntimeResponse::Result {
+                        let content_items =
+                            match response {
+                                codex_code_mode::RuntimeResponse::Result {
+                                    content_items,
+                                    error_text: None,
+                                    ..
+                                } if case != "terminated" => content_items,
+                                codex_code_mode::RuntimeResponse::Terminated {
+                                    content_items, ..
+                                } if case == "terminated" => content_items,
+                                other => panic!("unexpected terminal response: {other:?}"),
+                            };
+                        if case == "waited" {
+                            yielded_trace_output.extend(content_items);
+                        } else {
+                            assert_eq!(
                                 content_items,
-                                error_text: None,
-                                ..
-                            } if case != "terminated" => content_items,
-                            codex_code_mode::RuntimeResponse::Terminated {
-                                content_items, ..
-                            } if case == "terminated" => content_items,
-                            other => panic!("unexpected terminal response: {other:?}"),
-                        };
-                        assert_eq!(
-                            content_items,
-                            if terminal_text.is_empty() {
-                                vec![]
-                            } else {
-                                vec![FunctionCallOutputContentItem::InputText {
-                                    text: terminal_text.to_string(),
-                                }]
-                            }
-                        );
+                                if terminal_text.is_empty() {
+                                    vec![]
+                                } else {
+                                    vec![FunctionCallOutputContentItem::InputText {
+                                        text: terminal_text.to_string(),
+                                    }]
+                                }
+                            );
+                        }
                     }
                     _ => {}
                 }
             }
             assert_eq!(sequence, vec!["started", "initial", "ended"]);
+            if case == "waited" {
+                assert_eq!(
+                    yielded_trace_output,
+                    vec![
+                        FunctionCallOutputContentItem::InputText {
+                            text: "first".to_string()
+                        },
+                        FunctionCallOutputContentItem::InputText {
+                            text: "second".to_string()
+                        },
+                    ]
+                );
+            }
         }
         session
             .services

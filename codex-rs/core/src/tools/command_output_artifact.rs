@@ -4839,6 +4839,43 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     selectors: Vec<ToolOutputSelector>,
     token_ceiling: usize,
 ) -> Result<(ReadToolOutputResult, bool), ReadToolOutputError> {
+    let snapshot = load_tool_output_snapshot(codex_home, thread_id, artifact_id).await?;
+    let result = snapshot.select(selectors, token_ceiling).await?;
+    Ok((result, false))
+}
+
+/// One authenticated observation, owned by a single recovery transaction. Do
+/// not cache it across calls: a new call must observe expiration and corruption.
+pub(crate) struct ToolOutputSnapshot {
+    metadata: LogicalArtifactMetadata,
+    bytes: Vec<u8>,
+}
+
+impl ToolOutputSnapshot {
+    pub(crate) async fn select(
+        self: &Arc<Self>,
+        selectors: Vec<ToolOutputSelector>,
+        token_ceiling: usize,
+    ) -> Result<ReadToolOutputResult, ReadToolOutputError> {
+        let snapshot = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            select_tool_output_snapshot(
+                &snapshot.metadata,
+                &snapshot.bytes,
+                selectors,
+                token_ceiling,
+            )
+        })
+        .await
+        .map_err(|err| ReadToolOutputError::Io(format!("failed to select artifact: {err}")))?
+    }
+}
+
+pub(crate) async fn load_tool_output_snapshot(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
     let id = artifact_id
         .parse::<ToolOutputArtifactId>()
         .map_err(|_| ReadToolOutputError::InvalidArtifactId)?;
@@ -4849,24 +4886,14 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
         .join("tool-output")
         .join(thread_id)
         .join(format!("{id}.log"));
-    let metadata_path = path.clone();
-    let metadata = tokio::task::spawn_blocking(move || load_logical_metadata(&metadata_path, id))
-        .await
-        .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    let validation_path = path.clone();
-    let metadata_for_snapshot = metadata.clone();
-    let snapshot = tokio::task::spawn_blocking(move || {
-        open_regular_artifact(&validation_path)?;
-        load_validated_logical_snapshot(&validation_path, &metadata_for_snapshot)
+    tokio::task::spawn_blocking(move || {
+        let metadata = load_logical_metadata(&path, id)?;
+        open_regular_artifact(&path)?;
+        let bytes = load_validated_logical_snapshot(&path, &metadata)?;
+        Ok(Arc::new(ToolOutputSnapshot { metadata, bytes }))
     })
     .await
-    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    let result = tokio::task::spawn_blocking(move || {
-        select_tool_output_snapshot(&metadata, &snapshot, selectors, token_ceiling)
-    })
-    .await
-    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    Ok((result, false))
+    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
 /// Select from bytes already owned by a producer. Disk recovery uses this same

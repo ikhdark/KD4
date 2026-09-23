@@ -16,3 +16,8 @@ change_line: ("+" | "-" | " ") /(.+)/? LF
 eof_line: "*** End of File" LF
 
 %import common.LF
+
+retry: "*** Retry Patch: " patch_id LF amendment*
+amendment: "*** Replace Hunk: " index LF hunk | "*** Replace Chunk: " index " " index LF change
+patch_id: /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
+index: /[1-9][0-9]*/

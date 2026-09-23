@@ -241,8 +241,23 @@ impl ToolRouter {
         &self,
         turn: &crate::session::turn_context::TurnContext,
     ) -> Arc<ToolSchemaArtifact> {
-        let (_, activated) = turn.deferred_tool_activation_snapshot();
-        self.tool_schema_snapshot(&activated)
+        if crate::tools::effective_tool_mode(turn)
+            != codex_protocol::openai_models::ToolMode::CodeModeOnly
+            || !turn.config.code_mode.excluded_tool_namespaces.is_empty()
+        {
+            // Direct calls need activated schemas in the API tools array.
+            return self.tool_schema_snapshot(&turn.activated_deferred_tools());
+        }
+        // Activated schemas travel in appended history, never ahead of it.
+        let mut state = turn
+            .deferred_tool_activations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            state
+                .model_visible_schemas
+                .get_or_insert_with(|| self.tool_schema_snapshot(&HashSet::new())),
+        )
     }
 
     pub(crate) fn deferred_tool_capability_revisions(&self) -> Arc<HashMap<ToolName, String>> {
@@ -277,7 +292,7 @@ impl ToolRouter {
         turn: &crate::session::turn_context::TurnContext,
     ) -> ToolManifestItem {
         let (_, activated) = turn.deferred_tool_activation_snapshot();
-        self.tool_manifest_snapshot(&activated)
+        self.tool_manifest_snapshot(&activated, turn)
     }
 
     /// Return the manifest record for this request without cloning the full schema tree when the
@@ -302,7 +317,7 @@ impl ToolRouter {
             }
         }
 
-        let manifest = self.tool_manifest_snapshot(&activated);
+        let manifest = self.tool_manifest_snapshot(&activated, turn);
         if previous_hash == Some(manifest.hash.as_str()) {
             ToolManifestItem::reference(manifest.hash)
         } else {
@@ -349,7 +364,11 @@ impl ToolRouter {
         schemas
     }
 
-    fn tool_manifest_snapshot(&self, activated: &HashSet<ToolName>) -> ToolManifestItem {
+    fn tool_manifest_snapshot(
+        &self,
+        activated: &HashSet<ToolName>,
+        turn: &crate::session::turn_context::TurnContext,
+    ) -> ToolManifestItem {
         let mut cache = self
             .manifest_cache
             .lock()
@@ -358,6 +377,7 @@ impl ToolRouter {
             return manifest.clone();
         }
 
+        let model_visible = self.model_visible_schemas_for_turn(turn);
         let schemas = self.tool_schema_snapshot(activated);
         let registered = self
             .registry
@@ -385,7 +405,8 @@ impl ToolRouter {
             })
             .collect::<Vec<_>>();
         let manifest = canonicalize_json(&serde_json::json!({
-            "model_visible": schemas.specs(),
+            "model_visible": model_visible.specs(),
+            "activated_schemas": schemas.specs(),
             "registered": registered,
         }));
         let fingerprint_input = serde_json::json!({
@@ -568,6 +589,45 @@ impl ToolRouter {
         dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let _completion_guard = ToolDispatchCompletionGuard(Arc::clone(&dispatch_state));
+        let mut call = call;
+        if call.tool_name.namespace.is_none()
+            && matches!(
+                call.tool_name.name.as_str(),
+                "read_file"
+                    | "list_files"
+                    | "semantic_context"
+                    | "exec_command"
+                    | "shell_command"
+                    | "apply_patch"
+            )
+            && matches!(
+                step_context.turn.sandbox_policy(),
+                codex_protocol::protocol::SandboxPolicy::DangerFullAccess
+            )
+            && step_context
+                .environments
+                .primary()
+                .is_some_and(|env| !env.environment.is_remote())
+        {
+            let home = step_context.turn.config.codex_home.clone();
+            let thread = session.thread_id.to_string();
+            let cwd = step_context.turn.config.cwd.to_path_buf();
+            let name = call.tool_name.name.clone();
+            let mut payload = call.payload;
+            call.payload = tokio::task::spawn_blocking(move || {
+                crate::workspace_transaction::route_call(
+                    &home,
+                    &thread,
+                    &cwd,
+                    &name,
+                    &mut payload,
+                )?;
+                Ok::<_, anyhow::Error>(payload)
+            })
+            .await
+            .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+            .map_err(|e| FunctionCallError::RespondToModel(format!("workspace routing: {e:#}")))?;
+        }
         let registered = self.registry.registered_tool(&call.tool_name);
         if registered.map(RegisteredTool::exposure)
             == Some(crate::tools::registry::ToolExposure::Deferred)

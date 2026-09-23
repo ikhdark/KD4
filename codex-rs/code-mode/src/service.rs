@@ -217,6 +217,8 @@ impl InProcessCodeModeSession {
 fn observe_mode_for_yield_time(yield_time_ms: u64) -> runtime::ObserveMode {
     if yield_time_ms == codex_code_mode_protocol::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS {
         runtime::ObserveMode::StateChange
+    } else if yield_time_ms == codex_code_mode_protocol::OWNER_HELD_DECISION_YIELD_TIME_MS {
+        runtime::ObserveMode::Decision
     } else {
         runtime::ObserveMode::YieldAfter(Duration::from_millis(yield_time_ms))
     }

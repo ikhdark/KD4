@@ -132,6 +132,14 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// Resolve a structured request to its executable operation before hooks
+    /// and command authorization inspect it. The target must be registered.
+    fn prepare_invocation<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+    ) -> BoxFuture<'a, Result<ToolInvocation, FunctionCallError>> {
+        Box::pin(async move { Ok(invocation) })
+    }
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::Handler
     }
@@ -498,6 +506,10 @@ impl AnyToolResult {
         } = self;
         result.code_mode_result(&payload)
     }
+
+    pub(crate) fn code_mode_failure_is_error(&self) -> bool {
+        self.result.code_mode_failure_is_error()
+    }
 }
 
 /// Materialize the model-visible representation for a terminal result owned by
@@ -755,6 +767,10 @@ fn apply_post_tool_use_outcome(
 }
 
 impl ToolOutput for PostToolUseFeedbackOutput {
+    fn code_mode_failure_is_error(&self) -> bool {
+        self.original.code_mode_failure_is_error()
+    }
+
     fn log_preview(&self) -> String {
         self.original.log_preview()
     }
@@ -820,6 +836,10 @@ struct UnavailableModelProjectionOutput {
 }
 
 impl ToolOutput for UnavailableModelProjectionOutput {
+    fn code_mode_failure_is_error(&self) -> bool {
+        self.original.code_mode_failure_is_error()
+    }
+
     fn log_preview(&self) -> String {
         self.original.log_preview()
     }
@@ -1162,15 +1182,30 @@ impl ToolRegistry {
         &self,
         mut invocation: ToolInvocation,
     ) -> Result<(ToolInvocation, Option<String>), FunctionCallError> {
+        let original_name = invocation.tool_name.clone();
+        if let Some(registered) = self.tools.get(&invocation.tool_name) {
+            invocation = registered.runtime().prepare_invocation(invocation).await?;
+            if !self.tools.contains_key(&invocation.tool_name) {
+                return Err(FunctionCallError::RespondToModel(
+                    "expanded tool operation is not available in this session".into(),
+                ));
+            }
+        }
+        let expansion_notice = (invocation.tool_name != original_name).then(|| {
+            format!(
+                "Resolved `{original_name}` through `{}` with its normal execution policy.",
+                invocation.tool_name
+            )
+        });
         if !invocation
             .session
             .hooks()
             .has_handler_for(HookEventName::PreToolUse)
         {
-            return Ok((invocation, None));
+            return Ok((invocation, expansion_notice));
         }
         let Some(registered) = self.tools.get(&invocation.tool_name) else {
-            return Ok((invocation, None));
+            return Ok((invocation, expansion_notice));
         };
         let tool = registered.runtime();
         let parsed = ParsedFunctionArguments::from_payload(&invocation.payload);
@@ -1179,7 +1214,7 @@ impl ToolRegistry {
         })
         .await;
         let Some(payload) = payload else {
-            return Ok((invocation, None));
+            return Ok((invocation, expansion_notice));
         };
         let started = Instant::now();
         let result = run_pre_tool_use_hooks(
@@ -1197,7 +1232,7 @@ impl ToolRegistry {
             }
             PreToolUseHookResult::Continue {
                 updated_input: None,
-            } => Ok((invocation, None)),
+            } => Ok((invocation, expansion_notice)),
             PreToolUseHookResult::Continue {
                 updated_input: Some(updated),
             } => {
@@ -1225,6 +1260,20 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        // Direct registry callers do not pass through ToolCallRuntime's prepare
+        // phase. Resolve their executable before selecting its handler/schema.
+        let original_name = invocation.tool_name.clone();
+        if PREPARED_HOOK_INPUT.try_with(|_| ()).is_err()
+            && let Some(registered) = self.tools.get(&invocation.tool_name)
+        {
+            invocation = registered.runtime().prepare_invocation(invocation).await?;
+        }
+        let expansion_notice = (original_name != invocation.tool_name).then(|| {
+            format!(
+                "Resolved `{original_name}` through `{}` with its normal execution policy.",
+                invocation.tool_name
+            )
+        });
         let tool_name = invocation.tool_name.clone();
         let mut parsed_function_arguments =
             ParsedFunctionArguments::from_payload(&invocation.payload);
@@ -1384,6 +1433,7 @@ impl ToolRegistry {
             },
         };
         invocation = prepared_invocation;
+        let hook_input_notice = hook_input_notice.or(expansion_notice);
         let hook_rewrote_input = hook_input_notice.is_some();
         if hook_rewrote_input {
             parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
@@ -1843,8 +1893,7 @@ struct ModelProjectionInput {
     source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
     projection_eligible: bool,
     projection_truncated: bool,
-    /// The producer, truncation, or predetermined selectors need a durable
-    /// canonical artifact regardless of output size.
+    /// The producer or truncation needs a durable canonical artifact.
     canonical_artifact_required: bool,
     predetermined_ranges: Vec<ToolOutputProjectionRange>,
     predetermined_json_pointers: Vec<ToolOutputProjectionJsonPointer>,
@@ -2026,7 +2075,14 @@ async fn prepare_model_projection(
         requested_limit,
         outcome,
         diagnostic_class,
-        DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
+        if matches!(
+            invocation.tool_name.name.as_str(),
+            "exec_command" | "write_stdin"
+        ) {
+            25_000
+        } else {
+            DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS
+        },
     );
     let generic_projection = formatted_truncate_text_with_output_limit(&spillable_text, limits);
     let non_text_tokens = non_text_projection_token_cost(&preserved_content);
@@ -2041,11 +2097,12 @@ async fn prepare_model_projection(
     .saturating_add(non_text_tokens);
     let projection_truncated =
         generic_projection.was_truncated || model_output_tokens > limits.applied_limit;
-    let has_predetermined_selectors = !metadata.predetermined_ranges.is_empty()
-        || !metadata.predetermined_json_pointers.is_empty();
-    let needs_canonical_artifact = result.result.requires_canonical_artifact()
-        || projection_truncated
-        || has_predetermined_selectors;
+    // Preset selectors describe how to recover omitted evidence; they do not
+    // establish that anything was omitted. Projecting a fitting result solely
+    // for these hints needlessly reads its artifact and, in code mode, merges
+    // recovered excerpts alongside the complete native result printed by JS.
+    let needs_canonical_artifact =
+        result.result.requires_canonical_artifact() || projection_truncated;
     let retain_for_history = track_for_admission
         && invocation
             .step_context
@@ -3597,58 +3654,62 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
     let selected_text = envelope.result["selected_text"]
         .as_str()
         .unwrap_or_default();
-    let mut header = serde_json::Map::new();
-    header.insert(
-        "outcome".to_string(),
-        Value::String(envelope.outcome.clone()),
-    );
-    header.insert(
-        "canonical_complete".to_string(),
-        Value::Bool(envelope.canonical_complete),
-    );
-    if let Some(artifact_id) = envelope.artifact_id.as_ref() {
-        header.insert(
+    let mut fields = envelope.result["essential"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    // These facts remain in the canonical envelope and rollout, not the prompt.
+    for key in [
+        "chunk_id",
+        "wall_time_seconds",
+        "execution_state",
+        "process_exited",
+        "output_complete",
+        "output_reduced",
+        "original_token_count",
+        "original_token_count_is_approximate",
+        "session_capabilities",
+        "success",
+        "raw_output_artifact_bytes",
+        "raw_output_artifact_id",
+        "raw_output_artifact_retention_limit_hit",
+        "raw_output_artifact_retention_limit_reason",
+        "changes_count",
+        "changes_exact",
+        "environment_id",
+        "nested_commands",
+    ] {
+        fields.remove(key);
+    }
+    fields.retain(|_, value| !value.is_null());
+    if let Some(artifact_id) = envelope.artifact_id.as_ref()
+        && (!envelope.omitted_sections.is_empty()
+            || selected_text.is_empty()
+            || envelope.canonical_bytes > selected_text.len() as u64)
+    {
+        fields.insert(
             "artifact_id".to_string(),
             Value::String(artifact_id.clone()),
         );
     }
-    if !envelope.omitted_sections.is_empty() {
-        header.insert(
-            "omitted_sections".to_string(),
-            serde_json::to_value(&envelope.omitted_sections).ok()?,
-        );
-    }
-    for field in ["essential", "preserved_content", "artifact"] {
-        if let Some(value) = envelope.result.get(field)
-            && !value.is_null()
-            && !value.as_array().is_some_and(Vec::is_empty)
-            && !value.as_object().is_some_and(serde_json::Map::is_empty)
-        {
-            header.insert(field.to_string(), value.clone());
-        }
-    }
-    if let Some(selection) = envelope.result["selection"].as_object() {
-        let mut compact_selection = serde_json::Map::new();
-        for field in ["selected_ids", "omitted_inline_ids", "partial_ids"] {
-            if let Some(value) = selection.get(field)
-                && !value.as_array().is_some_and(Vec::is_empty)
-            {
-                compact_selection.insert(field.to_string(), value.clone());
-            }
-        }
-        if !compact_selection.is_empty() {
-            header.insert("selection".to_string(), Value::Object(compact_selection));
-        }
+    let mut parts = Vec::new();
+    if !fields.is_empty() {
+        parts.push(serde_json::to_string(&fields).ok()?);
     }
     if !selected_text.is_empty() {
-        header.insert("selected_text_follows".to_string(), Value::Bool(true));
+        parts.push(selected_text.to_string());
     }
-
-    let mut rendered = serde_json::to_string(&header).ok()?;
-    if !selected_text.is_empty() {
-        rendered.push('\n');
-        rendered.push_str(selected_text);
+    if let Some(preserved) = envelope.result["preserved_content"].as_array() {
+        for value in preserved {
+            parts.push(
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string()),
+            );
+        }
     }
+    let rendered = parts.join("\n");
     envelope.model_bytes = rendered.len() as u64;
     envelope.model_approximate_tokens = approx_token_count(&rendered) as u64;
     Some(rendered)

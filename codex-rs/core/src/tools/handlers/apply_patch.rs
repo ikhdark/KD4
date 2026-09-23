@@ -26,6 +26,7 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
+use crate::tools::handlers::apply_patch_retries;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::updated_hook_command;
@@ -133,6 +134,7 @@ impl ApplyPatchHandler {
 #[derive(Default)]
 struct ApplyPatchArgumentDiffConsumer {
     parser: StreamingPatchParser,
+    input: String,
     parse_error: Option<ParseError>,
     last_sent_at: Option<Instant>,
     pending: Option<String>,
@@ -165,7 +167,8 @@ impl ToolArgumentDiffConsumer for ApplyPatchArgumentDiffConsumer {
 
 impl ApplyPatchArgumentDiffConsumer {
     fn push_delta(&mut self, call_id: String, delta: &str) -> Option<PatchApplyUpdatedEvent> {
-        if self.parse_error.is_some() {
+        self.input.push_str(delta);
+        if apply_patch_retries::is_retry(&self.input) || self.parse_error.is_some() {
             return None;
         }
         match self.parser.push_delta_in_place(delta) {
@@ -202,6 +205,11 @@ impl ApplyPatchArgumentDiffConsumer {
     fn finish_update_on_complete(
         &mut self,
     ) -> Result<Option<PatchApplyUpdatedEvent>, FunctionCallError> {
+        if apply_patch_retries::is_retry(&self.input) {
+            apply_patch_retries::validate_retry(&self.input)
+                .map_err(FunctionCallError::RespondToModel)?;
+            return Ok(None);
+        }
         if let Some(err) = &self.parse_error {
             return Err(FunctionCallError::RespondToModel(format!(
                 "failed to parse apply_patch: {err}"
@@ -483,7 +491,28 @@ impl ApplyPatchHandler {
                 "apply_patch handler received unsupported payload".to_string(),
             ));
         };
-        let args = match codex_apply_patch::parse_patch(&patch_input) {
+        let retry = if apply_patch_retries::is_retry(&patch_input) {
+            Some(
+                session
+                    .services
+                    .retained_patches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .prepare(&patch_input)
+                    .map_err(FunctionCallError::RespondToModel)?,
+            )
+        } else {
+            None
+        };
+        let (retry_id, retry_scope, parsed) = match retry {
+            Some(retry) => (
+                Some(retry.id),
+                Some((retry.environment_id, retry.cwd)),
+                Ok(retry.args),
+            ),
+            None => (None, None, codex_apply_patch::parse_patch(&patch_input)),
+        };
+        let args = match parsed {
             Ok(args) => args,
             Err(parse_error) => {
                 session.services.session_telemetry.counter(
@@ -515,6 +544,7 @@ impl ApplyPatchHandler {
                 _ => 1,
             })
             .sum();
+        let retained_input = args.patch.clone();
         let cancellation = cancellation_token.clone();
         let result = async {
             let selected_environment_id =
@@ -530,6 +560,13 @@ impl ApplyPatchHandler {
                     "apply_patch requires a ready execution environment. If an environment is starting, call wait_for_environment with its id first.".to_string(),
                 ));
             };
+            if retry_scope.as_ref().is_some_and(|(id, cwd)| {
+                id != &turn_environment.environment_id || cwd != turn_environment.cwd()
+            }) {
+                return Err(FunctionCallError::RespondToModel(
+                    "retained patch belongs to a different execution environment or working directory".into(),
+                ));
+            }
             let fs = turn_environment.environment.get_filesystem();
             let sandbox = turn.file_system_sandbox_context(
                 /*additional_permissions*/ None,
@@ -541,6 +578,11 @@ impl ApplyPatchHandler {
                 &cancellation_token,
             )
             .await?;
+            if let Some(id) = &retry_id {
+                session.services.retained_patches.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .consume(id).map_err(FunctionCallError::RespondToModel)?;
+            }
             match codex_apply_patch::verify_apply_patch_args(
                 args,
                 turn_environment.cwd(),
@@ -619,9 +661,21 @@ impl ApplyPatchHandler {
                             crate::tools::runtimes::apply_patch::patch_failure_kind(&parse_error),
                         )],
                     );
-                    Err(FunctionCallError::RespondToModel(format!(
-                        "apply_patch verification failed: {parse_error}"
-                    )))
+                    let observed_source = match &parse_error {
+                        codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) => Some(serde_json::json!({
+                            "path": mismatch.canonical_path, "sha256": mismatch.current_content_sha256,
+                            "hunk": mismatch.hunk_ordinal, "chunk": mismatch.chunk_ordinal,
+                        })),
+                        _ => None,
+                    };
+                    let retry = session.services.retained_patches.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retain(&retained_input, &turn_environment.environment_id,
+                            turn_environment.cwd(), &Default::default(), observed_source);
+                    Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
+                        format!("apply_patch verification failed: {parse_error}"), false,
+                        &Default::default(), Some(turn_environment.environment_id.clone()),
+                    ).with_retry(retry)))
                 }
                 codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
                     tracing::trace!("Failed to parse apply_patch input, {error:?}");
@@ -682,7 +736,20 @@ impl CoreToolRuntime for ApplyPatchHandler {
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        apply_patch_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
+        let mut command = apply_patch_payload_command(&invocation.payload)?;
+        if apply_patch_retries::is_retry(&command) {
+            if let Ok(retry) = invocation
+                .session
+                .services
+                .retained_patches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .prepare(&command)
+            {
+                command = retry.args.patch;
+            }
+        }
+        Some(PreToolUsePayload {
             tool_name: HookToolName::apply_patch(),
             tool_input: serde_json::json!({ "command": command }),
         })
@@ -698,6 +765,36 @@ impl CoreToolRuntime for ApplyPatchHandler {
         updated_input: serde_json::Value,
     ) -> Result<ToolInvocation, FunctionCallError> {
         let patch = updated_hook_command(&updated_input)?;
+        if let ToolPayload::Custom { input } = &invocation.payload
+            && apply_patch_retries::is_retry(input)
+        {
+            codex_apply_patch::parse_patch(patch)
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+            let mut retained = invocation
+                .session
+                .services
+                .retained_patches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let retry = retained
+                .prepare(input)
+                .map_err(FunctionCallError::RespondToModel)?;
+            let environment = resolve_tool_environment(
+                &invocation.step_context.environments,
+                Some(&retry.environment_id),
+            )?
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel("retained patch environment is not ready".into())
+            })?;
+            if environment.cwd() != &retry.cwd {
+                return Err(FunctionCallError::RespondToModel(
+                    "retained patch working directory changed".into(),
+                ));
+            }
+            retained
+                .consume(&retry.id)
+                .map_err(FunctionCallError::RespondToModel)?;
+        }
         invocation.payload = match invocation.payload {
             ToolPayload::Custom { .. } => ToolPayload::Custom {
                 input: patch.to_string(),
@@ -863,12 +960,33 @@ async fn run_owned_patch(
             Err(FunctionCallError::RespondToModel(text))
                 if !req.cancellation_token.is_cancelled() =>
             {
+                // Shell interception can verify relative paths after `cd`.
+                // The dedicated tool cannot select that working directory, so
+                // never offer a receipt that would replay those paths elsewhere.
+                let retry = (req.action.cwd == *req.turn_environment.cwd())
+                    .then(|| {
+                        tool_ctx
+                            .session
+                            .services
+                            .retained_patches
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .retain(
+                                &req.action.patch,
+                                &req.turn_environment.environment_id,
+                                &req.action.cwd,
+                                runtime.committed_delta(),
+                                None,
+                            )
+                    })
+                    .flatten();
                 Ok(ApplyPatchToolOutput::from_delta(
                     text,
                     false,
                     runtime.committed_delta(),
                     Some(req.turn_environment.environment_id.clone()),
-                ))
+                )
+                .with_retry(retry))
             }
             Err(error) => Err(error),
         };

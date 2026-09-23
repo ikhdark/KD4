@@ -30,9 +30,178 @@ fn sample_patch() -> &'static str {
 }
 
 #[tokio::test]
-async fn registered_large_patch_recovers_middle_changes_from_canonical_output() {
-    use crate::tools::command_output_artifact::ToolOutputSelector;
-    use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
+async fn retained_retry_reaches_filesystem_once_and_hooks_see_expanded_code() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("a.txt"), "current\n").unwrap();
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.environments.turn_environments = vec![TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        PathUri::from_host_native_path(workspace.path()).unwrap(),
+        None,
+    )];
+    let mut call = ToolInvocation {
+        session: Arc::new(session),
+        step_context: StepContext::for_test(Arc::new(turn)),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "retained-original".into(),
+        tool_name: ToolName::plain("apply_patch"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: ToolPayload::Custom { input: "*** Begin Patch\n*** Update File: a.txt\n@@\n-stale\n+new\n*** Add File: b.txt\n+retained code\n*** End Patch".into() },
+    };
+    let handler = ApplyPatchHandler::default();
+    let failed = handler
+        .handle(call.clone())
+        .await
+        .unwrap()
+        .code_mode_result(&call.payload);
+    assert_eq!(failed["success"], false);
+    assert_eq!(failed["changes"], json!([]));
+    assert!(!workspace.path().join("b.txt").exists());
+    let id = failed["retry"]["patch_id"].as_str().unwrap();
+    assert_eq!(failed["retry"]["observed_source"]["chunk"], 1);
+    call.call_id = "retained-retry".into();
+    call.payload = ToolPayload::Custom {
+        input: format!(
+            "*** Begin Patch\n*** Retry Patch: {id}\n*** Replace Chunk: 1 1\n@@\n-current\n+new\n*** End Patch"
+        ),
+    };
+    for change_environment in [false, true] {
+        let other = TempDir::new().unwrap();
+        let mut wrong_scope = call.clone();
+        let mut step = (*wrong_scope.step_context).clone();
+        step.environments.turn_environments = vec![TurnEnvironment::new(
+            if change_environment {
+                "different-environment".into()
+            } else {
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.into()
+            },
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            if change_environment {
+                PathUri::from_host_native_path(workspace.path()).unwrap()
+            } else {
+                PathUri::from_host_native_path(other.path()).unwrap()
+            },
+            None,
+        )];
+        wrong_scope.step_context = Arc::new(step);
+        let rejected = handler
+            .handle(wrong_scope)
+            .await
+            .unwrap()
+            .code_mode_result(&call.payload);
+        assert_eq!(rejected["success"], false);
+        assert!(
+            rejected["text"]
+                .as_str()
+                .unwrap()
+                .contains("different execution environment or working directory")
+        );
+        assert!(!other.path().join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "current\n"
+        );
+    }
+    let hook = handler.pre_tool_use_payload(&call).unwrap();
+    assert!(
+        hook.tool_input["command"]
+            .as_str()
+            .unwrap()
+            .contains("+retained code")
+    );
+    assert!(
+        !hook.tool_input["command"]
+            .as_str()
+            .unwrap()
+            .contains("Retry Patch")
+    );
+    let (one, two) = tokio::join!(handler.handle(call.clone()), handler.handle(call.clone()));
+    let one = one.unwrap().code_mode_result(&call.payload);
+    let two = two.unwrap().code_mode_result(&call.payload);
+    assert_eq!(
+        [&one, &two].iter().filter(|v| v["success"] == true).count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("b.txt")).unwrap(),
+        "retained code\n"
+    );
+    assert!(
+        handler
+            .handle(call)
+            .await
+            .unwrap()
+            .log_preview()
+            .contains("already used")
+    );
+}
+
+#[tokio::test]
+async fn hook_replacement_consumes_retained_id_without_replaying_original_code() {
+    let patch = sample_patch();
+    let mut call = invocation_for_payload(ToolPayload::Custom {
+        input: patch.into(),
+    })
+    .await;
+    let environment = &call.step_context.environments.turn_environments[0];
+    let receipt = call
+        .session
+        .services
+        .retained_patches
+        .lock()
+        .unwrap()
+        .retain(
+            patch,
+            &environment.environment_id,
+            environment.cwd(),
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+    let id = receipt["patch_id"].as_str().unwrap();
+    let retry = format!("*** Begin Patch\n*** Retry Patch: {id}\n*** End Patch");
+    call.payload = ToolPayload::Custom {
+        input: retry.clone(),
+    };
+    let updated = "*** Begin Patch\n*** Add File: different.txt\n+hook contents\n*** End Patch";
+    let changed = ApplyPatchHandler::default()
+        .with_updated_hook_input(call.clone(), json!({"command": updated}))
+        .unwrap();
+    assert!(matches!(changed.payload, ToolPayload::Custom { input } if input == updated));
+    assert!(
+        call.session
+            .services
+            .retained_patches
+            .lock()
+            .unwrap()
+            .prepare(&retry)
+            .is_err()
+    );
+}
+
+#[test]
+fn retained_retry_streaming_accepts_fragmented_amendments_without_false_file_events() {
+    let retry = "*** Begin Patch\n*** Retry Patch: 01900000-0000-7000-8000-000000000001\n*** Replace Chunk: 1 2\n@@\n-old\n+new\n*** End Patch";
+    let mut consumer = ApplyPatchArgumentDiffConsumer::default();
+    for character in retry.chars() {
+        assert!(
+            consumer
+                .push_delta("retry".into(), &character.to_string())
+                .is_none()
+        );
+    }
+    assert!(consumer.finish_update_on_complete().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn registered_large_patch_keeps_native_acknowledgment_and_complete_structured_changes() {
     use crate::tools::parallel::ToolCallRuntime;
     use crate::tools::registry::ToolRegistry;
     use crate::tools::router::ToolCall;
@@ -49,8 +218,6 @@ async fn registered_large_patch_recovers_middle_changes_from_canonical_output() 
         cwd.clone(),
         None,
     )];
-    let codex_home = turn.config.codex_home.clone();
-    let thread_id = session.thread_id.to_string();
     let router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools([
             Arc::new(ApplyPatchHandler::default()) as Arc<dyn CoreToolRuntime>
@@ -70,53 +237,34 @@ async fn registered_large_patch_recovers_middle_changes_from_canonical_output() 
         patch.push_str(&format!("*** Add File: {name}\n+content\n"));
     }
     patch.push_str("*** End Patch");
-    let response = runtime
-        .handle_tool_call(
+    let result = runtime
+        .handle_tool_call_with_source(
             ToolCall {
                 tool_name: ToolName::plain("apply_patch"),
                 call_id: "large-patch".into(),
                 payload: ToolPayload::Custom { input: patch },
             },
+            crate::tools::context::ToolCallSource::Direct,
             tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
-    let ResponseInputItem::CustomToolCallOutput { output, .. } = response else {
+    let ResponseInputItem::CustomToolCallOutput { output, .. } = result.response() else {
         panic!("custom output")
     };
     assert_eq!(output.success, Some(true));
     let text = output.body.to_text().unwrap();
-    assert!(
-        !text.contains("Exit code:"),
-        "patch results must not use shell framing"
-    );
-    let projection: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-    let artifact_id = projection["artifact_id"]
-        .as_str()
-        .expect("large patch recovery artifact");
-    let (recovered, _) = read_tool_output_selectors_with_reuse(
-        &codex_home,
-        &thread_id,
-        artifact_id,
-        vec![
-            ToolOutputSelector::JsonPointer {
-                pointer: "/changes/128".into(),
-            },
-            ToolOutputSelector::JsonPointer {
-                pointer: "/success".into(),
-            },
-        ],
-    )
-    .await
-    .unwrap();
-    assert!(recovered.complete);
+    assert_eq!(text, "Success. Updated the files.");
+    let structured = result.code_mode_result();
+    assert_eq!(structured["success"], true);
+    assert_eq!(structured["changes_exact"], true);
+    assert_eq!(structured["changes"].as_array().unwrap().len(), names.len());
     assert_eq!(
-        recovered.results[0].value,
-        Some(json!({
+        structured["changes"][128],
+        json!({
             "path": cwd.join(&names[128]).unwrap().to_path_buf(), "kind": "add", "move_path": null,
-        }))
+        })
     );
-    assert_eq!(recovered.results[1].value, Some(json!(true)));
     for name in names {
         assert_eq!(
             std::fs::read_to_string(workspace.path().join(name)).unwrap(),

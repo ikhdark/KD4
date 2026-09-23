@@ -396,7 +396,7 @@ impl ExecCommandHandler {
         let repaired = preflight.repaired();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
-        let repair_notice = preflight.repair_notice;
+        let mut repair_notice = preflight.repair_notice;
         let invocation_changed = &command_invocation != original_invocation;
         if invocation_changed {
             args.replace_command_invocation(&command_invocation);
@@ -538,6 +538,10 @@ impl ExecCommandHandler {
             ..
         } = args;
 
+        let max_output_tokens = max_output_tokens.or_else(|| {
+            crate::tools::shell_output_summary::source_read_output_budget(&hook_command)
+        });
+
         let exec_permission_approvals_enabled =
             session.features().enabled(Feature::ExecPermissionApprovals);
         let requested_additional_permissions = additional_permissions.clone();
@@ -610,7 +614,32 @@ impl ExecCommandHandler {
             context.turn.network,
         );
         let input_context = format!("prefix={prefix_rule:?}");
-        let effective_environment = manager.effective_environment(&context);
+        let mut effective_environment = manager.effective_environment(&context);
+        if !environment_is_remote && let Ok(native) = cwd.to_abs_path() {
+            let snapshot = crate::workspace_transaction::validation_context(
+                &turn.config.codex_home,
+                &session.thread_id.to_string(),
+                native.as_path(),
+            )
+            .map_err(|e| {
+                FunctionCallError::RespondToModel(format!("validation snapshot: {e:#}"))
+            })?;
+            if let Some(snapshot) = snapshot {
+                crate::workspace_transaction::bind_validation_environment(
+                    &snapshot,
+                    &mut effective_environment,
+                );
+                let notice = format!(
+                    "Validation source revision: {}. Captured source: {}. Build artifacts belong only to this run. This result does not validate later task edits or the reconciled checkout.",
+                    snapshot.revision,
+                    snapshot.workdir.display()
+                );
+                repair_notice = Some(match repair_notice {
+                    Some(previous) => format!("{previous}\n{notice}"),
+                    None => notice,
+                });
+            }
+        }
         let environment_hash = validation_environment_hash(&effective_environment);
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
@@ -879,7 +908,12 @@ impl ExecCommandHandler {
                     .raw_output_artifact
                     .clone()
                     .unwrap_or_else(|| raw_output_artifact.clone());
-                response.repair_notice = repair_notice;
+                if let Some(notice) = repair_notice {
+                    response.repair_notice = Some(match response.repair_notice.take() {
+                        Some(receipt) => format!("{notice}\n{receipt}"),
+                        None => notice,
+                    });
+                }
                 if !known_delta_hit && !validation_attempt {
                     if let Some(process_id) = response.process_id {
                         session

@@ -6230,14 +6230,23 @@ async fn try_run_sampling_request(
                 }
                 if needs_follow_up && !in_flight.is_empty() && all_tool_calls_eager_read_eligible {
                     let history = sess.clone_history().await;
-                    continuation_workspace_prefetch = start_continuation_workspace_prefetch(
-                        &history,
-                        &turn_diff_tracker,
-                        Arc::clone(&sess.services.git_workspace),
-                        turn_context.config.cwd.clone(),
-                        turn_context.environments.clone(),
+                    if let Ok(cwd) = crate::workspace_transaction::evidence_cwd(
+                        &turn_context,
+                        turn_context.config.cwd.as_path(),
                     )
-                    .await;
+                    .and_then(|cwd| {
+                        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(cwd)
+                            .map_err(Into::into)
+                    }) {
+                        continuation_workspace_prefetch = start_continuation_workspace_prefetch(
+                            &history,
+                            &turn_diff_tracker,
+                            Arc::clone(&sess.services.git_workspace),
+                            cwd,
+                            turn_context.environments.clone(),
+                        )
+                        .await;
+                    }
                 }
                 break Ok(UnsettledSamplingRequestResult {
                     needs_follow_up,

@@ -1812,6 +1812,7 @@ impl Session {
                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
                 unified_exec_manager,
                 command_execution,
+                retained_patches: Default::default(),
                 plan_store: crate::plan_store::PlanStore::default(),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,

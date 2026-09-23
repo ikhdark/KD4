@@ -231,10 +231,9 @@ fn exec_command_tool_matches_expected_spec() {
         ),
         (
             "max_output_tokens".to_string(),
-            bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
-                codex_utils_output_truncation::adaptive_output_budget_description()
-            ), 0, usize::MAX as u64),
+            bounded_integer(
+                "Output token budget. Source reads and searches default to 25000 tokens; other commands use the standard output policy. Larger requests may be capped by policy. Zero returns only execution controls.".to_string(),
+                0, usize::MAX as u64),
         ),
         (
             "login".to_string(),

@@ -1033,3 +1033,47 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
         );
     }
 }
+
+#[test]
+fn rust_paths_do_not_trigger_diagnostic_projection() {
+    for source in [
+        "return Err(serde::de::Error::custom(message));",
+        "std::io::Error::new(kind, message)",
+        "tracing::Level::WARN; Diagnostic::Warning::new()",
+        "source.rs:42:    return Err(serde::de::Error::custom(message));",
+        "雪.rs:42:    module::error::Type",
+    ] {
+        assert_eq!(
+            crate::classify_diagnostic(Some("Get-Content source.rs"), source),
+            OutputDiagnosticClass::Normal,
+            "{source}"
+        );
+        let limits = resolve_output_limits(None, OutputOutcome::Success, None, source, 20_000);
+        assert_eq!(limits.applied_limit, DEFAULT_SUCCESS_OUTPUT_TOKENS);
+    }
+}
+
+#[test]
+fn actual_diagnostics_after_rust_paths_keep_diagnostic_projection() {
+    for diagnostic in [
+        "error:",
+        "warning:",
+        "C:\\repo\\source.rs:42: error: invalid type",
+        "雪.rs:42: warning: unused import",
+        "source.rs:42: error TS1234: invalid type",
+        "error MSB1234: failed build",
+        "module::Error::new()\nerror: compilation failed",
+        "module::Error::new(): error: compilation failed",
+    ] {
+        assert_eq!(
+            crate::classify_diagnostic(None, diagnostic),
+            OutputDiagnosticClass::HighSignal,
+            "{diagnostic}"
+        );
+    }
+    assert_eq!(
+        crate::classify_diagnostic(Some("cargo test"), "module::Error::new()"),
+        OutputDiagnosticClass::HighSignal,
+        "an actual validation command keeps its diagnostic budget"
+    );
+}

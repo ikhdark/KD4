@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::NestedCancellation;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::OutputLoss;
@@ -11,7 +12,6 @@ use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -22,6 +22,7 @@ struct TestHost;
 #[derive(Default)]
 struct RecordingHost {
     notified: AtomicBool,
+    completion_committed: AtomicBool,
 }
 
 impl CellHost for TestHost {
@@ -81,7 +82,9 @@ impl CellHost for RecordingHost {
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
-        cell_state.commit_completion(event, pending_initial_yield_items, || {})
+        let completion = cell_state.commit_completion(event, pending_initial_yield_items, || {});
+        self.completion_committed.store(true, Ordering::Release);
+        completion
     }
 
     async fn closed(&self, _event: Option<CellEvent>) {}
@@ -314,6 +317,245 @@ async fn state_change_observer_wakes_on_output_after_the_completion_grace() {
 }
 
 #[tokio::test]
+async fn decision_observer_buffers_output_until_success_or_failure() {
+    for error_text in [None, Some("validation failed".to_string())] {
+        let mut harness = spawn_cell_actor_harness(ObserveMode::Decision).await;
+        tokio::time::pause();
+        harness.event_tx.send(RuntimeEvent::Started).unwrap();
+        for text in ["process running", "more output"] {
+            harness
+                .event_tx
+                .send(RuntimeEvent::ContentItem {
+                    item: FunctionCallOutputContentItem::InputText {
+                        text: text.to_string(),
+                    },
+                    admitted_bytes: 0,
+                })
+                .unwrap();
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                matches!(
+                    harness.initial_event_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "buffered text must not end the owner's wait"
+            );
+        }
+        harness
+            .event_tx
+            .send(RuntimeEvent::Result {
+                stored_value_writes: HashMap::new(),
+                error_text: error_text.clone(),
+                output_loss: None,
+            })
+            .unwrap();
+        assert_eq!(
+            harness.initial_event_rx.await.unwrap(),
+            Ok(CellEvent::Completed {
+                content_items: vec![
+                    OutputItem::Text {
+                        text: "process running".to_string()
+                    },
+                    OutputItem::Text {
+                        text: "more output".to_string()
+                    },
+                ],
+                error_text,
+                output_loss: None,
+            })
+        );
+        harness.task.await.unwrap();
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
+async fn decision_observer_still_delivers_explicit_yield_and_termination() {
+    let harness = spawn_cell_actor_harness(ObserveMode::Decision).await;
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+    harness
+        .event_tx
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
+                text: "needs a decision".to_string(),
+            },
+            admitted_bytes: 0,
+        })
+        .unwrap();
+    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+    assert_eq!(
+        harness.initial_event_rx.await.unwrap(),
+        Ok(CellEvent::ExplicitYield {
+            content_items: vec![OutputItem::Text {
+                text: "needs a decision".to_string()
+            }],
+        })
+    );
+    let termination = harness.handle.terminate();
+    drop(harness.event_tx);
+    assert_eq!(
+        termination.await,
+        Ok(CellEvent::Terminated {
+            content_items: Vec::new()
+        })
+    );
+    harness.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn decision_observer_keeps_buffered_output_after_interrupted_observation() {
+    let host = Arc::new(RecordingHost::default());
+    let harness =
+        spawn_cell_actor_harness_with_host(ObserveMode::Decision, Arc::clone(&host)).await;
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+    harness
+        .event_tx
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
+                text: "before steering".to_string(),
+            },
+            admitted_bytes: 0,
+        })
+        .unwrap();
+    harness
+        .event_tx
+        .send(RuntimeEvent::Notify {
+            id: None,
+            call_id: "output-barrier".to_string(),
+            text: "progress".to_string(),
+        })
+        .unwrap();
+    wait_for_notification(&host).await;
+    // Dropping the observation is how owner-side steering releases a held
+    // wait. The cell and its buffered evidence must remain available.
+    drop(harness.initial_event_rx);
+    let resumed = harness.handle.observe(ObserveMode::Decision);
+    harness
+        .event_tx
+        .send(RuntimeEvent::Result {
+            stored_value_writes: HashMap::new(),
+            error_text: None,
+            output_loss: None,
+        })
+        .unwrap();
+    assert_eq!(
+        resumed.await,
+        Ok(CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "before steering".to_string()
+            }],
+            error_text: None,
+            output_loss: None,
+        })
+    );
+    harness.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_yield_survives_the_owner_observation_handoff() {
+    for completed in [false, true] {
+        let host = Arc::new(RecordingHost::default());
+        let harness = spawn_cell_actor_harness_with_host(
+            ObserveMode::YieldAfter(Duration::ZERO),
+            Arc::clone(&host),
+        )
+        .await;
+        harness.event_tx.send(RuntimeEvent::Started).unwrap();
+        assert_eq!(
+            harness.initial_event_rx.await.unwrap(),
+            Ok(CellEvent::Yielded {
+                content_items: Vec::new()
+            })
+        );
+        harness
+            .event_tx
+            .send(RuntimeEvent::ContentItem {
+                item: FunctionCallOutputContentItem::InputText {
+                    text: "decision evidence".to_string(),
+                },
+                admitted_bytes: 0,
+            })
+            .unwrap();
+        harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+        harness
+            .event_tx
+            .send(RuntimeEvent::ContentItem {
+                item: FunctionCallOutputContentItem::InputText {
+                    text: "after the yield".to_string(),
+                },
+                admitted_bytes: 0,
+            })
+            .unwrap();
+        harness
+            .event_tx
+            .send(RuntimeEvent::Notify {
+                id: None,
+                call_id: "yield-barrier".to_string(),
+                text: "progress".to_string(),
+            })
+            .unwrap();
+        wait_for_notification(&host).await;
+        if completed {
+            harness
+                .event_tx
+                .send(RuntimeEvent::Result {
+                    stored_value_writes: HashMap::new(),
+                    error_text: None,
+                    output_loss: None,
+                })
+                .unwrap();
+            // Exercise the completed-state path as well as the live actor:
+            // register the next observer only after completion is committed.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !host.completion_committed.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cell should commit completion before the next observation");
+        }
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                harness.handle.observe(ObserveMode::Decision)
+            )
+            .await
+            .unwrap(),
+            Ok(CellEvent::ExplicitYield {
+                content_items: vec![OutputItem::Text {
+                    text: "decision evidence".to_string()
+                }]
+            }),
+        );
+        let later_items = vec![OutputItem::Text {
+            text: "after the yield".to_string(),
+        }];
+        if completed {
+            assert_eq!(
+                harness.handle.observe(ObserveMode::Decision).await,
+                Ok(CellEvent::Completed {
+                    content_items: later_items,
+                    error_text: None,
+                    output_loss: None,
+                })
+            );
+        } else {
+            let termination = harness.handle.terminate();
+            drop(harness.event_tx);
+            assert_eq!(
+                termination.await,
+                Ok(CellEvent::Terminated {
+                    content_items: later_items
+                })
+            );
+        }
+        harness.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn state_change_observer_coalesces_output_with_imminent_completion() {
     let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange).await;
     // Native V8 startup uses wall-clock time; pause only after its async handshake.
@@ -514,7 +756,7 @@ async fn observation_dropped_before_dequeue_does_not_consume_output() {
             .handle
             .observe(ObserveMode::YieldAfter(Duration::ZERO))
             .await,
-        Ok(CellEvent::Yielded {
+        Ok(CellEvent::ExplicitYield {
             content_items: vec![OutputItem::Text {
                 text: "survives pre-dequeue cancellation".to_string(),
             }],
@@ -579,7 +821,7 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
             .handle
             .observe(ObserveMode::YieldAfter(Duration::ZERO))
             .await,
-        Ok(CellEvent::Yielded {
+        Ok(CellEvent::ExplicitYield {
             content_items: vec![OutputItem::Text {
                 text: "survives active cancellation".to_string(),
             }],

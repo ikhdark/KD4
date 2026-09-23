@@ -21,7 +21,7 @@ fn create_apply_patch_freeform_tool_matches_expected_spec() {
     );
     assert_eq!(
         tool.format.definition,
-        format!("start: begin_patch hunk+ end_patch\n{APPLY_PATCH_LARK_GRAMMAR}")
+        format!("start: begin_patch (hunk+ | retry) end_patch\n{APPLY_PATCH_LARK_GRAMMAR}")
     );
     for rule in [
         "one or many files",

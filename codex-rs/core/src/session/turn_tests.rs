@@ -1670,7 +1670,14 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
             _ => None,
         })
         .expect("the changed dependency output should remain in the projected history");
-    assert!(stale_output.contains("stale_workspace_evidence"));
+    assert_eq!(stale_output, format!("completed {}", call_ids[0]));
+    assert!(later_prepared.items().iter().any(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "developer" => {
+            let text = serde_json::to_string(content).unwrap();
+            text.contains("stale_workspace_evidence") && text.contains(call_ids[0])
+        }
+        _ => false,
+    }));
     let disjoint_output = later_prepared
         .items()
         .iter()

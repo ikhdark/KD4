@@ -41,6 +41,50 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                 panic!("nested function dispatch must preserve its payload kind");
             };
             let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+            let process_exit_code = args["process_exit_code"]
+                .as_i64()
+                .or_else(|| (args["cmd"] == "fixture-exit-101").then_some(101));
+            let process_running = args["process_running"] == true;
+            if process_exit_code.is_some() || process_running {
+                return Ok(crate::tools::context::boxed_tool_output(
+                    crate::tools::context::ExecCommandToolOutput {
+                        validation: None,
+                        event_call_id: invocation.call_id,
+                        chunk_id: "failed-process".into(),
+                        wall_time: Duration::ZERO,
+                        raw_output: b"COMPILER_DIAGNOSTIC".to_vec(),
+                        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(
+                            2000,
+                        ),
+                        max_output_tokens: None,
+                        process_id: process_running.then_some(777),
+                        session_capabilities: None,
+                        exit_code: process_exit_code.map(|code| code as i32),
+                        process_exited: !process_running,
+                        search_no_match: false,
+                        original_token_count: None,
+                        hook_command: None,
+                        raw_output_artifact: None,
+                        raw_output_reduction_notice: None,
+                        repair_notice: None,
+                        pending_deferred_completions: Vec::new(),
+                    },
+                ));
+            }
+            if args["patch_success"] == true {
+                return Ok(crate::tools::context::boxed_tool_output(
+                    crate::tools::context::ApplyPatchToolOutput {
+                        text: "Success. Updated changed.rs".to_string(),
+                        success: true,
+                        changes: vec![
+                            serde_json::json!({"path": "changed.rs", "kind": "update", "move_path": null}),
+                        ],
+                        changes_exact: true,
+                        environment_id: Some("local".to_string()),
+                        retry: None,
+                    },
+                ));
+            }
             if let Some(status) = args["terminal_status"].as_u64() {
                 return Ok(crate::tools::context::boxed_tool_output(
                     FunctionToolOutput::from_text(
@@ -54,6 +98,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
             if let Some(error) = args["error"]
                 .as_str()
                 .or_else(|| match args["cmd"].as_str() {
+                    Some("fixture-dispatch-rejected") => Some("dispatch rejected"),
                     Some("Remove-Item output.txt") => Some("write rejected"),
                     Some("git log -1") => Some("history unavailable"),
                     Some("Get-Content missing.txt") => Some("file missing"),
@@ -225,7 +270,7 @@ async fn discarded_runtime_output_remains_machine_readable_after_projection() {
         .exec("// @exec: {\"max_output_tokens\": 1}\ntext('x'.repeat(64 * 1024 * 1024 + 1));")
         .await;
     let rendered = packet_output_text(output.as_ref());
-    assert!(rendered.contains("Script completed"), "{rendered}");
+    assert!(!rendered.contains("Script completed"), "{rendered}");
     let metadata = rendered
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -260,7 +305,7 @@ async fn nested_failures_preserve_only_observed_workspace_dependencies() {
     use crate::tool_history::SourceDependencyV1;
     use std::collections::BTreeSet;
 
-    for (input, added_dependency, unscoped) in [
+    for (input, added_dependency, observes_directory) in [
         (serde_json::json!(42), None, false),
         (
             serde_json::json!({"cmd": "Remove-Item output.txt"}),
@@ -289,6 +334,7 @@ async fn nested_failures_preserve_only_observed_workspace_dependencies() {
         );
         assert!(visible.contains("READ_RESULT_42"), "{visible}");
         let expected_error = match input["cmd"].as_str() {
+            Some("fixture-dispatch-rejected") => "dispatch rejected",
             Some("Remove-Item output.txt") => "write rejected",
             Some("git log -1") => "history unavailable",
             Some("Get-Content missing.txt") => "file missing",
@@ -310,8 +356,11 @@ async fn nested_failures_preserve_only_observed_workspace_dependencies() {
                 false,
             ));
         }
-        if unscoped {
-            expected.clear();
+        if observes_directory {
+            expected.insert(SourceDependencyV1::new(
+                runtime.step.turn.config.cwd.as_path(),
+                true,
+            ));
         }
         assert_eq!(
             runtime.signals.code_mode_source_dependencies(&cell_id),
@@ -521,6 +570,142 @@ async fn small_read_results_do_not_inject_batching_instructions() {
 }
 
 #[tokio::test]
+async fn nested_process_state_remains_available_to_the_resumed_script() {
+    let runtime = PacketRuntime::with_nested_tool("write_stdin").await;
+    let initial = runtime.exec(
+        "const running = await tools.write_stdin({process_running: true}); \
+         if (running.execution_state !== 'running' || running.process_exited !== false \
+             || running.exit_code !== null || running.session_id !== 777) \
+             throw new Error('lost running state'); \
+         await yield_control(); \
+         const done = await tools.write_stdin({session_id: running.session_id, process_exit_code: 0}); \
+         if (done.execution_state !== 'exited' || !done.process_exited \
+             || done.exit_code !== 0 || !done.output_complete || done.output_reduced) \
+             throw new Error('lost terminal state'); \
+         text('observed running and terminal results in one cell');",
+    ).await;
+    assert_eq!(initial.outcome_for_logging(), ToolOutputOutcome::Yielded);
+    let completed = runtime.wait(&runtime.live_cell()).await;
+    assert_eq!(completed.outcome_for_logging(), ToolOutputOutcome::Success);
+    assert!(
+        packet_output_text(completed.as_ref())
+            .contains("observed running and terminal results in one cell")
+    );
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn nested_patch_result_remains_structured_across_explicit_yield() {
+    let runtime = PacketRuntime::with_nested_tool("apply_patch").await;
+    let initial = runtime
+        .exec(
+            "const patch = await tools.apply_patch({patch_success: true}); \
+         if (!patch.success || !patch.changes_exact || patch.changes[0].path !== 'changed.rs') \
+             throw new Error('lost patch metadata'); \
+         await yield_control(); \
+         text({file: patch.changes[0].path, environment: patch.environment_id});",
+        )
+        .await;
+    assert_eq!(initial.outcome_for_logging(), ToolOutputOutcome::Yielded);
+    let completed = runtime.wait(&runtime.live_cell()).await;
+    assert_eq!(completed.outcome_for_logging(), ToolOutputOutcome::Success);
+    let text = packet_output_text(completed.as_ref());
+    assert!(text.contains(r#""file":"changed.rs""#), "{text}");
+    assert!(text.contains(r#""environment":"local""#), "{text}");
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn command_failure_remains_inspectable_without_another_cell() {
+    for name in ["exec_command", "write_stdin"] {
+        let runtime = PacketRuntime::with_nested_tool(name).await;
+        let source = format!(
+            "const r = await tools.{name}({{cmd: 'fixture-exit-101'}}); \
+             if (r.exit_code !== 101 || !r.process_exited) throw new Error('lost exit state'); \
+             text(r.output); text(await tools.{name}({{cmd: 'fixture-read'}}));"
+        );
+        let payload = ToolPayload::Custom {
+            input: source.clone(),
+        };
+        let registration = runtime.signals.register_deterministic_tool_call(
+            &codex_tools::ToolName::plain("exec"),
+            &payload,
+            "packet-exec",
+        );
+        let output = runtime.exec(&source).await;
+        runtime.signals.record_response_result(
+            registration.ordinal,
+            output.outcome_context(),
+            output.sampling_request_signal(),
+            &output.to_response_item("packet-exec", &payload),
+            false,
+        );
+        let visible = packet_output_text(output.as_ref());
+        assert_eq!(
+            output.outcome_for_logging(),
+            ToolOutputOutcome::Success,
+            "{visible}"
+        );
+        assert!(
+            visible.contains("READ_RESULT_42"),
+            "the next tool must execute in the same cell: {visible}"
+        );
+        assert!(visible.contains("COMPILER_DIAGNOSTIC"), "{visible}");
+        assert!(
+            !visible.contains("Script error:"),
+            "a nonzero exit is not a JS exception: {visible}"
+        );
+        let control = crate::session::turn_execution::TurnExecutionControl::new();
+        let request = control.continuation_generation_request(
+            &control.baselines(0),
+            &runtime.signals,
+            &crate::session::turn_execution::SamplingRequestSettledState {
+                mutation_revision: 0,
+                tool_exposure_revision: 0,
+            },
+            false,
+        );
+        assert_eq!(
+            request.purpose,
+            Some(codex_protocol::protocol::TurnTimingGenerationPurpose::FailureDiagnosis),
+            "process failure must still reach the continuation consumer"
+        );
+        assert!(
+            request.failure_fingerprint.is_none(),
+            "a command failure must not imply that retries are forbidden"
+        );
+        runtime.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn command_failure_state_survives_explicit_yield_before_recovery() {
+    let runtime = PacketRuntime::with_nested_tool("write_stdin").await;
+    let initial = runtime.exec(
+        "const result = await tools.write_stdin({process_exit_code: 7}); await yield_control(); \
+         if (result.exit_code !== 7) throw new Error('lost failure'); text(await tools.write_stdin({}));",
+    ).await;
+    assert_eq!(initial.outcome_for_logging(), ToolOutputOutcome::Yielded);
+    let output = runtime.wait(&runtime.live_cell()).await;
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+    assert!(packet_output_text(output.as_ref()).contains("READ_RESULT_42"));
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn command_dispatch_errors_still_stop_dependent_work() {
+    let runtime = PacketRuntime::with_nested_tool("exec_command").await;
+    let output = runtime.exec(
+        "await tools.exec_command({cmd: 'fixture-dispatch-rejected'}); text(await tools.exec_command({}));",
+    ).await;
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    let visible = packet_output_text(output.as_ref());
+    assert!(visible.contains("dispatch rejected"));
+    assert!(!visible.contains("READ_RESULT_42"));
+    runtime.finish().await;
+}
+
+#[tokio::test]
 async fn real_nested_calls_keep_registration_order_across_yield_and_wait() {
     let runtime = PacketRuntime::new().await;
     let initial = runtime.exec(
@@ -717,7 +902,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
                 error_text: None,
             },
             Some(true),
-            "Script completed",
+            "",
         ),
         (
             RuntimeResponse::Result {
@@ -833,7 +1018,7 @@ fn runtime_response_sampling_identity_excludes_wall_time() {
         None,
     );
 
-    assert_ne!(recent.body, older.body);
+    assert_eq!(recent.body, older.body);
     assert_eq!(
         recent.sampling_request_signal(),
         older.sampling_request_signal(),
@@ -895,11 +1080,11 @@ fn failed_script_keeps_successful_nested_result_and_linkage_visible() {
     )
     .into_text();
 
-    assert!(output.contains("Nested tool result:"));
+    assert!(!output.contains("Nested tool result:"));
     assert!(output.contains("COMMAND_SENTINEL"));
-    assert!(output.contains("\"parent_call_id\":\"outer-exec-call\""));
-    assert!(output.contains("\"parent_cell_id\":\"cell-1\""));
-    assert!(output.contains("\"runtime_tool_call_id\":\"call-1\""));
+    assert!(!output.contains("parent_call_id"));
+    assert!(!output.contains("parent_cell_id"));
+    assert!(!output.contains("runtime_tool_call_id"));
     assert!(output.contains("Script error:\nboom at line 7"));
 }
 
@@ -1207,27 +1392,23 @@ async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_stat
     let inline = output.essential_inline["nested_commands"]
         .as_array()
         .unwrap();
-    assert_eq!(
-        inline.len(),
-        crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES
-    );
-    assert_eq!(inline[0]["session_id"], 99);
-    assert!(
-        inline
-            .iter()
-            .all(|state| state.get("raw_output_artifact_error").is_none())
-    );
+    assert_eq!(inline.len(), 101);
+    assert!(!visible.contains("DISTINCT_"));
+    assert!(visible.contains("Running command session_id: 99"));
     let canonical = output.canonical_body.as_ref().unwrap();
-    let receipts = canonical
+    let states = canonical
         .iter()
         .find_map(|item| match item {
             FunctionCallOutputContentItem::InputText { text } => {
-                text.strip_prefix("Nested command states (independent of script completion):\n")
+                serde_json::from_str::<serde_json::Value>(text)
+                    .ok()?
+                    .get("nested_commands")
+                    .cloned()
             }
             _ => None,
         })
         .unwrap();
-    let states: Vec<serde_json::Value> = serde_json::from_str(receipts).unwrap();
+    let states = states.as_array().unwrap();
     assert_eq!(states.len(), 101);
     let polled = states
         .iter()

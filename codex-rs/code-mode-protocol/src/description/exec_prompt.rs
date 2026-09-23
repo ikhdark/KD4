@@ -6,25 +6,26 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
 - `text(...)` emits values; on failure/no output, the host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions. Emit needed results explicitly.
 - Reuse current schemas and results; resolve missing/stale schemas before calls.
-- Nested tools: use a present schema; else `resolve_tool(name)` when the name is known, or inspect `ALL_TOOL_NAMES`. Never scan/filter/stringify/print `ALL_TOOLS`.
+- Nested tools: use a present schema; otherwise filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally by name or description and use `resolve_tool(name)` to obtain a missing schema. Search only if local discovery fails.
 - Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results.
-- Choose tools whose scope, evidence, and cost fit the task. Process returned results in JavaScript rather than spawning subprocesses to re-filter them.
+- Choose tools whose scope, evidence, and cost fit the task. Process returned results in JavaScript.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
-- Cells yield on `yield_control()`, input, or their initial 10s budget. Keep already-planned calls and long commands in the same awaited evaluation; yield explicitly only for a new model decision or dependency resolution.
+- `text(...)` buffers output while awaited work continues in the same awaited evaluation; `yield_control()` is only for a new model decision. Input and host deadlines can yield.
 - An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
 - Empty `write_stdin` polls: use default waits; avoid one-second loops.
 - Parallelize only when tools permit and build locks, outputs, and services are independent. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
-- Output defaults to the 10000-token hard cap. Set the smallest useful budget with first-line `// @exec: {"max_output_tokens": 2000}`. This limits model-visible output separately from nested tools' output budgets. Select relevant results before emitting them; use retained-artifact selectors after truncation.
+- Output defaults to the 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command reads default to 25000 tokens; the cell budget is separate. Read whole useful regions; use retained-artifact selectors after truncation.
+- Continue independent work in the same cell; `notify(...)` reports progress.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
 - `notify(value): Promise<void>` queues a model-visible message without yielding.
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
-const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` owns its initial 10s completion budget and internally drains ordinary empty observations. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()` or input interruption; a completed cell never needs `wait`.
+const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awaited continuation runs. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()`, input interruption, or bounded host wait; a completed cell never needs `wait`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `max_tokens` limits how much new output this wait call returns. Model projections default to the 10000-token hard cap; an explicit request can select a smaller budget.
 - `terminate: true` stops the running cell; false or omitted waits for output.
-- `wait` is host-held until meaningful new output, an explicit yield, input activity, or the final completion or termination result for that cell.
+- `wait` buffers output until an explicit yield, input activity, the host's bounded wait, or the final completion or termination result for that cell.
 - New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
 - If the cell has already finished, `wait` returns the completed result and closes the cell."#;
 
@@ -93,7 +94,7 @@ mod tests {
                     assert_eq!(directives.len(), 1);
                     let source = format!("{}\ntext('budget applied');", directives[0]);
                     let parsed = parse_exec_source(&source).unwrap();
-                    assert_eq!(parsed.max_output_tokens, Some(2000));
+                    assert_eq!(parsed.max_output_tokens, Some(10000));
                     assert_eq!(parsed.code, "text('budget applied');");
                     assert!(description.contains(
                         "override it with the documented `{ timeout_ms }` option when needed."
@@ -128,14 +129,14 @@ mod tests {
                     "Await `Promise.allSettled`",
                     "for independent known calls in the same exec and inspect every result.",
                     "Do not split a known independent batch into one-call execs.",
-                    "Keep already-planned calls and long commands in the same awaited evaluation;",
-                    "yield explicitly only for a new model decision or dependency resolution.",
+                    "buffers output while awaited work continues in the same awaited evaluation;",
+                    "`yield_control()` is only for a new model decision.",
                     "still await the batch. At evaluation end, unawaited work is discarded.",
                     "Parallelize only when tools permit and build locks, outputs, and services are independent.",
                     "Reuse current schemas and results;",
                     "A resolved `exec_command` call may still return a running command session.",
                     "continue that session within the current evaluation.",
-                    "separately from nested tools' output budgets.",
+                    "the cell budget is separate.",
                     "host-configured default deadline",
                     "Expiry cancels the nested call and may return only an error, without a live handle.",
                     "Resume only an actually returned live session/cell ID;",

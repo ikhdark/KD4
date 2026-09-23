@@ -5,6 +5,7 @@ use tracing::debug;
 /// Authoritative registration for models that use the fork's local prompt policy.
 pub(crate) const LOCAL_PROMPT_POLICY_SLUGS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",

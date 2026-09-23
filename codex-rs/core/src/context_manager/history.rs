@@ -76,6 +76,7 @@ enum PreparedPromptItemsSource {
         prefix: PreparedPromptItems,
         suffix: Arc<[ResponseItem]>,
     },
+    #[cfg(test)]
     Prefix {
         source: PreparedPromptItems,
     },
@@ -124,6 +125,7 @@ impl PreparedPromptItems {
         }))
     }
 
+    #[cfg(test)]
     fn truncated(&self, len: usize) -> Self {
         let len = len.min(self.0.len);
         if len == self.0.len {
@@ -193,6 +195,7 @@ impl PreparedPromptItems {
                     remaining = remaining.min(prefix.0.len);
                     current = prefix.clone();
                 }
+                #[cfg(test)]
                 PreparedPromptItemsSource::Prefix { source } => {
                     remaining = remaining.min(source.0.len);
                     current = source.clone();
@@ -202,6 +205,7 @@ impl PreparedPromptItems {
         chunks.extend(reversed.into_iter().rev());
     }
 
+    #[cfg(test)]
     fn get(&self, index: usize) -> Option<&ResponseItem> {
         if index >= self.0.len {
             return None;
@@ -220,6 +224,7 @@ impl PreparedPromptItems {
                         return suffix.get(index - prefix.0.len);
                     }
                 }
+                #[cfg(test)]
                 PreparedPromptItemsSource::Prefix { source } => current = source,
             }
         }
@@ -261,17 +266,7 @@ impl CompactedPromptProjections {
                 continue;
             }
 
-            let mut prefix = projection.clone();
-            if let Some(last @ ResponseItem::ToolSearchOutput { tools, .. }) =
-                projection.get(projection.0.len.saturating_sub(1))
-                && !tools.is_empty()
-            {
-                let compacted_last = compact_tool_search_output(last);
-                prefix = projection
-                    .truncated(projection.0.len - 1)
-                    .appended(vec![compacted_last].into());
-            }
-            advanced.push(prefix.appended(Arc::clone(&compacted_suffix)));
+            advanced.push(projection.appended(Arc::clone(&compacted_suffix)));
         }
 
         Self(
@@ -399,80 +394,9 @@ impl PreparedPromptInput {
 pub(crate) fn compact_acknowledged_tool_search_outputs(
     input: Arc<[ResponseItem]>,
 ) -> Arc<[ResponseItem]> {
-    let last_index = input.len().saturating_sub(1);
-    if !input.iter().take(last_index).any(
-        |item| matches!(item, ResponseItem::ToolSearchOutput { tools, .. } if !tools.is_empty()),
-    ) {
-        return input;
-    }
-
+    // Search schemas are part of the cached conversation prefix. Keep their
+    // original bytes after acknowledgement, just like every other result.
     input
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            if index < last_index {
-                compact_tool_search_output(item)
-            } else {
-                item.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .into()
-}
-
-fn compact_tool_search_output(item: &ResponseItem) -> ResponseItem {
-    if let ResponseItem::ToolSearchOutput {
-        id,
-        call_id,
-        status,
-        execution,
-        tools,
-        omitted_result_count,
-        internal_chat_message_metadata_passthrough,
-    } = item
-    {
-        return ResponseItem::ToolSearchOutput {
-            id: id.clone(),
-            call_id: call_id.clone(),
-            status: status.clone(),
-            execution: execution.clone(),
-            tools: tools
-                .iter()
-                .map(compact_tool_search_tool_identity)
-                .collect(),
-            omitted_result_count: *omitted_result_count,
-            internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
-                .clone(),
-        };
-    }
-    item.clone()
-}
-
-fn compact_tool_search_tool_identity(tool: &serde_json::Value) -> serde_json::Value {
-    let Some(object) = tool.as_object() else {
-        return tool.clone();
-    };
-    let Some(name) = object.get("name") else {
-        return tool.clone();
-    };
-
-    let mut identity = serde_json::Map::new();
-    if let Some(kind) = object.get("type") {
-        identity.insert("type".to_string(), kind.clone());
-    }
-    identity.insert("name".to_string(), name.clone());
-    if let Some(tools) = object.get("tools").and_then(serde_json::Value::as_array) {
-        identity.insert(
-            "tools".to_string(),
-            serde_json::Value::Array(
-                tools
-                    .iter()
-                    .map(compact_tool_search_tool_identity)
-                    .collect(),
-            ),
-        );
-    }
-    serde_json::Value::Object(identity)
 }
 
 #[derive(Clone, Debug)]
@@ -567,7 +491,7 @@ pub(crate) struct ContextManager {
     prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
     /// The tool-history projection sent by the latest sampling request of the
     /// current turn. Continuation requests extend it so their input keeps the
-    /// previous request as an exact prefix; a new user turn, compaction,
+    /// previous request as an exact prefix; compaction,
     /// rollback, or replaced tool-history state starts over. Shared like the
     /// prepared cache so a prompt prepared from a snapshot publishes it back.
     sampling_projection_anchor: Arc<StdMutex<Option<SamplingProjectionAnchor>>>,
@@ -590,6 +514,12 @@ pub(crate) struct ContextManager {
 }
 
 impl ContextManager {
+    pub(crate) fn phase_checkpoint_receipts(
+        &self,
+        call_ids: &[String],
+    ) -> Result<serde_json::Value, String> {
+        self.tool_history.phase_checkpoint_receipts(call_ids)
+    }
     pub(crate) fn new() -> Self {
         Self {
             items: Arc::new(Vec::new()),
@@ -633,7 +563,8 @@ impl ContextManager {
             .configured_model_visible_tool_result_token_budget()
             != budget
         {
-            Arc::make_mut(&mut self.tool_history).set_model_visible_tool_result_token_budget(budget);
+            Arc::make_mut(&mut self.tool_history)
+                .set_model_visible_tool_result_token_budget(budget);
         }
     }
 
@@ -736,11 +667,8 @@ impl ContextManager {
         if appended.is_empty() {
             return;
         }
-        // A new user turn re-budgets consumed results once, at its first
-        // request; everything after that extends what was sent.
-        if appended.iter().any(is_user_turn_boundary) {
-            self.clear_sampling_projection_anchor();
-        }
+        // User messages extend the same provider prefix. Only destructive
+        // history changes (compaction, rollback, replacement) reset the anchor.
         // Clones may prepare the same snapshot together, but a divergent append
         // must not reuse another branch's positional estimates or consume its cache.
         if Arc::strong_count(&self.prepared_history) > 1 {
@@ -857,11 +785,16 @@ impl ContextManager {
         if let Some(metrics) = codex_otel::global() {
             let _ = metrics.counter("codex.history.prepared_cache", 1, &[("result", "miss")]);
         }
-        evict_resolved_reasoning(Arc::make_mut(&mut self.items));
+        if stable_context_target != StableContextTarget::Sampling {
+            evict_resolved_reasoning(Arc::make_mut(&mut self.items));
+            project_update_plan_history(Arc::make_mut(&mut self.items));
+        }
         self.normalize_history(input_modalities);
-        project_update_plan_history(Arc::make_mut(&mut self.items));
         let normalized_items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
-        let projection = project_stable_context(normalized_items, stable_context_target);
+        // Keep context updates at their original positions. Hoisting the latest
+        // value into an earlier message invalidates the cached session prefix.
+        let projection = project_stable_context(normalized_items, StableContextTarget::FailOpen);
+        debug_assert_eq!(projection.items, projection.fallback_items);
         let items = projection.items;
         let prompt_provenance =
             PromptProvenanceSidecar::from_assembled_items(&items, &projection.manifest);
@@ -869,11 +802,7 @@ impl ContextManager {
             PreparedHistoryFingerprint::new(&items, &projection.manifest, policy).ok();
         let projected_items = items;
         let items = PreparedPromptItems::from_shared(Arc::clone(&projected_items));
-        let fallback_items = if Arc::ptr_eq(&projected_items, &projection.fallback_items) {
-            items.clone()
-        } else {
-            PreparedPromptItems::from_shared(projection.fallback_items)
-        };
+        let fallback_items = items.clone();
         let prepared = PreparedPromptInput {
             unreplaced_items: items.clone(),
             unreplaced_fallback_items: fallback_items.clone(),
@@ -919,6 +848,7 @@ impl ContextManager {
             target,
             workspace_identity,
             Some(git_workspace),
+            true,
         )
     }
 
@@ -935,26 +865,13 @@ impl ContextManager {
         git_workspace: &crate::git_workspace::GitWorkspaceCache,
     ) -> PreparedPromptInput {
         debug_assert_eq!(target, StableContextTarget::Sampling);
-        let tool_history = Arc::clone(&self.tool_history);
-        let prepared = self.prepare_for_prompt_target(input_modalities, target);
-        let items = prepared.shared_items();
-        let fallback_items = prepared.shared_fallback_items();
-        let shares_input = Arc::ptr_eq(&items, &fallback_items);
-        let projection = tool_history.project_workspace_freshness_with_cache(
-            items,
+        self.prepare_for_prompt_with_completed_tool_projection_target(
+            input_modalities,
+            target,
             workspace_identity,
-            git_workspace,
-        );
-        let fallback_projection = if shares_input {
-            projection.clone()
-        } else {
-            tool_history.project_workspace_freshness_with_cache(
-                fallback_items,
-                workspace_identity,
-                git_workspace,
-            )
-        };
-        apply_tool_history_projection(prepared, projection, fallback_projection)
+            Some(git_workspace),
+            false,
+        )
     }
 
     /// Compaction also benefits from settled, exactly recoverable tool receipts.
@@ -969,6 +886,7 @@ impl ContextManager {
             StableContextTarget::FailOpen,
             workspace_identity,
             None,
+            true,
         )
         .shared_items()
     }
@@ -979,6 +897,7 @@ impl ContextManager {
         target: StableContextTarget,
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: Option<&crate::git_workspace::GitWorkspaceCache>,
+        completed_tool_projection: bool,
     ) -> PreparedPromptInput {
         let tool_history = Arc::clone(&self.tool_history);
         // Only sampling requests anchor: compaction prompts and generic
@@ -1018,10 +937,22 @@ impl ContextManager {
                 return apply_tool_history_projection(prepared, projection.clone(), projection);
             }
         }
-        let project = |items| match git_workspace {
-            Some(cache) => {
-                tool_history.project_with_workspace_cache(items, workspace_identity, cache)
+        let project = |items: Arc<[ResponseItem]>| match git_workspace {
+            Some(cache)
+                if completed_tool_projection || ToolHistoryState::has_phase_checkpoint(&items) =>
+            {
+                tool_history.project_sampling_with_workspace_cache(items, workspace_identity, cache)
             }
+            Some(cache) => tool_history.project_workspace_freshness_with_cache(
+                items,
+                workspace_identity,
+                cache,
+            ),
+            None if target == StableContextTarget::Sampling => ToolHistoryProjection {
+                items: Arc::clone(&items),
+                unreplaced_items: items,
+                ..Default::default()
+            },
             None => tool_history.project_with_workspace_identity(items, workspace_identity),
         };
         let projection = project(Arc::clone(&items));
@@ -1138,29 +1069,50 @@ impl ContextManager {
         )
     }
 
-    /// Estimates the prompt after tool-result receipts and the aggregate output
-    /// budget are applied. Compaction pressure compared the raw canonical
-    /// history against the limit, which compacted a 93k-token prompt whose raw
-    /// tool outputs alone exceeded the limit and discarded the task.
+    /// Estimate the sampling history actually sent, including appended notices.
+    /// A hypothetical receipt projection would hide genuine context pressure.
     fn estimate_projected_prompt_token_count(
         &self,
         input_modalities: &[InputModality],
         base_instructions: &BaseInstructions,
         pending_user_boundary: bool,
     ) -> Option<i64> {
-        let tool_history = Arc::clone(&self.tool_history);
         let prepared = self
             .clone()
             .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
         let prepared_items = prepared.shared_items();
-        let projected = tool_history.project(Arc::clone(&prepared_items));
+        let projected = self.sampling_items_for_estimate(Arc::clone(&prepared_items));
         self.estimate_projected_items_token_count(
             &prepared_items,
-            &projected.items,
+            &projected,
             base_instructions,
             pending_user_boundary,
             Some(prepared.policy),
         )
+    }
+
+    fn sampling_items_for_estimate(&self, items: Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
+        let anchor = self
+            .sampling_projection_anchor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(anchor) = anchor
+            .as_ref()
+            .filter(|anchor| items.starts_with(&anchor.prepared_items))
+        else {
+            return items;
+        };
+        let tail = &items[anchor.prepared_items.len()..];
+        if tail.is_empty() {
+            return Arc::clone(&anchor.projection.items);
+        }
+        anchor
+            .projection
+            .items
+            .iter()
+            .chain(tail)
+            .cloned()
+            .collect()
     }
 
     /// Sums the projected prompt from the per-position cache of its source
@@ -1504,13 +1456,13 @@ impl ContextManager {
             );
         if local_tail_contains_instruction_boundary {
             // Server usage is stale across an instruction boundary, so estimate
-            // the whole prompt; receipts and the output budget still apply.
+            // the whole history that sampling will actually send.
             let raw_items: Arc<[ResponseItem]> = Arc::from(self.raw_items());
-            let projected = self.tool_history.project(Arc::clone(&raw_items));
+            let projected = self.sampling_items_for_estimate(Arc::clone(&raw_items));
             return self
                 .estimate_projected_items_token_count(
                     &raw_items,
-                    &projected.items,
+                    &projected,
                     base_instructions,
                     /*pending_user_boundary*/ false,
                     /*policy*/ None,
@@ -1560,6 +1512,24 @@ impl ContextManager {
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
+        if let Some(call_id) = crate::tool_history::item_call_id(item)
+            && matches!(
+                item,
+                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+            )
+            && self.items.iter().rev().any(|prior| match prior {
+                ResponseItem::FunctionCall {
+                    call_id: id, name, ..
+                }
+                | ResponseItem::CustomToolCall {
+                    call_id: id, name, ..
+                } => id == call_id && matches!(name.as_str(), "exec" | "wait"),
+                _ => false,
+            })
+        {
+            // The cell owner has already enforced its tokenizer-based budget.
+            return item.clone();
+        }
         match item {
             ResponseItem::FunctionCallOutput {
                 id,

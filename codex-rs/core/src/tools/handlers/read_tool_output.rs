@@ -5,6 +5,9 @@ use crate::tools::command_output_artifact::ReadToolOutputResult;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorResult;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
+use crate::tools::command_output_artifact::ToolOutputSnapshot;
+use crate::tools::command_output_artifact::load_tool_output_snapshot;
+#[cfg(test)]
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
 #[cfg(test)]
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
@@ -910,6 +913,16 @@ pub(crate) async fn execute_recovery_transaction_with_continuations(
     } else {
         RECOVERY_AGGREGATE_TOKEN_CEILING
     };
+    let snapshot = load_tool_output_snapshot(codex_home, thread_id, artifact_id).await?;
+    drain_recovery_snapshot(&snapshot, selectors, token_ceiling, cancellation_token).await
+}
+
+async fn drain_recovery_snapshot(
+    snapshot: &std::sync::Arc<ToolOutputSnapshot>,
+    selectors: Vec<ToolOutputSelector>,
+    token_ceiling: usize,
+    cancellation_token: &CancellationToken,
+) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
     // Reserve stop metadata, including caller-supplied selectors. Byte continuations
     // fit within the fixed allowance; arbitrary error text is checked at finalization.
     let reserve = selectors
@@ -919,15 +932,12 @@ pub(crate) async fn execute_recovery_transaction_with_continuations(
         .max()
         .unwrap_or_default()
         .saturating_add(256);
-    let (output, reused) = read_tool_output_selectors_with_ceiling_and_reuse(
-        codex_home,
-        thread_id,
-        artifact_id,
-        selectors,
-        token_ceiling.saturating_sub(reserve),
-    )
-    .await?;
-    let mut state = RecoveryContinuationState::new(output, reused, token_ceiling);
+    let output = snapshot
+        .select(selectors, token_ceiling.saturating_sub(reserve))
+        .await?;
+    // Loading this transaction did perform an artifact read. Following its
+    // pages reuses that same identity-checked observation, without more I/O.
+    let mut state = RecoveryContinuationState::new(output, false, token_ceiling);
     loop {
         let (result_index, selector) = match state.next_step() {
             ContinuationStep::Complete => break,
@@ -953,14 +963,10 @@ pub(crate) async fn execute_recovery_transaction_with_continuations(
                 state.record_stop(ContinuationStopReason::Budget, Some(selector));
                 break;
             }
-            read_tool_output_selectors_with_ceiling_and_reuse(
-                codex_home,
-                thread_id,
-                artifact_id,
-                vec![selector.clone()],
-                ceiling,
-            )
-            .await
+            snapshot
+                .select(vec![selector.clone()], ceiling)
+                .await
+                .map(|page| (page, true))
         };
         if cancellation_token.is_cancelled() {
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
@@ -1125,6 +1131,154 @@ fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallErr
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[serial_test::serial(command_output_artifact)]
+    async fn recovery_pages_use_one_validated_snapshot_without_reopening_the_artifact() {
+        use crate::tools::command_output_artifact::create_canonical_output_artifact;
+
+        let home = tempfile::tempdir().unwrap();
+        let text = "recovery evidence\n".repeat(8_000);
+        let canonical = CanonicalToolResult::text(&text);
+        let artifact = create_canonical_output_artifact(home.path(), "snapshot", &canonical).await;
+        let id = artifact.artifact_id().unwrap();
+        let snapshot = load_tool_output_snapshot(home.path(), "snapshot", &id)
+            .await
+            .unwrap();
+        let path = home
+            .path()
+            .join("tool-output/snapshot")
+            .join(format!("{id}.log"));
+        std::fs::remove_file(&path).unwrap();
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let stopped = drain_recovery_snapshot(
+            &snapshot,
+            vec![ToolOutputSelector::Bytes {
+                start: 0,
+                end: text.len() as u64,
+            }],
+            CODE_MODE_RECOVERY_TOKEN_CEILING,
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped.drained_continuation_pages, 0);
+        assert!(!stopped.output.complete);
+        assert_eq!(
+            stopped.continuation_stop.unwrap().reason,
+            ContinuationStopReason::Cancelled,
+        );
+
+        // Removing the backing file makes any hidden reopen fail. The production
+        // continuation loop must still deliver authenticated pages from its
+        // initial observation, and stop at the normal output ceiling.
+        let recovered = drain_recovery_snapshot(
+            &snapshot,
+            vec![ToolOutputSelector::Bytes {
+                start: 0,
+                end: text.len() as u64,
+            }],
+            CODE_MODE_RECOVERY_TOKEN_CEILING,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(recovered.drained_continuation_pages > 0);
+        assert!(
+            !recovered.reused,
+            "the initial disk read must remain accounted for"
+        );
+        assert!(!recovered.output.complete);
+        assert_eq!(recovered.output.canonical_sha256, canonical.sha256);
+        assert_eq!(
+            recovered.continuation_stop.as_ref().unwrap().reason,
+            ContinuationStopReason::Budget
+        );
+        let pages = recovered
+            .output
+            .results
+            .iter()
+            .filter(|part| part.text.is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            !pages.is_empty(),
+            "recovery must return useful evidence, not just an overflow descriptor"
+        );
+        for page in pages {
+            let range = page.canonical_range.unwrap();
+            assert_eq!(
+                page.text.as_deref().unwrap(),
+                &text[range.start as usize..range.end as usize]
+            );
+        }
+
+        // Reuse is scoped to this observation, never a cache that masks expiry
+        // on the next invocation. Required disk validation still takes place.
+        assert!(matches!(
+            execute_recovery_transaction_with_continuations(
+                home.path(),
+                "snapshot",
+                &id,
+                vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
+                true,
+                &CancellationToken::new(),
+            )
+            .await,
+            Err(ReadToolOutputError::Expired),
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(command_output_artifact)]
+    async fn new_recovery_transaction_revalidates_same_length_modified_bytes() {
+        use crate::tools::command_output_artifact::create_canonical_output_artifact;
+
+        let home = tempfile::tempdir().unwrap();
+        let canonical = CanonicalToolResult::text("original evidence\n");
+        let artifact = create_canonical_output_artifact(home.path(), "snapshot", &canonical).await;
+        let id = artifact.artifact_id().unwrap();
+        let selectors = vec![ToolOutputSelector::Lines { start: 1, end: 1 }];
+        let first = execute_recovery_transaction_with_continuations(
+            home.path(),
+            "snapshot",
+            &id,
+            selectors.clone(),
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(first.output.complete);
+        assert_eq!(
+            first.output.results[0].text.as_deref(),
+            Some("original evidence\n")
+        );
+
+        std::fs::write(
+            home.path()
+                .join("tool-output/snapshot")
+                .join(format!("{id}.log")),
+            "modified evidence\n",
+        )
+        .unwrap();
+        let error = execute_recovery_transaction_with_continuations(
+            home.path(),
+            "snapshot",
+            &id,
+            selectors,
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("new calls must authenticate disk contents again");
+        assert_eq!(
+            error,
+            ReadToolOutputError::Io("artifact SHA identity does not match metadata".to_string())
+        );
+    }
+
     use super::*;
     use crate::tools::command_output_artifact::ByteSubdivisionPlan;
 

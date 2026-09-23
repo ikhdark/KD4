@@ -332,9 +332,9 @@ mod tests {
         );
         assert!(description.contains("Stable built-in tool contracts may be included below"));
         assert!(description.contains("external and omitted contracts remain lazy"));
-        assert!(description.contains("`resolve_tool(name)` when the name is known"));
-        assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
-        assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
+        assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
+        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(description.contains("Search only if local discovery fails"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
         assert!(description.contains(
             "When `tool_search` is advertised, use it to activate tools that are not yet listed."
@@ -383,9 +383,9 @@ mod tests {
         assert!(description.contains("Reuse current schemas and results"));
         assert!(description.contains("resolve missing/stale schemas before calls"));
         assert!(description.contains("Nested tools: use a present schema"));
-        assert!(description.contains("`resolve_tool(name)` when the name is known"));
-        assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
-        assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
+        assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
+        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
         assert!(!description.contains("do not substitute a search or second shell"));
         assert!(description.contains("host-configured default deadline"));
         assert!(description.contains(
@@ -401,7 +401,7 @@ mod tests {
             description
                 .contains("Sequence dependent calls only after checking prerequisite results")
         );
-        assert!(description.contains("initial 10s budget"));
+        assert!(description.contains("buffers output while awaited work continues"));
         assert!(description.contains("same awaited evaluation"));
         assert!(description.contains("only for a new model decision"));
         assert!(description.contains(
@@ -420,8 +420,8 @@ mod tests {
             "Output defaults to the {}-token hard cap",
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
-        assert!(description.contains("smallest useful budget"));
-        assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 2000}`"#));
+        assert!(description.contains("the cell budget is separate"));
+        assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 10000}`"#));
         assert!(description.contains("queues a model-visible message without yielding"));
         // Retired guidance that pushed the model into wait rounds or extra
         // sampling passes must stay out of the contract.
@@ -478,9 +478,9 @@ mod tests {
         let description = build_exec_tool_description(false, true, &[]);
 
         assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("`resolve_tool(name)` when the name is known"));
-        assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
-        assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
+        assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
+        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
         assert!(!description.contains("Nested tool schemas are discovered lazily at runtime"));
     }
@@ -736,7 +736,7 @@ mod tests {
             parse_exec_source(&format!("{directive}\ntext('hi')"))
                 .unwrap()
                 .max_output_tokens,
-            Some(2000)
+            Some(10000)
         );
     }
 

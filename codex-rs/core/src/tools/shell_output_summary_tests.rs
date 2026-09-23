@@ -43,8 +43,12 @@ fn a_successful_flat_list_is_truncated_rather_than_summarized() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let summary =
-        summarize_shell_output_for_model(&output, 0, false, options(Some("git status --short"), None));
+    let summary = summarize_shell_output_for_model(
+        &output,
+        0,
+        false,
+        options(Some("git status --short"), None),
+    );
 
     assert_eq!(
         summary, None,
@@ -262,12 +266,15 @@ fn oversized_warning_line(total_bytes: usize) -> String {
 fn oversized_first_line_reserves_room_for_the_tail() {
     let mut lines = vec![String::new(); 700];
     lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES);
+    // Exercise the byte ceiling independently of a tighter caller token limit.
     let probe =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000))).unwrap();
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+            .unwrap();
     let prefix_bytes = probe.find("    1: ").unwrap() + "    1: ".len();
     lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes);
     let summary =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000))).unwrap();
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+            .unwrap();
     assert!(summary.ends_with("[summary capped]"), "{summary}");
     assert!(summary.contains("- emitted_source_lines: 88\n"));
     // A final empty line is not a source line according to str::lines().
@@ -286,7 +293,8 @@ fn summary_reports_gap_sizes_and_source_line_counts() {
     // while giving a successful run something to rank.
     lines[0] = "warning: line 0".to_string();
     let output = lines.join("\n");
-    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, Some(1_000))).unwrap();
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(None, Some(1_000))).unwrap();
     assert!(summary.contains("... [612 lines omitted]"));
     assert!(summary.contains("- emitted_source_lines: 88\n"));
     assert!(summary.ends_with("- omitted_source_lines: 612"));
@@ -297,8 +305,10 @@ fn summary_reports_gap_sizes_and_source_line_counts() {
 fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
     let mut lines = vec!["ordinary".to_string(); 700];
     lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES);
-    let probe = summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000)))
-        .expect("large output summary");
+    // Exercise the byte ceiling independently of a tighter caller token limit.
+    let probe =
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+            .expect("large output summary");
     let prefix_bytes = probe.find("    1: ").expect("first source line") + "    1: ".len();
     let following_head_bytes = (SUCCESS_HEAD_LINES - 1) * "\n    2: ordinary".len();
     let gap_bytes = "\n... [612 lines omitted]".len();
@@ -307,7 +317,7 @@ fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
     );
 
     let summary =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, Some(4_000)))
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
             .expect("large output summary");
     let (body, _) = summary
         .split_once("\n- emitted_source_lines:")
@@ -786,12 +796,68 @@ fn oversized_single_line_retains_bounded_head_and_tail() {
         "x".repeat(DEFAULT_SUMMARY_AFTER_BYTES + 1024)
     );
 
-    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, Some(4_000))).unwrap();
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(None, Some(4_000))).unwrap();
 
     assert!(summary.contains("HEAD"));
     assert!(summary.contains("TAIL"));
     assert!(summary.contains("[line truncated]"));
     assert!(summary.len() <= SUMMARY_MAX_BYTES + "\n[summary capped]".len());
+}
+
+#[test]
+fn caller_budget_preserves_each_selected_failure_without_retruncation() {
+    let mut lines = vec!["ordinary context".to_string(); 900];
+    for (index, name) in [
+        (100, "FIRST_FAILURE"),
+        (350, "MIDDLE_FAILURE"),
+        (600, "LAST_FAILURE"),
+    ] {
+        lines[index] = format!(
+            "error: {name} {}",
+            "{{\"detail\":\"verbose assertion\"}}".repeat(3000)
+        );
+        lines[index + 1] = format!("  --> src/{name}.rs:7:3");
+    }
+    lines[899] = "test result: FAILED. 12 passed; 3 failed".into();
+    let raw = lines.join("\n");
+    for limit in [2000, 4000] {
+        let summary = summarize_shell_output_for_model(
+            &raw,
+            101,
+            false,
+            options(Some("cargo test"), Some(limit)),
+        )
+        .unwrap();
+        assert!(
+            codex_utils_string::approx_token_count(&summary) <= limit,
+            "summary must fit before downstream projection"
+        );
+        let projected = crate::tools::project_exec_output_for_model_with_budget(
+            &codex_protocol::exec_output::ExecToolCallOutput {
+                exit_code: 101,
+                aggregated_output: codex_protocol::exec_output::StreamOutput::new(raw.clone()),
+                ..Default::default()
+            },
+            codex_utils_output_truncation::TruncationPolicy::Tokens(limit),
+            Some(limit),
+            Some("cargo test"),
+        );
+        for expected in [
+            "FIRST_FAILURE",
+            "MIDDLE_FAILURE",
+            "LAST_FAILURE",
+            "test result: FAILED. 12 passed; 3 failed",
+        ] {
+            assert!(
+                projected.text.contains(expected),
+                "missing {expected}: {}",
+                projected.text
+            );
+        }
+        assert!(!projected.text.contains("tokens truncated"));
+        assert!(projected.reduced);
+    }
 }
 
 #[test]
@@ -835,4 +901,27 @@ fn summary_declines_output_that_would_grow() {
         summarize_shell_output_for_model(&output, 0, false, options(None, None)),
         None
     );
+}
+
+#[test]
+fn source_reads_get_room_without_expanding_noisy_command_defaults() {
+    for command in [
+        "cat src/lib.rs",
+        "rg -n pattern src",
+        "Get-Content src/lib.rs | Select-Object -First 500",
+    ] {
+        assert_eq!(
+            super::source_read_output_budget(command),
+            Some(25_000),
+            "{command}"
+        );
+    }
+    for command in [
+        "cargo test",
+        "npm run build",
+        "echo huge-output",
+        "cat file; cargo test",
+    ] {
+        assert_eq!(super::source_read_output_budget(command), None, "{command}");
+    }
 }

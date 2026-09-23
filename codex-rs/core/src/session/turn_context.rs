@@ -80,6 +80,7 @@ pub(crate) struct DeferredToolActivation {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DeferredToolActivationState {
+    pub(crate) model_visible_schemas: Option<Arc<crate::client_common::ToolSchemaArtifact>>,
     revision: u64,
     capability_revisions: Arc<HashMap<codex_tools::ToolName, String>>,
     activations: HashMap<codex_tools::ToolName, DeferredToolActivation>,

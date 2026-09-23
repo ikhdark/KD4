@@ -1,6 +1,5 @@
 /// Attempt to find the sequence of `pattern` lines within `lines` beginning at or after `start`.
-/// Returns the unique starting index or `None` if not found. Ambiguity at the
-/// first matching tier is an error; a weaker tier must not resolve it. Matches use
+/// Returns the first starting index or `None` if not found. Matches use
 /// decreasing strictness: exact match, then ignoring trailing whitespace, then ignoring leading
 /// and trailing whitespace, then normalizing Unicode punctuation and whitespace.
 /// When `eof` is true, the match must end at end-of-file
@@ -81,7 +80,6 @@ pub(crate) fn seek_sequence(
                 .map(|line| normalise(line).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         });
-        let mut found = None;
         for index in search_start..=last_start {
             if lines[index..index + pattern.len()]
                 .iter()
@@ -97,18 +95,8 @@ pub(crate) fn seek_sequence(
                     },
                 })
             {
-                if let Some(first) = found {
-                    return Err(AmbiguousMatch {
-                        first_line: first + 1,
-                        second_line: index + 1,
-                        strictness,
-                    });
-                }
-                found = Some(index);
+                return Ok(Some(index));
             }
-        }
-        if found.is_some() {
-            return Ok(found);
         }
     }
 

@@ -62,6 +62,9 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     }
 
     let argv1 = args.next().unwrap_or_default();
+    if argv1 == codex_workspace_tools::WORKER_ARG {
+        codex_workspace_tools::main();
+    }
     if argv1 == CODEX_FS_HELPER_ARG1 {
         codex_exec_server::run_fs_helper_main();
     }

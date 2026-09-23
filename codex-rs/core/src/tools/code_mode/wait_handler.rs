@@ -33,7 +33,7 @@ use super::handle_runtime_response;
 use super::wait_spec::create_wait_tool;
 
 const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
-// A held wait that sees no output, yield, or completion for this long returns
+// A held wait that sees no explicit yield or completion for this long returns
 // control to the model as a live-cell yield instead of blocking silently. The
 // cell keeps running; nothing is terminated. A one-hour bound left a recorded
 // full-suite run invisible for ten minutes until the user aborted it.
@@ -138,15 +138,15 @@ impl CodeModeWaitHandler {
                         .input_queue
                         .subscribe_activity(turn_state.as_deref(), false)
                         .await;
-                    // Periodic empty observations are host-owned and do not
-                    // wake the model. The runtime wakes this owner on output,
-                    // explicit `yield_control()`, or terminal completion.
+                    // Buffered output is not a new model decision. The script
+                    // owns its awaited continuation until explicit yield or
+                    // completion; input and the idle bound remain steerable.
                     let held = hold_until_state_change(
                         || {
                             exec.session
                                 .services
                                 .code_mode_service
-                                .wait_for_state_change(cell_id.clone())
+                                .wait_for_decision(cell_id.clone())
                         },
                         &cancellation_token,
                         activity_rx,
@@ -402,7 +402,7 @@ pub(super) fn idle_timeout_response(
         cell_id: cell_id.clone(),
         content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText {
             text: format!(
-                "No output or state change from this cell for {}s. The cell and any command \
+                "No explicit yield or completion from this cell for {}s. Output remains buffered. The cell and any command \
                  sessions it started are still running; nothing was terminated. Call wait again \
                  to keep waiting, or inspect its logs or processes first. Do not restart the work.",
                 OWNER_HELD_WAIT_TIMEOUT.as_secs()
@@ -944,7 +944,7 @@ mod tests {
             hold_until_state_change(
                 move || {
                     let service = Arc::clone(&wait_service);
-                    async move { service.wait_for_state_change(wait_cell_id).await }
+                    async move { service.wait_for_decision(wait_cell_id).await }
                 },
                 &cancellation,
                 activity_rx,

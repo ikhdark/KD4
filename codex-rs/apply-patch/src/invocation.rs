@@ -265,6 +265,7 @@ async fn try_verify_apply_patch_args(
     }
 
     validate_mutation_endpoints(&hunks, &effective_cwd, fs, sandbox).await?;
+    crate::preflight_hunks(&hunks, &effective_cwd, fs, sandbox).await?;
 
     let mut changes = HashMap::new();
     for (hunk_index, hunk) in hunks.into_iter().enumerate() {
@@ -802,7 +803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verification_rejects_ambiguous_update_before_any_writes() {
+    async fn test_verification_accepts_first_exact_match_without_writing() {
         let tmp = tempdir().unwrap();
         let cwd = PathUri::from_host_native_path(tmp.path()).unwrap();
         let original = "old\nold\n";
@@ -815,25 +816,7 @@ mod tests {
             None,
         )
         .await;
-        let MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::PatchContextMismatch(
-            mismatch,
-        )) = result
-        else {
-            panic!("{result:?}")
-        };
-        assert_eq!(
-            mismatch.kind,
-            crate::PatchContextMismatchKind::AmbiguousMatch
-        );
-        assert_eq!((mismatch.hunk_ordinal, mismatch.chunk_ordinal), (2, 1));
-        assert_eq!(mismatch.current_line_start, 1);
-        assert!(mismatch.current_excerpt.contains("old"));
-        let message = mismatch.message;
-        assert!(
-            message.contains("Ambiguous exact match at lines 1 and 2"),
-            "{message}"
-        );
-        assert!(message.contains("add more context"), "{message}");
+        assert!(matches!(result, MaybeApplyPatchVerified::Body(_)), "{result:?}");
         assert_eq!(
             fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
             original

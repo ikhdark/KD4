@@ -523,6 +523,13 @@ pub trait ToolOutput: Send {
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         response_input_to_code_mode_result(self.to_response_item("", payload))
     }
+
+    /// Whether a Failure/TimedOut result rejects the JavaScript promise.
+    /// A process exit status is returned data, even when it records failure;
+    /// logging and continuation classification must still see that failure.
+    fn code_mode_failure_is_error(&self) -> bool {
+        true
+    }
 }
 
 impl<T> ToolOutput for Box<T>
@@ -605,6 +612,10 @@ where
 
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         (**self).code_mode_result(payload)
+    }
+
+    fn code_mode_failure_is_error(&self) -> bool {
+        (**self).code_mode_failure_is_error()
     }
 }
 

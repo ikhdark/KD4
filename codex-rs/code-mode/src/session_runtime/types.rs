@@ -33,6 +33,9 @@ pub(crate) enum ObserveMode {
     /// Wake on model-visible output or terminal completion without periodic
     /// empty observations.
     StateChange,
+    /// Buffer output while the script owns its continuation. Explicit yields
+    /// and terminal outcomes still release the observer.
+    Decision,
 }
 
 /// An observable cell lifecycle event.

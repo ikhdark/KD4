@@ -1021,11 +1021,17 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
                 .body
                 .to_text()
                 .expect("exec output should serialize as text");
-            assert!(text.starts_with("Process"), "{text}");
-            assert!(text.contains("\n[...]\n"), "{text}");
+            let packet: JsonValue = serde_json::from_str(&text).unwrap();
+            assert_eq!(packet["exit_code"], 0);
+            assert!(
+                packet["output"].as_str().unwrap().contains("\n[...]\n"),
+                "{text}"
+            );
             assert!(!text.contains("Chunk ID:"));
             assert!(!text.contains("Original token count:"));
-            assert!(codex_utils_string::approx_token_count(&text) <= 20);
+            assert!(
+                codex_utils_string::approx_token_count(packet["output"].as_str().unwrap()) <= 20
+            );
             assert_ne!(
                 text,
                 String::from_utf8(vec![b'x'; 400]).expect("UTF-8 fixture")
@@ -1233,11 +1239,7 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
         arguments: "{}".to_string(),
     });
     assert_eq!(code_mode["process_exited"], json!(true));
-    assert!(
-        output
-            .response_text()
-            .contains("Process exited with code 7")
-    );
+    assert!(output.response_text().contains("\"exit_code\":7"));
     assert!(!output.response_text().contains("Process running"));
 }
 
@@ -1275,7 +1277,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         vec![
             ToolOutputProjectionFragment::new(
                 ToolOutputProjectionFragmentKind::ProcessFinalStatus,
-                "process final status: exit_code=None, session_id=Some(42), wall_time_seconds=0.0010",
+                "process final status: exit_code=None, session_id=Some(42)",
             )
             .with_id("process_status"),
             ToolOutputProjectionFragment::new(
@@ -1317,7 +1319,12 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
     let raw_output = String::from_utf8_lossy(&output.raw_output);
     let projected = output.projected_model_output(raw_output.as_ref());
     assert!(projected.reduced);
-    assert_eq!(projected.text.matches('…').count(), 1);
+    assert_eq!(
+        projected.text.matches("[...]").count(),
+        1,
+        "{}",
+        projected.text
+    );
     assert!(!projected.text.contains("tokens truncated"));
 }
 
@@ -1468,7 +1475,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
     }
     .response_text();
 
-    assert!(response.contains("Process running with session ID 42"));
+    assert!(response.contains("\"session_id\":42"));
     assert!(!response.contains("Process exited with code"));
     assert!(!response.contains("exit_code: 0"));
     assert!(!response.contains("timed_out: true"));
@@ -1498,7 +1505,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         wall_time: std::time::Duration::from_millis(25),
         raw_output: raw_output.as_bytes().to_vec(),
         truncation_policy: TruncationPolicy::Tokens(10_000),
-        max_output_tokens: None,
+        max_output_tokens: Some(10_000),
         process_id: None,
         session_capabilities: None,
         exit_code: Some(1),
@@ -1623,7 +1630,7 @@ async fn artifact_backed_exec_output(
 #[tokio::test]
 async fn exec_model_output_exposes_artifact_id_not_path() {
     let (output, artifact_id, artifact_path, _retained_root) =
-        artifact_backed_exec_output(b"complete output\n", Some(1_000)).await;
+        artifact_backed_exec_output(b"complete output requiring reduction\n", Some(2)).await;
 
     let response = output.response_text();
 
@@ -1703,32 +1710,17 @@ async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
 
     let response = output.response_text();
 
-    assert!(
-        response
-            .contains("[command output reduced; read a bounded selection from the retained output")
-    );
-    assert!(response.contains(&format!("\"artifact_id\":\"{artifact_id}\"")));
-    assert!(response.contains(&format!(
-        "\"selectors\":[{{\"kind\":\"bytes\",\"start\":0,\"end\":{}}}]",
-        raw_output.len()
-    )));
-    assert!(response.contains("Selection completeness does not mean full artifact delivery."));
-    assert!(response.contains("do not rerun the producer.]"));
+    let packet: JsonValue = serde_json::from_str(&response).unwrap();
+    assert_eq!(packet["artifact_id"], artifact_id.to_string());
     assert_eq!(response.matches(&artifact_id.to_string()).count(), 1);
-    assert!(codex_utils_string::approx_token_count(&response) <= 200);
-    assert!(!response.contains("artifact above"));
+    assert!(codex_utils_string::approx_token_count(packet["output"].as_str().unwrap()) <= 200);
+    assert!(!response.contains("selectors"));
     let code_mode = output.code_mode_result(&ToolPayload::Function {
-        arguments: "{}".to_string(),
+        arguments: "{}".into(),
     });
-    assert!(
-        code_mode["output"]
-            .as_str()
-            .expect("code-mode output")
-            .contains("[command output reduced; read a bounded selection from the retained output")
-    );
     assert_eq!(code_mode["raw_output_artifact_id"], artifact_id.to_string());
     assert!(
-        code_mode["output"]
+        !code_mode["output"]
             .as_str()
             .unwrap()
             .contains(&artifact_id.to_string())
@@ -1772,18 +1764,10 @@ async fn audit_tiny_recovery_budget_preserves_process_state() {
     output.process_id = Some(42);
     output.process_exited = false;
     output.exit_code = None;
-    assert!(
-        output
-            .response_text()
-            .contains("Process running with session ID 42")
-    );
+    assert!(output.response_text().contains("\"session_id\":42"));
     output.process_exited = true;
     output.exit_code = Some(7);
-    assert!(
-        output
-            .response_text()
-            .contains("Process exited with code 7")
-    );
+    assert!(output.response_text().contains("\"exit_code\":7"));
     output.exit_code = None;
     assert!(
         output

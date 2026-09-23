@@ -328,6 +328,54 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
 }
 
 #[tokio::test]
+async fn semantic_context_requires_local_worker_and_command_runtime() {
+    let plan = probe(|turn| {
+        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+        Arc::make_mut(&mut turn.config).codex_self_exe =
+            Some(turn.config.cwd.join("codex.exe").to_path_buf());
+    })
+    .await;
+    plan.assert_visible_contains(&[
+        "semantic_context",
+        "workspace_validation",
+        "exec_command",
+        "context_checkpoint",
+    ]);
+    plan.assert_registered_contains(&[
+        "semantic_context",
+        "workspace_validation",
+        "exec_command",
+        "context_checkpoint",
+    ]);
+    assert_eq!(
+        plan.authorization_class("semantic_context"),
+        TypedToolClass::Shell
+    );
+    assert_eq!(
+        plan.authorization_class("workspace_validation"),
+        TypedToolClass::Shell
+    );
+    assert_eq!(
+        plan.authorization_class("context_checkpoint"),
+        TypedToolClass::OwnTask
+    );
+    for missing in ["executable", "runtime", "environment"] {
+        let plan = probe(|turn| {
+            set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+            Arc::make_mut(&mut turn.config).codex_self_exe =
+                Some(turn.config.cwd.join("codex.exe").to_path_buf());
+            match missing {
+                "executable" => Arc::make_mut(&mut turn.config).codex_self_exe = None,
+                "runtime" => set_feature(turn, Feature::ShellTool, false),
+                _ => turn.environments.turn_environments.clear(),
+            }
+        })
+        .await;
+        plan.assert_registered_lacks(&["semantic_context", "workspace_validation"]);
+    }
+}
+
+#[tokio::test]
 async fn read_file_is_visible_and_registered_for_text_models() {
     let plan = probe(|turn| turn.model_info.input_modalities = vec![InputModality::Text]).await;
     plan.assert_visible_contains(&["read_file", "list_files"]);
