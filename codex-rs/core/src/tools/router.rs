@@ -595,7 +595,6 @@ impl ToolRouter {
                 call.tool_name.name.as_str(),
                 "read_file"
                     | "list_files"
-                    | "semantic_context"
                     | "exec_command"
                     | "shell_command"
                     | "apply_patch"

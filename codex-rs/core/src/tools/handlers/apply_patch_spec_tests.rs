@@ -37,6 +37,8 @@ fn create_apply_patch_freeform_tool_matches_expected_spec() {
         assert!(tool.description.contains(rule), "missing rule: {rule}");
     }
     assert!(!tool.description.contains("Environment ID"));
+    assert!(tool.description.contains("A current read_file source hash"));
+    assert!(!tool.description.contains("semantic_context"));
     assert_eq!(tool.format.r#type, "grammar");
     assert_eq!(tool.format.syntax, "lark");
     assert_eq!(

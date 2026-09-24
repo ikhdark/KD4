@@ -2066,7 +2066,6 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
  "codex-windows-sandbox",
- "codex-workspace-tools",
  "dotenvy",
  "pretty_assertions",
  "tempfile",
@@ -4238,13 +4237,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "fs2",
- "proc-macro2",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "syn 2.0.119",
  "tempfile",
- "url",
 ]
 
 [[package]]

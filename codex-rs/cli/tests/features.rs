@@ -12,6 +12,22 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
 }
 
 #[test]
+fn removed_workspace_worker_flag_is_rejected() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    for operation in ["semantic_context", "workspace_validation"] {
+        codex_command(codex_home.path())?
+            .args(["--codex-workspace-worker", operation, "{}"])
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(contains("unexpected argument '--codex-workspace-worker'"));
+    }
+    assert!(!codex_home.path().join("semantic-context").exists());
+    assert!(!codex_home.path().join("validation-cache").exists());
+    Ok(())
+}
+
+#[test]
 fn strict_config_rejects_unknown_config_override() -> Result<()> {
     let codex_home = TempDir::new()?;
 

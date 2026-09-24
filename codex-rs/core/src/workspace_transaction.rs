@@ -602,7 +602,6 @@ pub(crate) fn route_call(
         name,
         "read_file"
             | "list_files"
-            | "semantic_context"
             | "exec_command"
             | "shell_command"
             | "apply_patch"
@@ -619,20 +618,15 @@ pub(crate) fn route_call(
                 value.get("environment_id").is_none_or(|v| v.is_null()),
                 "isolated workspaces use the primary local environment; omit environment_id"
             );
-            if matches!(name, "read_file" | "list_files" | "semantic_context") {
-                let field = if name == "semantic_context" {
-                    "repository"
-                } else {
-                    "path"
-                };
+            if matches!(name, "read_file" | "list_files") {
                 let path = value
-                    .get(field)
+                    .get("path")
                     .and_then(|v| v.as_str())
                     .context("missing read path")?;
                 if path.starts_with("skill:") {
                     return Ok(());
                 }
-                value[field] = serde_json::json!(map_path(&transaction, cwd, path)?);
+                value["path"] = serde_json::json!(map_path(&transaction, cwd, path)?);
             } else {
                 let workdir = value.get("workdir").and_then(|v| v.as_str()).unwrap_or(".");
                 let mapped = map_path(&transaction, cwd, workdir)?;
