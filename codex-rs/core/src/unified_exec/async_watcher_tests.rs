@@ -744,6 +744,7 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cach
             Some(started),
             None,
             Some(deferred.clone()),
+            None,
         );
         process.signal_exit_for_test(Some(0));
         // Let the real watcher observe exit; retain the output-drain barrier so an

@@ -232,18 +232,48 @@ async fn project_idempotency_keys_replay_and_survive_deletion() -> anyhow::Resul
 async fn project_import_rejects_unknown_thread_without_partial_project() -> anyhow::Result<()> {
     let home = unique_temp_dir();
     let runtime = StateRuntime::init(home.clone(), "test-provider".to_string()).await?;
+    let mut thread_ids = Vec::new();
+    for index in 0..128 {
+        let thread_id = ThreadId::default();
+        let metadata = ThreadMetadataBuilder::new(
+            thread_id,
+            home.join(format!("thread-{index}.jsonl")),
+            chrono::Utc::now(),
+            SessionSource::Cli,
+        )
+        .build("test-provider");
+        runtime.upsert_thread(&metadata).await?;
+        thread_ids.push(thread_id.to_string());
+    }
+    let previous_project = runtime
+        .create_project(
+            "Previous".to_string(),
+            Vec::new(),
+            BTreeMap::new(),
+            &thread_ids[..64],
+            "state:previous-project",
+        )
+        .await?
+        .project;
+    let missing_thread_id = "00000000-0000-0000-0000-000000000123";
+    thread_ids.push(missing_thread_id.to_string());
     let error = runtime
         .create_project(
             "Work".to_string(),
-            Vec::new(),
+            vec![ProjectRoot {
+                path: home.display().to_string(),
+            }],
             BTreeMap::new(),
-            &["00000000-0000-0000-0000-000000000123".to_string()],
+            &thread_ids,
             "state:unknown-thread",
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("thread not found"));
-    assert!(
+    assert_eq!(
+        error.to_string(),
+        format!("thread not found: {missing_thread_id}")
+    );
+    assert_eq!(
         runtime
             .list_projects(
                 /*cursor*/ None,
@@ -252,9 +282,54 @@ async fn project_import_rejects_unknown_thread_without_partial_project() -> anyh
                 SortDirection::Asc
             )
             .await?
-            .projects
-            .is_empty()
+            .projects,
+        vec![previous_project.clone()]
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_roots")
+            .fetch_one(runtime.pool.as_ref())
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_idempotency_keys WHERE key = ?")
+            .bind("state:unknown-thread")
+            .fetch_one(runtime.pool.as_ref())
+            .await?,
+        0
+    );
+    thread_ids.pop();
+    for (index, thread_id) in thread_ids.iter().enumerate() {
+        let expected_project_id = (index < 64).then(|| previous_project.id.clone());
+        assert_eq!(
+            runtime
+                .get_thread(ThreadId::from_string(thread_id)?)
+                .await?
+                .expect("imported thread must still exist")
+                .project_id,
+            expected_project_id
+        );
+    }
+    let imported = runtime
+        .create_project(
+            "Work".to_string(),
+            Vec::new(),
+            BTreeMap::new(),
+            &thread_ids,
+            "state:unknown-thread",
+        )
+        .await?;
+    assert!(imported.created);
+    for thread_id in thread_ids {
+        assert_eq!(
+            runtime
+                .get_thread(ThreadId::from_string(&thread_id)?)
+                .await?
+                .expect("imported thread must still exist")
+                .project_id,
+            Some(imported.project.id.clone())
+        );
+    }
     Ok(())
 }
 

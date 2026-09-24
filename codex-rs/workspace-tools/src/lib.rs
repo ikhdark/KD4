@@ -1,7 +1,6 @@
 //! Sandboxed workers for isolated implementation and compiler-resolved context.
 //! These run through the ordinary command runtime, never in the host tool router.
 pub mod diagnostics;
-mod migration;
 pub mod semantic;
 pub mod source_units;
 pub mod validation;

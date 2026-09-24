@@ -6,6 +6,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -31,11 +32,63 @@ pub(crate) struct ReconcileResult {
     /// A merge receipt is not validation evidence for the combined source.
     pub(crate) validation_required: bool,
     pub(crate) conflicts: Vec<String>,
+    pub(crate) conflict_directory: Option<PathBuf>,
+    pub(crate) conflict_revisions: BTreeMap<String, String>,
     pub(crate) changed_paths: Vec<String>,
 }
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+/// The single line-ending style of text, or `None` for mixed, newline-free,
+/// or binary contents.
+fn line_ending(bytes: &[u8]) -> Option<LineEnding> {
+    if bytes.contains(&0) {
+        return None;
+    }
+    let mut style = None;
+    for (index, _) in bytes.iter().enumerate().filter(|(_, byte)| **byte == b'\n') {
+        let current = if index > 0 && bytes[index - 1] == b'\r' {
+            LineEnding::CrLf
+        } else {
+            LineEnding::Lf
+        };
+        match style {
+            None => style = Some(current),
+            Some(previous) if previous != current => return None,
+            Some(_) => {}
+        }
+    }
+    style
+}
+
+/// Returns the task bytes to merge. A wholesale line-ending conversion, such as
+/// a formatter rewriting a CRLF file as LF, changes every line and would
+/// conflict with any concurrent edit, so the task content is merged in the
+/// style base and current still share.
+fn merge_line_endings<'a>(base: &[u8], current: &[u8], task: &'a [u8]) -> Cow<'a, [u8]> {
+    let (Some(shared), Some(task_style)) = (line_ending(base), line_ending(task)) else {
+        return Cow::Borrowed(task);
+    };
+    if line_ending(current) != Some(shared) || task_style == shared {
+        return Cow::Borrowed(task);
+    }
+    let mut converted = Vec::with_capacity(task.len() + task.len() / 32);
+    for (index, byte) in task.iter().enumerate() {
+        match (shared, *byte) {
+            (LineEnding::CrLf, b'\n') => converted.extend_from_slice(b"\r\n"),
+            (LineEnding::Lf, b'\r') if task.get(index + 1) == Some(&b'\n') => {}
+            (_, byte) => converted.push(byte),
+        }
+    }
+    Cow::Owned(converted)
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<Output> {
@@ -49,6 +102,12 @@ fn git(root: &Path, args: &[&str]) -> Result<Output> {
             "core.fsmonitor=false",
             "-c",
             "core.autocrlf=false",
+            // Attribute-driven EOL warnings, one per CRLF file, otherwise bury
+            // the actual failure in the stderr that errors report.
+            "-c",
+            "core.safecrlf=false",
+            "-c",
+            "core.longpaths=true",
         ])
         .args(args);
     command
@@ -318,7 +377,11 @@ pub(crate) fn validation_snapshot(home: &Path, thread: &str) -> Result<Workspace
     Ok(snapshot)
 }
 
-pub(crate) fn reconcile(home: &Path, thread: &str) -> Result<ReconcileResult> {
+pub(crate) fn reconcile(
+    home: &Path,
+    thread: &str,
+    resolutions: &BTreeMap<String, String>,
+) -> Result<ReconcileResult> {
     let mut transaction = load(home, thread)?.context("no task workspace to reconcile")?;
     let _lock = lock(home, &transaction.origin)?;
     ensure!(!transaction.reconciled, "transaction already reconciled");
@@ -329,10 +392,17 @@ pub(crate) fn reconcile(home: &Path, thread: &str) -> Result<ReconcileResult> {
         .chain(current.keys())
         .cloned()
         .collect();
+    ensure!(
+        resolutions.keys().all(|name| names.contains(name)),
+        "resolution path is not a task source path"
+    );
     let mut conflicts = Vec::new();
+    let mut conflict_revisions = BTreeMap::new();
+    let conflict_root = state_dir(home, thread)?.join("conflicts");
+    let mut conflict_directory = None;
     let mut changes = Vec::new();
     for name in names {
-        if transaction.files.get(&name) == current.get(&name) {
+        if transaction.files.get(&name) == current.get(&name) && !resolutions.contains_key(&name) {
             continue;
         }
         let base = bytes(&transaction.base, &name)?;
@@ -342,20 +412,40 @@ pub(crate) fn reconcile(home: &Path, thread: &str) -> Result<ReconcileResult> {
         );
         let ours = bytes(&transaction.workdir, &name)?;
         let theirs = bytes(&transaction.origin, &name)?;
+        let current_revision = theirs
+            .as_deref()
+            .map(digest)
+            .unwrap_or_else(|| "absent".to_string());
+        if let Some(expected) = resolutions.get(&name) {
+            ensure!(
+                expected == &current_revision,
+                "resolution is stale; current source changed: {name}"
+            );
+            // The caller has combined the retained inputs in the task file.
+            // Final destination and task checks still guard publication below.
+            if ours != theirs {
+                changes.push((name, theirs, ours));
+            }
+            continue;
+        }
         if ours == theirs {
             continue;
         }
-        let merged = if theirs == base {
-            Some(ours)
-        } else if base.is_some() && ours.is_some() && theirs.is_some() {
+        if theirs == base {
+            changes.push((name, theirs, ours));
+            continue;
+        }
+        let merged = if let (Some(base), Some(ours), Some(theirs)) = (&base, &ours, &theirs) {
+            let ours = merge_line_endings(base, theirs, ours);
             // Merge exactly the bytes whose identities were checked, not files
             // another process can rewrite while Git is reading them.
             let inputs = tempfile::tempdir()?;
-            for (label, contents) in [("base", &base), ("ours", &ours), ("theirs", &theirs)] {
-                fs::write(
-                    inputs.path().join(label),
-                    contents.as_deref().unwrap_or_default(),
-                )?;
+            for (label, contents) in [
+                ("base", base.as_slice()),
+                ("ours", ours.as_ref()),
+                ("theirs", theirs.as_slice()),
+            ] {
+                fs::write(inputs.path().join(label), contents)?;
             }
             let mut command = Command::new("git");
             command
@@ -374,8 +464,22 @@ pub(crate) fn reconcile(home: &Path, thread: &str) -> Result<ReconcileResult> {
             None
         };
         if let Some(merged) = merged {
-            changes.push((name, theirs, merged));
+            // A task change that was only a line-ending conversion leaves the
+            // current file as the merge result; publishing it would be a no-op.
+            if merged != theirs {
+                changes.push((name, theirs, merged));
+            }
         } else {
+            let directory = conflict_directory
+                .get_or_insert_with(|| conflict_root.join(uuid::Uuid::new_v4().to_string()));
+            for (label, contents) in [("base", &base), ("task", &ours), ("current", &theirs)] {
+                let path = safe_path(&directory.join(label), &name)?;
+                fs::create_dir_all(path.parent().context("conflict parent")?)?;
+                if let Some(contents) = contents {
+                    fs::write(path, contents)?;
+                }
+            }
+            conflict_revisions.insert(name.clone(), current_revision);
             conflicts.push(name);
         }
     }
@@ -384,6 +488,8 @@ pub(crate) fn reconcile(home: &Path, thread: &str) -> Result<ReconcileResult> {
             merged: false,
             validation_required: false,
             conflicts,
+            conflict_directory,
+            conflict_revisions,
             changed_paths: Vec::new(),
         });
     }
@@ -435,6 +541,8 @@ pub(crate) fn reconcile(home: &Path, thread: &str) -> Result<ReconcileResult> {
         merged: true,
         validation_required: true,
         conflicts,
+        conflict_directory,
+        conflict_revisions,
         changed_paths,
     })
 }
@@ -595,7 +703,6 @@ pub(crate) fn route_call(
                     );
                     let snapshot = validation_snapshot(home, thread)?;
                     value["workdir"] = serde_json::json!(snapshot.workdir.join(tail));
-                    value["force_fresh"] = serde_json::json!(true);
                 } else {
                     value["workdir"] = serde_json::json!(mapped);
                 }
@@ -685,6 +792,49 @@ pub(crate) fn bind_validation_environment(
         "CODEX_VALIDATION_SOURCE_REVISION".into(),
         snapshot.revision.clone(),
     );
+}
+
+/// A warm build-output lane leased for one validation process.
+pub(crate) struct ValidationLane {
+    root: PathBuf,
+    _lease: fs::File,
+}
+
+impl ValidationLane {
+    /// Replaces the snapshot's own output directories with the lane's.
+    pub(crate) fn bind(&self, env: &mut std::collections::HashMap<String, String>) {
+        let target = self.root.join("target").to_string_lossy().into_owned();
+        env.insert(
+            "CARGO_BUILD_BUILD_DIR".into(),
+            self.root.join("build").to_string_lossy().into_owned(),
+        );
+        env.insert("CODEX_CARGO_LANE_TARGET_DIR".into(), target.clone());
+        env.insert("CARGO_TARGET_DIR".into(), target);
+    }
+}
+
+/// Leases an idle build lane shared by every validation snapshot of the task's
+/// checkout, so each build reuses compiled dependencies instead of starting
+/// cold. Returns `None` when every lane is busy; the snapshot then keeps its
+/// own output directory. The lease must outlive the process that builds.
+pub(crate) fn lease_validation_lane(
+    home: &Path,
+    thread: &str,
+    snapshot: &WorkspaceTransaction,
+) -> Result<Option<ValidationLane>> {
+    let transaction = load(home, thread)?.context("validation snapshot has no task transaction")?;
+    let base = home.join("validation-cache").join(format!(
+        "exec-{}",
+        digest(transaction.origin.to_string_lossy().as_bytes())
+    ));
+    let Some((root, lease, _)) = codex_workspace_tools::validation::try_acquire_lane(&base)? else {
+        return Ok(None);
+    };
+    codex_workspace_tools::validation::refresh_snapshot_mtimes(&snapshot.workdir)?;
+    Ok(Some(ValidationLane {
+        root,
+        _lease: lease,
+    }))
 }
 
 pub(crate) fn verify_validation_snapshot(snapshot: &WorkspaceTransaction) -> Result<()> {

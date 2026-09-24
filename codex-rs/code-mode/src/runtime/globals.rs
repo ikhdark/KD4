@@ -25,6 +25,14 @@ use super::value::throw_type_error;
 const EXEC_COMMAND_ALIASES: &[&str] = &["exec", "exec_command", "execTool", "shell"];
 const EXEC_COMMAND_GLOBAL_NAME: &str = "exec_command";
 const CONSOLE_METHODS: &[&str] = &["log", "info", "warn", "error", "debug"];
+/// `name` and `message` are non-enumerable, so `text(...)` and `JSON.stringify`
+/// would render every error, including a rejected nested tool call's reason,
+/// as `{}`. Own enumerable fields still follow the standard spread.
+const ERROR_TO_JSON_SOURCE: &str = r#"Object.defineProperty(Error.prototype, "toJSON", {
+  value: function toJSON() { return { name: this.name, message: this.message, ...this }; },
+  writable: true,
+  configurable: true,
+});"#;
 
 pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
     let global = scope.get_current_context().global(scope);
@@ -32,6 +40,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     delete_global(scope, global, "Atomics")?;
     delete_global(scope, global, "SharedArrayBuffer")?;
     delete_global(scope, global, "WebAssembly")?;
+    install_error_serialization(scope)?;
 
     let enabled_tools = scope
         .get_slot::<RuntimeState>()
@@ -69,6 +78,15 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     install_tool_aliases(scope, global, &enabled_tools)?;
     install_console_shim(scope, global)?;
     Ok(())
+}
+
+fn install_error_serialization(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    let source = v8::String::new(scope, ERROR_TO_JSON_SOURCE)
+        .ok_or_else(|| "failed to allocate error serialization source".to_string())?;
+    v8::Script::compile(scope, source, None)
+        .and_then(|script| script.run(scope))
+        .map(|_| ())
+        .ok_or_else(|| "failed to install error serialization".to_string())
 }
 
 fn install_tool_aliases<'s>(

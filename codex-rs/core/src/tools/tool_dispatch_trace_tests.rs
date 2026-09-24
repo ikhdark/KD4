@@ -127,6 +127,39 @@ fn process_wait_records_timeout_wake_and_reentry() {
     );
 }
 
+#[test]
+fn repeated_wakes_toward_one_deadline_fold_into_one_counted_record() {
+    let timing = ToolDispatchTiming::new(tokio::time::Instant::now(), false);
+    let wait = |requested_timeout_ms, deadline_at_ms, wake_reason| ToolLifecycleTimerWait {
+        wait_kind: "owner_output_wait".to_string(),
+        requested_timeout_ms: Some(requested_timeout_ms),
+        effective_timeout_ms: Some(requested_timeout_ms),
+        deadline_at_ms: Some(deadline_at_ms),
+        wake_reason,
+        sequence: 0,
+    };
+    for remaining in (1_000..2_000).rev() {
+        timing.record_timer_wait(wait(remaining, 48_252, ToolLifecycleWakeReason::Completed));
+    }
+    timing.record_timer_wait(wait(1, 48_252, ToolLifecycleWakeReason::Timeout));
+    timing.record_timer_wait(wait(500, 49_000, ToolLifecycleWakeReason::Timeout));
+
+    let waits = timing.snapshot(tokio::time::Instant::now()).timer_waits;
+    assert_eq!(
+        waits
+            .iter()
+            .map(|wait| (wait.requested_timeout_ms, wait.wake_reason, wait.sequence))
+            .collect::<Vec<_>>(),
+        vec![
+            // The first wake keeps its full requested timeout; the sequence
+            // advances past all 1,000 wakes it now covers.
+            (Some(1_999), ToolLifecycleWakeReason::Completed, 1_000),
+            (Some(1), ToolLifecycleWakeReason::Timeout, 1_001),
+            (Some(500), ToolLifecycleWakeReason::Timeout, 1_002),
+        ]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boundaries() {
     let accepted_at = tokio::time::Instant::now();

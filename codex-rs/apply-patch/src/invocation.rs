@@ -803,7 +803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verification_accepts_first_exact_match_without_writing() {
+    async fn test_verification_rejects_ambiguous_update_before_any_writes() {
         let tmp = tempdir().unwrap();
         let cwd = PathUri::from_host_native_path(tmp.path()).unwrap();
         let original = "old\nold\n";
@@ -816,7 +816,21 @@ mod tests {
             None,
         )
         .await;
-        assert!(matches!(result, MaybeApplyPatchVerified::Body(_)), "{result:?}");
+        let MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::PatchContextMismatch(
+            mismatch,
+        )) = result
+        else {
+            panic!("{result:?}")
+        };
+        assert_eq!(mismatch.kind, crate::PatchContextMismatchKind::AmbiguousMatch);
+        assert_eq!((mismatch.hunk_ordinal, mismatch.chunk_ordinal), (2, 1));
+        assert!(
+            mismatch
+                .message
+                .contains("Ambiguous exact match at lines 1 and 2"),
+            "{}",
+            mismatch.message
+        );
         assert_eq!(
             fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
             original

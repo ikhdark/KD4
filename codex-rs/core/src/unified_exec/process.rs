@@ -262,6 +262,17 @@ impl UnifiedExecProcess {
         }
     }
 
+    /// Keeps `guard` until the process exits, or until this handle is dropped
+    /// without an observed exit. An exited process can stay registered until
+    /// its output is read, so its drop is too late to release shared resources.
+    pub(super) fn hold_until_exit<T: Send + 'static>(&self, guard: T) {
+        let mut state = self.state_rx.clone();
+        tokio::spawn(async move {
+            let _ = state.wait_for(|state| state.has_exited).await;
+            drop(guard);
+        });
+    }
+
     pub(super) async fn workspace_snapshot_receipt(&self, exited: bool) -> Option<String> {
         let snapshot = self.workspace_snapshot.get()?;
         let integrity = if exited {

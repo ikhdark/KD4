@@ -30,6 +30,8 @@ pub(crate) struct ExecCommandArgs {
     login: Option<bool>,
     tty: bool,
     yield_time_ms: u64,
+    /// Whether the caller chose `yield_time_ms` rather than its default.
+    yield_time_requested: bool,
     max_output_tokens: Option<usize>,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
@@ -146,6 +148,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             login: raw.login,
             tty: raw.tty,
             yield_time_ms,
+            yield_time_requested: raw.yield_time_ms.is_some(),
             max_output_tokens: raw.max_output_tokens,
             sandbox_permissions: raw.sandbox_permissions,
             additional_permissions: raw.additional_permissions,
@@ -186,6 +189,12 @@ struct ExecCommandEnvironmentArgs {
 fn default_exec_yield_time_ms() -> u64 {
     2_000
 }
+
+/// Default observation window for a command started by a code-mode cell.
+/// The cell already waits on the call, so the short direct default only turns
+/// a command that ends moments later into a live session that costs the model
+/// a turn to poll.
+pub(super) const NESTED_EXEC_YIELD_TIME_MS: u64 = 10_000;
 
 fn default_write_stdin_yield_time_ms() -> u64 {
     250

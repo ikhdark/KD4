@@ -370,9 +370,9 @@ impl ShellCommandHandler {
             ))
         })?;
         let command_repaired = preflight.repaired();
+        let repair_notice = preflight.model_notice();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
-        let repair_notice = preflight.repair_notice;
         let invocation_changed = command_invocation != original_invocation;
         let validation_admission = admit_validation_invocations(
             &turn.validation_authorization,
@@ -527,6 +527,7 @@ impl ShellCommandHandler {
             None
         };
         let run_args = RunExecLikeArgs {
+            max_output_tokens: params.max_output_tokens,
             validation: params.validation,
             tool_name,
             exec_params,

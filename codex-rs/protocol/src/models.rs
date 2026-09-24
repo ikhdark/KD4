@@ -1967,6 +1967,10 @@ pub struct SearchToolCallParams {
 /// `arguments` field should deserialize to this struct.
 #[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 pub struct ShellCommandToolCallParams {
+    /// Optional model-visible output token budget, capped by policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_output_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub command: Option<String>,

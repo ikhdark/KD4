@@ -13,6 +13,7 @@ use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -279,6 +280,7 @@ impl ExecCommandHandler {
         };
 
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
+        let nested = matches!(source, ToolCallSource::CodeMode { .. });
         let context = UnifiedExecContext::with_tracker(
             session.clone(),
             turn.clone(),
@@ -394,9 +396,9 @@ impl ExecCommandHandler {
             ))
         })?;
         let repaired = preflight.repaired();
+        let mut repair_notice = preflight.model_notice();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
-        let mut repair_notice = preflight.repair_notice;
         let invocation_changed = &command_invocation != original_invocation;
         if invocation_changed {
             args.replace_command_invocation(&command_invocation);
@@ -529,14 +531,20 @@ impl ExecCommandHandler {
         let ExecCommandArgs {
             tty,
             yield_time_ms,
+            yield_time_requested,
             max_output_tokens,
             sandbox_permissions,
             additional_permissions,
             justification,
             prefix_rule,
-            force_fresh,
+            mut force_fresh,
             ..
         } = args;
+        let yield_time_ms = if nested && !yield_time_requested {
+            yield_time_ms.max(super::NESTED_EXEC_YIELD_TIME_MS)
+        } else {
+            yield_time_ms
+        };
 
         let max_output_tokens = max_output_tokens.or_else(|| {
             crate::tools::shell_output_summary::source_read_output_budget(&hook_command)
@@ -625,12 +633,13 @@ impl ExecCommandHandler {
                 FunctionCallError::RespondToModel(format!("validation snapshot: {e:#}"))
             })?;
             if let Some(snapshot) = snapshot {
+                force_fresh = true;
                 crate::workspace_transaction::bind_validation_environment(
                     &snapshot,
                     &mut effective_environment,
                 );
                 let notice = format!(
-                    "Validation source revision: {}. Captured source: {}. Build artifacts belong only to this run. This result does not validate later task edits or the reconciled checkout.",
+                    "Validation source revision: {}. Captured source: {}. This result does not validate later task edits or the reconciled checkout.",
                     snapshot.revision,
                     snapshot.workdir.display()
                 );
@@ -689,7 +698,7 @@ impl ExecCommandHandler {
                 .await
                 .map_err(FunctionCallError::RespondToModel)?;
         }
-        let known_delta = if session.features().enabled(Feature::KnownDeltaStore)
+        let mut known_delta = if session.features().enabled(Feature::KnownDeltaStore)
             && !environment_is_remote
             && !tty
             && validation_launch.is_none()
@@ -726,6 +735,19 @@ impl ExecCommandHandler {
         } else {
             None
         };
+        if let Some(prepared) = known_delta.as_mut() {
+            let policy: codex_utils_output_truncation::TruncationPolicy =
+                turn.model_info.truncation_policy.into();
+            prepared
+                .prepare_output_budget(
+                    codex_utils_output_truncation::TruncationPolicy::Tokens(
+                        policy.token_budget().max(25_000),
+                    ),
+                    max_output_tokens,
+                    &hook_command,
+                )
+                .await;
+        }
         let known_delta_hit = known_delta
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
@@ -833,7 +855,6 @@ impl ExecCommandHandler {
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         let process_id_reservation = manager.reserve_process_id().await;
         let process_id = process_id_reservation.process_id();
-        let validation_execution_wall_started_at = validation_attempt.then(std::time::Instant::now);
         let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
@@ -885,21 +906,6 @@ impl ExecCommandHandler {
             .command_execution
             .process_execution_identity(process_id)
             .await;
-        if validation_attempt {
-            let duration = match &exec_result {
-                Ok(response) => Some(response.wall_time),
-                Err(UnifiedExecError::SandboxDenied { output, .. }) => Some(output.duration),
-                Err(UnifiedExecError::ToolHistoryPersistence { duration, .. }) => Some(*duration),
-                Err(UnifiedExecError::ProcessFailed { .. }) if tracked_execution.is_some() => {
-                    validation_execution_wall_started_at.map(|started_at| started_at.elapsed())
-                }
-                Err(_) => None,
-            };
-            if let Some(duration) = duration {
-                turn.turn_timing_state
-                    .record_executed_validation_duration(duration);
-            }
-        }
         let mut background_process_expected = false;
         let result = match exec_result {
             Ok(mut response) => {

@@ -98,9 +98,104 @@ fn region_restricted_status_skips_every_outer_response_retry() {
 }
 
 #[tokio::test]
+async fn first_stream_read_failure_switches_to_https_with_bounded_remaining_retries() {
+    for request in [
+        ResponsesStreamRequest::Sampling,
+        ResponsesStreamRequest::LocalCompaction,
+        ResponsesStreamRequest::RemoteCompactionV2,
+    ] {
+        for max_retries in [0, 2] {
+            let home = tempfile::tempdir().unwrap();
+            let (session, turn_context, events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    codex_login::CodexAuth::from_api_key("test key"),
+                    Vec::new(),
+                    home.path(),
+                    |config| config.model_provider.supports_websockets = true,
+                )
+                .await;
+            let mut client_session = session.services.model_client.new_session();
+            let mut retry_state = ResponsesStreamRetryState::default();
+            let cancellation_token = CancellationToken::new();
+            assert!(session.services.model_client.responses_websocket_enabled());
+            tokio::time::pause();
+
+            let started = tokio::time::Instant::now();
+            handle_retryable_response_stream_error(
+                &mut retry_state,
+                max_retries,
+                codex_api::map_api_error(codex_api::ApiError::Stream(
+                    "websocket closed before response.completed".to_string(),
+                )),
+                &mut client_session,
+                &session,
+                &turn_context,
+                request,
+                &cancellation_token,
+            )
+            .await
+            .expect("retry immediately over HTTPS, not the failed WebSocket transport");
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert!(!session.services.model_client.responses_websocket_enabled());
+            assert_eq!(retry_state.retries, 0);
+            let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(emitted.len(), 1);
+            assert!(matches!(&emitted[0].msg, EventMsg::Warning(warning)
+                if warning.message.contains("Falling back from WebSockets to HTTPS")));
+
+            // HTTP failures consume the original budget and cannot activate fallback again.
+            for expected_retries in 1..=max_retries {
+                handle_retryable_response_stream_error(
+                    &mut retry_state,
+                    max_retries,
+                    codex_api::map_api_error(codex_api::ApiError::Stream(
+                        "stream closed before response.completed".to_string(),
+                    )),
+                    &mut client_session,
+                    &session,
+                    &turn_context,
+                    request,
+                    &cancellation_token,
+                )
+                .await
+                .expect("remaining HTTP retry");
+                assert_eq!(retry_state.retries, expected_retries);
+                let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+                assert_eq!(emitted.len(), 1);
+                assert!(matches!(&emitted[0].msg, EventMsg::StreamError(_)));
+            }
+            let result = handle_retryable_response_stream_error(
+                &mut retry_state,
+                max_retries,
+                codex_api::map_api_error(codex_api::ApiError::Stream(
+                    "stream closed before response.completed".to_string(),
+                )),
+                &mut client_session,
+                &session,
+                &turn_context,
+                request,
+                &cancellation_token,
+            )
+            .await;
+            assert!(matches!(result, Err(CodexErr::ResponseStreamFailed(_))));
+            assert_eq!(retry_state.retries, max_retries);
+            assert!(events.try_recv().is_err());
+            tokio::time::resume();
+        }
+    }
+}
+
+#[tokio::test]
 async fn server_requested_retry_delay_above_local_backoff_cap_is_preserved() {
+    let home = tempfile::tempdir().unwrap();
     let (session, turn_context, events) =
-        crate::session::tests::make_session_and_context_with_rx().await;
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |config| config.model_provider.supports_websockets = true,
+        )
+        .await;
     let mut client_session = session.services.model_client.new_session();
     let mut retry_state = ResponsesStreamRetryState::default();
     let cancellation_token = CancellationToken::new();
@@ -126,6 +221,7 @@ async fn server_requested_retry_delay_above_local_backoff_cap_is_preserved() {
         "the request loop must not retry before the server's delay"
     );
     retry.await.expect("retry after the requested delay");
+    assert!(session.services.model_client.responses_websocket_enabled());
     assert!((Duration::from_secs(60)..=Duration::from_millis(60_001)).contains(&started.elapsed()));
     let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
     assert!(emitted.iter().any(|event| matches!(&event.msg,

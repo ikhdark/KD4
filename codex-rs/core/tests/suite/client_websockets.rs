@@ -1723,7 +1723,10 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
     });
 
     let server = start_websocket_server(vec![
-        vec![vec![websocket_connection_limit_error]],
+        vec![
+            vec![ev_completed("resp-prewarm")],
+            vec![websocket_connection_limit_error],
+        ],
         vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
     ])
     .await;
@@ -1736,12 +1739,62 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
         .await
         .expect("build websocket codex");
 
-    test.submit_turn("hello")
+    // Finish speculative warmup before submitting the turn so it cannot consume the error.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        server.wait_for_response_batch(0, 0),
+    )
+    .await
+    .expect("startup warmup response");
+    assert_eq!(
+        server.wait_for_request(0, 0).await.body_json()["generate"],
+        false
+    );
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
         .await
-        .expect("submission should reconnect after websocket connection limit error");
+        .expect("submit turn");
+    let mut reconnects = 0;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), test.codex.next_event())
+            .await
+            .expect("turn must complete")
+            .expect("event stream");
+        match event.msg {
+            EventMsg::StreamError(error) => {
+                assert!(error.additional_details.as_deref().is_some_and(|details| {
+                    details.contains("Responses websocket connection limit reached")
+                }));
+                reconnects += 1;
+            }
+            EventMsg::Warning(warning) => {
+                assert!(
+                    !warning
+                        .message
+                        .contains("Falling back from WebSockets to HTTPS")
+                );
+            }
+            EventMsg::Error(error) => panic!("unexpected terminal error: {error:?}"),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        reconnects, 1,
+        "the provider error must reach the turn retry loop"
+    );
 
     let total_websocket_requests: usize = server.connections().iter().map(Vec::len).sum();
-    assert_eq!(total_websocket_requests, 2);
+    assert_eq!(total_websocket_requests, 3);
     let handshake_user_agents: Vec<_> = server
         .handshakes()
         .iter()

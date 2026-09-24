@@ -160,10 +160,10 @@ package = "codex-config"
 lib = true
 helpers = []
 
-[gates.workspace-transactions]
+[gates.sampling-freshness]
 description = "Sampling freshness integration and validation snapshot receipts."
 
-[[gates.workspace-transactions.steps]]
+[[gates.sampling-freshness.steps]]
 target = "core_lib"
 helpers = []
 tests = [

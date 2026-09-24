@@ -168,15 +168,6 @@ impl StateRuntime {
                 created: false,
             });
         }
-        for thread_id in thread_ids {
-            let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM threads WHERE id = ?")
-                .bind(thread_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            if exists == 0 {
-                anyhow::bail!("thread not found: {thread_id}");
-            }
-        }
         let id = Uuid::now_v7().to_string();
         let now = chrono::Utc::now().timestamp_millis();
         let position = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(position) FROM projects")
@@ -199,11 +190,14 @@ impl StateRuntime {
         .await?;
         replace_roots(&mut tx, &id, &roots).await?;
         for thread_id in thread_ids {
-            sqlx::query("UPDATE threads SET project_id = ? WHERE id = ?")
+            let result = sqlx::query("UPDATE threads SET project_id = ? WHERE id = ?")
                 .bind(&id)
                 .bind(thread_id)
                 .execute(&mut *tx)
                 .await?;
+            if result.rows_affected() != 1 {
+                anyhow::bail!("thread not found: {thread_id}");
+            }
         }
         sqlx::query(
             "INSERT INTO project_idempotency_keys (key, project_id, created_at_ms) VALUES (?, ?, ?)",

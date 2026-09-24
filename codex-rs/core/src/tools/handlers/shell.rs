@@ -96,6 +96,7 @@ fn parse_shell_command_hook_invocation(
 }
 
 pub(super) struct RunExecLikeArgs {
+    pub(super) max_output_tokens: Option<usize>,
     pub(super) validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub(super) tool_name: ToolName,
     pub(super) exec_params: ExecParams,
@@ -233,6 +234,7 @@ pub(super) fn validation_structured_output(value: serde_json::Value) -> Function
 }
 
 pub(super) struct LegacyShellToolOutput {
+    pub(super) max_output_tokens: Option<usize>,
     pub(super) validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub(super) inner: FunctionToolOutput,
     pub(super) canonical_output: Option<Vec<u8>>,
@@ -282,6 +284,7 @@ impl ToolOutput for LegacyShellToolOutput {
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         let mut metadata = self.inner.projection_metadata()?;
+        metadata.requested_limit = self.max_output_tokens;
         let contextual_output = metadata.spillable_text.join("\n");
         metadata.fragments.insert(
             0,
@@ -370,6 +373,7 @@ pub(super) async fn run_exec_like(
     let call_id = args.call_id.clone();
     let validation = args.validation.clone();
     let validation_output_owned = args.validation_launch.is_some();
+    let max_output_tokens = args.max_output_tokens;
     let mut result = run_exec_like_with_exit_code(args).await?;
     if let Some(validation) = validation.as_ref() {
         let metadata = crate::tools::context::declared_validation_metadata(validation);
@@ -382,6 +386,7 @@ pub(super) async fn run_exec_like(
     let validation_failure = validation_output_owned
         && result.validation_execution_outcome == ValidationExecutionOutcome::ExecutedFailure;
     Ok(LegacyShellToolOutput {
+        max_output_tokens,
         validation,
         inner: result.output,
         canonical_output: result.canonical_output,
@@ -597,6 +602,7 @@ async fn run_exec_like_with_exit_code_inner(
     repository_root: std::path::PathBuf,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
+        max_output_tokens,
         validation: _,
         tool_name,
         exec_params,
@@ -677,7 +683,7 @@ async fn run_exec_like_with_exit_code_inner(
     let attempt_key =
         attempt_key.map(|key| key.with_permission_context(&effective_permission_context));
 
-    let known_delta = if turn.config.features.enabled(Feature::KnownDeltaStore)
+    let mut known_delta = if turn.config.features.enabled(Feature::KnownDeltaStore)
         && !is_validation
         && !exec_params.command.is_empty()
         && known_delta_store::is_immutable_git_show_candidate(
@@ -717,6 +723,15 @@ async fn run_exec_like_with_exit_code_inner(
     } else {
         None
     };
+    if let Some(prepared) = known_delta.as_mut() {
+        prepared
+            .prepare_output_budget(
+                turn.model_info.truncation_policy.into(),
+                max_output_tokens,
+                &hook_command,
+            )
+            .await;
+    }
     let known_delta_hit = known_delta
         .as_ref()
         .is_some_and(known_delta_store::PreparedKnownDelta::is_hit);
@@ -812,7 +827,8 @@ async fn run_exec_like_with_exit_code_inner(
         source,
         turn_environment.environment_id.clone(),
     )
-    .with_model_command_text(hook_command.clone());
+    .with_model_command_text(hook_command.clone())
+    .with_max_output_tokens(max_output_tokens);
     let event_tracker = track_command_mutations.then_some(&tracker);
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
         .with_call_source(&tool_call_source);
@@ -1028,7 +1044,7 @@ async fn run_exec_like_with_exit_code_inner(
         crate::tools::project_exec_output_text_with_budget(
             output,
             turn.model_info.truncation_policy.into(),
-            /*requested_limit*/ None,
+            max_output_tokens,
             Some(req.hook_command.as_str()),
         )
     });
@@ -1043,20 +1059,26 @@ async fn run_exec_like_with_exit_code_inner(
             &output.aggregated_output.text,
         )
     });
-    let raw_output_artifact = if !known_delta_hit
-        && model_projection
-            .as_ref()
-            .is_some_and(|projection| projection.reduced)
-        && let (Some(_attempt_key), Some(output)) = (&attempt_key, execution_output)
+    let raw_output_artifact = if model_projection
+        .as_ref()
+        .is_some_and(|projection| projection.reduced)
+        && let Some(output) = execution_output
     {
-        Some(
-            create_raw_output_artifact(
-                turn.config.codex_home.as_path(),
-                &session.thread_id.to_string(),
-                output.aggregated_output.text.as_bytes(),
+        if let Some(hit) = known_delta
+            .as_ref()
+            .and_then(known_delta_store::PreparedKnownDelta::hit)
+        {
+            Some(hit.raw_output_artifact().clone())
+        } else {
+            Some(
+                create_raw_output_artifact(
+                    turn.config.codex_home.as_path(),
+                    &session.thread_id.to_string(),
+                    output.aggregated_output.text.as_bytes(),
+                )
+                .await,
             )
-            .await,
-        )
+        }
     } else {
         None
     };

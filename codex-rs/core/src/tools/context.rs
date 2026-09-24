@@ -744,6 +744,15 @@ pub struct ApplyPatchToolOutput {
     pub retry: Option<JsonValue>,
 }
 
+/// Text-only projections carry the retry receipt inline. The structured result
+/// already has it as `retry`, so embedding it in `text` too would repeat it.
+pub(crate) fn failed_patch_text(text: &str, retry: Option<&JsonValue>) -> String {
+    match retry {
+        Some(receipt) => format!("{text}\nRetained patch retry: {receipt}"),
+        None => text.to_string(),
+    }
+}
+
 impl ApplyPatchToolOutput {
     pub fn from_text(text: String) -> Self {
         Self::from_delta(text, true, &Default::default(), None)
@@ -781,10 +790,6 @@ impl ApplyPatchToolOutput {
     }
 
     pub(crate) fn with_retry(mut self, retry: Option<JsonValue>) -> Self {
-        if let Some(receipt) = &retry {
-            self.text
-                .push_str(&format!("\nRetained patch retry: {receipt}"));
-        }
         self.retry = retry;
         self
     }
@@ -793,7 +798,7 @@ impl ApplyPatchToolOutput {
         if self.success {
             "Success. Updated the files.".to_string()
         } else {
-            self.text.clone()
+            failed_patch_text(&self.text, self.retry.as_ref())
         }
     }
 
@@ -1133,7 +1138,14 @@ impl ToolOutput for ExecCommandToolOutput {
                 None => (None, None, None),
             };
         let raw_output = String::from_utf8_lossy(&self.raw_output);
-        let model_output = self.projected_model_output(raw_output.as_ref());
+        // A script shows this result to the model only by printing it into
+        // its cell. Bound it to fit there, so the command's own projection,
+        // with its summary and artifact recovery, is the only reduction; the
+        // direct response keeps the requested budget.
+        let model_output = self.projected_model_output(
+            raw_output.as_ref(),
+            Some(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS),
+        );
         let output_reduced = model_output.reduced;
         let output = model_output.text;
 
@@ -1484,7 +1496,9 @@ impl ExecCommandToolOutput {
     pub(crate) async fn prepare_reduction_notice(&mut self) {
         self.raw_output_reduction_notice = None;
         let raw_output = String::from_utf8_lossy(&self.raw_output);
-        if self.projected_model_output(raw_output.as_ref()).reduced
+        if self
+            .projected_model_output(raw_output.as_ref(), None)
+            .reduced
             && let Some(artifact) = &self.raw_output_artifact
         {
             self.raw_output_reduction_notice = artifact.reduction_notice().await;
@@ -1609,24 +1623,31 @@ impl ExecCommandToolOutput {
         })
     }
 
-    fn model_output_limits(&self, raw_output: &str) -> OutputLimitResolution {
+    /// `hard_limit_cap` bounds the projection for a consumer whose own output
+    /// ceiling is below the command ceiling.
+    fn model_output_limits(
+        &self,
+        raw_output: &str,
+        hard_limit_cap: Option<usize>,
+    ) -> OutputLimitResolution {
         let outcome = match self.outcome_for_logging() {
             ToolOutputOutcome::Success | ToolOutputOutcome::Yielded => OutputOutcome::Success,
             ToolOutputOutcome::Failure => OutputOutcome::Failure,
             ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
             ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
         };
+        let hard_limit = self.truncation_policy.token_budget().max(25_000);
         resolve_projected_output_limits(
             self.requested_model_output_tokens(),
             outcome,
             classify_diagnostic(self.hook_command.as_deref(), raw_output),
-            self.truncation_policy.token_budget().max(25_000),
+            hard_limit_cap.map_or(hard_limit, |cap| hard_limit.min(cap)),
         )
     }
 
     fn model_output_max_tokens(&self) -> usize {
         let raw = String::from_utf8_lossy(&self.raw_output);
-        self.model_output_limits(raw.as_ref()).applied_limit
+        self.model_output_limits(raw.as_ref(), None).applied_limit
     }
 
     pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
@@ -1634,8 +1655,12 @@ impl ExecCommandToolOutput {
         formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
     }
 
-    fn projected_model_output(&self, raw_output: &str) -> ProjectedModelOutput {
-        let limits = self.model_output_limits(raw_output);
+    fn projected_model_output(
+        &self,
+        raw_output: &str,
+        hard_limit_cap: Option<usize>,
+    ) -> ProjectedModelOutput {
+        let limits = self.model_output_limits(raw_output, hard_limit_cap);
         let summarized =
             if codex_utils_string::approx_token_count(raw_output) <= limits.applied_limit {
                 None
@@ -1692,7 +1717,7 @@ impl ExecCommandToolOutput {
         #[cfg(test)]
         EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(|calls| calls.set(calls.get() + 1));
 
-        let projected = self.projected_model_output(raw_output);
+        let projected = self.projected_model_output(raw_output, None);
         let mut fields = serde_json::Map::new();
         if let Some(code) = self.exit_code {
             fields.insert("exit_code".into(), code.into());

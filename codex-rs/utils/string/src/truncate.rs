@@ -115,6 +115,23 @@ impl TokenCountEstimate {
         token_byte_estimate(self.bytes).max(self.lexical)
     }
 
+    /// Add independently delimited fragments (for example, complete JSON values).
+    /// The caller must ensure no word spans the join; delimiters count separately.
+    pub fn add_delimited(self, next: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_add(next.bytes),
+            lexical: self.lexical.saturating_add(next.lexical),
+        }
+    }
+
+    /// Remove a previously added, independently delimited fragment.
+    pub fn subtract_delimited(self, previous: Self) -> Self {
+        Self {
+            bytes: self.bytes - previous.bytes,
+            lexical: self.lexical - previous.lexical,
+        }
+    }
+
     /// Combine fragments with a nonempty separator consisting only of whitespace.
     /// The separator terminates words, so their lexical counts are additive.
     pub fn then(self, next: Self, whitespace_bytes: usize) -> Self {

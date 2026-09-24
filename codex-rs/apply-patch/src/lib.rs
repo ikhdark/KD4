@@ -805,6 +805,14 @@ pub(crate) async fn preflight_hunks(
                                 if let ApplyPatchError::PatchContextMismatch(ref mut mismatch) =
                                     error
                                 {
+                                    // Alone, a later chunk loses the anchor its
+                                    // predecessors give it in sequence, so an
+                                    // ambiguity found here is not independent.
+                                    if index > 0
+                                        && mismatch.kind == PatchContextMismatchKind::AmbiguousMatch
+                                    {
+                                        continue;
+                                    }
                                     mismatch.chunk_ordinal = index + 1;
                                 }
                                 if error.to_string() != first
@@ -1060,6 +1068,10 @@ fn compute_replacements(
 ) -> std::result::Result<Vec<(usize, usize, Vec<String>)>, ApplyPatchError> {
     let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut line_index: usize = 0;
+    // A search that follows an earlier match in this hunk is anchored: the
+    // nearest candidate is the intended one. Only a search that no match
+    // precedes must identify its location uniquely.
+    let mut anchored = false;
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         if let Some(handle) = chunk
             .change_context
@@ -1089,6 +1101,7 @@ fn compute_replacements(
             }
             replacements.push((start - 1, end - start + 1, chunk.new_lines.clone()));
             line_index = end;
+            anchored = true;
             continue;
         }
         let source = || PatchMismatchSource {
@@ -1114,10 +1127,12 @@ fn compute_replacements(
                 std::slice::from_ref(ctx_line),
                 line_index,
                 /*eof*/ false,
+                anchored,
             )
             .map_err(ambiguous_match)?
             {
                 line_index = idx + 1;
+                anchored = true;
             } else {
                 let context = bounded_expected_lines(std::iter::once(ctx_line.as_str()));
                 let message = format!("Failed to find context '{context}' in {path}");
@@ -1157,9 +1172,14 @@ fn compute_replacements(
 
         // Parsed blank lines are source preconditions, not newline sentinels.
         let pattern: &[String] = &chunk.old_lines;
-        let found =
-            seek_sequence::seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file)
-                .map_err(ambiguous_match)?;
+        let found = seek_sequence::seek_sequence(
+            original_lines,
+            pattern,
+            line_index,
+            chunk.is_end_of_file,
+            anchored,
+        )
+        .map_err(ambiguous_match)?;
         let new_slice: &[String] = &chunk.new_lines;
 
         if let Some(start_idx) = found {
@@ -1199,6 +1219,7 @@ fn compute_replacements(
                 ));
             }
             line_index = start_idx + pattern.len();
+            anchored = true;
         } else {
             let message = format!(
                 "Failed to find expected lines in {} after line {}. Chunks must be in top-to-bottom file order; check ordering and current context:\n{}",
@@ -2568,7 +2589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unicode_space_matching_preserves_nested_content_and_uses_first_match() {
+    async fn unicode_space_matching_preserves_nested_content_and_rejects_ambiguity() {
         for ambiguous in [false, true] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("nested.py");
@@ -2594,13 +2615,100 @@ mod tests {
             )
             .await;
             let contents = std::fs::read_to_string(&path).unwrap();
-            result.unwrap();
-            assert_eq!(
-                contents,
-                original.replacen("label = \"a\u{00a0}b\"", "label = \"updated\"", 1)
-            );
-            assert!(stderr.is_empty());
+            if ambiguous {
+                let failure = result.unwrap_err();
+                assert!(failure.delta().is_empty());
+                assert!(failure.to_string().contains("Ambiguous Unicode-normalized"));
+                assert_eq!(contents, original);
+                assert!(stdout.is_empty());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    contents,
+                    original.replacen("label = \"a\u{00a0}b\"", "label = \"updated\"", 1)
+                );
+                assert!(stderr.is_empty());
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn chunks_after_an_earlier_match_take_the_nearest_candidate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("arms.rs");
+        let original = "match code {\n    1 => (\n        \"cancelled\",\n    ),\n    _ => (\n        \"deadline\",\n    ),\n}\n";
+        std::fs::write(&path, original).unwrap();
+        // Chunk 2 repeats a line that occurs twice after chunk 1; sequential
+        // chunks select the first occurrence after the preceding match.
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n     1 => (\n@@\n     ),\n+    3 => (\n+        \"memory\",\n+    ),",
+            path.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "match code {\n    1 => (\n        \"cancelled\",\n    ),\n    3 => (\n        \"memory\",\n    ),\n    _ => (\n        \"deadline\",\n    ),\n}\n"
+        );
+
+        // The first chunk has no preceding match, so its location must be unique.
+        std::fs::write(&path, original).unwrap();
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n     ),\n+    3 => (),",
+            path.display()
+        ));
+        let failure = apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).unwrap(),
+            &mut Vec::<u8>::new(),
+            &mut Vec::<u8>::new(),
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("Ambiguous exact match at lines 4 and 7"),
+            "{failure}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // When a later chunk fails, re-checking each chunk alone must not
+        // report the anchored chunk as ambiguous.
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n     1 => (\n@@\n     ),\n+    3 => (),\n@@\n-    missing => (),",
+            path.display()
+        ));
+        let failure = apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).unwrap(),
+            &mut Vec::<u8>::new(),
+            &mut Vec::<u8>::new(),
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            failure.contains("Failed to find expected lines"),
+            "{failure}"
+        );
+        assert!(!failure.contains("Ambiguous"), "{failure}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[tokio::test]

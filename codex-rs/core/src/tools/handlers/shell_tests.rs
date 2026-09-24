@@ -526,6 +526,7 @@ fn retained_validation_attempt_preserves_output_and_late_skip_timing() {
 fn legacy_shell_projection_metadata_keeps_exact_bytes_status_and_context() {
     let raw = vec![b'o', b'k', b'\n', 0xff];
     let output = super::LegacyShellToolOutput {
+        max_output_tokens: None,
         validation: None,
         inner: FunctionToolOutput::from_text("bounded shell output".to_string(), Some(false)),
         canonical_output: Some(raw.clone()),
@@ -777,6 +778,7 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
     inject_permission_profile_env(&mut expected_env, active_permission_profile.as_ref());
 
     let params = ShellCommandToolCallParams {
+        max_output_tokens: None,
         command: Some(command.clone()),
         kind: None,
         program: None,
@@ -870,6 +872,7 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         .to_abs_path()
         .expect("native environment cwd");
     let params = ShellCommandToolCallParams {
+        max_output_tokens: None,
         command: Some("echo hello".to_string()),
         kind: None,
         program: None,
@@ -919,6 +922,7 @@ async fn shell_command_exec_params_reuse_the_resolved_shell() {
         .to_abs_path()
         .expect("native environment cwd");
     let params = ShellCommandToolCallParams {
+        max_output_tokens: None,
         command: Some("echo hello".to_string()),
         kind: None,
         program: None,
@@ -972,6 +976,7 @@ async fn shell_command_handler_preserves_structured_argv_shape() {
         .to_abs_path()
         .expect("native environment cwd");
     let params = ShellCommandToolCallParams {
+        max_output_tokens: None,
         command: None,
         kind: Some("argv".to_string()),
         program: Some("python".to_string()),
@@ -1378,9 +1383,20 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
 
 #[tokio::test]
 async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
+    shell_command_output_budget_case(256, None).await;
+}
+
+#[tokio::test]
+async fn shell_command_caller_budget_retains_exact_output() {
+    for budget in [0, 500, 1000] {
+        shell_command_output_budget_case(80_000, Some(budget)).await;
+    }
+}
+
+async fn shell_command_output_budget_case(policy_bytes: i64, budget: Option<usize>) {
     let (session, mut turn) = make_session_and_context().await;
     turn.model_info.truncation_policy =
-        codex_protocol::openai_models::TruncationPolicyConfig::bytes(256);
+        codex_protocol::openai_models::TruncationPolicyConfig::bytes(policy_bytes);
     let input_home = tempfile::tempdir().expect("search input directory");
     let fixture = input_home.path().join("shell-recovery-notice-input.txt");
     let expected = (0..256)
@@ -1393,6 +1409,7 @@ async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
         arguments: json!({
             "kind": "argv",
             "program": "rg",
+            "max_output_tokens": budget,
             "args": ["--no-heading", "--no-filename", "--no-line-number", "--color", "never", ".", fixture.to_string_lossy()]
         }).to_string(),
     };
@@ -1412,7 +1429,44 @@ async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
         })
         .await
         .expect("normal shell handler executes actual search");
-    let rendered = output.code_mode_result(&payload).to_string();
+    assert_eq!(
+        output
+            .projection_metadata()
+            .expect("projection metadata")
+            .requested_limit,
+        budget
+    );
+    let rendered = output
+        .code_mode_result(&payload)
+        .as_str()
+        .expect("native text output")
+        .to_string();
+    if let Some(budget) = budget {
+        if budget == 0 {
+            assert!(
+                !rendered.contains("notice-proof-"),
+                "zero budget leaked source output: {rendered}"
+            );
+            assert_eq!(
+                output.projection_metadata().unwrap().essential_inline["exit_code"],
+                0
+            );
+        } else {
+            let text = rendered
+                .split_once("\nOutput:\n")
+                .expect("output section")
+                .1;
+            let text = text.split("\n[command output reduced;").next().unwrap();
+            assert!(
+                codex_utils_string::approx_token_count(text) <= budget + 100,
+                "caller budget ignored: {text}"
+            );
+            assert!(
+                text.contains("notice-proof-0000"),
+                "positive budgets must retain useful output: {text}"
+            );
+        }
+    }
     assert!(
         rendered.contains(
             "command output reduced; read a bounded selection from the retained output with read_tool_output"
@@ -1420,10 +1474,17 @@ async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
         "{rendered}"
     );
     assert!(rendered.contains("do not rerun the producer"));
-    assert!(
-        !rendered.contains("notice-proof-0128"),
-        "middle output must actually be reduced"
-    );
+    if budget.is_none() {
+        assert!(
+            !rendered.contains("notice-proof-0128"),
+            "middle output must actually be reduced"
+        );
+    } else {
+        assert!(
+            !rendered.contains(&expected),
+            "the caller budget must reduce the complete producer output"
+        );
+    }
     let artifact_id = rendered
         .split_once("Raw output artifact: ")
         .expect("raw artifact metadata")
@@ -1652,14 +1713,29 @@ async fn registered_shell_declared_validation_preserves_scope_without_proof() {
 fn oversized_validation_diagnostic_projection_is_bounded_and_recoverable() {
     let canonical = format!("error: {}", "\u{754c}".repeat(30000)).into_bytes();
     let output = super::LegacyShellToolOutput {
-        validation: None, inner: FunctionToolOutput::from_text("command failed".to_string(), Some(false)),
-        canonical_output: Some(canonical.clone()), exit_code: Some(1), call_id: "failure".to_string(), validation_failure: true,
+        max_output_tokens: None,
+        validation: None,
+        inner: FunctionToolOutput::from_text("command failed".to_string(), Some(false)),
+        canonical_output: Some(canonical.clone()),
+        exit_code: Some(1),
+        call_id: "failure".to_string(),
+        validation_failure: true,
     };
     let metadata = output.projection_metadata().expect("projection");
-    let diagnostic = metadata.fragments.iter().find(|fragment| fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary).expect("diagnostic");
+    let diagnostic = metadata
+        .fragments
+        .iter()
+        .find(|fragment| {
+            fragment.kind
+                == codex_tools::ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
+        })
+        .expect("diagnostic");
     assert!(diagnostic.text.len() <= 12 * 1024);
     assert!(diagnostic.text.starts_with("error:"));
     assert!(diagnostic.text.contains("truncated"));
-    assert!(metadata.predetermined_ranges.is_empty(), "partial lines are not exact ranges");
+    assert!(
+        metadata.predetermined_ranges.is_empty(),
+        "partial lines are not exact ranges"
+    );
     assert_eq!(output.canonical_output, Some(canonical));
 }

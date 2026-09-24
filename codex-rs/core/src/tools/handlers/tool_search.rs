@@ -318,6 +318,7 @@ struct ToolSearchResult {
     tools: Vec<LoadableToolSpec>,
     serialized_tools: Vec<serde_json::Value>,
     activation_tools: Vec<ToolName>,
+    supplemental_tools: Vec<ToolName>,
     omitted_result_count: usize,
     encoded_tools_len: usize,
 }
@@ -328,6 +329,7 @@ impl Default for ToolSearchResult {
             tools: Vec::new(),
             serialized_tools: Vec::new(),
             activation_tools: Vec::new(),
+            supplemental_tools: Vec::new(),
             omitted_result_count: 0,
             encoded_tools_len: 2,
         }
@@ -811,14 +813,14 @@ impl ToolSearchHandler {
             == codex_protocol::openai_models::ToolMode::CodeModeOnly
             && turn.config.code_mode.excluded_tool_namespaces.is_empty()
             && result
-                .activation_tools
+                .supplemental_tools
                 .iter()
                 .any(|name| !already_active.contains(name))
         {
-            // Search receipts can omit oversized schemas. Append authoritative
-            // definitions, filtered to the newly activated callable identities.
+            // Complete search definitions already live in history. Only restore
+            // contracts that the receipt omitted or compacted.
             let newly_active = result
-                .activation_tools
+                .supplemental_tools
                 .iter()
                 .filter(|name| !already_active.contains(*name))
                 .cloned()
@@ -996,6 +998,7 @@ impl ToolSearchHandler {
     ) -> Result<ToolSearchResult, FunctionCallError> {
         let mut retained = ToolSearchResultBuilder::new();
         let mut activation_tools = Vec::new();
+        let mut supplemental_tools = Vec::new();
         let mut omitted_result_count = 0usize;
         let mut selected = HashSet::new();
         for result_id in results {
@@ -1037,8 +1040,9 @@ impl ToolSearchHandler {
                     continue;
                 }
                 selected.extend(names.iter().cloned());
-                activation_tools.extend(names);
+                activation_tools.extend(names.iter().cloned());
                 if !retained.try_push(&candidate) {
+                    supplemental_tools.extend(names);
                     let local_names = match &candidate {
                         LoadableToolSpec::Function(tool) => HashSet::from([tool.name.clone()]),
                         LoadableToolSpec::Namespace(namespace) => namespace
@@ -1072,6 +1076,7 @@ impl ToolSearchHandler {
             tools,
             serialized_tools,
             activation_tools,
+            supplemental_tools,
             omitted_result_count,
             encoded_tools_len,
         })
@@ -1294,7 +1299,9 @@ fn tool_search_cache_entry_fits_budget(
         return false;
     };
     let mut writer = ByteBudgetWriter::new(remaining);
-    if serde_json::to_writer(&mut writer, &result.activation_tools).is_err() {
+    if serde_json::to_writer(&mut writer, &result.activation_tools).is_err()
+        || serde_json::to_writer(&mut writer, &result.supplemental_tools).is_err()
+    {
         return false;
     }
 
@@ -1525,40 +1532,22 @@ mod tests {
             };
             assert_eq!(tools, vec![expected], "query: {query}");
             let history = session.clone_history().await;
-            let schema_text = history
-                .raw_items()
-                .iter()
-                .find_map(|item| match item {
-                    codex_protocol::models::ResponseItem::Message { role, content, .. }
-                        if role == "developer" =>
-                    {
-                        content.iter().find_map(|content| match content {
-                            codex_protocol::models::ContentItem::InputText { text } => text
-                                .strip_prefix("Activated tool schemas (callable through exec):\n"),
-                            _ => None,
-                        })
-                    }
-                    _ => None,
-                })
-                .expect("activation appends schemas for the registered exec dispatcher");
-            let definitions: Vec<serde_json::Value> = serde_json::from_str(schema_text).unwrap();
-            let advertised = definitions
-                .iter()
-                .flat_map(|namespace| {
-                    namespace["tools"].as_array().unwrap().iter().map(|tool| {
-                        ToolName::namespaced(
-                            namespace["name"].as_str().unwrap(),
-                            tool["name"].as_str().unwrap(),
-                        )
+            let schema_text = history.raw_items().iter().find_map(|item| match item {
+                codex_protocol::models::ResponseItem::Message { role, content, .. }
+                    if role == "developer" =>
+                {
+                    content.iter().find_map(|content| match content {
+                        codex_protocol::models::ContentItem::InputText { text } => {
+                            text.strip_prefix("Activated tool schemas (callable through exec):\n")
+                        }
+                        _ => None,
                     })
-                })
-                .collect::<HashSet<_>>();
-            assert_eq!(
-                advertised,
-                names
-                    .iter()
-                    .map(|name| ToolName::namespaced("mcp__calendar", *name))
-                    .collect()
+                }
+                _ => None,
+            });
+            assert!(
+                schema_text.is_none(),
+                "complete schemas must not be republished"
             );
             assert_eq!(
                 turn.activated_deferred_tools(),
@@ -1568,6 +1557,108 @@ mod tests {
                     .collect(),
                 "query: {query}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn code_mode_only_publishes_only_omitted_or_compacted_definitions() {
+        for compacted in [false, true] {
+            let normal = search_info("publication", None, "normal", "small");
+            let normal_definition = serde_json::to_value(&normal.entry.output).unwrap();
+            let mut oversized = search_info("publication", None, "large", "oversized");
+            let LoadableToolSpec::Namespace(namespace) = &mut oversized.entry.output else {
+                panic!("expected namespace");
+            };
+            if compacted {
+                namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
+            } else {
+                let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
+                tool.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
+            }
+            let authoritative = serde_json::to_value(&oversized.entry.output).unwrap();
+            let handler = ToolSearchHandler::new(vec![normal, oversized]);
+            let (session, mut turn, _events) = make_session_and_context_with_rx().await;
+            Arc::get_mut(&mut turn).unwrap().model_info.tool_mode =
+                Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
+            let names = [
+                ToolName::namespaced("mcp__normal", "small"),
+                ToolName::namespaced("mcp__large", "oversized"),
+            ];
+            turn.refresh_deferred_tool_capabilities(Arc::new(
+                names
+                    .iter()
+                    .cloned()
+                    .map(|name| (name, "v1".into()))
+                    .collect(),
+            ));
+            let payload = ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: "publication".into(),
+                    limit: Some(2),
+                },
+            };
+            for _ in 0..2 {
+                let output = handler
+                    .handle(ToolInvocation {
+                        session: Arc::clone(&session),
+                        step_context: StepContext::for_test(Arc::clone(&turn)),
+                        cancellation_token: CancellationToken::new(),
+                        tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                        call_id: "mixed-search".into(),
+                        tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                        source: ToolCallSource::Direct,
+                        payload: payload.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let codex_protocol::models::ResponseInputItem::ToolSearchOutput {
+                    tools,
+                    omitted_result_count,
+                    ..
+                } = output.to_response_item("mixed-search", &payload)
+                else {
+                    panic!("expected search output");
+                };
+                assert!(tools.contains(&normal_definition));
+                assert_eq!(tools.len(), if compacted { 2 } else { 1 });
+                assert_eq!(
+                    omitted_result_count.unwrap_or_default(),
+                    usize::from(!compacted)
+                );
+                assert_eq!(
+                    turn.activated_deferred_tools(),
+                    names.iter().cloned().collect()
+                );
+                let history = session.clone_history().await;
+                let publications = history
+                    .raw_items()
+                    .iter()
+                    .filter_map(|item| {
+                        let codex_protocol::models::ResponseItem::Message { role, content, .. } =
+                            item
+                        else {
+                            return None;
+                        };
+                        if role != "developer" {
+                            return None;
+                        }
+                        content.iter().find_map(|content| match content {
+                            codex_protocol::models::ContentItem::InputText { text } => text
+                                .strip_prefix("Activated tool schemas (callable through exec):\n"),
+                            _ => None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    publications.len(),
+                    1,
+                    "cached searches must not republish schemas"
+                );
+                assert_eq!(
+                    serde_json::from_str::<Vec<serde_json::Value>>(publications[0]).unwrap(),
+                    vec![authoritative.clone()]
+                );
+            }
         }
     }
 

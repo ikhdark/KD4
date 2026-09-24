@@ -61,6 +61,7 @@ use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
+pub(crate) use wait_handler::NESTED_DEFAULT_POLL;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
@@ -840,6 +841,24 @@ fn format_runtime_response(
             text: serde_json::to_string(result).unwrap_or_default(),
         })
         .collect::<Vec<_>>();
+    // An uncaught nested rejection is rethrown as the script error, which
+    // already carries its complete message; the retained copy only repeats it.
+    // So does a copy of a result the script printed before it failed.
+    let emitted = if nested_results.is_empty() {
+        String::new()
+    } else {
+        code_mode_text_content(&content_items)
+    };
+    let nested_results = nested_results
+        .into_iter()
+        .filter(|result| {
+            !(result.failed
+                && script_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(result.output.as_str())))
+        })
+        .filter(|result| !nested_result_already_emitted(result, &emitted))
+        .collect();
     content_items.extend(nested_result_content_items(nested_results));
     content_items.extend(post_tool_use_feedback);
     let mut diagnostic = required_terminal.as_ref().map(|terminal| {
@@ -1292,18 +1311,7 @@ async fn call_nested_tool(
         parent_cell_id: cell_id.to_string(),
         runtime_tool_call_id,
         tool_name: tool_name.to_string(),
-        output: if tool_name.namespace.is_none()
-            && matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
-            && let Some(text) = result_value["output"].as_str()
-        {
-            let rendered = format!("exit_code: {}\n{}", result_value["exit_code"], text);
-            codex_utils_string::truncate_middle_chars(
-                &rendered,
-                MAX_RETAINED_NESTED_RESULT_BYTES - 128,
-            )
-        } else {
-            retained_output
-        },
+        output: retained_nested_output(&tool_name, &result_value, retained_output),
         output_truncated,
     };
     let required_terminal = required_nested_tool_terminal_cause(outcome_context, signal.as_ref())
@@ -1359,6 +1367,58 @@ async fn call_nested_tool(
     Ok(result_value)
 }
 
+/// Retained evidence of a completed nested call: a command's exit code and
+/// output, otherwise the bounded result JSON.
+fn retained_nested_output(
+    tool_name: &ToolName,
+    result_value: &JsonValue,
+    retained_json: String,
+) -> String {
+    if tool_name.namespace.is_none()
+        && matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
+        && let Some(text) = result_value["output"].as_str()
+    {
+        let mut rendered = format!("exit_code: {}\n{}", result_value["exit_code"], text);
+        if let Some(repair) = result_value["repair"].as_str() {
+            rendered.push('\n');
+            rendered.push_str(repair);
+        }
+        codex_utils_string::truncate_middle_chars(&rendered, MAX_RETAINED_NESTED_RESULT_BYTES - 128)
+    } else {
+        retained_json
+    }
+}
+
+/// Whether the script already printed this retained result before the cell
+/// ended. `text(result)` shows it JSON-escaped and `text(result.output)`
+/// verbatim. Both ends of the retained copy must appear, so a different result
+/// that only shares a prefix, such as build progress, stays visible.
+fn nested_result_already_emitted(result: &CodeModeNestedResultEvidence, emitted: &str) -> bool {
+    const PROBE_BYTES: usize = 256;
+    // A short result costs little to repeat and is weak evidence of printing.
+    const MIN_PAYLOAD_BYTES: usize = 32;
+    let payload = match result
+        .output
+        .strip_prefix("exit_code: ")
+        .and_then(|rest| rest.split_once('\n'))
+    {
+        Some((_, output)) => output,
+        // A script may spread a result object into another, so its opening
+        // brace is not evidence.
+        None => result.output.strip_prefix('{').unwrap_or(&result.output),
+    };
+    if payload.len() < MIN_PAYLOAD_BYTES {
+        return false;
+    }
+    let head = &payload[..payload.floor_char_boundary(PROBE_BYTES)];
+    let tail = &payload[payload.ceil_char_boundary(payload.len().saturating_sub(PROBE_BYTES))..];
+    [head, tail].into_iter().all(|probe| {
+        emitted.contains(probe)
+            || serde_json::to_string(probe)
+                .is_ok_and(|escaped| emitted.contains(&escaped[1..escaped.len() - 1]))
+    })
+}
+
 // Presentation only: never use this projection for a JavaScript tool return.
 fn model_visible_nested_result(tool: &ToolName, value: JsonValue) -> JsonValue {
     if tool.namespace.is_some() || !value.is_object() {
@@ -1366,7 +1426,9 @@ fn model_visible_nested_result(tool: &ToolName, value: JsonValue) -> JsonValue {
     }
     if matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
         let mut compact = serde_json::Map::new();
-        for key in ["exit_code", "output", "session_id"] {
+        // A preflight advisory or repair explains output the command itself
+        // cannot, such as a literal glob path that matched nothing.
+        for key in ["exit_code", "output", "session_id", "repair"] {
             if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
                 compact.insert(key.to_string(), value.clone());
             }
@@ -1382,7 +1444,10 @@ fn model_visible_nested_result(tool: &ToolName, value: JsonValue) -> JsonValue {
         return JsonValue::String(if value["success"] == true {
             "Success. Updated the files.".to_string()
         } else {
-            value["text"].as_str().unwrap_or("Patch failed").to_string()
+            crate::tools::context::failed_patch_text(
+                value["text"].as_str().unwrap_or("Patch failed"),
+                value.get("retry").filter(|retry| !retry.is_null()),
+            )
         });
     }
     value
@@ -2729,6 +2794,15 @@ mod tests {
                 "raw_output_artifact_id": "artifact"})
             ),
             serde_json::json!({"session_id": 12, "output": "building", "artifact_id": "artifact"})
+        );
+        assert_eq!(
+            super::model_visible_nested_result(
+                &ToolName::plain("exec_command"),
+                serde_json::json!({"exit_code": 2, "output": "src/run*: os error 123",
+                "repair": "Command preflight advisory (rg_literal_glob_path): ..."})
+            ),
+            serde_json::json!({"exit_code": 2, "output": "src/run*: os error 123",
+                "repair": "Command preflight advisory (rg_literal_glob_path): ..."})
         );
     }
 

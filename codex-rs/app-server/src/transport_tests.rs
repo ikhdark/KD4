@@ -34,6 +34,7 @@ fn empty_notification_opt_outs_skip_method_rendering_and_lock_acquisition() {
         Arc::new(AtomicBool::new(true)),
         Arc::clone(&opt_outs),
         /*disconnect_sender*/ None,
+        CancellationToken::new(),
     );
     let notification = OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
         ConfigWarningNotification {
@@ -67,6 +68,7 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
     connections.insert(
@@ -77,6 +79,7 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -145,6 +148,7 @@ async fn to_connection_notification_respects_opt_out_filters() {
             Arc::new(AtomicBool::new(true)),
             opted_out_notification_methods,
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -187,6 +191,7 @@ async fn to_connection_notifications_are_dropped_for_opted_out_clients() {
                 "configWarning".to_string(),
             ]))),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -227,6 +232,7 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -273,6 +279,7 @@ async fn to_connection_receipt_sender_reaches_the_transport_writer() {
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -320,6 +327,7 @@ async fn experimental_notifications_are_dropped_without_capability() {
             Arc::new(AtomicBool::new(false)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -355,6 +363,7 @@ async fn experimental_notifications_are_preserved_with_capability() {
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -394,6 +403,7 @@ async fn command_execution_request_approval_strips_additional_permissions_withou
             Arc::new(AtomicBool::new(false)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -459,6 +469,7 @@ async fn command_execution_request_approval_keeps_additional_permissions_with_ca
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
+            CancellationToken::new(),
         ),
     );
 
@@ -529,6 +540,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
     let (slow_writer_tx, mut slow_writer_rx) = mpsc::channel(1);
     let fast_disconnect_token = CancellationToken::new();
     let slow_disconnect_token = CancellationToken::new();
+    let shutdown = CancellationToken::new();
 
     let mut connections = HashMap::new();
     connections.insert(
@@ -539,6 +551,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             Some(fast_disconnect_token.clone()),
+            shutdown.clone(),
         ),
     );
     connections.insert(
@@ -549,6 +562,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
             Arc::new(AtomicBool::new(true)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             Some(slow_disconnect_token.clone()),
+            shutdown.clone(),
         ),
     );
 
@@ -586,6 +600,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
     assert!(!connections.contains_key(&slow_connection_id));
     assert!(slow_disconnect_token.is_cancelled());
     assert!(!fast_disconnect_token.is_cancelled());
+    assert!(!shutdown.is_cancelled());
     let fast_message = fast_writer_rx
         .try_recv()
         .expect("fast connection should receive the broadcast notification");
@@ -610,31 +625,27 @@ async fn broadcast_does_not_block_on_slow_connection() {
 #[tokio::test]
 async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is_full() {
     let connection_id = ConnectionId(3);
-    let (writer_tx, mut writer_rx) = mpsc::channel(1);
-    writer_tx
-        .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "queued".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-        ))
-        .await
-        .expect("channel should accept the first queued message");
+    let shutdown = CancellationToken::new();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    for _ in 0..CHANNEL_CAPACITY {
+        writer_tx
+            .try_send(QueuedOutgoingMessage::new(
+                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "queued".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
+            ))
+            .expect("channel should accept the initial burst");
+    }
 
     let mut connections = HashMap::new();
     connections.insert(
         connection_id,
-        OutboundConnectionState::new(
-            writer_tx,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
-            /*disconnect_sender*/ None,
-        ),
+        registered_stdio_connection(connection_id, writer_tx, shutdown.clone()),
     );
 
     let route_task = async {
@@ -660,6 +671,7 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
         futures::poll!(&mut route_task).is_pending(),
         "full stdio queue must retain the second message until capacity is available"
     );
+    assert!(!shutdown.is_cancelled());
 
     let first = timeout(Duration::from_millis(100), writer_rx.recv())
         .await
@@ -668,6 +680,7 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
     timeout(Duration::from_millis(100), &mut route_task)
         .await
         .expect("routing should finish after the first queued message is drained");
+    assert!(!shutdown.is_cancelled());
 
     assert!(matches!(
         first.message,
@@ -675,6 +688,15 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
             ConfigWarningNotification { summary, .. }
         )) if summary == "queued"
     ));
+    for _ in 1..CHANNEL_CAPACITY {
+        let queued = writer_rx.try_recv().expect("burst output must not be lost");
+        assert!(matches!(
+            queued.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "queued"
+        ));
+    }
     let second = writer_rx
         .try_recv()
         .expect("second notification should be delivered once the queue has room");
@@ -684,6 +706,114 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
             ConfigWarningNotification { summary, .. }
         )) if summary == "second"
     ));
+}
+
+fn registered_stdio_connection(
+    connection_id: ConnectionId,
+    writer: mpsc::Sender<QueuedOutgoingMessage>,
+    shutdown: CancellationToken,
+) -> OutboundConnectionState {
+    let (connection, event) = crate::prepare_connection(
+        connection_id,
+        ConnectionOrigin::Stdio,
+        writer,
+        None,
+        shutdown,
+    );
+    connection.outbound_initialized.store(true, Ordering::Release);
+    let crate::OutboundControlEvent::Opened {
+        connection_id: registered_id,
+        state,
+    } = event
+    else {
+        panic!("connection setup must register the outbound writer");
+    };
+    assert_eq!(registered_id, connection_id);
+    state
+}
+
+#[tokio::test]
+async fn stdio_shutdown_releases_backpressure_without_acknowledging_unsent_output() {
+    let connection_id = ConnectionId(3);
+    let shutdown = CancellationToken::new();
+    let (writer, mut reader) = mpsc::channel(1);
+    let message = OutgoingMessage::Response(OutgoingResponse {
+        id: RequestId::Integer(1),
+        result: json!({"queued": true}),
+    });
+    writer
+        .try_send(QueuedOutgoingMessage::new(message.clone()))
+        .unwrap();
+    let mut connections = HashMap::from([(
+        connection_id,
+        registered_stdio_connection(connection_id, writer, shutdown.clone()),
+    )]);
+    let (receipt, completed) = tokio::sync::oneshot::channel();
+    {
+        let route = route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message,
+                write_complete_tx: Some(receipt),
+            },
+        );
+        tokio::pin!(route);
+        assert!(futures::poll!(&mut route).is_pending());
+        assert!(!shutdown.is_cancelled());
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), route)
+            .await
+            .expect("shutdown must release a full stdio queue");
+    }
+    assert!(connections.is_empty());
+    assert!(
+        completed.await.is_err(),
+        "unsent output must not be acknowledged"
+    );
+    assert!(reader.try_recv().is_ok(), "original output stays queued");
+    assert!(matches!(
+        reader.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+#[tokio::test]
+async fn closed_stdio_writer_shuts_down_runtime() {
+    let connection_id = ConnectionId(3);
+    let shutdown = CancellationToken::new();
+    let (writer, reader) = mpsc::channel(1);
+    drop(reader);
+    let mut connections = HashMap::from([(
+        connection_id,
+        registered_stdio_connection(connection_id, writer, shutdown.clone()),
+    )]);
+    let (receipt, completed) = tokio::sync::oneshot::channel();
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::Response(OutgoingResponse {
+                id: RequestId::Integer(1),
+                result: json!({}),
+            }),
+            write_complete_tx: Some(receipt),
+        },
+    )
+    .await;
+    assert!(shutdown.is_cancelled());
+    assert!(connections.is_empty());
+    assert!(completed.await.is_err());
+}
+
+#[test]
+fn dropping_stdio_router_state_shuts_down_runtime() {
+    let shutdown = CancellationToken::new();
+    let (writer, _reader) = mpsc::channel(1);
+    let state = registered_stdio_connection(ConnectionId(3), writer, shutdown.clone());
+    assert!(!shutdown.is_cancelled());
+    drop(state);
+    assert!(shutdown.is_cancelled());
 }
 
 #[tokio::test]
@@ -730,6 +860,7 @@ async fn dropping_router_state_closes_registered_websocket_connection() {
             Arc::new(AtomicBool::new(false)),
             Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             disconnect_sender,
+            CancellationToken::new(),
         ),
     )]);
     route_outgoing_envelope(

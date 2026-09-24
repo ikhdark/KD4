@@ -220,6 +220,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cached_estimates_match_delimited_json_and_rollback() {
+        use super::TokenCountEstimate;
+        for value in [
+            r#""a""#,
+            r#"{"text":"中😀\n\\\""}"#,
+            "true",
+            "12345",
+            r#""                    ""#,
+        ] {
+            let prefix = TokenCountEstimate::new("[");
+            let value_cost = TokenCountEstimate::new(value);
+            let suffix = TokenCountEstimate::new("]");
+            let size = prefix.add_delimited(value_cost).add_delimited(suffix);
+            assert_eq!(
+                size.tokens(),
+                super::approx_token_count(&format!("[{value}]"))
+            );
+            assert_eq!(
+                size.subtract_delimited(value_cost).tokens(),
+                super::approx_token_count("[]")
+            );
+        }
+    }
+
     use super::normalize_markdown_hash_location_suffix;
     use super::sanitize_metric_tag_value;
     use super::sha1_hex;

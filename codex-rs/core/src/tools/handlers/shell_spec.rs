@@ -116,7 +116,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
+                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise ({} ms inside `exec`); explicit values use 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -307,6 +307,17 @@ pub(crate) fn create_shell_command_tool_for_policy(
             )),
         ),
         (
+            "max_output_tokens".to_string(),
+            bounded_integer(
+                format!(
+                    "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
+                    adaptive_output_budget_description()
+                ),
+                0,
+                usize::MAX as u64,
+            ),
+        ),
+        (
             "timeout_ms".to_string(),
             bounded_integer(
                 "Maximum command runtime. Defaults to 300000 ms for recognized validation commands and 10000 ms otherwise. This is a hard deadline; use exec_command for resumable long-running work. Zero sets an immediate deadline; it does not disable the timeout.".to_string(),
@@ -339,7 +350,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
     ));
 
     let description = format!(
-        "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Its output budget is policy-controlled; max_output_tokens is not accepted. Use syntax supported by that shell.\n\n{}\n\n{}",
+        "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Use max_output_tokens to request a smaller output budget; larger requests are capped by policy. Use syntax supported by that shell.\n\n{}\n\n{}",
         rg_search_admission_guidance(),
         filesystem_safety_guidance(),
     );

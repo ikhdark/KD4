@@ -224,7 +224,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
+                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise (10000 ms inside `exec`); explicit values use 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -421,7 +421,7 @@ fn shell_command_tool_matches_expected_spec() {
         exec_permission_approvals_enabled: false,
     });
 
-    let description = "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Its output budget is policy-controlled; max_output_tokens is not accepted. Use syntax supported by that shell.".to_string()
+    let description = "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Use max_output_tokens to request a smaller output budget; larger requests are capped by policy. Use syntax supported by that shell.".to_string()
         + &shell_command_guidance_description();
 
     let mut properties = BTreeMap::from([
@@ -457,6 +457,17 @@ fn shell_command_tool_matches_expected_spec() {
             JsonSchema::string(Some(
                 "Working directory for the command. Defaults to the turn cwd.".to_string(),
             )),
+        ),
+        (
+            "max_output_tokens".to_string(),
+            bounded_integer(
+                format!(
+                    "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; command lifecycle and recovery metadata are still returned.",
+                    codex_utils_output_truncation::adaptive_output_budget_description()
+                ),
+                0,
+                usize::MAX as u64,
+            ),
         ),
         (
             "timeout_ms".to_string(),

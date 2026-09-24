@@ -13,6 +13,8 @@ pub(crate) struct WorkspaceTransactionHandler;
 #[serde(deny_unknown_fields)]
 struct Args {
     action: Action,
+    #[serde(default)]
+    resolutions: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,10 +34,14 @@ impl ToolExecutor<ToolInvocation> for WorkspaceTransactionHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: "workspace_transaction".into(),
-            description: "Isolate a local Git editing task. Call begin before reading source for edits: it captures tracked and nonignored untracked regular files, including uncommitted changes, in a task-owned checkout. Read/edit/exec tools then use that checkout; use its paths inside shell text. Builds/tests through exec_command capture a separate input snapshot with their own output directory. Call reconcile after edits and validation to three-way merge back, preserving independent changes; conflicts publish nothing and retain the task workspace. Reconciliation never stages or commits in the original checkout. Status recovers paths after resume. Requires local unrestricted filesystem access; links/submodules and snapshots over 1 GiB are rejected. Ignored files and external dependencies are not captured. Snapshots are retained for recovery.".into(),
+            description: "Isolate a local Git editing task. Call begin before reading source for edits: it captures tracked and nonignored untracked regular files, including uncommitted changes, in a task-owned checkout. Read/edit/exec tools then use that checkout; use its paths inside shell text. Builds/tests through exec_command capture a separate input snapshot and build in a warm output lane shared with the checkout's other snapshots. Call reconcile after edits and validation to three-way merge back, preserving independent changes; conflicts publish nothing and retain the task workspace. Reconciliation never stages or commits in the original checkout. Status recovers paths after resume. Requires local unrestricted filesystem access; links/submodules and snapshots over 1 GiB are rejected. Ignored files and external dependencies are not captured. Snapshots are retained for recovery.".into(),
             strict: false, defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
                 ("action".into(), JsonSchema::string(Some("begin, status, or reconcile".into()))),
+                ("resolutions".into(), JsonSchema {
+                    description: Some("Reconcile only: map each manually resolved repository-relative path to its conflict_revisions value. Read retained base/task/current inputs, combine them in the task workspace, then submit the observed current revision. Stale revisions reject publication; absent denotes a deleted current file.".into()),
+                    ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::string(None).into()))
+                }),
             ]), Some(vec!["action".into()]), Some(false.into())),
             output_schema: None,
         })
@@ -48,6 +54,11 @@ impl ToolExecutor<ToolInvocation> for WorkspaceTransactionHandler {
                 ));
             };
             let args: Args = parse_arguments(arguments)?;
+            if !args.resolutions.is_empty() && !matches!(args.action, Action::Reconcile) {
+                return Err(FunctionCallError::RespondToModel(
+                    "resolutions are only supported for reconcile".into(),
+                ));
+            }
             let turn = &invocation.step_context.turn;
             if !matches!(
                 turn.sandbox_policy(),
@@ -89,9 +100,11 @@ impl ToolExecutor<ToolInvocation> for WorkspaceTransactionHandler {
                             None => json!({"active": false}),
                         }),
                         Action::Reconcile => {
-                            let mut value = serde_json::to_value(workspace::reconcile(&home, &thread)?)?;
+                            let mut value = serde_json::to_value(workspace::reconcile(&home, &thread, &args.resolutions)?)?;
                             if value["merged"] == true {
                                 value["next_action"] = json!("Run the affected checks against the integrated original checkout before reporting completion. Pre-merge test results do not validate the combined source.");
+                            } else {
+                                value["next_action"] = json!("Read conflict_directory base/task/current inputs. Combine compatible changes in the task workspace, validate, and reconcile with resolutions mapping each resolved path to its conflict_revisions value. Unresolved conflicts publish nothing; changed current revisions reject stale resolutions.");
                             }
                             Ok(value)
                         }

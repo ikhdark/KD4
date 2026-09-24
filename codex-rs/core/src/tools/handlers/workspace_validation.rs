@@ -114,6 +114,7 @@ impl CoreToolRuntime for WorkspaceValidationHandler {
                 .join(&args.repository)
                 .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
             let mut root = repository.to_path_buf();
+            let mut snapshot_root = None;
             let home = config.codex_home.clone();
             let thread = invocation.session.thread_id.to_string();
             let active = crate::workspace_transaction::load(&home, &thread)
@@ -153,18 +154,30 @@ impl CoreToolRuntime for WorkspaceValidationHandler {
                     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
                     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
                     root = snapshot.workdir.join(tail);
+                    snapshot_root = Some(snapshot.workdir);
                 } else {
                     root = mapped;
                 }
             }
             let request = json!({"repository":root,"cache_identity":cache_identity,"cache_directory":config.codex_home.join("validation-cache"),
-                "action":args.action,"checks":args.checks,"allow_full_suite":args.allow_full_suite,"force_fresh":args.force_fresh});
+                "action":args.action,"checks":args.checks,"allow_full_suite":args.allow_full_suite,"force_fresh":args.force_fresh,
+                "snapshot_root":snapshot_root});
             invocation.tool_name = ToolName::plain("exec_command");
-            invocation.payload=ToolPayload::Function { arguments:json!({
-                "kind":"argv","program":executable,"args":["--codex-workspace-worker","workspace_validation",request.to_string()],
-                "workdir":root,"environment_id":args.environment_id,"yield_time_ms":1000,"max_output_tokens":12000,
-                "force_fresh":true,
-            }).to_string() };
+            let mut command = json!({
+                "program":executable,"args":["--codex-workspace-worker","workspace_validation",request.to_string()],
+                "workdir":root,"yield_time_ms":1000,"max_output_tokens":12000,
+            });
+            if invocation
+                .step_context
+                .environments
+                .primary()
+                .is_some_and(|primary| primary.environment_id != environment.environment_id)
+            {
+                command["environment_id"] = json!(environment.environment_id);
+            }
+            invocation.payload = ToolPayload::Function {
+                arguments: command.to_string(),
+            };
             Ok(invocation)
         })
     }
@@ -245,12 +258,24 @@ mod tests {
         let command: serde_json::Value = serde_json::from_str(arguments).unwrap();
         let worker: serde_json::Value =
             serde_json::from_str(command["args"][2].as_str().unwrap()).unwrap();
-        assert_eq!(command["kind"], "argv");
+        let ToolSpec::Function(spec) = ExecCommandHandler::default().spec() else {
+            panic!("command schema required")
+        };
+        let schema = serde_json::to_value(spec.parameters).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&command)
+            .unwrap();
         assert_eq!(command["args"][1], "workspace_validation");
         assert_eq!(worker["checks"], checks);
         assert_eq!(worker["force_fresh"], true);
         assert_eq!(worker["allow_full_suite"], false);
         let captured = std::path::Path::new(worker["repository"].as_str().unwrap());
+        // The worker refreshes the captured copy after leasing its build lane.
+        assert_eq!(
+            std::path::Path::new(worker["snapshot_root"].as_str().unwrap()),
+            captured
+        );
         assert_ne!(
             std::fs::canonicalize(captured).unwrap(),
             std::fs::canonicalize(&tx.workdir).unwrap()

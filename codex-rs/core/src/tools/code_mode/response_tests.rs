@@ -802,9 +802,11 @@ async fn nested_status_codes_remain_distinct_in_the_continuation_consumer() {
 use super::CodeModeNestedResultEvidence;
 use super::FAILED_CELL_ERROR_TRUNCATION_MARKER;
 use super::MAX_FAILED_CELL_ERROR_BYTES;
+use super::bounded_serialized_json;
 use super::failed_code_mode_cell_item;
 use super::format_runtime_response;
 use super::response_needs_retained_nested_results;
+use super::retained_nested_output;
 
 fn nested_result_evidence(output: &str) -> CodeModeNestedResultEvidence {
     CodeModeNestedResultEvidence {
@@ -1086,6 +1088,119 @@ fn failed_script_keeps_successful_nested_result_and_linkage_visible() {
     assert!(!output.contains("parent_cell_id"));
     assert!(!output.contains("runtime_tool_call_id"));
     assert!(output.contains("Script error:\nboom at line 7"));
+}
+
+#[test]
+fn rethrown_nested_failure_is_projected_once_through_the_script_error() {
+    let rejection = "Command rejected: `rg -n needle 'src/run*'`\nReason: literal glob path";
+    let response = RuntimeResponse::Result {
+        output_loss: None,
+        cell_id: CellId::new("cell-1".to_string()),
+        content_items: Vec::new(),
+        error_text: Some(format!("Error: {rejection}")),
+    };
+    let failed = CodeModeNestedResultEvidence {
+        failed: true,
+        ..nested_result_evidence(rejection)
+    };
+    let caught = CodeModeNestedResultEvidence {
+        failed: true,
+        ..nested_result_evidence("CAUGHT_FAILURE_SENTINEL")
+    };
+
+    let output = format_runtime_response(
+        response,
+        None,
+        usize::MAX,
+        true,
+        Instant::now(),
+        Vec::new(),
+        vec![failed, caught],
+        None,
+    )
+    .into_text();
+
+    assert_eq!(
+        output.matches("Reason: literal glob path").count(),
+        1,
+        "{output}"
+    );
+    assert!(output.contains(&format!("Script error:\nError: {rejection}")));
+    assert!(output.contains("CAUGHT_FAILURE_SENTINEL"));
+}
+
+#[test]
+fn failed_script_does_not_repeat_nested_results_it_already_printed() {
+    let lines = "    let value = parse(\"field\")?;\r\n".repeat(40);
+    let command = |output: String| {
+        serde_json::json!({
+            "chunk_id": "chunk",
+            "exit_code": 0,
+            "process_exited": true,
+            "output": output,
+        })
+    };
+    let printed = command(format!("SHARED_HEAD\r\n{lines}FIRST_RESULT_END\r\n"));
+    // Shares the printed prefix, as build progress does, but was never printed.
+    let unprinted = command(format!("SHARED_HEAD\r\n{lines}SECOND_RESULT_END\r\n"));
+    let plan = serde_json::json!({
+        "current_plan": {"plan": [{"step": "Validate the focused change", "status": "in_progress"}]},
+        "message": "Plan updated",
+    });
+    let retained = |tool: &str, value: &serde_json::Value| CodeModeNestedResultEvidence {
+        tool_name: tool.to_string(),
+        output: retained_nested_output(
+            &codex_tools::ToolName::plain(tool),
+            value,
+            bounded_serialized_json(value).0,
+        ),
+        ..nested_result_evidence("")
+    };
+    // `text(result)` prints the escaped JSON; `text(result.output)` the text.
+    let printed_forms = [
+        printed.to_string(),
+        printed["output"].as_str().unwrap().to_string(),
+    ];
+    for printed_command in printed_forms {
+        let response = RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: CellId::new("cell-1".to_string()),
+            content_items: vec![
+                RuntimeContentItem::InputText {
+                    text: printed_command,
+                },
+                RuntimeContentItem::InputText {
+                    text: plan.to_string(),
+                },
+            ],
+            error_text: Some("Error: cargo test failed".to_string()),
+        };
+
+        let output = format_runtime_response(
+            response,
+            None,
+            usize::MAX,
+            true,
+            Instant::now(),
+            Vec::new(),
+            vec![
+                retained("exec_command", &printed),
+                retained("update_plan", &plan),
+                retained("exec_command", &unprinted),
+            ],
+            None,
+        )
+        .into_text();
+
+        assert_eq!(output.matches("FIRST_RESULT_END").count(), 1, "{output}");
+        assert_eq!(
+            output.matches("Validate the focused change").count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(output.matches("SECOND_RESULT_END").count(), 1, "{output}");
+        assert!(output.contains("Script error:\nError: cargo test failed"));
+    }
 }
 
 #[test]

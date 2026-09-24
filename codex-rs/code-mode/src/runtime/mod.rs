@@ -1052,6 +1052,56 @@ mod tests {
         assert!(content_count < 1_000);
     }
 
+    #[tokio::test]
+    async fn rejected_reasons_serialize_their_error_message() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_runtime_tx, _runtime_terminate_handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(
+                r#"const results = await Promise.allSettled([Promise.reject(new Error("nested tool `exec_command` exceeded its 60000ms timeout"))]);
+text({i: 0, ...results[0]});
+const coded = new TypeError("bad input");
+coded.code = 7;
+text(JSON.stringify([coded]));"#,
+            ),
+            60_000,
+            event_tx,
+            std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
+            /*task_failure_handler*/ None,
+        )
+        .await
+        .unwrap();
+
+        let mut texts = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("runtime event timeout")
+                .expect("runtime must report a result");
+            match event {
+                RuntimeEvent::ContentItem {
+                    item:
+                        codex_code_mode_protocol::FunctionCallOutputContentItem::InputText { text },
+                    ..
+                } => texts.push(text),
+                RuntimeEvent::Result { error_text, .. } => {
+                    assert_eq!(error_text, None);
+                    break;
+                }
+                RuntimeEvent::Started => {}
+                event => panic!("unexpected runtime event: {event:?}"),
+            }
+        }
+
+        assert_eq!(
+            texts,
+            vec![
+                r#"{"i":0,"status":"rejected","reason":{"name":"Error","message":"nested tool `exec_command` exceeded its 60000ms timeout"}}"#.to_string(),
+                r#"[{"name":"TypeError","message":"bad input","code":7}]"#.to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn output_admission_resets_after_marker_only_delivery() {
         let output_admission = OutputAdmission::new(1);

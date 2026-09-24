@@ -31,6 +31,30 @@ use codex_tools::ToolOutputSkipDisposition;
 
 static NEXT_TOOL_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Appends `wait`, folding a re-armed wake into the previous record. Each
+/// output wake re-arms the same wait toward the same deadline, and one record
+/// per wake grew a single long command to thousands of identical entries in
+/// every persisted turn profile. `sequence` is the ordinal of the latest wake a
+/// record covers, so the gap from the previous record still counts each wake.
+pub(crate) fn push_timer_wait(
+    waits: &mut Vec<ToolLifecycleTimerWait>,
+    mut wait: ToolLifecycleTimerWait,
+) {
+    let sequence = waits
+        .last()
+        .map_or(1, |last| last.sequence.saturating_add(1));
+    if let Some(last) = waits.last_mut()
+        && last.wait_kind == wait.wait_kind
+        && last.wake_reason == wait.wake_reason
+        && last.deadline_at_ms == wait.deadline_at_ms
+    {
+        last.sequence = sequence;
+        return;
+    }
+    wait.sequence = sequence;
+    waits.push(wait);
+}
+
 tokio::task_local! {
     static ACTIVE_TOOL_DISPATCH_TIMING: Arc<ToolDispatchTiming>;
 }
@@ -209,13 +233,12 @@ impl ToolDispatchTiming {
         self.reentry_count.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    pub(crate) fn record_timer_wait(&self, mut wait: ToolLifecycleTimerWait) {
+    pub(crate) fn record_timer_wait(&self, wait: ToolLifecycleTimerWait) {
         let mut waits = self
             .timer_waits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        wait.sequence = u32::try_from(waits.len() + 1).unwrap_or(u32::MAX);
-        waits.push(wait);
+        push_timer_wait(&mut waits, wait);
     }
 
     pub(crate) fn deadline_after_ms(&self, timeout_ms: u64) -> Option<u64> {

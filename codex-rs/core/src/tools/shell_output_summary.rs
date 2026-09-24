@@ -171,15 +171,38 @@ pub(crate) fn summarize_shell_output_for_model(
                 (kind.critical || kind.advisory || kind.status).then_some(*index)
             })
             .collect::<Vec<_>>();
-        selected.retain(|(index, _)| {
-            *index < FOCUS_CONTEXT_LINES
-                || *index >= line_count.saturating_sub(FOCUS_CONTEXT_LINES)
-                || diagnostic_indexes
-                    .iter()
-                    .any(|diagnostic| index.abs_diff(*diagnostic) <= FOCUS_CONTEXT_LINES)
-        });
+        let (kept, mut pruned): (Vec<_>, Vec<_>) = std::mem::take(&mut selected)
+            .into_iter()
+            .partition(|(index, _)| {
+                *index < FOCUS_CONTEXT_LINES
+                    || *index >= line_count.saturating_sub(FOCUS_CONTEXT_LINES)
+                    || diagnostic_indexes
+                        .iter()
+                        .any(|diagnostic| index.abs_diff(*diagnostic) <= FOCUS_CONTEXT_LINES)
+            });
+        selected = kept;
         summary = render_selected_lines(builder.clone(), &selected, line_budget, line_count)?;
         if !codex_utils_string::approx_token_count_exceeds(&summary, limit) {
+            // Pruning is coarse. Return the remaining budget to the pruned
+            // lines, nearest the tail first, so an output slightly over the
+            // budget does not collapse to its diagnostics alone.
+            pruned.reverse();
+            let mut low = 0;
+            let mut high = pruned.len();
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                let mut candidate = selected.clone();
+                candidate.extend_from_slice(&pruned[..mid]);
+                candidate.sort_unstable_by_key(|(index, _)| *index);
+                let rendered =
+                    render_selected_lines(builder.clone(), &candidate, line_budget, line_count)?;
+                if codex_utils_string::approx_token_count_exceeds(&rendered, limit) {
+                    high = mid - 1;
+                } else {
+                    low = mid;
+                    summary = rendered;
+                }
+            }
             return (summary.len() < output.len()).then_some(summary);
         }
         let minimum = render_selected_lines(builder.clone(), &selected, 0, line_count)?;
@@ -344,6 +367,9 @@ fn is_read_only_powershell_script(script: &str) -> bool {
         "get-ciminstance",
         "get-command",
         "get-member",
+        "get-filehash",
+        "convertfrom-json",
+        "convertto-json",
         "rg",
         "grep",
         "findstr",
@@ -378,18 +404,61 @@ fn is_read_only_powershell_script(script: &str) -> bool {
         "rev-parse",
         "branch",
     ];
+    // Type literals that only build or format values. Any other type may expose
+    // a mutating static member, such as `[IO.File]::Delete(...)`.
+    const PURE_TYPE_LITERALS: &[&str] = &[
+        "pscustomobject",
+        "ordered",
+        "math",
+        "string",
+        "int",
+        "long",
+        "double",
+        "bool",
+        "char",
+        "regex",
+        "datetime",
+        "timespan",
+        "array",
+        "hashtable",
+    ];
+    let segments = powershell_command_segments(script).unwrap_or_else(|| {
+        // Splitting inside unmodeled quoting only makes the check more conservative.
+        script
+            .split([';', '|', '\n', '\r', '{', '('])
+            .flat_map(|segment| segment.split("&&"))
+            .collect()
+    });
     let mut saw_command = false;
-    // Every position that can start a command: statement separators, pipes,
-    // conditional chains, script blocks, and sub-expressions. Splitting inside
-    // quoted patterns only makes the check more conservative.
-    for segment in script
-        .split(|character: char| matches!(character, ';' | '|' | '\n' | '\r' | '{' | '('))
-        .flat_map(|segment| segment.split("&&"))
-    {
-        let segment = segment
+    for segment in segments {
+        let mut segment = segment
             .trim()
             .trim_matches(|character: char| matches!(character, ')' | '}' | '&'))
             .trim();
+        // A hash-literal entry such as `@{seconds=[math]::Round(...)}` evaluates
+        // only its value.
+        if let Some((key, value)) = segment.split_once('=')
+            && !key.is_empty()
+            && key
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            && !value.trim().contains(char::is_whitespace)
+        {
+            segment = value.trim();
+        }
+        // `$x = <command>` runs its right-hand side; other `$` forms are
+        // variable expressions that produce no command output of their own.
+        while let Some(rest) = segment.strip_prefix('$') {
+            match rest.split_once('=') {
+                Some((name, value))
+                    if !name.trim_end().ends_with('-')
+                        && !name.trim_end().contains(char::is_whitespace) =>
+                {
+                    segment = value.trim();
+                }
+                _ => segment = "",
+            }
+        }
         if segment.is_empty() {
             continue;
         }
@@ -402,16 +471,14 @@ fn is_read_only_powershell_script(script: &str) -> bool {
         }) {
             continue;
         }
-        let segment = if let Some(rest) = segment.strip_prefix('$') {
-            // `$x = <command>` runs its right-hand side; other `$` forms are
-            // variable expressions that produce no command output of their own.
-            match rest.split_once('=') {
-                Some((name, rest)) if !name.ends_with('-') && !name.contains(' ') => rest.trim(),
-                _ => continue,
+        if let Some(rest) = segment.strip_prefix('[') {
+            if rest.split_once(']').is_some_and(|(type_name, _)| {
+                PURE_TYPE_LITERALS.contains(&type_name.trim().to_ascii_lowercase().as_str())
+            }) {
+                continue;
             }
-        } else {
-            segment
-        };
+            return false;
+        }
         let mut tokens = segment.split_whitespace();
         let Some(command) = tokens.next() else {
             continue;
@@ -436,6 +503,77 @@ fn is_read_only_powershell_script(script: &str) -> bool {
         saw_command = true;
     }
     saw_command
+}
+
+/// Splits a PowerShell script at every position that can start a command:
+/// statement separators, pipes, conditional chains, script blocks, and
+/// sub-expressions. Quoted text and comments are data, so the `|` in
+/// `rg -n 'fn |impl '` does not start a command. Returns `None` for syntax this
+/// scanner does not model: here-strings, block comments, typographic quotes,
+/// and `$(...)` inside double quotes, which runs a command.
+fn powershell_command_segments(script: &str) -> Option<Vec<&str>> {
+    if script.contains("@'")
+        || script.contains("@\"")
+        || script.contains("<#")
+        || script.contains(['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'])
+        || script.contains(['\u{201C}', '\u{201D}', '\u{201E}'])
+    {
+        return None;
+    }
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut token_start = true;
+    let mut characters = script.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let at_token_start = token_start;
+        token_start = character.is_whitespace();
+        match character {
+            '\'' => {
+                // A doubled quote is a literal quote inside a verbatim string.
+                while let Some((_, next)) = characters.next() {
+                    if next == '\'' && characters.next_if(|&(_, c)| c == '\'').is_none() {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                while let Some((_, next)) = characters.next() {
+                    match next {
+                        '`' => {
+                            characters.next();
+                        }
+                        '$' if characters.peek().is_some_and(|&(_, c)| c == '(') => return None,
+                        '"' if characters.next_if(|&(_, c)| c == '"').is_none() => break,
+                        _ => {}
+                    }
+                }
+            }
+            '`' => {
+                characters.next();
+            }
+            '#' if at_token_start => {
+                segments.push(&script[start..index]);
+                while characters
+                    .next_if(|&(_, c)| c != '\n' && c != '\r')
+                    .is_some()
+                {}
+                start = characters.peek().map_or(script.len(), |&(next, _)| next);
+            }
+            ';' | '|' | '\n' | '\r' | '{' | '(' => {
+                segments.push(&script[start..index]);
+                start = index + character.len_utf8();
+                token_start = true;
+            }
+            '&' if characters.next_if(|&(_, c)| c == '&').is_some() => {
+                segments.push(&script[start..index]);
+                start = index + 2;
+                token_start = true;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&script[start..]);
+    Some(segments)
 }
 
 #[derive(Clone, Copy, Default)]

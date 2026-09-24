@@ -1,9 +1,13 @@
 /// Attempt to find the sequence of `pattern` lines within `lines` beginning at or after `start`.
-/// Returns the first starting index or `None` if not found. Matches use
+/// Returns the unique starting index or `None` if not found, rejecting multiple
+/// matches at the strongest matching tier. Matches use
 /// decreasing strictness: exact match, then ignoring trailing whitespace, then ignoring leading
 /// and trailing whitespace, then normalizing Unicode punctuation and whitespace.
 /// When `eof` is true, the match must end at end-of-file
 /// and must still begin at or after `start`.
+/// When `anchored` is true, `start` follows an earlier match in the same file
+/// hunk, so the first match at or after it is the intended location, as with
+/// sequentially applied diff hunks.
 ///
 /// Special cases handled defensively:
 ///  • Empty `pattern` → matches at `start` (or EOF), unless `start` is past EOF
@@ -14,6 +18,7 @@ pub(crate) fn seek_sequence(
     pattern: &[String],
     start: usize,
     eof: bool,
+    anchored: bool,
 ) -> Result<Option<usize>, AmbiguousMatch> {
     if pattern.is_empty() {
         return Ok((start <= lines.len()).then_some(if eof { lines.len() } else { start }));
@@ -80,6 +85,7 @@ pub(crate) fn seek_sequence(
                 .map(|line| normalise(line).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         });
+        let mut found = None;
         for index in search_start..=last_start {
             if lines[index..index + pattern.len()]
                 .iter()
@@ -95,8 +101,21 @@ pub(crate) fn seek_sequence(
                     },
                 })
             {
-                return Ok(Some(index));
+                if let Some(first) = found {
+                    return Err(AmbiguousMatch {
+                        first_line: first + 1,
+                        second_line: index + 1,
+                        strictness,
+                    });
+                }
+                if anchored {
+                    return Ok(Some(index));
+                }
+                found = Some(index);
             }
+        }
+        if found.is_some() {
+            return Ok(found);
         }
     }
 
@@ -115,6 +134,7 @@ pub(crate) struct AmbiguousMatch {
 
 #[cfg(test)]
 mod tests {
+    use super::AmbiguousMatch;
     use super::seek_sequence;
     use std::string::ToString;
 
@@ -127,9 +147,42 @@ mod tests {
         let lines = to_vec(&["foo", "bar", "baz"]);
         let pattern = to_vec(&["bar", "baz"]);
         assert_eq!(
-            seek_sequence(&lines, &pattern, /*start*/ 0, /*eof*/ false).unwrap(),
+            seek_sequence(
+                &lines, &pattern, /*start*/ 0, /*eof*/ false, /*anchored*/ false
+            )
+            .unwrap(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn test_duplicate_matches_report_candidates_at_each_tier() {
+        for (candidates, pattern, strictness) in [
+            (["old", "old"], "old", "exact"),
+            (["old  ", "old\t"], "old", "trailing-whitespace"),
+            (["  old", "    old"], "old", "whitespace"),
+            (["‘old’", "‘old’"], "'old'", "Unicode-normalized"),
+        ] {
+            let lines = to_vec(&["prefix", candidates[0], "gap", candidates[1]]);
+            assert_eq!(
+                seek_sequence(&lines, &to_vec(&[pattern]), 0, false, false),
+                Err(AmbiguousMatch {
+                    first_line: 2,
+                    second_line: 4,
+                    strictness,
+                })
+            );
+            // After an earlier match anchors the search, the nearest
+            // candidate is the intended one, at the same tier.
+            assert_eq!(
+                seek_sequence(&lines, &to_vec(&[pattern]), 1, false, true),
+                Ok(Some(1))
+            );
+            assert_eq!(
+                seek_sequence(&lines, &to_vec(&[pattern]), 2, false, true),
+                Ok(Some(3))
+            );
+        }
     }
 
     #[test]
@@ -138,7 +191,10 @@ mod tests {
         // Pattern omits trailing whitespace.
         let pattern = to_vec(&["foo", "bar"]);
         assert_eq!(
-            seek_sequence(&lines, &pattern, /*start*/ 0, /*eof*/ false).unwrap(),
+            seek_sequence(
+                &lines, &pattern, /*start*/ 0, /*eof*/ false, /*anchored*/ false
+            )
+            .unwrap(),
             Some(0)
         );
     }
@@ -149,7 +205,10 @@ mod tests {
         // Pattern omits any additional whitespace.
         let pattern = to_vec(&["foo", "bar"]);
         assert_eq!(
-            seek_sequence(&lines, &pattern, /*start*/ 0, /*eof*/ false).unwrap(),
+            seek_sequence(
+                &lines, &pattern, /*start*/ 0, /*eof*/ false, /*anchored*/ false
+            )
+            .unwrap(),
             Some(0)
         );
     }
@@ -160,7 +219,10 @@ mod tests {
         let pattern = to_vec(&["too", "many", "lines"]);
         // Should not panic – must return None when pattern cannot possibly fit.
         assert_eq!(
-            seek_sequence(&lines, &pattern, /*start*/ 0, /*eof*/ false).unwrap(),
+            seek_sequence(
+                &lines, &pattern, /*start*/ 0, /*eof*/ false, /*anchored*/ false
+            )
+            .unwrap(),
             None
         );
     }
@@ -169,10 +231,16 @@ mod tests {
     fn test_eof_match_respects_start() {
         let lines = to_vec(&["a", "b", "c"]);
         let pattern = to_vec(&["c"]);
-        assert_eq!(seek_sequence(&lines, &pattern, 2, true).unwrap(), Some(2));
-        assert_eq!(seek_sequence(&lines, &pattern, 3, true).unwrap(), None);
         assert_eq!(
-            seek_sequence(&lines, &to_vec(&["b"]), 0, true).unwrap(),
+            seek_sequence(&lines, &pattern, 2, true, false).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            seek_sequence(&lines, &pattern, 3, true, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            seek_sequence(&lines, &to_vec(&["b"]), 0, true, false).unwrap(),
             None
         );
     }
@@ -181,9 +249,14 @@ mod tests {
     fn test_exact_match_precedes_unicode_fallback() {
         let lines = to_vec(&["‘early’—value", "'early'-value"]);
         let pattern = to_vec(&["'early'-value"]);
-        assert_eq!(seek_sequence(&lines, &pattern, 0, false).unwrap(), Some(1));
+        for anchored in [false, true] {
+            assert_eq!(
+                seek_sequence(&lines, &pattern, 0, false, anchored).unwrap(),
+                Some(1)
+            );
+        }
         assert_eq!(
-            seek_sequence(&lines[..1], &pattern, 0, false).unwrap(),
+            seek_sequence(&lines[..1], &pattern, 0, false, false).unwrap(),
             Some(0)
         );
     }

@@ -4973,8 +4973,8 @@ impl ModelClientSession {
 
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
     ///
-    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
-    /// the HTTP transport.
+    /// This is used on a stream-read failure or after exhausting the provider retry budget,
+    /// to force subsequent requests onto the HTTP transport.
     ///
     /// Returns `true` when the failed stream should be retried over HTTP. This includes a concurrent
     /// session having already activated the shared fallback while this session still had an

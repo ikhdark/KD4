@@ -313,6 +313,47 @@ def _tool_dispatch_counts(
         observed = sum(call[key] for call in covered)
         result[key] = observed if complete else None
         result["observed" + key[0].upper() + key[1:]] = observed
+    waits = collections.Counter()
+    suspects = []
+    for call in calls:
+        timer_waits = call.get("timerWaits")
+        previous_sequence = 0
+        for wait in timer_waits if isinstance(timer_waits, list) else []:
+            if isinstance(wait, dict):
+                # A record folds repeated wakes toward one deadline; its sequence
+                # is the ordinal of the latest wake it covers.
+                sequence = wait.get("sequence")
+                wakes = 1
+                if type(sequence) is int and sequence > previous_sequence:
+                    wakes = sequence - previous_sequence
+                    previous_sequence = sequence
+                waits[(str(wait.get("waitKind", "unknown")), str(wait.get("wakeReason", "unknown")))] += wakes
+        reentries = call.get("reentryCount")
+        duration = call.get("totalDurationMs")
+        if type(reentries) is int and reentries >= 1000:
+            suspects.append({
+                "callId": call.get("callId"),
+                "turnId": call.get("_turnId"),
+                "toolName": call.get("toolName"),
+                "reentryCount": reentries,
+                "totalDurationMs": duration,
+                "reentriesPerSecond": reentries * 1000 / duration
+                if type(duration) is int and duration > 0 else None,
+            })
+    calls_with_waits = sum(isinstance(call.get("timerWaits"), list) for call in calls)
+    if not calls_with_waits and not suspects:
+        return result
+    result["waitDiagnostics"] = {
+        "available": True,
+        "observedWaits": [
+            {"waitKind": kind, "wakeReason": reason, "count": count}
+            for (kind, reason), count in sorted(waits.items())
+        ],
+        "highReentryCallCount": len(suspects),
+        "highReentryCalls": sorted(suspects, key=lambda call: call["reentryCount"], reverse=True)[:20],
+        "callsWithWaitEvidence": calls_with_waits,
+        "note": "Observed retained waits only. High re-entry is a diagnostic signal, not proof of CPU spinning or model retries. Durations across nested calls overlap; do not sum them.",
+    }
     return result
 
 

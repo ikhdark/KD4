@@ -35,6 +35,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolOutput;
 use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolSpec;
+use codex_utils_string::TokenCountEstimate;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -90,6 +91,50 @@ struct RecoveryCheckpoint {
     complete: bool,
     continuation: Option<ToolOutputSelector>,
     owner_complete: bool,
+    owner_cost: RecoveryResultCost,
+}
+
+fn recovery_size(value: &impl Serialize) -> TokenCountEstimate {
+    TokenCountEstimate::new(&serde_json::to_string(value).expect("recovery value serializes"))
+}
+
+fn continuation_size(selector: Option<&ToolOutputSelector>) -> TokenCountEstimate {
+    selector.map_or_else(TokenCountEstimate::default, |selector| {
+        TokenCountEstimate::new(",\"continuation\":").add_delimited(recovery_size(selector))
+    })
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryResultCost {
+    serialized: TokenCountEstimate,
+    payload_tokens: usize,
+}
+
+impl RecoveryResultCost {
+    fn new(result: &ToolOutputSelectorResult) -> Self {
+        let payload_tokens = if result.status == ToolOutputSelectorStatus::Ok {
+            result
+                .text
+                .as_ref()
+                .or(result.data_base64.as_ref())
+                .map(recovery_size)
+                .or_else(|| result.value.as_ref().map(recovery_size))
+                .map_or(0, TokenCountEstimate::tokens)
+        } else {
+            0
+        };
+        Self {
+            serialized: recovery_size(result),
+            payload_tokens,
+        }
+    }
+}
+
+struct ReconstructedSelection {
+    result: ToolOutputSelectorResult,
+    cost: RecoveryResultCost,
+    source_length: usize,
+    direct_index: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -135,21 +180,43 @@ struct RecoveryContinuationState {
     drained_continuation_pages: u32,
     token_ceiling: usize,
     continuation_stop: Option<RecoveryContinuationStopV1>,
+    result_costs: Vec<RecoveryResultCost>,
+    reconstructed: Vec<Option<ReconstructedSelection>>,
+    covered_until: Vec<u64>,
+    envelope_costs: [TokenCountEstimate; 2],
 }
 
 impl RecoveryContinuationState {
-    fn new(output: ReadToolOutputResult, reused: bool, token_ceiling: usize) -> Self {
-        Self {
+    fn new(mut output: ReadToolOutputResult, reused: bool, token_ceiling: usize) -> Self {
+        let results = std::mem::take(&mut output.results);
+        let complete = output.complete;
+        output.complete = false;
+        let incomplete_cost = recovery_size(&output);
+        output.complete = true;
+        let complete_cost = recovery_size(&output);
+        output.complete = complete;
+        output.results = results;
+        let mut state = Self {
             checkpoints: Vec::new(),
             initial_result_count: output.results.len(),
             result_owners: (0..output.results.len()).collect(),
+            result_costs: output.results.iter().map(RecoveryResultCost::new).collect(),
+            reconstructed: (0..output.results.len()).map(|_| None).collect(),
+            covered_until: output
+                .results
+                .iter()
+                .map(|result| result.canonical_range.map_or(0, |range| range.start))
+                .collect(),
+            envelope_costs: [incomplete_cost, complete_cost],
             output,
             reused,
             followed_selectors: Vec::new(),
             drained_continuation_pages: 0,
             token_ceiling,
             continuation_stop: None,
-        }
+        };
+        state.refresh_reconstruction();
+        state
     }
 
     fn record_stop(
@@ -297,6 +364,7 @@ impl RecoveryContinuationState {
 
         let previous_length = self.output.results.len();
         let previous_complete = self.output.complete;
+        let previous_cost = self.result_costs[result_index];
         let predecessor = &mut self.output.results[result_index];
         let next_continuation = next_owner_continuation(predecessor, selector);
         let previous_continuation =
@@ -305,6 +373,14 @@ impl RecoveryContinuationState {
         if predecessor.status == ToolOutputSelectorStatus::Ok {
             predecessor.complete = predecessor.continuation.is_none();
         }
+        self.result_costs[result_index].serialized = previous_cost
+            .serialized
+            .subtract_delimited(continuation_size(previous_continuation.as_ref()))
+            .subtract_delimited(recovery_size(&predecessor_was_complete))
+            .add_delimited(continuation_size(predecessor.continuation.as_ref()))
+            .add_delimited(recovery_size(&predecessor.complete));
+        self.result_costs
+            .extend(page.results.iter().map(RecoveryResultCost::new));
         // Keep already-drained pages in traversal order. Inserting every page
         // immediately after the owner reverses multi-page continuations.
         self.result_owners.extend(std::iter::repeat_n(
@@ -318,7 +394,8 @@ impl RecoveryContinuationState {
                     && result.complete
                     && result.continuation.is_none()
             });
-        if !recovery_result_fits_token_ceiling(&self.reconstructed_output(), self.token_ceiling) {
+        self.refresh_reconstruction();
+        if self.projected_size(None).tokens() > self.token_ceiling {
             // Roll back only this page rather than copying every accumulated
             // page for each budget check.
             self.output.results.truncate(previous_length);
@@ -327,6 +404,7 @@ impl RecoveryContinuationState {
             let predecessor = &mut self.output.results[result_index];
             predecessor.continuation = previous_continuation;
             predecessor.complete = predecessor_was_complete;
+            self.rollback_costs(previous_length, result_index, previous_cost);
             return Err(ContinuationStopReason::Budget);
         }
 
@@ -339,11 +417,13 @@ impl RecoveryContinuationState {
             complete: previous_complete,
             continuation: previous_continuation,
             owner_complete: predecessor_was_complete,
+            owner_cost: previous_cost,
         });
         self.drained_continuation_pages = self.drained_continuation_pages.saturating_add(1);
         Ok(())
     }
 
+    #[cfg(test)]
     fn reconstructed_output(&self) -> ReadToolOutputResult {
         // Replace overflow descriptors only after exact, gap-free coverage is
         // proven. Appended byte pages are transport fragments, not extra selections.
@@ -398,32 +478,16 @@ impl RecoveryContinuationState {
     fn page_token_ceiling(&self, result_index: usize) -> usize {
         let owner = self.result_owners[result_index];
         let occupied = self
-            .output
-            .results
+            .result_costs
             .iter()
             .enumerate()
-            .filter_map(|(index, result)| {
+            .map(|(index, cost)| {
                 if self.result_owners[index] != owner {
-                    serde_json::to_string(result).ok()
-                } else if result.status == ToolOutputSelectorStatus::Ok {
-                    // Keep the byte cost already recovered for this owner, while
-                    // crediting the fragment envelope removed by reconstruction.
-                    result
-                        .text
-                        .as_ref()
-                        .or(result.data_base64.as_ref())
-                        .and_then(|text| serde_json::to_string(text).ok())
-                        .or_else(|| {
-                            result
-                                .value
-                                .as_ref()
-                                .and_then(|value| serde_json::to_string(value).ok())
-                        })
+                    cost.serialized.tokens()
                 } else {
-                    None
+                    cost.payload_tokens
                 }
             })
-            .map(|text| codex_utils_string::approx_token_count(&text))
             .sum::<usize>();
         self.token_ceiling.saturating_sub(occupied)
     }
@@ -437,22 +501,29 @@ impl RecoveryContinuationState {
             }
             _ => None,
         };
+        if !selection_has_coverage(&owner, &self.output.results) {
+            return None;
+        }
         let exact = reconstruct_selection(&owner, &self.output.results)?;
-        let mut page = self.output.clone();
-        page.results = vec![exact];
-        page.complete = true;
-        Some(page)
+        Some(ReadToolOutputResult {
+            artifact_id: self.output.artifact_id.clone(),
+            canonical_sha256: self.output.canonical_sha256.clone(),
+            canonical_bytes: self.output.canonical_bytes,
+            retained_bytes: self.output.retained_bytes,
+            unavailable_ranges: self.output.unavailable_ranges.clone(),
+            results: vec![exact],
+            complete: true,
+        })
     }
 
     fn finish(mut self) -> DrainedRecoveryTransaction {
         loop {
-            let reconstructed = self.reconstructed_output();
-            if recovery_envelope_fits(
-                &reconstructed,
-                self.continuation_stop.as_ref(),
-                self.token_ceiling,
-            ) {
-                self.output = reconstructed;
+            if self
+                .projected_size(self.continuation_stop.as_ref())
+                .tokens()
+                <= self.token_ceiling
+            {
+                self.materialize_reconstruction();
                 break;
             }
             let Some(checkpoint) = self.checkpoints.pop() else {
@@ -467,6 +538,7 @@ impl RecoveryContinuationState {
             self.output.complete = checkpoint.complete;
             self.output.results[checkpoint.index].continuation = checkpoint.continuation;
             self.output.results[checkpoint.index].complete = checkpoint.owner_complete;
+            self.rollback_costs(checkpoint.length, checkpoint.index, checkpoint.owner_cost);
             self.followed_selectors.pop();
             self.drained_continuation_pages = self.drained_continuation_pages.saturating_sub(1);
             self.record_stop(ContinuationStopReason::Budget, Some(checkpoint.selector));
@@ -478,6 +550,188 @@ impl RecoveryContinuationState {
             continuation_stop: self.continuation_stop,
         }
     }
+
+    fn rollback_costs(&mut self, length: usize, index: usize, cost: RecoveryResultCost) {
+        self.result_costs.truncate(length);
+        self.result_costs[index] = cost;
+        for cached in &mut self.reconstructed {
+            if cached
+                .as_ref()
+                .is_some_and(|cached| cached.source_length > length)
+            {
+                *cached = None;
+            }
+        }
+        for (index, cursor) in self.covered_until.iter_mut().enumerate() {
+            *cursor = self.output.results[index]
+                .canonical_range
+                .map_or(0, |range| range.start);
+        }
+        self.refresh_reconstruction();
+    }
+
+    fn refresh_reconstruction(&mut self) {
+        if !self.output.unavailable_ranges.is_empty() {
+            return;
+        }
+        for (index, owner) in self.output.results[..self.initial_result_count]
+            .iter()
+            .enumerate()
+        {
+            if owner.status == ToolOutputSelectorStatus::Ok {
+                continue;
+            }
+            let direct_index = self.output.results.iter().position(|page| {
+                page.selector == owner.selector
+                    && page.status == ToolOutputSelectorStatus::Ok
+                    && page.complete
+                    && page.continuation.is_none()
+            });
+            if self.reconstructed[index]
+                .as_ref()
+                .is_some_and(|cached| cached.direct_index == direct_index)
+                || !selection_has_coverage_from(
+                    owner,
+                    &self.output.results,
+                    &mut self.covered_until[index],
+                )
+            {
+                continue;
+            }
+            if let Some(result) = reconstruct_selection(owner, &self.output.results) {
+                self.reconstructed[index] = Some(ReconstructedSelection {
+                    cost: RecoveryResultCost::new(&result),
+                    result,
+                    source_length: self.output.results.len(),
+                    direct_index,
+                });
+            }
+        }
+    }
+
+    fn fragment_is_reconstructed(&self, index: usize) -> bool {
+        if index < self.initial_result_count {
+            return false;
+        }
+        let page = &self.output.results[index];
+        self.reconstructed.iter().flatten().any(|cached| {
+            let owner = &cached.result;
+            page.selector == owner.selector
+                || (matches!(page.selector, ToolOutputSelector::Bytes { .. })
+                    && owner.canonical_range.zip(page.canonical_range).is_some_and(
+                        |(owner, page)| owner.start <= page.start && page.end <= owner.end,
+                    ))
+        })
+    }
+
+    fn projected_size(&self, stop: Option<&RecoveryContinuationStopV1>) -> TokenCountEstimate {
+        let mut size = TokenCountEstimate::default();
+        let mut count = 0;
+        let mut complete = true;
+        for (index, raw) in self.output.results.iter().enumerate() {
+            if self.fragment_is_reconstructed(index) {
+                continue;
+            }
+            let (result, cost) = self
+                .reconstructed
+                .get(index)
+                .and_then(Option::as_ref)
+                .map_or((raw, &self.result_costs[index]), |cached| {
+                    (&cached.result, &cached.cost)
+                });
+            if count > 0 {
+                size = size.add_delimited(TokenCountEstimate::new(","));
+            }
+            size = size.add_delimited(cost.serialized);
+            count += 1;
+            complete &= result.status == ToolOutputSelectorStatus::Ok
+                && result.complete
+                && result.continuation.is_none();
+        }
+        if !self.reconstructed.iter().any(Option::is_some) {
+            complete = self.output.complete;
+        }
+        size = size.add_delimited(self.envelope_costs[usize::from(complete)]);
+        if let Some(stop) = stop {
+            size = size
+                .add_delimited(TokenCountEstimate::new(",\"continuation_stop\":"))
+                .add_delimited(recovery_size(stop));
+        }
+        size
+    }
+
+    fn materialize_reconstruction(&mut self) {
+        if !self.reconstructed.iter().any(Option::is_some) {
+            return;
+        }
+        let keep = (0..self.output.results.len())
+            .map(|index| !self.fragment_is_reconstructed(index))
+            .collect::<Vec<_>>();
+        self.output.results = std::mem::take(&mut self.output.results)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                keep[index].then(|| {
+                    self.reconstructed
+                        .get_mut(index)
+                        .and_then(Option::take)
+                        .map_or(result, |cached| cached.result)
+                })
+            })
+            .collect();
+        self.output.complete = self.output.results.iter().all(|result| {
+            result.status == ToolOutputSelectorStatus::Ok
+                && result.complete
+                && result.continuation.is_none()
+        });
+    }
+}
+
+// Check only range metadata until coverage is complete. Incomplete owners must
+// not repeatedly decode/copy all previously accepted fragments.
+fn selection_has_coverage(
+    owner: &ToolOutputSelectorResult,
+    pages: &[ToolOutputSelectorResult],
+) -> bool {
+    let mut cursor = owner.canonical_range.map_or(0, |range| range.start);
+    selection_has_coverage_from(owner, pages, &mut cursor)
+}
+
+fn selection_has_coverage_from(
+    owner: &ToolOutputSelectorResult,
+    pages: &[ToolOutputSelectorResult],
+    cursor: &mut u64,
+) -> bool {
+    if pages.iter().any(|page| {
+        page.selector == owner.selector
+            && page.status == ToolOutputSelectorStatus::Ok
+            && page.complete
+            && page.continuation.is_none()
+    }) {
+        return true;
+    }
+    let Some(range) = owner.canonical_range else {
+        return false;
+    };
+    while *cursor < range.end {
+        let next = pages
+            .iter()
+            .filter(|page| {
+                page.status == ToolOutputSelectorStatus::Ok
+                    && page.complete
+                    && page.continuation.is_none()
+                    && (page.text.is_some() || page.data_base64.is_some())
+            })
+            .filter_map(|page| page.canonical_range)
+            .filter(|page| page.start <= *cursor && *cursor < page.end)
+            .map(|page| page.end)
+            .max();
+        let Some(next) = next else {
+            return false;
+        };
+        *cursor = next;
+    }
+    true
 }
 
 fn reconstruct_selection(
@@ -998,6 +1252,7 @@ async fn drain_recovery_snapshot(
     Ok(result)
 }
 
+#[cfg(test)]
 fn recovery_result_fits_token_ceiling(output: &ReadToolOutputResult, token_ceiling: usize) -> bool {
     serde_json::to_string(output)
         .is_ok_and(|rendered| codex_utils_string::approx_token_count(&rendered) <= token_ceiling)
@@ -1469,6 +1724,203 @@ mod tests {
                 .all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete),
             unavailable_ranges: Vec::new(),
             results,
+        }
+    }
+
+    #[test]
+    fn many_page_incremental_recovery_matches_reconstruction_and_budget_rollback() {
+        for mode in 0..4 {
+            let text = "escaped \"\\\n\t 中😀 word_123 ".repeat(160);
+            let bytes = match mode {
+                2 => serde_json::to_vec(&serde_json::json!({"data": text})).unwrap(),
+                3 => [text.as_bytes(), &[0xff, 0xfe]].concat(),
+                _ => text.into_bytes(),
+            };
+            let pages = bytes
+                .chunks(64)
+                .enumerate()
+                .map(|(index, bytes)| {
+                    let start = (index * 64) as u64;
+                    let end = start + bytes.len() as u64;
+                    let mut page = selector_result(ToolOutputSelectorStatus::Ok);
+                    page.selector = ToolOutputSelector::Bytes { start, end };
+                    page.canonical_range = Some(CanonicalByteRange::new(start, end));
+                    page.exact_bytes = Some(bytes.len() as u64);
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        page.text = Some(text.into());
+                    } else {
+                        page.data_base64 =
+                            Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+                    }
+                    page
+                })
+                .collect::<Vec<_>>();
+            assert!(pages.len() > 64);
+            let mut owner = selector_result(if mode == 0 {
+                ToolOutputSelectorStatus::Ok
+            } else {
+                ToolOutputSelectorStatus::SelectorTooLarge
+            });
+            owner.complete = false;
+            owner.continuation = Some(pages[0].selector.clone());
+            if mode != 0 {
+                owner.selector = if mode == 2 {
+                    ToolOutputSelector::JsonPointer {
+                        pointer: "/data".into(),
+                    }
+                } else {
+                    ToolOutputSelector::Bytes {
+                        start: 0,
+                        end: bytes.len() as u64,
+                    }
+                };
+                owner.canonical_range = Some(CanonicalByteRange::new(0, bytes.len() as u64));
+                owner.subdivision_plan =
+                    Some(crate::tools::command_output_artifact::ByteSubdivisionPlan {
+                        range: owner.canonical_range.unwrap(),
+                        chunk_bytes: 64,
+                        chunk_count: pages.len() as u64,
+                        selector_kind: "bytes".into(),
+                    });
+            }
+            let initial = recovery_output(vec![owner]);
+            for ceiling in [usize::MAX, 3500, 3501] {
+                let mut state = RecoveryContinuationState::new(initial.clone(), false, ceiling);
+                let mut reference = RecoveryContinuationState::new(initial.clone(), false, ceiling);
+                let mut checkpoints = Vec::new();
+                for (index, fragment) in pages.iter().enumerate() {
+                    let step = reference.next_step();
+                    assert_eq!(state.next_step(), step);
+                    let ContinuationStep::Follow {
+                        result_index,
+                        selector,
+                    } = step
+                    else {
+                        panic!("expected continuation {index}");
+                    };
+                    let mut page = fragment.clone();
+                    if mode == 0 && index + 1 < pages.len() {
+                        page.complete = false;
+                        page.continuation = Some(pages[index + 1].selector.clone());
+                    }
+                    let before = reference.output.clone();
+                    let predecessor = &mut reference.output.results[result_index];
+                    predecessor.continuation = next_owner_continuation(predecessor, &selector);
+                    if predecessor.status == ToolOutputSelectorStatus::Ok {
+                        predecessor.complete = predecessor.continuation.is_none();
+                    }
+                    reference.output.results.push(page.clone());
+                    reference.output.complete = reference.output.results.iter().all(|result| {
+                        result.status == ToolOutputSelectorStatus::Ok
+                            && result.complete
+                            && result.continuation.is_none()
+                    });
+                    let expected = reference.reconstructed_output();
+                    let fits = recovery_result_fits_token_ceiling(&expected, ceiling);
+                    let accepted = state.accept_page(
+                        result_index,
+                        &selector,
+                        recovery_output(vec![page]),
+                        true,
+                    );
+                    assert_eq!(
+                        accepted,
+                        if fits {
+                            Ok(())
+                        } else {
+                            Err(ContinuationStopReason::Budget)
+                        }
+                    );
+                    if !fits {
+                        reference.output = before;
+                        reference
+                            .record_stop(ContinuationStopReason::Budget, Some(selector.clone()));
+                        state.record_stop(ContinuationStopReason::Budget, Some(selector));
+                        break;
+                    }
+                    reference
+                        .result_owners
+                        .push(reference.result_owners[result_index]);
+                    checkpoints.push((before, selector));
+                    assert_eq!(
+                        state.projected_size(None).tokens(),
+                        recovery_size(&expected).tokens()
+                    );
+                    assert_eq!(state.reconstructed_output(), expected);
+                    // The cache must agree with the old per-selection serialization,
+                    // including the per-fragment rounding used for page admission.
+                    for owner in 0..state.initial_result_count {
+                        let occupied = state
+                            .output
+                            .results
+                            .iter()
+                            .enumerate()
+                            .map(|(index, result)| {
+                                if state.result_owners[index] != owner {
+                                    recovery_size(result).tokens()
+                                } else {
+                                    RecoveryResultCost::new(result).payload_tokens
+                                }
+                            })
+                            .sum::<usize>();
+                        assert_eq!(
+                            state.page_token_ceiling(owner),
+                            ceiling.saturating_sub(occupied)
+                        );
+                    }
+                }
+                if ceiling == usize::MAX {
+                    assert_eq!(checkpoints.len(), pages.len());
+                    assert_eq!(state.next_step(), ContinuationStep::Complete);
+                } else {
+                    assert!(checkpoints.len() > 8 && checkpoints.len() < pages.len());
+                    assert_eq!(
+                        state.continuation_stop.as_ref().unwrap().reason,
+                        ContinuationStopReason::Budget
+                    );
+                }
+                // Replay the old final-envelope rollback independently of the cache.
+                let expected = loop {
+                    let reconstructed = reference.reconstructed_output();
+                    if recovery_envelope_fits(
+                        &reconstructed,
+                        reference.continuation_stop.as_ref(),
+                        ceiling,
+                    ) {
+                        break reconstructed;
+                    }
+                    let (previous, selector) = checkpoints
+                        .pop()
+                        .expect("fixture leaves room for stop metadata");
+                    reference.output = previous;
+                    reference.record_stop(ContinuationStopReason::Budget, Some(selector));
+                };
+                let actual = state.finish();
+                assert_eq!(
+                    actual.drained_continuation_pages as usize,
+                    checkpoints.len()
+                );
+                assert_eq!(actual.continuation_stop, reference.continuation_stop);
+                assert_eq!(
+                    serde_json::to_vec(&actual.output).unwrap(),
+                    serde_json::to_vec(&expected).unwrap()
+                );
+                if ceiling == usize::MAX && mode != 0 {
+                    let result = &actual.output.results[0];
+                    let recovered = if let Some(text) = &result.text {
+                        text.as_bytes().to_vec()
+                    } else if let Some(value) = &result.value {
+                        serde_json::to_vec(value).unwrap()
+                    } else {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(result.data_base64.as_ref().unwrap())
+                            .unwrap()
+                    };
+                    assert_eq!(recovered, bytes);
+                    assert!(actual.output.complete);
+                    assert!(actual.continuation_stop.is_none());
+                }
+            }
         }
     }
 

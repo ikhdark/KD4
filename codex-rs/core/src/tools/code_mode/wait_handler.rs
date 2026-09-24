@@ -38,6 +38,13 @@ const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 // cell keeps running; nothing is terminated. A one-hour bound left a recorded
 // full-suite run invisible for ten minutes until the user aborted it.
 const OWNER_HELD_WAIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Default for a nested terminal poll whose caller omitted its deadline. It
+/// must end inside the held wait above: an equal default always loses that
+/// race, so the cell yields first and the model spends a `wait` call to collect
+/// a result that was milliseconds away. The headroom covers dispatch and the
+/// short setup a cell typically runs before it starts polling.
+pub(crate) const NESTED_DEFAULT_POLL: Duration =
+    OWNER_HELD_WAIT_TIMEOUT.saturating_sub(Duration::from_secs(15));
 
 pub struct CodeModeWaitHandler;
 

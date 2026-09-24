@@ -34,6 +34,10 @@ pub struct Request {
     pub allow_full_suite: bool,
     #[serde(default)]
     pub force_fresh: bool,
+    /// A captured source copy whose files must be marked newer than any build
+    /// that already ran in the leased lane.
+    #[serde(default)]
+    pub snapshot_root: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -208,9 +212,9 @@ fn selected_packages(meta: &Value, check: &Check) -> anyhow::Result<BTreeSet<Str
     Ok(ids)
 }
 
-fn hash_tree(root: &Path, hash: &mut Sha256, count: &mut usize) -> anyhow::Result<()> {
+fn hash_tree(root: &Path, hash: &mut Sha256) -> anyhow::Result<()> {
     let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
         let name = entry.file_name();
         if matches!(name.to_str(), Some("target" | ".git" | ".codex-validation")) {
@@ -226,17 +230,31 @@ fn hash_tree(root: &Path, hash: &mut Sha256, count: &mut usize) -> anyhow::Resul
         hash.update([0]);
         if ty.is_dir() {
             hash.update(b"directory");
-            hash_tree(&entry.path(), hash, count)?;
+            hash_tree(&entry.path(), hash)?;
             hash.update(b"end-directory\0");
         } else if ty.is_file() {
-            *count += 1;
+            let file = fs::File::open(entry.path())?;
+            let len = file.metadata()?.len();
+            hash.update(len.to_le_bytes());
+            // Bound memory, not input size: large dependency trees still need
+            // complete content hashes before a passing receipt can be reused.
+            let mut reader = BufReader::with_capacity(64 * 1024, file);
+            let mut read_len = 0_u64;
+            loop {
+                let bytes = reader.fill_buf()?;
+                if bytes.is_empty() {
+                    break;
+                }
+                hash.update(bytes);
+                let consumed = bytes.len();
+                read_len += consumed as u64;
+                reader.consume(consumed);
+            }
             ensure!(
-                *count <= 100_000 && entry.metadata()?.len() <= 64 * 1024 * 1024,
-                "dependency fingerprint exceeds its bounded file limit"
+                read_len == len,
+                "validation dependency changed size while fingerprinting: {}",
+                entry.path().display()
             );
-            let bytes = fs::read(entry.path())?;
-            hash.update((bytes.len() as u64).to_le_bytes());
-            hash.update(bytes);
         }
     }
     Ok(())
@@ -250,10 +268,9 @@ fn fingerprint(
 ) -> anyhow::Result<String> {
     let ids = selected_packages(meta, check)?;
     let mut hash = Sha256::new();
-    hash.update(b"codex-validation-v2");
+    hash.update(b"codex-validation-v3");
     hash.update(serde_json::to_vec(check)?);
     hash.update(toolchain.as_bytes());
-    let mut count = 0;
     for package in meta["packages"].as_array().context("packages")? {
         if ids.contains(package["id"].as_str().unwrap_or_default()) {
             hash.update(package["name"].as_str().context("name")?.as_bytes());
@@ -263,7 +280,6 @@ fn fingerprint(
                     .parent()
                     .context("manifest parent")?,
                 &mut hash,
-                &mut count,
             )?;
         }
     }
@@ -324,6 +340,7 @@ fn fingerprint(
                 Some(
                     "CARGO_TARGET_DIR"
                         | "CARGO_BUILD_BUILD_DIR"
+                        | "CODEX_CARGO_LANE_TARGET_DIR"
                         | "CODEX_VALIDATION_SOURCE_REVISION"
                         | "PWD"
                         | "OLDPWD"
@@ -399,7 +416,91 @@ fn changed_packages(root: &Path, meta: &Value) -> anyhow::Result<(Vec<String>, B
     Ok((names.into_iter().collect(), affected))
 }
 
+const LANES: usize = 4;
+
+fn open_lane(base: &Path, index: usize) -> anyhow::Result<(PathBuf, fs::File)> {
+    let lane = if index == 0 {
+        base.to_path_buf()
+    } else {
+        base.with_file_name(format!(
+            "{}-{index}",
+            base.file_name().context("lane name")?.to_string_lossy()
+        ))
+    };
+    fs::create_dir_all(&lane)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lane.join("lease.lock"))?;
+    Ok((lane, lock))
+}
+
+/// Leases the first idle output lane under `base` without waiting; `None`
+/// when every lane is busy. The lease lasts until the returned file is dropped.
+pub fn try_acquire_lane(base: &Path) -> anyhow::Result<Option<(PathBuf, fs::File, usize)>> {
+    for index in 0..LANES {
+        let (lane, lock) = open_lane(base, index)?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(Some((lane, lock, index))),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
+
+fn acquire_lane(base: &Path) -> anyhow::Result<(PathBuf, fs::File, usize, u128)> {
+    let started = std::time::Instant::now();
+    if let Some((lane, lock, index)) = try_acquire_lane(base)? {
+        return Ok((lane, lock, index, started.elapsed().as_millis()));
+    }
+    let (lane, lock) = open_lane(base, 0)?;
+    lock.lock_exclusive()?;
+    Ok((lane, lock, LANES, started.elapsed().as_millis()))
+}
+
+/// Marks every file of a captured source copy as modified now. Cargo judges
+/// path-package freshness by mtime and hashes workspace members relative to
+/// their root, so a copy captured before another snapshot's build started in
+/// the same lane would otherwise reuse that build's artifacts. Call it only
+/// while holding the lane's lease, after every earlier build there finished.
+pub fn refresh_snapshot_mtimes(root: &Path) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                if entry.file_name() != ".git" {
+                    pending.push(entry.path());
+                }
+            } else if kind.is_file() {
+                let mut options = fs::OpenOptions::new();
+                // Timestamps need only attribute access; captured copies keep
+                // their source permissions and may be read-only.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+                    options.access_mode(FILE_WRITE_ATTRIBUTES);
+                }
+                #[cfg(not(windows))]
+                options.read(true);
+                options
+                    .open(entry.path())?
+                    .set_modified(now)
+                    .with_context(|| format!("refresh {}", entry.path().display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run(request: Request) -> anyhow::Result<Value> {
+    let run_started = std::time::Instant::now();
     let root = fs::canonicalize(&request.repository)?;
     let meta = metadata(&root)?;
     if matches!(request.action, Action::Plan) {
@@ -447,7 +548,7 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
         output("cargo", &["-V"], &root)?
     );
     // A lane is stable across edits but exclusive until all test executables
-    // exit. Different compiler configurations have independent warm outputs.
+    // exit. Concurrent runs may lease one of the bounded overflow lanes.
     let lane_id = format!(
         "{:x}",
         Sha256::digest(format!(
@@ -455,15 +556,11 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
             request.cache_identity.as_ref().unwrap_or(&root).display()
         ))
     );
-    let lane = request.cache_directory.join(lane_id);
-    fs::create_dir_all(&lane)?;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lane.join("lease.lock"))?;
-    lock.lock_exclusive()?;
+    let (lane, _lease, busy_lanes, lease_wait_ms) =
+        acquire_lane(&request.cache_directory.join(lane_id))?;
+    if let Some(snapshot) = &request.snapshot_root {
+        refresh_snapshot_mtimes(snapshot)?;
+    }
     let mut results = Vec::new();
     for check in &request.checks {
         let key = format!("{:x}", Sha256::digest(serde_json::to_vec(check)?));
@@ -481,6 +578,8 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
                 {
                     let mut result = receipt.result;
                     result["reused"] = json!(true);
+                    result["executed_duration_ms"] = json!(0);
+                    result["cargo_lock_messages"] = json!(0);
                     results.push(result);
                     continue;
                 }
@@ -511,12 +610,16 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
         if !args.iter().any(|a| a == "--locked" || a == "--frozen") {
             args.insert(1, "--locked".into());
         }
+        let process_started = std::time::Instant::now();
         let mut child = OwnedChild(
             crate::command("cargo")
                 .args(&args)
                 .current_dir(&root)
                 .env("CARGO_TARGET_DIR", lane.join("target"))
                 .env("CARGO_BUILD_BUILD_DIR", lane.join("build"))
+                // Match the Cargo output override so nested repository runners
+                // cannot redirect builds back into the caller's snapshot lane.
+                .env("CODEX_CARGO_LANE_TARGET_DIR", lane.join("target"))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?,
@@ -541,9 +644,13 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
         });
         let mut text = String::new();
         let mut log_complete = true;
+        let mut cargo_lock_messages = 0_u64;
         for line in receiver {
             match line {
                 Ok(line) => {
+                    if line.contains("Blocking waiting for file lock") {
+                        cargo_lock_messages += 1;
+                    }
                     writeln!(raw, "{line}")?;
                     if text.len().saturating_add(line.len()) <= 64 * 1024 * 1024 {
                         text.push_str(&line);
@@ -559,6 +666,7 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
             }
         }
         let status = child.0.wait()?;
+        let executed_duration_ms = process_started.elapsed().as_millis();
         out_reader
             .join()
             .map_err(|_| anyhow::anyhow!("stdout reader panicked"))?;
@@ -583,7 +691,8 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
             && (check.args[0] != "test" || tests_executed);
         let result = json!({"id":check.id,"args":args,"exit_code":status.code(),"success":success,
             "source_unchanged":before==after,"tests_executed":tests_executed,"reused":false,
-            "dependency_fingerprint":after,"raw_log":raw_path,"inventory":inventory});
+            "dependency_fingerprint":after,"raw_log":raw_path,"inventory":inventory,
+            "executed_duration_ms":executed_duration_ms,"cargo_lock_messages":cargo_lock_messages});
         if success {
             let receipt = Receipt {
                 fingerprint: before,
@@ -596,13 +705,118 @@ pub fn run(request: Request) -> anyhow::Result<Value> {
         results.push(result);
     }
     Ok(
-        json!({"success":results.iter().all(|r|r["success"]==true),"checks":results,"build_lane":lane}),
+        json!({"success":results.iter().all(|r|r["success"]==true),"checks":results,"build_lane":lane,
+            "diagnostics":{"busy_lanes":busy_lanes,"lease_wait_ms":lease_wait_ms,"total_duration_ms":run_started.elapsed().as_millis()}}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_output_paths_reuse_passes_but_real_environment_changes_invalidate() {
+        const CHILD_ROOT: &str = "CODEX_VALIDATION_SNAPSHOT_TEST_ROOT";
+        if let Some(dir) = std::env::var_os(CHILD_ROOT) {
+            let dir = PathBuf::from(dir);
+            let revision = std::env::var("CODEX_VALIDATION_SOURCE_REVISION").unwrap();
+            let result = run(Request {
+                repository: dir.join(revision),
+                cache_directory: dir.join("cache"),
+                cache_identity: Some(dir.join("origin")),
+                action: Action::Run,
+                checks: vec![Check {
+                    id: "snapshot".into(),
+                    args: vec!["test".into(), "--lib".into()],
+                }],
+                allow_full_suite: false,
+                force_fresh: false,
+                snapshot_root: None,
+            })
+            .unwrap();
+            fs::write(
+                dir.join("result.json"),
+                serde_json::to_vec(&result).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        fs::create_dir_all(first_root.join("src")).unwrap();
+        fs::write(
+            first_root.join("Cargo.toml"),
+            "[package]\nname='snapshot_environment'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(
+            first_root.join("src/lib.rs"),
+            format!(
+                r#"#[test] fn environment() {{
+                    std::fs::write({:?}, std::env::var("CODEX_CARGO_LANE_TARGET_DIR").unwrap()).unwrap();
+                    assert_eq!(std::env::var("WORKSPACE_VALIDATION_TEST_INPUT").unwrap(), "pass");
+                }}"#,
+                dir.path().join("observed-lane.txt")
+            ),
+        )
+        .unwrap();
+        output("cargo", &["generate-lockfile", "--offline"], &first_root).unwrap();
+        let second_root = dir.path().join("second");
+        fs::create_dir_all(second_root.join("src")).unwrap();
+        for name in ["Cargo.toml", "Cargo.lock", "src/lib.rs"] {
+            fs::copy(first_root.join(name), second_root.join(name)).unwrap();
+        }
+        // Separate workers reproduce the environment bound by the core snapshot
+        // launcher without mutating this test process's shared environment.
+        let execute = |revision: &str, input: &str| {
+            let artifacts = dir.path().join(revision).join("artifacts");
+            let result = crate::command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "validation::tests::snapshot_output_paths_reuse_passes_but_real_environment_changes_invalidate",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, dir.path())
+                .env("CODEX_VALIDATION_SOURCE_REVISION", revision)
+                .env("CARGO_TARGET_DIR", artifacts.join("target"))
+                .env("CARGO_BUILD_BUILD_DIR", artifacts.join("build"))
+                .env("CODEX_CARGO_LANE_TARGET_DIR", artifacts.join("target"))
+                .env("WORKSPACE_VALIDATION_TEST_INPUT", input)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "worker failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            serde_json::from_slice::<Value>(&fs::read(dir.path().join("result.json")).unwrap())
+                .unwrap()
+        };
+        let first = execute("first", "pass");
+        assert_eq!(first["success"], true, "{first}");
+        assert_eq!(first["checks"][0]["reused"], false);
+        let second = execute("second", "pass");
+        assert_eq!(second["success"], true, "{second}");
+        assert_eq!(second["checks"][0]["reused"], true, "{second}");
+        assert_eq!(second["checks"][0]["executed_duration_ms"], 0);
+        assert_eq!(
+            second["checks"][0]["raw_log"],
+            first["checks"][0]["raw_log"]
+        );
+        assert_eq!(
+            PathBuf::from(fs::read_to_string(dir.path().join("observed-lane.txt")).unwrap()),
+            Path::new(first["build_lane"].as_str().unwrap()).join("target")
+        );
+        let changed = execute("second", "fail");
+        assert_eq!(changed["success"], false, "{changed}");
+        assert_eq!(changed["checks"][0]["reused"], false);
+        assert_ne!(
+            changed["checks"][0]["dependency_fingerprint"],
+            second["checks"][0]["dependency_fingerprint"]
+        );
+    }
 
     #[test]
     fn fresh_failure_invalidates_an_older_pass_with_the_same_fingerprint() {
@@ -636,6 +850,7 @@ mod tests {
                 }],
                 allow_full_suite: false,
                 force_fresh,
+                snapshot_root: None,
             })
             .unwrap()
         };
@@ -698,6 +913,7 @@ mod tests {
             checks: vec![],
             allow_full_suite: false,
             force_fresh: false,
+            snapshot_root: None,
         })
         .unwrap();
         assert_eq!(result["changed_paths"], json!(["a/src/lib.rs"]));
@@ -727,16 +943,158 @@ mod tests {
         assert!(validate_check(&check(&["test", "--lib", "--", "--list"]), false).is_err());
         assert!(validate_check(&check(&["check", "--message-format=short"]), false).is_err());
     }
+
+    #[test]
+    fn busy_validation_lane_uses_exclusive_overflow_and_returns_to_warm_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("lane");
+        let (first, first_lease, first_busy, _) = acquire_lane(&base).unwrap();
+        assert_eq!(first, base);
+        assert_eq!(first_busy, 0);
+        let (second, second_lease, second_busy, _) = acquire_lane(&base).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second_busy, 1);
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(second.join("lease.lock"))
+            .unwrap();
+        assert_eq!(
+            probe.try_lock_exclusive().unwrap_err().raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        drop(first_lease);
+        let (third, _third_lease, third_busy, _) = acquire_lane(&base).unwrap();
+        assert_eq!(third, first);
+        assert_eq!(third_busy, 0);
+        drop(second_lease);
+    }
+
+    #[test]
+    fn nonblocking_lane_lease_reports_saturation_and_reopens_released_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("lane");
+        let mut leases = (0..LANES)
+            .map(|expected| {
+                let (lane, lease, index) = try_acquire_lane(&base).unwrap().expect("idle lane");
+                assert_eq!(index, expected);
+                (lane, lease)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            try_acquire_lane(&base).unwrap().is_none(),
+            "a saturated origin must not wait for a lane"
+        );
+        let (released, lease) = leases.remove(2);
+        drop(lease);
+        let (lane, _lease, index) = try_acquire_lane(&base).unwrap().expect("released lane");
+        assert_eq!((lane, index), (released, 2));
+    }
+
+    #[test]
+    fn refreshed_snapshot_is_rebuilt_in_a_lane_built_from_another_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = dir.path().join("lane");
+        let snapshot = |name: &str, value: u32| {
+            let root = dir.path().join(name).join("work");
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname='lane_probe'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/lib.rs"),
+                format!("#[test] fn probe() {{ println!(\"probe value {value}\"); }}\n"),
+            )
+            .unwrap();
+            root
+        };
+        let run = |root: &Path| {
+            let output = crate::command("cargo")
+                .args(["test", "--offline", "--lib", "--", "--nocapture"])
+                .current_dir(root)
+                .env("CARGO_TARGET_DIR", lane.join("target"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        // The second snapshot was captured before the first build started in
+        // the shared lane; Cargo hashes both copies identically.
+        let second = snapshot("second", 2);
+        let captured = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        for file in ["Cargo.toml", "src/lib.rs"] {
+            fs::File::options()
+                .write(true)
+                .open(second.join(file))
+                .unwrap()
+                .set_modified(captured)
+                .unwrap();
+        }
+        let first = snapshot("first", 1);
+        assert!(run(&first).contains("probe value 1"));
+
+        refresh_snapshot_mtimes(&second).unwrap();
+        let output = run(&second);
+        assert!(
+            output.contains("probe value 2"),
+            "the lane must not serve the other snapshot's build: {output}"
+        );
+    }
+
+    #[test]
+    fn snapshot_mtime_refresh_covers_read_only_sources_but_not_git_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let source = dir.path().join("src/nested/lib.rs");
+        let read_only = dir.path().join("Cargo.toml");
+        let metadata = dir.path().join(".git/index");
+        for path in [&source, &read_only, &metadata] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "contents").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&read_only, permissions).unwrap();
+        let before = std::time::SystemTime::now();
+
+        refresh_snapshot_mtimes(dir.path()).unwrap();
+
+        let modified = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
+        assert!(modified(&source) >= before);
+        assert!(modified(&read_only) >= before);
+        assert!(fs::metadata(&read_only).unwrap().permissions().readonly());
+        assert!(
+            modified(&metadata) < before,
+            "Git metadata is not a build input"
+        );
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&read_only, permissions).unwrap();
+    }
     #[test]
     fn dependency_tree_fingerprint_tracks_content_and_file_additions() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("source.rs"), "first").unwrap();
         let hash = || {
             let mut h = Sha256::new();
-            hash_tree(dir.path(), &mut h, &mut 0).unwrap();
+            hash_tree(dir.path(), &mut h).unwrap();
             format!("{:x}", h.finalize())
         };
         let first = hash();
+        let mut expected = Sha256::new();
+        expected.update(b"source.rs\0");
+        expected.update(5_u64.to_le_bytes());
+        expected.update(b"first");
+        assert_eq!(first, format!("{:x}", expected.finalize()));
         fs::write(dir.path().join("source.rs"), "second").unwrap();
         let second = hash();
         assert_ne!(first, second);
@@ -746,6 +1104,34 @@ mod tests {
         let before = hash();
         fs::write(dir.path().join("target/cache"), "ignored build output").unwrap();
         assert_eq!(before, hash());
+    }
+
+    #[test]
+    fn dependency_tree_fingerprint_includes_more_than_100_000_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected = Sha256::new();
+        for directory in 0..100 {
+            let name = format!("{directory:03}");
+            let path = dir.path().join(&name);
+            fs::create_dir(&path).unwrap();
+            expected.update(name.as_bytes());
+            expected.update(b"\0directory");
+            for file in 0..1_000 {
+                let name = format!("{file:03}");
+                fs::write(path.join(&name), []).unwrap();
+                expected.update(name.as_bytes());
+                expected.update([0]);
+                expected.update(0_u64.to_le_bytes());
+            }
+            expected.update(b"end-directory\0");
+        }
+        fs::write(dir.path().join("last"), b"included").unwrap();
+        expected.update(b"last\0");
+        expected.update(8_u64.to_le_bytes());
+        expected.update(b"included");
+        let mut actual = Sha256::new();
+        hash_tree(dir.path(), &mut actual).unwrap();
+        assert_eq!(actual.finalize(), expected.finalize());
     }
 
     #[test]
@@ -772,6 +1158,11 @@ mod tests {
             .unwrap();
         }
         output("cargo", &["generate-lockfile", "--offline"], &root).unwrap();
+        let large_input = root.join("a/large.bin");
+        fs::File::create(&large_input)
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
         let run_check = || {
             run(Request {
                 repository: root.clone(),
@@ -784,6 +1175,7 @@ mod tests {
                 }],
                 allow_full_suite: false,
                 force_fresh: false,
+                snapshot_root: None,
             })
             .unwrap()
         };
@@ -791,15 +1183,37 @@ mod tests {
         assert_eq!(first["success"], true, "{first}");
         assert_eq!(first["checks"][0]["reused"], false);
         assert_eq!(first["checks"][0]["tests_executed"], true);
+        assert!(first["checks"][0]["executed_duration_ms"].as_u64().unwrap() > 0);
+        assert_eq!(first["diagnostics"]["busy_lanes"], 0);
         fs::write(
             root.join("b/src/lib.rs"),
             "#[test] fn other() { assert!(true); }\n",
         )
         .unwrap();
         let second = run_check();
+        assert_eq!(second["checks"][0]["executed_duration_ms"], 0);
         assert_eq!(
             second["checks"][0]["reused"], true,
             "unrelated package must not invalidate a's receipt: {second}"
+        );
+        {
+            use std::io::Seek;
+            use std::io::SeekFrom;
+
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&large_input)
+                .unwrap();
+            file.seek(SeekFrom::End(-1)).unwrap();
+            file.write_all(b"x").unwrap();
+        }
+        let changed_input = run_check();
+        assert_eq!(changed_input["success"], true, "{changed_input}");
+        assert_eq!(changed_input["checks"][0]["reused"], false);
+        assert_ne!(
+            first["checks"][0]["dependency_fingerprint"],
+            changed_input["checks"][0]["dependency_fingerprint"],
+            "same-length changes beyond 64 MiB must invalidate cached passes"
         );
         fs::write(
             root.join("a/src/lib.rs"),

@@ -72,8 +72,11 @@ pub(crate) async fn handle_retryable_response_stream_error(
     );
     // Connection recovery has its own retry counter. It must still reach the
     // HTTPS fallback when the WebSocket endpoint remains unavailable.
-    if (retry_state.retries >= max_retries
-        || (wait_for_connection_recovery && retry_state.connection_retries >= max_retries))
+    let retry_budget_exhausted = retry_state.retries >= max_retries
+        || (wait_for_connection_recovery && retry_state.connection_retries >= max_retries);
+    // Each new model request resets the retry budget. Switch on the first stream-read
+    // failure so intermittent WebSocket drops cannot keep replaying work at "1/N" indefinitely.
+    if (matches!(err, CodexErr::ResponseStreamFailed(_)) || retry_budget_exhausted)
         && should_switch_fallback_transport(&err)
         && client_session.try_switch_fallback_transport(&turn_context.session_telemetry)
     {
@@ -85,9 +88,11 @@ pub(crate) async fn handle_retryable_response_stream_error(
             }),
         )
         .await;
-        // The loop itself supplies one immediate HTTPS fallback attempt. Keep the provider retry
-        // budget exhausted so a failed fallback does not start a second full retry window.
-        exhaust_retry_budget_for_http_fallback(&mut retry_state.retries, max_retries);
+        // The loop supplies one immediate HTTPS attempt. Early fallback keeps the remaining
+        // budget; exhausted recovery must not start a second full retry window.
+        if retry_budget_exhausted {
+            exhaust_retry_budget_for_http_fallback(&mut retry_state.retries, max_retries);
+        }
         return Ok(());
     }
 

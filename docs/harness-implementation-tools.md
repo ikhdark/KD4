@@ -61,8 +61,8 @@ the repository are not captured.
 
 ## Compiler-backed Rust context
 
-`semantic_context` resolves several source positions using one rust-analyzer
-process and the repository's resolved dependency graph:
+`semantic_context` resolves several source positions through KDA's embedded Rust
+provider and the repository's resolved dependency graph:
 
 ```json
 {
@@ -73,19 +73,34 @@ process and the repository's resolved dependency graph:
 
 Line and UTF-16 column numbers are one-based. The result includes definitions,
 hover signatures, types, references, callers, source units or excerpts with hashes,
-and the Cargo.lock hash when present. Dependency definitions point to their actual
-resolved source locations. References and callers expose counts and coverage.
+and a source snapshot identity covering configuration and lockfiles. Dependency
+definitions point to their actual resolved source locations. References and
+callers expose counts and coverage across the configured production and test
+views, including `cfg(test)` and `cfg(not(test))` consumers.
 An unresolved or unavailable entry is not evidence of absence.
 
-The tool requires `rust-analyzer` on PATH, a local execution environment, and the
-normal `exec_command` runtime. It expands to a structured argv invocation of the
-packaged Codex worker before command hooks and authorization. Sandbox, approval,
-process cancellation, polling, and output recovery use the existing command path.
+The tool requires a compatible `cargo-kda` on PATH (or the host environment's
+`CODEX_KDA_EXECUTABLE`), a local execution environment, and the normal
+`exec_command` runtime. It expands to a structured argv invocation of the
+packaged Codex worker before command hooks and authorization. That worker sends
+the `semantic_context` operation to KDA and validates its versioned response;
+an unavailable or incompatible KDA fails explicitly. KDA owns semantic analysis,
+migration state, and compiler verification. Sandbox, approval, process
+cancellation, polling, and output recovery use the existing command path.
 If a process session is returned, finish it with `write_stdin`.
 
-Up to 16 positions share a 120-second request deadline. Build scripts and
-procedural macros are disabled by default; generated and macro-only definitions may remain
-unresolved. Changed query source or lockfiles invalidate the result. Source
+The repository root need not contain `Cargo.toml`. KDA discovers the Cargo
+workspace from the first query and reports `cargo_workspace`; all positions must
+belong to that workspace. This supports KD4's `codex-rs` layout and applies its
+Cargo configuration during compiler verification.
+
+Up to 16 positions share a ten-minute KDA execution deadline, including requested
+compiler verification. Build scripts and procedural macros are disabled by
+default during semantic loading; `compiler_check` runs Cargo and can execute
+workspace code. Generated and macro-only definitions may remain unresolved.
+Changed source, dependency manifests, Cargo configuration, or lockfiles
+invalidate the result. Migration evidence is revalidated while holding its
+state lock before reviews are saved. Source
 bundles mark whether an enclosing Rust unit was parsed or only an excerpt was
 available. Active workspace transactions resolve against their task checkout.
 
@@ -125,6 +140,10 @@ the resolved context.
 Set `migration_id` before changing a representation. Every reported reference is
 retained, including consumers that disappear after edits. Submit reviewed IDs in
 `reviewed_consumers`; later edits to their source files invalidate those reviews.
+Changes to the effective Cargo configuration or dependency graph also invalidate
+reviews while retaining the consumer list. Package filters only scope compiler
+verification, so a migration can start with focused checks and later use the
+workspace-wide check required for completion.
 Completion requires every retained consumer reviewed, complete source coverage,
 and a successful current workspace compiler check without a package filter.
 Completion is scoped to discovered consumers in that configuration; unresolved

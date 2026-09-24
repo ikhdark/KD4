@@ -420,7 +420,11 @@ mod tests {
             "Output defaults to the {}-token hard cap",
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
-        assert!(description.contains("the cell budget is separate"));
+        assert!(description.contains(&format!(
+            "Nested exec_command/write_stdin results carry at most {} output tokens",
+            crate::MAX_NESTED_COMMAND_OUTPUT_TOKENS,
+        )));
+        assert!(!description.contains("the cell budget is separate"));
         assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 10000}`"#));
         assert!(description.contains("queues a model-visible message without yielding"));
         // Retired guidance that pushed the model into wait rounds or extra

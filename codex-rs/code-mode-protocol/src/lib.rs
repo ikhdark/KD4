@@ -35,6 +35,7 @@ pub use runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
 pub use runtime::DEFAULT_TOOL_TIMEOUT_MS;
 pub use runtime::DEFAULT_WAIT_YIELD_TIME_MS;
 pub use runtime::ExecuteRequest;
+pub use runtime::MAX_NESTED_COMMAND_OUTPUT_TOKENS;
 pub use runtime::MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
 pub use runtime::MAX_TOOL_TIMEOUT_MS;
 pub use runtime::OWNER_HELD_DECISION_YIELD_TIME_MS;

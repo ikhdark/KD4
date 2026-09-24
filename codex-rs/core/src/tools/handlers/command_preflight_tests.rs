@@ -1237,6 +1237,52 @@ fn rejects_rg_literal_glob_path_for_direct_argv() {
 }
 
 #[test]
+fn rg_literal_glob_path_in_a_script_runs_with_an_advisory() {
+    let script = "rg -n 'memory|budget' 'src/runner*' src/main.rs; Get-ChildItem src -Name";
+    let invocation = CommandInvocation::PowerShellScript(script.to_string());
+    let outcome = preflight_invocation_with_equivalent_repair(
+        &invocation,
+        &strings(&["pwsh", "-NoProfile", "-Command", script]),
+        Some(ShellType::PowerShell),
+    )
+    .expect("one literal glob path must not discard the rest of the script");
+
+    assert_eq!(outcome.invocation, invocation);
+    assert!(!outcome.repaired(), "an unchanged command is not a repair");
+    let notice = outcome
+        .model_notice()
+        .expect("advisory explains the literal path");
+    assert!(notice.contains("rg_literal_glob_path"), "{notice}");
+    assert!(notice.contains("`src/runner*`"), "{notice}");
+    assert!(
+        notice.contains("pass wildcards through `--glob`"),
+        "{notice}"
+    );
+
+    // Other lints still reject a script, and direct argv keeps the rejection.
+    let typo = "rg --ignorecase TODO 'src/runner*'";
+    assert!(
+        preflight_invocation_with_equivalent_repair(
+            &CommandInvocation::PowerShellScript(typo.to_string()),
+            &strings(&["pwsh", "-NoProfile", "-Command", typo]),
+            Some(ShellType::PowerShell),
+        )
+        .is_err()
+    );
+    let argv = CommandInvocation::Argv {
+        program: "rg".to_string(),
+        args: strings(&["-n", "TODO", "src/runner*"]),
+    };
+    let error = preflight_invocation_with_equivalent_repair(
+        &argv,
+        &argv.to_direct_argv().unwrap(),
+        /*shell_type*/ None,
+    )
+    .expect_err("direct argv is a single command and is still rejected");
+    assert!(error.contains("rg_literal_glob_path"), "{error}");
+}
+
+#[test]
 fn files_with_matches_keeps_the_first_positional_argument_as_a_pattern() {
     preflight_command(
         &strings(&[

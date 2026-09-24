@@ -20,8 +20,9 @@ fn test_apply_patch_cli_rejects_ambiguous_matches_without_writes() -> anyhow::Re
     ] {
         fs::write(tmp.path().join("a.txt"), original)?;
         let header = if body.starts_with("@@") { "" } else { "@@\n" };
-        let patch =
-            format!("*** Begin Patch\n*** Update File: a.txt\n{header}{body}\n*** End Patch");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: prefix.txt\n+must not be written\n*** Update File: a.txt\n{header}{body}\n*** End Patch"
+        );
         let output = apply_patch_command()?
             .arg(patch)
             .current_dir(tmp.path())
@@ -30,6 +31,7 @@ fn test_apply_patch_cli_rejects_ambiguous_matches_without_writes() -> anyhow::Re
         let stderr = String::from_utf8_lossy(&output.get_output().stderr);
         assert!(stderr.contains("Ambiguous"), "{stderr}");
         assert!(stderr.contains("context"), "{stderr}");
+        assert!(!tmp.path().join("prefix.txt").exists());
         assert_eq!(fs::read_to_string(tmp.path().join("a.txt"))?, original);
     }
     Ok(())

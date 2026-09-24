@@ -399,6 +399,138 @@ async fn run_exec_command_for_test(
         .expect("exec_command test invocation succeeds")
 }
 
+#[tokio::test]
+async fn validation_snapshot_derives_fresh_execution_without_private_arguments() {
+    let repo = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(repo.path().join("source.txt"), "snapshot input\n").unwrap();
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    let home = turn.config.codex_home.clone();
+    let thread = session.thread_id.to_string();
+    crate::workspace_transaction::begin(&home, &thread, repo.path()).unwrap();
+    let snapshot = crate::workspace_transaction::validation_snapshot(&home, &thread).unwrap();
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let value = serde_json::json!({
+        "program": "git", "args": ["rev-parse", "--verify", "refs/heads/missing-snapshot-probe"],
+        "workdir": snapshot.workdir, "yield_time_ms": 10_000,
+    });
+    let codex_tools::ToolSpec::Function(spec) = ExecCommandHandler::default().spec() else {
+        panic!("exec schema")
+    };
+    jsonschema::validator_for(&serde_json::to_value(spec.parameters).unwrap())
+        .unwrap()
+        .validate(&value)
+        .unwrap();
+    let payload = ToolPayload::Function {
+        arguments: value.to_string(),
+    };
+    let ((), launches) = crate::tools::runtimes::unified_exec::test_observation::observe(async {
+        for attempt in 0..3 {
+            let output = run_exec_command_for_test(
+                &session,
+                &turn,
+                &format!("snapshot-{attempt}"),
+                payload.clone(),
+            )
+            .await;
+            let result = output.code_mode_result(&payload);
+            assert_eq!(result["exit_code"], 128);
+            assert!(
+                result["repair"]
+                    .as_str()
+                    .is_some_and(|notice| notice.contains(&snapshot.revision)),
+                "{result}"
+            );
+        }
+    })
+    .await;
+    assert_eq!(launches.process_launches, 3);
+    crate::workspace_transaction::verify_validation_snapshot(&snapshot).unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_validation_builds_in_the_checkouts_warm_lane() {
+    let repo = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(repo.path().join("source.txt"), "snapshot input\n").unwrap();
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    let home = turn.config.codex_home.clone();
+    let thread = session.thread_id.to_string();
+    crate::workspace_transaction::begin(&home, &thread, repo.path()).unwrap();
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    let script = "import os; print(os.environ['CARGO_TARGET_DIR'])";
+    session
+        .services
+        .exec_policy
+        .append_amendment_and_update(
+            turn.config.codex_home.as_path(),
+            &codex_protocol::protocol::ExecPolicyAmendment::new(vec![
+                python.to_string_lossy().into_owned(),
+                "-c".into(),
+                script.into(),
+            ]),
+        )
+        .await
+        .unwrap();
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let snapshot = crate::workspace_transaction::validation_snapshot(&home, &thread).unwrap();
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": python, "args": ["-c", script],
+            "workdir": snapshot.workdir, "yield_time_ms": 10_000,
+            "validation": { "covered_paths": [snapshot.workdir] },
+        })
+        .to_string(),
+    };
+    let output = run_exec_command_for_test(&session, &turn, "lane", payload.clone()).await;
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["exit_code"], 0, "{result}");
+    let target = std::path::PathBuf::from(result["output"].as_str().unwrap().trim());
+    assert!(
+        target.starts_with(home.join("validation-cache")),
+        "validation must build in the checkout's warm lane: {result}"
+    );
+    assert!(!target.starts_with(snapshot.workdir.parent().unwrap()));
+    // The finished build returns the same warm lane to the next snapshot.
+    let next = crate::workspace_transaction::validation_snapshot(&home, &thread).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let lane = crate::workspace_transaction::lease_validation_lane(&home, &thread, &next)
+                .unwrap()
+                .expect("idle lane");
+            let mut env = std::collections::HashMap::new();
+            lane.bind(&mut env);
+            if std::path::Path::new(&env["CARGO_TARGET_DIR"]) == target {
+                break;
+            }
+            drop(lane);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the exited build must release its lane");
+}
+
 async fn wait_for_exec_command_end(
     rx_event: &async_channel::Receiver<codex_protocol::protocol::Event>,
     call_id: &str,
@@ -935,6 +1067,121 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
     );
 }
 
+#[test_case::test_case(0; "success")]
+#[test_case::test_case(7; "failure")]
+#[tokio::test]
+async fn yielded_validation_records_full_lifetime_once(exit_code: i32) {
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let script = format!("import time; time.sleep(6); raise SystemExit({exit_code})");
+    let command = vec![
+        python.to_string_lossy().into_owned(),
+        "-c".into(),
+        script.clone(),
+    ];
+    tokio::fs::create_dir_all(turn.config.codex_home.as_path())
+        .await
+        .unwrap();
+    session
+        .services
+        .exec_policy
+        .append_amendment_and_update(
+            turn.config.codex_home.as_path(),
+            &codex_protocol::protocol::ExecPolicyAmendment::new(command),
+        )
+        .await
+        .unwrap();
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": python, "args": ["-c", script], "yield_time_ms": 250,
+            "validation": { "covered_paths": [turn.config.cwd.as_path()] }
+        })
+        .to_string(),
+    };
+    let output =
+        run_exec_command_for_test(&session, &turn, "validation-lifetime", payload.clone()).await;
+    assert!(output.code_mode_result(&payload)["session_id"].is_number());
+    wait_for_exec_command_end(&events, "validation-lifetime").await;
+    let counters = turn
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing()
+        .counters;
+    assert_eq!(counters.executed_validation_count, 1);
+    assert!(
+        counters.executed_validation_duration_ns >= 5_000_000_000,
+        "{counters:?}"
+    );
+}
+
+#[tokio::test]
+async fn nested_exec_default_yield_outlasts_a_brief_command() {
+    // Nested reads of 2.6-2.8 s missed the 2 s direct default by half a
+    // second, so their cells ended with live sessions the model had to poll.
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    let (session, turn) = make_session_and_context().await;
+    let (session, turn) = (Arc::new(session), Arc::new(turn));
+    tokio::fs::create_dir_all(turn.config.codex_home.as_path())
+        .await
+        .unwrap();
+    let nested = ToolCallSource::CodeMode {
+        cell_id: "brief-cell".into(),
+        parent_call_id: None,
+        runtime_tool_call_id: "brief-call".into(),
+        nested_deadline: None,
+        cancellation_cause: None,
+    };
+    for (source, marker, completes) in [
+        (nested, "NESTED_BRIEF_DONE", true),
+        (ToolCallSource::Direct, "DIRECT_BRIEF_DONE", false),
+    ] {
+        let script = format!("import time; time.sleep(3); print('{marker}')");
+        session
+            .services
+            .exec_policy
+            .append_amendment_and_update(
+                turn.config.codex_home.as_path(),
+                &codex_protocol::protocol::ExecPolicyAmendment::new(vec![
+                    python.to_string_lossy().into_owned(),
+                    "-c".into(),
+                    script.clone(),
+                ]),
+            )
+            .await
+            .unwrap();
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({"program": python, "args": ["-c", script]}).to_string(),
+        };
+        let output = ExecCommandHandler::default()
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: marker.to_string(),
+                tool_name: codex_tools::ToolName::plain("exec_command"),
+                source,
+                payload: payload.clone(),
+            })
+            .await
+            .expect("brief command runs");
+
+        let result = output.code_mode_result(&payload);
+        assert_eq!(result["session_id"].is_null(), completes, "{result}");
+        assert_eq!(
+            result["output"]
+                .as_str()
+                .is_some_and(|output| output.contains(marker)),
+            completes,
+            "{result}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
     let (session, turn) = make_session_and_context().await;
@@ -1005,6 +1252,16 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
 
 #[tokio::test]
 async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches() {
+    known_delta_replay_case(300, None).await;
+}
+
+#[tokio::test]
+async fn known_delta_small_replay_stays_inline_until_budget_requires_recovery() {
+    known_delta_replay_case(1, None).await;
+    known_delta_replay_case(1, Some(0)).await;
+}
+
+async fn known_delta_replay_case(repetitions: usize, replay_budget: Option<usize>) {
     let repo = tempfile::tempdir().unwrap();
     let codex_home = tempfile::tempdir().unwrap();
     let initialized = std::process::Command::new("git")
@@ -1013,13 +1270,10 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
         .output()
         .unwrap();
     assert!(initialized.status.success(), "{initialized:?}");
-    // Exercise retained artifacts as well as cache promotion, without relying on checkout size.
-    let fixture = "immutable cache fixture\n".repeat(300);
-    assert!(
-        fixture.len()
-            > crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES
-    );
-    std::fs::write(repo.path().join("fixture.txt"), fixture).unwrap();
+    let fixture = "immutable cache fixture\n".repeat(repetitions);
+    let large = fixture.len()
+        > crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES;
+    std::fs::write(repo.path().join("fixture.txt"), &fixture).unwrap();
     // Cache namespaces use root commit identities, so an unborn repository is ineligible.
     for args in [
         vec!["add", "fixture.txt"],
@@ -1043,7 +1297,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
             .unwrap();
         assert!(output.status.success(), "{output:?}");
     }
-    let (session, turn, rx_event) =
+    let (session, mut turn, rx_event) =
         crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
             codex_login::CodexAuth::from_api_key("Test API Key"),
             Vec::new(),
@@ -1063,6 +1317,12 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
             },
         )
         .await;
+    // Unified exec's output policy can exceed the model's generic policy.
+    // Lazy retention must use the same budget as the delivered result.
+    Arc::get_mut(&mut turn)
+        .expect("unshared setup turn")
+        .model_info
+        .truncation_policy = codex_protocol::openai_models::TruncationPolicyConfig::bytes(256);
     assert!(
         session
             .features()
@@ -1123,6 +1383,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
                                 "kind": "argv",
                                 "program": "git",
                                 "args": ["-C", turn.cwd().as_path(), "show", blob.clone()],
+                                "max_output_tokens": replay_budget,
                                 "yield_time_ms": 10_000,
                             })
                             .to_string(),
@@ -1172,14 +1433,50 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
     assert_eq!(essential["original_token_count"], fresh_token_count);
     assert_eq!(essential["original_token_count_is_approximate"], true);
     assert!(third_code_mode.get("session_id").is_none());
-    let second_artifact_id = second.code_mode_result(&payload)["raw_output_artifact_id"]
-        .as_str()
-        .expect("shadow validation has an output artifact")
-        .to_string();
-    let third_artifact_id = third_code_mode["raw_output_artifact_id"]
-        .as_str()
-        .expect("cache hit has a reminted output artifact");
-    assert_ne!(third_artifact_id, second_artifact_id);
+    let second_json = second.code_mode_result(&payload);
+    if large || replay_budget.is_some() {
+        let third_artifact_id = third_code_mode["raw_output_artifact_id"]
+            .as_str()
+            .expect("large or reduced replay must be recoverable");
+        assert_ne!(
+            Some(third_artifact_id),
+            second_json["raw_output_artifact_id"].as_str()
+        );
+        let recovered = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+            codex_home.path(),
+            &session.thread_id.to_string(),
+            third_artifact_id,
+        )
+        .await
+        .expect("exact cached output recovery");
+        assert_eq!(recovered, fixture.as_bytes());
+        if replay_budget.is_some() {
+            assert_eq!(third_code_mode["output_reduced"], true);
+            assert!(
+                !third_code_mode["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("immutable cache fixture")
+            );
+        }
+    } else {
+        assert!(second_json.get("raw_output_artifact_id").is_none());
+        assert!(third_code_mode.get("raw_output_artifact_id").is_none());
+        assert_eq!(third_code_mode["output_reduced"], false);
+        assert!(
+            third_code_mode["output"]
+                .as_str()
+                .unwrap()
+                .contains(&fixture)
+        );
+        assert!(
+            !codex_home
+                .path()
+                .join("tool-output")
+                .join(session.thread_id.to_string())
+                .exists()
+        );
+    }
 
     let force_fresh_payload = ToolPayload::Function {
         arguments: serde_json::json!({

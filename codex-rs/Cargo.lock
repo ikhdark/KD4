@@ -2551,6 +2551,7 @@ dependencies = [
  "codex-utils-string",
  "codex-web-search-extension",
  "codex-windows-sandbox",
+ "codex-workspace-tools",
  "core_test_support",
  "csv",
  "ctor",

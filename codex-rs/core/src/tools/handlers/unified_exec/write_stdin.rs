@@ -1,5 +1,6 @@
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_stdin;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -93,7 +94,11 @@ impl WriteStdinHandler {
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
-        let yield_time_ms = owner_wait_yield_time_ms(&args.chars, args.yield_time_ms);
+        let yield_time_ms = owner_wait_yield_time_ms(
+            &args.chars,
+            args.yield_time_ms,
+            matches!(source, ToolCallSource::CodeMode { .. }),
+        );
         let response = session
             .services
             .unified_exec_manager
@@ -185,11 +190,21 @@ impl WriteStdinHandler {
     }
 }
 
-fn owner_wait_yield_time_ms(chars: &str, requested_yield_time_ms: Option<u64>) -> u64 {
+fn owner_wait_yield_time_ms(
+    chars: &str,
+    requested_yield_time_ms: Option<u64>,
+    nested: bool,
+) -> u64 {
     if chars.is_empty() {
         // Omitted deadlines favor unattended waits. An explicit short poll may
         // be needed before a decision and must reach the process manager intact.
-        requested_yield_time_ms.unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
+        // A nested poll must still return before its code-mode cell yields.
+        requested_yield_time_ms.unwrap_or(if nested {
+            u64::try_from(crate::tools::code_mode::NESTED_DEFAULT_POLL.as_millis())
+                .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
+        } else {
+            DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
+        })
     } else {
         requested_yield_time_ms.unwrap_or_else(super::default_write_stdin_yield_time_ms)
     }
@@ -238,11 +253,25 @@ mod tests {
 
     #[test]
     fn empty_poll_uses_one_owner_wait_deadline() {
-        assert_eq!(owner_wait_yield_time_ms("", None), 300_000);
-        assert_eq!(owner_wait_yield_time_ms("", Some(5_000)), 5_000);
-        assert_eq!(owner_wait_yield_time_ms("", Some(250)), 250);
-        assert_eq!(owner_wait_yield_time_ms("", Some(120_000)), 120_000);
-        assert_eq!(owner_wait_yield_time_ms("input", None), 250);
-        assert_eq!(owner_wait_yield_time_ms("input", Some(1_000)), 1_000);
+        for nested in [false, true] {
+            assert_eq!(owner_wait_yield_time_ms("", Some(5_000), nested), 5_000);
+            assert_eq!(owner_wait_yield_time_ms("", Some(250), nested), 250);
+            assert_eq!(owner_wait_yield_time_ms("", Some(120_000), nested), 120_000);
+            assert_eq!(owner_wait_yield_time_ms("input", None, nested), 250);
+            assert_eq!(
+                owner_wait_yield_time_ms("input", Some(1_000), nested),
+                1_000
+            );
+        }
+        assert_eq!(owner_wait_yield_time_ms("", None, false), 300_000);
+    }
+
+    #[test]
+    fn nested_default_poll_returns_before_its_cell_yields() {
+        // The code-mode cell hands control back after five silent minutes; an
+        // equal poll default always lost that race and cost a `wait` call.
+        let nested = owner_wait_yield_time_ms("", None, true);
+        assert_eq!(nested, 285_000);
+        assert!(nested < 300_000);
     }
 }

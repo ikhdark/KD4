@@ -5445,6 +5445,14 @@ impl Session {
         }
     }
 
+    pub(crate) async fn prepare_workspace_evidence_item(
+        &self,
+        item: &ResponseItem,
+        policy: codex_utils_output_truncation::TruncationPolicy,
+    ) -> ResponseItem {
+        self.state.lock().await.history.process_item(item, policy)
+    }
+
     pub(crate) async fn register_workspace_evidence<WorkspaceGateGuard: Send>(
         &self,
         observation: crate::tool_history::WorkspaceEvidenceObservation,

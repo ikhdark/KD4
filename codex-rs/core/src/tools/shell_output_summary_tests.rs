@@ -722,6 +722,12 @@ fn powershell_read_pipelines_use_ordered_truncation() {
         "$s = Get-Content src/lib.rs; $s[10..40]; git diff --stat",
         "foreach ($p in @('a','b')) { if (Test-Path $p) { Get-Content -Raw $p } }",
         "Get-ChildItem src -Recurse -File | Where-Object { $_.Name -match 'test' } | Select-Object FullName",
+        // Quoted alternations are patterns, not pipelines.
+        "Get-Content src/plan.rs -TotalCount 220; rg -n 'fn |clone|parallel|cache' src/jobs.rs",
+        "Get-Process | Where-Object { $_.Name -match '^kda-.*\\.exe$|^cargo\\.exe$' } | Format-List",
+        "Get-Content src/lib.rs # don't summarize; Remove-Item is only prose here",
+        "$r = Get-Content audit.json -Raw | ConvertFrom-Json -Depth 100; $r.summary | ConvertTo-Json -Compress",
+        "$r.passes | ForEach-Object { [pscustomobject]@{pass=$_.Name;seconds=[math]::Round($_.micros/1e6,2)} } | Sort-Object seconds | Format-Table -Wrap",
     ] {
         assert_eq!(
             summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400))),
@@ -736,6 +742,12 @@ fn powershell_read_pipelines_use_ordered_truncation() {
         "Get-Content src/lib.rs; cargo build",
         "git checkout -- src/lib.rs; Get-Content src/lib.rs",
         "Get-ChildItem src | ForEach-Object { Set-Content $_ '' }",
+        "rg -n 'a|b' src; Remove-Item 'old|new.rs'",
+        // A single quote inside a double-quoted string must not hide a command.
+        "Write-Output \"it's\"; Remove-Item src/old.rs; Write-Output 'done'",
+        "Get-Content src/lib.rs; $removed = Remove-Item src/old.rs",
+        "Write-Output \"$(Remove-Item src/old.rs)\"",
+        "[IO.File]::Delete('src/old.rs'); Get-Content src/lib.rs",
     ] {
         assert!(
             summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400)))
@@ -770,6 +782,42 @@ fn dense_output_over_token_budget_keeps_middle_diagnostics() {
     assert!(projected.text.contains("error: unique middle diagnostic"));
     assert!(projected.text.contains("test result: FAILED"));
     assert!(codex_utils_string::approx_token_count(&projected.text) <= limit);
+}
+
+#[test]
+fn output_just_over_budget_keeps_most_lines_after_diagnostic_pruning() {
+    let mut lines = (0..115)
+        .map(|index| format!("{index:03}: let value_{index} = compute(input_{index}, &mut state);"))
+        .collect::<Vec<_>>();
+    lines[111] = "warning: in the working copy of 'README.md', CRLF will be replaced by LF".into();
+    lines[113] = "SOURCEMAP.md:242: declared owner has no repository source: .github".into();
+    let output = lines.join("\n");
+    let limit = codex_utils_string::approx_token_count(&output) * 9 / 10;
+
+    let summary = summarize_shell_output_for_model(
+        &output,
+        1,
+        false,
+        options(Some("python scripts/source_map_check.py"), Some(limit)),
+    )
+    .expect("failed output over its budget is summarized");
+
+    assert!(!codex_utils_string::approx_token_count_exceeds(
+        &summary, limit
+    ));
+    let emitted = summary
+        .split_once("- emitted_source_lines: ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .and_then(|count| count.parse::<usize>().ok())
+        .expect("emitted line count");
+    assert!(emitted >= lines.len() / 2, "{summary}");
+    // Budget returns to the tail first; the diagnostic context stays intact.
+    assert!(summary.contains("let value_100 ="), "{summary}");
+    assert!(
+        summary.contains("warning: in the working copy"),
+        "{summary}"
+    );
+    assert!(summary.contains("  115: 114: let value_114"), "{summary}");
 }
 
 #[test]
@@ -909,6 +957,7 @@ fn source_reads_get_room_without_expanding_noisy_command_defaults() {
         "cat src/lib.rs",
         "rg -n pattern src",
         "Get-Content src/lib.rs | Select-Object -First 500",
+        "rg -n 'fn |impl ' src; Get-Content src/lib.rs | Select-Object -Skip 40 -First 90",
     ] {
         assert_eq!(
             super::source_read_output_budget(command),

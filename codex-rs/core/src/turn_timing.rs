@@ -2157,14 +2157,16 @@ impl TurnTimingState {
         }
     }
 
-    pub(crate) fn record_pending_tool_timer_wait(&self, mut wait: ToolLifecycleTimerWait) {
+    pub(crate) fn record_pending_tool_timer_wait(&self, wait: ToolLifecycleTimerWait) {
         let mut state = self.state();
         for tool_call in state.tool_calls.iter_mut().rev() {
             if tool_call.model_resumed_at_ms.is_some() {
                 break;
             }
-            wait.sequence = u32::try_from(tool_call.timer_waits.len() + 1).unwrap_or(u32::MAX);
-            tool_call.timer_waits.push(wait.clone());
+            crate::tools::tool_dispatch_trace::push_timer_wait(
+                &mut tool_call.timer_waits,
+                wait.clone(),
+            );
             tool_call.reentry_count = tool_call.reentry_count.saturating_add(1);
         }
     }

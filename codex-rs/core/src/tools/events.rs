@@ -206,6 +206,7 @@ pub(crate) async fn emit_exec_command_begin(
 pub(crate) enum ToolEmitter {
     Shell {
         command: Vec<String>,
+        max_output_tokens: Option<usize>,
         model_command_text: Option<String>,
         cwd: PathUri,
         source: ExecCommandSource,
@@ -238,6 +239,7 @@ impl ToolEmitter {
         let parsed_cmd = parse_command(&command);
         Self::Shell {
             command,
+            max_output_tokens: None,
             model_command_text: None,
             cwd: PathUri::from_abs_path(&cwd),
             source,
@@ -275,6 +277,16 @@ impl ToolEmitter {
             process_id,
             environment_id,
         }
+    }
+
+    pub fn with_max_output_tokens(mut self, requested_limit: Option<usize>) -> Self {
+        if let Self::Shell {
+            max_output_tokens, ..
+        } = &mut self
+        {
+            *max_output_tokens = requested_limit;
+        }
+        self
     }
 
     pub fn with_model_command_text(mut self, command_text: String) -> Self {
@@ -470,6 +482,12 @@ impl ToolEmitter {
         ctx: ToolEventCtx<'_>,
     ) -> String {
         let truncation_policy = ctx.turn.model_info.truncation_policy.into();
+        let requested_limit = match self {
+            Self::Shell {
+                max_output_tokens, ..
+            } => *max_output_tokens,
+            _ => None,
+        };
         match self {
             Self::Shell {
                 command,
@@ -488,7 +506,7 @@ impl ToolEmitter {
                 let projected = super::project_exec_output_for_model_with_budget(
                     output,
                     truncation_policy,
-                    /*requested_limit*/ None,
+                    requested_limit,
                     Some(&command_text),
                 );
                 projected.text

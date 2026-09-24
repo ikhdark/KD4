@@ -394,6 +394,7 @@ pub(crate) fn spawn_exit_watcher(
     known_delta_executor_started_at: Option<Instant>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
     network_approval: Option<crate::tools::network_approval::DeferredNetworkApproval>,
+    validation_started_at: Option<Instant>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
@@ -416,6 +417,13 @@ pub(crate) fn spawn_exit_watcher(
         }
         let exit_observed_at = Instant::now();
         let duration = exit_observed_at.saturating_duration_since(started_at);
+        if let Some(validation_started_at) = validation_started_at {
+            turn_ref
+                .turn_timing_state
+                .record_executed_validation_duration(
+                    exit_observed_at.saturating_duration_since(validation_started_at),
+                );
+        }
         if let Err(message) =
             super::process_manager::finish_deferred_network_approval_after_process_exit_for_session(
                 Some(&session_ref),

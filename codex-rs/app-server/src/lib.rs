@@ -190,16 +190,42 @@ enum OutboundControlEvent {
     /// Register a new writer for an opened connection.
     Opened {
         connection_id: ConnectionId,
-        writer: mpsc::Sender<QueuedOutgoingMessage>,
-        disconnect_sender: Option<CancellationToken>,
-        initialized: Arc<AtomicBool>,
-        experimental_api_enabled: Arc<AtomicBool>,
-        opted_out_notification_methods: Arc<transport::OutboundNotificationOptOuts>,
+        state: OutboundConnectionState,
     },
     /// Remove state for a closed/disconnected connection.
     Closed { connection_id: ConnectionId },
     /// Disconnect all connection-oriented clients during graceful restart.
     DisconnectAll,
+}
+
+fn prepare_connection(
+    connection_id: ConnectionId,
+    origin: transport::ConnectionOrigin,
+    writer: mpsc::Sender<QueuedOutgoingMessage>,
+    disconnect_sender: Option<CancellationToken>,
+    transport_shutdown: CancellationToken,
+) -> (ConnectionState, OutboundControlEvent) {
+    let connection = ConnectionState::new(
+        origin,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(transport::OutboundNotificationOptOuts::new(HashSet::new())),
+    );
+    let state = OutboundConnectionState::new(
+        writer,
+        Arc::clone(&connection.outbound_initialized),
+        Arc::clone(&connection.outbound_experimental_api_enabled),
+        Arc::clone(&connection.outbound_opted_out_notification_methods),
+        disconnect_sender,
+        transport_shutdown,
+    );
+    (
+        connection,
+        OutboundControlEvent::Opened {
+            connection_id,
+            state,
+        },
+    )
 }
 
 #[derive(Default)]
@@ -790,22 +816,9 @@ pub async fn run_main(
                         match event {
                             OutboundControlEvent::Opened {
                                 connection_id,
-                                writer,
-                                disconnect_sender,
-                                initialized,
-                                experimental_api_enabled,
-                                opted_out_notification_methods,
+                                state,
                             } => {
-                                outbound_connections.insert(
-                                    connection_id,
-                                    OutboundConnectionState::new(
-                                        writer,
-                                        initialized,
-                                        experimental_api_enabled,
-                                        opted_out_notification_methods,
-                                        disconnect_sender,
-                                    ),
-                                );
+                                outbound_connections.insert(connection_id, state);
                             }
                             OutboundControlEvent::Closed { connection_id } => {
                                 outbound_connections.remove(&connection_id);
@@ -924,45 +937,28 @@ pub async fn run_main(
                                 writer,
                                 disconnect_sender,
                             } => {
-                                let outbound_initialized = Arc::new(AtomicBool::new(false));
-                                let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
+                                let (connection, outbound_opened) = prepare_connection(
+                                    connection_id,
+                                    origin,
+                                    writer,
+                                    disconnect_sender.clone(),
+                                    transport_shutdown_token.clone(),
+                                );
                                 initialize_notification_sender
                                     .connection_opened_with_runtime(
                                         connection_id,
-                                        Arc::clone(&outbound_initialized),
-                                        disconnect_sender.clone().unwrap_or_else(|| transport_shutdown_token.clone()),
+                                        Arc::clone(&connection.outbound_initialized),
+                                        disconnect_sender.unwrap_or_else(|| transport_shutdown_token.clone()),
                                     )
                                     .await;
-                                let outbound_opted_out_notification_methods = Arc::new(
-                                    transport::OutboundNotificationOptOuts::new(HashSet::new()),
-                                );
                                 if outbound_control_tx
-                                    .send(OutboundControlEvent::Opened {
-                                        connection_id,
-                                        writer,
-                                        disconnect_sender: Some(disconnect_sender.unwrap_or_else(|| transport_shutdown_token.clone())),
-                                        initialized: Arc::clone(&outbound_initialized),
-                                        experimental_api_enabled: Arc::clone(
-                                            &outbound_experimental_api_enabled,
-                                        ),
-                                        opted_out_notification_methods: Arc::clone(
-                                            &outbound_opted_out_notification_methods,
-                                        ),
-                                    })
+                                    .send(outbound_opened)
                                     .await
                                     .is_err()
                                 {
                                     break "outbound_router_closed";
                                 }
-                                connections.insert(
-                                    connection_id,
-                                    ConnectionState::new(
-                                        origin,
-                                        outbound_initialized,
-                                        outbound_experimental_api_enabled,
-                                        outbound_opted_out_notification_methods,
-                                    ),
-                                );
+                                connections.insert(connection_id, connection);
                             }
                             TransportEvent::ConnectionClosed { connection_id } => {
                                 let Some(connection_state) = connections.remove(&connection_id) else {

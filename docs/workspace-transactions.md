@@ -15,16 +15,25 @@ paths. Commands containing the original checkout's absolute path are rejected.
 External tools are not redirected.
 
 Recognized validation commands through `exec_command` capture another source
-snapshot before launch. They run there with unique Cargo target/build directories
-and `CODEX_VALIDATION_SOURCE_REVISION`. Other build tools use the unique source
-directory but must keep outputs within it. Explicit Cargo target overrides are
-rejected. The receipt on launch and subsequent polls identifies the source;
-completion checks its file manifest for changes and marks altered inputs invalid.
-A receipt never certifies later edits or the checkout after reconciliation.
+snapshot before launch and run there with `CODEX_VALIDATION_SOURCE_REVISION`.
+Cargo builds use one of up to four warm target/build lanes shared by every
+snapshot of the same original checkout, under `CODEX_HOME/validation-cache`.
+A running process leases its lane exclusively until it exits. After leasing,
+the snapshot's files are marked newer than any earlier build in that lane,
+because Cargo judges path-package freshness by modification time. When every
+lane is busy, the snapshot uses its own cold output directory instead of
+waiting. Other build tools use the unique source directory but must keep
+outputs within it. Explicit Cargo target overrides are rejected. The receipt on
+launch and subsequent polls identifies the source; completion checks its file
+manifest for changes and marks altered inputs invalid. A receipt never certifies
+later edits or the checkout after reconciliation.
 
 `reconcile` performs a three-way merge between the captured baseline, task files,
 and current original files. Detected content conflicts publish no files and leave
 the task workspace available for inspection. Independent edits merge together.
+When a task converted a whole file's line endings, as formatters do, while the
+baseline and current file still share their style, the task content merges in
+that shared style instead of conflicting on every line.
 Publication uses a cooperative cross-process lock and destination rechecks;
 external editors do not share that lock. A retained journal records original and
 replacement bytes for recovery after an I/O failure during publication. Multi-file
@@ -42,6 +51,6 @@ the appended notice removes its claim to describe current source. Unchanged
 invalidations are not repeated within the anchored sampling continuation.
 
 These mechanisms have correctness tests. Performance gains require matched
-evaluation runs; snapshot capture and isolated cold builds can themselves add
-cost. Source changes require the normal local binary rebuild and Desktop restart
+evaluation runs; snapshot capture, refreshed workspace crates, and the cold
+fallback when every lane is busy can themselves add cost. Source changes require the normal local binary rebuild and Desktop restart
 before they affect Desktop sessions.

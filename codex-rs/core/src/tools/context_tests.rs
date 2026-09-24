@@ -121,6 +121,44 @@ fn apply_patch_code_mode_result_preserves_output() {
 }
 
 #[test]
+fn failed_patch_carries_its_retry_receipt_once_per_projection() {
+    let receipt = json!({"patch_id": "patch-1", "remaining_hunks": [{"hunk": 2, "chunks": 3}]});
+    let output = ApplyPatchToolOutput {
+        text: "apply_patch verification failed: Ambiguous exact match".to_string(),
+        success: false,
+        changes: Vec::new(),
+        changes_exact: true,
+        environment_id: None,
+        retry: None,
+    }
+    .with_retry(Some(receipt.clone()));
+    let payload = ToolPayload::Custom {
+        input: "*** Begin Patch\n*** End Patch".to_string(),
+    };
+
+    let structured = output.code_mode_result(&payload);
+    assert_eq!(structured["retry"], receipt);
+    assert_eq!(
+        structured.to_string().matches("patch-1").count(),
+        1,
+        "{structured}"
+    );
+    let ResponseInputItem::CustomToolCallOutput { output: direct, .. } =
+        output.to_response_item("patch-call", &payload)
+    else {
+        panic!("expected custom tool output");
+    };
+    let direct = direct.body.to_text().unwrap_or_default();
+    assert!(direct.contains("Ambiguous exact match"), "{direct}");
+    assert_eq!(
+        direct.matches("Retained patch retry: ").count(),
+        1,
+        "{direct}"
+    );
+    assert!(direct.contains("patch-1"), "{direct}");
+}
+
+#[test]
 fn skipped_function_outputs_remain_typed_and_non_successful() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -1317,7 +1355,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
     };
 
     let raw_output = String::from_utf8_lossy(&output.raw_output);
-    let projected = output.projected_model_output(raw_output.as_ref());
+    let projected = output.projected_model_output(raw_output.as_ref(), None);
     assert!(projected.reduced);
     assert_eq!(
         projected.text.matches("[...]").count(),
@@ -1352,7 +1390,7 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
     };
 
     let raw_output = String::from_utf8_lossy(&output.raw_output);
-    let projected = output.projected_model_output(raw_output.as_ref());
+    let projected = output.projected_model_output(raw_output.as_ref(), None);
     assert!(projected.reduced);
     assert!(!projected.text.is_empty());
     assert!(codex_utils_string::approx_token_count(&projected.text) <= 4);
@@ -1385,7 +1423,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         pending_deferred_completions: Vec::new(),
     };
 
-    let projected = output.projected_model_output(&raw_output);
+    let projected = output.projected_model_output(&raw_output, None);
 
     assert!(!projected.reduced);
     assert_eq!(projected.text, raw_output);
@@ -1698,6 +1736,52 @@ async fn exec_code_mode_preserves_empty_output_and_explicit_lifecycle() {
     assert_eq!(running["output"], "");
     assert_eq!(running["execution_state"], "running");
     assert_eq!(running["output_complete"], false);
+}
+
+#[tokio::test]
+async fn code_mode_command_result_fits_its_cell_when_printed() {
+    // Scripts requested 12000-18000 nested tokens and printed the result. The
+    // 10000-token cell then cut the escaped JSON again, without a locator,
+    // even where the command had reported its output complete.
+    let raw_output = [
+        "    pub(crate) fn enter(jobs: usize) -> Self {",
+        "        assert!(jobs > 0);",
+        "        let previous = JOBS.replace(jobs);",
+        "        Self { previous, _thread: PhantomData }",
+        "    }",
+        "",
+        "    /// Restores the previous job count when the scope ends.",
+        "    fn drop(&mut self) {",
+        "        JOBS.set(self.previous);",
+        "    }",
+    ]
+    .map(|line| format!("{line}\r\n"))
+    .concat()
+    .repeat(400);
+    let (mut output, artifact_id, _, _retained_root) =
+        artifact_backed_exec_output(raw_output.as_bytes(), Some(18_000)).await;
+    output.hook_command = Some("Get-Content src/analysis_jobs.rs".to_string());
+
+    let result = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+    // `text(result)` prints this serialization; the cell cap counts model tokens.
+    let printed = result.to_string();
+
+    assert!(
+        codex_utils_output_truncation::model_token_count(&printed)
+            <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        "a printed nested result must fit its cell"
+    );
+    assert_eq!(result["output_reduced"], true);
+    assert_eq!(result["output_complete"], false);
+    assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
+    let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
+    assert!(
+        codex_utils_string::approx_token_count(direct["output"].as_str().unwrap())
+            > codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        "the direct response keeps the requested budget"
+    );
 }
 
 #[tokio::test]

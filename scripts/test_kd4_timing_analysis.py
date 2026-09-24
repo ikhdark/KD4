@@ -181,6 +181,36 @@ class SharedTimingAnalysisTest(unittest.TestCase):
             self.assertTrue(zero["complete"])
             self.assertEqual(zero["retryCount"], 0)
 
+    def test_wait_diagnostics_reach_runner_report_without_claiming_cpu_cost(self):
+        profile = timing_profile()
+        profile["toolCalls"][0].update(
+            toolName="exec_command", retryCount=0, reentryCount=14000, totalDurationMs=1000,
+            timerWaits=[{"waitKind": "owner_output_wait", "wakeReason": "completed"}] * 3,
+        )
+        report = analysis.analyze_runner_evidence(self.evidence(profile))
+        waits = report["toolDispatch"]["waitDiagnostics"]
+        self.assertEqual(waits["observedWaits"], [
+            {"waitKind": "owner_output_wait", "wakeReason": "completed", "count": 3}
+        ])
+        self.assertEqual(waits["highReentryCallCount"], 1)
+        self.assertEqual(waits["highReentryCalls"][0]["callId"], "tool-1")
+        self.assertEqual(waits["highReentryCalls"][0]["reentriesPerSecond"], 14000)
+        self.assertIn("not proof", waits["note"])
+        # A folded record's sequence counts every wake it covers.
+        profile["toolCalls"][0]["timerWaits"] = [
+            {"waitKind": "owner_output_wait", "wakeReason": "completed", "sequence": 14000},
+            {"waitKind": "output_drain", "wakeReason": "completed", "sequence": 14001},
+        ]
+        folded = analysis.analyze_runner_evidence(self.evidence(profile))
+        self.assertEqual(folded["toolDispatch"]["waitDiagnostics"]["observedWaits"], [
+            {"waitKind": "output_drain", "wakeReason": "completed", "count": 1},
+            {"waitKind": "owner_output_wait", "wakeReason": "completed", "count": 14000},
+        ])
+        profile["toolCalls"][0].pop("timerWaits")
+        profile["toolCalls"][0]["reentryCount"] = 1
+        dispatch = analysis.analyze_runner_evidence(self.evidence(profile))["toolDispatch"]
+        self.assertNotIn("waitDiagnostics", dispatch)
+
     def test_request_history_cap_cannot_produce_complete_usage_or_continuation_totals(
         self,
     ):

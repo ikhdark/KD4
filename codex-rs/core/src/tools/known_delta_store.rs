@@ -245,8 +245,8 @@ impl KnownDeltaHit {
 ///
 /// The candidate is retained on a forced-fresh or shadow-validation launch so
 /// the eventual exact result can either promote the evidence or quarantine a
-/// contradiction. A reusable hit also carries a freshly minted task-scoped
-/// artifact; cache blobs themselves never cross the task boundary directly.
+/// contradiction. A reusable hit keeps small output inline, with a task-scoped
+/// artifact only when needed; cache blobs never cross the task boundary directly.
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedKnownDelta {
     identity: EvidenceIdentity,
@@ -257,6 +257,45 @@ pub(crate) struct PreparedKnownDelta {
 }
 
 impl PreparedKnownDelta {
+    pub(crate) async fn prepare_output_budget(
+        &mut self,
+        policy: codex_utils_output_truncation::TruncationPolicy,
+        requested_limit: Option<usize>,
+        command_text: &str,
+    ) {
+        let (Some(hit), Some(candidate)) = (self.hit.as_mut(), self.candidate.as_ref()) else {
+            return;
+        };
+        let RawOutputArtifact::Pending {
+            codex_home,
+            thread_id,
+        } = &hit.raw_output_artifact
+        else {
+            return;
+        };
+        let output = codex_protocol::exec_output::ExecToolCallOutput {
+            aggregated_output: codex_protocol::exec_output::StreamOutput::new(
+                hit.rendered_output.clone(),
+            ),
+            ..Default::default()
+        };
+        if crate::tools::project_exec_output_text_with_budget(
+            &output,
+            policy,
+            requested_limit,
+            Some(command_text),
+        )
+        .reduced
+        {
+            hit.raw_output_artifact =
+                create_raw_output_artifact(codex_home, thread_id, &candidate.output).await;
+            hit.rendered_output = render_hit(candidate, &hit.raw_output_artifact);
+        }
+        if hit.raw_output_artifact.model_projection().2.is_some() {
+            self.hit = None;
+        }
+    }
+
     pub(crate) fn hit(&self) -> Option<&KnownDeltaHit> {
         self.hit.as_ref()
     }
@@ -707,7 +746,11 @@ pub(crate) async fn remint_task_handle(
     thread_id: &str,
     candidate: &EvidenceCandidate,
 ) -> RawOutputArtifact {
-    create_raw_output_artifact(codex_home, thread_id, &candidate.output).await
+    crate::tools::command_output_artifact::replace_raw_output_artifact(
+        &RawOutputArtifact::pending(codex_home, thread_id),
+        &candidate.output,
+    )
+    .await
 }
 
 pub(crate) fn render_hit(candidate: &EvidenceCandidate, artifact: &RawOutputArtifact) -> String {
@@ -1854,12 +1897,13 @@ fn main() {
     async fn shadow_match_promotes_and_cross_task_handle_is_readable() {
         let home = TempDir::new().unwrap();
         let id = identity("project", "lineage", "fingerprint");
+        let large_output = "complete output\n".repeat(512);
         assert_eq!(
             record_success(
                 home.path(),
                 &id,
                 None,
-                b"complete output",
+                large_output.as_bytes(),
                 Duration::from_secs(1)
             )
             .await,
@@ -1872,7 +1916,7 @@ fn main() {
                 home.path(),
                 &id,
                 Some(&candidate),
-                b"complete output",
+                large_output.as_bytes(),
                 Duration::from_secs(1),
             )
             .await,
@@ -1938,7 +1982,9 @@ fn main() {
         assert!(candidate.reusable());
         let artifact = remint_task_handle(home.path(), "empty-task", &candidate).await;
         let (_, bytes, error) = artifact.model_projection();
-        assert_eq!(bytes, Some(0));
+        assert_eq!(bytes, None);
+        assert!(artifact.is_pending());
+        assert!(!home.path().join("tool-output/empty-task").exists());
         assert!(error.is_none());
     }
 

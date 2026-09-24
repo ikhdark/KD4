@@ -47,7 +47,7 @@ impl ToolExecutor<ToolInvocation> for SemanticContextHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name:"semantic_context".into(), strict:false, defer_loading:None, output_schema:None,
-            description:"Resolve 1-16 Rust source positions together using installed rust-analyzer and the resolved dependency graph. Returns definitions, types, callers, all reported references and complete enclosing Rust source units with revision-bound edit handles; fallback excerpts explicitly mark incomplete coverage. Select features, target and packages through configuration; build scripts/procedural macros default off and can be enabled. compiler_check verifies the configured code with Cargo and returns structured diagnostics. migration_id retains every discovered consumer, including consumers removed by later edits; reviewed_consumers records reviewed IDs at their current source revisions. Completion requires every retained consumer reviewed and compiler success; unconfigured macro/generated consumers may need more checks. Use before editing unfamiliar APIs. Lines and UTF-16 columns are one-based. Normal exec_command sandbox, approval, cancellation and artifact handling apply; finish yielded processes with write_stdin. Source and lockfile changes invalidate in-flight results. Local environments only.".into(),
+            description:"Resolve 1-16 Rust source positions together through KDA's embedded Rust provider. Requires compatible cargo-kda on PATH or host CODEX_KDA_EXECUTABLE; no fallback to an external language server. KDA owns definitions, types, incoming callers, references, complete source units, revision-bound edit handles, migrations and compiler verification. Features and target configure analysis; packages restrict compiler verification, not reference coverage. Build scripts/procedural macros default off. compiler_check returns Cargo diagnostics. migration_id retains discovered consumers after removal; reviewed_consumers records reviews at current revisions. Completion requires reviewed consumers and workspace-wide compiler success; unresolved or unconfigured macro/generated consumers never establish absence. Lines and UTF-16 columns are one-based. Normal exec_command sandbox, cancellation and artifact handling apply; finish yielded processes with write_stdin. Source/configuration changes invalidate evidence. Local environments only.".into(),
             parameters:JsonSchema::object(BTreeMap::from([
                 ("repository".into(),JsonSchema::string(Some("Repository root, relative to current cwd or absolute.".into()))),
                 ("environment_id".into(),JsonSchema::string(None)),
@@ -152,11 +152,22 @@ impl CoreToolRuntime for SemanticContextHandler {
                 "migration_id":args.migration_id,"reviewed_consumers":args.reviewed_consumers,
                 "state_directory":invocation.step_context.turn.config.codex_home.join("semantic-context").join(invocation.session.thread_id.to_string())});
             invocation.tool_name = ToolName::plain("exec_command");
-            invocation.payload=ToolPayload::Function { arguments:json!({
-                "kind":"argv","program":executable,"args":["--codex-workspace-worker","semantic_context",request.to_string()],
-                "workdir":repository_path,"environment_id":args.environment_id,
+            let mut command = json!({
+                "program":executable,"args":["--codex-workspace-worker","semantic_context",request.to_string()],
+                "workdir":repository_path,
                 "yield_time_ms":1000,"max_output_tokens":6000
-            }).to_string() };
+            });
+            if invocation
+                .step_context
+                .environments
+                .primary()
+                .is_some_and(|primary| primary.environment_id != environment.environment_id)
+            {
+                command["environment_id"] = json!(environment.environment_id);
+            }
+            invocation.payload = ToolPayload::Function {
+                arguments: command.to_string(),
+            };
             Ok(invocation)
         })
     }
@@ -228,7 +239,14 @@ mod tests {
             panic!("structured command required")
         };
         let value: serde_json::Value = serde_json::from_str(&arguments).unwrap();
-        assert_eq!(value["kind"], "argv");
+        let ToolSpec::Function(spec) = ExecCommandHandler::default().spec() else {
+            panic!("command schema required")
+        };
+        let schema = serde_json::to_value(spec.parameters).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&value)
+            .unwrap();
         assert!(value.get("cmd").is_none());
         assert!(value.get("sandbox_permissions").is_none());
         assert_eq!(value["args"][0], "--codex-workspace-worker");
@@ -326,8 +344,10 @@ mod tests {
         );
     }
 
+    #[test_case::test_case(false; "direct")]
+    #[test_case::test_case(true; "code_mode")]
     #[tokio::test]
-    async fn direct_registry_dispatch_selects_the_expanded_command_handler() {
+    async fn direct_registry_dispatch_selects_the_expanded_command_handler(code_mode: bool) {
         struct CaptureCommand;
         impl ToolExecutor<ToolInvocation> for CaptureCommand {
             fn tool_name(&self) -> ToolName {
@@ -352,11 +372,20 @@ mod tests {
         }
         impl CoreToolRuntime for CaptureCommand {}
         let dir = tempfile::tempdir().unwrap();
-        let (_, invocation) = fixture(
+        let (_, mut invocation) = fixture(
             dir.path(),
             json!({"repository":".","queries":[{"path":"lib.rs","line":1,"column":1}]}),
         )
         .await;
+        if code_mode {
+            invocation.source = ToolCallSource::CodeMode {
+                cell_id: "helper-cell".into(),
+                parent_call_id: None,
+                runtime_tool_call_id: "helper-call".into(),
+                nested_deadline: None,
+                cancellation_cause: None,
+            };
+        }
         let registry = ToolRegistry::from_tools([
             Arc::new(SemanticContextHandler) as Arc<dyn CoreToolRuntime>,
             Arc::new(CaptureCommand) as Arc<dyn CoreToolRuntime>,

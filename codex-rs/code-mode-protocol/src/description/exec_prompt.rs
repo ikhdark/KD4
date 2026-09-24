@@ -14,7 +14,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
 - Empty `write_stdin` polls: use default waits; avoid one-second loops.
 - Parallelize only when tools permit and build locks, outputs, and services are independent. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
-- Output defaults to the 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command reads default to 25000 tokens; the cell budget is separate. Read whole useful regions; use retained-artifact selectors after truncation.
+- Output defaults to the 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, so a printed result fits the cell. Read whole useful regions; use retained-artifact selectors after truncation.
 - Continue independent work in the same cell; `notify(...)` reports progress.
 
 Helpers:
@@ -136,7 +136,7 @@ mod tests {
                     "Reuse current schemas and results;",
                     "A resolved `exec_command` call may still return a running command session.",
                     "continue that session within the current evaluation.",
-                    "the cell budget is separate.",
+                    "so a printed result fits the cell.",
                     "host-configured default deadline",
                     "Expiry cancels the nested call and may return only an error, without a live handle.",
                     "Resume only an actually returned live session/cell ID;",

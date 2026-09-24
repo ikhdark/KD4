@@ -38,6 +38,153 @@ use tokio::time::Duration;
 
 const UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cargo_validation_failure_then_current_pass_without_workspace_tools() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config.features.enable(Feature::UnifiedExec).unwrap();
+        // This revision still offers worker tools when their prerequisites exist.
+        // Exercise the ordinary route with no worker and no transaction-capable profile.
+        config.codex_self_exe = None;
+    });
+    let test = builder.build(&server).await?;
+    let fixture = test.config.cwd.join("validation-fixture");
+    fs::create_dir_all(fixture.join("src"))?;
+    fs::write(
+        fixture.join("Cargo.toml"),
+        "[package]\nname = \"validation-route-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+    )?;
+    let permission = PermissionProfile::External {
+        network: NetworkSandboxPolicy::Enabled,
+    };
+    for (revision, value, expected_success) in [("failing", 1, false), ("repaired", 2, true)] {
+        fs::write(
+            fixture.join("src/lib.rs"),
+            format!(
+                "#[test]\nfn validates_current_source() {{\n println!(\"fixture revision: {revision}\");\n assert_eq!({value}, 2);\n}}\n"
+            ),
+        )?;
+        let mut tool = "exec_command";
+        let mut args = json!({
+            "cmd": "cargo test --offline -p validation-route-fixture --lib --target-dir target -- --nocapture",
+            "workdir": fixture,
+            "yield_time_ms": 1000,
+            "max_output_tokens": 2000,
+        });
+        let mut output = String::new();
+        let mut terminal_exit = None;
+        for attempt in 0..20 {
+            let call_id = format!("cargo-{revision}-{attempt}");
+            let request_log = mount_sse_sequence(
+                &server,
+                vec![
+                    sse(vec![
+                        ev_response_created("run"),
+                        ev_function_call(&call_id, tool, &args.to_string()),
+                        ev_completed("run"),
+                    ]),
+                    sse(vec![
+                        ev_assistant_message("observed", "Observed command output."),
+                        ev_completed("observed"),
+                    ]),
+                ],
+            )
+            .await;
+            submit_unified_exec_turn(
+                &test,
+                "Run the fixture validation and observe its current result.",
+                permission.clone(),
+            )
+            .await?;
+            wait_for_event_with_timeout(
+                &test.codex,
+                |event| matches!(event, EventMsg::TurnComplete(_)),
+                Duration::from_secs(120),
+            )
+            .await;
+            let requests = request_log.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "the model must receive each command result"
+            );
+            let bodies = requests
+                .iter()
+                .map(|request| request.body_json())
+                .collect::<Vec<_>>();
+            for body in &bodies {
+                let surface = body["tools"].as_array().context("model-visible tools")?;
+                let names = surface
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .collect::<Vec<_>>();
+                assert!(names.contains(&"exec_command"));
+                assert!(names.contains(&"write_stdin"));
+                for absent in [
+                    "semantic_context",
+                    "workspace_validation",
+                    "workspace_transaction",
+                ] {
+                    assert!(
+                        !names.contains(&absent),
+                        "unexpected callable {absent}: {names:?}"
+                    );
+                    // Check embedded Code Mode definitions too, without treating
+                    // prose references in other tools as callable registration.
+                    for tool in surface {
+                        if tool["name"] == "exec" {
+                            let description = tool["description"].as_str().unwrap_or_default();
+                            assert!(!description.contains(&format!("### {absent}\n")));
+                            assert!(!description.contains(&format!("{absent}(args:")));
+                        }
+                    }
+                }
+            }
+            let outputs = collect_tool_outputs(&bodies)?;
+            let result = outputs
+                .get(&call_id)
+                .context("command result was not model-visible")?;
+            output.push_str(&result.output);
+            if let Some(exit) = result.exit_code {
+                terminal_exit = Some(exit);
+                assert!(result.process_id.is_none());
+                break;
+            }
+            let session_id = result
+                .process_id
+                .as_ref()
+                .context("live command needs a session ID")?
+                .parse::<u32>()?;
+            tool = "write_stdin";
+            args =
+                json!({"session_id": session_id, "yield_time_ms": 1000, "max_output_tokens": 2000});
+        }
+        let exit = terminal_exit.context("validation must finish, not leave a live process")?;
+        assert_eq!(exit == 0, expected_success, "exit {exit}: {output}");
+        assert!(
+            output.contains(&format!("fixture revision: {revision}")),
+            "{output}"
+        );
+        assert!(output.contains("validates_current_source"), "{output}");
+        if expected_success {
+            assert!(
+                output.contains("test result: ok. 1 passed; 0 failed"),
+                "{output}"
+            );
+            assert!(
+                !output.contains("fixture revision: failing"),
+                "stale failure replayed: {output}"
+            );
+        } else {
+            assert!(
+                output.contains("test result: FAILED. 0 passed; 1 failed"),
+                "{output}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn extract_output_text(item: &Value) -> Option<&str> {
     item.get("output").and_then(|value| match value {
         Value::String(text) => Some(text.as_str()),
@@ -58,6 +205,24 @@ struct ParsedUnifiedExecOutput {
 }
 
 fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
+    if raw.trim_start().starts_with('{') {
+        #[derive(serde::Deserialize)]
+        struct CompactOutput {
+            exit_code: Option<i32>,
+            session_id: Option<u32>,
+            output: String,
+        }
+        let parsed: CompactOutput = serde_json::from_str(raw)?;
+        return Ok(ParsedUnifiedExecOutput {
+            chunk_id: None,
+            wall_time_seconds: 0.0,
+            process_id: parsed.session_id.map(|id| id.to_string()),
+            exit_code: parsed.exit_code,
+            original_token_count: None,
+            output: parsed.output,
+        });
+    }
+
     fn parse_wall_time(value: &str) -> Result<f64> {
         value
             .strip_suffix(" seconds")
@@ -137,6 +302,16 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
 
 #[test]
 fn token_efficiency_unified_exec_parser_accepts_compact_and_legacy_headers() {
+    let terminal = parse_unified_exec_output(r#"{"exit_code":1,"output":"failed\n中"}"#).unwrap();
+    assert_eq!(terminal.exit_code, Some(1));
+    assert_eq!(terminal.process_id, None);
+    assert_eq!(terminal.output, "failed\n中");
+    let running = parse_unified_exec_output(r#"{"session_id":42,"output":"waiting"}"#).unwrap();
+    assert_eq!(running.exit_code, None);
+    assert_eq!(running.process_id.as_deref(), Some("42"));
+    assert_eq!(running.output, "waiting");
+    assert!(parse_unified_exec_output(r#"{"exit_code":0}"#).is_err());
+
     let compact = parse_unified_exec_output(
         "Process exited with code 0; wall time: 1.2500 seconds\nOutput:\ndone",
     )

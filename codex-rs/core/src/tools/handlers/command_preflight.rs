@@ -43,11 +43,21 @@ pub(crate) struct CommandPreflightOutcome {
     pub(crate) invocation: CommandInvocation,
     pub(crate) validation_invocations: Vec<CommandInvocation>,
     pub(crate) repair_notice: Option<String>,
+    /// Explains a likely mistake in a script that still runs unchanged. It
+    /// never admits the command as repaired.
+    pub(crate) advisory: Option<String>,
 }
 
 impl CommandPreflightOutcome {
     pub(crate) fn repaired(&self) -> bool {
         self.repair_notice.is_some()
+    }
+
+    pub(crate) fn model_notice(&self) -> Option<String> {
+        match (&self.repair_notice, &self.advisory) {
+            (Some(repair), Some(advisory)) => Some(format!("{repair}\n{advisory}")),
+            (repair, advisory) => repair.clone().or_else(|| advisory.clone()),
+        }
     }
 }
 
@@ -93,6 +103,20 @@ impl CommandPreflightIssue {
         });
         rendered.push_str("\nTool error metadata: ");
         rendered.push_str(&metadata.to_string());
+        rendered
+    }
+
+    fn render_advisory_for_model(&self) -> String {
+        let mut rendered = format!(
+            "Command preflight advisory ({}): {}",
+            self.code.tool_error_kind(),
+            self.detail
+        );
+        if let Some(guidance) = &self.guidance {
+            rendered.push_str(" To search it, ");
+            rendered.push_str(guidance);
+        }
+        rendered.push_str(" The script ran as written, so that path produced no results.");
         rendered
     }
 }
@@ -148,6 +172,17 @@ fn preflight_command_issue(
     command: &[String],
     shell_type: Option<ShellType>,
 ) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
+    preflight_command_issues(command, shell_type, /*literal_glob_advisories*/ None)
+}
+
+/// With `literal_glob_advisories`, a literal `rg` glob path is collected
+/// instead of rejecting the command. A script's other commands still produce
+/// useful output, and `rg` reports the missing path itself.
+fn preflight_command_issues(
+    command: &[String],
+    shell_type: Option<ShellType>,
+    mut literal_glob_advisories: Option<&mut Vec<CommandPreflightIssue>>,
+) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
     let preflight_shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
     // Parsing here extracts validation metadata; the target shell owns script
     // syntax and expansion. Heuristic quote/name/path checks can reject valid scripts.
@@ -156,7 +191,12 @@ fn preflight_command_issue(
     for argv in &argv_commands {
         lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)?;
         lint_known_flag_typos(argv)?;
-        lint_rg_literal_glob_paths(argv, preflight_shell_type)?;
+        if let Err(issue) = lint_rg_literal_glob_paths(argv, preflight_shell_type) {
+            match literal_glob_advisories.as_deref_mut() {
+                Some(advisories) => advisories.push(issue),
+                None => return Err(issue),
+            }
+        }
     }
 
     Ok(argv_commands)
@@ -199,6 +239,7 @@ pub(crate) async fn preflight_invocation_for_kd4_runtime(
             invocation: invocation.clone(),
             validation_invocations: vec![invocation.clone()],
             repair_notice: None,
+            advisory: None,
         });
     }
     preflight_invocation_for_runtime(direct_runtime, invocation, command, shell_type).await
@@ -215,6 +256,7 @@ pub(crate) async fn preflight_invocation_for_runtime(
             invocation: invocation.clone(),
             validation_invocations: Vec::new(),
             repair_notice: None,
+            advisory: None,
         });
     }
     preflight_invocation_with_equivalent_repair_async(invocation, command, shell_type).await
@@ -225,7 +267,15 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     command: &[String],
     shell_type: Option<ShellType>,
 ) -> Result<CommandPreflightOutcome, CommandPreflightIssue> {
-    let issue = match preflight_command_issue(command, shell_type) {
+    // Direct argv is a single command, so rejecting it costs nothing. A script
+    // runs its other commands too; discarding all of them for one literal glob
+    // path forces the whole script to be regenerated.
+    let mut literal_glob_advisories = Vec::new();
+    let issue = match preflight_command_issues(
+        command,
+        shell_type,
+        (!invocation.is_argv()).then_some(&mut literal_glob_advisories),
+    ) {
         Ok(argv_commands) => {
             if let Some(repaired) = git_status_read_only_equivalent(invocation) {
                 let Some(repaired_command) = repaired.to_direct_argv() else {
@@ -233,6 +283,7 @@ fn preflight_invocation_with_equivalent_repair_detailed(
                         invocation: invocation.clone(),
                         validation_invocations: validation_invocations(argv_commands, invocation),
                         repair_notice: None,
+                        advisory: None,
                     });
                 };
                 let repaired_argv_commands =
@@ -241,6 +292,7 @@ fn preflight_invocation_with_equivalent_repair_detailed(
                     // Status is already valid. Disabling optional locks is
                     // normalization, so it must not bypass retry admission.
                     repair_notice: None,
+                    advisory: None,
                     validation_invocations: validation_invocations(
                         repaired_argv_commands,
                         &repaired,
@@ -248,10 +300,18 @@ fn preflight_invocation_with_equivalent_repair_detailed(
                     invocation: repaired,
                 });
             }
+            let advisory = (!literal_glob_advisories.is_empty()).then(|| {
+                literal_glob_advisories
+                    .iter()
+                    .map(CommandPreflightIssue::render_advisory_for_model)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
             return Ok(CommandPreflightOutcome {
                 invocation: invocation.clone(),
                 validation_invocations: validation_invocations(argv_commands, invocation),
                 repair_notice: None,
+                advisory,
             });
         }
         Err(issue) => issue,
@@ -300,6 +360,7 @@ fn preflight_invocation_with_equivalent_repair_detailed(
         validation_invocations: validation_invocations(repaired_argv_commands, &repaired),
         invocation: repaired,
         repair_notice: Some(repair_notice),
+        advisory: None,
     })
 }
 
