@@ -17,7 +17,6 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 pub use codex_protocol::protocol::SortDirection;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 pub use codex_protocol::protocol::ThreadRelationFilter;
 pub use codex_protocol::protocol::ThreadSortKey;
 use codex_protocol::protocol::ThreadSource;
@@ -59,8 +58,6 @@ pub struct ThreadPersistenceMetadata {
     pub cwd: Option<PathBuf>,
     /// Model provider associated with the thread.
     pub model_provider: String,
-    /// Memory mode associated with the live thread.
-    pub memory_mode: MemoryMode,
 }
 
 /// Extra configuration fields for a thread.
@@ -144,7 +141,7 @@ pub struct AppendThreadItemsParams {
     pub items: Vec<RolloutItem>,
 }
 
-/// Parameters for loading persisted history for resume, fork, rollback, and memory jobs.
+/// Parameters for loading persisted history for resume, fork, and rollback.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadThreadHistoryParams {
     /// Thread id to load.
@@ -604,8 +601,6 @@ pub struct ThreadMetadataPatch {
     pub first_user_message: Option<String>,
     /// Git metadata patch.
     pub git_info: Option<GitInfoPatch>,
-    /// Thread memory behavior.
-    pub memory_mode: Option<MemoryMode>,
     /// Initial project assignment supplied with thread creation.
     #[serde(
         default,
@@ -693,9 +688,6 @@ impl ThreadMetadataPatch {
                 .get_or_insert_with(GitInfoPatch::default)
                 .merge(git_info);
         }
-        if next.memory_mode.is_some() {
-            self.memory_mode = next.memory_mode;
-        }
         if next.project_id.is_some() {
             self.project_id = next.project_id;
         }
@@ -724,7 +716,6 @@ impl ThreadMetadataPatch {
             && self.token_usage.is_none()
             && self.first_user_message.is_none()
             && self.git_info.is_none()
-            && self.memory_mode.is_none()
             && self.project_id.is_none()
     }
 }

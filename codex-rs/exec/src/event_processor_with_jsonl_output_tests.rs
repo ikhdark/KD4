@@ -12,7 +12,6 @@ fn agent_completion(id: &str, text: &str) -> ServerNotification {
             id: id.into(),
             text: text.into(),
             phase: None,
-            memory_citation: None,
         },
     })
 }
@@ -31,7 +30,6 @@ fn recovered_message_is_deduplicated_by_identity_not_text() {
             id: recovered_id.into(),
             text: "same answer".into(),
             phase: None,
-            memory_citation: None,
         }];
         let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(payload));
         assert_eq!(collected.events.len(), expected_count + 1);
@@ -113,7 +111,6 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
                 id: "msg-1".to_string(),
                 text: "partial answer".to_string(),
                 phase: None,
-                memory_citation: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -169,7 +166,6 @@ fn output_last_message_write_failure_is_returned() {
                 id: "msg-1".to_string(),
                 text: "final answer".to_string(),
                 phase: None,
-                memory_citation: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),

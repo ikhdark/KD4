@@ -6,7 +6,6 @@ use crate::hook_runtime::prepare_additional_context_items;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::run_post_tool_use_hooks;
 use crate::hook_runtime::run_pre_tool_use_hooks;
-use crate::memory_usage::emit_metric_for_tool_read;
 use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
 use crate::session::turn_context::TurnContext;
@@ -51,7 +50,6 @@ use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
-use codex_rollout::state_integration;
 use codex_tools::CanonicalByteRange;
 use codex_tools::CanonicalJsonPointer;
 use codex_tools::CanonicalToolResult;
@@ -874,10 +872,6 @@ impl ToolOutput for UnavailableModelProjectionOutput {
         self.original.deterministic_continuation_content()
     }
 
-    fn contains_external_context(&self) -> bool {
-        self.original.contains_external_context()
-    }
-
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         self.model_visible.projection_metadata()
     }
@@ -1537,7 +1531,6 @@ impl ToolRegistry {
             Ok(result) => result.success_for_logging(),
             Err(_) => false,
         };
-        emit_metric_for_tool_read(&invocation, success);
         let post_tool_use_plan = success
             .then(|| tool.post_tool_use_hook_name(&invocation))
             .flatten()
@@ -1846,22 +1839,6 @@ async fn handle_any_tool(
     let output = tool.handle(invocation.clone()).await;
     mark_tool_handler_exit();
     let output = output?;
-    if output.contains_external_context()
-        && invocation
-            .step_context
-            .turn
-            .config
-            .memories
-            .disable_on_external_context
-        && invocation.step_context.turn.claim_memory_pollution_signal()
-    {
-        state_integration::mark_thread_memory_mode_polluted(
-            invocation.session.services.state_db.as_deref(),
-            invocation.session.thread_id,
-            "tool_output",
-        )
-        .await;
-    }
     Ok(AnyToolResult {
         call_id: invocation.call_id,
         payload: invocation.payload,

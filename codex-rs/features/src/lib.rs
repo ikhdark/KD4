@@ -147,8 +147,6 @@ pub enum Feature {
     TaskModelGuidance,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
-    /// Enable startup memory extraction and file-backed memory consolidation.
-    MemoryTool,
     /// Compress cold local thread-store rollout files.
     LocalThreadStoreCompression,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -896,12 +894,6 @@ define_features! {
         id: Feature::RuntimeMetrics,
         key: "runtime_metrics",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::MemoryTool,
-        key: "memories",
-        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {

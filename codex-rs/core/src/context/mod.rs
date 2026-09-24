@@ -61,7 +61,6 @@ pub(crate) use multi_agent_mode_instructions::MultiAgentModeInstructions;
 pub(crate) use network_rule_saved::NetworkRuleSaved;
 pub(crate) use personality_spec_instructions::PersonalitySpecInstructions;
 pub(crate) use plugin_instructions::PluginInstructions;
-pub(crate) use prompt_provenance::CategorizedPromptFragment;
 pub(crate) use prompt_provenance::PromptContextBreakdown;
 pub(crate) use prompt_provenance::PromptContextCategory;
 pub(crate) use prompt_provenance::PromptContextMeasurement;

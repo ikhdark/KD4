@@ -538,7 +538,7 @@ mod tests {
                     base_instructions: None,
                     dynamic_tools: None,
                     selected_capability_roots: Vec::new(),
-                    memory_mode: None,
+
                     history_mode: Default::default(),
                     multi_agent_version: None,
                     context_window: None,
@@ -786,7 +786,7 @@ mod tests {
                     base_instructions: None,
                     dynamic_tools: None,
                     selected_capability_roots: Vec::new(),
-                    memory_mode: None,
+
                     history_mode: ThreadHistoryMode::Legacy,
                     multi_agent_version: None,
                     context_window: None,

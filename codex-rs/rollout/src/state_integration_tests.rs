@@ -156,7 +156,6 @@ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result
         /*builder*/ None,
         &[],
         /*archived_only*/ Some(false),
-        /*new_thread_memory_mode*/ None,
     )
     .await;
 
@@ -295,7 +294,7 @@ fn write_rollout_with_user_message(
                     base_instructions: None,
                     dynamic_tools: None,
                     selected_capability_roots: Vec::new(),
-                    memory_mode: None,
+
                     history_mode: Default::default(),
                     multi_agent_version: None,
                     context_window: None,

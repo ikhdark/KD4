@@ -43,7 +43,7 @@ use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::LogoutAccountResponse;
-use codex_app_server_protocol::MemoryResetResponse;
+
 use codex_app_server_protocol::Model as ApiModel;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
@@ -76,9 +76,7 @@ use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
-use codex_app_server_protocol::ThreadMemoryMode;
-use codex_app_server_protocol::ThreadMemoryModeSetParams;
-use codex_app_server_protocol::ThreadMemoryModeSetResponse;
+
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
@@ -953,39 +951,6 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/name/set failed in TUI")?;
-        Ok(())
-    }
-
-    pub(crate) async fn thread_memory_mode_set(
-        &mut self,
-        thread_id: ThreadId,
-        mode: ThreadMemoryMode,
-    ) -> Result<()> {
-        let request_id = self.next_request_id();
-        let _: ThreadMemoryModeSetResponse = self
-            .client
-            .request_typed(ClientRequest::ThreadMemoryModeSet {
-                request_id,
-                params: ThreadMemoryModeSetParams {
-                    thread_id: thread_id.to_string(),
-                    mode,
-                },
-            })
-            .await
-            .wrap_err("thread/memoryMode/set failed in TUI")?;
-        Ok(())
-    }
-
-    pub(crate) async fn memory_reset(&mut self) -> Result<()> {
-        let request_id = self.next_request_id();
-        let _: MemoryResetResponse = self
-            .client
-            .request_typed(ClientRequest::MemoryReset {
-                request_id,
-                params: None,
-            })
-            .await
-            .wrap_err("memory/reset failed in TUI")?;
         Ok(())
     }
 
@@ -2400,7 +2365,6 @@ mod tests {
                             id: "assistant-1".to_string(),
                             text: "assistant reply".to_string(),
                             phase: None,
-                            memory_citation: None,
                         },
                     ],
                     status: TurnStatus::Completed,
@@ -2724,7 +2688,6 @@ mod tests {
                 id: "saved-answer".into(),
                 text: "restored from remote history".into(),
                 phase: None,
-                memory_citation: None,
             }],
             status: TurnStatus::Completed,
             error: None,

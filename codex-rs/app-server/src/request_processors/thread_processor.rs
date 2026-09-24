@@ -1535,65 +1535,6 @@ impl ThreadRequestProcessor {
         ))
     }
 
-    pub(crate) async fn thread_memory_mode_set(
-        &self,
-        params: ThreadMemoryModeSetParams,
-    ) -> Result<ThreadMemoryModeSetResponse, JSONRPCErrorError> {
-        let ThreadMemoryModeSetParams { thread_id, mode } = params;
-        let thread_id = ThreadId::from_string(&thread_id)
-            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
-
-        self.thread_manager
-            .update_thread_metadata(
-                thread_id,
-                StoreThreadMetadataPatch {
-                    memory_mode: Some(mode),
-                    ..Default::default()
-                },
-                /*include_archived*/ false,
-            )
-            .await
-            .map_err(|err| core_thread_write_error("set thread memory mode", err))?;
-
-        Ok(ThreadMemoryModeSetResponse {})
-    }
-
-    pub(crate) async fn memory_reset(&self) -> Result<MemoryResetResponse, JSONRPCErrorError> {
-        let state_db = self
-            .state_db
-            .clone()
-            .ok_or_else(|| internal_error("sqlite state db unavailable for memory reset"))?;
-
-        let staged_roots = stage_memory_roots_reset(&self.config.codex_home)
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to stage memory directories under {} for reset: {err}",
-                    self.config.codex_home.display()
-                ))
-            })?;
-
-        if let Err(err) = state_db.memories().clear_memory_data().await {
-            let rollback_result = staged_roots.rollback().await;
-            return Err(internal_error(match rollback_result {
-                Ok(()) => format!("failed to clear memory rows in memories db: {err}"),
-                Err(rollback_err) => format!(
-                    "failed to clear memory rows in memories db: {err}; also failed to restore memory directories: {rollback_err}"
-                ),
-            }));
-        }
-
-        if let Err(err) = staged_roots.commit().await {
-            tracing::warn!(
-                error = %err,
-                codex_home = %self.config.codex_home.display(),
-                "memory reset completed but stale staged directories could not be removed"
-            );
-        }
-
-        Ok(MemoryResetResponse {})
-    }
-
     pub(crate) async fn thread_metadata_update(
         &self,
         params: ThreadMetadataUpdateParams,

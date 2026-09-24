@@ -90,7 +90,6 @@ export type { SessionSource } from "./SessionSource";
 export type { Settings } from "./Settings";
 export type { SubAgentSource } from "./SubAgentSource";
 export type { ThreadId } from "./ThreadId";
-export type { ThreadMemoryMode } from "./ThreadMemoryMode";
 export type { Tool } from "./Tool";
 export type { ToolExecutionId } from "./ToolExecutionId";
 export type { ToolLifecycleBoundary } from "./ToolLifecycleBoundary";

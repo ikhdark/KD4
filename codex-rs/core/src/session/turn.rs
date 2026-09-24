@@ -155,7 +155,6 @@ use codex_core_skills::injection::PlannedSkillInjections;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
-use codex_memories_read::citations::parse_memory_citation;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
@@ -2127,7 +2126,12 @@ async fn build_pure_pending_turn_plan(
         .enabled(Feature::TaskModelGuidance)
         && !base_instructions_own_task_model_guidance(&base_instructions.text)
     {
-        injection_items.insert(0, ContextualUserFragment::into(TaskModelGuidance));
+        injection_items.insert(
+            0,
+            ContextualUserFragment::into(TaskModelGuidance::for_base_instructions(
+                &base_instructions.text,
+            )),
+        );
     }
     injection_items.extend(recommended_plugin_items);
     injection_items.extend(plugin_items);
@@ -4483,8 +4487,6 @@ struct PlanModeStreamState {
     started_agent_message_items: BTreeMap<String, TurnItem>,
     /// Leading whitespace buffered until we see non-whitespace text for an item.
     leading_whitespace_by_item: HashMap<String, String>,
-    /// Raw citation payloads already surfaced through live delta events.
-    emitted_memory_citations: HashSet<String>,
     /// Tracks plan item lifecycle while streaming plan output.
     plan_item_state: ProposedPlanItemState,
 }
@@ -4495,7 +4497,6 @@ impl PlanModeStreamState {
             pending_agent_message_items: HashMap::new(),
             started_agent_message_items: BTreeMap::new(),
             leading_whitespace_by_item: HashMap::new(),
-            emitted_memory_citations: HashSet::new(),
             plan_item_state: ProposedPlanItemState::new(turn_id),
         }
     }
@@ -4578,19 +4579,13 @@ impl ProposedPlanItemState {
         sess.emit_turn_item_started(turn_context, &item).await;
     }
 
-    async fn push_delta(
-        &mut self,
-        sess: &Session,
-        turn_context: &TurnContext,
-        delta: &str,
-        memory_citation: Option<codex_protocol::memory_citation::MemoryCitation>,
-    ) {
+    async fn push_delta(&mut self, sess: &Session, turn_context: &TurnContext, delta: &str) {
         // A delta without a preceding ItemStarted event produces an invalid
         // client-visible item stream. Treat both out-of-phase cases as inert.
         if !self.started || self.completed {
             return;
         }
-        if delta.is_empty() && memory_citation.is_none() {
+        if delta.is_empty() {
             return;
         }
         self.streamed_text.push_str(delta);
@@ -4599,7 +4594,6 @@ impl ProposedPlanItemState {
             turn_id: turn_context.sub_id.clone(),
             item_id: self.item_id.clone(),
             delta: delta.to_string(),
-            memory_citation,
         };
         sess.send_event(turn_context, EventMsg::PlanDelta(event))
             .await;
@@ -4663,17 +4657,6 @@ async fn maybe_emit_pending_agent_message_start(
             .started_agent_message_items
             .insert(item_id.to_string(), item);
     }
-}
-
-fn take_new_memory_citation(
-    state: &mut PlanModeStreamState,
-    citations: Vec<String>,
-) -> Option<codex_protocol::memory_citation::MemoryCitation> {
-    let citations = citations
-        .into_iter()
-        .filter(|citation| state.emitted_memory_citations.insert(citation.clone()))
-        .collect();
-    parse_memory_citation(citations)
 }
 
 /// Agent messages are text-only today; concatenate all text entries.
@@ -4824,7 +4807,6 @@ async fn handle_plan_segments_inner(
                     turn_id: turn_context.sub_id.clone(),
                     item_id: item_id.to_string(),
                     delta,
-                    memory_citation: None,
                 };
                 if let Some(item) = state.started_agent_message_items.get_mut(item_id) {
                     apply_partial_agent_message_delta(item, &event);
@@ -4844,7 +4826,7 @@ async fn handle_plan_segments_inner(
                     }
                     state
                         .plan_item_state
-                        .push_delta(sess, turn_context, &delta, None)
+                        .push_delta(sess, turn_context, &delta)
                         .await;
                 }
             }
@@ -4880,19 +4862,6 @@ fn apply_partial_agent_message_delta(item: &mut TurnItem, event: &AgentMessageCo
                 }),
         }
     }
-    if let Some(citation) = &event.memory_citation {
-        let accumulated = message.memory_citation.get_or_insert_with(Default::default);
-        for entry in &citation.entries {
-            if !accumulated.entries.contains(entry) {
-                accumulated.entries.push(entry.clone());
-            }
-        }
-        for rollout_id in &citation.rollout_ids {
-            if !accumulated.rollout_ids.contains(rollout_id) {
-                accumulated.rollout_ids.push(rollout_id.clone());
-            }
-        }
-    }
 }
 
 async fn emit_streamed_assistant_text_delta(
@@ -4906,28 +4875,12 @@ async fn emit_streamed_assistant_text_delta(
         return None;
     }
     if let Some(state) = plan_mode_state {
-        if let Some(memory_citation) = take_new_memory_citation(state, parsed.citations) {
-            maybe_emit_pending_agent_message_start(sess, turn_context, state, item_id).await;
-            let event = AgentMessageContentDeltaEvent {
-                thread_id: sess.thread_id.to_string(),
-                turn_id: turn_context.sub_id.clone(),
-                item_id: item_id.to_string(),
-                delta: String::new(),
-                memory_citation: Some(memory_citation),
-            };
-            if let Some(item) = state.started_agent_message_items.get_mut(item_id) {
-                apply_partial_agent_message_delta(item, &event);
-            }
-            sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
-                .await;
-        }
         if !parsed.plan_segments.is_empty() {
             handle_plan_segments(sess, turn_context, state, item_id, parsed.plan_segments).await;
         }
         return None;
     }
-    let memory_citation = parse_memory_citation(parsed.citations);
-    if parsed.visible_text.is_empty() && memory_citation.is_none() {
+    if parsed.visible_text.is_empty() {
         return None;
     }
     let event = AgentMessageContentDeltaEvent {
@@ -4935,7 +4888,6 @@ async fn emit_streamed_assistant_text_delta(
         turn_id: turn_context.sub_id.clone(),
         item_id: item_id.to_string(),
         delta: parsed.visible_text,
-        memory_citation,
     };
     sess.send_event(
         turn_context,
@@ -5000,15 +4952,9 @@ async fn maybe_complete_plan_item_from_message(
             }
         }
         if let Some(plan_text) = extract_proposed_plan_text(&text) {
-            let (plan_text, citations) = strip_citations(&plan_text);
+            let (plan_text, _) = strip_citations(&plan_text);
             if !state.plan_item_state.started {
                 state.plan_item_state.start(sess, turn_context).await;
-            }
-            if let Some(memory_citation) = take_new_memory_citation(state, citations) {
-                state
-                    .plan_item_state
-                    .push_delta(sess, turn_context, "", Some(memory_citation))
-                    .await;
             }
             state
                 .plan_item_state
@@ -5050,7 +4996,6 @@ async fn emit_agent_message_in_plan_mode(
                     id: agent_message_id.clone(),
                     content: Vec::new(),
                     phase: None,
-                    memory_citation: None,
                 })
             });
         sess.emit_turn_item_started(turn_context, &start_item).await;
@@ -6230,23 +6175,14 @@ async fn try_run_sampling_request(
                 }
                 if needs_follow_up && !in_flight.is_empty() && all_tool_calls_eager_read_eligible {
                     let history = sess.clone_history().await;
-                    if let Ok(cwd) = crate::workspace_transaction::evidence_cwd(
-                        &turn_context,
-                        turn_context.config.cwd.as_path(),
+                    continuation_workspace_prefetch = start_continuation_workspace_prefetch(
+                        &history,
+                        &turn_diff_tracker,
+                        Arc::clone(&sess.services.git_workspace),
+                        turn_context.config.cwd.clone(),
+                        turn_context.environments.clone(),
                     )
-                    .and_then(|cwd| {
-                        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(cwd)
-                            .map_err(Into::into)
-                    }) {
-                        continuation_workspace_prefetch = start_continuation_workspace_prefetch(
-                            &history,
-                            &turn_diff_tracker,
-                            Arc::clone(&sess.services.git_workspace),
-                            cwd,
-                            turn_context.environments.clone(),
-                        )
-                        .await;
-                    }
+                    .await;
                 }
                 break Ok(UnsettledSamplingRequestResult {
                     needs_follow_up,
@@ -6282,7 +6218,6 @@ async fn try_run_sampling_request(
                             turn_id: turn_context.sub_id.clone(),
                             item_id: active.id(),
                             delta,
-                            memory_citation: None,
                         };
                         sess.send_event(&turn_context, EventMsg::AgentMessageContentDelta(event))
                             .await;

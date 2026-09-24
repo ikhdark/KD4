@@ -34,7 +34,6 @@ use crate::dynamic_tools::DynamicToolSpec;
 use crate::items::TurnItem;
 use crate::mcp::CallToolResult;
 use crate::mcp::RequestId;
-use crate::memory_citation::MemoryCitation;
 use crate::models::ActivePermissionProfile;
 use crate::models::AgentMessageInputContent;
 use crate::models::BaseInstructions;
@@ -380,12 +379,6 @@ pub enum Op {
     /// to generate a summary which will be returned as an AgentMessage event.
     Compact,
 
-    /// Set whether the thread remains eligible for memory generation.
-    ///
-    /// This persists thread-level memory mode metadata without involving the
-    /// model.
-    SetThreadMemoryMode { mode: ThreadMemoryMode },
-
     /// Request Codex to drop the last N user turns from in-memory context.
     ///
     /// This does not attempt to revert local filesystem changes. Clients are
@@ -407,23 +400,6 @@ pub enum Op {
         /// The raw command string after '!'
         command: String,
     },
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-#[ts(rename_all = "lowercase")]
-pub enum ThreadMemoryMode {
-    Enabled,
-    Disabled,
-}
-
-impl ThreadMemoryMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Enabled => "enabled",
-            Self::Disabled => "disabled",
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema, TS)]
@@ -643,7 +619,6 @@ impl Op {
             Self::RefreshMcpServers { .. } => "refresh_mcp_servers",
             Self::ReloadUserConfig => "reload_user_config",
             Self::Compact => "compact",
-            Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
             Self::ThreadRollback { .. } => "thread_rollback",
             Self::Review { .. } => "review",
             Self::Shutdown => "shutdown",
@@ -1639,9 +1614,6 @@ pub struct AgentMessageContentDeltaEvent {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub memory_citation: Option<crate::memory_citation::MemoryCitation>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -1650,9 +1622,6 @@ pub struct PlanDeltaEvent {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub memory_citation: Option<crate::memory_citation::MemoryCitation>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -3580,8 +3549,6 @@ pub struct AgentMessageEvent {
     pub message: String,
     #[serde(default)]
     pub phase: Option<MessagePhase>,
-    #[serde(default)]
-    pub memory_citation: Option<MemoryCitation>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, TS)]
@@ -4045,6 +4012,7 @@ pub enum ThreadSource {
     User,
     Subagent,
     Feature(String),
+    // Legacy rollout origin only; no memory worker is registered.
     MemoryConsolidation,
 }
 
@@ -4096,6 +4064,7 @@ impl FromStr for ThreadSource {
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
 pub enum InternalSessionSource {
+    // Legacy rollout origin only; no memory worker is registered.
     MemoryConsolidation,
 }
 
@@ -4115,6 +4084,7 @@ pub enum SubAgentSource {
         #[serde(default, alias = "agent_type")]
         agent_role: Option<String>,
     },
+    // Legacy rollout origin only; no memory worker is registered.
     MemoryConsolidation,
     Other(String),
 }
@@ -4368,8 +4338,6 @@ pub struct SessionMeta {
     /// Capability roots selected for this thread by the hosting platform.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_capability_roots: Vec<SelectedCapabilityRoot>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_mode: Option<String>,
     #[serde(default)]
     pub history_mode: ThreadHistoryMode,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4400,7 +4368,7 @@ impl Default for SessionMeta {
             base_instructions: None,
             dynamic_tools: None,
             selected_capability_roots: Vec::new(),
-            memory_mode: None,
+
             history_mode: ThreadHistoryMode::default(),
             multi_agent_version: None,
             context_window: None,

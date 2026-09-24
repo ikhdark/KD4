@@ -14,7 +14,6 @@ COMPONENT_FIELDS = (
     "conversation_history_bytes",
     "current_input_bytes",
     "repository_context_bytes",
-    "memory_bytes",
     "skills_bytes",
     "other_injected_context_bytes",
     "envelope_overhead_bytes",

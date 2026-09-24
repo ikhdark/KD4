@@ -33,7 +33,6 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -390,11 +389,6 @@ impl CodexThread {
                 )))
             }
         }
-    }
-
-    /// Persist whether this thread is eligible for future memory generation.
-    pub async fn set_thread_memory_mode(&self, mode: ThreadMemoryMode) -> anyhow::Result<()> {
-        self.codex.set_thread_memory_mode(mode).await
     }
 
     pub async fn steer_input(

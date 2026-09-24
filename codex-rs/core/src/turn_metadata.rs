@@ -23,6 +23,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
+#[cfg(test)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 const MODEL_KEY: &str = "model";
@@ -33,25 +34,6 @@ const WORKSPACE_KIND_KEY: &str = "workspace_kind";
 pub(crate) struct McpTurnMetadataContext<'a> {
     pub(crate) model: &'a str,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn detached_memory_responses_metadata(
-    installation_id: String,
-    session_id: String,
-    thread_id: String,
-    window_id: String,
-    session_source: &SessionSource,
-    cwd: &AbsolutePathBuf,
-    sandbox: Option<&str>,
-) -> CodexResponsesMetadata {
-    CodexResponsesMetadata {
-        request_kind: Some(CodexResponsesRequestKind::Memory),
-        subagent_header: subagent_header_value(session_source),
-        sandbox: sandbox.map(ToString::to_string),
-        workspaces: memory_workspaces(cwd).await,
-        ..CodexResponsesMetadata::new(installation_id, session_id, thread_id, window_id)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -327,19 +309,6 @@ impl TurnMetadataState {
             None => GitWorkspaceMetadata::default(),
         }
     }
-}
-
-async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, GitWorkspaceMetadata> {
-    let Some(source) = GitWorkspaceMetadataSource::discover_local(cwd.clone()) else {
-        return BTreeMap::new();
-    };
-    let repo_root = source.repo_root().to_string_lossy().into_owned();
-    let workspace_git_metadata = source.metadata().await;
-    let mut workspaces = BTreeMap::new();
-    if !workspace_git_metadata.is_empty() {
-        workspaces.insert(repo_root, workspace_git_metadata);
-    }
-    workspaces
 }
 
 #[cfg(test)]

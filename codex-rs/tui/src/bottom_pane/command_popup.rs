@@ -418,7 +418,7 @@ mod tests {
         let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
-            .take(4)
+            .take(3)
             .map(|item| match item {
                 CommandItem::Builtin(cmd) => cmd.command().to_string(),
                 CommandItem::ServiceTier(command) => command.name,
@@ -428,7 +428,6 @@ mod tests {
             cmds,
             vec![
                 "model".to_string(),
-                "memories".to_string(),
                 "mention".to_string(),
                 "mcp".to_string()
             ]

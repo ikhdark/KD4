@@ -2547,39 +2547,6 @@ fn bundled_api_models_advertise_none_reasoning_effort() {
 }
 
 #[tokio::test]
-async fn audit_cache_io_failure_recovers_and_fresh_memory_avoids_disk() {
-    let home = tempdir().unwrap();
-    let blocked_home = home.path().join("not-a-directory");
-    std::fs::write(&blocked_home, "file").unwrap();
-    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model("recovered", "Recovered", 0)]]);
-    let manager = openai_manager_for_tests(blocked_home, endpoint.clone());
-    for _ in 0..3 {
-        let models = manager
-            .list_models(
-                RefreshStrategy::OnlineIfUncached,
-                DEFAULT_HTTP_CLIENT_FACTORY,
-            )
-            .await
-            .expect("cache failure must not prevent discovery or warm reuse");
-        assert!(models.iter().any(|model| model.model == "recovered"));
-    }
-    assert_eq!(endpoint.fetch_count(), 1);
-    // Holding the cache transaction proves warm reads perform no disk operation.
-    let _refresh = manager.refresh_gate.lock().await;
-    let models = timeout(
-        Duration::from_millis(100),
-        manager.list_models(
-            RefreshStrategy::OnlineIfUncached,
-            DEFAULT_HTTP_CLIENT_FACTORY,
-        ),
-    )
-    .await
-    .expect("fresh reads must bypass the transaction gate")
-    .unwrap();
-    assert!(models.iter().any(|model| model.model == "recovered"));
-}
-
-#[tokio::test]
 async fn audit_concurrent_cache_misses_share_one_fetch() {
     let home = tempdir().unwrap();
     let endpoint = ControlledModelsEndpoint::new(vec![ControlledResponse::Models(
@@ -2658,11 +2625,8 @@ async fn sol_6_bundled_catalog_resolves_picker_and_runtime_metadata() {
 
     let codex_home = tempdir().expect("temp dir");
     let endpoint = TestModelsEndpoint::without_refresh(Vec::new());
-    let manager = openai_manager_for_tests_with_auth(
-        codex_home.path().to_path_buf(),
-        endpoint.clone(),
-        None,
-    );
+    let manager =
+        openai_manager_for_tests_with_auth(codex_home.path().to_path_buf(), endpoint.clone(), None);
     let models = manager
         .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
         .await

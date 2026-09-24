@@ -2,7 +2,6 @@
 
 // The Windows transport future exceeds the default trait-solver recursion depth.
 #![recursion_limit = "256"]
-
 // Prevent accidental direct writes to stdout/stderr in library code. All
 // user-visible output must go through the appropriate abstraction (e.g.,
 // the TUI or the tracing stack).
@@ -17,7 +16,6 @@ mod responses_retry;
 pub(crate) mod session;
 pub use responses_metadata::CodexResponsesMetadata;
 pub use session::SteerInputError;
-pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;
 mod compact_model_fallback;
 mod compact_remote;
@@ -143,7 +141,6 @@ mod turn_metadata;
 mod turn_timing;
 mod validation_admission;
 mod workspace_operation_gate;
-mod workspace_transaction;
 pub(crate) use codex_tools::FunctionCallError;
 
 pub async fn init_state_db(config: &config::Config) -> Option<StateDbHandle> {
@@ -200,5 +197,4 @@ pub use exec_policy::format_exec_policy_error_with_source;
 pub use exec_policy::load_exec_policy;
 pub use installation_id::resolve_installation_id;
 pub mod compact;
-mod memory_usage;
 pub mod otel_init;

@@ -1265,11 +1265,6 @@ impl Session {
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),
-                                memory_mode: if config.memories.generate_memories {
-                                    ThreadMemoryMode::Enabled
-                                } else {
-                                    ThreadMemoryMode::Disabled
-                                },
                             },
                         };
                         LiveThread::create(Arc::clone(&thread_store), params).await?
@@ -1283,11 +1278,6 @@ impl Session {
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),
-                                memory_mode: if config.memories.generate_memories {
-                                    ThreadMemoryMode::Enabled
-                                } else {
-                                    ThreadMemoryMode::Disabled
-                                },
                             },
                         };
                         LiveThread::resume(

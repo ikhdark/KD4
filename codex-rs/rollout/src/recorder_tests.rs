@@ -52,7 +52,6 @@ fn test_config(codex_home: &Path) -> RolloutConfig {
         sqlite_home: codex_home.to_path_buf(),
         cwd: codex_home.to_path_buf(),
         model_provider_id: "test-provider".to_string(),
-        generate_memories: true,
     }
 }
 
@@ -240,7 +239,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             base_instructions: None,
             dynamic_tools: None,
             selected_capability_roots: Vec::new(),
-            memory_mode: None,
+
             history_mode: Default::default(),
             multi_agent_version: None,
             context_window: None,
@@ -546,7 +545,6 @@ async fn recorder_persists_every_sampling_request_token_count() -> std::io::Resu
                 AgentMessageEvent {
                     message: "accepted-marker".into(),
                     phase: None,
-                    memory_citation: None,
                 },
             ))])
             .await?;
@@ -617,7 +615,6 @@ async fn recorder_last_handle_drop_drains_accepted_deferred_records() -> std::io
             RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
                 message: "accepted-before-last-drop".into(),
                 phase: None,
-                memory_citation: None,
             })),
             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                 info: None,
@@ -695,7 +692,6 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
             AgentMessageEvent {
                 message: "buffered-event".to_string(),
                 phase: None,
-                memory_citation: None,
             },
         ))])
         .await?;
@@ -789,7 +785,6 @@ async fn concurrent_shutdown_never_acknowledges_items_behind_shutdown() -> std::
             AgentMessageEvent {
                 message: "before-concurrent-shutdown".to_string(),
                 phase: None,
-                memory_citation: None,
             },
         ))])
         .await?;
@@ -807,7 +802,6 @@ async fn concurrent_shutdown_never_acknowledges_items_behind_shutdown() -> std::
                     AgentMessageEvent {
                         message: message.clone(),
                         phase: None,
-                        memory_citation: None,
                     },
                 ))])
                 .await;
@@ -865,7 +859,6 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
             AgentMessageEvent {
                 message: "buffered-before-persist".to_string(),
                 phase: None,
-                memory_citation: None,
             },
         ))])
         .await?;
@@ -920,7 +913,6 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         EventMsg::AgentMessage(AgentMessageEvent {
             message: "queued-after-writer-error".to_string(),
             phase: None,
-            memory_citation: None,
         }),
     )]));
 
@@ -1137,7 +1129,6 @@ fn agent_message(message: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
         message: message.to_string(),
         phase: None,
-        memory_citation: None,
     }))
 }
 
@@ -1382,7 +1373,6 @@ async fn assert_failed_append_is_written_once(
         EventMsg::AgentMessage(AgentMessageEvent {
             message: message.to_string(),
             phase: None,
-            memory_citation: None,
         }),
     )]));
 
@@ -1437,7 +1427,6 @@ async fn unrecoverable_append_stops_writer_with_live_senders() -> std::io::Resul
             AgentMessageEvent {
                 message: "cannot safely retry".into(),
                 phase: None,
-                memory_citation: None,
             },
         ))]),
         flush_if_materialized: true,
@@ -1505,7 +1494,6 @@ async fn ordered_append_waits_for_in_memory_acceptance_without_materializing() -
     let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
         message: "accepted-in-memory".to_string(),
         phase: None,
-        memory_citation: None,
     }));
     let items = [item];
     let append = recorder.record_canonical_items_ordered(&items);
@@ -1555,7 +1543,6 @@ async fn ordered_append_reaches_disk_before_a_terminal_barrier() -> std::io::Res
         AgentMessageEvent {
             message: "persisted-without-barrier".to_string(),
             phase: None,
-            memory_citation: None,
         },
     ))];
     recorder.record_canonical_items_ordered(&items).await?;
@@ -1599,7 +1586,6 @@ async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::
                 RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
                     message: message.to_string(),
                     phase: None,
-                    memory_citation: None,
                 }))
             })
             .collect(),
@@ -2501,7 +2487,6 @@ async fn failed_reconciliation_does_not_overlay_stale_readable_metadata() -> any
         "test-provider",
         None,
         &[],
-        None,
         None,
     )
     .await;

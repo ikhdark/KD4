@@ -21,7 +21,6 @@ codex-features = { workspace = true }
 codex-goal-extension = { workspace = true }
 codex-image-generation-extension = { workspace = true }
 codex-login = { workspace = true }
-codex-memories-extension = { workspace = true }
 codex-mcp-extension = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }

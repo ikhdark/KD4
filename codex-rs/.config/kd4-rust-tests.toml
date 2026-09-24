@@ -78,7 +78,6 @@ helpers = [
 "plan_store::tests::" = []
 "session::rollout_reconstruction_tests::" = []
 "tool_history::tests::" = []
-"workspace_transaction::tests::" = []
 
 [targets.available_skills_instructions]
 package = "codex-core"
@@ -161,7 +160,7 @@ lib = true
 helpers = []
 
 [gates.sampling-freshness]
-description = "Sampling freshness integration and validation snapshot receipts."
+description = "Sampling freshness integration and direct-workspace evidence."
 
 [[gates.sampling-freshness.steps]]
 target = "core_lib"
@@ -169,7 +168,7 @@ helpers = []
 tests = [
   "context_manager::history::tests::sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context",
   "session::turn::tests::workspace_evidence_coalesces_mutating_calls_at_generation_boundary",
-  "unified_exec::process_manager::tests::validation_snapshot_receipt_survives_polls_and_rejects_changed_source",
+  "tools::parallel::tests::workspace_evidence_ignores_retired_transaction_state",
 ]
 
 # ---------------------------------------------------------------------------

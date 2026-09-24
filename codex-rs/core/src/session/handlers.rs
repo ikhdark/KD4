@@ -30,7 +30,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
@@ -641,38 +640,6 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     .await;
 }
 
-pub(super) async fn persist_thread_memory_mode_update(
-    sess: &Arc<Session>,
-    mode: ThreadMemoryMode,
-) -> anyhow::Result<()> {
-    let live_thread = sess.live_thread_for_persistence("update thread memory mode")?;
-    live_thread.persist().await?;
-    live_thread.flush().await?;
-    live_thread
-        .update_memory_mode(mode, /*include_archived*/ false)
-        .await?;
-    live_thread.flush().await?;
-    Ok(())
-}
-
-/// Persists thread-level memory mode metadata for the active session.
-///
-/// This does not involve the model and only affects whether the thread is
-/// eligible for future memory generation.
-pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: ThreadMemoryMode) {
-    if let Err(err) = persist_thread_memory_mode_update(sess, mode).await {
-        warn!("Failed to persist thread memory mode update to rollout: {err}");
-        let event = Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: err.to_string(),
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        };
-        sess.send_event_raw(event).await;
-    }
-}
-
 pub(super) const TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
@@ -1075,10 +1042,6 @@ async fn dispatch_submission(
             }
             Op::ThreadRollback { num_turns } => {
                 thread_rollback(&sess, sub.id.clone(), num_turns).await;
-                false
-            }
-            Op::SetThreadMemoryMode { mode } => {
-                set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
                 false
             }
             Op::RunUserShellCommand { command } => {

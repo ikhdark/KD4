@@ -10,7 +10,6 @@ use sqlx::migrate::Migrator;
 pub(crate) static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 pub(crate) static LOGS_MIGRATOR: Migrator = sqlx::migrate!("./logs_migrations");
 pub(crate) static GOALS_MIGRATOR: Migrator = sqlx::migrate!("./goals_migrations");
-pub(crate) static MEMORIES_MIGRATOR: Migrator = sqlx::migrate!("./memory_migrations");
 pub(crate) static BUGS_MIGRATOR: Migrator = sqlx::migrate!("./bugs_migrations");
 
 /// Allow an older Codex binary to open a database that has already been
@@ -40,10 +39,6 @@ pub(crate) fn runtime_logs_migrator() -> Migrator {
 
 pub(crate) fn runtime_goals_migrator() -> Migrator {
     runtime_migrator(&GOALS_MIGRATOR)
-}
-
-pub(crate) fn runtime_memories_migrator() -> Migrator {
-    runtime_migrator(&MEMORIES_MIGRATOR)
 }
 
 pub(crate) fn runtime_bugs_migrator() -> Migrator {

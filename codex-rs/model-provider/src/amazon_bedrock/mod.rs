@@ -12,7 +12,6 @@ use codex_api::SharedAuthProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::BedrockApiKeyAuth;
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::SharedModelsManager;
@@ -114,14 +113,6 @@ impl ModelProvider for AmazonBedrockModelProvider {
             image_generation: false,
             web_search: false,
         }
-    }
-
-    fn memory_extraction_preferred_model(&self) -> &'static str {
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID
-    }
-
-    fn memory_consolidation_preferred_model(&self) -> &'static str {
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID
     }
 
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {

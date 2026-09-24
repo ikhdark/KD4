@@ -222,9 +222,6 @@ pub struct TurnContext {
     pub(crate) agent_task_binding: Arc<OnceLock<Option<codex_agent_task_store::AgentTaskBinding>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
-    /// Ensures external-context producers signal memory pollution at most once
-    /// during this turn, even when the same result has multiple projections.
-    pub(crate) memory_pollution_signal_claimed: AtomicBool,
     /// Flat tool names dispatched earlier in this turn, in dispatch order.
     /// PreToolUse hooks receive it so advice the turn already acted on is not
     /// injected again.
@@ -299,12 +296,6 @@ impl TurnContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    }
-
-    pub(crate) fn claim_memory_pollution_signal(&self) -> bool {
-        self.memory_pollution_signal_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
     }
 
     /// Returns the host-native cwd resolved for this turn.
@@ -623,9 +614,6 @@ impl TurnContext {
             model_verification_emitted: AtomicBool::new(
                 self.model_verification_emitted.load(Ordering::Relaxed),
             ),
-            memory_pollution_signal_claimed: AtomicBool::new(
-                self.memory_pollution_signal_claimed.load(Ordering::Relaxed),
-            ),
             dispatched_tool_names: Arc::clone(&self.dispatched_tool_names),
             cancellation_cause: Arc::new(OnceLock::new()),
         }
@@ -925,7 +913,6 @@ impl Session {
             agent_task_binding: Arc::new(OnceLock::new()),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
-            memory_pollution_signal_claimed: AtomicBool::new(false),
             dispatched_tool_names: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancellation_cause: Arc::new(OnceLock::new()),
         }

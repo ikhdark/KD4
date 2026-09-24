@@ -396,7 +396,7 @@ impl ExecCommandHandler {
             ))
         })?;
         let repaired = preflight.repaired();
-        let mut repair_notice = preflight.model_notice();
+        let repair_notice = preflight.model_notice();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let invocation_changed = &command_invocation != original_invocation;
@@ -537,7 +537,7 @@ impl ExecCommandHandler {
             additional_permissions,
             justification,
             prefix_rule,
-            mut force_fresh,
+            force_fresh,
             ..
         } = args;
         let yield_time_ms = if nested && !yield_time_requested {
@@ -622,33 +622,7 @@ impl ExecCommandHandler {
             context.turn.network,
         );
         let input_context = format!("prefix={prefix_rule:?}");
-        let mut effective_environment = manager.effective_environment(&context);
-        if !environment_is_remote && let Ok(native) = cwd.to_abs_path() {
-            let snapshot = crate::workspace_transaction::validation_context(
-                &turn.config.codex_home,
-                &session.thread_id.to_string(),
-                native.as_path(),
-            )
-            .map_err(|e| {
-                FunctionCallError::RespondToModel(format!("validation snapshot: {e:#}"))
-            })?;
-            if let Some(snapshot) = snapshot {
-                force_fresh = true;
-                crate::workspace_transaction::bind_validation_environment(
-                    &snapshot,
-                    &mut effective_environment,
-                );
-                let notice = format!(
-                    "Validation source revision: {}. Captured source: {}. This result does not validate later task edits or the reconciled checkout.",
-                    snapshot.revision,
-                    snapshot.workdir.display()
-                );
-                repair_notice = Some(match repair_notice {
-                    Some(previous) => format!("{previous}\n{notice}"),
-                    None => notice,
-                });
-            }
-        }
+        let effective_environment = manager.effective_environment(&context);
         let environment_hash = validation_environment_hash(&effective_environment);
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session

@@ -270,7 +270,6 @@ fn turn_completed_recovers_final_message_from_turn_items() {
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
-                    memory_citation: None,
                 }],
                 status: TurnStatus::Completed,
                 error: None,
@@ -322,7 +321,6 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
-                    memory_citation: None,
                 }],
                 status: TurnStatus::Completed,
                 error: None,
@@ -518,7 +516,6 @@ fn canonical_message_retains_rendered_state_only_when_unchanged() {
                     id: "message".into(),
                     text: "streamed answer".into(),
                     phase: None,
-                    memory_citation: None,
                 },
             },
         ));

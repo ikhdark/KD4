@@ -223,7 +223,6 @@ pub(crate) struct RolloutMetadataAccumulator {
     reducer: Option<ThreadMetadataRolloutReducer>,
     has_metadata_builder: bool,
     parent_thread_id: Option<ThreadId>,
-    memory_mode: Option<String>,
     saw_item: bool,
     saw_first_session_meta: bool,
     persisted_recency_at: bool,
@@ -250,9 +249,6 @@ impl RolloutMetadataAccumulator {
             self.reducer = Some(ThreadMetadataRolloutReducer::default());
         }
         if let RolloutItem::SessionMeta(meta_line) = &item {
-            if let Some(mode) = meta_line.meta.memory_mode.as_ref() {
-                self.memory_mode = Some(mode.clone());
-            }
             if !self.saw_first_session_meta {
                 self.saw_first_session_meta = true;
                 if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
@@ -322,7 +318,6 @@ impl RolloutMetadataAccumulator {
         Ok(ExtractionOutcome {
             metadata,
             parent_thread_id: self.parent_thread_id,
-            memory_mode: self.memory_mode,
             parse_errors,
         })
     }
@@ -473,7 +468,6 @@ pub(crate) async fn backfill_sessions_with_lease(
                     let parent_thread_id = outcome.parent_thread_id;
                     let mut metadata = outcome.metadata;
                     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
-                    let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
                     if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
                         metadata.prefer_existing_git_info(&existing_metadata);
                         metadata.prefer_existing_explicit_title(&existing_metadata);
@@ -498,19 +492,8 @@ pub(crate) async fn backfill_sessions_with_lease(
                         );
                         false
                     } else {
-                        if let Err(err) = runtime
-                            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
-                            .await
-                        {
-                            warn!(
-                                "failed to restore memory mode for {}: {err}",
-                                rollout.path.display()
-                            );
-                            false
-                        } else {
-                            stats.upserted = stats.upserted.saturating_add(1);
-                            true
-                        }
+                        stats.upserted = stats.upserted.saturating_add(1);
+                        true
                     }
                 }
                 Err(err) => {

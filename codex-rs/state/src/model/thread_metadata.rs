@@ -45,8 +45,6 @@ pub struct ExtractionOutcome {
     pub metadata: ThreadMetadata,
     /// The explicit parent thread identifier from rollout metadata, if present.
     pub parent_thread_id: Option<ThreadId>,
-    /// The explicit thread memory mode from rollout metadata, if present.
-    pub memory_mode: Option<String>,
     /// The number of rollout lines that failed to parse.
     pub parse_errors: usize,
 }

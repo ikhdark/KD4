@@ -2044,7 +2044,6 @@ async fn list_all_tools_adds_server_metadata_to_tools() {
         server_name.to_string(),
         McpServerMetadata {
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            pollutes_memory: true,
             origin: Some(McpServerOrigin::StreamableHttp(
                 "https://docs.example".to_string(),
             )),

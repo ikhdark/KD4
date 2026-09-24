@@ -839,7 +839,6 @@ impl TurnRequestProcessor {
             .map(V2UserInput::into_core)
             .collect();
         let client_user_message_id = params.client_user_message_id;
-        let turn_has_input = !mapped_items.is_empty();
         let cwd = resolve_request_cwd(params.cwd)?;
         let environments = self
             .build_environment_override(thread.as_ref(), cwd, environment_selections)
@@ -954,18 +953,6 @@ impl TurnRequestProcessor {
             )
             .await
             .map_err(|error| internal_error(format!("turn submission task failed: {error}")))??;
-
-        if turn_has_input {
-            let config_snapshot = thread.config_snapshot().await;
-            let _ = codex_memories_write::start_memories_startup_task(
-                Arc::clone(&self.thread_manager),
-                Arc::clone(&self.auth_manager),
-                thread_id,
-                Arc::clone(&thread),
-                thread.config().await,
-                &config_snapshot.session_source,
-            );
-        }
 
         self.outgoing
             .record_request_turn_id(&request_id, &turn_id)

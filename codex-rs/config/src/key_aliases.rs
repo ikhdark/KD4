@@ -2,19 +2,6 @@ use codex_network_proxy::normalize_host;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
 
-#[derive(Debug, Clone, Copy)]
-struct ConfigKeyAlias {
-    table_path: &'static [&'static str],
-    legacy_key: &'static str,
-    canonical_key: &'static str,
-}
-
-const CONFIG_KEY_ALIASES: &[ConfigKeyAlias] = &[ConfigKeyAlias {
-    table_path: &["memories"],
-    legacy_key: "no_memories_if_mcp_or_web_search",
-    canonical_key: "disable_on_external_context",
-}];
-
 pub(crate) fn normalize_key_aliases(path: &[String], table: &mut TomlMap<String, TomlValue>) {
     if matches!(
         path,
@@ -25,18 +12,6 @@ pub(crate) fn normalize_key_aliases(path: &[String], table: &mut TomlMap<String,
         let entries = std::mem::take(table);
         for (pattern, value) in entries {
             table.insert(normalize_host(&pattern), value);
-        }
-    }
-    for alias in CONFIG_KEY_ALIASES {
-        if path
-            .iter()
-            .map(String::as_str)
-            .eq(alias.table_path.iter().copied())
-            && let Some(value) = table.remove(alias.legacy_key)
-        {
-            table
-                .entry(alias.canonical_key.to_string())
-                .or_insert(value);
         }
     }
 }

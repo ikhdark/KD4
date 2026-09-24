@@ -858,15 +858,6 @@ pub(crate) enum AppEvent {
         updates: Vec<(Feature, bool)>,
     },
 
-    /// Update memory settings and persist them to config.toml.
-    UpdateMemorySettings {
-        use_memories: bool,
-        generate_memories: bool,
-    },
-
-    /// Clear all persisted local memory artifacts via the app-server.
-    ResetMemories,
-
     /// Update whether the world-writable directories warning has been acknowledged.
     UpdateWorldWritableWarningAcknowledged(bool),
 

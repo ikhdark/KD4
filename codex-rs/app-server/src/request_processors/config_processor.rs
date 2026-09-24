@@ -49,12 +49,8 @@ use codex_protocol::config_types::WebSearchMode;
 use serde_json::json;
 use std::path::PathBuf;
 
-const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
-    "auth_elicitation",
-    "memories",
-    "remote_plugin",
-    "tool_suggest",
-];
+const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] =
+    &["auth_elicitation", "remote_plugin", "tool_suggest"];
 
 fn runtime_refreshable_features_for_batch(params: &ConfigBatchWriteParams) -> Vec<Feature> {
     let refresh_all = params.edits.iter().any(|edit| edit.key_path == "features");

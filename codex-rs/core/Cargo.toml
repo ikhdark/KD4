@@ -49,7 +49,6 @@ codex-feedback = { workspace = true }
 codex-file-system = { workspace = true }
 codex-file-watcher = { workspace = true }
 codex-login = { workspace = true }
-codex-memories-read = { workspace = true }
 codex-mcp = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-models-manager = { workspace = true }
@@ -83,7 +82,6 @@ codex-utils-pty = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-utils-stream-parser = { workspace = true }
 codex-windows-sandbox = { workspace = true }
-codex-workspace-tools = { workspace = true }
 csv = { workspace = true }
 dunce = { workspace = true }
 eventsource-stream = { workspace = true }

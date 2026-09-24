@@ -2304,7 +2304,10 @@ impl ToolOutput for WaitAgentResult {
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
-        let mut metadata = crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)?;
+        let mut metadata =
+            crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(
+                self, true,
+            )?;
         if let Some(receipt) = &self.previous_delivery {
             metadata.essential_inline["previous_delivery"] = receipt.clone();
         }

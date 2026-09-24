@@ -445,12 +445,6 @@ pub trait ToolOutput: Send {
         Vec::new()
     }
 
-    /// Whether this output contains external context that should disable memory generation when
-    /// `memories.disable_on_external_context` is enabled.
-    fn contains_external_context(&self) -> bool {
-        false
-    }
-
     /// Returns typed projection inputs for textual output, if this output may
     /// be reduced for a direct or code-mode model consumer.
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
@@ -570,10 +564,6 @@ where
         (**self).deterministic_continuation_content()
     }
 
-    fn contains_external_context(&self) -> bool {
-        (**self).contains_external_context()
-    }
-
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         (**self).projection_metadata()
     }
@@ -625,7 +615,6 @@ pub struct JsonToolOutput {
     success: Option<bool>,
     outcome: Option<ToolOutputOutcome>,
     skip_disposition: Option<ToolOutputSkipDisposition>,
-    contains_external_context: bool,
     serialized: Arc<OnceLock<String>>,
 }
 
@@ -637,7 +626,6 @@ impl std::fmt::Debug for JsonToolOutput {
             .field("success", &self.success)
             .field("outcome", &self.outcome)
             .field("skip_disposition", &self.skip_disposition)
-            .field("contains_external_context", &self.contains_external_context)
             .finish()
     }
 }
@@ -648,7 +636,6 @@ impl PartialEq for JsonToolOutput {
             && self.success == other.success
             && self.outcome == other.outcome
             && self.skip_disposition == other.skip_disposition
-            && self.contains_external_context == other.contains_external_context
     }
 }
 
@@ -664,7 +651,6 @@ impl JsonToolOutput {
             success: Some(true),
             outcome: None,
             skip_disposition: None,
-            contains_external_context: false,
             serialized: Arc::new(OnceLock::new()),
         }
     }
@@ -675,7 +661,6 @@ impl JsonToolOutput {
             success,
             outcome: None,
             skip_disposition: None,
-            contains_external_context: false,
             serialized: Arc::new(OnceLock::new()),
         }
     }
@@ -686,7 +671,6 @@ impl JsonToolOutput {
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: None,
-            contains_external_context: false,
             serialized: Arc::new(OnceLock::new()),
         }
     }
@@ -700,14 +684,8 @@ impl JsonToolOutput {
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: Some(disposition),
-            contains_external_context: false,
             serialized: Arc::new(OnceLock::new()),
         }
-    }
-
-    pub fn with_external_context(mut self) -> Self {
-        self.contains_external_context = true;
-        self
     }
 
     fn serialized(&self) -> &str {
@@ -918,10 +896,6 @@ impl ToolOutput for JsonToolOutput {
                     "failure": { "fingerprint": fingerprint },
                 })
             })
-    }
-
-    fn contains_external_context(&self) -> bool {
-        self.contains_external_context
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {

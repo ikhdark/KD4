@@ -43,7 +43,6 @@ use codex_analytics::TurnTokenUsageFact;
 use codex_code_mode::CancellationCause;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_E2E_DURATION_METRIC;
-use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
@@ -57,7 +56,6 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 
-use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
@@ -163,7 +161,6 @@ fn turn_boundary_history_marker(
 fn emit_turn_network_proxy_metric(
     session_telemetry: &SessionTelemetry,
     network_proxy_active: bool,
-    tmp_mem: (&str, &str),
 ) {
     let active = if network_proxy_active {
         "true"
@@ -173,26 +170,7 @@ fn emit_turn_network_proxy_metric(
     session_telemetry.counter(
         TURN_NETWORK_PROXY_METRIC,
         /*inc*/ 1,
-        &[("active", active), tmp_mem],
-    );
-}
-
-fn emit_turn_memory_metric(
-    session_telemetry: &SessionTelemetry,
-    feature_enabled: bool,
-    config_enabled: bool,
-    has_citations: bool,
-) {
-    let read_allowed = feature_enabled && config_enabled;
-    session_telemetry.counter(
-        TURN_MEMORY_METRIC,
-        /*inc*/ 1,
-        &[
-            ("read_allowed", bool_tag(read_allowed)),
-            ("feature_enabled", bool_tag(feature_enabled)),
-            ("config_use_memories", bool_tag(config_enabled)),
-            ("has_citations", bool_tag(has_citations)),
-        ],
+        &[("active", active)],
     );
 }
 
@@ -963,19 +941,9 @@ impl Session {
     async fn emit_post_terminal_metrics(
         &self,
         turn_context: &TurnContext,
-        turn_had_memory_citation: bool,
         turn_tool_calls: u64,
         turn_token_usage: &TokenUsage,
     ) {
-        let memory_feature_enabled = turn_context.config.features.enabled(Feature::MemoryTool);
-        let tmp_mem = (
-            "tmp_mem_enabled",
-            if memory_feature_enabled {
-                "true"
-            } else {
-                "false"
-            },
-        );
         let network_proxy = self.services.network_proxy.load_full();
         let network_proxy_active = match network_proxy.as_ref() {
             Some(started_network_proxy) => {
@@ -991,15 +959,11 @@ impl Session {
             }
             None => false,
         };
-        emit_turn_network_proxy_metric(
-            &self.services.session_telemetry,
-            network_proxy_active,
-            tmp_mem,
-        );
+        emit_turn_network_proxy_metric(&self.services.session_telemetry, network_proxy_active);
         self.services.session_telemetry.histogram(
             TURN_TOOL_CALL_METRIC,
             i64::try_from(turn_tool_calls).unwrap_or(i64::MAX),
-            &[tmp_mem],
+            &[],
         );
         let current_span = Span::current();
         current_span.record(
@@ -1043,15 +1007,9 @@ impl Session {
             self.services.session_telemetry.histogram(
                 TURN_TOKEN_USAGE_METRIC,
                 value,
-                &[("token_type", token_type), tmp_mem],
+                &[("token_type", token_type)],
             );
         }
-        emit_turn_memory_metric(
-            &self.services.session_telemetry,
-            memory_feature_enabled,
-            turn_context.config.memories.use_memories,
-            turn_had_memory_citation,
-        );
     }
 
     async fn emit_worker_join_failure_before_terminal(
@@ -1253,13 +1211,9 @@ impl Session {
         }
         self.dispatch_terminal_lifecycle(finalization).await;
 
-        let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
+        let (turn_tool_calls, token_usage_at_turn_start) = {
             let state = finalization.turn_state.lock().await;
-            (
-                state.has_memory_citation,
-                state.tool_calls,
-                state.token_usage_at_turn_start.clone(),
-            )
+            (state.tool_calls, state.token_usage_at_turn_start.clone())
         };
 
         let repaired_tool_timings = turn_context
@@ -1390,13 +1344,8 @@ impl Session {
             .command_execution
             .persist_cache_after_terminal()
             .await;
-        self.emit_post_terminal_metrics(
-            turn_context.as_ref(),
-            turn_had_memory_citation,
-            turn_tool_calls,
-            &turn_token_usage,
-        )
-        .await;
+        self.emit_post_terminal_metrics(turn_context.as_ref(), turn_tool_calls, &turn_token_usage)
+            .await;
 
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");

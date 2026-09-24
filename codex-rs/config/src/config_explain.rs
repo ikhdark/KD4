@@ -362,17 +362,12 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     ),
     doc(
         "web_search",
-        "Search, memory, and agents",
+        "Search and agents",
         "Global web search mode: `disabled`, `cached`, or `live`.",
     ),
     doc(
-        "memories",
-        "Search, memory, and agents",
-        "Memory generation, injection, limits, and consolidation models.",
-    ),
-    doc(
         "agents",
-        "Search, memory, and agents",
+        "Search and agents",
         "Agent thread limits, nesting, runtime, interrupt messages, and roles.",
     ),
     doc(

@@ -9,8 +9,7 @@ before the tools appear in the published Desktop.
 | --- | --- |
 | 1. Whole-patch preflight | Finds rejected update hunks before committing a valid prefix. |
 | 2. Revision-bound edits | Replaces exact source ranges without regenerating surrounding code; stale hashes reject. |
-| 3. Warm build leases | Reuses build directories while excluding overlapping validation processes. |
-| 4. Phase checkpoints | Replaces selected completed outputs with recovery receipts while preserving active evidence. |
+| 3. Phase checkpoints | Replaces selected completed outputs with recovery receipts while preserving active evidence. |
 
 ## Retained patch retries
 
@@ -32,26 +31,6 @@ only the rejected chunk; unmentioned code is retained:
 hunk. Already committed hunks are excluded. A receipt retains code, not approval:
 the effective patch still passes hooks, current-source verification, environment
 checks, and permissions. Unknown, consumed, or evicted IDs require a fresh patch.
-
-## Isolated task workspace
-
-Call `workspace_transaction` with `{"action":"begin"}` before inspecting source
-for a concurrent implementation task. It captures tracked and nonignored
-untracked files, including local edits, without changing the original index or
-HEAD. Read, patch, and command paths are routed to the task checkout. Shell text
-is not rewritten; use the returned workspace paths and relative source paths.
-
-`{"action":"status"}` recovers the active checkout. Validation launched through
-`exec_command` uses captured source and isolated build output. After editing,
-`{"action":"reconcile"}` merges compatible changes back. Conflicts retain the
-task checkout and publish no files. Successful receipts set `validation_required`
-and identify the next validation step. Inspect that result and validate
-the integrated runtime before reporting completion; pre-merge validation alone
-does not prove the combined source.
-
-This first implementation supports local unrestricted environments and rejects
-links, submodules, and oversized snapshots. Ignored files and dependencies outside
-the repository are not captured.
 
 ## Whole-patch preflight and revision-bound edits
 
@@ -76,13 +55,11 @@ The hash must match the current complete file, and ranges must be ordered and
 nonoverlapping. A stale handle rejects the edit. Normal patch authorization and
 retained retry handling still apply.
 
-## Focused validation and warm builds
+## Focused validation
 
-Run scoped Cargo checks through `exec_command`. Active workspace transactions
-capture validation source and lease warm output lanes until the process exits.
-The shared lane and snapshot-freshness helpers remain in `codex-workspace-tools`;
-that crate no longer provides a worker entrypoint, semantic analysis, or a
-validation runner. See [workspace transactions](workspace-transactions.md).
+Run scoped Cargo checks through `exec_command` in the selected working directory.
+Read, patch, and command tools use the selected workspace directly, without
+automatic source copies, build-output overrides, or a reconciliation step.
 
 ## Evidence-preserving phase checkpoints
 
@@ -95,7 +72,7 @@ original instructions remain available. The checkpoint persists with the session
 and deliberately creates one new prompt projection boundary.
 
 These capabilities address patch retries, repeated source reconstruction,
-cold or conflicting builds, and accumulated completed-phase context.
+and accumulated completed-phase context.
 Mechanism tests establish these
 behaviors; a controlled F/O evaluation is still required to establish the size
 of any wall-time, token, or task-success improvement.

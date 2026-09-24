@@ -4,7 +4,6 @@ use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::error::reject_paginated_history_mode;
 use codex_git_utils::RepositoryContext;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
@@ -42,7 +41,6 @@ async fn create_thread_inner(
         sqlite_home: store.config.sqlite_home.clone(),
         cwd,
         model_provider_id: params.metadata.model_provider.clone(),
-        generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
     };
     RolloutRecorder::new_with_repository_context(
         &config,

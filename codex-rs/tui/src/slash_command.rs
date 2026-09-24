@@ -22,7 +22,6 @@ pub enum SlashCommand {
     #[strum(serialize = "sandbox-add-read-dir")]
     SandboxReadRoot,
     Experimental,
-    Memories,
     Skills,
     Import,
     Hooks,
@@ -69,11 +68,6 @@ pub enum SlashCommand {
     TestApproval,
     #[strum(serialize = "subagents")]
     MultiAgents,
-    // Debugging commands.
-    #[strum(serialize = "debug-m-drop")]
-    MemoryDrop,
-    #[strum(serialize = "debug-m-update")]
-    MemoryUpdate,
 }
 
 impl SlashCommand {
@@ -109,8 +103,6 @@ impl SlashCommand {
             SlashCommand::Pets => "choose or hide the terminal pet",
             SlashCommand::Ps => "list background terminals",
             SlashCommand::Stop => "stop all background terminals",
-            SlashCommand::MemoryDrop => "DO NOT USE",
-            SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
             SlashCommand::Ide => {
                 "include current selection, open files, and other context from your IDE"
@@ -130,7 +122,6 @@ impl SlashCommand {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
-            SlashCommand::Memories => "configure memory use and generation",
             SlashCommand::Mcp => "list configured MCP tools; use /mcp verbose for details",
             SlashCommand::Apps => "manage apps",
             SlashCommand::Plugins => "browse plugins",
@@ -195,14 +186,11 @@ impl SlashCommand {
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
-            | SlashCommand::Memories
             | SlashCommand::Import
             | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Clear
-            | SlashCommand::Logout
-            | SlashCommand::MemoryDrop
-            | SlashCommand::MemoryUpdate => false,
+            | SlashCommand::Logout => false,
             SlashCommand::Diff
             | SlashCommand::Resume
             | SlashCommand::Model
@@ -244,10 +232,7 @@ impl SlashCommand {
             SlashCommand::SandboxReadRoot => true,
             SlashCommand::Copy => true,
             SlashCommand::App => true,
-            SlashCommand::Rollout
-            | SlashCommand::TestApproval
-            | SlashCommand::MemoryDrop
-            | SlashCommand::MemoryUpdate => cfg!(debug_assertions),
+            SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
             _ => true,
         }
     }
@@ -268,6 +253,14 @@ mod tests {
 
     use super::SlashCommand;
     use super::built_in_slash_commands;
+
+    #[test]
+    fn removed_memory_commands_are_not_available() {
+        for name in ["memories", "debug-m-drop", "debug-m-update"] {
+            assert!(SlashCommand::from_str(name).is_err());
+            assert!(!built_in_slash_commands().iter().any(|(command, _)| *command == name));
+        }
+    }
 
     #[test]
     fn stop_command_is_canonical_name() {
@@ -295,22 +288,5 @@ mod tests {
         assert!(SlashCommand::Raw.available_in_side_conversation());
         assert!(SlashCommand::Raw.supports_inline_args());
         assert!(SlashCommand::App.available_during_task());
-    }
-
-    #[test]
-    fn unfinished_memory_commands_are_visible_only_in_debug_builds() {
-        let commands = built_in_slash_commands()
-            .into_iter()
-            .map(|(_, command)| command)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            commands.contains(&SlashCommand::MemoryDrop),
-            cfg!(debug_assertions)
-        );
-        assert_eq!(
-            commands.contains(&SlashCommand::MemoryUpdate),
-            cfg!(debug_assertions)
-        );
     }
 }

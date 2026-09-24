@@ -24,7 +24,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
-pub use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenUsage as CoreTokenUsage;
 use codex_protocol::protocol::TokenUsageInfo as CoreTokenUsageInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -941,38 +940,16 @@ pub struct ThreadMetadataUpdateResponse {
     pub thread: Thread,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ThreadMemoryModeSetParams {
-    pub thread_id: String,
-    pub mode: ThreadMemoryMode,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ThreadMemoryModeSetResponse {}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct MemoryResetResponse {}
-
 #[cfg(test)]
 mod mode_mirror_tests {
     use super::ThreadHistoryMode;
-    use super::ThreadMemoryMode;
     use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
-    use codex_protocol::protocol::ThreadMemoryMode as CoreThreadMemoryMode;
 
     #[test]
     fn thread_modes_round_trip_through_core_contracts() {
         let history: CoreThreadHistoryMode = ThreadHistoryMode::default();
-        let memory: CoreThreadMemoryMode = ThreadMemoryMode::Enabled;
 
         assert_eq!(history, CoreThreadHistoryMode::Legacy);
-        assert_eq!(memory.as_str(), "enabled");
     }
 }
 

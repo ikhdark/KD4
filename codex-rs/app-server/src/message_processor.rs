@@ -1187,16 +1187,6 @@ impl MessageProcessor {
                 .thread_settings_update(&request_id, params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ThreadMemoryModeSet { params, .. } => self
-                .thread_processor
-                .thread_memory_mode_set(params)
-                .await
-                .map(|response| Some(response.into())),
-            ClientRequest::MemoryReset { .. } => self
-                .thread_processor
-                .memory_reset()
-                .await
-                .map(|response| Some(response.into())),
             ClientRequest::ThreadUnarchive { params, .. } => {
                 self.thread_processor
                     .thread_unarchive(request_id.clone(), params)

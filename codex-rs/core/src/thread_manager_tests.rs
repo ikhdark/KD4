@@ -2094,7 +2094,10 @@ fn resumed_rollout_reports_only_explicitly_unfinished_turns() {
 
     // A legacy event-only turn without any response is still unfinished.
     let legacy_unfinished = vec![request];
-    assert_eq!(resumed_rollout_unfinished_turn(&legacy_unfinished), Some(None));
+    assert_eq!(
+        resumed_rollout_unfinished_turn(&legacy_unfinished),
+        Some(None)
+    );
 
     // Response items alone recorded completed exchanges in older rollouts;
     // fork snapshots may treat them as mid-turn, a resume must not.
@@ -2163,7 +2166,6 @@ fn completed_legacy_event_history_is_not_mid_turn() {
         RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
             message: "done".to_string(),
             phase: None,
-            memory_citation: None,
         })),
     ]);
 

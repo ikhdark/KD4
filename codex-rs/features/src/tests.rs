@@ -20,6 +20,15 @@ use toml::Table;
 use toml::Value as TomlValue;
 
 #[test]
+fn removed_memory_features_are_not_registered() {
+    for key in ["memories", "memory_tool"] {
+        assert!(!is_known_feature_key(key));
+        assert_eq!(feature_for_key(key), None);
+        assert_eq!(user_settable_feature_for_key(key), None);
+    }
+}
+
+#[test]
 fn feature_membership_is_independent_and_enumeration_preserves_enum_order() {
     let mut features = Features::default();
     let mut expected = std::collections::BTreeSet::new();

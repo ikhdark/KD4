@@ -118,7 +118,6 @@ pub(crate) enum CodexResponsesRequestKind {
     Turn,
     Prewarm,
     Compaction(CompactionTurnMetadata),
-    Memory,
 }
 
 impl CodexResponsesRequestKind {
@@ -127,12 +126,7 @@ impl CodexResponsesRequestKind {
             CodexResponsesRequestKind::Turn => ("turn", None),
             CodexResponsesRequestKind::Prewarm => ("prewarm", None),
             CodexResponsesRequestKind::Compaction(metadata) => ("compaction", Some(metadata)),
-            CodexResponsesRequestKind::Memory => ("memory", None),
         }
-    }
-
-    fn has_turn_identity(self) -> bool {
-        !matches!(self, CodexResponsesRequestKind::Memory)
     }
 }
 
@@ -272,17 +266,12 @@ impl CodexResponsesMetadata {
             let (request_kind, compaction) = request_kind.metadata();
             (Some(request_kind), compaction)
         });
-        let has_turn_identity =
-            request_kind.is_none_or(CodexResponsesRequestKind::has_turn_identity);
-        let has_request_identity =
-            request_kind.is_some_and(CodexResponsesRequestKind::has_turn_identity);
+        let has_request_identity = request_kind.is_some();
         CodexTurnMetadataPayload {
             installation_id: has_request_identity.then_some(self.installation_id.as_str()),
-            session_id: has_turn_identity.then_some(self.session_id.as_str()),
-            thread_id: has_turn_identity.then_some(self.thread_id.as_str()),
-            turn_id: has_turn_identity
-                .then_some(self.turn_id.as_deref())
-                .flatten(),
+            session_id: Some(self.session_id.as_str()),
+            thread_id: Some(self.thread_id.as_str()),
+            turn_id: self.turn_id.as_deref(),
             window_id: has_request_identity.then_some(self.window_id.as_str()),
             request_kind: request_kind_value,
             forked_from_thread_id: self.forked_from_thread_id,

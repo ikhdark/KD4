@@ -4,11 +4,9 @@ use super::TASK_COMPACT_METRIC;
 use super::TerminalSchedule;
 use super::TurnTerminalOutcome;
 use super::emit_compact_metric;
-use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
 use crate::session::TurnInput;
 use crate::session::tests::attach_thread_persistence;
-use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
@@ -18,21 +16,16 @@ use crate::state::TerminalWakeResult;
 use crate::state::TurnTerminalCoordinator;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 use crate::turn_timing::ToolCallTimingLineage;
-use codex_features::Feature;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
-use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
-use codex_otel::TURN_TOKEN_USAGE_METRIC;
-use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTimingToolCallSource;
@@ -410,23 +403,6 @@ fn metric_point(resource_metrics: &ResourceMetrics, name: &str) -> (BTreeMap<Str
             _ => panic!("unexpected counter aggregation"),
         },
         _ => panic!("unexpected counter data type"),
-    }
-}
-
-fn histogram_attribute_maps(
-    resource_metrics: &ResourceMetrics,
-    name: &str,
-) -> Vec<BTreeMap<String, String>> {
-    let metric = find_metric(resource_metrics, name);
-    match metric.data() {
-        AggregatedMetrics::F64(data) => match data {
-            MetricData::Histogram(histogram) => histogram
-                .data_points()
-                .map(|point| attributes_to_map(point.attributes()))
-                .collect(),
-            _ => panic!("unexpected histogram aggregation"),
-        },
-        _ => panic!("unexpected histogram data type"),
     }
 }
 
@@ -1402,11 +1378,7 @@ fn terminal_analytics_claim_converges_across_in_process_recovery() {
 fn emit_turn_network_proxy_metric_records_active_turn() {
     let session_telemetry = test_session_telemetry();
 
-    emit_turn_network_proxy_metric(
-        &session_telemetry,
-        /*network_proxy_active*/ true,
-        ("tmp_mem_enabled", "true"),
-    );
+    emit_turn_network_proxy_metric(&session_telemetry, /*network_proxy_active*/ true);
 
     let snapshot = session_telemetry
         .snapshot_metrics()
@@ -1416,10 +1388,7 @@ fn emit_turn_network_proxy_metric_records_active_turn() {
     assert_eq!(value, 1);
     assert_eq!(
         attrs,
-        BTreeMap::from([
-            ("active".to_string(), "true".to_string()),
-            ("tmp_mem_enabled".to_string(), "true".to_string()),
-        ])
+        BTreeMap::from([("active".to_string(), "true".to_string()),])
     );
 }
 
@@ -1427,11 +1396,7 @@ fn emit_turn_network_proxy_metric_records_active_turn() {
 fn emit_turn_network_proxy_metric_records_inactive_turn() {
     let session_telemetry = test_session_telemetry();
 
-    emit_turn_network_proxy_metric(
-        &session_telemetry,
-        /*network_proxy_active*/ false,
-        ("tmp_mem_enabled", "false"),
-    );
+    emit_turn_network_proxy_metric(&session_telemetry, /*network_proxy_active*/ false);
 
     let snapshot = session_telemetry
         .snapshot_metrics()
@@ -1441,124 +1406,7 @@ fn emit_turn_network_proxy_metric_records_inactive_turn() {
     assert_eq!(value, 1);
     assert_eq!(
         attrs,
-        BTreeMap::from([
-            ("active".to_string(), "false".to_string()),
-            ("tmp_mem_enabled".to_string(), "false".to_string()),
-        ])
-    );
-}
-
-#[test]
-fn emit_turn_memory_metric_records_read_allowed_with_citations() {
-    let session_telemetry = test_session_telemetry();
-
-    emit_turn_memory_metric(
-        &session_telemetry,
-        /*feature_enabled*/ true,
-        /*config_enabled*/ true,
-        /*has_citations*/ true,
-    );
-
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    let (attrs, value) = metric_point(&snapshot, TURN_MEMORY_METRIC);
-
-    assert_eq!(value, 1);
-    assert_eq!(
-        attrs,
-        BTreeMap::from([
-            ("config_use_memories".to_string(), "true".to_string()),
-            ("feature_enabled".to_string(), "true".to_string()),
-            ("has_citations".to_string(), "true".to_string()),
-            ("read_allowed".to_string(), "true".to_string()),
-        ])
-    );
-}
-
-#[test]
-fn emit_turn_memory_metric_records_config_disabled_without_citations() {
-    let session_telemetry = test_session_telemetry();
-
-    emit_turn_memory_metric(
-        &session_telemetry,
-        /*feature_enabled*/ true,
-        /*config_enabled*/ false,
-        /*has_citations*/ false,
-    );
-
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    let (attrs, value) = metric_point(&snapshot, TURN_MEMORY_METRIC);
-
-    assert_eq!(value, 1);
-    assert_eq!(
-        attrs,
-        BTreeMap::from([
-            ("config_use_memories".to_string(), "false".to_string()),
-            ("feature_enabled".to_string(), "true".to_string()),
-            ("has_citations".to_string(), "false".to_string()),
-            ("read_allowed".to_string(), "false".to_string()),
-        ])
-    );
-}
-
-#[tokio::test]
-async fn live_runtime_memory_feature_labels_use_refreshed_turn_state() {
-    let (mut session, _initial_turn) = make_session_and_context().await;
-    assert!(
-        !session.enabled(Feature::MemoryTool),
-        "the fixture must begin with the session-invariant feature disabled"
-    );
-    session.services.session_telemetry = test_session_telemetry();
-    let mut refreshed_config = session.get_config().await.as_ref().clone();
-    refreshed_config
-        .features
-        .enable(Feature::MemoryTool)
-        .expect("memory feature should be enabled in refreshed config");
-    session
-        .refresh_runtime_config_features(refreshed_config, &[Feature::MemoryTool])
-        .await;
-    let turn_context = session.new_default_turn().await;
-    assert!(turn_context.config.features.enabled(Feature::MemoryTool));
-    assert!(!session.enabled(Feature::MemoryTool));
-
-    session
-        .emit_post_terminal_metrics(
-            &turn_context,
-            /*turn_had_memory_citation*/ false,
-            /*turn_tool_calls*/ 1,
-            &TokenUsage::default(),
-        )
-        .await;
-
-    let snapshot = session
-        .services
-        .session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    let (network_attrs, _) = metric_point(&snapshot, TURN_NETWORK_PROXY_METRIC);
-    assert_eq!(
-        network_attrs.get("tmp_mem_enabled").map(String::as_str),
-        Some("true")
-    );
-    for metric_name in [TURN_TOOL_CALL_METRIC, TURN_TOKEN_USAGE_METRIC] {
-        let attribute_maps = histogram_attribute_maps(&snapshot, metric_name);
-        assert!(
-            !attribute_maps.is_empty(),
-            "{metric_name} should have samples"
-        );
-        assert!(
-            attribute_maps
-                .iter()
-                .all(|attrs| { attrs.get("tmp_mem_enabled").map(String::as_str) == Some("true") })
-        );
-    }
-    let (memory_attrs, _) = metric_point(&snapshot, TURN_MEMORY_METRIC);
-    assert_eq!(
-        memory_attrs.get("feature_enabled").map(String::as_str),
-        Some("true")
+        BTreeMap::from([("active".to_string(), "false".to_string()),])
     );
 }
 

@@ -1,7 +1,5 @@
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextManifest;
-use codex_extension_api::PromptFragment;
-use codex_extension_api::PromptFragmentKind;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
@@ -36,12 +34,11 @@ pub(crate) enum PromptContextCategory {
     EnvironmentPermissions,
     TaskInput,
     History,
-    Memory,
     OtherInjected,
 }
 
 impl PromptContextCategory {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::BaseSystem,
         Self::ToolSchemas,
         Self::Repository,
@@ -55,11 +52,10 @@ impl PromptContextCategory {
         Self::EnvironmentPermissions,
         Self::TaskInput,
         Self::History,
-        Self::Memory,
         Self::OtherInjected,
     ];
 
-    pub(crate) const FIXED_PREFIX: [Self; 13] = [
+    pub(crate) const FIXED_PREFIX: [Self; 12] = [
         Self::BaseSystem,
         Self::ToolSchemas,
         Self::Repository,
@@ -71,7 +67,6 @@ impl PromptContextCategory {
         Self::AppDesktop,
         Self::Collaboration,
         Self::EnvironmentPermissions,
-        Self::Memory,
         Self::OtherInjected,
     ];
 
@@ -90,7 +85,6 @@ impl PromptContextCategory {
             Self::EnvironmentPermissions => "environment_permissions",
             Self::TaskInput => "task_input",
             Self::History => "history",
-            Self::Memory => "memory",
             Self::OtherInjected => "other_injected",
         }
     }
@@ -113,35 +107,7 @@ impl PromptContextCategory {
                 | Self::EnvironmentPermissions
                 | Self::TaskInput
                 | Self::History
-                | Self::Memory
         )
-    }
-}
-
-/// Internal provenance for a public prompt fragment. Public extension values
-/// remain constructor-compatible and enter the built-in assembly as
-/// `OtherInjected`.
-#[derive(Clone, Debug)]
-pub(crate) struct CategorizedPromptFragment {
-    fragment: PromptFragment,
-    category: PromptContextCategory,
-}
-
-impl CategorizedPromptFragment {
-    pub(crate) fn from_extension(fragment: PromptFragment) -> Self {
-        let category = match fragment.kind() {
-            PromptFragmentKind::OtherInjected => PromptContextCategory::OtherInjected,
-            PromptFragmentKind::Memory => PromptContextCategory::Memory,
-        };
-        Self { fragment, category }
-    }
-
-    pub(crate) fn category(&self) -> PromptContextCategory {
-        self.category
-    }
-
-    pub(crate) fn into_fragment(self) -> PromptFragment {
-        self.fragment
     }
 }
 
@@ -930,7 +896,6 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         StableContextKind::Environment | StableContextKind::EnvironmentPermissions => {
             PromptContextCategory::EnvironmentPermissions
         }
-        StableContextKind::Memory => PromptContextCategory::Memory,
         StableContextKind::RootCoordinator
         | StableContextKind::MultiAgent
         | StableContextKind::MultiAgentUsageHint => PromptContextCategory::AgentRole,
@@ -958,7 +923,6 @@ fn hex_hash(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_extension_api::PromptSlot;
     use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 
     // Synchronous tests count real fingerprint work without timing thresholds
@@ -1058,7 +1022,7 @@ mod tests {
         .with_exact_fragment(
             &original,
             "remember café & quotes \"here\"",
-            PromptContextCategory::Memory,
+            PromptContextCategory::AgentRole,
         );
         let mut replay = original.clone();
         replay[0].clear_internal_chat_message_metadata_passthrough();
@@ -1066,7 +1030,7 @@ mod tests {
         let recovered = sidecar.for_reprojected_items(&original, &replay);
         for measured in measure_both(&replay, &recovered) {
             assert_eq!(
-                measured.bytes(PromptContextCategory::Memory),
+                measured.bytes(PromptContextCategory::AgentRole),
                 item_bytes(&replay[0])
             );
             assert_eq!(
@@ -1081,14 +1045,6 @@ mod tests {
     }
 
     #[test]
-    fn public_extension_fragments_are_other_injected() {
-        let fragment = PromptFragment::new(PromptSlot::DeveloperPolicy, "extension text");
-        let categorized = CategorizedPromptFragment::from_extension(fragment.clone());
-        assert_eq!(categorized.category(), PromptContextCategory::OtherInjected);
-        assert_eq!(categorized.into_fragment(), fragment);
-    }
-
-    #[test]
     fn replay_keeps_duplicate_occurrences_and_input_after_metadata_removal() {
         let original = vec![
             message("developer", "same", None),
@@ -1100,7 +1056,7 @@ mod tests {
             &original,
             &StableContextManifest::default(),
         )
-        .with_response_item_category(&original, 1, PromptContextCategory::Memory);
+        .with_response_item_category(&original, 1, PromptContextCategory::AgentRole);
         let mut replay = vec![message("developer", "transport context", None)];
         replay.extend(original.iter().cloned());
         for item in &mut replay {
@@ -1110,7 +1066,7 @@ mod tests {
         let recovered = sidecar.for_reprojected_items(&original, &replay);
         for measured in measure_both(&replay, &recovered) {
             assert_eq!(
-                measured.bytes(PromptContextCategory::Memory),
+                measured.bytes(PromptContextCategory::AgentRole),
                 item_bytes(&replay[2])
             );
             assert_eq!(
@@ -1167,9 +1123,9 @@ mod tests {
             &items,
             &StableContextManifest::default(),
         )
-        .with_exact_fragment(&items, "memory", PromptContextCategory::Memory);
+        .with_exact_fragment(&items, "memory", PromptContextCategory::AgentRole);
         assert_eq!(
-            measure_both(&items, &sidecar)[0].bytes(PromptContextCategory::Memory),
+            measure_both(&items, &sidecar)[0].bytes(PromptContextCategory::AgentRole),
             item_bytes(&items[0])
         );
         let repeated = vec![items[0].clone(), items[0].clone()];
@@ -1177,9 +1133,9 @@ mod tests {
             &repeated,
             &StableContextManifest::default(),
         )
-        .with_exact_fragment(&repeated, "memory", PromptContextCategory::Memory);
+        .with_exact_fragment(&repeated, "memory", PromptContextCategory::AgentRole);
         assert_eq!(
-            measure_both(&repeated, &sidecar)[0].bytes(PromptContextCategory::Memory),
+            measure_both(&repeated, &sidecar)[0].bytes(PromptContextCategory::AgentRole),
             0
         );
     }
@@ -1262,15 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_extension_fragments_keep_explicit_provenance() {
-        let fragment =
-            PromptFragment::developer_policy("memory text").with_kind(PromptFragmentKind::Memory);
-        let categorized = CategorizedPromptFragment::from_extension(fragment.clone());
-        assert_eq!(categorized.category(), PromptContextCategory::Memory);
-        assert_eq!(categorized.into_fragment(), fragment);
-    }
-
-    #[test]
     fn ordinary_history_does_not_require_a_provenance_fingerprint() {
         for history_len in [1, 64] {
             let mut items = (0..history_len)
@@ -1291,7 +1238,7 @@ mod tests {
                 "only the last input needs identity recovery"
             );
             let augmented =
-                sidecar.with_exact_fragment(&items, "memory", PromptContextCategory::Memory);
+                sidecar.with_exact_fragment(&items, "memory", PromptContextCategory::AgentRole);
             assert_eq!(
                 FINGERPRINT_CALLS.replace(0),
                 1,
@@ -1304,7 +1251,7 @@ mod tests {
 
             for measured in measure_both(&items, &unmatched) {
                 assert_eq!(
-                    measured.bytes(PromptContextCategory::Memory),
+                    measured.bytes(PromptContextCategory::AgentRole),
                     item_bytes(&items[history_len])
                 );
                 assert_eq!(
@@ -1373,14 +1320,14 @@ mod tests {
         prefixed.extend(original.iter().cloned());
         let overridden = sidecar
             .with_response_item_category(&prefixed, 0, PromptContextCategory::BaseSystem)
-            .with_response_item_category(&prefixed, 1, PromptContextCategory::Memory);
+            .with_response_item_category(&prefixed, 1, PromptContextCategory::AgentRole);
         for measured in measure_both(&prefixed, &overridden) {
             assert_eq!(
                 measured.bytes(PromptContextCategory::BaseSystem),
                 item_bytes(&prefixed[0])
             );
             assert_eq!(
-                measured.bytes(PromptContextCategory::Memory),
+                measured.bytes(PromptContextCategory::AgentRole),
                 item_bytes(&prefixed[1])
             );
             assert_eq!(
@@ -1390,7 +1337,7 @@ mod tests {
             assert_eq!(measured.bytes(PromptContextCategory::History), 0);
         }
         for measured in measure_both(&original, &sidecar) {
-            assert_eq!(measured.bytes(PromptContextCategory::Memory), 0);
+            assert_eq!(measured.bytes(PromptContextCategory::AgentRole), 0);
             assert_eq!(
                 measured.bytes(PromptContextCategory::History),
                 item_bytes(&original[0])
@@ -1414,7 +1361,7 @@ mod tests {
                 &original,
                 &StableContextManifest::default(),
             )
-            .with_exact_fragment(&original, "memory", PromptContextCategory::Memory);
+            .with_exact_fragment(&original, "memory", PromptContextCategory::AgentRole);
             let replay = vec![
                 original[2].clone(),
                 message("user", "restored history", Some("old-turn")),
@@ -1437,7 +1384,7 @@ mod tests {
                     item_bytes(&replay[1])
                 );
                 assert_eq!(
-                    measured.bytes(PromptContextCategory::Memory),
+                    measured.bytes(PromptContextCategory::AgentRole),
                     item_bytes(&replay[2])
                 );
                 assert_eq!(measured.bytes(PromptContextCategory::OtherInjected), 4);
@@ -1540,13 +1487,13 @@ mod tests {
             &items,
             &StableContextManifest::default(),
         )
-        .with_response_item_category(&items, 1, PromptContextCategory::Memory);
+        .with_response_item_category(&items, 1, PromptContextCategory::AgentRole);
         let augmented =
             sidecar.with_exact_fragment(&items, "absent", PromptContextCategory::Skills);
         assert!(augmented.shares_contributions_with(&sidecar));
         let measured = PromptContextBreakdown::from_response_items(&items, &augmented).unwrap();
         assert_eq!(
-            measured.bytes(PromptContextCategory::Memory),
+            measured.bytes(PromptContextCategory::AgentRole),
             serde_json::to_vec(&items[1]).unwrap().len() as u64
         );
         assert_eq!(measured.bytes(PromptContextCategory::Skills), 0);

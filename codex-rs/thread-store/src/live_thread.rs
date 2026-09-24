@@ -7,7 +7,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
 use codex_rollout::persisted_rollout_items;
@@ -479,32 +478,6 @@ impl LiveThread {
         clippy::await_holding_invalid_type,
         reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
     )]
-    pub async fn update_memory_mode(
-        &self,
-        mode: ThreadMemoryMode,
-        include_archived: bool,
-    ) -> ThreadStoreResult<()> {
-        let mut metadata_sync = self.metadata_sync.lock().await;
-        let update = metadata_sync.take_pending_update();
-        self.apply_pending_metadata_update(&mut metadata_sync, update)
-            .await?;
-        self.thread_store
-            .update_thread_metadata(UpdateThreadMetadataParams {
-                thread_id: self.thread_id,
-                patch: ThreadMetadataPatch {
-                    memory_mode: Some(mode),
-                    ..Default::default()
-                },
-                include_archived,
-            })
-            .await?;
-        Ok(())
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
-    )]
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
@@ -589,7 +562,6 @@ mod tests {
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(cwd),
                 model_provider: "test-provider".to_string(),
-                memory_mode: ThreadMemoryMode::Enabled,
             },
         }
     }

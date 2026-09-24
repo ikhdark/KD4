@@ -85,14 +85,6 @@ WHERE threads.id = ?
             .transpose()
     }
 
-    pub async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>> {
-        let row = sqlx::query("SELECT memory_mode FROM threads WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_optional(self.pool.as_ref())
-            .await?;
-        Ok(row.map(|row| row.try_get("memory_mode")).transpose()?)
-    }
-
     pub async fn set_thread_preview_if_empty(
         &self,
         thread_id: ThreadId,
@@ -578,10 +570,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
 
     /// Insert or replace thread metadata directly.
     pub async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()> {
-        self.upsert_thread_with_creation_memory_mode(
-            metadata, /*creation_memory_mode*/ None, /*allocate_timestamps*/ true,
-        )
-        .await
+        self.upsert_thread_with_timestamps(metadata, /*allocate_timestamps*/ true)
+            .await
     }
 
     /// Commit an explicit project assignment with the other metadata fields.
@@ -599,7 +589,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 .await?;
             anyhow::ensure!(exists != 0, "project not found: {id}");
         }
-        self.upsert_thread_on_connection(&mut tx, metadata, None, true)
+        self.upsert_thread_on_connection(&mut tx, metadata, true)
             .await?;
         sqlx::query("UPDATE threads SET project_id = ? WHERE id = ?")
             .bind(project_id)
@@ -617,10 +607,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
         &self,
         metadata: &crate::ThreadMetadata,
     ) -> anyhow::Result<()> {
-        self.upsert_thread_with_creation_memory_mode(
-            metadata, /*creation_memory_mode*/ None, /*allocate_timestamps*/ false,
-        )
-        .await
+        self.upsert_thread_with_timestamps(metadata, /*allocate_timestamps*/ false)
+            .await
     }
 
     pub async fn insert_thread_if_absent(
@@ -663,9 +651,8 @@ INSERT INTO threads (
     git_sha,
     git_branch,
     git_origin_url,
-    memory_mode,
     project_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -709,24 +696,10 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.git_sha.as_deref())
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
-        .bind("enabled")
         .bind(metadata.project_id.as_deref())
         .execute(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
-            .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    pub async fn set_thread_memory_mode(
-        &self,
-        thread_id: ThreadId,
-        memory_mode: &str,
-    ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET memory_mode = ? WHERE id = ?")
-            .bind(memory_mode)
-            .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -875,20 +848,14 @@ WHERE id = ?
         Ok(result.rows_affected() > 0)
     }
 
-    async fn upsert_thread_with_creation_memory_mode(
+    async fn upsert_thread_with_timestamps(
         &self,
         metadata: &crate::ThreadMetadata,
-        creation_memory_mode: Option<&str>,
         allocate_timestamps: bool,
     ) -> anyhow::Result<()> {
         let mut connection = self.pool.acquire().await?;
-        self.upsert_thread_on_connection(
-            &mut connection,
-            metadata,
-            creation_memory_mode,
-            allocate_timestamps,
-        )
-        .await?;
+        self.upsert_thread_on_connection(&mut connection, metadata, allocate_timestamps)
+            .await?;
         drop(connection);
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
             .await?;
@@ -899,7 +866,6 @@ WHERE id = ?
         &self,
         connection: &mut sqlx::SqliteConnection,
         metadata: &crate::ThreadMetadata,
-        creation_memory_mode: Option<&str>,
         allocate_timestamps: bool,
     ) -> anyhow::Result<()> {
         let updated_at = if allocate_timestamps {
@@ -949,9 +915,8 @@ INSERT INTO threads (
     git_sha,
     git_branch,
     git_origin_url,
-    memory_mode,
     project_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -1024,7 +989,6 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.git_sha.as_deref())
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
-        .bind(creation_memory_mode.unwrap_or("enabled"))
         .bind(metadata.project_id.as_deref())
         .execute(connection)
         .await?;
@@ -1036,7 +1000,6 @@ ON CONFLICT(id) DO UPDATE SET
         &self,
         builder: &ThreadMetadataBuilder,
         items: &[RolloutItem],
-        new_thread_memory_mode: Option<&str>,
         updated_at_override: Option<DateTime<Utc>>,
     ) -> anyhow::Result<()> {
         if items.is_empty() {
@@ -1063,24 +1026,8 @@ ON CONFLICT(id) DO UPDATE SET
         if let Some(updated_at) = updated_at {
             metadata.updated_at = updated_at;
         }
-        self.upsert_thread_on_connection(
-            &mut transaction,
-            &metadata,
-            if existing_metadata.is_none() {
-                new_thread_memory_mode
-            } else {
-                None
-            },
-            true,
-        )
-        .await?;
-        if let Some(memory_mode) = extract_memory_mode(builder.id, items) {
-            sqlx::query("UPDATE threads SET memory_mode = ? WHERE id = ?")
-                .bind(memory_mode)
-                .bind(builder.id.to_string())
-                .execute(&mut *transaction)
-                .await?;
-        }
+        self.upsert_thread_on_connection(&mut transaction, &metadata, true)
+            .await?;
         transaction.commit().await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
             .await?;
@@ -1267,9 +1214,6 @@ WHERE parent_thread_id IN (SELECT value FROM json_each(?))
         {
             warn!("failed to remove logs for deleted threads: {err}");
         }
-        if let Err(err) = self.memories.delete_threads_memory(&thread_ids_json).await {
-            warn!("failed to remove memories for deleted threads: {err}");
-        }
         for thread_id in thread_ids {
             if let Err(err) = self.thread_goals.delete_thread_goal(*thread_id).await {
                 warn!("failed to remove goal for deleted thread {thread_id}: {err}");
@@ -1439,24 +1383,6 @@ SELECT
     threads.git_origin_url
 "#,
     );
-}
-
-pub(super) fn extract_memory_mode(thread_id: ThreadId, items: &[RolloutItem]) -> Option<String> {
-    items.iter().rev().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == thread_id => {
-            meta_line.meta.memory_mode.clone()
-        }
-        RolloutItem::SessionMeta(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::ToolManifest(_)
-        | RolloutItem::SamplingBoundary(_)
-        | RolloutItem::Compacted(_)
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::EventMsg(_) => None,
-    })
 }
 
 fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId> {
@@ -1705,7 +1631,6 @@ mod tests {
             codex_protocol::protocol::AgentMessageEvent {
                 message: "completed response".into(),
                 phase: None,
-                memory_citation: None,
             },
         ))];
         for operation in 0..3 {
@@ -1726,7 +1651,7 @@ mod tests {
                 match operation {
                     0 => {
                         runtime
-                            .apply_rollout_items(&builder, &items, None, Some(metadata.updated_at))
+                            .apply_rollout_items(&builder, &items, Some(metadata.updated_at))
                             .await
                     }
                     1 => {
@@ -1793,48 +1718,6 @@ mod tests {
         );
         assert!(after.diff_fields(&after).is_empty());
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn upsert_thread_keeps_creation_memory_mode_for_existing_rows() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize");
-        let thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
-        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-
-        runtime
-            .upsert_thread_with_creation_memory_mode(
-                &metadata,
-                Some("disabled"),
-                /*allocate_timestamps*/ true,
-            )
-            .await
-            .expect("initial insert should succeed");
-
-        let memory_mode: String =
-            sqlx::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
-                .bind(thread_id.to_string())
-                .fetch_one(runtime.pool.as_ref())
-                .await
-                .expect("memory mode should be readable");
-        assert_eq!(memory_mode, "disabled");
-
-        metadata.title = "updated title".to_string();
-        runtime
-            .upsert_thread(&metadata)
-            .await
-            .expect("upsert should succeed");
-
-        let memory_mode: String =
-            sqlx::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
-                .bind(thread_id.to_string())
-                .fetch_one(runtime.pool.as_ref())
-                .await
-                .expect("memory mode should remain readable");
-        assert_eq!(memory_mode, "disabled");
     }
 
     #[tokio::test]
@@ -2549,116 +2432,6 @@ END
     }
 
     #[tokio::test]
-    async fn apply_rollout_items_restores_memory_mode_from_session_meta() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let codex_home = temp.path().to_path_buf();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize");
-        let thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000456").expect("valid thread id");
-        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-
-        runtime
-            .upsert_thread(&metadata)
-            .await
-            .expect("initial upsert should succeed");
-
-        let builder = ThreadMetadataBuilder::new(
-            thread_id,
-            metadata.rollout_path.clone(),
-            metadata.created_at,
-            SessionSource::Cli,
-        );
-        let mut items = vec![RolloutItem::SessionMeta(SessionMetaLine {
-            meta: SessionMeta {
-                session_id: thread_id.into(),
-                id: thread_id,
-                forked_from_id: None,
-                parent_thread_id: None,
-                timestamp: metadata.created_at.to_rfc3339(),
-                cwd: PathBuf::new(),
-                originator: String::new(),
-                cli_version: String::new(),
-                source: SessionSource::Cli,
-                thread_source: None,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-                model_provider: None,
-                base_instructions: None,
-                dynamic_tools: None,
-                selected_capability_roots: Vec::new(),
-                memory_mode: Some("polluted".to_string()),
-                history_mode: Default::default(),
-                multi_agent_version: None,
-                context_window: None,
-            },
-            git: None,
-        })];
-
-        runtime
-            .apply_rollout_items(
-                &builder, &items, /*new_thread_memory_mode*/ None,
-                /*updated_at_override*/ None,
-            )
-            .await
-            .expect("apply_rollout_items should succeed");
-
-        let mut foreign = items[0].clone();
-        let RolloutItem::SessionMeta(ref mut session) = foreign else {
-            unreachable!()
-        };
-        session.meta.id = ThreadId::new();
-        session.meta.memory_mode = Some("disabled".to_string());
-        items.push(foreign);
-        runtime
-            .apply_rollout_items(&builder, &items, None, None)
-            .await
-            .expect("foreign metadata ignored");
-
-        let memory_mode = runtime
-            .get_thread_memory_mode(thread_id)
-            .await
-            .expect("memory mode should load");
-        assert_eq!(memory_mode.as_deref(), Some("polluted"));
-        let before = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("thread before failure")
-            .expect("thread exists");
-        sqlx::query("CREATE TRIGGER reject_memory_mode BEFORE UPDATE OF memory_mode ON threads BEGIN SELECT RAISE(ABORT, 'injected mode failure'); END")
-            .execute(runtime.pool.as_ref()).await.expect("install failure trigger");
-        let result = runtime
-            .apply_rollout_items(
-                &builder,
-                &items,
-                None,
-                Some(before.updated_at + chrono::Duration::seconds(10)),
-            )
-            .await;
-        assert!(result.is_err());
-        assert_eq!(
-            runtime
-                .get_thread(thread_id)
-                .await
-                .expect("thread after failure")
-                .expect("thread exists")
-                .updated_at,
-            before.updated_at
-        );
-        assert_eq!(
-            runtime
-                .get_thread_memory_mode(thread_id)
-                .await
-                .expect("mode after failure")
-                .as_deref(),
-            Some("polluted")
-        );
-        runtime.close().await;
-    }
-
-    #[tokio::test]
     async fn apply_rollout_items_preserves_existing_git_branch_and_fills_missing_git_fields() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
@@ -2700,7 +2473,7 @@ END
                 base_instructions: None,
                 dynamic_tools: None,
                 selected_capability_roots: Vec::new(),
-                memory_mode: None,
+
                 history_mode: Default::default(),
                 multi_agent_version: None,
                 context_window: None,
@@ -2713,10 +2486,7 @@ END
         })];
 
         runtime
-            .apply_rollout_items(
-                &builder, &items, /*new_thread_memory_mode*/ None,
-                /*updated_at_override*/ None,
-            )
+            .apply_rollout_items(&builder, &items, /*updated_at_override*/ None)
             .await
             .expect("apply_rollout_items should succeed");
 
@@ -3402,12 +3172,7 @@ END
             DateTime::<Utc>::from_timestamp(1_700_001_234, 0).expect("timestamp");
 
         runtime
-            .apply_rollout_items(
-                &builder,
-                &items,
-                /*new_thread_memory_mode*/ None,
-                Some(override_updated_at),
-            )
+            .apply_rollout_items(&builder, &items, Some(override_updated_at))
             .await
             .expect("apply_rollout_items should succeed");
 

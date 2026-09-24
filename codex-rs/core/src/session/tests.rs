@@ -2717,8 +2717,8 @@ disabled_tools = [
         .expect("enable auth elicitation for runtime refresh");
     next_config
         .features
-        .enable(Feature::MemoryTool)
-        .expect("enable memories for runtime refresh");
+        .enable(Feature::RuntimeMetrics)
+        .expect("enable runtime_metrics for runtime refresh");
     next_config
         .features
         .enable(Feature::RemotePlugin)
@@ -2729,7 +2729,7 @@ disabled_tools = [
         .expect("disable tool suggest for runtime refresh");
     let refreshed_features = [
         Feature::AuthElicitation,
-        Feature::MemoryTool,
+        Feature::RuntimeMetrics,
         Feature::RemotePlugin,
         Feature::ToolSuggest,
     ];
@@ -2758,7 +2758,7 @@ disabled_tools = [
     assert_eq!(config.model, original.model);
     assert_eq!(config.notify, original.notify);
     assert!(config.features.enabled(Feature::AuthElicitation));
-    assert!(config.features.enabled(Feature::MemoryTool));
+    assert!(config.features.enabled(Feature::RuntimeMetrics));
     assert!(config.features.enabled(Feature::RemotePlugin));
     assert!(!config.features.enabled(Feature::ToolSuggest));
     let turn_context = session.new_default_turn().await;
@@ -5771,11 +5771,6 @@ async fn attach_thread_persistence_with_materialization(
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
-                memory_mode: if config.memories.generate_memories {
-                    ThreadMemoryMode::Enabled
-                } else {
-                    ThreadMemoryMode::Disabled
-                },
             },
         },
     )
@@ -8883,11 +8878,6 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
-                memory_mode: if config.memories.generate_memories {
-                    ThreadMemoryMode::Enabled
-                } else {
-                    ThreadMemoryMode::Disabled
-                },
             },
         },
     )
@@ -9118,11 +9108,6 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
-                memory_mode: if config.memories.generate_memories {
-                    ThreadMemoryMode::Enabled
-                } else {
-                    ThreadMemoryMode::Disabled
-                },
             },
         },
     )
@@ -13661,11 +13646,6 @@ async fn attach_thread_store(
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
-                memory_mode: if config.memories.generate_memories {
-                    ThreadMemoryMode::Enabled
-                } else {
-                    ThreadMemoryMode::Disabled
-                },
             },
         },
     )

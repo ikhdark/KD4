@@ -160,13 +160,11 @@ mod tests {
                 id: "first".to_string(),
                 text: "first answer".to_string(),
                 phase: None,
-                memory_citation: None,
             },
             ThreadItem::AgentMessage {
                 id: "latest".to_string(),
                 text: "latest answer".to_string(),
                 phase: None,
-                memory_citation: None,
             },
         ];
         assert_eq!(

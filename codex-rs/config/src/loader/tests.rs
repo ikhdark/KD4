@@ -21,7 +21,6 @@ model_supports_reasoning_summaries = true
 
 [features]
 connectors = true
-memory_tool = true
 terminal_resize_reflow = true
 enable_experimental_windows_sandbox = true
 chronicle = true
@@ -46,8 +45,6 @@ elevated_windows_sandbox = true
     assert_eq!(migrated["config_version"].as_integer(), Some(1));
     assert_eq!(migrated["features"]["unified_exec"].as_bool(), Some(true));
     assert_eq!(migrated["features"]["apps"].as_bool(), Some(true));
-    assert_eq!(migrated["features"]["memories"].as_bool(), Some(true));
-    assert!(migrated["features"].get("memory_tool").is_none());
     assert!(migrated["features"].get("terminal_resize_reflow").is_none());
     assert!(
         migrated["features"]
@@ -691,7 +688,7 @@ async fn session_feature_tables_from_newer_clients_do_not_block_config_loading()
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let config_path = home.path().join(CONFIG_TOML_FILE);
-    let saved_config = "[features]\nunified_exec = true\nmemories = false\n";
+    let saved_config = "[features]\nunified_exec = true\ngoals = false\n";
     std::fs::write(&config_path, saved_config).unwrap();
     let stack = load_config_layers_state(
         &TestFileSystem::default(),
@@ -719,7 +716,7 @@ async fn session_feature_tables_from_newer_clients_do_not_block_config_loading()
     let config: ConfigToml = stack.effective_config().try_into().unwrap();
     let features = config.features.unwrap().entries();
     assert_eq!(features.get("unified_exec"), Some(&false));
-    assert_eq!(features.get("memories"), Some(&false));
+    assert_eq!(features.get("goals"), Some(&false));
     assert!(!features.contains_key("tool_registry"));
     assert!(!features.contains_key("token_budget"));
     assert_eq!(std::fs::read_to_string(config_path).unwrap(), saved_config);

@@ -369,7 +369,7 @@ fn compaction_strips_tagged_startup_entries_but_retains_untagged_legacy_text() {
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: crate::context::TaskModelGuidance.render(),
+                text: crate::context::TaskModelGuidance::default().render(),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,

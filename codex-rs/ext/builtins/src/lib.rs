@@ -53,7 +53,6 @@ pub fn install_builtin_extensions(
             |config: &Config| config.features.enabled(codex_features::Feature::Goals),
         );
     }
-    codex_memories_extension::install(builder, codex_otel::global());
     codex_mcp_extension::install(builder);
     codex_mcp_extension::install_executor_plugins(builder, Arc::clone(&environment_manager));
     codex_web_search_extension::install(builder, Arc::clone(&auth_manager));
@@ -106,11 +105,11 @@ mod tests {
         );
 
         let registry = builder.build();
-        assert_eq!(registry.thread_lifecycle_contributors().len(), 4);
-        assert_eq!(registry.config_contributors().len(), 4);
-        assert_eq!(registry.context_contributors().len(), 2);
+        assert_eq!(registry.thread_lifecycle_contributors().len(), 3);
+        assert_eq!(registry.config_contributors().len(), 3);
+        assert_eq!(registry.context_contributors().len(), 1);
         assert_eq!(registry.turn_input_contributors().len(), 1);
-        assert_eq!(registry.tool_contributors().len(), 4);
+        assert_eq!(registry.tool_contributors().len(), 3);
         assert_eq!(
             registry
                 .mcp_server_contributors()

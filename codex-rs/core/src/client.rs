@@ -100,7 +100,6 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnTimingRequestTokenCategories;
 use codex_protocol::protocol::TurnTimingTokenCategoryBasis;
@@ -184,7 +183,6 @@ pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
 pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
-pub const X_OPENAI_MEMGEN_REQUEST_HEADER: &str = "x-openai-memgen-request";
 pub const X_OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
@@ -216,7 +214,6 @@ struct ModelRequestMeasurements {
     conversation_history_bytes: u64,
     current_input_bytes: u64,
     repository_context_bytes: u64,
-    memory_bytes: u64,
     skills_bytes: u64,
     other_injected_context_bytes: u64,
     envelope_overhead_bytes: u64,
@@ -374,7 +371,6 @@ impl ModelRequestMeasurements {
             PromptContextCategory::AppDesktop,
             PromptContextCategory::Collaboration,
             PromptContextCategory::EnvironmentPermissions,
-            PromptContextCategory::Memory,
             PromptContextCategory::OtherInjected,
         ]
         .into_iter()
@@ -630,7 +626,6 @@ impl ModelRequestMeasurements {
         let conversation_history_bytes = context.bytes(PromptContextCategory::History);
         let current_input_bytes = context.bytes(PromptContextCategory::TaskInput);
         let repository_context_bytes = context.bytes(PromptContextCategory::Repository);
-        let memory_bytes = context.bytes(PromptContextCategory::Memory);
         let skills_bytes = context
             .bytes(PromptContextCategory::Skills)
             .saturating_add(context.bytes(PromptContextCategory::SkillCatalog));
@@ -667,7 +662,6 @@ impl ModelRequestMeasurements {
             conversation_history_bytes,
             current_input_bytes,
             repository_context_bytes,
-            memory_bytes,
             skills_bytes,
             other_injected_context_bytes,
             envelope_overhead_bytes,
@@ -1528,7 +1522,6 @@ impl ModelAttemptGuard {
                 conversation_history_bytes: self.measurements.conversation_history_bytes,
                 current_input_bytes: self.measurements.current_input_bytes,
                 repository_context_bytes: self.measurements.repository_context_bytes,
-                memory_bytes: self.measurements.memory_bytes,
                 skills_bytes: self.measurements.skills_bytes,
                 other_injected_context_bytes: self.measurements.other_injected_context_bytes,
                 envelope_overhead_bytes: self.measurements.envelope_overhead_bytes,
@@ -1982,12 +1975,6 @@ impl RequestRouteTelemetry {
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
 /// call site.
 ///
-/// Direct memory summarization is owned by the `codex-api` endpoint client rather than this
-/// session-scoped Responses client.
-///
-/// ```compile_fail
-/// let _legacy_endpoint = codex_core::ModelClient::summarize_memories;
-/// ```
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     state: Arc<ModelClientState>,
@@ -2623,15 +2610,6 @@ impl ModelClient {
         {
             extra_headers.insert(X_OPENAI_SUBAGENT_HEADER, val);
         }
-        if matches!(
-            self.state.session_source,
-            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
-        ) {
-            extra_headers.insert(
-                X_OPENAI_MEMGEN_REQUEST_HEADER,
-                HeaderValue::from_static("true"),
-            );
-        }
         extra_headers
     }
 
@@ -2639,17 +2617,7 @@ impl ModelClient {
         &self,
         responses_metadata: &CodexResponsesMetadata,
     ) -> ApiHeaderMap {
-        let mut extra_headers = responses_metadata.compatibility_headers();
-        if matches!(
-            self.state.session_source,
-            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
-        ) {
-            extra_headers.insert(
-                X_OPENAI_MEMGEN_REQUEST_HEADER,
-                HeaderValue::from_static("true"),
-            );
-        }
-        extra_headers
+        responses_metadata.compatibility_headers()
     }
 
     fn build_ws_client_metadata(
@@ -2706,7 +2674,7 @@ impl ModelClient {
     ) -> Option<Reasoning> {
         if model_info.supports_reasoning_summaries {
             Some(Reasoning {
-                // Sampling, compaction, and memory callers resolve their raw
+                // Sampling and compaction callers resolve their raw
                 // configured effort exactly once. In particular, do not feed an
                 // already-normalized request effort (such as ultra -> max) back
                 // through model capability normalization here.

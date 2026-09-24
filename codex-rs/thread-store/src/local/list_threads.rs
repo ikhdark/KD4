@@ -66,7 +66,6 @@ async fn list_threads_with_state_db_read_count(
         sqlite_home: store.config.sqlite_home.clone(),
         cwd: store.config.codex_home.clone(),
         model_provider_id: store.config.default_model_provider_id.clone(),
-        generate_memories: false,
     };
     let SelectedRolloutThreads {
         page,
@@ -568,7 +567,6 @@ mod tests {
             sqlite_home: config.sqlite_home.clone(),
             cwd: config.codex_home.clone(),
             model_provider_id: config.default_model_provider_id.clone(),
-            generate_memories: false,
         };
         RolloutRecorder::list_threads(
             Some(runtime.clone()),

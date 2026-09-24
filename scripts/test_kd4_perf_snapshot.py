@@ -410,7 +410,6 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                 "conversation_history_bytes": 0,
                 "current_input_bytes": 0,
                 "repository_context_bytes": 0,
-                "memory_bytes": 0,
                 "skills_bytes": 0,
                 "other_injected_context_bytes": 0,
                 "envelope_overhead_bytes": 0,
@@ -446,6 +445,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             analysis["exclusionCounts"]["missing_first_actionable_output_us"], 1
         )
         group = analysis["groups"][0]
+        self.assertNotIn("memory_bytes", group["predictors"])
         self.assertEqual(group["sampleCount"], 3)
         self.assertEqual(group["generationPurpose"], "implementation")
         self.assertEqual(group["generationDisposition"], "decision_bearing")

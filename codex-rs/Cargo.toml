@@ -15,7 +15,6 @@ members = [
     "app-server-test-client",
     "apply-patch",
     "arg0",
-    "workspace-tools",
     "feedback",
     "features",
     "install-context",
@@ -53,7 +52,6 @@ members = [
     "ext/goal",
     "ext/image-generation",
     "ext/items",
-    "ext/memories",
     "ext/mcp",
     "ext/skills",
     "ext/web-search",
@@ -67,8 +65,6 @@ members = [
     "codex-mcp",
     "mcp-server",
     "mcp-server/tests/common",
-    "memories/read",
-    "memories/write",
     "message-history",
     "model-provider-info",
     "models-manager",
@@ -146,7 +142,6 @@ codex-app-server-protocol = { path = "app-server-protocol" }
 codex-app-server-test-client = { path = "app-server-test-client" }
 codex-apply-patch = { path = "apply-patch" }
 codex-arg0 = { path = "arg0" }
-codex-workspace-tools = { path = "workspace-tools" }
 codex-async-utils = { path = "async-utils" }
 codex-backend-client = { path = "backend-client" }
 codex-chatgpt = { path = "chatgpt" }
@@ -191,10 +186,7 @@ codex-keyring-store = { path = "keyring-store" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
 codex-message-history = { path = "message-history" }
-codex-memories-extension = { path = "ext/memories" }
 codex-web-search-extension = { path = "ext/web-search" }
-codex-memories-read = { path = "memories/read" }
-codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }
 codex-mcp-extension = { path = "ext/mcp" }
 codex-mcp-server = { path = "mcp-server" }

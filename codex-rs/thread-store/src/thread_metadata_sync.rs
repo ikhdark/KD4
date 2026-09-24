@@ -13,7 +13,6 @@ use codex_protocol::persisted_thread_settings::PersistedThreadSettingsReducer;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
@@ -81,7 +80,6 @@ impl ThreadMetadataSync {
             cwd: Some(cwd.clone()),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             git_info: git_info.map(git_info_patch_from_observation),
-            memory_mode: Some(params.metadata.memory_mode),
             ..Default::default()
         };
         Self {
@@ -244,11 +242,6 @@ impl ThreadMetadataSync {
                     if let Some(git_info) = meta_line.git.clone() {
                         update.git_info = Some(git_info_patch_from_observation(git_info));
                     }
-                    if let Some(memory_mode) = meta_line.meta.memory_mode.as_deref()
-                        && let Some(memory_mode) = parse_memory_mode(memory_mode)
-                    {
-                        update.memory_mode = Some(memory_mode);
-                    }
                 }
                 RolloutItem::TurnContext(_) => {}
                 RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
@@ -381,14 +374,6 @@ fn apply_persisted_settings_delta(
     }
 }
 
-fn parse_memory_mode(value: &str) -> Option<ThreadMemoryMode> {
-    match value {
-        "enabled" => Some(ThreadMemoryMode::Enabled),
-        "disabled" => Some(ThreadMemoryMode::Disabled),
-        _ => None,
-    }
-}
-
 fn parse_session_timestamp(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
@@ -427,7 +412,6 @@ fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
         || update.token_usage.is_some()
         || update.first_user_message.is_some()
         || update.git_info.is_some()
-        || update.memory_mode.is_some()
 }
 
 fn git_info_patch_from_observation(git_info: GitInfo) -> GitInfoPatch {
@@ -737,7 +721,6 @@ mod tests {
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
-                memory_mode: ThreadMemoryMode::Enabled,
             },
         }
     }

@@ -211,8 +211,6 @@ type TerminalCompletionReceiver = watch::Receiver<Option<Result<(), String>>>;
 /// Unified wrapper over directly spawned PTY sessions and exec-server-backed
 /// processes.
 pub(crate) struct UnifiedExecProcess {
-    workspace_snapshot: std::sync::OnceLock<crate::workspace_transaction::WorkspaceTransaction>,
-    snapshot_integrity: tokio::sync::OnceCell<Result<(), String>>,
     validation: std::sync::OnceLock<codex_protocol::validation::ValidationCommandContext>,
     process_handle: ProcessHandle,
     termination_owner: std::sync::OnceLock<ProcessTerminationOwner>,
@@ -253,55 +251,6 @@ impl std::fmt::Debug for UnifiedExecProcess {
 }
 
 impl UnifiedExecProcess {
-    pub(super) fn set_workspace_snapshot(
-        &self,
-        snapshot: Option<crate::workspace_transaction::WorkspaceTransaction>,
-    ) {
-        if let Some(snapshot) = snapshot {
-            let _ = self.workspace_snapshot.set(snapshot);
-        }
-    }
-
-    /// Keeps `guard` until the process exits, or until this handle is dropped
-    /// without an observed exit. An exited process can stay registered until
-    /// its output is read, so its drop is too late to release shared resources.
-    pub(super) fn hold_until_exit<T: Send + 'static>(&self, guard: T) {
-        let mut state = self.state_rx.clone();
-        tokio::spawn(async move {
-            let _ = state.wait_for(|state| state.has_exited).await;
-            drop(guard);
-        });
-    }
-
-    pub(super) async fn workspace_snapshot_receipt(&self, exited: bool) -> Option<String> {
-        let snapshot = self.workspace_snapshot.get()?;
-        let integrity = if exited {
-            let result = self
-                .snapshot_integrity
-                .get_or_init(|| async {
-                    let snapshot = snapshot.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::workspace_transaction::verify_validation_snapshot(&snapshot)
-                            .map_err(|error| format!("{error:#}"))
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                })
-                .await;
-            match result {
-                Ok(()) => "source integrity verified".to_string(),
-                Err(error) => format!("INVALID VALIDATION: {error}"),
-            }
-        } else {
-            "source integrity pending process completion".to_string()
-        };
-        Some(format!(
-            "Validation source revision: {}. Captured source: {}. {integrity}. This result applies only to this snapshot, not later task edits or the reconciled checkout.",
-            snapshot.revision,
-            snapshot.workdir.display()
-        ))
-    }
-
     #[cfg(test)]
     pub(super) fn hold_termination_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
         self.termination_lock
@@ -347,8 +296,6 @@ impl UnifiedExecProcess {
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
         Self {
-            workspace_snapshot: std::sync::OnceLock::new(),
-            snapshot_integrity: tokio::sync::OnceCell::new(),
             validation: std::sync::OnceLock::new(),
             process_handle,
             termination_owner: std::sync::OnceLock::new(),

@@ -1073,7 +1073,7 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
 async fn config_batch_write_hot_reloads_supported_feature_for_loaded_thread() -> Result<()> {
     let tmp_dir = TempDir::new()?;
     let codex_home = tmp_dir.path().canonicalize()?;
-    write_config(&tmp_dir, "[features]\nmemories = false\n")?;
+    write_config(&tmp_dir, "[features]\nauth_elicitation = false\n")?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
@@ -1098,7 +1098,7 @@ async fn config_batch_write_hot_reloads_supported_feature_for_loaded_thread() ->
         .send_config_batch_write_request(ConfigBatchWriteParams {
             file_path: Some(codex_home.join("config.toml").display().to_string()),
             edits: vec![ConfigEdit {
-                key_path: "features.memories".to_string(),
+                key_path: "features.auth_elicitation".to_string(),
                 value: json!(true),
                 merge_strategy: MergeStrategy::Replace,
             }],
@@ -1127,12 +1127,12 @@ async fn config_batch_write_hot_reloads_supported_feature_for_loaded_thread() ->
     )
     .await??;
     let feature_list: ExperimentalFeatureListResponse = to_response(feature_list_response)?;
-    let memories = feature_list
+    let auth_elicitation = feature_list
         .data
         .iter()
-        .find(|feature| feature.name == "memories")
-        .expect("memories feature should be present");
-    assert!(memories.enabled);
+        .find(|feature| feature.name == "auth_elicitation")
+        .expect("auth_elicitation feature should be present");
+    assert!(auth_elicitation.enabled);
 
     Ok(())
 }

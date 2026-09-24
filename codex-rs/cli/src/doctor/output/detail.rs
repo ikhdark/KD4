@@ -472,7 +472,6 @@ fn state_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<Hu
     push_database_row(&mut out, parsed, "state DB", options);
     push_database_row(&mut out, parsed, "log DB", options);
     push_database_row(&mut out, parsed, "goals DB", options);
-    push_database_row(&mut out, parsed, "memories DB", options);
     for (source, label) in [
         ("active rollout files", "active rollouts"),
         ("archived rollout files", "archived rollouts"),
@@ -499,8 +498,6 @@ fn state_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<Hu
             "state DB integrity",
             "log DB integrity",
             "goals DB integrity",
-            "memories DB",
-            "memories DB integrity",
             "active rollout files",
             "archived rollout files",
         ],
@@ -720,7 +717,6 @@ fn humanize_source_value(label: &str, value: &str, options: HumanOutputOptions) 
             | "state DB"
             | "log DB"
             | "goals DB"
-            | "memories DB"
             | "managed package root"
     ) || label.starts_with("PATH codex #")
         || label.starts_with("PATH git #");

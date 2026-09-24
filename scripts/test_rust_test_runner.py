@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any, ClassVar
@@ -386,8 +387,69 @@ class WallClockRunnerTest(RunnerTestCase):
             manifest=Manifest.from_data(data), executor=executor, platform="linux"
         )
         runner.run_target("core_lib", ["-E", "all()"])
-        self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
+        direct_runner, direct_executor = self.runner(
+            executor=FakeExecutor(artifacts=executor.artifacts), platform="linux"
+        )
+        direct_runner.run_target("core_lib", ["-E", "all()"])
+        self.assertEqual(
+            executor.commands(["cargo"]),
+            [
+                [
+                    "cargo",
+                    "nextest",
+                    "list",
+                    "--locked",
+                    "--target-dir",
+                    str(self.target_dir),
+                    "-p",
+                    "codex-core",
+                    "--lib",
+                    "-T",
+                    "json",
+                    "-E",
+                    "all()",
+                ],
+                *direct_executor.commands(["cargo"]),
+            ],
+        )
+        self.assertEqual(executor.last_env(), direct_executor.last_env())
         self.assertIn("CARGO_BIN_EXE_codex", executor.last_env())
+
+    def test_discovery_is_skipped_when_no_active_helper_can_be_omitted(self):
+        for helpers, prefixes in (
+            (["codex", "codex-command-runner"], {"mod::": ["codex"]}),
+            (
+                ["codex", "codex-command-runner"],
+                {"mod::": ["codex-command-runner", "codex"], "other::": ["codex"]},
+            ),
+            (["codex-command-runner"], {"mod::": []}),
+        ):
+            with self.subTest(helpers=helpers, prefixes=prefixes):
+                data = copy.deepcopy(MANIFEST_DATA)
+                data["targets"]["core_lib"]["helpers"] = helpers
+                direct_runner, direct = self.runner(
+                    manifest=Manifest.from_data(data),
+                    executor=FakeExecutor(
+                        artifacts={"codex": self.helper_executable("codex")}
+                    ),
+                    platform="linux",
+                )
+                data["targets"]["core_lib"]["helpers_by_test_prefix"] = prefixes
+                runner, executor = self.runner(
+                    manifest=Manifest.from_data(data),
+                    executor=FakeExecutor(artifacts=direct.artifacts),
+                    platform="linux",
+                )
+                direct_runner.run_target("core_lib", ["alpha"])
+                runner.run_target("core_lib", ["alpha"])
+                self.assertEqual(executor.calls, direct.calls)
+                self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+                run = executor.commands(["cargo", "nextest", "run"])
+                self.assertEqual(len(run), 1)
+                self.assertIn("--no-tests=fail", run[0])
+                executor.failing_runs.add("--lib")
+                with self.assertRaises(RunnerError):
+                    runner.run_target("core_lib", ["missing"])
 
     def test_prefix_requires_module_boundary_valid_helpers_and_no_overlap(self):
         for prefixes in (
@@ -496,6 +558,10 @@ class WallClockRunnerTest(RunnerTestCase):
 
 
 class RealExecutorTest(RunnerTestCase):
+    # Allow busy Windows startup/cleanup, but reject a ten-second delay and
+    # waiting for the sleeping child's natural exit.
+    CLEANUP_ALLOWANCE_SECS = 8
+
     def test_live_streams_are_also_retained_with_failure_status(self):
         for capture in (rust_test_runner.CAPTURE_NONE, rust_test_runner.CAPTURE_STDOUT):
             with self.subTest(capture=capture):
@@ -531,8 +597,19 @@ class RealExecutorTest(RunnerTestCase):
                     "test output\n" if capture == rust_test_runner.CAPTURE_NONE else "",
                 )
 
-    def test_interrupted_live_run_keeps_partial_logs(self):
+    def test_deadline_stops_parent_and_descendant_and_keeps_live_logs(self):
+        pid_file = self.temp_dir / "child.pid"
+        child = (
+            "import os,time; from pathlib import Path; "
+            f"Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+            "print('failure before interruption', flush=True); time.sleep(60)"
+        )
+        parent = (
+            "import subprocess,sys,time; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(60)"
+        )
         stdout, stderr = io.StringIO(), io.StringIO()
+        started = time.monotonic()
         with (
             mock.patch.object(sys, "stdout", stdout),
             mock.patch.object(sys, "stderr", stderr),
@@ -542,7 +619,7 @@ class RealExecutorTest(RunnerTestCase):
                 [
                     sys.executable,
                     "-c",
-                    "import time; print('failure before interruption', flush=True); time.sleep(60)",
+                    parent,
                 ],
                 cwd=self.temp_dir,
                 env={
@@ -552,6 +629,9 @@ class RealExecutorTest(RunnerTestCase):
                 },
                 capture=rust_test_runner.CAPTURE_NONE,
             )
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 2)
+        self.assertLess(elapsed, 2 + self.CLEANUP_ALLOWANCE_SECS)
         self.assertEqual(failure.exception.outcome, "timed_out")
         self.assertIn("Full stdout:", str(failure.exception))
         self.assertIn("Full stderr:", str(failure.exception))
@@ -559,6 +639,23 @@ class RealExecutorTest(RunnerTestCase):
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0].read_text(), "failure before interruption\n")
         self.assertIn("failure before interruption", stdout.getvalue())
+        self.assertTrue(
+            pid_file.exists(), "descendant must have started before the deadline"
+        )
+        child_pid = int(pid_file.read_text())
+        if os.name == "nt":
+            status = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=self.CLEANUP_ALLOWANCE_SECS,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self.assertNotIn(f'"{child_pid}"', status.stdout)
+        else:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
 
     def test_metadata_failure_preserves_full_log_recovery(self):
         results = []
@@ -643,30 +740,6 @@ class RealExecutorTest(RunnerTestCase):
                             runner.run_gates(["demo-gate"], quiet=True)
                         self.assertEqual(failure.exception.outcome, "not_executed")
 
-    def test_deadline_stops_parent_and_descendant(self):
-        pid_file = self.temp_dir / "child.pid"
-        child = f"import os,time; from pathlib import Path; Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(60)"
-        parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(60)"
-        with self.assertRaises(RunnerError) as failure:
-            self.execute(parent, CODEX_RUST_TEST_TIMEOUT_SECS="2")
-        self.assertEqual(failure.exception.outcome, "timed_out")
-        self.assertTrue(
-            pid_file.exists(), "descendant must have started before the deadline"
-        )
-        child_pid = int(pid_file.read_text())
-        if os.name == "nt":
-            status = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            self.assertNotIn(f'"{child_pid}"', status.stdout)
-        else:
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
-        self.assertIn("Full stdout:", str(failure.exception))
-
     def test_interrupt_is_cancelled_and_reaps_the_child(self):
         real_wait = subprocess.Popen.wait
         observed = []
@@ -677,11 +750,68 @@ class RealExecutorTest(RunnerTestCase):
                 raise KeyboardInterrupt
             return real_wait(process, *args, **kwargs)
 
+        started = time.monotonic()
         with mock.patch.object(subprocess.Popen, "wait", interrupt_once):
             with self.assertRaises(RunnerError) as failure:
                 self.execute("import time; time.sleep(60)")
+        self.assertLess(time.monotonic() - started, self.CLEANUP_ALLOWANCE_SECS)
         self.assertEqual(failure.exception.outcome, "cancelled")
         self.assertIsNotNone(observed[0].returncode)
+
+    def test_interruption_terminates_before_bounded_reap(self):
+        for error, outcome in (
+            (KeyboardInterrupt(), "cancelled"),
+            (subprocess.TimeoutExpired("child", 2), "timed_out"),
+        ):
+            with self.subTest(outcome=outcome):
+                process = mock.Mock()
+                process.wait.side_effect = [error, 0]
+                with (
+                    mock.patch.object(
+                        rust_test_runner,
+                        "owned_process",
+                        return_value=contextlib.nullcontext(process),
+                    ),
+                    mock.patch.object(time, "monotonic", return_value=100),
+                    self.assertRaises(RunnerError) as failure,
+                ):
+                    self.execute("unused", CODEX_RUST_TEST_TIMEOUT_SECS="2")
+                self.assertEqual(failure.exception.outcome, outcome)
+                self.assertEqual(
+                    process.mock_calls,
+                    [
+                        mock.call.wait(timeout=2),
+                        mock.call._codex_owned_job.stop(115),
+                        mock.call.wait(timeout=15),
+                    ],
+                )
+
+    def test_cleanup_failure_uses_bounded_fallback_and_is_not_cancellation(self):
+        process = mock.Mock()
+        process.wait.side_effect = [KeyboardInterrupt(), 0]
+        process._codex_owned_job.stop.side_effect = rust_test_runner.CleanupFailed(
+            "stuck"
+        )
+        with (
+            mock.patch.object(
+                rust_test_runner,
+                "owned_process",
+                return_value=contextlib.nullcontext(process),
+            ),
+            mock.patch.object(time, "monotonic", return_value=100),
+            self.assertRaises(RunnerError) as failure,
+        ):
+            self.execute("unused", CODEX_RUST_TEST_TIMEOUT_SECS="2")
+        self.assertEqual(failure.exception.outcome, "cleanup_failed")
+        self.assertEqual(
+            process.mock_calls,
+            [
+                mock.call.wait(timeout=2),
+                mock.call._codex_owned_job.stop(115),
+                mock.call.kill(),
+                mock.call.wait(timeout=5),
+            ],
+        )
 
 
 class ManifestSchemaTest(RunnerTestCase):

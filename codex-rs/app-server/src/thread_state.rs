@@ -1592,7 +1592,6 @@ mod tests {
                 codex_protocol::protocol::AgentMessageEvent {
                     message: format!("reply to {message}"),
                     phase: None,
-                    memory_citation: None,
                 },
             )));
             items.push(RolloutItem::EventMsg(terminal_event(turn_id, message)));

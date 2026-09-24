@@ -3,7 +3,6 @@
 Everything becomes a good contributor design, which contributors do we need?
 
 git attribution              Context
-memories                     Context + Tool + Output
 goal                         Tool + Runtime
 image generation             Tool + Output
 skills                       Context + Turn

@@ -539,7 +539,6 @@ const LEGACY_FEATURE_ALIASES: &[(&str, &str)] = &[
     ("web_search", "web_search_request"),
     ("imagegenext", "image_generation"),
     ("collab", "multi_agent"),
-    ("memory_tool", "memories"),
     ("codex_hooks", "hooks"),
 ];
 

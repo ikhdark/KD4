@@ -177,5 +177,5 @@ fn external_json_output<T: Serialize>(value: &T) -> Result<Box<dyn ToolOutput>, 
     let value = serde_json::to_value(value).map_err(|err| {
         FunctionCallError::Fatal(format!("failed to serialize tool output: {err}"))
     })?;
-    Ok(Box::new(JsonToolOutput::new(value).with_external_context()))
+    Ok(Box::new(JsonToolOutput::new(value)))
 }

@@ -10,7 +10,6 @@ use crate::LOGS_DB_FILENAME;
 use crate::LogEntry;
 use crate::LogQuery;
 use crate::LogRow;
-use crate::MEMORIES_DB_FILENAME;
 use crate::STATE_DB_FILENAME;
 use crate::SortKey;
 use crate::ThreadMetadata;
@@ -21,7 +20,6 @@ use crate::migrations::repair_legacy_recency_migration_version;
 use crate::migrations::repair_legacy_validation_index_migration_order;
 use crate::migrations::runtime_goals_migrator;
 use crate::migrations::runtime_logs_migrator;
-use crate::migrations::runtime_memories_migrator;
 use crate::migrations::runtime_migrator_for_pool;
 use crate::migrations::runtime_state_migrator;
 use crate::model::AgentJobRow;
@@ -70,7 +68,6 @@ mod goals;
 mod logs;
 pub use logs::LogReader;
 pub(crate) use logs::LogRetentionScope;
-mod memories;
 mod projects;
 mod recovery;
 mod remote_control;
@@ -92,7 +89,6 @@ pub use goals::GoalAccountingMode;
 pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
 pub use goals::GoalUpdate;
-pub use memories::MemoryStore;
 pub use recovery::RuntimeDbBackup;
 pub use recovery::backup_runtime_db_for_fresh_start;
 pub use recovery::is_sqlite_corruption_error;
@@ -151,15 +147,7 @@ const GOALS_DB: RuntimeDbSpec = RuntimeDbSpec {
     migrate_phase: "migrate_goals",
 };
 
-const MEMORIES_DB: RuntimeDbSpec = RuntimeDbSpec {
-    label: "memories DB",
-    filename: MEMORIES_DB_FILENAME,
-    kind: DbKind::Memories,
-    open_phase: "open_memories",
-    migrate_phase: "migrate_memories",
-};
-
-const RUNTIME_DBS: [RuntimeDbSpec; 4] = [STATE_DB, LOGS_DB, GOALS_DB, MEMORIES_DB];
+const RUNTIME_DBS: [RuntimeDbSpec; 3] = [STATE_DB, LOGS_DB, GOALS_DB];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDbPath {
@@ -179,7 +167,6 @@ pub struct StateRuntime {
     #[cfg(test)]
     log_retention_test_control: Arc<logs::LogRetentionTestControl>,
     thread_goals: GoalStore,
-    memories: MemoryStore,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
 }
@@ -218,11 +205,9 @@ impl StateRuntime {
         let state_migrator = runtime_state_migrator();
         let logs_migrator = runtime_logs_migrator();
         let goals_migrator = runtime_goals_migrator();
-        let memories_migrator = runtime_memories_migrator();
         let state_path = STATE_DB.path(codex_home.as_path());
         let logs_path = LOGS_DB.path(codex_home.as_path());
         let goals_path = GOALS_DB.path(codex_home.as_path());
-        let memories_path = MEMORIES_DB.path(codex_home.as_path());
         let telemetry = telemetry_override.as_deref();
         // These migrations touch only their own database. Await every opener
         // so failure cleanup also closes pools that succeeded concurrently.
@@ -230,21 +215,16 @@ impl StateRuntime {
             open_state_sqlite(&state_path, &state_migrator, telemetry),
             open_logs_sqlite(&logs_path, &logs_migrator, telemetry),
             open_goals_sqlite(&goals_path, &goals_migrator, telemetry),
-            open_memories_sqlite(&memories_path, &memories_migrator, telemetry),
         );
-        let results = [results.0, results.1, results.2, results.3];
+        let results = [results.0, results.1, results.2];
         if results.iter().any(Result::is_err) {
             for pool in results.iter().filter_map(|result| result.as_ref().ok()) {
                 pool.close().await;
             }
         }
-        let [pool, logs_pool, goals_pool, memories_pool] = results;
-        let (pool, logs_pool, goals_pool, memories_pool) = (
-            Arc::new(pool?),
-            Arc::new(logs_pool?),
-            Arc::new(goals_pool?),
-            Arc::new(memories_pool?),
-        );
+        let [pool, logs_pool, goals_pool] = results;
+        let (pool, logs_pool, goals_pool) =
+            (Arc::new(pool?), Arc::new(logs_pool?), Arc::new(goals_pool?));
         let started = Instant::now();
         let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref())
             .await
@@ -264,13 +244,7 @@ impl StateRuntime {
             &backfill_state_result,
         );
         if let Err(err) = backfill_state_result {
-            close_sqlite_pools(&[
-                pool.as_ref(),
-                logs_pool.as_ref(),
-                goals_pool.as_ref(),
-                memories_pool.as_ref(),
-            ])
-            .await;
+            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
             return Err(err);
         }
         let started = Instant::now();
@@ -303,13 +277,8 @@ SELECT
             match thread_timestamp_millis_result {
                 Ok(value) => value,
                 Err(err) => {
-                    close_sqlite_pools(&[
-                        pool.as_ref(),
-                        logs_pool.as_ref(),
-                        goals_pool.as_ref(),
-                        memories_pool.as_ref(),
-                    ])
-                    .await;
+                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()])
+                        .await;
                     return Err(err);
                 }
             };
@@ -322,13 +291,7 @@ SELECT
         )
         .await
         {
-            close_sqlite_pools(&[
-                pool.as_ref(),
-                logs_pool.as_ref(),
-                goals_pool.as_ref(),
-                memories_pool.as_ref(),
-            ])
-            .await;
+            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
             return Err(recovery::RuntimeDbInitError::new(
                 STATE_DB.label,
                 "register agent job runner",
@@ -346,7 +309,6 @@ SELECT
         );
         let runtime = Arc::new(Self {
             thread_goals: GoalStore::new(Arc::clone(&goals_pool)),
-            memories: MemoryStore::new(Arc::clone(&memories_pool), Arc::clone(&pool)),
             pool,
             logs_pool,
             agent_job_runner_instance_id,
@@ -371,10 +333,6 @@ SELECT
         &self.thread_goals
     }
 
-    pub fn memories(&self) -> &MemoryStore {
-        &self.memories
-    }
-
     pub fn is_closed(&self) -> bool {
         self.pool.is_closed()
     }
@@ -390,28 +348,9 @@ SELECT
         {
             warn!(%error, "failed to unregister agent job runner instance");
         }
-        self.memories.close().await;
         self.thread_goals.close().await;
         self.logs_pool.close().await;
         self.pool.close().await;
-    }
-
-    pub async fn clear_memory_data_in_sqlite_home(sqlite_home: &Path) -> anyhow::Result<bool> {
-        let memories_path = MEMORIES_DB.path(sqlite_home);
-        if !tokio::fs::try_exists(&memories_path).await? {
-            return Ok(false);
-        }
-
-        let memories_migrator = runtime_memories_migrator();
-        let pool = open_memories_sqlite(
-            &memories_path,
-            &memories_migrator,
-            /*telemetry_override*/ None,
-        )
-        .await?;
-        memories::clear_memory_data_in_pool(&pool).await?;
-        pool.close().await;
-        Ok(true)
     }
 }
 
@@ -456,14 +395,6 @@ async fn open_goals_sqlite(
     telemetry_override: Option<&dyn DbTelemetry>,
 ) -> anyhow::Result<SqlitePool> {
     open_sqlite(path, migrator, GOALS_DB, telemetry_override).await
-}
-
-async fn open_memories_sqlite(
-    path: &Path,
-    migrator: &Migrator,
-    telemetry_override: Option<&dyn DbTelemetry>,
-) -> anyhow::Result<SqlitePool> {
-    open_sqlite(path, migrator, MEMORIES_DB, telemetry_override).await
 }
 
 async fn open_sqlite(
@@ -568,14 +499,6 @@ pub fn goals_db_filename() -> String {
 
 pub fn goals_db_path(codex_home: &Path) -> PathBuf {
     GOALS_DB.path(codex_home)
-}
-
-pub fn memories_db_filename() -> String {
-    MEMORIES_DB.filename.to_string()
-}
-
-pub fn memories_db_path(codex_home: &Path) -> PathBuf {
-    MEMORIES_DB.path(codex_home)
 }
 
 pub fn runtime_db_paths(codex_home: &Path) -> Vec<RuntimeDbPath> {
@@ -795,8 +718,6 @@ mod tests {
             "migrate_logs",
             "open_goals",
             "migrate_goals",
-            "open_memories",
-            "migrate_memories",
             "ensure_backfill_state",
             "post_init_query",
         ]
@@ -804,6 +725,14 @@ mod tests {
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
         assert_eq!(phases, expected);
+        assert!(!codex_home.join("memories_1.sqlite").exists());
+        let memory_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('threads') WHERE name = 'memory_mode'",
+        )
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("inspect thread schema");
+        assert_eq!(memory_columns, 0);
 
         runtime.pool.close().await;
         runtime.logs_pool.close().await;

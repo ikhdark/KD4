@@ -393,23 +393,7 @@ impl WorkspaceEvidenceGenerationBatch {
         dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
         mutation_revision: u64,
     ) -> WorkspaceEvidenceBaseline {
-        let routed_cwd = turn
-            .filter(|turn| {
-                turn.environments
-                    .primary()
-                    .is_some_and(|selected| !selected.environment.is_remote())
-            })
-            .map(|turn| crate::workspace_transaction::evidence_cwd(turn, cwd))
-            .transpose();
-        let cache_cwd = match routed_cwd {
-            Ok(cwd) => cwd,
-            Err(_) => {
-                return capture_workspace_evidence_baseline(cache, turn, cwd, dependencies, false)
-                    .await;
-            }
-        };
         // Coalesce sibling captures, including the authoritative non-Git None.
-        // Transaction routing must also separate captures made before isolation.
         let slot = {
             let mut baselines = self
                 .baselines
@@ -417,7 +401,7 @@ impl WorkspaceEvidenceGenerationBatch {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(
                 baselines
-                    .entry(cache_cwd.unwrap_or_else(|| cwd.to_path_buf()))
+                    .entry(cwd.to_path_buf())
                     .or_default(),
             )
         };
@@ -1269,34 +1253,6 @@ async fn capture_workspace_evidence_baseline(
             source_path_observations: Vec::new(),
         };
     }
-    let routed_cwd = match turn
-        .filter(|turn| {
-            turn.environments
-                .primary()
-                .is_some_and(|selected| !selected.environment.is_remote())
-        })
-        .map(|turn| crate::workspace_transaction::evidence_cwd(turn, cwd))
-        .transpose()
-    {
-        Ok(cwd) => cwd,
-        Err(error) => {
-            warn!(%error, "task workspace evidence is unavailable");
-            return WorkspaceEvidenceBaseline {
-                revision: Some(crate::git_workspace::WorkspaceEvidenceIdentity {
-                    unavailable: true,
-                    repository_root: None,
-                    head_identity: None,
-                    index_identity: None,
-                    worktree_identity: None,
-                }),
-                cache_hit: false,
-                timed_out_git_dependencies: Vec::new(),
-                source_dependencies,
-                source_path_observations: Vec::new(),
-            };
-        }
-    };
-    let cwd = routed_cwd.as_deref().unwrap_or(cwd);
     // Register dependency watches before the authoritative snapshot. A change
     // that races the snapshot is then either reflected by the snapshot or
     // invalidates the path-scoped observation.
@@ -5368,7 +5324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_evidence_baseline_follows_transaction_routing_and_cache_scope() {
+    async fn workspace_evidence_ignores_retired_transaction_state() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         assert!(
@@ -5379,7 +5335,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        std::fs::write(workspace.path().join("source.txt"), "unchanged source\n").unwrap();
+        std::fs::write(workspace.path().join("source.txt"), "current source\n").unwrap();
         let cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(workspace.path()).unwrap();
         let (session, turn, _events) =
             crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
@@ -5396,23 +5352,17 @@ mod tests {
                 },
             )
             .await;
+        let legacy_state = home
+            .path()
+            .join("workspace-transactions")
+            .join(turn.session_telemetry.conversation_id().to_string())
+            .join("transaction.json");
+        std::fs::create_dir_all(legacy_state.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_state, "retired metadata is not consulted").unwrap();
+
         let cache = session.services.git_workspace.as_ref();
-        let batch = WorkspaceEvidenceGenerationBatch::new();
-        let original = batch
-            .capture_baseline(cache, Some(&turn), workspace.path(), Default::default(), 0)
-            .await;
-        let tx = crate::workspace_transaction::begin(
-            home.path(),
-            &turn.session_telemetry.conversation_id().to_string(),
-            workspace.path(),
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read(tx.workdir.join("source.txt")).unwrap(),
-            std::fs::read(workspace.path().join("source.txt")).unwrap()
-        );
         let expected = cache
-            .workspace_evidence_for_turn(&turn, workspace.path())
+            .workspace_evidence_identity_with_attribution(workspace.path())
             .await
             .identity;
         assert!(
@@ -5420,12 +5370,13 @@ mod tests {
                 .as_ref()
                 .is_some_and(|identity| !identity.unavailable)
         );
-        assert_ne!(original.revision, expected);
-        // The mutation counter can be unchanged when routing switches repositories.
-        let isolated = batch
-            .capture_baseline(cache, Some(&turn), workspace.path(), Default::default(), 0)
-            .await;
-        assert_eq!(isolated.revision, expected);
+        assert_eq!(
+            cache
+                .workspace_evidence_for_turn(&turn, workspace.path())
+                .await
+                .identity,
+            expected
+        );
         let direct = capture_workspace_evidence_baseline(
             cache,
             Some(&turn),
@@ -5435,75 +5386,18 @@ mod tests {
         )
         .await;
         assert_eq!(direct.revision, expected);
-        let reused = batch
-            .capture_baseline(cache, Some(&turn), workspace.path(), Default::default(), 0)
-            .await;
-        assert!(reused.cache_hit);
-        assert_eq!(reused.revision, expected);
-
-        let unavailable = batch
-            .capture_baseline(
-                cache,
-                Some(&turn),
-                &workspace.path().join(".."),
-                Default::default(),
-                0,
-            )
-            .await;
-        assert!(unavailable.revision.as_ref().unwrap().unavailable);
-        assert!(!unavailable.cache_hit);
-        assert!(!finish_workspace_evidence_capture(&unavailable, false).1);
-
-        let response = ResponseInputItem::FunctionCallOutput {
-            call_id: "isolated-read".to_string(),
-            output: FunctionCallOutputPayload::from_text("unchanged source\n".to_string()),
-        };
-        let classification = crate::tool_history::WorkspaceCallClassification {
-            observes_workspace: true,
-            workspace_cwd: workspace.path().to_path_buf(),
-            source_dependencies: Default::default(),
-        };
-        ToolCallRuntime::register_workspace_evidence_after_call(
-            &session,
-            &turn,
-            WorkspaceEvidenceAfterCall {
-                response: &response,
-                baseline: Some(isolated),
-                mutation_advanced: false,
-                source_dependencies_override: None,
-                classification: &classification,
-                workspace_gate_guard: None,
-            },
-            None,
-            None,
-        )
-        .await;
-        let canonical: Arc<[ResponseItem]> = Arc::from([
-            ResponseItem::FunctionCall {
-                id: None,
-                name: "exec".to_string(),
-                namespace: None,
-                arguments: "{}".to_string(),
-                call_id: "isolated-read".to_string(),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::from(response),
-        ]);
-        let evidence = session.clone_history().await.tool_history_state();
+        let batch = WorkspaceEvidenceGenerationBatch::new();
+        for _ in 0..2 {
+            let baseline = batch
+                .capture_baseline(cache, Some(&turn), workspace.path(), Default::default(), 0)
+                .await;
+            assert_eq!(baseline.revision, expected);
+            assert!(finish_workspace_evidence_capture(&baseline, false).1);
+        }
         assert_eq!(
-            evidence
-                .project_with_workspace_identity(Arc::clone(&canonical), expected.as_ref())
-                .items,
-            canonical,
+            std::fs::read_to_string(legacy_state).unwrap(),
+            "retired metadata is not consulted"
         );
-        let wrong_repository =
-            evidence.project_with_workspace_identity(canonical, original.revision.as_ref());
-        let (_, notice) =
-            crate::tool_history::canonical_textual_output_identity(&wrong_repository.items[1])
-                .unwrap();
-        let notice: serde_json::Value = serde_json::from_str(&notice).unwrap();
-        assert_eq!(notice["reason_code"], "workspace_identity_changed");
-        assert_eq!(notice["valid_for_current_workspace"], false);
     }
 
     #[tokio::test]

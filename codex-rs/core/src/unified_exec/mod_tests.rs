@@ -575,8 +575,13 @@ async fn an_empty_poll_on_a_validation_launch_waits_the_requested_yield() -> any
 #[tokio::test(start_paused = true)]
 async fn an_empty_poll_on_an_interactive_process_keeps_the_quiet_period() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
-    let (process_id, process, allow_terminate) =
-        register_pollable_process(&session, &turn, "interactive-poll", /*validation*/ false).await?;
+    let (process_id, process, allow_terminate) = register_pollable_process(
+        &session,
+        &turn,
+        "interactive-poll",
+        /*validation*/ false,
+    )
+    .await?;
 
     emit_burst_then_go_silent(&process, Duration::from_secs(1));
     let started_at = Instant::now();
@@ -666,7 +671,8 @@ async fn noninteractive_poll_keeps_progress_until_completion_or_deadline() -> an
 /// Preservation: a direct model call has no wrapper bounding it, so the
 /// configured background maximum still governs the wait.
 #[tokio::test(start_paused = true)]
-async fn a_direct_call_without_a_nested_budget_keeps_the_background_maximum() -> anyhow::Result<()> {
+async fn a_direct_call_without_a_nested_budget_keeps_the_background_maximum() -> anyhow::Result<()>
+{
     let (session, turn) = test_session_and_turn().await;
     let (process_id, process, allow_terminate) =
         register_pollable_process(&session, &turn, "direct-poll", /*validation*/ false).await?;

@@ -156,7 +156,6 @@ pub(super) async fn spawn_review_thread(
         agent_task_binding: Arc::new(std::sync::OnceLock::new()),
         server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),
-        memory_pollution_signal_claimed: AtomicBool::new(false),
         dispatched_tool_names: Arc::new(std::sync::Mutex::new(Vec::new())),
         cancellation_cause: Arc::new(OnceLock::new()),
     };

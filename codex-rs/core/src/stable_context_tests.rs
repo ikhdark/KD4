@@ -879,27 +879,6 @@ fn recommended_plugins_expire_after_the_requesting_turn() {
 }
 
 #[test]
-fn memory_context_has_dedicated_stable_provenance() {
-    let memory = "<memory_context>\nremember this\n</memory_context>";
-    let projection = project_stable_context(
-        vec![
-            text_message("developer", memory),
-            text_message("user", "current task"),
-        ]
-        .into(),
-        StableContextTarget::Sampling,
-    );
-
-    assert!(
-        projection
-            .manifest
-            .components()
-            .iter()
-            .any(|component| { component.kind == StableContextKind::Memory && component.active })
-    );
-}
-
-#[test]
 fn base_and_compact_catalog_identities_are_deterministic_without_local_reuse() {
     let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
     let selected = skill("deterministic");

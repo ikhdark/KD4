@@ -1511,7 +1511,11 @@ impl ContextManager {
         normalize::strip_images_when_unsupported(input_modalities, items);
     }
 
-    pub(crate) fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
+    pub(crate) fn process_item(
+        &self,
+        item: &ResponseItem,
+        policy: TruncationPolicy,
+    ) -> ResponseItem {
         if let Some(call_id) = crate::tool_history::item_call_id(item)
             && matches!(
                 item,

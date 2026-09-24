@@ -39,7 +39,6 @@ use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::History;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
-use codex_config::types::MemoriesConfig;
 use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_config::types::Notice;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -82,7 +81,6 @@ use codex_mcp::McpConfig;
 use codex_mcp::McpPluginAttribution;
 use codex_mcp::McpServerRegistration;
 use codex_mcp::ResolvedMcpCatalog;
-use codex_memories_read::memory_root;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
@@ -870,9 +868,6 @@ pub struct Config {
 
     /// User-defined role declarations keyed by role name.
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
-
-    /// Memories subsystem settings.
-    pub memories: MemoriesConfig,
 
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
@@ -2894,8 +2889,6 @@ impl Config {
             Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
             None => WindowsSandboxLevel::Disabled,
         };
-        let memories_config: MemoriesConfig = cfg.memories.clone().unwrap_or_default().into();
-        let memories_root = memory_root(&codex_home);
 
         let profiles_are_active = effective_permission_selection.profiles_are_active(
             default_permissions_override.as_deref(),
@@ -3417,10 +3410,7 @@ impl Config {
             network_requirements,
             &network_permission_profile,
         )?;
-        let mut helper_readable_roots = Vec::new();
-        if features.enabled(Feature::MemoryTool) && memories_config.use_memories {
-            helper_readable_roots.push(memories_root);
-        }
+        let helper_readable_roots = Vec::new();
         let effective_permission_profile = constrained_permission_profile.value.get().clone();
         let (mut effective_file_system_sandbox_policy, effective_network_sandbox_policy) =
             effective_permission_profile.to_runtime_permissions();
@@ -3533,7 +3523,6 @@ impl Config {
             agent_max_threads,
             agent_max_depth,
             agent_roles,
-            memories: memories_config,
             agent_job_max_runtime_seconds,
             agent_interrupt_message_enabled,
             codex_home,

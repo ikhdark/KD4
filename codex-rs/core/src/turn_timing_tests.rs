@@ -368,7 +368,6 @@ fn turn_timing_state_records_ttfm_independently_of_visible_output() {
             id: "msg-1".to_string(),
             content: Vec::new(),
             phase: None,
-            memory_citation: None,
         })),
         Some(Duration::from_millis(12))
     );
@@ -378,7 +377,6 @@ fn turn_timing_state_records_ttfm_independently_of_visible_output() {
             id: "msg-2".to_string(),
             content: Vec::new(),
             phase: None,
-            memory_citation: None,
         })),
         None
     );

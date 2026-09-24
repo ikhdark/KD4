@@ -76,7 +76,6 @@ impl McpServerOrigin {
 #[derive(Debug, Clone)]
 pub(crate) struct McpServerMetadata {
     pub environment_id: String,
-    pub pollutes_memory: bool,
     pub origin: Option<McpServerOrigin>,
     pub supports_parallel_tool_calls: bool,
     pub default_tools_approval_mode: Option<AppToolApproval>,
@@ -98,7 +97,6 @@ impl From<&EffectiveMcpServer> for McpServerMetadata {
         match server.launch() {
             McpServerLaunch::Configured(config) => Self {
                 environment_id: config.environment_id.clone(),
-                pollutes_memory: true,
                 origin: McpServerOrigin::from_transport(&config.transport),
                 supports_parallel_tool_calls: config.supports_parallel_tool_calls,
                 default_tools_approval_mode: config.default_tools_approval_mode,

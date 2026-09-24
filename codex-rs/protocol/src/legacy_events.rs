@@ -102,7 +102,6 @@ impl AgentMessageItem {
                 AgentMessageContent::Text { text } => EventMsg::AgentMessage(AgentMessageEvent {
                     message: text.clone(),
                     phase: self.phase.clone(),
-                    memory_citation: self.memory_citation.clone(),
                 }),
             })
             .collect()

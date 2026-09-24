@@ -765,12 +765,6 @@ impl McpConnectionManager {
             .map(|metadata| metadata.environment_id.as_str())
     }
 
-    pub fn server_pollutes_memory(&self, server_name: &str) -> bool {
-        self.server_metadata
-            .get(server_name)
-            .is_none_or(|metadata| metadata.pollutes_memory)
-    }
-
     pub fn plugin_id_for_mcp_server_name(&self, server_name: &str) -> Option<&str> {
         self.tool_plugin_provenance
             .plugin_id_for_mcp_server_name(server_name)

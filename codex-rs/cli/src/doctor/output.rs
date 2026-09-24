@@ -730,7 +730,6 @@ fn state_summary(check: &DoctorCheck) -> String {
         "state DB integrity",
         "log DB integrity",
         "goals DB integrity",
-        "memories DB integrity",
     ]
     .into_iter()
     .all(|label| detail::detail_value(check, label).is_some_and(|value| value == "ok"));
@@ -1216,7 +1215,7 @@ mod tests {
                 .detail("profile: debug")
                 .detail(r"current executable: C:\custom\a-very-long-installation-directory\another-long-directory\codex.exe"),
             DoctorCheck::new("config", "config", CheckStatus::Ok, "config")
-                .detail("feature flag overrides: memories=false, shell=true")
+                .detail("feature flag overrides: goals=false, shell=true")
                 .detail("branch: feature/TestTimestampZ"),
             DoctorCheck::new("title", "title", CheckStatus::Ok, "title")
                 .detail("terminal title items: used-tokens, model")
@@ -1231,7 +1230,7 @@ mod tests {
         );
         assert!(rendered.contains("v0.0.0 | windows-x86_64"));
         assert!(rendered.contains("local debug build"));
-        assert!(rendered.contains("memories=false, shell=true"));
+        assert!(rendered.contains("goals=false, shell=true"));
         assert!(rendered.contains("feature/TestTimestampZ"));
         assert!(rendered.contains("used-tokens, model"));
         assert!(rendered.contains("projet \u{00e9}"));
@@ -1543,37 +1542,6 @@ Run codex doctor without --summary for detailed diagnostics.
     }
 
     #[test]
-    fn render_human_report_includes_memories_db_in_state_health_summary() {
-        let report = DoctorReport {
-            schema_version: 1,
-            generated_at: "0s since unix epoch".to_string(),
-            overall_status: CheckStatus::Ok,
-            codex_version: "0.0.0".to_string(),
-            checks: vec![
-                DoctorCheck::new(
-                    "state.paths",
-                    "state",
-                    CheckStatus::Ok,
-                    "state paths inspectable",
-                )
-                .detail("state DB: /tmp/state.sqlite")
-                .detail("state DB integrity: ok")
-                .detail("log DB: /tmp/logs.sqlite")
-                .detail("log DB integrity: ok")
-                .detail("goals DB: /tmp/goals.sqlite")
-                .detail("goals DB integrity: ok")
-                .detail("memories DB: /tmp/memories.sqlite")
-                .detail("memories DB integrity: ok"),
-            ],
-        };
-
-        let rendered = render_human_report(&report, detailed_no_color_unicode_options());
-
-        assert!(rendered.contains("✓ state        databases healthy"));
-        assert!(rendered.contains("memories DB              /tmp/memories.sqlite · integrity ok"));
-    }
-
-    #[test]
     fn render_human_report_supports_ascii_output() {
         let rendered = render_human_report(
             &sample_report(),
@@ -1771,8 +1739,8 @@ Run codex doctor without --summary for detailed diagnostics.
                     .detail("model: gpt-5.5")
                     .detail("model provider: openai")
                     .detail("feature flags enabled: 3")
-                    .detail("enabled feature flags: shell_tool, memories, goals")
-                    .detail("feature flag overrides: memories=true"),
+                    .detail("enabled feature flags: shell_tool, goals")
+                    .detail("feature flag overrides: goals=true"),
             ],
         };
 
@@ -1785,9 +1753,9 @@ Run codex doctor without --summary for detailed diagnostics.
                 "feature flags            3 enabled · 1 overridden (full list with --all)"
             )
         );
-        assert!(expanded.contains("enabled flags            shell_tool, memories, goals"));
-        assert!(compact.contains("overrides                memories=true"));
-        assert!(expanded.contains("overrides                memories=true"));
+        assert!(expanded.contains("enabled flags            shell_tool, goals"));
+        assert!(compact.contains("overrides                goals=true"));
+        assert!(expanded.contains("overrides                goals=true"));
     }
 
     #[test]

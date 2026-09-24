@@ -573,7 +573,6 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionNetworkProxyRuntime;
 use codex_protocol::protocol::StreamErrorEvent;
 use codex_protocol::protocol::Submission;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -1024,17 +1023,6 @@ impl Codex {
         Ok(())
     }
 
-    /// Persist a thread-level memory mode update for the active session.
-    ///
-    /// This is a local-only operation that updates rollout metadata directly
-    /// and does not involve the model.
-    pub async fn set_thread_memory_mode(
-        &self,
-        mode: codex_protocol::protocol::ThreadMemoryMode,
-    ) -> anyhow::Result<()> {
-        handlers::persist_thread_memory_mode_update(&self.session, mode).await
-    }
-
     pub(crate) async fn request_shutdown(&self) -> CodexResult<()> {
         match self.submit(Op::Shutdown).await {
             Ok(_) => {}
@@ -1262,15 +1250,7 @@ fn take_prompt_fragment_with_identity(
     turn_id: &str,
     contribution_index: Option<usize>,
 ) -> Option<(PromptSlot, String)> {
-    let categorized = crate::context::CategorizedPromptFragment::from_extension(fragment);
-    let category = categorized.category();
-    let fragment = categorized.into_fragment();
-    let rendered = match category {
-        crate::context::PromptContextCategory::Memory => {
-            format!("<memory_context>\n{}\n</memory_context>", fragment.text())
-        }
-        _ => fragment.text().to_string(),
-    };
+    let rendered = fragment.text().to_string();
     let slot = fragment.slot();
     if slot == PromptSlot::SeparateDeveloper && rendered.is_empty() {
         return None;
@@ -1448,13 +1428,15 @@ fn unfinished_turn_boundary_items(
     ) {
         items.push(RolloutItem::ResponseItem(marker));
     }
-    items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-        turn_id,
-        reason: TurnAbortReason::Interrupted,
-        completed_at: None,
-        duration_ms: None,
-        timing: None,
-    })));
+    items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
+        TurnAbortedEvent {
+            turn_id,
+            reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+            timing: None,
+        },
+    )));
     items
 }
 
@@ -4001,7 +3983,6 @@ impl Session {
         let commit = tokio::spawn(async move {
             let _in_flight = in_flight;
             let result = async {
-                let is_tool_completion = post_tool_context_call_id.is_some();
                 let commit_permit = session
                     .durable_history_commit_gate
                     .acquire()
@@ -4011,7 +3992,8 @@ impl Session {
                 let (commit_key, recovered_items) =
                     if conversation_items_need_blocking_history_identity(&raw_items) {
                         tokio::task::spawn_blocking(move || {
-                            durable_history_commit_key(&turn_id, &raw_items).map(|key| (key, raw_items))
+                            durable_history_commit_key(&turn_id, &raw_items)
+                                .map(|key| (key, raw_items))
                         })
                         .await
                         .map_err(std::io::Error::other)??
@@ -4112,16 +4094,6 @@ impl Session {
                 }
                 session.send_raw_response_items(&turn_context, &items).await;
                 drop(persistence_timing_guard);
-                if is_tool_completion {
-                    for item in &items {
-                        crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context(
-                            session.as_ref(),
-                            turn_context.as_ref(),
-                            item,
-                        )
-                        .await;
-                    }
-                }
                 durability_result
             }
             .await;
@@ -6305,17 +6277,6 @@ impl Session {
             .session_telemetry
             .user_prompt(&input_for_telemetry);
         Ok(active_turn_id)
-    }
-
-    pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {
-        let turn_state = self
-            .input_queue
-            .turn_state_for_sub_id(&self.active_turn, sub_id)
-            .await;
-        let Some(turn_state) = turn_state else {
-            return;
-        };
-        turn_state.lock().await.has_memory_citation = true;
     }
 
     pub async fn interrupt_task(self: &Arc<Self>) {

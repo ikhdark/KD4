@@ -1537,9 +1537,6 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     let state_db =
         StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
     let persisted_id = ThreadId::from_string(&thread.id)?;
-    state_db
-        .set_thread_memory_mode(persisted_id, "disabled")
-        .await?;
 
     let goal_id = mcp
         .send_raw_request(
@@ -1559,14 +1556,6 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     .await??;
     let goal: ThreadGoalSetResponse = to_response(goal_resp)?;
     assert_eq!(goal.goal.status, ThreadGoalStatus::BudgetLimited);
-    assert_eq!(
-        state_db
-            .get_thread_memory_mode(persisted_id)
-            .await?
-            .as_deref(),
-        Some("disabled"),
-        "setting a goal must preserve independently stored memory policy"
-    );
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1659,14 +1648,6 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     .await??;
     let clear: ThreadGoalClearResponse = to_response(clear_resp)?;
     assert!(clear.cleared);
-    assert_eq!(
-        state_db
-            .get_thread_memory_mode(persisted_id)
-            .await?
-            .as_deref(),
-        Some("disabled"),
-        "clearing a goal must preserve independently stored memory policy"
-    );
     Ok(())
 }
 
@@ -2256,7 +2237,7 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Still running".to_string(),
                 phase: None,
-                memory_citation: None,
+
             }))?,
         })
         .to_string(),
@@ -2356,7 +2337,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Interrupted after usage".to_string(),
                 phase: None,
-                memory_citation: None,
+
             }))?,
         })
         .to_string(),
@@ -2554,7 +2535,7 @@ stream_max_retries = 0
         base_instructions: None,
         dynamic_tools: None,
         selected_capability_roots: Vec::new(),
-        memory_mode: None,
+
         history_mode: Default::default(),
         multi_agent_version: None,
         context_window: None,
@@ -2688,7 +2669,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Still running".to_string(),
                 phase: None,
-                memory_citation: None,
+
             }))?,
         })
         .to_string(),

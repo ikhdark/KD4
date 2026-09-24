@@ -181,7 +181,6 @@ async fn residency_materialization_failure_preserves_running_agent_and_buffered_
             AgentMessageEvent {
                 message: "history-before-failed-eviction".to_string(),
                 phase: None,
-                memory_citation: None,
             },
         ))])
         .await

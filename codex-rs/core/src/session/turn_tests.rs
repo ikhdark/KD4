@@ -5951,7 +5951,7 @@ fn pending_token_estimate_excludes_stable_startup_injections_from_body_growth() 
     let empty_router = ToolRouter::from_parts(empty_registry, Vec::new());
     let baseline =
         estimate_pending_tokens(&[], &[], &[], &empty_router, /*initial_context*/ false);
-    let guidance = ContextualUserFragment::into(TaskModelGuidance);
+    let guidance = ContextualUserFragment::into(TaskModelGuidance::default());
     let with_guidance = estimate_pending_tokens(
         &[],
         &[guidance],
@@ -6966,25 +6966,6 @@ fn projected_prompt_pressure_adds_pending_body_growth_to_server_usage() {
             /*pending_token_estimate*/ 450, /*pending_body_growth_tokens*/ 50,
         ),
         1_250
-    );
-}
-
-#[test]
-fn plan_mode_memory_citations_are_parsed_once_for_live_events() {
-    let mut state = PlanModeStreamState::new("turn-1");
-    let raw = "<citation_entries>\nMEMORY.md:1-2|note=[x]\n</citation_entries>\n<rollout_ids>\n019cc2ea-1dff-7902-8d40-c8f6e5d83cc4\n</rollout_ids>";
-
-    let citation =
-        take_new_memory_citation(&mut state, vec![raw.to_string()]).expect("valid memory citation");
-    assert_eq!(citation.entries.len(), 1);
-    assert_eq!(citation.entries[0].path, "MEMORY.md");
-    assert_eq!(
-        citation.rollout_ids,
-        vec!["019cc2ea-1dff-7902-8d40-c8f6e5d83cc4"]
-    );
-    assert_eq!(
-        take_new_memory_citation(&mut state, vec![raw.to_string()]),
-        None
     );
 }
 

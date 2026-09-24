@@ -29,6 +29,7 @@ use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
 use codex_git_utils::DISABLED_HOOKS_PATH;
 use codex_git_utils::get_git_remote_urls_assume_git_repo;
+#[cfg(test)]
 use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_git_repo_root_with_fs;
 use codex_git_utils::get_has_changes;
@@ -833,6 +834,7 @@ async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Opt
 }
 
 impl GitWorkspaceMetadataSource {
+    #[cfg(test)]
     pub(crate) fn discover_local(cwd: AbsolutePathBuf) -> Option<Self> {
         let repo_root =
             AbsolutePathBuf::from_absolute_path(get_git_repo_root(cwd.as_path())?).ok()?;
@@ -1523,25 +1525,6 @@ impl GitWorkspaceCache {
         turn: &crate::session::turn_context::TurnContext,
         cwd: &Path,
     ) -> WorkspaceEvidenceCapture {
-        if turn
-            .environments
-            .primary()
-            .is_some_and(|env| !env.environment.is_remote())
-        {
-            return match crate::workspace_transaction::evidence_cwd(turn, cwd) {
-                Ok(cwd) => {
-                    self.workspace_evidence_identity_with_attribution(&cwd)
-                        .await
-                }
-                Err(error) => {
-                    warn!(%error, "task workspace evidence is unavailable");
-                    WorkspaceEvidenceCapture {
-                        identity: Some(WorkspaceEvidenceIdentity::unavailable(None)),
-                        timed_out_git_dependencies: Vec::new(),
-                    }
-                }
-            };
-        }
         self.workspace_evidence_for_environment(&turn.environments, turn.config.cwd.as_path(), cwd)
             .await
     }

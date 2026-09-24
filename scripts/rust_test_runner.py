@@ -773,7 +773,12 @@ class RustTestRunner:
         require_core_lib_filter(name, args, allow_all=allow_all)
         target = self.target(name)
         helpers = self.active_helpers([name])
-        if target.helpers_by_test_prefix:
+        # Discovery is worthwhile only if some prefix can omit an active helper.
+        # Otherwise the direct run already rejects an empty selection.
+        if any(
+            len(self._active_helper_names(names)) < len(helpers)
+            for names in target.helpers_by_test_prefix.values()
+        ):
             # Let nextest interpret filters, exclusions and ignored tests. Listing
             # builds the unit binary without building unrelated helper binaries.
             selected = self._list_tests(target, args)

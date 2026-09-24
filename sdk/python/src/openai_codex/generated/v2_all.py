@@ -94,6 +94,16 @@ class AdditionalContextKind(Enum):
     application = "application"
 
 
+class AgentMessageDeltaNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    delta: str
+    item_id: Annotated[str, Field(alias="itemId")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
 class InputTextAgentMessageInputContent(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -2247,16 +2257,6 @@ class McpToolCallStatus(Enum):
     failed = "failed"
 
 
-class MemoryCitationEntry(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    line_end: Annotated[int, Field(alias="lineEnd", ge=0)]
-    line_start: Annotated[int, Field(alias="lineStart", ge=0)]
-    note: str
-    path: str
-
-
 class MergeStrategy(Enum):
     replace = "replace"
     upsert = "upsert"
@@ -2575,6 +2575,16 @@ class Personality(Enum):
     none = "none"
     friendly = "friendly"
     pragmatic = "pragmatic"
+
+
+class PlanDeltaNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    delta: str
+    item_id: Annotated[str, Field(alias="itemId")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
 
 
 class PlanType(Enum):
@@ -3556,6 +3566,24 @@ class ProjectChangedServerNotification(BaseModel):
     params: ProjectChangedNotification
 
 
+class ItemAgentMessageDeltaServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["item/agentMessage/delta"], Field(title="Item/agentMessage/deltaNotificationMethod")
+    ]
+    params: AgentMessageDeltaNotification
+
+
+class ItemPlanDeltaServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[Literal["item/plan/delta"], Field(title="Item/plan/deltaNotificationMethod")]
+    params: PlanDeltaNotification
+
+
 class ProcessExitedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4144,6 +4172,16 @@ class HookPromptThreadItem(BaseModel):
     type: Annotated[Literal["hookPrompt"], Field(title="HookPromptThreadItemType")]
 
 
+class AgentMessageThreadItem(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: str
+    phase: MessagePhase | None = None
+    text: str
+    type: Annotated[Literal["agentMessage"], Field(title="AgentMessageThreadItemType")]
+
+
 class PlanThreadItem(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4383,11 +4421,6 @@ class ThreadLoadedListResponse(BaseModel):
             description="Opaque cursor to pass to the next call to continue after the last item. if None, there are no more items to return.",
         ),
     ] = None
-
-
-class ThreadMemoryMode(Enum):
-    enabled = "enabled"
-    disabled = "disabled"
 
 
 class ThreadMetadataGitInfoUpdateParams(BaseModel):
@@ -6941,14 +6974,6 @@ class McpServerStatus(BaseModel):
     tools: dict[str, Tool]
 
 
-class MemoryCitation(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    entries: list[MemoryCitationEntry]
-    thread_ids: Annotated[list[str], Field(alias="threadIds")]
-
-
 class MigrationDetails(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7083,17 +7108,6 @@ class PermissionProfileForAbsolutePathBuf(
             description="Canonical active runtime permissions for a conversation, turn, or command."
         ),
     ]
-
-
-class PlanDeltaNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    delta: str
-    item_id: Annotated[str, Field(alias="itemId")]
-    memory_citation: Annotated[MemoryCitation | None, Field(alias="memoryCitation")] = None
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
 
 
 class PluginRemoteErrorData(BaseModel):
@@ -7381,14 +7395,6 @@ class TurnDiffUpdatedServerNotification(BaseModel):
     params: TurnDiffUpdatedNotification
 
 
-class ItemPlanDeltaServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[Literal["item/plan/delta"], Field(title="Item/plan/deltaNotificationMethod")]
-    params: PlanDeltaNotification
-
-
 class CommandExecOutputDeltaServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7659,17 +7665,6 @@ class UserMessageThreadItem(BaseModel):
     content: list[UserInput]
     id: str
     type: Annotated[Literal["userMessage"], Field(title="UserMessageThreadItemType")]
-
-
-class AgentMessageThreadItem(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: str
-    memory_citation: Annotated[MemoryCitation | None, Field(alias="memoryCitation")] = None
-    phase: MessagePhase | None = None
-    text: str
-    type: Annotated[Literal["agentMessage"], Field(title="AgentMessageThreadItemType")]
 
 
 class FileChangeThreadItem(BaseModel):
@@ -8674,17 +8669,6 @@ class AccountRateLimitsUpdatedNotification(BaseModel):
     rate_limits: Annotated[RateLimitSnapshot, Field(alias="rateLimits")]
 
 
-class AgentMessageDeltaNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    delta: str
-    item_id: Annotated[str, Field(alias="itemId")]
-    memory_citation: Annotated[MemoryCitation | None, Field(alias="memoryCitation")] = None
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
 class AppInfo(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9334,16 +9318,6 @@ class ItemCompletedServerNotification(BaseModel):
     )
     method: Annotated[Literal["item/completed"], Field(title="Item/completedNotificationMethod")]
     params: ItemCompletedNotification
-
-
-class ItemAgentMessageDeltaServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["item/agentMessage/delta"], Field(title="Item/agentMessage/deltaNotificationMethod")
-    ]
-    params: AgentMessageDeltaNotification
 
 
 class ItemFileChangePatchUpdatedServerNotification(BaseModel):

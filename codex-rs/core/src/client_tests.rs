@@ -81,7 +81,6 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_rollout_trace::CompactionTraceContext;
@@ -651,7 +650,6 @@ fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
         + measured.conversation_history_bytes
         + measured.current_input_bytes
         + measured.repository_context_bytes
-        + measured.memory_bytes
         + measured.skills_bytes;
     let reconciled =
         classified + measured.other_injected_context_bytes + measured.envelope_overhead_bytes;
@@ -761,7 +759,7 @@ fn model_request_measurements_keep_category_overrides_occurrence_specific() {
     input.extend(request.input.iter().cloned());
     request.input = input.into();
     let provenance =
-        provenance.with_response_item_category(&request.input, 2, PromptContextCategory::Memory);
+        provenance.with_response_item_category(&request.input, 2, PromptContextCategory::AgentRole);
     let encoded = serde_json::to_vec(&request).unwrap();
     let logical = ModelRequestMeasurements::for_responses_request(
         &request,
@@ -784,7 +782,12 @@ fn model_request_measurements_keep_category_overrides_occurrence_specific() {
     );
     for measured in [logical, transport] {
         assert_eq!(
-            measured.memory_bytes,
+            measured
+                .prompt_context_categories
+                .iter()
+                .find(|entry| entry.category == "agent_role")
+                .unwrap()
+                .serialized_bytes,
             serde_json::to_vec(&request.input[2]).unwrap().len() as u64
         );
         assert_eq!(
@@ -853,7 +856,7 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
             &original,
             &StableContextManifest::default(),
         )
-        .with_response_item_category(&original, 1, PromptContextCategory::Memory);
+        .with_response_item_category(&original, 1, PromptContextCategory::AgentRole);
         let request = history_test_request(vec![memory, original[0].clone(), original[2].clone()]);
         let expected_memory = serde_json::to_vec(&request.input[0]).unwrap().len() as u64;
         let expected_history = serde_json::to_vec(&request.input[1]).unwrap().len() as u64;
@@ -880,7 +883,16 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
         )
         .await
         .unwrap();
-        assert_eq!(result.measurements.memory_bytes, expected_memory);
+        assert_eq!(
+            result
+                .measurements
+                .prompt_context_categories
+                .iter()
+                .find(|entry| entry.category == "agent_role")
+                .unwrap()
+                .serialized_bytes,
+            expected_memory
+        );
         assert_eq!(
             result.measurements.conversation_history_bytes,
             expected_history
@@ -3047,22 +3059,6 @@ fn build_subagent_headers_sets_other_subagent_label() {
 }
 
 #[test]
-fn build_subagent_headers_sets_internal_memory_consolidation_label() {
-    let client = test_model_client(SessionSource::Internal(
-        InternalSessionSource::MemoryConsolidation,
-    ));
-    let headers = client.build_subagent_headers();
-    let value = headers
-        .get(X_OPENAI_SUBAGENT_HEADER)
-        .and_then(|value| value.to_str().ok());
-    assert_eq!(value, Some("memory_consolidation"));
-    assert_eq!(
-        headers.get("originator"),
-        Some(&http::HeaderValue::from_static("test_originator"))
-    );
-}
-
-#[test]
 fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
     let parent_thread_id = ThreadId::new();
     let client = test_model_client(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -3958,7 +3954,7 @@ fn fixed_prefix_reuse_rejects_reordered_request_items() {
     ]);
     let provenance = PromptProvenanceSidecar::default()
         .with_response_item_category(&request.input, 0, PromptContextCategory::Repository)
-        .with_response_item_category(&request.input, 1, PromptContextCategory::Memory);
+        .with_response_item_category(&request.input, 1, PromptContextCategory::AgentRole);
     let mut first =
         ModelRequestMeasurements::for_responses_request(&request, &provenance, "").unwrap();
     assert_eq!(first.fixed_prefix_item_count, 2);

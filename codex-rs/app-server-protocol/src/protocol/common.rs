@@ -667,18 +667,6 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadSettingsUpdateResponse,
     },
-    #[experimental("thread/memoryMode/set")]
-    ThreadMemoryModeSet => "thread/memoryMode/set" {
-        params: v2::ThreadMemoryModeSetParams,
-        serialization: thread_id(params.thread_id),
-        response: v2::ThreadMemoryModeSetResponse,
-    },
-    #[experimental("memory/reset")]
-    MemoryReset => "memory/reset" {
-        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
-        serialization: global("memory"),
-        response: v2::MemoryResetResponse,
-    },
     ThreadUnarchive => "thread/unarchive" {
         params: v2::ThreadUnarchiveParams,
         serialization: thread_id(params.thread_id),
@@ -4034,6 +4022,18 @@ mod tests {
             crate::experimental_api::ExperimentalApi::experimental_reason(&notification),
             Some("turn/moderationMetadata")
         );
+    }
+
+    #[test]
+    fn removed_memory_request_methods_are_rejected() {
+        for method in ["memory/reset", "thread/memoryMode/set"] {
+            let request = serde_json::from_value::<ClientRequest>(json!({
+                "method": method,
+                "id": 42,
+                "params": { "threadId": "thread_123", "mode": "enabled" }
+            }));
+            assert!(request.is_err(), "removed method accepted: {method}");
+        }
     }
 
     #[test]

@@ -56,7 +56,6 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
@@ -1749,7 +1748,7 @@ fn append_agent_message(path: &Path, timestamp: &str, text: &str) -> anyhow::Res
             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
                 message: text.to_string(),
                 phase: None,
-                memory_citation: None,
+
             }))?,
         })
     )?;
@@ -1875,7 +1874,6 @@ async fn seed_pathless_store_thread(
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
-                memory_mode: ThreadMemoryMode::Disabled,
             },
         })
         .await?;

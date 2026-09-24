@@ -21,8 +21,6 @@ use codex_protocol::items::UserMessageItem;
 use codex_protocol::items::WebSearchItem as CoreWebSearchItem;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::McpServerInfo;
-use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
-use codex_protocol::memory_citation::MemoryCitationEntry as CoreMemoryCitationEntry;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
@@ -2667,7 +2665,6 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             },
         ],
         phase: None,
-        memory_citation: None,
     });
 
     assert_eq!(
@@ -2676,7 +2673,6 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             id: "agent-1".to_string(),
             text: "Hello world".to_string(),
             phase: None,
-            memory_citation: None,
         }
     );
 
@@ -2686,15 +2682,6 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             text: "final".to_string(),
         }],
         phase: Some(MessagePhase::FinalAnswer),
-        memory_citation: Some(CoreMemoryCitation {
-            entries: vec![CoreMemoryCitationEntry {
-                path: "MEMORY.md".to_string(),
-                line_start: 1,
-                line_end: 2,
-                note: "summary".to_string(),
-            }],
-            rollout_ids: vec!["rollout-1".to_string()],
-        }),
     });
 
     assert_eq!(
@@ -2703,15 +2690,6 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             id: "agent-2".to_string(),
             text: "final".to_string(),
             phase: Some(MessagePhase::FinalAnswer),
-            memory_citation: Some(MemoryCitation {
-                entries: vec![MemoryCitationEntry {
-                    path: "MEMORY.md".to_string(),
-                    line_start: 1,
-                    line_end: 2,
-                    note: "summary".to_string(),
-                }],
-                thread_ids: vec!["rollout-1".to_string()],
-            }),
         }
     );
 

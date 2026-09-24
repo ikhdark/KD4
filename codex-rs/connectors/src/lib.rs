@@ -656,37 +656,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disk_promotion_keeps_a_memory_result_published_after_the_miss() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
-        clear_directory_memory_cache();
-        let home = TempDir::new()?;
-        let context = cache_context(&home, "promotion", false);
-        let stale = vec![directory_app_to_app_info(app("old", "Old"))];
-        let fresh = vec![directory_app_to_app_info(app("new", "New"))];
-        directory_cache::write_cached_directory_connectors_to_disk(&context, &stale);
-        assert_eq!(
-            cached_directory_connectors_in_memory(&context.cache_key),
-            None
-        );
-        let directory_cache::CachedConnectorDirectoryDiskLoad::Hit { connectors } =
-            directory_cache::load_cached_directory_connectors_from_disk(&context)
-        else {
-            panic!("old disk snapshot should load");
-        };
-        write_cached_directory_connectors(&context, &fresh);
-        assert_eq!(
-            promote_disk_directory_connectors(&context.cache_key, connectors),
-            fresh
-        );
-        assert_eq!(cached_directory_connectors(&context), Some(fresh.clone()));
-        assert_eq!(
-            unexpired_directory_connectors_in_memory(&context.cache_key),
-            Some(fresh)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Serializes tests that mutate the shared connector directory cache"

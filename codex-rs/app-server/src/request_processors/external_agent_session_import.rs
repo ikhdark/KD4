@@ -15,7 +15,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::StateDbHandle;
 use codex_rollout::is_persisted_rollout_item;
 use codex_thread_store::AppendThreadItemsParams;
@@ -240,11 +239,6 @@ impl ExternalAgentSessionImporter {
         let source = self.thread_manager.session_source();
         let cwd = config.cwd.to_path_buf();
         let model_provider = config.model_provider_id.clone();
-        let memory_mode = if config.memories.generate_memories {
-            ThreadMemoryMode::Enabled
-        } else {
-            ThreadMemoryMode::Disabled
-        };
         let now = Utc::now();
         let create_params = CreateThreadParams {
             session_id: thread_id.into(),
@@ -267,7 +261,6 @@ impl ExternalAgentSessionImporter {
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(cwd.clone()),
                 model_provider: model_provider.clone(),
-                memory_mode,
             },
         };
         rollout_items.retain(|item| is_persisted_rollout_item(item, ThreadHistoryMode::Legacy));
@@ -288,7 +281,6 @@ impl ExternalAgentSessionImporter {
             cwd: Some(cwd),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             first_user_message,
-            memory_mode: Some(memory_mode),
             ..Default::default()
         };
 
@@ -535,7 +527,6 @@ mod tests {
                 metadata: ThreadPersistenceMetadata {
                     cwd: Some(cwd),
                     model_provider: "test-provider".to_string(),
-                    memory_mode: ThreadMemoryMode::Disabled,
                 },
             })
             .await

@@ -120,7 +120,6 @@ use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
-use codex_app_server_protocol::ThreadMemoryMode;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::Turn;
@@ -130,7 +129,6 @@ use codex_app_server_protocol::WriteStatus;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
-use codex_config::types::MemoriesToml;
 use codex_config::types::ModelAvailabilityNuxConfig;
 
 use codex_config::types::WindowsToml;

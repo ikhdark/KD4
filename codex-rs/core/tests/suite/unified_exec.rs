@@ -43,8 +43,6 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.features.enable(Feature::UnifiedExec).unwrap();
-        // This revision still offers worker tools when their prerequisites exist.
-        // Exercise the ordinary route with no worker and no transaction-capable profile.
         config.codex_self_exe = None;
     });
     let test = builder.build(&server).await?;
@@ -54,9 +52,7 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
         fixture.join("Cargo.toml"),
         "[package]\nname = \"validation-route-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
     )?;
-    let permission = PermissionProfile::External {
-        network: NetworkSandboxPolicy::Enabled,
-    };
+    let permission = PermissionProfile::Disabled;
     for (revision, value, expected_success) in [("failing", 1, false), ("repaired", 2, true)] {
         fs::write(
             fixture.join("src/lib.rs"),
@@ -182,6 +178,8 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
             );
         }
     }
+    assert!(!test.config.codex_home.join("workspace-transactions").exists());
+    assert!(!test.config.codex_home.join("validation-cache").exists());
     Ok(())
 }
 

@@ -62,6 +62,66 @@ use super::authorize_independent_review_tool_call;
 use super::extension_tool_executors;
 
 #[tokio::test]
+async fn retired_transactions_are_unregistered_and_do_not_intercept_edits() -> anyhow::Result<()> {
+    let repo = tempfile::tempdir()?;
+    std::fs::write(repo.path().join("source.txt"), "before\n")?;
+    let (session, mut turn) = make_session_and_context().await;
+    set_router_environment(&mut turn, repo.path());
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+    let legacy_state = turn
+        .config
+        .codex_home
+        .join("workspace-transactions")
+        .join(session.thread_id.to_string())
+        .join("transaction.json");
+    std::fs::create_dir_all(legacy_state.parent().unwrap())?;
+    std::fs::write(&legacy_state, "retired metadata is not consulted")?;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    );
+    assert!(!router.has_registered_tool(&ToolName::plain("workspace_transaction")));
+    let call = ToolCall {
+        tool_name: ToolName::plain("apply_patch"),
+        call_id: "direct-workspace-edit".to_string(),
+        payload: ToolPayload::Custom {
+            input: "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch".to_string(),
+        },
+    };
+    router
+        .dispatch_tool_call_with_terminal_outcome(
+            Arc::new(session),
+            step_context,
+            CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call,
+            ToolCallSource::Direct,
+            admitted_tool_dispatch_state(),
+        )
+        .await?;
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("source.txt"))?,
+        "after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(legacy_state)?,
+        "retired metadata is not consulted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn serialized_tool_manifest_fingerprint_includes_exposure_identity() {
     let (_session, turn) = make_session_and_context().await;
     let disabled = ToolExposureIdentity {

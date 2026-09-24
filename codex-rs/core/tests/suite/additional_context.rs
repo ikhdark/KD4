@@ -650,77 +650,65 @@ async fn submit_plain_user_text(
 async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> Result<()> {
     require_network!();
 
-    // Default configuration: the per-turn guidance fragment stays out of the
-    // request entirely.
-    let server = start_mock_server().await;
-    let request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let test = test_codex()
-        .with_config(|config| config.include_environment_context = false)
-        .build(&server)
-        .await?;
-    submit_plain_user_text(&test, "summarize the guidance policy").await?;
-    let request = request.single_request();
-    assert!(
-        task_model_guidance_texts(&request).is_empty(),
-        "guidance must be opt-in: {:?}",
-        request.message_input_texts("user")
-    );
-
-    // Opting in restores the fragment ahead of the other injected context.
-    let server = start_mock_server().await;
-    let request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.include_environment_context = false;
-            config
-                .features
-                .enable(Feature::TaskModelGuidance)
-                .expect("test config should allow feature update");
-        })
-        .build(&server)
-        .await?;
-    submit_plain_user_text(&test, "summarize the guidance policy").await?;
-    let request = request.single_request();
-    let guidance = task_model_guidance_texts(&request);
-    assert_eq!(
-        guidance.len(),
-        1,
-        "exactly one guidance fragment per request"
-    );
-    assert!(guidance[0].contains("direct_file_read"));
-    assert!(guidance[0].contains("Form competing hypotheses only when uncertainty between explanations affects the next action."));
-    assert!(guidance[0].contains("Track repository ownership and runtime relationships only as needed to establish the requested behavior."));
-    assert!(guidance[0].contains(
-        "These are internal evidence labels, not a mandatory user-facing reporting format."
-    ));
-    assert!(
-        guidance[0].contains(
-            "Inspect implementation detail when needed to establish the requested behavior"
-        )
-    );
-    assert!(!guidance[0].contains("one to three plausible hypotheses"));
-    assert!(!guidance[0].contains("stay at module-level abstraction"));
-    assert!(guidance[0].ends_with("</task_model_guidance>"));
-
-    // A second turn must reuse the stable fragment, not append another copy.
-    let second_request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
-    submit_plain_user_text(&test, "continue using the retained evidence").await?;
-    assert_eq!(
-        task_model_guidance_texts(&second_request.single_request()),
-        guidance
-    );
+    for (instructions, base_owns_shared_policy) in [
+        (codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim(), true),
+        ("catalog supplied instructions", false),
+    ] {
+        for enabled in [false, true] {
+            let server = start_mock_server().await;
+            let test = test_codex()
+                .with_config(move |config| {
+                    config.include_environment_context = false;
+                    config.base_instructions = Some(instructions.to_string());
+                    config
+                        .features
+                        .set_enabled(Feature::TaskModelGuidance, enabled)
+                        .expect("test config should allow feature update");
+                })
+                .build(&server)
+                .await?;
+            let mut first_guidance = None;
+            for turn in 0..2 {
+                let request = mount_sse_once(
+                    &server,
+                    sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+                )
+                .await;
+                submit_plain_user_text(&test, &format!("summarize guidance, turn {turn}")).await?;
+                let request = request.single_request();
+                assert_eq!(request.body_json()["instructions"], instructions);
+                let guidance = task_model_guidance_texts(&request);
+                assert_eq!(guidance.len(), usize::from(enabled));
+                if enabled {
+                    for required in [
+                        "direct_file_read",
+                        "Form competing hypotheses only when uncertainty between explanations affects the next action.",
+                        "Track repository ownership and runtime relationships only as needed to establish the requested behavior.",
+                        "These are internal evidence labels, not a mandatory user-facing reporting format.",
+                    ] {
+                        assert!(guidance[0].contains(required), "missing guidance: {required}");
+                    }
+                    let shared = "A no-change result is valid and preferred when the requested capability already exists adequately.";
+                    assert_eq!(guidance[0].contains(shared), !base_owns_shared_policy);
+                    assert_eq!(
+                        instructions.matches(shared).count() + guidance[0].matches(shared).count(),
+                        1
+                    );
+                    assert!(!guidance[0].contains("one to three plausible hypotheses"));
+                    assert!(!guidance[0].contains("stay at module-level abstraction"));
+                    assert!(guidance[0].ends_with("</task_model_guidance>"));
+                }
+                if let Some(first_guidance) = &first_guidance {
+                    assert_eq!(
+                        &guidance, first_guidance,
+                        "second turn must not duplicate guidance"
+                    );
+                } else {
+                    first_guidance = Some(guidance);
+                }
+            }
+        }
+    }
 
     Ok(())
 }

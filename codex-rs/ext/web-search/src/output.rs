@@ -23,10 +23,6 @@ impl ToolOutput for SearchOutput {
         true
     }
 
-    fn contains_external_context(&self) -> bool {
-        true
-    }
-
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         ResponseInputItem::FunctionCallOutput {
             call_id: call_id.to_string(),

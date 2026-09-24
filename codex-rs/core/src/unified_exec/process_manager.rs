@@ -840,18 +840,6 @@ async fn finish_exited_process_result(
     hard_deadline: Option<Instant>,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     if let Some(process) = process
-        && let Ok(response) = &mut result
-        && let Some(receipt) = process
-            .workspace_snapshot_receipt(response.process_exited)
-            .await
-    {
-        response.repair_notice = Some(match response.repair_notice.take() {
-            Some(previous) if previous.contains(&receipt) => previous,
-            Some(previous) => format!("{previous}\n{receipt}"),
-            None => receipt,
-        });
-    }
-    if let Some(process) = process
         && match &result {
             Ok(response) => response.process_exited,
             Err(_) => process.has_exited(),
@@ -1157,21 +1145,6 @@ impl UnifiedExecProcessManager {
         event_delivery: &tokio::sync::Mutex<()>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
-        let workspace_snapshot = if !request.turn_environment.environment.is_remote() {
-            match cwd.to_abs_path() {
-                Ok(native) => crate::workspace_transaction::validation_context(
-                    &context.turn.config.codex_home,
-                    &context.session.thread_id.to_string(),
-                    native.as_path(),
-                )
-                .map_err(|e| {
-                    UnifiedExecError::create_process(format!("validation snapshot: {e:#}"))
-                })?,
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
         let mut tool_history_error = None;
         let known_delta_executor_started_at = Instant::now();
         let executor_readiness_timing_guard = context
@@ -1283,7 +1256,6 @@ impl UnifiedExecProcessManager {
         process.set_validation(request.validation.clone());
         let validation_process =
             request.validation_launch.is_some() || request.validation.is_some();
-        process.set_workspace_snapshot(workspace_snapshot);
         registration.attach_process(Arc::clone(&process), deferred_network_approval.clone());
         let executor_was_ready = self.mark_executor_ready(&request.turn_environment.environment_id);
         let tool_execution_timing_guard = context.turn.turn_timing_state.begin_tool_execution();
@@ -2556,42 +2528,7 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         pending_spawns: PendingSpawnRegistration,
     ) -> Result<(UnifiedExecLaunch, Option<DeferredNetworkApproval>), UnifiedExecError> {
-        let (mut env, local_policy_env) = build_unified_exec_environment(context);
-        let mut validation_lane = None;
-        if !request.turn_environment.environment.is_remote()
-            && let Ok(native) = cwd.to_abs_path()
-        {
-            let snapshot = crate::workspace_transaction::validation_context(
-                &context.turn.config.codex_home,
-                &context.session.thread_id.to_string(),
-                native.as_path(),
-            )
-            .map_err(|e| UnifiedExecError::create_process(format!("validation snapshot: {e:#}")))?;
-            if let Some(snapshot) = snapshot {
-                crate::workspace_transaction::bind_validation_environment(&snapshot, &mut env);
-                if request.validation_launch.is_some() || request.validation.is_some() {
-                    let home = context.turn.config.codex_home.to_path_buf();
-                    let thread = context.session.thread_id.to_string();
-                    match tokio::task::spawn_blocking(move || {
-                        crate::workspace_transaction::lease_validation_lane(
-                            &home, &thread, &snapshot,
-                        )
-                    })
-                    .await
-                    {
-                        Ok(Ok(lane)) => validation_lane = lane,
-                        // The snapshot's own output directory remains valid.
-                        Ok(Err(error)) => {
-                            tracing::warn!("validation lane unavailable: {error:#}");
-                        }
-                        Err(error) => tracing::warn!("validation lane lease failed: {error}"),
-                    }
-                    if let Some(lane) = validation_lane.as_ref() {
-                        lane.bind(&mut env);
-                    }
-                }
-            }
-        }
+        let (env, local_policy_env) = build_unified_exec_environment(context);
         let exec_server_env_config = ExecServerEnvConfig {
             policy: exec_env_policy_from_shell_policy(
                 &context.turn.config.permissions.shell_environment_policy,
@@ -2725,7 +2662,7 @@ impl UnifiedExecProcessManager {
             call_id: context.call_id.clone(),
             tool_name: ToolName::plain("exec_command"),
         };
-        let launch = orchestrator
+        orchestrator
             .run(
                 &mut runtime,
                 &req,
@@ -2733,15 +2670,7 @@ impl UnifiedExecProcessManager {
                 &context.turn,
                 context.turn.approval_policy.value(),
             )
-            .await;
-        // Other builds may use the lane once this process exits; a cached
-        // replay or a failed launch releases it here.
-        if let (Ok(result), Some(lane)) = (&launch, validation_lane)
-            && let UnifiedExecLaunch::Process(process) = &result.output
-        {
-            process.hold_until_exit(lane);
-        }
-        launch
+            .await
             .map(|result| (result.output, result.deferred_network_approval))
             .map_err(|err| match err {
                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => {
