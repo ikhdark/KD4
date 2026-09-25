@@ -222,7 +222,6 @@ rm -f tmp/imagegen/prompts.jsonl
 
 Notes:
 - `generate-batch` requires `--out-dir`.
-- generate-batch requires --out-dir.
 - Use `--concurrency` to control parallelism (default `5`).
 - Per-job overrides are supported in JSONL (for example `size`, `quality`, `background`, `output_format`, `output_compression`, `moderation`, `n`, `model`, `out`, and prompt-augmentation fields).
 - `--n` generates multiple variants for a single prompt; `generate-batch` is for many different prompts.

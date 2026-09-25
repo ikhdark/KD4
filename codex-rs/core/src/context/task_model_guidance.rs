@@ -192,7 +192,6 @@ mod tests {
             "Verify the combined runtime path; ask only when conflicting intended behavior cannot be resolved from current evidence.",
             "Partial wiring of implemented code is forbidden. End-to-end wiring is mandatory.",
             "Every test relied upon as evidence for the changed behavior must assert an expected observable result and fail for at least one plausible incorrect implementation of that behavior.",
-            "Strengthen weak tests relied upon to validate the changed behavior when necessary to make that validation meaningful.",
             "Report unrelated weaknesses encountered without starting a broader test audit.",
             "When validation or tests report errors, warnings, or failures, let a valid, progressing run finish. Triage all reported issues together before repair edits.",
             "Fully diagnose issues caused by the requested changes or necessary to complete required validation; report unrelated issues and their validation impact without expanding the investigation.",
@@ -210,6 +209,7 @@ mod tests {
             );
         }
         for required in [
+            "Strengthen weak tests relied upon to validate the changed behavior when necessary to make that validation meaningful.",
             "Repeat only if failures remain or new evidence requires it.",
             "Reuse passing results while relevant inputs remain unchanged; rerun affected checks when those inputs change or new evidence invalidates the result.",
         ] {

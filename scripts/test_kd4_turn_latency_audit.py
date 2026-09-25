@@ -199,6 +199,47 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_turn_tokens_ignore_session_cumulative_and_suppression_is_not_savings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            events = [_meta(temp)]
+            for turn_id in ("first", "second"):
+                timing = _timing()
+                timing["counters"]["internallyDrainedWaitCount"] = 24
+                timing["counters"]["suppressedDeterministicContinuationCount"] = 24
+                events.extend(
+                    [
+                        _event({"type": "task_started", "turn_id": turn_id}),
+                        _event(
+                            {
+                                "type": "token_count",
+                                "info": {
+                                    "total_token_usage": {"input_tokens": 999999},
+                                },
+                            }
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": turn_id,
+                                "timing": timing,
+                            }
+                        ),
+                    ]
+                )
+            path.write_text("\n".join(events), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        self.assertEqual(len(report["perTurn"]), 2)
+        for turn in report["perTurn"]:
+            self.assertEqual(turn["tokens"]["inputTokens"], 210)
+            self.assertEqual(
+                turn["tokenScope"], "turn_model_requests_not_session_cumulative"
+            )
+            accounting = turn["continuationAccounting"]
+            self.assertEqual(accounting["internallyDrainedWaitObservations"], 24)
+            self.assertEqual(accounting["reportedSuppressedContinuations"], 24)
+            self.assertIsNone(accounting["provenAvoidedModelRequests"])
+
     def test_unmeasured_residual_and_honest_continuation_metrics(self) -> None:
         timing = _timing()
         timing["counters"]["residualDeterministicGenerationCount"] = None

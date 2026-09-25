@@ -27,5 +27,5 @@ owner and symbol paths, focused build/test commands, caller/consumer relationshi
 and their snapshot or freshness qualifications. Retire superseded locations.
 Carry changes to live command, cell, and job identifiers, their last observed
 status, supported continuation or cancellation calls, and indispensable artifact
-or recovery references. Retire completed handles and obsolete next actions.
+or recovery references. Retire completed handles.
 Preserve unknown status; do not infer completion or gather new evidence.

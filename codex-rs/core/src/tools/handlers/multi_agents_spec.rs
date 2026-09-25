@@ -1056,7 +1056,7 @@ You are then able to refer to this agent as `task_3` or `/root/task1/task_3` int
 The spawned agent receives a durable task binding. Explicitly typed agents cannot spawn additional subagents; compatibility `message` agents may delegate another compatibility task, which remains bound to its parent while overlap is recorded as advisory metadata.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
-Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work. Requests for thoroughness or investigation alone do not authorize spawning.
+Spawn only when the active multi-agent mode authorizes it.
 Before delegating, identify useful work to do locally. Keep immediately blocking work local, give each agent a clear scope, and avoid duplicating delegated work. Review and integrate returned changes before treating the subtask as complete.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.

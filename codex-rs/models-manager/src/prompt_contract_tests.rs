@@ -41,7 +41,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "report any remaining gap instead of claiming full coverage",
             "recover only missing ranges from current retained evidence rather than rerunning its producer",
             "Checkpoint substantial completed discovery before implementation",
-            "Never infer task completion from a completed plan or passing tests; preserve required continuation",
+            "A completed plan, passing tests, an ended turn, or an exhausted budget does not prove completion",
             "including staged and unstaged changes and new untracked file contents",
             "a diff stat or truncated patch is insufficient",
             "do not describe a supported subset as general support",
@@ -74,14 +74,13 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Cancellation need not roll back effects",
             "without weakening required invariants or assertions",
             "match every explicit requirement, prohibition, and preserved invariant to current evidence",
-            "Ending a turn or exhausting a budget does not prove completion",
+            "an ended turn, or an exhausted budget does not prove completion",
             "Distinguish missing capability, failure to follow existing guidance, and interface friction",
             "Check the supported reuse path",
             "Incomplete discovery or an output receipt never proves absence or omitted content",
             "Measure progress by resolved requirements and validated outcomes",
             "finish missing coverage without restarting discovery",
             "using the original request and corrections, not just a checklist",
-            "Respect explicit user limits",
             "repair omissions with targeted follow-up",
             "without an automatic review loop",
             "report any partial, blocked, or unverified result",
@@ -108,9 +107,6 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "Conciseness limits wording, not substance.",
             "Include all requested material content now; do not defer it behind follow-up offers or length targets.",
-            "Treat \"what else?\" as a request for remaining material points within scope.",
-            "Respect explicit user limits",
-            "Respect explicit user limits without omitting necessary explanations and caveats.",
             "Explain each material point once.",
         ],
     },
@@ -128,6 +124,8 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Implement the smallest coherent change that fully satisfies the requested behavior.",
             "Before adding a mechanism, establish from relevant source evidence the concrete missing capability and why existing abstractions are insufficient.",
             "avoid unrelated refactors, renames, file moves, and dependencies.",
+            "Scope configuration and side effects to the requested behavior; change shared, global, or user-wide settings only when the requirement is global.",
+            "An option or setting must change reachable behavior; one that is only parsed, validated, or forced is dead code.",
         ],
     },
     PromptContract {
@@ -135,7 +133,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::FallbackAndBundled,
         expectation: AnchorExpectation::Any,
         anchors: &[
-            "Once all requested changes and affected validation pass, inspect the diff and deliver the result without repeating passing checks.",
+            "Once all requested changes and affected validation pass, deliver the result without repeating passing checks.",
         ],
     },
     PromptContract {
@@ -192,7 +190,6 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Do not run a check for every touched file or layer.",
             "Reuse existing coverage; add or repair a test only for a concrete changed-behavior gap that blocks sufficient validation.",
             "Run a full suite only when explicitly required by the user or repository.",
-            "Do not run additional validation solely for extra confidence.",
             "Broaden validation only when required or when a concrete unresolved risk makes existing evidence insufficient; state the risk and how the added check addresses it.",
             "If the cost is disproportionate, use a cheaper valid proof or report the remaining uncertainty, not a stronger claim.",
             "Respect explicit scope limits and stop at the nearest sufficient validation.",
@@ -285,8 +282,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Serialize actual shared-resource conflicts",
             "not whole categories of independent work",
             "Change locking only with evidence of conflict or unnecessary exclusion.",
-            "Prefer extending the existing owning execution mechanism over parallel orchestration unless it is demonstrably insufficient.",
-            "Once all requested changes and affected validation pass, inspect the diff and deliver the result without repeating passing checks.",
+            "Once all requested changes and affected validation pass, deliver the result without repeating passing checks.",
         ],
     },
     PromptContract {
@@ -299,7 +295,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Retrieve missing or potentially changed instructions",
             "Resolve conflicts by authority, scope, and explicit supersession.",
             "Ask only when conflicting requirements or an essential user-only fact remain unresolved after inspecting available evidence.",
-            "State material assumptions, keep affected conclusions conditional",
+            "State material assumptions and keep affected conclusions conditional.",
             "Incorporate new user corrections before the next dependent action",
             "a status question does not cancel ongoing work.",
             "Stage, commit, push, publish, deploy, install, restart, contact third parties, delete data, change external state, or rebuild or activate the installed application only when authorized.",
@@ -324,13 +320,14 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "Before editing, identify the behavior's owner, intended observable change, preserved invariants, affected files and contracts, and focused validation.",
             "Revise this prediction as evidence changes.",
-            "retain them in the final handoff",
             "Update affected callers, schemas, generated representations, persistence/migrations, compatibility paths, and tests.",
             "identify the material uncertainty and how the result could change the next action; otherwise skip it",
             "Run validation required by the user or repository.",
             "Every test relied upon as evidence for the changed behavior must assert an expected observable result and fail for at least one plausible incorrect implementation of that behavior.",
             "Exercise the intended path, including required rejection and absent-side-effect cases.",
             "including required rejection and absent-side-effect cases",
+            "exercise it at least once against that real state rather than only through tests that substitute it",
+            "derive inputs from what the behavior actually reads; irrelevant inputs cause false invalidation and missing ones cause stale results",
             "Test quality requirements do not authorize expanding coverage beyond that gap.",
             "Report unrelated weaknesses encountered without starting a broader test audit.",
             "Validate the final relevant source state",
@@ -502,6 +499,26 @@ fn resolved_prompts_prioritize_complete_answers() {
                     "prompt {label} violated contract {id}: {anchor}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn resolved_prompts_keep_short_validation_waits_owned_and_discovery_bounded() {
+    let response = crate::bundled_models_response().expect("bundled models should parse");
+    for (label, prompt) in prompts_for_scope(PromptScope::LocalPolicyAndFallback, &response) {
+        for anchor in [
+            "omit short explicit yield_time_ms values",
+            "await its supported polling operation inside the same execution",
+            "Do not poll past an interruption or explicit yield",
+            "Budget the combined output of batched reads",
+            "Keep potentially large status inventories separate from source reads",
+            "retain complete recoverable evidence when broader coverage is required",
+        ] {
+            assert!(
+                prompt.contains(anchor),
+                "prompt {label} is missing {anchor}"
+            );
         }
     }
 }

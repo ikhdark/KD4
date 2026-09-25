@@ -129,7 +129,7 @@ pub(crate) fn unfinished_turn_history_marker(
     turn_boundary_history_marker(
         marker,
         crate::context::TurnAborted::UNFINISHED_GUIDANCE,
-        crate::context::TurnAborted::UNFINISHED_DEVELOPER_GUIDANCE,
+        crate::context::TurnAborted::UNFINISHED_GUIDANCE,
     )
 }
 

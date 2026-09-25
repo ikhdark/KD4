@@ -244,6 +244,11 @@ struct ModelRequestMeasurements {
     /// cannot tell an append from a rewrite. Per-item digests can.
     input_item_digests: Vec<[u8; 32]>,
     fixed_prefix_item_count: usize,
+    /// Digests of the dispatched request settings; absent when the
+    /// dispatched bytes were unavailable.
+    request_setting_digests: Option<RequestSettingDigests>,
+    /// Settings whose dispatched value differs from the preceding request's.
+    changed_request_settings: Vec<&'static str>,
     /// Filled by comparison against the preceding request; absent on the first.
     history_divergence: Option<HistoryPrefixDivergence>,
     /// Drops the aggregate output budget made in the representation this
@@ -295,9 +300,40 @@ fn input_item_digests(input: &[ResponseItem]) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// Request settings that shape the provider's rendered prompt or cache
+/// routing. `instructions`, `tools`, and `input` already have category and
+/// per-item digests; transport fields such as `client_metadata` change per
+/// request by design and are excluded.
+const REQUEST_SETTING_FIELDS: [&str; 6] = [
+    "model",
+    "reasoning",
+    "text",
+    "tool_choice",
+    "parallel_tool_calls",
+    "service_tier",
+];
+
+type RequestSettingDigests = [Option<[u8; 32]>; REQUEST_SETTING_FIELDS.len()];
+
+/// Digests each request setting exactly as dispatched; an omitted setting has
+/// no digest.
+fn request_setting_digests(
+    encoded_request: &[u8],
+    cancellation: &CancellationToken,
+) -> serde_json::Result<RequestSettingDigests> {
+    ensure_measurement_not_cancelled(Some(cancellation))?;
+    let fields: BTreeMap<&str, &RawValue> = serde_json::from_slice(encoded_request)?;
+    Ok(REQUEST_SETTING_FIELDS.map(|field| {
+        fields
+            .get(field)
+            .map(|value| Sha256::digest(value.get().as_bytes()).into())
+    }))
+}
+
 #[derive(Debug, Clone)]
 struct PromptContextBaseline {
     prompt_cache_key: Option<String>,
+    request_setting_digests: Option<RequestSettingDigests>,
     category_hashes: BTreeMap<&'static str, [u8; 32]>,
     ordered_fixed_hashes: Vec<(&'static str, [u8; 32])>,
     digests: PromptDigests,
@@ -397,6 +433,11 @@ impl ModelRequestMeasurements {
                         })
                     })
                     .map(|category| category.as_str().to_string())
+                    .chain(
+                        self.changed_request_settings
+                            .iter()
+                            .map(|field| format!("request.{field}")),
+                    )
                     .collect()
             } else {
                 Vec::new()
@@ -685,6 +726,8 @@ impl ModelRequestMeasurements {
             local_projection_policy_active: false,
             input_item_digests,
             fixed_prefix_item_count: context.fixed_prefix_item_count,
+            request_setting_digests: None,
+            changed_request_settings: Vec::new(),
             history_divergence: None,
             tool_output_budget_drop_count: 0,
             tool_output_budget_dropped_token_count: 0,
@@ -698,6 +741,21 @@ impl ModelRequestMeasurements {
         digests: PromptDigests,
     ) {
         self.prompt_context_baseline_compared = baseline.is_some();
+        // Settings are compared only when both requests were measured from
+        // dispatched bytes; unavailable bytes leave a setting unknown, not changed.
+        self.changed_request_settings = baseline
+            .as_ref()
+            .and_then(|previous| previous.request_setting_digests.as_ref())
+            .zip(self.request_setting_digests.as_ref())
+            .map(|(previous, current)| {
+                REQUEST_SETTING_FIELDS
+                    .iter()
+                    .zip(previous.iter().zip(current))
+                    .filter(|(_, (previous, current))| previous != current)
+                    .map(|(field, _)| *field)
+                    .collect()
+            })
+            .unwrap_or_default();
         // A first request has no predecessor to diverge from, so it reports no
         // divergence rather than a vacuous zero.
         self.history_divergence = baseline.as_ref().map(|previous| {
@@ -746,6 +804,7 @@ impl ModelRequestMeasurements {
             .collect::<Vec<_>>();
         self.fixed_prefix_reuse_eligible = baseline.as_ref().is_some_and(|previous| {
             previous.prompt_cache_key.as_deref() == prompt_cache_key
+                && self.changed_request_settings.is_empty()
                 && previous.ordered_fixed_hashes == ordered_fixed_hashes
                 && previous.fixed_prefix_item_count == self.fixed_prefix_item_count
                 && previous
@@ -768,6 +827,7 @@ impl ModelRequestMeasurements {
             });
         *baseline = Some(PromptContextBaseline {
             prompt_cache_key: prompt_cache_key.map(str::to_string),
+            request_setting_digests: self.request_setting_digests,
             category_hashes,
             ordered_fixed_hashes,
             digests,
@@ -1177,6 +1237,13 @@ fn measure_responses_request_after_dispatch(
                     )?,
                 };
                 measurements.wire_request_bytes = wire_request_bytes;
+                // Incremental transport bodies still carry their settings, so
+                // this reads the dispatched bytes even when input measurement
+                // fell back to the logical request.
+                measurements.request_setting_digests =
+                    encoded_request.as_deref().and_then(|encoded| {
+                        request_setting_digests(encoded, &blocking_cancellation).ok()
+                    });
                 measurements.tool_output_budget_drop_count = selected_budget_drops.count;
                 measurements.tool_output_budget_dropped_token_count = selected_budget_drops.tokens;
                 Ok::<_, serde_json::Error>(measurements)

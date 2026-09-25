@@ -901,6 +901,93 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
     }
 }
 
+mod request_setting_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    async fn measured_after_dispatch(
+        request: ResponsesApiRequest,
+        dispatched: bool,
+    ) -> ModelRequestMeasurements {
+        let encoded = dispatched.then(|| serde_json::to_vec(&request).unwrap().into());
+        let prompt = Prompt {
+            input: request.input.clone(),
+            prompt_provenance: history_test_provenance(&request),
+            base_instructions: BaseInstructions {
+                text: request.instructions.clone(),
+            },
+            ..Prompt::default()
+        };
+        crate::client::measure_responses_request_after_dispatch(
+            request,
+            prompt,
+            crate::client::SelectedInputRepresentation::default(),
+            tokio_util::sync::CancellationToken::new(),
+            /*logical_request_bytes*/ None,
+            encoded,
+        )
+        .await
+        .unwrap()
+        .measurements
+    }
+
+    #[tokio::test]
+    async fn dispatched_request_settings_gate_fixed_prefix_reuse() {
+        let digests = crate::client_common::PromptDigests {
+            instructions: Some([1; 32]),
+            tools: Some([2; 32]),
+            history: Some([3; 32]),
+        };
+        let mut items = vec![
+            history_test_tool_output("call-1", "first result"),
+            history_test_item("task", Some("turn-1")),
+        ];
+        let mut baseline = None;
+        let mut first = measured_after_dispatch(history_test_request(items.clone()), true).await;
+        first.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), digests);
+
+        // A dispatched setting change breaks reuse even when the input only grew.
+        items.push(history_test_tool_output("call-2", "second result"));
+        let mut priority = history_test_request(items.clone());
+        priority.service_tier = Some("priority".to_string());
+        let mut second = measured_after_dispatch(priority, true).await;
+        second.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), digests);
+        assert!(!second.fixed_prefix_reuse_eligible);
+        assert_eq!(
+            second
+                .request_token_categories()
+                .fixed_prefix_changed_categories,
+            vec!["request.service_tier".to_string()]
+        );
+
+        // Per-request transport metadata is not a prompt setting.
+        items.push(history_test_tool_output("call-3", "third result"));
+        let mut metadata = history_test_request(items.clone());
+        metadata.service_tier = Some("priority".to_string());
+        metadata.client_metadata = Some(HashMap::from([(
+            "x-codex-ws-stream-request-start-ms".to_string(),
+            "1".to_string(),
+        )]));
+        let mut third = measured_after_dispatch(metadata, true).await;
+        third.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), digests);
+        assert!(third.fixed_prefix_reuse_eligible);
+
+        // Without dispatched bytes a setting is unknown, not changed.
+        items.push(history_test_tool_output("call-4", "fourth result"));
+        let mut logical = history_test_request(items);
+        logical.model = "other-model".to_string();
+        let mut fourth = measured_after_dispatch(logical, false).await;
+        fourth.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), digests);
+        assert!(
+            !fourth
+                .request_token_categories()
+                .fixed_prefix_changed_categories
+                .iter()
+                .any(|category| category.starts_with("request."))
+        );
+    }
+}
+
 #[test]
 fn model_request_measurements_stop_when_cancelled() {
     let request = history_test_request(vec![history_test_item("input", None)]);
@@ -2038,6 +2125,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         fixed_prefix_item_count: 0,
         full_prompt_estimated_tokens: 0,
         prompt_cache_key: Some("stale".to_string()),
+        request_setting_digests: None,
         category_hashes: BTreeMap::new(),
         ordered_fixed_hashes: Vec::new(),
         digests: Default::default(),

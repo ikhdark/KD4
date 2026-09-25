@@ -1089,6 +1089,21 @@ def _turn_report(
         "samplingPasses": sampling_passes,
         "samplingPassTarget": _SAMPLING_PASS_TARGET_PER_COMPLETED_TURN,
         "tokens": tokens,
+        "tokenScope": "turn_model_requests_not_session_cumulative",
+        "continuationAccounting": {
+            "reportedSuppressedContinuations": counters.get(
+                "suppressedDeterministicContinuationCount"
+            ),
+            "internallyDrainedWaitObservations": counters.get(
+                "internallyDrainedWaitCount"
+            ),
+            "provenAvoidedModelRequests": None,
+            "definition": (
+                "Internal wait observations and suppression receipts are not a "
+                "counterfactual count of avoided provider requests. Artifact "
+                "continuations can perform implementation or completion work."
+            ),
+        },
         "tokenIntervals": token_intervals,
         "observationalNonprogressTokens": _diagnostic_token_report(
             [timing.get("observationalNonprogressTokens", {})]

@@ -22,7 +22,7 @@ Escalate only when the task requires it, including when:
 
 Obtain consent for destructive actions not covered by the user's request. Consent alone does not require sandbox escalation; escalate only if the approved action needs unavailable permissions.
 
-For a sandbox-related failure, request permissions with `require_escalated` and `justification`. Retry the whole command only when safe to repeat; otherwise resume the failed portion with its required inputs and working directory. Use the returned result to avoid replaying completed effects; inspect state only when uncertainty about those effects matters. Do not evade the approval flow by switching tools or techniques, or by delegating to another agent.
+Retry the whole command only when safe to repeat; otherwise resume the failed portion with its required inputs and working directory. Use the returned result to avoid replaying completed effects; inspect state only when uncertainty about those effects matters. Do not evade the approval flow by switching tools or techniques, or by delegating to another agent.
 
 ## Command segmentation
 

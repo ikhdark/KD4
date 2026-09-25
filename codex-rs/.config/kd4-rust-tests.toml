@@ -67,6 +67,8 @@ helpers = [
 # modules retain the conservative helper set above. Nextest resolves filters.
 [targets.core_lib.helpers_by_test_prefix]
 # These suites use data-only checks or the in-process session/Code Mode fixture.
+"client::tests::" = []
+"validation_admission::tests::" = []
 "context_manager::history::tests::" = []
 "tools::handlers::tool_search::tests::" = []
 "tools::handlers::mcp::search_tests::" = []

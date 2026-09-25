@@ -3,7 +3,7 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 
-const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
+const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work. Requests for thoroughness or investigation alone do not authorize spawning.";
 
 #[cfg(test)]
 mod tests {

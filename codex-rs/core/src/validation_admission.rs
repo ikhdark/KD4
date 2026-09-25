@@ -662,7 +662,20 @@ fn classify_simple_script(script: &str, depth: usize) -> ValidationClassificatio
     let classifications = commands
         .into_iter()
         .filter_map(|command| {
-            let Some(words) = shlex::split(command.trim()) else {
+            let command = command.trim();
+            // A guard such as `if ($LASTEXITCODE -eq 0) { cargo test }` runs
+            // the same commands a flat sequence would, so its condition and
+            // bodies are classified instead of the `if` keyword.
+            if let Some(parts) = powershell_if_statement_parts(command)
+                .or_else(|| grouped_command_body(command).map(|body| vec![body]))
+            {
+                return Some(combine_validation_classifications(
+                    parts
+                        .into_iter()
+                        .map(|part| classify_simple_script(part, depth + 1)),
+                ));
+            }
+            let Some(words) = shlex::split(command) else {
                 return Some(ValidationClassification::Opaque);
             };
             let first_command = words
@@ -710,33 +723,28 @@ fn split_deterministic_script(script: &str) -> Option<(Vec<&str>, bool)> {
     let mut commands = Vec::new();
     let mut start = 0;
     let mut index = 0;
-    let mut quote = None;
-    let mut escaped = false;
+    let mut quoting = QuoteState::default();
+    // Separators inside a statement block or condition belong to that
+    // statement; only top-level separators delimit commands.
+    let mut closers = Vec::new();
     let mut success_chain = true;
     while index < bytes.len() {
         let byte = bytes[index];
-        if escaped {
-            escaped = false;
+        if !quoting.is_syntax(byte) {
             index += 1;
             continue;
         }
-        if byte == b'\\' && quote != Some(b'\'') {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"') {
-            match quote {
-                Some(active) if active == byte => quote = None,
-                None => quote = Some(byte),
-                Some(_) => {}
+        match byte {
+            b'(' => closers.push(b')'),
+            b'{' => closers.push(b'}'),
+            // A stray closer stays literal; a mismatched one leaves the
+            // command boundaries unknowable.
+            b')' | b'}' if !closers.is_empty() => {
+                if closers.pop() != Some(byte) {
+                    return None;
+                }
             }
-            index += 1;
-            continue;
-        }
-        if quote.is_some() {
-            index += 1;
-            continue;
+            _ => {}
         }
         let separator_length = match byte {
             b';' | b'\r' | b'\n' => 1,
@@ -745,8 +753,8 @@ fn split_deterministic_script(script: &str) -> Option<(Vec<&str>, bool)> {
             b'&' | b'|' => return None,
             _ => 0,
         };
-        if separator_length == 0 {
-            index += 1;
+        if separator_length == 0 || !closers.is_empty() {
+            index += separator_length.max(1);
             continue;
         }
         success_chain &= byte == b'&';
@@ -757,11 +765,119 @@ fn split_deterministic_script(script: &str) -> Option<(Vec<&str>, bool)> {
         }
         start = index;
     }
-    if quote.is_some() || escaped {
+    if !quoting.is_closed() || !closers.is_empty() {
         return None;
     }
     commands.push(&script[start..]);
     Some((commands, success_chain))
+}
+
+/// Tracks shell quoting so separator and bracket scanning only sees syntax.
+#[derive(Default)]
+struct QuoteState {
+    quote: Option<u8>,
+    escaped: bool,
+}
+
+impl QuoteState {
+    /// Consumes `byte` and returns whether it is unquoted, unescaped syntax.
+    fn is_syntax(&mut self, byte: u8) -> bool {
+        if self.escaped {
+            self.escaped = false;
+            return false;
+        }
+        if byte == b'\\' && self.quote != Some(b'\'') {
+            self.escaped = true;
+            return false;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            match self.quote {
+                Some(active) if active == byte => self.quote = None,
+                None => self.quote = Some(byte),
+                Some(_) => {}
+            }
+            return false;
+        }
+        self.quote.is_none()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.quote.is_none() && !self.escaped
+    }
+}
+
+/// Returns the conditions and block bodies of a complete PowerShell
+/// `if (...) { ... }` statement, including `elseif` and `else` clauses.
+fn powershell_if_statement_parts(command: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut clause = strip_statement_keyword(command, "if")?;
+    loop {
+        let (condition, after_condition) = bracketed_prefix(clause.trim_start(), b'(')?;
+        let (body, after_body) = bracketed_prefix(after_condition.trim_start(), b'{')?;
+        parts.extend([condition, body]);
+        let after_body = after_body.trim_start();
+        if after_body.is_empty() {
+            return Some(parts);
+        }
+        if let Some(next) = strip_statement_keyword(after_body, "elseif") {
+            clause = next;
+            continue;
+        }
+        let else_clause = strip_statement_keyword(after_body, "else")?;
+        let (body, rest) = bracketed_prefix(else_clause.trim_start(), b'{')?;
+        parts.push(body);
+        return rest.trim().is_empty().then_some(parts);
+    }
+}
+
+/// Returns the body of a segment that is entirely one `( ... )` or
+/// `{ ... }` group, such as a subshell.
+fn grouped_command_body(command: &str) -> Option<&str> {
+    let open = *command.as_bytes().first()?;
+    if !matches!(open, b'(' | b'{') {
+        return None;
+    }
+    let (body, rest) = bracketed_prefix(command, open)?;
+    rest.trim().is_empty().then_some(body)
+}
+
+fn strip_statement_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text
+        .get(..keyword.len())
+        .filter(|head| head.eq_ignore_ascii_case(keyword))
+        .map(|_| &text[keyword.len()..])?;
+    // `ifconfig` or `else-branch` is a command name, not a keyword.
+    rest.starts_with(|character: char| character.is_whitespace() || matches!(character, '(' | '{'))
+        .then_some(rest)
+}
+
+/// Splits `text` after the bracket pair it opens with, honoring quotes and
+/// nested brackets, into the enclosed text and the remainder.
+fn bracketed_prefix(text: &str, open: u8) -> Option<(&str, &str)> {
+    if text.as_bytes().first() != Some(&open) {
+        return None;
+    }
+    let mut quoting = QuoteState::default();
+    let mut closers = Vec::new();
+    for (index, byte) in text.bytes().enumerate() {
+        if !quoting.is_syntax(byte) {
+            continue;
+        }
+        match byte {
+            b'(' => closers.push(b')'),
+            b'{' => closers.push(b'}'),
+            b')' | b'}' => {
+                if closers.pop() != Some(byte) {
+                    return None;
+                }
+                if closers.is_empty() {
+                    return Some((&text[1..index], &text[index + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn classify_argv(program: &str, args: &[String]) -> ValidationClassification {
@@ -1015,6 +1131,13 @@ fn python_operation(args: &[String]) -> Option<ValidationOperation> {
             return None;
         }
         if !argument.starts_with('-') {
+            if normalized_program_name(argument) == "validate.py" {
+                return (args.get(index + 1).is_some_and(|action| action == "run")
+                    && !args[index + 2..]
+                        .iter()
+                        .any(|option| matches!(option.as_str(), "-h" | "--help")))
+                .then_some(ValidationOperation::Test);
+            }
             if normalized_program_name(argument) == "rust_test_runner.py" {
                 let mut runner_index = index + 1;
                 while let Some(option) = args.get(runner_index) {
@@ -1669,6 +1792,135 @@ mod tests {
             argv("uv", &["run", "python", "script.py", "pytest"]),
         ] {
             assert!(!is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    mod manifest_runner {
+        use super::*;
+
+        #[test]
+        fn manifest_validation_runner_recognizes_only_execution() {
+            for invocation in [
+                argv("python", &["scripts/validate.py", "run", "atomic-write"]),
+                argv(
+                    "python",
+                    &[
+                        "-I",
+                        "scripts/validate.py",
+                        "run",
+                        "--changed",
+                        "src/lib.rs",
+                    ],
+                ),
+                argv("py", &["scripts/validate.py", "run"]),
+                CommandInvocation::Script(
+                    concat!(
+                        "python scripts/validate.py plan atomic-write; ",
+                        "python scripts/validate.py run atomic-write",
+                    )
+                    .to_string(),
+                ),
+            ] {
+                assert!(is_validation(&invocation), "{invocation:?}");
+                let mut authorization = ValidationAuthorization::enabled();
+                assert!(authorization.update_from_user_input("do not run tests"));
+                assert!(prohibited_skip_for(&authorization, &invocation, false).is_some());
+            }
+            for args in [
+                vec!["scripts/validate.py"],
+                vec!["scripts/validate.py", "plan", "atomic-write"],
+                vec!["scripts/validate.py", "list"],
+                vec!["scripts/validate.py", "--help"],
+                vec!["scripts/validate.py", "run", "--help"],
+                vec!["scripts/not_validate.py", "run"],
+                vec!["script.py", "scripts/validate.py", "run"],
+            ] {
+                assert!(!is_validation(&argv("python", &args)), "{args:?}");
+            }
+        }
+
+        #[test]
+        fn guarded_manifest_runs_from_rollout_are_validation() {
+            // Exact `exec_command` scripts a recorded session sent.
+            let guarded_runs = [
+                concat!(
+                    "python scripts/validate.py plan validation-tooling; ",
+                    "if ($LASTEXITCODE -eq 0) { python scripts/validate.py run validation-tooling }; ",
+                    "exit $LASTEXITCODE",
+                ),
+                concat!(
+                    "python scripts/validate.py plan --changed src/atomic_write.rs; ",
+                    "if ($LASTEXITCODE -eq 0) { python scripts/validate.py run --changed src/atomic_write.rs }; ",
+                    "exit $LASTEXITCODE",
+                ),
+                concat!(
+                    "python scripts/validate.py run --changed src/atomic_write.rs; ",
+                    "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ",
+                    "rg -n '^mod tests|^    mod tests' src/config/mod.rs src/workspace.rs src/test_plan.rs ",
+                    "src/validation_identity.rs src/execution_control.rs src/analysis_jobs.rs; ",
+                    "git diff --check -- .cargo/config.toml .config/nextest.toml ",
+                    "scripts/check_test_targets.py AGENTS.md; exit $LASTEXITCODE",
+                ),
+                concat!(
+                    "python scripts/validate.py plan validation-tooling atomic-write; ",
+                    "if ($LASTEXITCODE -eq 0) { python scripts/validate.py run validation-tooling atomic-write }; ",
+                    "exit $LASTEXITCODE",
+                ),
+            ];
+            let mut authorization = ValidationAuthorization::enabled();
+            assert!(authorization.update_from_user_input("do not run tests"));
+            for script in guarded_runs {
+                let invocation = CommandInvocation::Script(script.to_string());
+                assert!(
+                    matches!(
+                        classify_validation(&invocation),
+                        ValidationClassification::Validation {
+                            ref leaves,
+                            exit_code_is_authoritative: false,
+                            ..
+                        } if leaves.iter().all(|leaf| leaf.operation == ValidationOperation::Test)
+                    ),
+                    "{script}"
+                );
+                assert!(
+                    prohibited_skip_for(&authorization, &invocation, false).is_some(),
+                    "{script}"
+                );
+            }
+            for script in [
+                concat!(
+                    "python scripts/validate.py plan --changed src/validation_identity.rs ",
+                    "--changed tests/config_runtime_contracts.rs --changed src/atomic_write.rs",
+                ),
+                "if ($LASTEXITCODE -eq 0) { python scripts/validate.py plan atomic-write }",
+            ] {
+                assert_eq!(
+                    classify_validation(&CommandInvocation::Script(script.to_string())),
+                    ValidationClassification::NonValidation,
+                    "{script}"
+                );
+            }
+        }
+
+        #[test]
+        fn powershell_if_blocks_keep_their_commands_together() {
+            for script in [
+                "if ($LASTEXITCODE -eq 0) { python scripts/validate.py plan a; python scripts/validate.py run a }",
+                "if (Test-Path Cargo.toml) { echo skip } elseif ($env:CI) { echo ci } else { cargo test }",
+                "If($ok){cargo test}",
+            ] {
+                assert!(
+                    is_validation(&CommandInvocation::Script(script.to_string())),
+                    "{script}"
+                );
+            }
+            // An unclosed block leaves the command boundaries unknowable.
+            assert_eq!(
+                classify_validation(&CommandInvocation::Script(
+                    "if ($ok) { cargo test".to_string()
+                )),
+                ValidationClassification::Opaque
+            );
         }
     }
 

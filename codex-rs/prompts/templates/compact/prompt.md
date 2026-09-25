@@ -40,8 +40,7 @@ explicit; elapsed time alone does not establish completion. Retire completed han
 
 ## Completed work
 
-Completed steps and their meaningful outcomes. Do not claim completion without
-supporting evidence.
+Completed steps and their meaningful outcomes.
 
 ## Unresolved work
 
@@ -69,4 +68,4 @@ truncation, or stale-workspace qualification attached to that output.
 The single immediate action that should resume the task.
 
 Be concise and focused on allowing the next model to continue without
-rediscovering the repository. Exclude private reasoning and irrelevant history.
+rediscovering the repository. Exclude irrelevant history.

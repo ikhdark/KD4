@@ -166,7 +166,7 @@ pub fn normalize_request_user_input_args(
 pub fn request_user_input_tool_description(available_modes: &[ModeKind]) -> String {
     let allowed_modes = format_allowed_modes(available_modes);
     format!(
-        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. Each question should offer two to four meaningful, mutually exclusive suggested answers without filler; the client adds a free-text response. Set autoResolutionMs, from {MIN_AUTO_RESOLUTION_MS} to {MAX_AUTO_RESOLUTION_MS} milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. If no answer arrives, disclose the assumption used to continue; elapsed time is not user approval. This tool is only available in {allowed_modes}."
+        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. This tool is only available in {allowed_modes}."
     )
 }
 
