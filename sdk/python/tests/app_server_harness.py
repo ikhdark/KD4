@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -82,17 +84,21 @@ class CapturedResponsesRequest:
         return self.headers.get(name.lower())
 
 
+SseBody = str | Callable[[CapturedResponsesRequest], str]
+
+
 @dataclass(frozen=True)
 class MockSseResponse:
     """One queued SSE response served by the mock Responses API."""
 
-    body: str
+    body: SseBody
     delay_between_events_s: float = 0.0
 
-    def chunks(self) -> list[bytes]:
-        """Split an SSE body into event chunks while preserving framing."""
+    def chunks(self, request: CapturedResponsesRequest) -> list[bytes]:
+        """Render the SSE body for one request and split it into event chunks."""
+        body = self.body(request) if callable(self.body) else self.body
         chunks: list[bytes] = []
-        for part in self.body.split("\n\n"):
+        for part in body.split("\n\n"):
             if not part:
                 continue
             chunks.append(f"{part}\n\n".encode("utf-8"))
@@ -134,11 +140,11 @@ class MockResponsesServer:
 
     def enqueue_sse(
         self,
-        body: str,
+        body: SseBody,
         *,
         delay_between_events_s: float = 0.0,
     ) -> None:
-        """Queue one SSE body for the next `/v1/responses` request."""
+        """Queue one SSE body, or a builder given the request it answers."""
         self._responses.put(
             MockSseResponse(
                 body=body,
@@ -186,7 +192,9 @@ class MockResponsesServer:
         requests = self.requests()
         raise AssertionError(f"expected {count} requests, got {len(requests)}")
 
-    def _record_request(self, handler: BaseHTTPRequestHandler, body: bytes) -> None:
+    def _record_request(
+        self, handler: BaseHTTPRequestHandler, body: bytes
+    ) -> CapturedResponsesRequest:
         """Record one inbound HTTP request from app-server."""
         headers = {key.lower(): value for key, value in handler.headers.items()}
         request = CapturedResponsesRequest(
@@ -197,6 +205,7 @@ class MockResponsesServer:
         )
         with self._requests_lock:
             self._requests.append(request)
+        return request
 
     def _next_response(self) -> MockSseResponse:
         """Return the next queued SSE response or fail the HTTP request."""
@@ -204,7 +213,7 @@ class MockResponsesServer:
 
 
 class AppServerHarness:
-    """Test fixture that points a pinned runtime app-server at MockResponsesServer."""
+    """Test fixture that points an app-server under test at MockResponsesServer."""
 
     def __init__(self, tmp_path: Path, *, requires_openai_auth: bool = False) -> None:
         self.tmp_path = tmp_path
@@ -226,8 +235,13 @@ class AppServerHarness:
         shutil.rmtree(self.workspace, ignore_errors=True)
 
     def app_server_config(self) -> CodexConfig:
-        """Build SDK config for an isolated pinned-runtime app-server process."""
+        """Build SDK config for an isolated app-server process.
+
+        `CODEX_EXEC_PATH` selects the runtime under test, as in the TypeScript SDK
+        tests; without it the pinned runtime package is used.
+        """
         return CodexConfig(
+            codex_bin=os.environ.get("CODEX_EXEC_PATH") or None,
             cwd=str(self.workspace),
             env={
                 "CODEX_HOME": str(self.codex_home),
@@ -305,7 +319,7 @@ class _ResponsesHandler(BaseHTTPRequestHandler):
         """Serve queued SSE responses for `/v1/responses` requests."""
         length = int(self.headers.get("content-length", "0"))
         body = self.rfile.read(length)
-        self.server.mock._record_request(self, body)
+        request = self.server.mock._record_request(self, body)
 
         if not (self.path.endswith("/v1/responses") or self.path.endswith("/responses")):
             self.send_error(404, f"unexpected POST {self.path}")
@@ -320,7 +334,7 @@ class _ResponsesHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
-        for chunk in response.chunks():
+        for chunk in response.chunks(request):
             self.wfile.write(chunk)
             self.wfile.flush()
             if response.delay_between_events_s:

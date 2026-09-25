@@ -101,12 +101,24 @@ async fn get_account_rate_limits_requires_chatgpt_auth() -> Result<()> {
 
 #[tokio::test]
 async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
+    assert_get_account_rate_limits_returns_snapshot("pro", AccountPlanType::Pro).await
+}
+
+#[tokio::test]
+async fn get_account_rate_limits_returns_pro_max_snapshot() -> Result<()> {
+    assert_get_account_rate_limits_returns_snapshot("promax", AccountPlanType::ProMax).await
+}
+
+async fn assert_get_account_rate_limits_returns_snapshot(
+    raw_plan: &str,
+    plan_type: AccountPlanType,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("chatgpt-token")
             .account_id("account-123")
-            .plan_type("pro"),
+            .plan_type(raw_plan),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -131,7 +143,7 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
             .expect("parse second reset credit grant timestamp")
             .timestamp();
     let response_body = json!({
-        "plan_type": "pro",
+        "plan_type": raw_plan,
         "rate_limit": {
             "allowed": true,
             "limit_reached": false,
@@ -261,7 +273,7 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                 resets_at: secondary_reset_timestamp,
             }),
             spend_control_reached: Some(false),
-            plan_type: Some(AccountPlanType::Pro),
+            plan_type: Some(plan_type),
             rate_limit_reached_type: Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached),
         },
         rate_limits_by_limit_id: Some(
@@ -289,7 +301,7 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                             resets_at: secondary_reset_timestamp,
                         }),
                         spend_control_reached: Some(false),
-                        plan_type: Some(AccountPlanType::Pro),
+                        plan_type: Some(plan_type),
                         rate_limit_reached_type: Some(
                             RateLimitReachedType::WorkspaceMemberUsageLimitReached,
                         ),
@@ -309,7 +321,7 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                         credits: None,
                         individual_limit: None,
                         spend_control_reached: None,
-                        plan_type: Some(AccountPlanType::Pro),
+                        plan_type: Some(plan_type),
                         rate_limit_reached_type: None,
                     },
                 ),

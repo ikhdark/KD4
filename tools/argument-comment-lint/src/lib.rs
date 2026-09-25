@@ -188,10 +188,6 @@ impl ArgumentCommentLint {
         };
         let parameter_names: Vec<_> = cx.tcx.fn_arg_idents(def_id).iter().copied().collect();
         for (index, arg) in args.iter().enumerate() {
-            if arg.span.from_expansion() {
-                continue;
-            }
-
             let Some(expected_name) = parameter_names.get(index + parameter_offset) else {
                 continue;
             };
@@ -203,17 +199,21 @@ impl ArgumentCommentLint {
                 continue;
             }
 
+            // Macro-expanded spans point into the macro definition, so read the source around
+            // their call sites instead.
+            let arg_span = arg.span.source_callsite();
             let boundary_span = if index == 0 {
                 first_gap_anchor
             } else {
                 args[index - 1].span
-            };
-            let gap_span = boundary_span.between(arg.span);
+            }
+            .source_callsite();
+            let gap_span = boundary_span.between(arg_span);
             let gap_text = snippet(cx, gap_span, "");
-            let arg_text = snippet(cx, arg.span, "..");
-            let lookbehind_start = BytePos(arg.span.lo().0.saturating_sub(64));
+            let arg_text = snippet(cx, arg_span, "..");
+            let lookbehind_start = BytePos(arg_span.lo().0.saturating_sub(64));
             let lookbehind_text =
-                snippet(cx, arg.span.shrink_to_lo().with_lo(lookbehind_start), "");
+                snippet(cx, arg_span.shrink_to_lo().with_lo(lookbehind_start), "");
             let argument_comment = parse_argument_comment(gap_text.as_ref())
                 .or_else(|| parse_argument_comment(lookbehind_text.as_ref()))
                 .or_else(|| parse_argument_comment_prefix(arg_text.as_ref()));
@@ -223,7 +223,7 @@ impl ArgumentCommentLint {
                     span_lint_and_help(
                         cx,
                         ARGUMENT_COMMENT_MISMATCH,
-                        arg.span,
+                        arg_span,
                         format!(
                             "argument comment `/*{actual_name}*/` does not match parameter `{expected_name}`"
                         ),
@@ -240,7 +240,8 @@ impl ArgumentCommentLint {
                 continue;
             }
 
-            if !is_anonymous_literal_like(cx, arg) {
+            // Only literals written at the call site need a comment.
+            if arg.span.from_expansion() || !is_anonymous_literal_like(cx, arg) {
                 continue;
             }
 

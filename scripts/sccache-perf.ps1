@@ -67,13 +67,19 @@ function Invoke-SccachePerfCommand {
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $sccache = Get-SccacheCommandPath
 Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
-if ($Action -in @("stats", "reset")) {
+if ($Action -eq "reset") {
     Ensure-CodexRustSccacheServer -RepoRoot $repoRoot
 }
 
 switch ($Action) {
     "stats" {
-        Invoke-SccachePerfCommand -SccachePath $sccache -Arguments @("--show-stats")
+        # Reporting must not restart the server: a restart discards the
+        # statistics being requested and interrupts in-flight compiles.
+        $stats = @(Invoke-SccachePerfCommand -SccachePath $sccache -Arguments @("--show-stats"))
+        $stats
+        if (-not (Test-CodexRustSccacheStatsCacheSize -Stats $stats)) {
+            Write-Warning ('the running sccache server reports max cache size {0}, but the configured size is {1}; run "just sccache-restart" to apply it.' -f (Get-CodexRustSccacheStatsMaxCacheSize -Stats $stats), (Get-CodexRustSccacheCacheSize))
+        }
     }
     "reset" {
         Invoke-SccachePerfCommand -SccachePath $sccache -Arguments @("--zero-stats")

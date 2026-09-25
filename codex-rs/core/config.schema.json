@@ -350,6 +350,16 @@
       },
       "type": "object"
     },
+    "ContextManagementConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "experimental_mode": {
+          "description": "Enables experimental context management.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "CurrentTimeReminderConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -459,6 +469,16 @@
         }
       ]
     },
+    "FeatureToml_for_ContextManagementConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/ContextManagementConfigToml"
+        }
+      ]
+    },
     "FeatureToml_for_CurrentTimeReminderConfigToml": {
       "anyOf": [
         {
@@ -486,6 +506,16 @@
         },
         {
           "$ref": "#/definitions/NetworkProxyConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_TokenBudgetConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/TokenBudgetConfigToml"
         }
       ]
     },
@@ -2187,6 +2217,47 @@
           "type": "object"
         }
       ]
+    },
+    "TokenBudgetConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "auto_compact_fallback_buffer_tokens": {
+          "description": "Additional tokens available after the compaction threshold for fallback note-taking.",
+          "format": "int64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "auto_compact_fallback_prompt": {
+          "description": "Developer message sampled before an automatic context-window rollover.",
+          "maxLength": 2000,
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "guidance_message": {
+          "description": "Guidance appended to the context-window metadata in a developer message.",
+          "maxLength": 2000,
+          "type": "string"
+        },
+        "reminder_message_template": {
+          "description": "Reminder template. `{n_remaining}` is replaced with the tokens remaining before auto-compaction.",
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reminder_threshold_tokens": {
+          "description": "Number of tokens remaining before auto-compaction when the wrap-up reminder is emitted.",
+          "format": "int64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "use_history_notes_extension": {
+          "description": "Whether to expose the built-in history and notes extension.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
     },
     "ToolSuggestConfig": {
       "additionalProperties": false,
@@ -3991,6 +4062,9 @@
       "default": null,
       "description": "Centralized feature flags (new). Prefer this over individual toggles.",
       "properties": {
+        "analytics_plan_history": {
+          "type": "boolean"
+        },
         "apply_patch_streaming_events": {
           "type": "boolean"
         },
@@ -4023,6 +4097,9 @@
         },
         "concurrent_reasoning_summaries": {
           "type": "boolean"
+        },
+        "context_management": {
+          "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
         },
         "current_time_reminder": {
           "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
@@ -4137,6 +4214,9 @@
         },
         "terminal_visualization_instructions": {
           "type": "boolean"
+        },
+        "token_budget": {
+          "$ref": "#/definitions/FeatureToml_for_TokenBudgetConfigToml"
         },
         "tool_call_mcp_elicitation": {
           "type": "boolean"

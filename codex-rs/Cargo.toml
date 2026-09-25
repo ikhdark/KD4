@@ -50,6 +50,7 @@ members = [
     "ext/connectors",
     "ext/extension-api",
     "ext/goal",
+    "ext/history-notes",
     "ext/image-generation",
     "ext/items",
     "ext/mcp",
@@ -171,6 +172,7 @@ codex-execpolicy = { path = "execpolicy" }
 codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
 codex-goal-extension = { path = "ext/goal" }
+codex-history-notes-extension = { path = "ext/history-notes" }
 codex-image-generation-extension = { path = "ext/image-generation" }
 codex-external-agent-migration = { path = "external-agent-migration" }
 codex-external-agent-sessions = { path = "external-agent-sessions" }
@@ -241,7 +243,7 @@ mcp_test_support = { path = "mcp-server/tests/common" }
 
 # External
 age = "0.12.1"
-ansi-to-tui = "7.0.0"
+ansi-to-tui = "8.0.1"
 anyhow = "1"
 arboard = "3"
 arc-swap = "1.9.0"
@@ -254,7 +256,10 @@ aws-config = "1"
 aws-credential-types = "1"
 aws-sigv4 = "1"
 aws-types = "1"
-axum = { version = "0.8", default-features = false }
+# 0.8.8 is the last release on tokio-tungstenite ^0.28, which the patched
+# openai-oss-forks tungstenite pair below satisfies. 0.8.9 moved to ^0.29 and
+# pulled a second, unpatched tokio-tungstenite/tungstenite stack.
+axum = { version = "=0.8.8", default-features = false }
 base64 = "0.22.1"
 bm25 = { version = "2.3.2", default-features = false }
 bytes = "1.10.1"
@@ -275,7 +280,7 @@ color-eyre = "0.6.3"
 constant_time_eq = "0.3.1"
 crossbeam-channel = "0.5.15"
 crypto_box = { version = "0.9.1", features = ["seal"] }
-crossterm = "0.28.1"
+crossterm = "0.29.0"
 csv = "1.3.1"
 ctor = "1.0.13"
 deno_core_icudata = "0.77.0"
@@ -319,14 +324,18 @@ keyring = { version = "3.6", default-features = false }
 libsqlite3-sys = { version = "0.37", default-features = false }
 libc = "0.2"
 log = "0.4"
-lru = "0.16.3"
+# Match ratatui-core's layout-cache dependency.
+lru = "0.18.2"
 maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
 multimap = "0.10.0"
 notify = "8.2.0"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
-oauth2 = "5"
+objc2-foundation = { version = "0.3.2", default-features = false }
+# OAuth HTTP goes through codex-exec-server's HttpClient; the default
+# `reqwest` feature would add a second, unused reqwest/rustls stack.
+oauth2 = { version = "5", default-features = false }
 opentelemetry = "0.32.0"
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-http = "0.32.0"
@@ -355,8 +364,12 @@ rama-socks5 = "=0.3.0-alpha.4"
 rama-tcp = "=0.3.0-alpha.4"
 rama-tls-rustls = "=0.3.0-alpha.4"
 rand = "0.9"
-ratatui = "0.29.0"
-ratatui-macros = "0.6.0"
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+] }
+ratatui-macros = "0.7.2"
 rcgen = { version = "0.14.7", default-features = false, features = [
     "aws_lc_rs",
     "pem",
@@ -374,7 +387,9 @@ rustls-pki-types = "1.14.0"
 schannel = "0.1"
 schemars = { version = "0.8.22", features = ["indexmap2"] }
 semver = "1.0"
-sentry = { version = "0.46.0", default-features = false, features = [
+# 0.47 is the first release whose transport uses reqwest 0.13 (shared with
+# codex-http-client) instead of a second reqwest 0.12 stack.
+sentry = { version = "0.47.0", default-features = false, features = [
     "reqwest",
     "rustls",
 ] }
@@ -455,7 +470,8 @@ which = "8"
 wildmatch = "2.6.1"
 winapi = "0.3.9"
 winapi-util = "0.1.11"
-windows = "0.58"
+# Match the windows release rmcp's process-wrap already links.
+windows = "0.62"
 windows-sys = "0.61.2"
 winsplit = "0.1"
 zip = { version = "2.4.2", default-features = false, features = [
@@ -560,8 +576,6 @@ opt-level = 0
 [patch.crates-io]
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
-crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }
-ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 

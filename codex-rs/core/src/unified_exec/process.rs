@@ -161,6 +161,22 @@ impl SpawnLifecycle for NoopSpawnLifecycle {}
 
 pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
 
+pub(super) async fn append_output_chunk(
+    pending: &OutputBuffer,
+    completion: &OutputBuffer,
+    stream: &OutputBuffer,
+    chunk: &[u8],
+) {
+    // Acquire in pending/completion/stream order before mutating anything. There
+    // must be no cancellation point between the three copies of a chunk.
+    let mut pending = pending.lock().await;
+    let mut completion = completion.lock().await;
+    let mut stream = stream.lock().await;
+    pending.push_chunk(chunk);
+    completion.push_chunk(chunk);
+    stream.push_chunk(chunk);
+}
+
 async fn snapshot_retained_output(buffer: &OutputBuffer) -> (Vec<u8>, bool) {
     let guard = buffer.lock().await;
     let omitted_bytes = guard.omitted_bytes();
@@ -445,15 +461,17 @@ impl UnifiedExecProcess {
         stream: ExecOutputStream,
         chunk: Vec<u8>,
     ) {
-        self.output_buffer.lock().await.push_chunk(&chunk);
-        self.completion_output_buffer
-            .lock()
-            .await
-            .push_chunk(&chunk);
-        match &stream {
-            ExecOutputStream::Stdout => self.stdout_buffer.lock().await.push_chunk(&chunk),
-            ExecOutputStream::Stderr => self.stderr_buffer.lock().await.push_chunk(&chunk),
-        }
+        let stream_buffer = match &stream {
+            ExecOutputStream::Stdout => &self.stdout_buffer,
+            ExecOutputStream::Stderr => &self.stderr_buffer,
+        };
+        append_output_chunk(
+            &self.output_buffer,
+            &self.completion_output_buffer,
+            stream_buffer,
+            &chunk,
+        )
+        .await;
         self.output_tx
             .send(ProcessOutputChunk {
                 stream,
@@ -973,11 +991,13 @@ impl UnifiedExecProcess {
                         if let Some(task) = artifact_task.as_mut() {
                             task.write_chunk(&bytes);
                         }
-                        {
-                            output_buffer.lock().await.push_chunk(&bytes);
-                        }
-                        completion_output_buffer.lock().await.push_chunk(&bytes);
-                        stdout_buffer.lock().await.push_chunk(&bytes);
+                        append_output_chunk(
+                            &output_buffer,
+                            &completion_output_buffer,
+                            &stdout_buffer,
+                            &bytes,
+                        )
+                        .await;
                         let _ = output_tx.send(ProcessOutputChunk {
                             stream: ExecOutputStream::Stdout,
                             bytes,
@@ -1019,11 +1039,13 @@ impl UnifiedExecProcess {
                         if let Some(task) = artifact_task.as_mut() {
                             task.write_chunk(&bytes);
                         }
-                        {
-                            output_buffer.lock().await.push_chunk(&bytes);
-                        }
-                        completion_output_buffer.lock().await.push_chunk(&bytes);
-                        stdout_buffer.lock().await.push_chunk(&bytes);
+                        append_output_chunk(
+                            &output_buffer,
+                            &completion_output_buffer,
+                            &stdout_buffer,
+                            &bytes,
+                        )
+                        .await;
                         let _ = output_tx.send(ProcessOutputChunk {
                             stream: ExecOutputStream::Stdout,
                             bytes,
@@ -1123,21 +1145,17 @@ impl UnifiedExecProcess {
                     if let Some(task) = artifact_task.as_mut() {
                         task.write_chunk(&output.bytes);
                     }
-                    {
-                        output_buffer.lock().await.push_chunk(&output.bytes);
-                    }
-                    completion_output_buffer
-                        .lock()
-                        .await
-                        .push_chunk(&output.bytes);
-                    match &output.stream {
-                        ExecOutputStream::Stdout => {
-                            stdout_buffer.lock().await.push_chunk(&output.bytes)
-                        }
-                        ExecOutputStream::Stderr => {
-                            stderr_buffer.lock().await.push_chunk(&output.bytes)
-                        }
-                    }
+                    let stream_buffer = match &output.stream {
+                        ExecOutputStream::Stdout => &stdout_buffer,
+                        ExecOutputStream::Stderr => &stderr_buffer,
+                    };
+                    append_output_chunk(
+                        &output_buffer,
+                        &completion_output_buffer,
+                        stream_buffer,
+                        &output.bytes,
+                    )
+                    .await;
                     let _ = output_tx.send(output);
                     output_notify.notify_waiters();
                 }

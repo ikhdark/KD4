@@ -19,6 +19,10 @@ from unittest import mock
 
 import scripts.stage_npm_archives as archives
 import scripts.stage_npm_packages as stage
+from scripts.codex_package import layout
+from scripts.codex_package.targets import PACKAGE_VARIANTS
+from scripts.codex_package.targets import PackageInputs
+from scripts.codex_package.targets import TARGET_SPECS
 
 
 class CodexLauncherTests(unittest.TestCase):
@@ -94,7 +98,8 @@ class CodexLauncherTests(unittest.TestCase):
             "npm_config_user_agent": "npm/10.0.0",
             "npm_execpath": "",
             "CODEX_MANAGED_BY_BUN": "stale",
-            "CODEX_MANAGED_BY_PNPM": "stale",
+            # Windows environment names are case-insensitive.
+            "codex_managed_by_pnpm": "stale",
         }
         return subprocess.run(
             command,
@@ -191,6 +196,73 @@ class CodexLauncherTests(unittest.TestCase):
                 self.assert_startup_failure(result, "Native package version mismatch")
                 self.assertIn("expected 1.2.3-test-native", result.stderr)
                 self.assertIn("Reinstall this KD4 package", result.stderr)
+
+    def test_upstream_native_publication_cannot_satisfy_release_alias(self) -> None:
+        manifest = stage.load_build_module().build_codex_package_json("1.2.3")
+        native_target = manifest["codexNativeTargets"].get(self.platform_key)
+        if native_target is None:
+            self.skipTest(f"no KD4 native target for {self.platform_key}")
+        (self.root / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+        package_root = self.root / "node_modules" / native_target["package"]
+        binary = (
+            package_root
+            / "vendor"
+            / native_target["targetTriple"]
+            / "bin"
+            / native_target["binary"]
+        )
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(self.node, binary)
+        kd4_version = manifest["optionalDependencies"][native_target["package"]]
+        # Upstream publishes its native payloads as @openai/codex@<version>-<platform>
+        # with the same vendor layout, and KD4 reuses upstream release numbers.
+        for version, launches in (
+            (f"1.2.3-{self.platform_key}", False),
+            (kd4_version.rsplit("@", 1)[1], True),
+        ):
+            with self.subTest(version=version):
+                (package_root / "package.json").write_text(
+                    json.dumps({"name": "@openai/codex", "version": version}),
+                    encoding="utf-8",
+                )
+                result = self.run_launcher("-e", "console.log('launched')")
+                if launches:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "launched")
+                else:
+                    self.assert_startup_failure(
+                        result, "Native package version mismatch"
+                    )
+
+    @unittest.skipUnless(os.name == "nt", "Windows console Ctrl-C contract")
+    def test_windows_ctrl_c_waits_for_child_and_mirrors_its_exit(self) -> None:
+        binary = self.native_path()
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(self.node, binary)
+        # Console Ctrl-C already reaches the child; child.kill() would be
+        # TerminateProcess and pre-empt the child's own interrupt handling.
+        script = (
+            "import childProcess from 'node:child_process'; "
+            "import { syncBuiltinESMExports } from 'node:module'; "
+            "const spawn = childProcess.spawn; "
+            "childProcess.spawn = (...args) => { const child = spawn(...args); "
+            "child.once('spawn', () => process.emit('SIGINT')); return child; }; "
+            "syncBuiltinESMExports(); "
+            f"process.argv = [process.execPath, {json.dumps(str(self.launcher))}, '-e', "
+            "\"setTimeout(() => { console.log('child finished'); process.exit(5); }, 500)\"]; "
+            f"await import({json.dumps(self.launcher.as_uri())});"
+        )
+        result = subprocess.run(
+            [self.node, "--input-type=module", "-e", script],
+            cwd=self.root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertEqual(result.stdout.strip(), "child finished")
+        self.assertEqual(result.stderr, "")
 
     @unittest.skipUnless(os.name == "nt", "Windows exit status contract")
     def test_signal_terminated_child_preserves_numeric_exit_status(self) -> None:
@@ -433,7 +505,7 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(package_json["os"], ["win32"])
         self.assertEqual(
             package_json["optionalDependencies"]["@openai/codex-win32-x64"],
-            "npm:@openai/codex@1.2.3-win32-x64",
+            "npm:@openai/codex@1.2.3-kd4-win32-x64",
         )
         self.assertEqual(
             package_json["codexNativeTargets"]["win32-x64"],
@@ -520,36 +592,34 @@ class StageNpmPackagesTests(unittest.TestCase):
         build = stage.load_build_module()
         vendor_src = self.root / "vendor-src"
         selected_target = vendor_src / "x86_64-pc-windows-msvc"
-        selected_bin = selected_target / "bin"
-        selected_bin.mkdir(parents=True)
-        (selected_bin / "codex.exe").write_text("native", encoding="utf-8")
-        self.write_package_metadata(selected_target)
+        self.write_canonical_package(selected_target)
 
-        skipped_target = vendor_src / "aarch64-pc-windows-msvc"
-        skipped_bin = skipped_target / "bin"
+        # Filtered targets are neither validated nor copied.
+        skipped_bin = vendor_src / "aarch64-pc-windows-msvc" / "bin"
         skipped_bin.mkdir(parents=True)
         (skipped_bin / "codex.exe").write_text("native", encoding="utf-8")
-        self.write_package_metadata(skipped_target)
 
         staging_dir = self.root / "staging"
         staging_dir.mkdir()
-        build.copy_native_binaries(
-            vendor_src,
-            staging_dir,
-            [build.CODEX_PACKAGE_COMPONENT],
-            {"x86_64-pc-windows-msvc"},
-        )
+        with mock.patch.object(
+            layout.subprocess, "run", return_value=mock.Mock(stdout="codex 1.2.3")
+        ):
+            build.copy_native_binaries(
+                vendor_src,
+                staging_dir,
+                [build.CODEX_PACKAGE_COMPONENT],
+                {"x86_64-pc-windows-msvc"},
+                expected_version="1.2.3",
+            )
 
-        self.assertTrue(
-            (
-                staging_dir / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe"
-            ).is_file()
-        )
+        staged_target = staging_dir / "vendor" / "x86_64-pc-windows-msvc"
+        self.assertEqual(relative_files(staged_target), relative_files(selected_target))
+        self.assertIn("bin/codex.exe", relative_files(staged_target))
         self.assertFalse((staging_dir / "vendor" / "aarch64-pc-windows-msvc").exists())
 
         missing_src = self.root / "missing-src"
         (missing_src / "x86_64-pc-windows-msvc").mkdir(parents=True)
-        with self.assertRaisesRegex(RuntimeError, "Missing Codex executable"):
+        with self.assertRaisesRegex(RuntimeError, "Missing package directory"):
             build.copy_native_binaries(
                 missing_src,
                 self.root / "missing-staging",
@@ -560,11 +630,8 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_copy_native_binaries_rejects_changed_declared_file(self) -> None:
         build = stage.load_build_module()
         target_dir = self.root / "vendor-src" / "x86_64-pc-windows-msvc"
-        binary = target_dir / "bin" / "codex.exe"
-        binary.parent.mkdir(parents=True)
-        binary.write_bytes(b"original")
-        self.write_package_metadata(target_dir)
-        binary.write_bytes(b"tampered")
+        self.write_canonical_package(target_dir)
+        (target_dir / "bin" / "codex.exe").write_bytes(b"tampered")
 
         with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
             build.copy_native_binaries(
@@ -572,6 +639,29 @@ class StageNpmPackagesTests(unittest.TestCase):
                 self.root / "staging",
                 [build.CODEX_PACKAGE_COMPONENT],
             )
+
+    def test_copy_native_binaries_rejects_package_built_for_another_target(
+        self,
+    ) -> None:
+        build = stage.load_build_module()
+        x64_package = self.root / "x86_64-pc-windows-msvc"
+        self.write_canonical_package(x64_package)
+        # Relabelling metadata keeps every inventory digest and the bundle id valid.
+        relabelled = self.root / "vendor-src" / "aarch64-pc-windows-msvc"
+        shutil.copytree(x64_package, relabelled)
+        metadata_path = relabelled / "codex-package.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["target"] = relabelled.name
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "target mismatch"):
+            build.copy_native_binaries(
+                self.root / "vendor-src",
+                self.root / "staging",
+                [build.CODEX_PACKAGE_COMPONENT],
+                {relabelled.name},
+            )
+        self.assertFalse((self.root / "staging" / "vendor" / relabelled.name).exists())
 
     def test_copy_native_binaries_rejects_non_windows_targets(self) -> None:
         build = stage.load_build_module()
@@ -587,35 +677,73 @@ class StageNpmPackagesTests(unittest.TestCase):
                 [build.CODEX_PACKAGE_COMPONENT],
             )
 
-    def write_package_metadata(self, target_dir: Path, version: str = "1.2.3") -> None:
-        files = []
-        for path in sorted(target_dir.rglob("*")):
-            if not path.is_file() or path.name == "codex-package.json":
-                continue
-            contents = path.read_bytes()
-            files.append(
-                {
-                    "path": path.relative_to(target_dir).as_posix(),
-                    "role": "entrypoint",
-                    "size": len(contents),
-                    "sha256": hashlib.sha256(contents).hexdigest(),
-                }
-            )
-        bundle_id = hashlib.sha256(
-            json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        (target_dir / "codex-package.json").write_text(
-            json.dumps(
-                {
-                    "layoutVersion": 2,
-                    "version": version,
-                    "target": target_dir.name,
-                    "bundleId": bundle_id,
-                    "files": files,
-                }
-            ),
-            encoding="utf-8",
+    def write_canonical_package(self, target_dir: Path, version: str = "1.2.3") -> None:
+        from scripts.codex_package.test_layout import write_pe
+
+        inputs_dir = self.root / "inputs" / target_dir.name
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+        inputs = []
+        for name in ("codex", "host", "rg", "runner", "setup"):
+            path = inputs_dir / f"{name}.exe"
+            write_pe(path)
+            inputs.append(path)
+        target_dir.mkdir(parents=True)
+        layout.build_package_dir(
+            target_dir,
+            version,
+            PACKAGE_VARIANTS["codex"],
+            TARGET_SPECS[target_dir.name],
+            PackageInputs(*inputs),
+            build_identity={"source": "test"},
         )
+
+    def test_npm_smoke_install_uses_packed_name_outside_ancestor_projects(
+        self,
+    ) -> None:
+        if shutil.which("npm") is None or shutil.which("node") is None:
+            self.skipTest("npm and Node.js are required for the npm smoke install")
+        build = stage.load_build_module()
+        # A smoke install without its own prefix would land in this ancestor project.
+        ancestor_modules = self.root / "node_modules"
+        ancestor_modules.mkdir()
+        temp_root = self.root / "temp"
+        temp_root.mkdir()
+        npm_env = {
+            "NPM_CONFIG_CACHE": str(self.root / "npm-cache"),
+            "NPM_CONFIG_AUDIT": "false",
+            "NPM_CONFIG_FUND": "false",
+            "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+        }
+        for launcher, valid in (("export {};\n", True), ("export {\n", False)):
+            with self.subTest(valid=valid):
+                staging = self.root / f"staging-{valid}"
+                (staging / "bin").mkdir(parents=True)
+                (staging / "bin" / "proxy.js").write_text(launcher, encoding="utf-8")
+                (staging / "package.json").write_text(
+                    json.dumps(
+                        {
+                            "name": "@openai/codex-responses-api-proxy",
+                            "version": "1.2.3",
+                            "type": "module",
+                            "bin": {"codex-responses-api-proxy": "bin/proxy.js"},
+                            "files": ["bin"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                output = self.root / f"out-{valid}" / "proxy.tgz"
+                with (
+                    mock.patch.object(tempfile, "tempdir", str(temp_root)),
+                    mock.patch.dict(os.environ, npm_env),
+                ):
+                    if valid:
+                        self.assertEqual(
+                            build.run_npm_pack(staging, output), output.resolve()
+                        )
+                    else:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            build.run_npm_pack(staging, output)
+                self.assertEqual(list(ancestor_modules.iterdir()), [])
 
     def test_parse_args_accepts_max_download_workers(self) -> None:
         argv = [
@@ -1570,6 +1698,12 @@ class StageNpmPackagesTests(unittest.TestCase):
             [("codex", True), ("codex-win32-x64", True)],
         )
         self.assertEqual(completion_order, ["codex-win32-x64", "codex"])
+
+
+def relative_files(root: Path) -> set[str]:
+    return {
+        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()
+    }
 
 
 if __name__ == "__main__":

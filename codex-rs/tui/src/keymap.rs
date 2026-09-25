@@ -20,10 +20,12 @@
 
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::key_hint::KeyBindingListExt;
 use codex_config::types::KeybindingsSpec;
 use codex_config::types::MAX_FUNCTION_KEY;
 use codex_config::types::TuiKeymap;
 use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -245,6 +247,58 @@ pub(crate) struct ListKeymap {
     pub(crate) jump_bottom: Vec<KeyBinding>,
     pub(crate) accept: Vec<KeyBinding>,
     pub(crate) cancel: Vec<KeyBinding>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListAction {
+    MoveUp,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+    PageUp,
+    PageDown,
+    JumpTop,
+    JumpBottom,
+    Accept,
+    Cancel,
+}
+
+impl ListKeymap {
+    pub(crate) fn bindings_for(&self, action: ListAction) -> &[KeyBinding] {
+        match action {
+            ListAction::MoveUp => &self.move_up,
+            ListAction::MoveDown => &self.move_down,
+            ListAction::MoveLeft => &self.move_left,
+            ListAction::MoveRight => &self.move_right,
+            ListAction::PageUp => &self.page_up,
+            ListAction::PageDown => &self.page_down,
+            ListAction::JumpTop => &self.jump_top,
+            ListAction::JumpBottom => &self.jump_bottom,
+            ListAction::Accept => &self.accept,
+            ListAction::Cancel => &self.cancel,
+        }
+    }
+
+    pub(crate) fn action_for(&self, event: KeyEvent) -> Option<ListAction> {
+        [
+            ListAction::MoveUp,
+            ListAction::MoveDown,
+            ListAction::MoveLeft,
+            ListAction::MoveRight,
+            ListAction::PageUp,
+            ListAction::PageDown,
+            ListAction::JumpTop,
+            ListAction::JumpBottom,
+            ListAction::Accept,
+            ListAction::Cancel,
+        ]
+        .into_iter()
+        .find(|action| self.bindings_for(*action).is_pressed(event))
+    }
+
+    pub(crate) fn primary_hint(&self, action: ListAction) -> Option<KeyBinding> {
+        primary_binding(self.bindings_for(action))
+    }
 }
 
 /// Approval modal keybindings.

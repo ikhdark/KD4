@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
+from scripts.publish_local_codex_test_support import clean_env
 from scripts.publish_local_codex_test_support import ps_single_quote
 
 
@@ -184,21 +185,15 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     def test_auto_skip_build_uses_live_source_scan_before_stamp(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
+            install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=source_timestamp,
-            )
-            self.write_build_stamp("local-release", source_timestamp, fake_codex)
+            self.write_built_artifacts(timestamp=source_timestamp)
+            self.write_build_stamp("local-release", source_timestamp)
             self.touch_tracked_source(source_timestamp + 10)
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -222,14 +217,10 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     def test_auto_skip_build_detects_same_size_same_mtime_source_change(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
+            install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=source_timestamp,
-            )
-            self.write_build_stamp("local-release", source_timestamp, fake_codex)
+            self.write_built_artifacts(timestamp=source_timestamp)
+            self.write_build_stamp("local-release", source_timestamp)
             tracked = self.repo_root / "codex-rs" / "tracked-source.rs"
             original_stat = tracked.stat()
             original_size = original_stat.st_size
@@ -244,8 +235,6 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -266,13 +255,8 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     def test_auto_skip_build_scans_committed_publish_entrypoint(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
+            install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=source_timestamp,
-            )
             entrypoint = self.repo_root / "scripts" / "publish-local-codex.ps1"
             entrypoint.parent.mkdir(parents=True)
             entrypoint.write_text("# publish entrypoint\n", encoding="utf-8")
@@ -280,15 +264,14 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             self.run_git("commit", "--quiet", "-m", "add publish entrypoint")
             os.utime(entrypoint, (source_timestamp + 10, source_timestamp + 10))
             self.assertEqual(self.run_git("status", "--porcelain").stdout, "")
-            self.write_build_stamp("local-release", source_timestamp, fake_codex)
+            self.write_built_artifacts(timestamp=source_timestamp)
+            self.write_build_stamp("local-release", source_timestamp)
             entrypoint.write_text("# changed publish entrypoint\n", encoding="utf-8")
             os.utime(entrypoint, (source_timestamp + 10, source_timestamp + 10))
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -309,21 +292,15 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     def test_auto_skip_build_ignores_unrelated_source_changes(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
+            install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=source_timestamp + 20,
-            )
-            self.write_build_stamp("local-release", source_timestamp, fake_codex)
+            self.write_built_artifacts(timestamp=source_timestamp + 20)
+            self.write_build_stamp("local-release", source_timestamp)
             self.touch_unrelated_source(source_timestamp + 10)
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -346,26 +323,22 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     ) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
+            install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
             sidecar_timestamp = FIXTURE_TIME - 100
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=source_timestamp,
+            _, built_code_mode_host, _, _ = self.write_built_artifacts(
+                timestamp=source_timestamp
             )
             os.utime(
-                self.source_code_mode_host,
+                built_code_mode_host,
                 (sidecar_timestamp, sidecar_timestamp),
             )
-            self.write_build_stamp("local-release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp)
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
                 "-FailOnStaleSourceBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -446,34 +419,107 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             self.assert_proof_value(result.stdout, "sourceBuildStale", "False")
             self.assertNotIn("sourceBuildStaleRemedy:", result.stdout)
 
+    def test_skip_build_rejects_stamped_artifacts_from_other_publish_inputs(
+        self,
+    ) -> None:
+        # Recipe inputs such as RUSTFLAGS change without touching source mtimes;
+        # newer artifact timestamps must not outvote the content-bound stamp.
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_dir = Path(temp_dir) / "install"
+            install_dir.mkdir()
+            target = install_dir / "codex.exe"
+            target.write_bytes(b"previous-codex")
+            self.write_built_artifacts(timestamp=FRESH_SOURCE_TIME)
+            stamp_env = clean_env()
+            stamp_env.pop("RUSTFLAGS", None)
+            self.write_build_stamp("local-release", FIXTURE_TIME, env=stamp_env)
+
+            # Default Cargo outputs without a manifest; run_script would inject
+            # a digest-bound manifest for -SkipBuild.
+            result = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(SCRIPT),
+                    "-RepoRoot",
+                    str(self.repo_root),
+                    "-SkipBuild",
+                    "-InstallDir",
+                    str(install_dir),
+                    "-BackupDir",
+                    str(Path(temp_dir) / "backups"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**stamp_env, "RUSTFLAGS": "-C target-cpu=native"},
+                timeout=120,
+            )
+
+            self.assertNotEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildStampValidation",
+                "tracked publish inputs changed",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildFreshnessBasis",
+                "content-bound build stamp from different publish inputs",
+            )
+            self.assert_proof_value(result.stdout, "sourceBuildStale", "True")
+            self.assert_proof_value(
+                result.stdout, "replace", "blocked: source build stale"
+            )
+            # PowerShell hard-wraps errors at 120 columns; match within line one.
+            self.assertIn(
+                "their content-bound build stamp records different", result.stderr
+            )
+            self.assertEqual(target.read_bytes(), b"previous-codex")
+
     def test_auto_skip_revalidates_stamp_after_source_version_probe(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
+            install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
             tracked = self.repo_root / "codex-rs" / "tracked-source.rs"
-            fake_codex = temp_path / "fake-codex.cmd"
-            fake_codex.write_text(
-                "\r\n".join(
-                    [
-                        "@echo off",
-                        f'> "{tracked}" echo changed-during-version-probe',
-                        "echo codex 9.9.9",
-                        "echo commit: test-commit",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            os.utime(fake_codex, (source_timestamp, source_timestamp))
-            self.write_build_stamp("local-release", source_timestamp, fake_codex)
-
-            result = self.run_script(
-                "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
-                "-InstallDir",
-                str(install_dir),
+            self.write_built_artifacts(timestamp=source_timestamp)
+            self.write_build_stamp("local-release", source_timestamp)
+            # Change a tracked input during the source version probe, after
+            # auto-skip has already accepted the stamp.
+            command = rf"""
+$global:Mutated = $false
+Set-PSBreakpoint -Command Write-VersionProofBlock -Action {{
+    if (-not $global:Mutated) {{
+        [IO.File]::WriteAllText({ps_single_quote(tracked)}, "changed-during-version-probe`n")
+        $global:Mutated = $true
+    }}
+}} | Out-Null
+& {ps_single_quote(SCRIPT)} -AutoSkipBuild -RepoRoot {ps_single_quote(self.repo_root)} `
+    -InstallDir {ps_single_quote(install_dir)}
+"""
+            result = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=clean_env(),
+                timeout=120,
             )
 
             self.assertNotEqual(
@@ -507,30 +553,27 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     def test_auto_skip_build_detects_same_size_same_mtime_artifact_change(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
+            install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
+            built_codex, _, _, _ = self.write_built_artifacts(
+                codex_bytes=b"codex artifact test-commit",
                 timestamp=source_timestamp,
             )
-            self.write_build_stamp("local-release", source_timestamp, fake_codex)
-            original_stat = fake_codex.stat()
-            original_bytes = fake_codex.read_bytes()
+            self.write_build_stamp("local-release", source_timestamp)
+            original_stat = built_codex.stat()
+            original_bytes = built_codex.read_bytes()
             changed_bytes = original_bytes.replace(b"test-commit", b"best-commit")
             self.assertNotEqual(changed_bytes, original_bytes)
             self.assertEqual(len(changed_bytes), len(original_bytes))
-            fake_codex.write_bytes(changed_bytes)
+            built_codex.write_bytes(changed_bytes)
             os.utime(
-                fake_codex,
+                built_codex,
                 ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
             )
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -551,21 +594,15 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     def test_auto_skip_build_requires_code_mode_host_artifact(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=FRESH_SOURCE_TIME,
+            install_dir = Path(temp_dir) / "install"
+            _, built_code_mode_host, _, _ = self.write_built_artifacts(
+                timestamp=FRESH_SOURCE_TIME
             )
-            missing_host = temp_path / "missing-code-mode-host.exe"
+            built_code_mode_host.unlink()
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
-                "-SourceCodeModeHostExe",
-                str(missing_host),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -582,18 +619,12 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
 
     def test_auto_skip_build_does_not_skip_without_build_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=FRESH_SOURCE_TIME,
-            )
+            install_dir = Path(temp_dir) / "install"
+            self.write_built_artifacts(timestamp=FRESH_SOURCE_TIME)
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -617,27 +648,19 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     def test_auto_skip_build_rejects_legacy_timestamp_stamp(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            source_timestamp = FIXTURE_TIME + 100
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=source_timestamp,
-            )
+            install_dir = Path(temp_dir) / "install"
+            self.write_built_artifacts(timestamp=FIXTURE_TIME + 100)
             stamp = (
                 self.repo_root
                 / "codex-rs"
                 / "target"
                 / "codex-local-publish-local-release.stamp"
             )
-            stamp.parent.mkdir(parents=True)
             stamp.write_text("2000-01-01T00:00:00.0000000Z", encoding="utf-8")
 
             result = self.run_script(
                 "-DryRun",
                 "-AutoSkipBuild",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -706,19 +729,12 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
 
     def test_dry_run_debug_profile_uses_cargo_dev_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=FRESH_SOURCE_TIME,
-            )
+            install_dir = Path(temp_dir) / "install"
 
             result = self.run_script(
                 "-DryRun",
                 "-Profile",
                 "debug",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )
@@ -734,19 +750,12 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
 
     def test_dry_run_release_reports_only_artifact_producing_build(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=FRESH_SOURCE_TIME,
-            )
+            install_dir = Path(temp_dir) / "install"
 
             result = self.run_script(
                 "-DryRun",
                 "-Profile",
                 "release",
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
             )

@@ -490,6 +490,7 @@ pub(crate) async fn run_onboarding_app(
             event = tui_events.next() => {
                 if let Some(event) = event {
                     match event {
+                        TuiEvent::Mouse(_) => {}
                         TuiEvent::Key(key_event) => {
                             onboarding_screen.handle_key_event(key_event);
                             if !directory_trust_persisted {

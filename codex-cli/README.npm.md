@@ -4,11 +4,16 @@ Codex CLI is a coding agent from OpenAI that runs locally on Windows.
 
 ## Install
 
-Install the staged KD4 tarball from the matching fork release. For example:
+Install the staged KD4 tarball together with the native tarball for your
+architecture from the same fork release. On Windows x64:
 
 ```shell
-npm install -g ./codex-npm-${VERSION}.tgz
+npm install -g ./codex-npm-${VERSION}.tgz "@openai/codex-win32-x64@file:./codex-npm-win32-x64-${VERSION}.tgz"
 ```
+
+On Windows ARM64, use `@openai/codex-win32-arm64@file:./codex-npm-win32-arm64-${VERSION}.tgz`
+instead. The native package is not published to the npm registry, so installing
+the main tarball alone leaves Codex without its native binary.
 
 Then run:
 

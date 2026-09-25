@@ -17,15 +17,18 @@ export type TurnStartedEvent = {
   type: "turn.started";
 };
 
-/** Describes the usage of tokens during a turn. */
+/**
+ * Token usage for the thread as of the turn's completion. The counts are
+ * cumulative, so a resumed thread's usage includes its earlier turns.
+ */
 export type Usage = {
-  /** The number of input tokens used during the turn. */
+  /** The number of input tokens used by the thread. */
   input_tokens: number;
-  /** The number of cached input tokens used during the turn. */
+  /** The number of cached input tokens used by the thread. */
   cached_input_tokens: number;
-  /** The number of output tokens used during the turn. */
+  /** The number of output tokens used by the thread. */
   output_tokens: number;
-  /** The number of reasoning output tokens used during the turn. */
+  /** The number of reasoning output tokens used by the thread. */
   reasoning_output_tokens: number;
 };
 

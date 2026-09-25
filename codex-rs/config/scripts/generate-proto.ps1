@@ -200,7 +200,7 @@ try {
         $true
     )
 
-    & $cargoLane -Lane auto cargo run --locked -p codex-config --example generate-proto -- $protoDir
+    & $cargoLane -Lane auto cargo run -p codex-config --example generate-proto -- $protoDir
     if ($LASTEXITCODE -ne 0) {
         throw "generate-proto failed with exit code $LASTEXITCODE"
     }

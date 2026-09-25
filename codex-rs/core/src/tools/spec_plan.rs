@@ -1030,6 +1030,17 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
             .add_with_authorization_class(RequestPermissionsHandler, TypedToolClass::OwnTask);
     }
 
+    if features.enabled(Feature::TokenBudget) {
+        planned_tools.add_with_authorization_class(
+            crate::tools::handlers::GetContextRemainingHandler,
+            TypedToolClass::ReadSearch,
+        );
+        planned_tools.add_with_authorization_class(
+            crate::tools::handlers::NewContextWindowHandler,
+            TypedToolClass::OwnTask,
+        );
+    }
+
     if features.enabled(Feature::CurrentTimeReminder) {
         planned_tools.add_with_authorization_class(CurrentTimeHandler, TypedToolClass::ReadSearch);
         if turn_context

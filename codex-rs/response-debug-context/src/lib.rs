@@ -86,7 +86,7 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
         ApiError::RateLimit(_) => "rate limit".to_string(),
         ApiError::InvalidRequest { .. } => "invalid request".to_string(),
         ApiError::CyberPolicy { .. } => "cyber policy".to_string(),
-        ApiError::ServerOverloaded => "server overloaded".to_string(),
+        ApiError::ServerOverloaded { .. } => "server overloaded".to_string(),
     }
 }
 
@@ -118,6 +118,7 @@ mod tests {
         );
 
         let context = extract_response_debug_context(&TransportError::Http {
+            retry_after: None,
             status: StatusCode::UNAUTHORIZED,
             url: Some("https://chatgpt.com/backend-api/codex/models".to_string()),
             headers: Some(headers),
@@ -138,6 +139,7 @@ mod tests {
     #[test]
     fn telemetry_error_messages_omit_http_bodies() {
         let transport = TransportError::Http {
+            retry_after: None,
             status: StatusCode::UNAUTHORIZED,
             url: Some("https://chatgpt.com/backend-api/codex/responses".to_string()),
             headers: None,

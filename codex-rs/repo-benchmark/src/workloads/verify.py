@@ -103,7 +103,7 @@ def task_tests(root, kind, failing=False):
     if kind == 'rust':
         names = set(re.findall(r'#\[test\]\s*(?:#\[[^\]]+\]\s*)*fn\s+(\w+)',
                                (root / 'tests/regression.rs').read_text(encoding='utf-8')))
-        return run(['cargo', 'test', '--offline', '--locked', '--jobs', '6', '--test', 'regression',
+        return run(['cargo', 'test', '--offline', '--jobs', '6', '--test', 'regression',
                     '--', '--format', 'pretty', '--color', 'never', '--test-threads=1'], root,
                    expect_failure=failing, test_kind=kind, expected_names=names)
     if kind == 'node':
@@ -204,7 +204,7 @@ def rust_verify(root, protected, build_root):
     (scratch / 'src/lib.rs').write_text('pub fn parse_duration(text: &str) -> Result<u64,String> {\n'
         'for (unit,scale) in [("ms",1),("s",1000),("m",60000),("h",3600000)] { '
         'if let Some(v)=text.trim().strip_suffix(unit) { return v.parse::<u64>().ok().and_then(|v| v.checked_mul(scale)).ok_or("invalid".into()); }} Err("invalid".into()) }', encoding='utf-8')
-    compiled = run(['cargo', 'test', '--offline', '--locked', '--jobs', '6', '--test', 'regression',
+    compiled = run(['cargo', 'test', '--offline', '--jobs', '6', '--test', 'regression',
                     '--no-run', '--message-format=json'], scratch)
     artifacts = [json.loads(line) for line in compiled.stdout.splitlines() if line.strip()]
     executables = [artifact['executable'] for artifact in artifacts

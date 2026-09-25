@@ -5,7 +5,6 @@ codex-rs/core/src/tools/command_output_artifact_tests.rs diff
 codex-rs/**/*.sql text eol=lf
 codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs text eol=lf linguist-generated
 codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.rs text eol=lf linguist-generated
-architecture_index.json linguist-generated
 codex-rs/app-server-protocol/schema/** linguist-generated
 codex-rs/hooks/schema/generated/** linguist-generated
 codex-rs/core/config.schema.json linguist-generated

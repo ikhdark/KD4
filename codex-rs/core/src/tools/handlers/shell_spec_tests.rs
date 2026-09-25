@@ -254,7 +254,7 @@ fn exec_command_tool_matches_expected_spec() {
             strict: false,
             defer_loading: None,
             parameters: command_parameters_schema(properties, "cmd"),
-            output_schema: Some(unified_exec_output_schema()),
+            output_schema: Some(unified_exec_output_schema().into()),
         })
     );
 }
@@ -366,7 +366,7 @@ fn write_stdin_tool_matches_expected_spec() {
                 Some(vec!["session_id".to_string()]),
                 Some(false.into())
             ),
-            output_schema: Some(unified_exec_output_schema()),
+            output_schema: Some(unified_exec_output_schema().into()),
         })
     );
 }
@@ -408,7 +408,7 @@ fn request_permissions_tool_includes_full_permission_schema() {
             // The caller must read which permissions were actually granted, so
             // the response shape is published with the tool.
             output_schema: Some(
-                codex_protocol::request_permissions::RequestPermissionsResponse::output_schema()
+                codex_protocol::request_permissions::RequestPermissionsResponse::output_schema().into()
             ),
         })
     );
@@ -669,7 +669,7 @@ fn command_output_schemas_require_integral_counters_but_allow_fractional_time() 
         let ToolSpec::Function(tool) = tool else {
             panic!("expected command function tool");
         };
-        let schema = tool.output_schema.expect("command output schema");
+        let schema = tool.output_schema.expect("command output schema").into_value();
         let validator = jsonschema::validator_for(&schema).expect("valid output schema");
         let output = json!({
             "wall_time_seconds": 0.125,

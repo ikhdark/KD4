@@ -228,12 +228,12 @@ impl Drop for McpCallLease {
 
 pub struct McpHandler {
     tool_info: ToolInfo,
-    spec: ToolSpec,
+    spec: Arc<codex_tools::LoadableToolSpec>,
 }
 
 impl McpHandler {
     pub fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
-        let spec = create_tool_spec(&tool_info)?;
+        let spec = Arc::new(create_tool_spec(&tool_info)?);
         Ok(Self { tool_info, spec })
     }
 
@@ -307,7 +307,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        self.spec.clone()
+        self.spec.as_ref().clone().into()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
@@ -345,11 +345,22 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
                 .map(str::to_string),
         });
 
-        ToolSearchInfo::from_spec(
-            build_mcp_search_text(&self.tool_info, registered_spec),
-            registered_spec,
-            source_info,
-        )
+        let search_text = build_mcp_search_text(&self.tool_info, registered_spec);
+        // Registration may override the callable contract; only share an unchanged definition.
+        let unchanged = match (registered_spec, self.spec.as_ref()) {
+            (ToolSpec::Namespace(left), codex_tools::LoadableToolSpec::Namespace(right)) => left == right,
+            (ToolSpec::Function(left), codex_tools::LoadableToolSpec::Function(right)) => left == right,
+            _ => false,
+        };
+        if unchanged {
+            Some(ToolSearchInfo::from_shared_spec(
+                search_text,
+                Arc::clone(&self.spec),
+                source_info,
+            ))
+        } else {
+            ToolSearchInfo::from_spec(search_text, registered_spec, source_info)
+        }
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
@@ -502,7 +513,7 @@ impl CoreToolRuntime for McpHandler {
     }
 }
 
-fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error> {
+fn create_tool_spec(tool_info: &ToolInfo) -> Result<codex_tools::LoadableToolSpec, serde_json::Error> {
     let tool_name = tool_info.canonical_tool_name();
     let tool = mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?;
     let description = tool_info
@@ -521,7 +532,7 @@ fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error>
         })
         .unwrap_or_default();
 
-    Ok(ToolSpec::Namespace(ResponsesApiNamespace {
+    Ok(codex_tools::LoadableToolSpec::Namespace(ResponsesApiNamespace {
         name: tool_info.callable_namespace.clone(),
         description,
         tools: vec![ResponsesApiNamespaceTool::Function(tool)],

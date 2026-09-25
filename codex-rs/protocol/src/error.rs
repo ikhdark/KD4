@@ -15,10 +15,10 @@ use chrono::Datelike;
 use chrono::Local;
 use chrono::Utc;
 use codex_async_utils::CancelErr;
+use codex_http_client::RetryAfter;
 use http::StatusCode;
 use serde_json;
 use std::io;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::task::JoinError;
 
@@ -58,9 +58,9 @@ pub enum CodexErr {
     ///
     /// The Session loop treats this as a transient error and will automatically retry the turn.
     ///
-    /// Optionally includes the requested delay before retrying the turn.
+    /// Optionally includes the original server deadline before retrying the turn.
     #[error("stream disconnected before completion: {0}")]
-    Stream(String, Option<Duration>),
+    Stream(String, Option<RetryAfter>),
     #[error("{0}")]
     IncompleteResponse(Box<IncompleteResponse>),
     #[error("provider error {code:?}: {message}")]
@@ -114,7 +114,7 @@ pub enum CodexErr {
     #[error("{0}")]
     UsageLimitReached(UsageLimitReachedError),
     #[error("Selected model is at capacity. Please try a different model.")]
-    ServerOverloaded,
+    ServerOverloaded { retry_after: Option<RetryAfter> },
     #[error("{message}")]
     CyberPolicy { message: String },
     #[error("{0}")]
@@ -128,7 +128,7 @@ pub enum CodexErr {
     )]
     UsageNotIncluded,
     #[error("We're currently experiencing high demand, which may cause temporary errors.")]
-    InternalServerError,
+    InternalServerError { retry_after: Option<RetryAfter> },
     /// Retry limit exceeded.
     #[error("{0}")]
     RetryLimit(RetryLimitReachedError),
@@ -164,6 +164,35 @@ impl From<CancelErr> for CodexErr {
 }
 
 impl CodexErr {
+    pub fn retry_after(&self) -> Option<RetryAfter> {
+        match self {
+            Self::Stream(_, advice)
+            | Self::ServerOverloaded {
+                retry_after: advice,
+            }
+            | Self::InternalServerError {
+                retry_after: advice,
+            } => *advice,
+            Self::UnexpectedStatus(error) | Self::RegionRestricted(error) => error.retry_after,
+            Self::RetryLimit(error) => error.retry_after,
+            _ => None,
+        }
+    }
+
+    /// Prefer the original HTTP deadline over later provider-body advice.
+    pub fn with_retry_after(mut self, advice: Option<RetryAfter>) -> Self {
+        let slot = match &mut self {
+            Self::Stream(_, slot)
+            | Self::ServerOverloaded { retry_after: slot }
+            | Self::InternalServerError { retry_after: slot } => slot,
+            Self::UnexpectedStatus(error) | Self::RegionRestricted(error) => &mut error.retry_after,
+            Self::RetryLimit(error) => &mut error.retry_after,
+            _ => return self,
+        };
+        *slot = advice.or(*slot);
+        self
+    }
+
     pub fn is_retryable(&self) -> bool {
         match self {
             CodexErr::TurnAborted
@@ -189,7 +218,7 @@ impl CodexErr {
             | CodexErr::Spawn
             | CodexErr::SessionConfiguredNotFirstEvent
             | CodexErr::UsageLimitReached(_)
-            | CodexErr::ServerOverloaded
+            | CodexErr::ServerOverloaded { .. }
             | CodexErr::CyberPolicy { .. } => false,
             CodexErr::UnexpectedStatus(error) => {
                 error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error()
@@ -199,7 +228,7 @@ impl CodexErr {
             | CodexErr::RequestTimeout
             | CodexErr::ResponseStreamFailed(_)
             | CodexErr::ConnectionFailed(_)
-            | CodexErr::InternalServerError
+            | CodexErr::InternalServerError { .. }
             | CodexErr::InternalAgentDied
             | CodexErr::Io(_)
             | CodexErr::Json(_)
@@ -221,7 +250,7 @@ impl CodexErr {
             CodexErr::UsageLimitReached(_)
             | CodexErr::QuotaExceeded
             | CodexErr::UsageNotIncluded => CodexErrorInfo::UsageLimitExceeded,
-            CodexErr::ServerOverloaded => CodexErrorInfo::ServerOverloaded,
+            CodexErr::ServerOverloaded { .. } => CodexErrorInfo::ServerOverloaded,
             CodexErr::CyberPolicy { .. } => CodexErrorInfo::CyberPolicy,
             CodexErr::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {
                 http_status_code: self.http_status_code_value(),
@@ -234,7 +263,7 @@ impl CodexErr {
             },
             CodexErr::RefreshTokenFailed(_) => CodexErrorInfo::Unauthorized,
             CodexErr::SessionConfiguredNotFirstEvent
-            | CodexErr::InternalServerError
+            | CodexErr::InternalServerError { .. }
             | CodexErr::InternalAgentDied => CodexErrorInfo::InternalServerError,
             CodexErr::UnsupportedOperation(_)
             | CodexErr::InvalidRequest(_)
@@ -315,6 +344,7 @@ impl std::fmt::Display for ResponseStreamFailed {
 
 #[derive(Debug)]
 pub struct UnexpectedResponseError {
+    pub retry_after: Option<RetryAfter>,
     pub status: StatusCode,
     pub body: String,
     pub user_message: Option<String>,
@@ -402,6 +432,7 @@ fn truncate_with_ellipsis(text: &str, max_bytes: usize) -> String {
 
 #[derive(Debug)]
 pub struct RetryLimitReachedError {
+    pub retry_after: Option<RetryAfter>,
     pub status: StatusCode,
     pub request_id: Option<String>,
 }
@@ -511,10 +542,12 @@ impl std::fmt::Display for UsageLimitReachedError {
                     retry_suffix_after_or(self.resets_at.as_ref())
                 )
             }
-            Some(PlanType::Known(KnownPlan::Pro | KnownPlan::ProLite)) => format!(
-                "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
-                retry_suffix_after_or(self.resets_at.as_ref())
-            ),
+            Some(PlanType::Known(KnownPlan::Pro | KnownPlan::ProLite | KnownPlan::ProMax)) => {
+                format!(
+                    "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
+                    retry_suffix_after_or(self.resets_at.as_ref())
+                )
+            }
             Some(PlanType::Known(KnownPlan::Enterprise))
             | Some(PlanType::Known(KnownPlan::Edu)) => format!(
                 "You've hit your usage limit.{}",

@@ -168,7 +168,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         strict: false,
         defer_loading: None,
         parameters: command_parameters_schema(properties, "cmd"),
-        output_schema: Some(unified_exec_output_schema()),
+        output_schema: Some(unified_exec_output_schema().into()),
     })
 }
 
@@ -262,7 +262,7 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
             Some(vec!["session_id".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(unified_exec_output_schema()),
+        output_schema: Some(unified_exec_output_schema().into()),
     })
 }
 
@@ -394,7 +394,7 @@ pub fn create_request_permissions_tool(description: String) -> ToolSpec {
             Some(false.into()),
         ),
         output_schema: Some(
-            codex_protocol::request_permissions::RequestPermissionsResponse::output_schema(),
+            codex_protocol::request_permissions::RequestPermissionsResponse::output_schema().into(),
         ),
     })
 }

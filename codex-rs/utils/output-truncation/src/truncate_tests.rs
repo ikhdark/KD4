@@ -542,8 +542,6 @@ fn fork_validation_routes_receive_the_diagnostic_budget() {
         "just fmt-check-fast",
         "just sdk-ts-check",
         "just sdk-python-check",
-        "just source-map-check",
-        "just source-owners-check",
         "just --justfile codex-rs/justfile fmt-check",
         "just --justfile 'C:/repo with spaces/justfile' config-schema-check",
         "just --justfile 'C:/repo with spaces/justfile' config-schema-protocol-check",

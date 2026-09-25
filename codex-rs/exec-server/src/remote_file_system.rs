@@ -374,10 +374,13 @@ fn map_remote_error(error: ExecServerError) -> io::Error {
             code: INVALID_REQUEST_ERROR_CODE | INVALID_PARAMS_ERROR_CODE,
             message,
         } => io::Error::new(io::ErrorKind::InvalidInput, message),
-        ExecServerError::Server { message, .. } => io::Error::other(message),
         ExecServerError::Closed | ExecServerError::Disconnected(_) => {
             io::Error::new(io::ErrorKind::BrokenPipe, "exec-server transport closed")
         }
+        error if error.is_retryable_preparation_error() => {
+            io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+        }
+        ExecServerError::Server { message, .. } => io::Error::other(message),
         _ => io::Error::other(error.to_string()),
     }
 }
@@ -469,6 +472,39 @@ mod tests {
                     "exec-server transport closed".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn preparation_retryability_controls_filesystem_error_kind() {
+        let errors = [
+            ExecServerError::ConnectionAttempt(std::sync::Arc::new(
+                ExecServerError::EnvironmentRegistryHttp {
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
+                    code: None,
+                    message: "registry unavailable".to_string(),
+                },
+            )),
+            ExecServerError::Protocol("exec-server transport closed".to_string()),
+            ExecServerError::EnvironmentRegistryAuth("unauthorized".to_string()),
+            ExecServerError::WebSocketConnect {
+                url: "wss://executor.invalid".to_string(),
+                source: tokio_tungstenite::tungstenite::Error::Http(Box::new(
+                    http::Response::builder().status(401).body(None).unwrap(),
+                )),
+            },
+        ];
+        assert_eq!(
+            errors
+                .into_iter()
+                .map(|error| map_remote_error(error).kind())
+                .collect::<Vec<_>>(),
+            vec![
+                io::ErrorKind::BrokenPipe,
+                io::ErrorKind::Other,
+                io::ErrorKind::Other,
+                io::ErrorKind::Other
+            ],
         );
     }
 

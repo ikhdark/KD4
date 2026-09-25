@@ -14,7 +14,7 @@ fn tool_definition() -> ToolDefinition {
         ),
         output_schema: Some(serde_json::json!({
             "type": "object",
-        })),
+        }).into()),
         defer_loading: false,
     }
 }

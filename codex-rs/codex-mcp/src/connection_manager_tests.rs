@@ -367,6 +367,8 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
     let client_identity = Arc::clone(&client.startup_complete);
     let cancel_token = client.cancel_token.clone();
     previous.clients.insert("stdio".to_string(), client);
+    let resource_key = previous.resource_cache_key("stdio").expect("resource key");
+    assert!(previous.resource_cache_key("absent").is_none());
     let mcp_servers = HashMap::from([("stdio".to_string(), server)]);
     let (tx_event, rx_event) = async_channel::unbounded();
     drop(rx_event);
@@ -398,6 +400,14 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
     .await;
 
     let adopted = refreshed.clients.get("stdio").expect("adopted client");
+    assert!(refreshed.resource_cache_key("stdio").as_ref() == Some(&resource_key));
+    // An invalidation racing manager publication must also invalidate its replacement.
+    previous.invalidate_resource_caches();
+    let refreshed_key = refreshed
+        .resource_cache_key("stdio")
+        .expect("refreshed key");
+    assert!(refreshed_key != resource_key);
+    assert!(previous.resource_cache_key("stdio").as_ref() == Some(&refreshed_key));
     assert!(Arc::ptr_eq(&client_identity, &adopted.startup_complete));
     assert_eq!(adopted.manager_owners.load(Ordering::Acquire), 2);
 
@@ -408,6 +418,41 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
 
     drop(refreshed);
     assert!(cancel_token.is_cancelled());
+    assert!(resource_key.connection.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn resource_cache_key_changes_when_a_server_connection_is_replaced() {
+    let mut manager = McpConnectionManager::new_uninitialized(
+        &Constrained::allow_any(AskForApproval::OnRequest),
+        &Constrained::allow_any(PermissionProfile::default()),
+        true,
+    );
+    manager.clients.insert(
+        "apps".to_string(),
+        create_ready_async_managed_client(Vec::new()).await,
+    );
+    let first = manager
+        .resource_cache_key("apps")
+        .expect("first connection");
+    manager.clients.insert(
+        "apps".to_string(),
+        create_ready_async_managed_client(Vec::new()).await,
+    );
+    let second = manager
+        .resource_cache_key("apps")
+        .expect("replacement connection");
+    assert!(first != second);
+    assert!(first.connection.upgrade().is_none());
+    let manager = Arc::new(manager);
+    let weak = Arc::downgrade(&manager);
+    let resources = crate::McpResourceClient::new(move || {
+        weak.upgrade().map(|manager| (Arc::new(()), manager))
+    });
+    assert!(resources.server_cache_key("apps").as_ref() == Some(&second));
+    drop(manager);
+    assert!(resources.server_cache_key("apps").is_none());
+    assert!(second.connection.upgrade().is_none());
 }
 
 #[tokio::test]

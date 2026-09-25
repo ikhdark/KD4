@@ -1557,7 +1557,7 @@ mod tests {
             panic!("recovery uses a function spec");
         };
         let validator =
-            jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+            jsonschema::validator_for(&spec.output_schema.as_ref().expect("output schema").to_value())
                 .expect("valid output schema");
         for (selector, expected_status, expected_reason) in [
             (

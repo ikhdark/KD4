@@ -103,6 +103,8 @@ mod bottom_pane;
 mod branch_summary;
 mod chatwidget;
 mod cli;
+mod analytics;
+mod clock_format;
 mod clipboard_copy;
 mod clipboard_paste;
 mod collaboration_modes;

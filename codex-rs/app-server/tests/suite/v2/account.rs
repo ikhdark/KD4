@@ -2001,6 +2001,15 @@ async fn get_account_with_managed_bedrock_provider() -> Result<()> {
 
 #[tokio::test]
 async fn get_account_with_chatgpt() -> Result<()> {
+    assert_get_account_with_chatgpt("pro", AccountPlanType::Pro).await
+}
+
+#[tokio::test]
+async fn get_account_with_chatgpt_pro_max() -> Result<()> {
+    assert_get_account_with_chatgpt("promax", AccountPlanType::ProMax).await
+}
+
+async fn assert_get_account_with_chatgpt(raw_plan: &str, plan_type: AccountPlanType) -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(
         codex_home.path(),
@@ -2013,7 +2022,7 @@ async fn get_account_with_chatgpt() -> Result<()> {
         codex_home.path(),
         ChatGptAuthFixture::new("access-chatgpt")
             .email("user@example.com")
-            .plan_type("pro"),
+            .plan_type(raw_plan),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -2040,7 +2049,7 @@ async fn get_account_with_chatgpt() -> Result<()> {
     let expected = GetAccountResponse {
         account: Some(Account::Chatgpt {
             email: Some("user@example.com".to_string()),
-            plan_type: AccountPlanType::Pro,
+            plan_type,
         }),
         requires_openai_auth: true,
     };

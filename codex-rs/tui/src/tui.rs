@@ -462,7 +462,7 @@ fn restore_common(
         KeyboardRestore::ResetAfterExit => keyboard_modes::reset_keyboard_reporting_after_exit(),
     }
 
-    if let Err(err) = execute!(stdout(), DisableBracketedPaste) {
+    if let Err(err) = execute!(stdout(), DisableBracketedPaste, crossterm::event::DisableMouseCapture) {
         first_error.get_or_insert(err);
     }
     let _ = execute!(stdout(), DisableFocusChange);
@@ -606,6 +606,7 @@ fn set_panic_hook() {
 pub enum TuiEvent {
     /// A terminal key event after focus, paste, and protocol bookkeeping has been handled.
     Key(KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
     /// A bracketed paste payload normalized by the app layer before it reaches the composer.
     Paste(String),
     /// A terminal size notification that should be handled as resize-sensitive draw work.
@@ -646,7 +647,7 @@ struct PendingHistoryLines {
 
 fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
 where
-    B: Backend + Write,
+    B: Backend<Error = std::io::Error> + Write,
 {
     let clear_position = if terminal.viewport_area.is_empty() {
         new_area.as_position()
@@ -845,6 +846,14 @@ impl Tui {
         setup
     }
 
+    pub(crate) fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            execute!(self.terminal.backend_mut(), crossterm::event::EnableMouseCapture)
+        } else {
+            execute!(self.terminal.backend_mut(), crossterm::event::DisableMouseCapture)
+        }
+    }
+
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
         if !self.is_alt_screen_active() {
@@ -949,7 +958,7 @@ impl Tui {
         pending_history_lines: &mut Vec<PendingHistoryLines>,
     ) -> Result<()>
     where
-        B: Backend + Write,
+        B: Backend<Error = std::io::Error> + Write,
     {
         if pending_history_lines.is_empty() {
             return Ok(());

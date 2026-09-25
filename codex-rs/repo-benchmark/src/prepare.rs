@@ -57,7 +57,7 @@ pub struct PrepareOptions {
 
 /// Upstream release tags bump `[workspace.package].version` without
 /// regenerating `Cargo.lock`, so the committed lock records its own members at
-/// their pre-release version and Cargo's `--locked` builds refuse the checkout.
+/// their pre-release version rather than the version being built.
 /// Offline resolution repairs exactly those member entries; this records the
 /// repair so the changed working tree stays accountable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -526,13 +526,7 @@ fn freeze_harness_sources(repo: &Path, destination: &Path) -> Result<FileIdentit
 fn snapshot_shared_inputs(repo: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     copy_tree(&repo.join("scripts"), &destination.join("scripts"))?;
-    for name in [
-        "source_owners.toml",
-        "architecture_index.json",
-        "SOURCEMAP.md",
-        "kd4_features.toml",
-        "justfile",
-    ] {
+    for name in ["kd4_features.toml", "justfile"] {
         let input = repo.join(name);
         if input.is_file() {
             fs::copy(input, destination.join(name))?;
@@ -657,8 +651,8 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
     {
         fork_targets.push(("codex-code-mode-host", "codex-code-mode-host"));
     }
-    // Both builds run Cargo with --locked, and the build cache key includes the
-    // lockfile hash, so reconcile before the build reads this checkout.
+    // The build cache key includes the lockfile hash, so reconcile before the
+    // build reads this checkout.
     reconcile_lock(&mut fork, &environment, &fork_targets)?;
     let fork_build = builds::build(
         &fork.checkout,

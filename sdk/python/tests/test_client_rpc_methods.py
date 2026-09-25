@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import queue
 import sys
+import threading
+from collections import deque
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from openai_codex._message_router import MessageRouter
 from openai_codex.api import TurnHandle
 from openai_codex.client import (
     CodexClient,
@@ -25,7 +28,7 @@ from openai_codex.generated.v2_all import (
     TurnCompletedNotification,
     WarningNotification,
 )
-from openai_codex.models import UnknownNotification
+from openai_codex.models import Notification, UnknownNotification
 
 _STDERR_TAIL_MAX_BYTES = 64 * 1024
 _STDERR_TRUNCATION_MARKER = f"[stderr truncated; showing last {_STDERR_TAIL_MAX_BYTES} bytes]\n"
@@ -245,6 +248,43 @@ def test_reader_routes_interleaved_typed_and_unknown_notifications(register_late
         assert completion.payload.turn.id == "turn-1"
     finally:
         client.close()
+
+
+def test_turn_registration_keeps_buffered_events_ahead_of_concurrent_events() -> None:
+    """Events routed while registration replays the early buffer must queue after it."""
+    router = MessageRouter()
+
+    def delta(text: str) -> Notification:
+        return Notification(
+            "item/agentMessage/delta",
+            AgentMessageDeltaNotification(
+                delta=text, item_id="item-1", thread_id="thread-1", turn_id="turn-1"
+            ),
+        )
+
+    router.route_notification(delta("early-1"))
+    router.route_notification(delta("early-2"))
+    concurrent_routes: list[threading.Thread] = []
+
+    class ReplayInterleavedWithReader(deque):
+        def __iter__(self):
+            # The reader thread routes a newer event while the caller replays.
+            reader = threading.Thread(target=router.route_notification, args=(delta("late"),))
+            reader.start()
+            reader.join(timeout=0.2)
+            concurrent_routes.append(reader)
+            return super().__iter__()
+
+    router._pending_turn_notifications["turn-1"] = ReplayInterleavedWithReader(  # noqa: SLF001
+        router._pending_turn_notifications["turn-1"]  # noqa: SLF001
+    )
+    router.register_turn("turn-1")
+    for reader in concurrent_routes:
+        reader.join(timeout=5)
+
+    assert [
+        router.next_turn_notification("turn-1", timeout_s=5).payload.delta for _ in range(3)
+    ] == ["early-1", "early-2", "late"]
 
 
 def test_goal_notifications_arriving_on_stdout_route_by_thread() -> None:

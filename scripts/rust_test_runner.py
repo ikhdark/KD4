@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -26,10 +27,10 @@ import tomllib
 
 try:
     from .process_owner import owned_process, CleanupFailed
-    from .rust_tool_env import cargo_package_specs
+    from .rust_tool_env import cargo_package_specs, local_rust_env
 except ImportError:
     from process_owner import owned_process, CleanupFailed
-    from rust_tool_env import cargo_package_specs
+    from rust_tool_env import cargo_package_specs, local_rust_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_RS_ROOT = REPO_ROOT / "codex-rs"
@@ -620,7 +621,14 @@ class RustTestRunner:
         self.executor = executor
         self.cwd = cwd
         self.no_fail_fast = no_fail_fast
-        self.base_env = dict(os.environ if env is None else env)
+        self.base_env = {
+            key: value
+            for key, value in (os.environ if env is None else env).items()
+            # Only helpers built for this run may satisfy a helper lookup.
+            if not key.upper().startswith("CARGO_BIN_EXE_")
+        }
+        self.environment_updates = local_rust_env(self.base_env, repo_root=REPO_ROOT)
+        self.base_env.update(self.environment_updates)
         self.base_env["CODEX_RUST_TEST_LOG_DIR"] = str(
             self.target_dir / "test-runner-logs"
         )
@@ -633,12 +641,13 @@ class RustTestRunner:
                     "command timeout must be a finite positive number of seconds"
                 )
             self.base_env["CODEX_RUST_TEST_TIMEOUT_SECS"] = str(command_timeout_seconds)
-        # Ordinary acceptance must never update its expected outputs implicitly.
+        # Ordinary acceptance must never update or force-pass its expected outputs.
         self.base_env["INSTA_UPDATE"] = "no"
+        self.base_env["INSTA_FORCE_PASS"] = "0"
         self.base_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
         self._sccache_disabled = False
-        # CARGO_INCREMENTAL stays untouched on purpose. `scripts/just-shell.py`
-        # points RUSTC_WRAPPER at sccache for every recipe, and sccache aborts
+        # CARGO_INCREMENTAL stays untouched on purpose. The shared launcher policy
+        # points RUSTC_WRAPPER at sccache, and sccache aborts
         # the whole build when that variable asks for incremental compilation
         # while refusing to honor it when it asks for "0". Leaving it unset lets
         # `codex-rs/.cargo/config.toml` give workspace crates the incremental
@@ -683,16 +692,32 @@ class RustTestRunner:
     def _group_gate_steps(
         self, names: Sequence[str], *, exact_only: bool = False
     ) -> list[GateStep]:
-        groups: dict[tuple[str, str, str | None], list[GateStep]] = {}
+        groups: dict[
+            tuple[str, str, str | None, frozenset[str]],
+            tuple[tuple[str, ...], list[GateStep]],
+        ] = {}
         for name in dict.fromkeys(names):
             for step in self.gate(name).steps:
                 if exact_only and step.filterset is not None:
                     continue
                 target = self.target(step.target)
-                key = (target.package, target.selector_kind, target.selector_value)
-                groups.setdefault(key, []).append(step)
+                helpers = tuple(
+                    helper.name
+                    for helper in self._active_helper_names(
+                        target.helpers if step.helpers is None else step.helpers
+                    )
+                )
+                # A step proves its tests with exactly its declared helpers, so
+                # steps share a run only when both Cargo target and helpers match.
+                key = (
+                    target.package,
+                    target.selector_kind,
+                    target.selector_value,
+                    frozenset(helpers),
+                )
+                groups.setdefault(key, (helpers, []))[1].append(step)
         grouped = []
-        for steps in groups.values():
+        for helpers, steps in groups.values():
             filters = list(
                 dict.fromkeys(self._gate_filter_args(step)[1] for step in steps)
             )
@@ -703,17 +728,7 @@ class RustTestRunner:
                     if len(filters) == 1
                     else " | ".join(f"({value})" for value in filters),
                     tuple(dict.fromkeys(test for step in steps for test in step.tests)),
-                    tuple(
-                        dict.fromkeys(
-                            helper
-                            for step in steps
-                            for helper in (
-                                self.target(step.target).helpers
-                                if step.helpers is None
-                                else step.helpers
-                            )
-                        )
-                    ),
+                    helpers,
                 )
             )
         return grouped
@@ -728,6 +743,11 @@ class RustTestRunner:
                 "target_dir": str(self.target_dir),
                 "selection": target.selection_args(),
                 "helpers": [helper.name for helper in helpers],
+                "helper_selection": "upper bound; nextest discovery narrows helpers"
+                if target.helpers_by_test_prefix
+                else "exact",
+                "discovery_builds_test_binary": bool(target.helpers_by_test_prefix),
+                "environment_defaults": self.environment_updates,
                 "builds": self._helper_build_commands(helpers),
                 "run": self._run_command(target, []),
             }
@@ -744,6 +764,7 @@ class RustTestRunner:
                     {
                         "target": step.target,
                         "tests": list(step.tests),
+                        "helpers": list(step.helpers or ()),
                         "list": self._list_command(target, filter_args),
                         "run": self._gate_run_command(
                             target,
@@ -770,9 +791,21 @@ class RustTestRunner:
         allow_all: bool = False,
     ) -> None:
         args = validate_filtering_args(filter_args)
-        require_core_lib_filter(name, args, allow_all=allow_all)
         target = self.target(name)
+        require_core_lib_filter(target, args, allow_all=allow_all)
         helpers = self.active_helpers([name])
+        print(
+            f"Rust test target {name}: {subprocess.list2cmdline(target.selection_args())}; "
+            f"target-dir={self.target_dir}; helper upper bound="
+            + (", ".join(helper.name for helper in helpers) or "none"),
+            file=sys.stderr,
+        )
+        if self.environment_updates:
+            print(
+                "Rust environment defaults: "
+                + json.dumps(self.environment_updates, sort_keys=True),
+                file=sys.stderr,
+            )
         # Discovery is worthwhile only if some prefix can omit an active helper.
         # Otherwise the direct run already rejects an empty selection.
         if any(
@@ -781,6 +814,10 @@ class RustTestRunner:
         ):
             # Let nextest interpret filters, exclusions and ignored tests. Listing
             # builds the unit binary without building unrelated helper binaries.
+            print(
+                "Selecting tests with nextest list (this compiles the test binary).",
+                file=sys.stderr,
+            )
             selected = self._list_tests(target, args)
             required = []
             for test in selected:
@@ -795,7 +832,7 @@ class RustTestRunner:
                     )
                 )
             helpers = self._active_helper_names(required)
-        env = self._build_helper_environment(helpers)
+        env = self._helper_environment([target], helpers, self._build_helpers(helpers))
         self._checked(
             self._run_command(target, args, no_fail_fast=no_fail_fast),
             env=env,
@@ -849,7 +886,8 @@ class RustTestRunner:
     def run_gates(
         self, names: Sequence[str], *, quiet: bool = False, discover: bool = False
     ) -> dict[str, list[str]]:
-        """Verify exact selections, prepare helpers once, and execute each test once."""
+        """Verify exact selections, build helpers once, and execute each test once
+        per declared helper set with only that set exported."""
         if not names:
             raise RunnerError("at least one gate is required")
         grouped = self._group_gate_steps(names)
@@ -858,7 +896,7 @@ class RustTestRunner:
         # of the declared IDs alone cannot detect an over-broad source filter.
         self.check_gates(names, include_generated=discover)
 
-        env = self._build_helper_environment(
+        artifacts = self._build_helpers(
             self._active_helper_names(
                 helper for step in grouped for helper in step.helpers or ()
             )
@@ -866,6 +904,9 @@ class RustTestRunner:
         failures: list[RunnerError] = []
         for step in grouped:
             target = self.target(step.target)
+            env = self._helper_environment(
+                [target], self._active_helper_names(step.helpers or ()), artifacts
+            )
             filter_args = ["-E", " | ".join(f"test(={test})" for test in step.tests)]
             try:
                 result = self._checked(
@@ -883,8 +924,6 @@ class RustTestRunner:
             # unrelated filtered-out skips, and disallow retries for this proof.
             passed: dict[str, int] = {}
             unexpected = False
-            skipped = False
-            zero_tests = False
             expected = set(step.tests)
             suffix = (
                 f"bin/{target.selector_value}"
@@ -908,8 +947,6 @@ class RustTestRunner:
                             passed[test] = min(2, passed.get(test, 0) + 1)
                         else:
                             unexpected = True
-                    skipped |= re.match(r"\s*SKIP\s+\[", line) is not None
-                    zero_tests |= re.search(r"\b0 tests run\b", line) is not None
             if (
                 unexpected
                 or set(passed) != expected
@@ -917,16 +954,14 @@ class RustTestRunner:
             ):
                 if not quiet:
                     print(self._failure_detail(result))
-                outcome = "not_executed"
-                if skipped:
-                    outcome = "skipped"
-                elif zero_tests:
-                    outcome = "zero_tests"
+                # `--status-level pass` hides SKIP lines and `--no-tests=fail`
+                # fails an empty run before this point, so a missing or ignored
+                # test is only known as not executed; `check-gates` names it.
                 failures.append(
                     RunnerError(
                         f"gate {step.target!r} did not report every required test passed exactly once: "
                         f"expected={sorted(step.tests)}, passed={passed}, unexpected={unexpected}",
-                        outcome=outcome,
+                        outcome="not_executed",
                     )
                 )
             elif not quiet:
@@ -987,8 +1022,10 @@ class RustTestRunner:
                 f"missing={missing}, additions={added}, ignored_state_changes={ignored_changes}"
             )
 
-        all_names = [legacy_name, *replacement_names]
-        env = self._build_helper_environment(self.active_helpers(all_names))
+        helpers = self.active_helpers([legacy_name, *replacement_names])
+        env = self._helper_environment(
+            [legacy, *replacements], helpers, self._build_helpers(helpers)
+        )
         legacy_env = dict(env)
         legacy_env["INSTA_UPDATE"] = "no"
         replacement_env = dict(env)
@@ -1008,12 +1045,7 @@ class RustTestRunner:
         failed_runs: list[str] = []
         for target, run_env in behavior_runs:
             command = self._run_command(target, behavior_args, internal_args=True)
-            result = self.executor(
-                command,
-                cwd=CODEX_RS_ROOT,
-                env=run_env,
-                capture=CAPTURE_NONE,
-            )
+            result = self._execute(command, env=run_env, capture=CAPTURE_NONE)
             if result.returncode != 0:
                 detail = self._failure_detail(result)
                 rendered = subprocess.list2cmdline(command)
@@ -1113,7 +1145,6 @@ class RustTestRunner:
             "cargo",
             "nextest",
             verb,
-            "--locked",
             "--target-dir",
             str(self.target_dir),
             *target.selection_args(),
@@ -1156,7 +1187,6 @@ class RustTestRunner:
         return [
             "cargo",
             "build",
-            "--locked",
             "--message-format=json-render-diagnostics",
             "--target-dir",
             str(self.target_dir),
@@ -1183,21 +1213,20 @@ class RustTestRunner:
             )
         return tests
 
-    def _build_helper_environment(self, helpers: Sequence[Helper]) -> dict[str, str]:
-        env = dict(self.base_env)
+    def _build_helpers(self, helpers: Sequence[Helper]) -> dict[str, Path]:
+        print(
+            "Selected Rust helpers: "
+            + (", ".join(helper.name for helper in helpers) or "none"),
+            file=sys.stderr,
+        )
         command = self._helper_build(helpers)
         if command is None:
-            return env
-        result = self._checked(command, env=env, capture=CAPTURE_STDOUT)
-        helper_dirs: list[str] = []
+            return {}
+        result = self._checked(command, env=self.base_env, capture=CAPTURE_STDOUT)
+        artifacts: dict[str, Path] = {}
         for helper in helpers:
             executable = self._helper_artifact(helper, _output_lines(result, "stdout"))
-            if str(executable.parent) not in helper_dirs:
-                helper_dirs.append(str(executable.parent))
-            dashed = f"CARGO_BIN_EXE_{helper.binary}"
-            underscored = f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"
-            env[dashed] = str(executable)
-            env[underscored] = str(executable)
+            artifacts[helper.name] = executable
             # Test executables resolve bundled helpers before consulting PATH.
             # Refresh that generated layout after every helper build as well.
             if os.name == "nt" and helper.binary in {
@@ -1207,9 +1236,41 @@ class RustTestRunner:
                 resources = executable.parent / "deps" / "codex-resources"
                 resources.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(executable, resources / executable.name)
-        # Native sandbox setup also locates helpers by executable name. Prefer
-        # this build over an older installed executable inherited through PATH.
-        env["PATH"] = os.pathsep.join([*helper_dirs, env.get("PATH", "")])
+        return artifacts
+
+    def _helper_environment(
+        self,
+        targets: Sequence[Target],
+        helpers: Sequence[Helper],
+        artifacts: Mapping[str, Path],
+    ) -> dict[str, str]:
+        env = dict(self.base_env)
+        # `cargo_bin` falls back to `<lane>/debug/<name>` when its variable is
+        # unset, so an undeclared helper would silently run whatever an earlier
+        # build left in this persistent lane. Point every manifest helper at a
+        # path that cannot exist; the selected helpers below replace it. Cargo
+        # rebuilds a package's own binaries for its integration tests.
+        fresh_packages = {
+            target.package for target in targets if target.selector_kind == "test"
+        }
+        for helper in self.manifest.helpers.values():
+            if helper.package not in fresh_packages:
+                undeclared = str(
+                    self.target_dir / "test-runner-undeclared-helpers" / helper.binary
+                )
+                env[f"CARGO_BIN_EXE_{helper.binary}"] = undeclared
+                env[f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"] = undeclared
+        helper_dirs: list[str] = []
+        for helper in helpers:
+            executable = artifacts[helper.name]
+            if str(executable.parent) not in helper_dirs:
+                helper_dirs.append(str(executable.parent))
+            env[f"CARGO_BIN_EXE_{helper.binary}"] = str(executable)
+            env[f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"] = str(executable)
+        if helper_dirs:
+            # Native sandbox setup also locates helpers by executable name. Prefer
+            # this build over an older installed executable inherited through PATH.
+            env["PATH"] = os.pathsep.join([*helper_dirs, env.get("PATH", "")])
         return env
 
     def _helper_artifact(self, helper: Helper, output: str | Iterable[str]) -> Path:
@@ -1243,6 +1304,21 @@ class RustTestRunner:
             )
         return executables[0].resolve()
 
+    def _execute(
+        self,
+        args: Sequence[str],
+        *,
+        env: Mapping[str, str],
+        capture: str,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return self.executor(
+                list(args), cwd=self.cwd, env=dict(env), capture=capture
+            )
+        except CleanupFailed as error:
+            (self.target_dir / ".lane-cleanup-unconfirmed").write_text(str(error))
+            raise RunnerError(str(error), outcome="cleanup_failed") from error
+
     def _checked(
         self,
         args: Sequence[str],
@@ -1254,16 +1330,34 @@ class RustTestRunner:
         if self._sccache_disabled:
             effective_env["RUSTC_WRAPPER"] = ""
         for attempt in range(2):
+            phase = (
+                "compile/discover"
+                if list(args[:3]) == ["cargo", "nextest", "list"]
+                else "helper-build"
+                if list(args[:2]) == ["cargo", "build"]
+                else "build/test"
+            )
+            started = time.monotonic()
+            result = None
+            print(
+                f"Rust phase {phase}: starting {subprocess.list2cmdline(list(args))}",
+                file=sys.stderr,
+            )
             try:
-                result = self.executor(
-                    list(args),
-                    cwd=self.cwd,
-                    env=dict(effective_env),
-                    capture=capture,
+                result = self._execute(args, env=effective_env, capture=capture)
+            finally:
+                elapsed = time.monotonic() - started
+                reported = (
+                    self._reported_durations(result) if result is not None else {}
                 )
-            except CleanupFailed as error:
-                (self.target_dir / ".lane-cleanup-unconfirmed").write_text(str(error))
-                raise RunnerError(str(error), outcome="cleanup_failed") from error
+                print(
+                    f"Rust phase {phase}: wall={elapsed:.3f}s; "
+                    f"exit={result.returncode if result is not None else 'interrupted'}"
+                    + "".join(
+                        f"; {key}={value:.3f}s" for key, value in reported.items()
+                    ),
+                    file=sys.stderr,
+                )
             if attempt or not self._cache_transport_failure(
                 args, effective_env, result
             ):
@@ -1283,6 +1377,13 @@ class RustTestRunner:
                 result, include_stdout=capture == CAPTURE_BOTH
             )
             rendered = subprocess.list2cmdline(list(args))
+            if result.returncode in (-1, 0xFFFFFFFF):
+                detail = (
+                    "Process exited 0xFFFFFFFF without a normal Cargo exit code. "
+                    "Inspect retained logs and process-owner/OS termination evidence; "
+                    "this is not classified as a test failure or retried automatically.\n"
+                    + detail
+                )
             if detail:
                 raise RunnerError(
                     f"command failed ({rendered}), exit code {result.returncode}:\n{detail}"
@@ -1291,6 +1392,27 @@ class RustTestRunner:
                 f"command failed ({rendered}), exit code {result.returncode}"
             )
         return result
+
+    @staticmethod
+    def _reported_durations(
+        result: subprocess.CompletedProcess[str],
+    ) -> dict[str, float]:
+        """Separate Cargo/Nextest-reported times without another build or test run."""
+        durations: dict[str, float] = {}
+        for stream in ("stdout", "stderr"):
+            for line in _output_lines(result, stream):
+                line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                if match := re.search(
+                    r"Finished .* in ((?:[\d.]+(?:ms|[hms])\s*)+)", line
+                ):
+                    units = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+                    durations["cargo-reported"] = sum(
+                        float(value) * units[unit]
+                        for value, unit in re.findall(r"([\d.]+)(ms|[hms])", match[1])
+                    )
+                if match := re.search(r"Summary\s+\[\s*([\d.]+)s\]", line):
+                    durations["tests-reported"] = float(match[1])
+        return durations
 
     @staticmethod
     def _cache_transport_failure(
@@ -1324,7 +1446,12 @@ class RustTestRunner:
                     in line
                 )
                 transport |= "sccache: caused by: failed to connect to server" in line
-        return transport and compile_failed
+        # A failed discovery can lose Cargo's final compilation summary when
+        # sccache disconnects. Listing cannot execute tests, so it remains safe
+        # to retry without that summary; keep the stricter run/build guard.
+        return transport and (
+            compile_failed or list(args[:3]) == ["cargo", "nextest", "list"]
+        )
 
     def _failure_detail(
         self,
@@ -1552,8 +1679,16 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
     return args
 
 
-def require_core_lib_filter(name: str, args: Sequence[str], *, allow_all: bool) -> None:
-    if name != "core_lib" or allow_all:
+def require_core_lib_filter(
+    target: Target | None, args: Sequence[str], *, allow_all: bool
+) -> None:
+    # The guard belongs to the codex-core library suite, not to one manifest
+    # name for it: an alias must not run the whole suite unfiltered.
+    if (
+        allow_all
+        or target is None
+        or (target.package, target.selector_kind) != ("codex-core", "lib")
+    ):
         return
     index = 0
     while index < len(args):
@@ -1572,7 +1707,7 @@ def require_core_lib_filter(name: str, args: Sequence[str], *, allow_all: bool) 
             return
         index += 1
     raise RunnerError(
-        "core_lib requires an explicit test filter (-E <filterset> or a test name). "
+        f"{target.name} requires an explicit test filter (-E <filterset> or a test name). "
         "Use a named core-gate for its declared scope, or --all only when the full "
         "library suite is intended."
     )
@@ -1616,16 +1751,21 @@ def load_metadata(
     command_timeout_seconds: float | None = None,
 ) -> MetadataIndex:
     env = dict(os.environ)
+    env.update(local_rust_env(env, repo_root=REPO_ROOT))
     if command_timeout_seconds is not None:
         if not math.isfinite(command_timeout_seconds) or command_timeout_seconds <= 0:
             raise RunnerError("command timeout must be a finite positive number")
         env["CODEX_RUST_TEST_TIMEOUT_SECS"] = str(command_timeout_seconds)
-    result = executor(
-        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
-        cwd=cwd,
-        env=env,
-        capture=CAPTURE_BOTH,
-    )
+    try:
+        result = executor(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+            cwd=cwd,
+            env=env,
+            capture=CAPTURE_BOTH,
+        )
+    except CleanupFailed as error:
+        # Metadata never builds into a lane, so there is no lane to mark.
+        raise RunnerError(str(error), outcome="cleanup_failed") from error
     log_paths = "\n".join(
         f"Full {name}: {path}"
         for name in ("stdout", "stderr")
@@ -1756,11 +1896,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             filter_args, owned = _split_runner_owned_options(filter_args)
             no_fail_fast = no_fail_fast or "--no-fail-fast" in owned
             allow_all = allow_all or "--all" in owned
-            require_core_lib_filter(
-                args.name, validate_filtering_args(filter_args), allow_all=allow_all
-            )
+            validate_filtering_args(filter_args)
 
         manifest = Manifest.load(args.manifest)
+        if args.command == "run-target":
+            require_core_lib_filter(
+                manifest.targets.get(args.name), filter_args, allow_all=allow_all
+            )
         if args.command == "list-targets":
             for name in manifest.targets:
                 print(f"target\t{name}")

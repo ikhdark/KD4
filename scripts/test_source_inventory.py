@@ -63,7 +63,7 @@ class SourceInventoryTests(unittest.TestCase):
         query = {"categories": [{"name": "sources", "paths": ["*.rs"], "verification": "path"}],
                  "candidates": [{"path": "nested/target/deep/build.rs", "category": "sources"}]}
         real_run = inventory.repository_source_records.__globals__["subprocess"].run
-        with mock.patch("scripts.source_map_check.subprocess.run", wraps=real_run) as run:
+        with mock.patch("scripts.source_inventory.subprocess.run", wraps=real_run) as run:
             output, state = inventory.inventory(self.root, query)
         argv = run.call_args.args[0]
         self.assertIn("--exclude=target/", argv)
@@ -311,7 +311,7 @@ class SourceInventoryTests(unittest.TestCase):
         for path in ["unrelated/AGENTS.md", "src/feature/target/deep/AGENTS.md", "src/feature/node_modules/AGENTS.md"]:
             self.file(path, tracked=False)
         real_run = inventory.repository_source_records.__globals__["subprocess"].run
-        with mock.patch("scripts.source_map_check.subprocess.run", wraps=real_run) as run:
+        with mock.patch("scripts.source_inventory.subprocess.run", wraps=real_run) as run:
             paths = inventory.instruction_paths(self.root, ["src/feature"])
         self.assertEqual(paths, ["AGENTS.md", "src/AGENTS.md", "src/feature/AGENTS.override.md", "src/feature/nested/AGENTS.md"])
         argv = run.call_args.args[0]

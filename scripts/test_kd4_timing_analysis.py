@@ -322,6 +322,24 @@ class SharedTimingAnalysisTest(unittest.TestCase):
             self.assertEqual(complete["tokens"]["inputTokens"], 102400)
             self.assertEqual(analysis.continuation_count(timing), 1023)
 
+    def test_retry_and_fallback_attempts_are_not_continuations(self):
+        # The runtime flags every row after the turn's first as a continuation,
+        # retries included. Three logical generations have two continuations.
+        timing = timing_profile()
+        timing["modelRequests"] = [
+            {"generationIndex": index, "attemptKind": kind, "isContinuation": flag}
+            for index, kind, flag in (
+                (0, "primary", False),
+                (0, "retry", True),
+                (1, "primary", True),
+                (1, "fallback", True),
+                (2, "primary", True),
+            )
+        ]
+        timing["counters"]["modelRequestCount"] = 5
+        self.assertEqual(analysis.continuation_count(timing), 2)
+        self.assertEqual(analysis.analyze_timing(timing)["continuationCount"], 2)
+
     def test_contradictory_provider_usage_is_unavailable_through_audit(self):
         timing = timing_profile()
         timing["modelRequests"] = timing["modelRequests"][:1]

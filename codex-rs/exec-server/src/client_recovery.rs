@@ -623,7 +623,7 @@ pub(super) fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
         )
 }
 
-fn is_retryable_registry_error(error: &ExecServerError) -> bool {
+pub(crate) fn is_retryable_registry_error(error: &ExecServerError) -> bool {
     matches!(
         error,
         ExecServerError::EnvironmentRegistryRequest(error)

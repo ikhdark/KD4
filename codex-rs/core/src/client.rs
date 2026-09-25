@@ -183,6 +183,7 @@ pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
 pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
+pub const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 pub const X_OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
@@ -3008,8 +3009,12 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
+        routing_hint: Option<HeaderValue>,
     ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
-        let headers = self.build_websocket_headers(responses_metadata).await;
+        let mut headers = self.build_websocket_headers(responses_metadata).await;
+        if let Some(routing_hint) = routing_hint {
+            headers.insert(X_CODEX_ROUTING_HINT_HEADER, routing_hint);
+        }
         let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
             session_telemetry,
             auth_context.clone(),
@@ -3705,55 +3710,77 @@ impl ModelClientSession {
     /// This performs only connection setup; it never sends prompt payloads.
     pub async fn preconnect_websocket(
         &mut self,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
-    ) -> std::result::Result<(), ApiError> {
+    ) -> Result<()> {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.connection.is_some() {
-            return Ok(());
-        }
 
-        let client_setup = self.client.current_client_setup().await.map_err(|err| {
-            ApiError::Stream(format!(
-                "failed to build websocket prewarm client setup: {err}"
-            ))
-        })?;
-        let setup_fingerprint =
-            websocket_setup_fingerprint(&client_setup.api_provider, client_setup.api_auth.as_ref());
-        let auth_context = AuthRequestTelemetryContext::new(
-            client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-            client_setup.api_auth.as_ref(),
-            client_setup.agent_identity_telemetry.clone(),
-            PendingUnauthorizedRetry::default(),
-        );
-        let connection = match self
-            .client
-            .connect_websocket(
-                session_telemetry,
-                client_setup.api_provider,
-                client_setup.api_auth,
-                responses_metadata,
-                auth_context,
-                RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
-            )
-            .await
-        {
-            Ok(connection) => connection,
-            Err(err @ ApiError::Transport(TransportError::Http { status, .. }))
-                if status == StatusCode::UPGRADE_REQUIRED =>
+        let provider = Arc::clone(&self.client.state.provider);
+        let auth_manager = provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                pending_retry,
+            );
+            let routing_hint = build_routing_hint_header(
+                client_setup
+                    .auth
+                    .as_ref()
+                    .filter(|_| provider.info().is_openai()),
+                &client_setup.api_provider,
+                &model_info.slug,
+                model_info
+                    .service_tier_for_request(service_tier.clone())
+                    .as_deref(),
+            );
+            match self
+                .websocket_connection(WebsocketConnectParams {
+                    session_telemetry,
+                    api_provider: client_setup.api_provider,
+                    api_auth: client_setup.api_auth,
+                    responses_metadata,
+                    auth_context,
+                    request_route_telemetry: RequestRouteTelemetry::for_endpoint(
+                        RESPONSES_ENDPOINT,
+                    ),
+                    routing_hint,
+                })
+                .await
             {
-                self.client.force_http_fallback(session_telemetry);
-                return Err(err);
+                Ok(_) => return Ok(()),
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::UPGRADE_REQUIRED =>
+                {
+                    self.client.force_http_fallback(session_telemetry);
+                    return Ok(());
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            session_telemetry,
+                            &provider,
+                        )
+                        .await?,
+                    );
+                }
+                Err(err) => return Err(provider.map_api_error(err)),
             }
-            Err(err) => return Err(err),
-        };
-        self.websocket_session.connection = Some(connection);
-        self.websocket_session.setup_fingerprint = setup_fingerprint;
-        self.websocket_session
-            .set_connection_reused(/*connection_reused*/ false);
-        Ok(())
+        }
     }
     /// Returns a websocket connection for this turn.
     #[instrument(
@@ -3779,6 +3806,7 @@ impl ModelClientSession {
             responses_metadata,
             auth_context,
             request_route_telemetry,
+            routing_hint,
         } = params;
         let setup_fingerprint = websocket_setup_fingerprint(&api_provider, api_auth.as_ref());
         let needs_new = match self.websocket_session.connection.as_ref() {
@@ -3801,6 +3829,7 @@ impl ModelClientSession {
                     responses_metadata,
                     auth_context,
                     request_route_telemetry,
+                    routing_hint,
                 )
                 .await
             {
@@ -4305,6 +4334,15 @@ impl ModelClientSession {
             let connection_result = self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
+                    routing_hint: build_routing_hint_header(
+                        client_setup
+                            .auth
+                            .as_ref()
+                            .filter(|_| self.client.state.provider.info().is_openai()),
+                        &client_setup.api_provider,
+                        &request.model,
+                        request.service_tier.as_deref(),
+                    ),
                     api_provider: client_setup.api_provider.clone(),
                     api_auth: client_setup.api_auth,
                     responses_metadata,
@@ -5524,6 +5562,29 @@ struct WebsocketConnectParams<'a> {
     responses_metadata: &'a CodexResponsesMetadata,
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
+    routing_hint: Option<HeaderValue>,
+}
+
+fn build_routing_hint_header(
+    auth: Option<&CodexAuth>,
+    provider: &codex_api::Provider,
+    model: &str,
+    service_tier: Option<&str>,
+) -> Option<HeaderValue> {
+    if !auth.is_some_and(CodexAuth::uses_codex_backend)
+        || provider
+            .headers
+            .get("x-codex-guardian")
+            .is_some_and(|value| value == "reviewer")
+    {
+        return None;
+    }
+    let mut hint = format!("model={model}");
+    if let Some(service_tier) = service_tier {
+        hint.push_str(";tier=");
+        hint.push_str(service_tier);
+    }
+    HeaderValue::from_str(&hint).ok()
 }
 
 async fn handle_unauthorized(

@@ -31,6 +31,7 @@ chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
+codex-backend-client = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-install-context = { workspace = true }
 codex-cloud-config = { workspace = true }
@@ -127,6 +128,7 @@ tokio-util = { workspace = true, features = ["time"] }
 which = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
@@ -137,6 +139,18 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 winsplit = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { workspace = true, features = [
+    "std",
+    "NSDateFormatter",
+    "NSFormatter",
+    "NSLocale",
+    "NSString",
+] }
 
 [dev-dependencies]
 app_test_support = { workspace = true }

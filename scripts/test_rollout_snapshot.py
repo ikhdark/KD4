@@ -36,6 +36,7 @@ class RolloutSnapshotTest(unittest.TestCase):
                     "turn_id": "turn-1",
                     "timing": {
                         "schemaVersion": 25,
+                        "profileValid": True,
                         "milestones": {
                             "firstDomainActionMs": 12.5,
                             "firstUsefulActionMs": 12.5,

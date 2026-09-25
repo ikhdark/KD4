@@ -50,9 +50,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 REPO_ROOT / "scripts" / "common-rust-env.ps1",
                 root / "common-rust-env.ps1",
             )
-            (root / "cargo-lane.ps1").write_text(
-                "$cargoArgs = @($args | Select-Object -Skip 3)\n"
-                "& cargo @cargoArgs\nexit $LASTEXITCODE\n",
+            (root / "rust_build_status.py").write_text(
+                "import subprocess, sys\n"
+                "command = sys.argv[sys.argv.index('--') + 1 :]\n"
+                "raise SystemExit(subprocess.call(command))\n",
                 encoding="utf-8",
             )
             (root / "Cargo.toml").write_text(
@@ -343,6 +344,8 @@ function Get-Command($Name) {
             release = root / "_build" / "release" / "test-version"
             release.mkdir(parents=True)
             (release / "artifact.zip").write_bytes(b"fixture")
+            # Packaging leaves publication locks beside assets; never ship them.
+            (release / ".artifact.zip.publish.lock").write_bytes(b"pid=1\n")
             calls_path = root / "calls.jsonl"
             env = {
                 **os.environ,
@@ -401,14 +404,18 @@ function Get-Command($Name) {
                 REPO_ROOT / "scripts" / "cargo-workspace-analyzer.ps1",
                 analyzer_path,
             )
-            (temp_root / "cargo-lane.ps1").write_text(
-                "$Lane = $args[1]\n"
-                "$Command = @($args | Select-Object -Skip 2)\n"
-                "[ordered]@{ lane = $Lane; args = @($Command); rustflags = $env:RUSTFLAGS; encoded = $env:CARGO_ENCODED_RUSTFLAGS } "
-                "| ConvertTo-Json -Compress | Add-Content -LiteralPath "
-                "$env:CODEX_ANALYZER_TEST_OUTPUT\n"
-                "Write-Output 'child progress'\n"
-                f"exit {child_exit}\n",
+            (temp_root / "rust_build_status.py").write_text(
+                "import json, os, sys\n"
+                "args = sys.argv[1:]\n"
+                "assert args[:2] == ['run-lane', '--lane'], args\n"
+                "record = {'lane': args[2], 'args': args[args.index('--') + 1 :], "
+                "'rustflags': os.environ.get('RUSTFLAGS'), "
+                "'encoded': os.environ.get('CARGO_ENCODED_RUSTFLAGS')}\n"
+                "with open(os.environ['CODEX_ANALYZER_TEST_OUTPUT'], 'a', "
+                "encoding='utf-8') as output:\n"
+                "    output.write(json.dumps(record) + '\\n')\n"
+                "print('child progress')\n"
+                f"raise SystemExit({child_exit})\n",
                 encoding="utf-8",
             )
             output_path = temp_root / "calls.jsonl"
@@ -632,25 +639,6 @@ function Get-Command($Name) {
         )
         self.assertNotIn(r"C:\Users\kuh\Desktop\kd4", text)
         self.assertNotIn(r"C:\Users\kuh\Desktop\codexKD`", text)
-
-    def test_source_map_documents_bounded_routing_before_broad_lookup(self) -> None:
-        slice_command = (
-            "python scripts/source_owners.py slice --owner <owner-id> "
-            '--focus "<task description>" --max-relationships 32'
-        )
-
-        source_map = (REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8")
-        section = source_map.split("## How to use this map\n", 1)[1].split("\n## ", 1)[
-            0
-        ]
-        guidance = " ".join(section.split())
-        self.assertIn(slice_command, guidance)
-        self.assertIn("Expand truncated or omitted relationships", guidance)
-        self.assertIn("Resolve material unknowns", guidance)
-        self.assertIn(
-            "Use this broad map only when no owner matches",
-            guidance,
-        )
 
     def test_agents_desktop_boundary_is_top_level_guidance(self) -> None:
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -1205,6 +1193,52 @@ function Get-Command($Name) {
             ],
         )
 
+    def test_changed_script_validation_runs_focused_tests_and_skips_retired_scripts(
+        self,
+    ) -> None:
+        root_maintenance = load_root_maintenance_module()
+        # Each script is executed or asserted by this focused test module.
+        focused_tests = {
+            "codex-cli/scripts/build_npm_package.py": "scripts.test_stage_npm_packages",
+            "codex-rs/config/scripts/generate-proto.ps1": (
+                "scripts.test_generate_config_proto"
+            ),
+            "codex-rs/scripts/nextest_windows_stack.py": (
+                "scripts.test_build_tooling_policy"
+            ),
+            "codex-rs/scripts/setup-windows.ps1": "scripts.test_build_tooling",
+            "scripts/cargo-lane-patterns.ps1": "scripts.test_cargo_lane",
+            "scripts/cargo-workspace-analyzer.ps1": "scripts.test_build_tooling_policy",
+            "scripts/run-python.js": "scripts.test_build_tooling_policy",
+        }
+        for path, module in focused_tests.items():
+            with (
+                self.subTest(path=path),
+                mock.patch.object(root_maintenance, "run", return_value=0) as run,
+            ):
+                self.assertEqual(
+                    root_maintenance.main(["test-python", "--changed", path]), 0
+                )
+                self.assertIn(module, run.call_args.args[0])
+
+        # Retiring a script and its test leaves nothing to verify or import.
+        retired = [
+            "scripts/retired_example_tool.py",
+            "scripts/test_retired_example_tool.py",
+        ]
+        self.assertFalse(any((REPO_ROOT / path).exists() for path in retired))
+        with (
+            mock.patch.object(root_maintenance, "run", return_value=0) as run,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                root_maintenance.main(
+                    ["test-python", *(f"--changed={path}" for path in retired)]
+                ),
+                0,
+            )
+        run.assert_not_called()
+
     def test_python_sdk_gate_runs_lint_and_tests(self) -> None:
         just = shutil.which("just")
         if just is None:
@@ -1473,7 +1507,6 @@ function Get-Command($Name) {
                         "cargo",
                         "metadata",
                         "--offline",
-                        "--locked",
                         "--format-version",
                         "1",
                         "--filter-platform",
@@ -1515,13 +1548,6 @@ function Get-Command($Name) {
             encoding="utf-8"
         )
         self.assertNotIn("SIGHUP", codex_launcher)
-
-        dotslash_manifest = (
-            REPO_ROOT / "tools" / "argument-comment-lint" / "argument-comment-lint"
-        ).read_text(encoding="utf-8")
-        for retired_platform in ("macos-", "linux-", "apple-darwin", "unknown-linux"):
-            with self.subTest(dotslash_platform=retired_platform):
-                self.assertNotIn(retired_platform, dotslash_manifest)
 
     def test_ignore_rules_have_single_owners_for_generated_artifacts(self) -> None:
         root_ignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -1959,41 +1985,6 @@ function Get-Command($Name) {
         )
         self.assertNotIn("test:scripts:target", package["scripts"])
 
-    def test_gate_for_routes_repository_paths_from_another_workdir(self) -> None:
-        just = shutil.which("just")
-        if just is None:
-            self.skipTest("just is unavailable")
-        with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(
-                [
-                    just,
-                    "--justfile",
-                    str(REPO_ROOT / "justfile"),
-                    "gate-for",
-                    "scripts/rust_test_runner.py",
-                ],
-                cwd=directory,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        routes = json.loads(result.stdout)
-        self.assertEqual(routes["status"], "declared")
-        self.assertEqual(routes["unowned_paths"], [])
-        self.assertEqual(
-            [route["owner"] for route in routes["validation"]],
-            ["rust-test-routing", "rust-test-routing"],
-        )
-        self.assertEqual(
-            [route["argv"] for route in routes["validation"]],
-            [
-                ["python", "-m", "unittest", "scripts.test_rust_test_runner"],
-                ["just", "core-test-manifest-check"],
-            ],
-        )
-
     def test_hooks_schema_check_selects_the_fixture_comparison(self) -> None:
         result = subprocess.run(
             ["just", "--dry-run", "hooks-schema-check"],
@@ -2050,7 +2041,9 @@ function Get-Command($Name) {
             "app-server-schema-runtime-check",
             "app-server-schema-runtime-check-with-runtime",
             "app-server-schema-runtime-check-force",
-            "source-owners-slice-focused",
+            "source-map-check",
+            "source-owners-",
+            "gate-for",
         ):
             with self.subTest(recipe=obsolete_recipe):
                 self.assertNotIn(f"\n{obsolete_recipe}", justfile)
@@ -2083,28 +2076,6 @@ function Get-Command($Name) {
         self.assertIn('--owner "policy-test" -- --experimental', rendered)
 
         result = subprocess.run(
-            [
-                "just",
-                "source-owners-slice",
-                "source-owner-index",
-                "--focus",
-                "canonical tooling command",
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        source_owner_slice = json.loads(result.stdout)
-        self.assertFalse(source_owner_slice["truncated"])
-        self.assertEqual(source_owner_slice["omitted_relationships"], 0)
-        self.assertEqual(source_owner_slice["material_unknowns"], [])
-        self.assertEqual(justfile.count("\nsource-owners-slice "), 1)
-
-        result = subprocess.run(
             ["just", "--dry-run", "cargo-lane", "main", "cargo", "--version"],
             cwd=REPO_ROOT,
             capture_output=True,
@@ -2117,7 +2088,6 @@ function Get-Command($Name) {
         self.assertIn('run-lane --lane "main"', result.stdout + result.stderr)
 
         canonical_command_sources = {
-            "SOURCEMAP.md": "app-server-schema-regenerate <owner>",
             "codex-rs/app-server-protocol/tests/schema_fixtures.rs": (
                 "app-server-schema-regenerate <owner>"
             ),
@@ -2276,6 +2246,7 @@ function Get-Command($Name) {
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(payloads), 1, result.stdout)
+        self.assertEqual(payloads[0]["lane"], "rust-dead-code-matrix")
         self.assertEqual(
             payloads[0]["rustflags"],
             "-C target-cpu=native --cfg existing",
@@ -2461,7 +2432,6 @@ function Get-Command($Name) {
                 "tests::windows_tests::conpty_delivers_input_to_foreground_children",
                 "tests::windows_tests::conpty_ctrl_c_interrupts_powershell_foreground_child",
                 "tests::windows_tests::required_process_test_prerequisites_report_unverified_coverage",
-                "unified_exec::tests::legacy_capture_cancellation_terminates_descendants_without_timeout",
                 "windows_impl::tests::process_wait_failure_is_not_treated_as_exit",
                 "win::tests::controlling_ipc_eof_terminates_process_tree",
                 "win::tests::invalid_process_wait_is_not_treated_as_exit",
@@ -2487,15 +2457,14 @@ function Get-Command($Name) {
         )
         self.assertNotIn("python not found; skipping", pty_tests)
 
-    def test_local_setup_recipes_avoid_stale_or_unlocked_dependency_state(self) -> None:
+    def test_local_setup_recipes_allow_lockfile_updates(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         # `codex-fast` must actually be fast: reuse the built binary instead of
         # duplicating the plain `codex` recipe.
         self.assertIn("codex-fast *args:\n    just codex-stale-ok {args}", justfile)
-        # Install/setup paths must not quietly re-resolve the lockfile.
-        self.assertIn("cargo fetch --locked", justfile)
-        self.assertNotIn("cargo fetch\n", justfile)
+        self.assertIn("cargo fetch\n", justfile)
+        self.assertNotIn("cargo fetch --locked", justfile)
 
     def test_high_frequency_python_recipes_bypass_the_powershell_adapter(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -2635,7 +2604,7 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
                     ["rustup", "python", "rustup", "cargo"] if accepted else [],
                 )
                 if accepted:
-                    self.assertEqual(observed[-1]["args"], ["fetch", "--locked"])
+                    self.assertEqual(observed[-1]["args"], ["fetch"])
                     self.assertEqual(
                         observed[2]["args"],
                         [
@@ -2660,7 +2629,7 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             (REPO_ROOT / "codex-cli" / "package.json").read_text(encoding="utf-8")
         )
 
-        self.assertIn('rust_parallelism := "8"', justfile)
+        self.assertIn('rust_parallelism := "2"', justfile)
         self.assertIn('$requiredPwshVersion = [version]"7.5"', justfile)
         self.assertIn("\ntest-release-tooling:\n", justfile)
         self.assertIn(

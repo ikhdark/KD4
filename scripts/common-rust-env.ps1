@@ -278,7 +278,11 @@ function Assert-CargoTargetDirMatchesLane {
         throw "Cargo --target-dir requires a non-empty path."
     }
     try {
-        $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+        # Cargo joins a relative --target-dir onto its working directory,
+        # which PowerShell takes from the current location; GetFullPath alone
+        # would resolve against the unrelated process directory.
+        $location = (Get-Location -PSProvider FileSystem).ProviderPath
+        $candidatePath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($location, $Candidate))
         $lanePath = [System.IO.Path]::GetFullPath($TargetDir)
     }
     catch {

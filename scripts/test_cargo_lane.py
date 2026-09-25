@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts import rust_build_status  # noqa: E402
+from scripts.process_owner import owned_process  # noqa: E402
 
 SCRIPT = REPO_ROOT / "scripts" / "cargo-lane.ps1"
 CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cargo-lane-trash-cleanup.ps1"
@@ -48,6 +49,7 @@ class CargoLaneTest(unittest.TestCase):
             "cargo-lane-patterns.ps1",
             "cargo_lane_patterns.json",
             "cargo-lane-trash-cleanup.ps1",
+            "process_owner.py",
         ):
             shutil.copyfile(SCRIPT.parent / name, scripts / name)
         ready, release = repo / "prune-ready", repo / "prune-release"
@@ -644,6 +646,7 @@ Write-Output 'reservation released'
         *args: str,
         extra_env: dict[str, str] | None = None,
         lanes_root: Path | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE"] = "1"
@@ -670,6 +673,7 @@ Write-Output 'reservation released'
             capture_output=True,
             check=False,
             env=env,
+            cwd=cwd,
             creationflags=CREATE_NO_WINDOW,
             timeout=30,
         )
@@ -694,15 +698,30 @@ Write-Output 'reservation released'
         )
         return bin_dir
 
+    def fake_python(self, maintenance: str) -> Path:
+        # Stand in for the maintenance interpreter only: lane commands still
+        # need the real one to run scripts/process_owner.py.
+        bin_dir = self.fake_cargo_bin()
+        (bin_dir / "python.cmd").write_text(
+            "@echo off\r\n"
+            'if /i not "%~nx1"=="process_owner.py" goto maintenance\r\n'
+            f'"{sys.executable}" %*\r\n'
+            "exit /b %errorlevel%\r\n"
+            ":maintenance\r\n" + maintenance,
+            encoding="utf-8",
+        )
+        return bin_dir
+
     def run_fake_cargo(
         self,
         *args: str,
         extra_env: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(extra_env or {})
         base_path = env.get("PATH", os.environ["PATH"])
         env["PATH"] = f"{self.fake_cargo_bin()}{os.pathsep}{base_path}"
-        return self.run_script(*args, extra_env=env)
+        return self.run_script(*args, extra_env=env, cwd=cwd)
 
     def make_lane(self, lane: str, *, size: int = 0, days_old: int = 0) -> Path:
         self.mark_lanes_root()
@@ -752,7 +771,298 @@ Write-Output 'reservation released'
                     before,
                 )
 
-    def test_missing_python_does_not_block_lane_command(self) -> None:
+    def test_lane_names_resolve_to_the_same_directory_as_python(self) -> None:
+        # PowerShell once validated before trimming "-" and never validated
+        # affinity names: "..-" reserved the lanes root's parent, and derived
+        # names could enter the cleanup namespace or keep non-ASCII letters.
+        kelvin = "K"
+        show_target = (
+            "import os;print('TARGET='+os.environ['CODEX_CARGO_LANE_TARGET_DIR'])"
+        )
+        cases = [
+            ("..-", []),
+            ("keep-", []),
+            (f"core{kelvin}", []),
+            ("auto", ["-p", "../"]),
+            ("auto", ["-p", "x.trash-20260102030405000"]),
+            ("auto", ["-p", f"a{kelvin}b"]),
+        ]
+        for lane, selection in cases:
+            command = [sys.executable, "-c", show_target, *selection]
+            # ascii(): unittest reports subtests through the console encoding.
+            with self.subTest(lane=ascii(lane), selection=ascii(selection)):
+                try:
+                    with rust_build_status.reserve_cargo_lane(
+                        repo_root=self.temp_root,
+                        requested_lane=lane,
+                        command=command,
+                        lane_root=self.temp_root / "python-lanes",
+                    ) as (expected, _):
+                        pass
+                except ValueError:
+                    expected = None
+                lanes_before = sorted(p for p in self.lanes_root.iterdir() if p.is_dir())
+                result = self.run_script(
+                    "-Lane",
+                    lane,
+                    *command,
+                    extra_env={"CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0"},
+                )
+                targets = [
+                    line.removeprefix("TARGET=")
+                    for line in result.stdout.splitlines()
+                    if line.startswith("TARGET=")
+                ]
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertEqual(targets, [])
+                    self.assertEqual(
+                        sorted(p for p in self.lanes_root.iterdir() if p.is_dir()),
+                        lanes_before,
+                    )
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(targets, [str(self.lanes_root / expected)])
+        for root in (self.temp_root, self.lanes_root):
+            self.assertFalse((root / ".lane-active.lock").exists(), root)
+            self.assertFalse((root / ".lane-last-used").exists(), root)
+
+    def test_quarantined_lane_is_never_reserved(self) -> None:
+        # rust_build_status.py leaves this marker when it cannot confirm that
+        # a failed job's process tree stopped writing to the lane.
+        lane = self.make_lane("quarantined", size=10)
+        (lane / ".lane-cleanup-unconfirmed").write_text("unconfirmed\n")
+        result = self.run_fake_cargo(
+            "-Lane",
+            "quarantined",
+            "cargo",
+            "check",
+            extra_env={"CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"--target-dir {self.lane_path('quarantined-2')}", result.stdout
+        )
+        self.assertEqual(
+            sorted(path.name for path in lane.iterdir()),
+            [".lane-cleanup-unconfirmed", "payload.bin"],
+        )
+
+    def test_liveness_probe_never_blocks_a_starting_cargo(self) -> None:
+        # Cargo opens .cargo-lock with shared access and fails outright (os
+        # error 32) while any handle holds it exclusively, so probing another
+        # job's lane must share the handle for as long as it is open.
+        other = self.make_lane("other")
+        (other / "debug").mkdir()
+        (other / "debug" / ".cargo-lock").touch()
+        (other / ".lane-active.lock").touch()
+        lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+        start = lines.index("function Test-ExclusiveLaneFileBusy {")
+        opened = next(
+            index
+            for index in range(start, len(lines))
+            if lines[index].strip().startswith("$stream = [System.IO.File]::Open(")
+        )
+        line = 1 + next(
+            index
+            for index in range(opened, len(lines))
+            if lines[index].strip() == "return $false"
+        )
+        log = self.temp_root / "concurrent-opens.txt"
+        command = f"""
+$env:CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE = '1'
+$env:CODEX_CARGO_LANE_MAINTENANCE_SYNC = '0'
+$env:CODEX_CARGO_LANE_ACTIVE_NAMES = ''
+Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
+    try {{
+        [IO.File]::Open($lockPath, 'Open', 'ReadWrite', 'ReadWrite, Delete').Dispose()
+        $outcome = 'opened'
+    }} catch {{ $outcome = $_.Exception.Message }}
+    Add-Content -LiteralPath {ps_single_quote(log)} -Value "$(Split-Path -Leaf $lockPath): $outcome"
+}} | Out-Null
+& {ps_single_quote(SCRIPT)} -LanesRoot {ps_single_quote(self.lanes_root)} -Lane probe
+"""
+        result = subprocess.run(
+            [self.shell, "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LANE=probe", result.stdout)
+        self.assertEqual(
+            sorted(log.read_text().splitlines()),
+            [".cargo-lock: opened", ".lane-active.lock: opened"],
+        )
+
+    def test_relative_target_dir_is_checked_where_cargo_runs(self) -> None:
+        # Cargo resolves a relative --target-dir from codex-rs, where the
+        # script runs it, not from the caller's directory.
+        no_maintenance = {"CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0"}
+        escaped = self.run_fake_cargo(
+            "-Lane",
+            "rel",
+            "cargo",
+            "check",
+            "--target-dir",
+            r"lanes\rel",
+            cwd=self.temp_root,
+            extra_env=no_maintenance,
+        )
+        self.assertNotEqual(escaped.returncode, 0, escaped.stdout)
+        self.assertNotIn("cargo-args:", escaped.stdout)
+        self.assertIn("does not match reserved lane target", escaped.stderr)
+        try:
+            relative = os.path.relpath(self.lanes_root / "rel", REPO_ROOT / "codex-rs")
+        except ValueError:
+            self.skipTest("the lanes root and repository are on different drives")
+        accepted = self.run_fake_cargo(
+            "-Lane",
+            "rel",
+            "cargo",
+            "check",
+            "--target-dir",
+            relative,
+            cwd=self.temp_root,
+            extra_env=no_maintenance,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn(f"cargo-args:check --target-dir {relative}", accepted.stdout)
+
+    def test_python_prune_spares_a_lane_held_by_powershell(self) -> None:
+        # cargo-lane.ps1 holds .lane-active.lock with FileShare::None; Python
+        # must read the resulting sharing violation as ownership.
+        held = self.make_lane("held", size=10)
+        idle = self.make_lane("idle", size=10)
+        ready = self.temp_root / "child-ready"
+        release = self.temp_root / "child-release"
+        child = (
+            "import pathlib,sys,time; p=pathlib.Path; p(sys.argv[1]).touch(); "
+            "[time.sleep(.02) for _ in iter(lambda: p(sys.argv[2]).exists(), True)]"
+        )
+        owner = subprocess.Popen(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(SCRIPT),
+                "-LanesRoot",
+                str(self.lanes_root),
+                "-Lane",
+                "held",
+                sys.executable,
+                "-c",
+                child,
+                str(ready),
+                str(release),
+            ],
+            env={
+                **os.environ,
+                "CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE": "1",
+                "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        try:
+            deadline = time.monotonic() + 20
+            while (
+                not ready.exists()
+                and owner.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), "the PowerShell lane child never started")
+            self.assertTrue(rust_build_status.lane_active_lock_is_held(held))
+            with mock.patch.dict(
+                os.environ, {"CODEX_CARGO_LANES_ROOT": str(self.lanes_root)}
+            ):
+                removed = rust_build_status.prune_stale_lanes(
+                    repo_root=self.temp_root,
+                    processes=[],
+                    keep_warm_per_base=0,
+                    max_age_days=None,
+                )
+            self.assertEqual(removed, [idle])
+            self.assertEqual((held / "payload.bin").read_bytes(), b"x" * 10)
+        finally:
+            release.touch()
+            out, err = owner.communicate(timeout=20)
+        self.assertEqual(owner.returncode, 0, out + err)
+
+    def test_killed_host_keeps_its_lane_until_the_tree_is_stopped(self) -> None:
+        # Killing the host closes its handle, but process_owner.py co-holds the
+        # reservation and exits only after stopping the tree it owns.
+        lane = self.lanes_root / "owned"
+        beat = self.temp_root / "heartbeat"
+        ready = self.temp_root / "ready"
+        tree = self.temp_root / "tree.py"
+        tree.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "if sys.argv[1] == 'descendant':\n"
+            "    while True:\n"
+            "        pathlib.Path(sys.argv[2]).write_text(str(time.monotonic_ns()))\n"
+            "        time.sleep(0.02)\n"
+            "subprocess.Popen([sys.executable, __file__, 'descendant', sys.argv[2]])\n"
+            "pathlib.Path(sys.argv[3]).touch()\n"
+            "time.sleep(600)\n",
+            encoding="utf-8",
+        )
+        command = [
+            self.shell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SCRIPT),
+            "-LanesRoot",
+            str(self.lanes_root),
+            "-Lane",
+            "owned",
+            sys.executable,
+            str(tree),
+            "root",
+            str(beat),
+            str(ready),
+        ]
+        env = {
+            **os.environ,
+            "CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE": "1",
+            "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0",
+        }
+        # This test's own job reaps any tree the lane lets escape.
+        with owned_process(
+            command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) as host:
+            deadline = time.monotonic() + 20
+            while not (ready.exists() and beat.exists()) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists() and beat.exists(), "the lane tree never started")
+            host.kill()
+            host.wait(timeout=10)
+            deadline = time.monotonic() + 20
+            while (
+                rust_build_status.lane_active_lock_is_held(lane)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertFalse(
+                rust_build_status.lane_active_lock_is_held(lane),
+                "the lane stayed reserved after its host died",
+            )
+            stopped = beat.read_text()
+            time.sleep(0.3)
+            self.assertEqual(
+                beat.read_text(), stopped, "a descendant outlived the reservation"
+            )
+
+    def test_missing_python_refuses_to_run_an_unowned_lane_command(self) -> None:
         lane = f"unit-no-python-{os.getpid()}"
         fake_bin = self.fake_cargo_bin()
         path_without_python = (
@@ -770,13 +1080,15 @@ Write-Output 'reservation released'
             },
         )
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertIn("cargo-args:check --target-dir", result.stdout)
+        # Maintenance tolerates a missing interpreter; the command itself must
+        # not run without process_owner.py owning its process tree.
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("cargo-args:", result.stdout)
+        self.assertIn("process_owner.py", result.stderr)
         self.assertIn("python executable was not found", result.stdout + result.stderr)
+        self.assertFalse(
+            rust_build_status.lane_active_lock_is_held(self.lanes_root / lane)
+        )
 
     def test_lane_last_used_stamp_is_refreshed_after_command_finishes(self) -> None:
         lane = f"unit-last-used-{os.getpid()}"
@@ -1807,10 +2119,7 @@ Write-Output 'reservation released'
         self.assertFalse((self.lanes_root / ".cargo-lane-trash-cleanup.lock").exists())
 
     def test_failed_gc_does_not_advance_stamp(self) -> None:
-        fake_bin = self.fake_cargo_bin()
-        (fake_bin / "python.cmd").write_text(
-            "@echo off\r\nexit /b 7\r\n", encoding="utf-8"
-        )
+        fake_bin = self.fake_python("exit /b 7\r\n")
 
         result = self.run_script(
             "-Lane",
@@ -1835,12 +2144,10 @@ Write-Output 'reservation released'
         self.assertTrue((self.lanes_root / ".gc-retry").is_file())
 
     def test_powershell_maintenance_honors_python_lock_and_retry_stamp(self):
-        fake_bin = self.fake_cargo_bin()
-        args_log = self.temp_root / "gc-attempts.txt"
-        (fake_bin / "python.cmd").write_text(
-            '@echo off\r\necho attempt >> "%CODEX_TEST_GC_ARGS_LOG%"\r\nexit /b 7\r\n',
-            encoding="utf-8",
+        fake_bin = self.fake_python(
+            'echo attempt >> "%CODEX_TEST_GC_ARGS_LOG%"\r\nexit /b 7\r\n'
         )
+        args_log = self.temp_root / "gc-attempts.txt"
         self.mark_lanes_root()
         env = {
             "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
@@ -1938,12 +2245,8 @@ Write-Output 'reservation released'
         self.assertTrue(newest_path.exists())
 
     def test_gc_defaults_skip_aggregate_caps(self) -> None:
-        fake_bin = self.fake_cargo_bin()
+        fake_bin = self.fake_python('echo %* > "%CODEX_TEST_GC_ARGS_LOG%"\r\n')
         args_log = self.temp_root / "gc-args.txt"
-        (fake_bin / "python.cmd").write_text(
-            '@echo off\r\necho %* > "%CODEX_TEST_GC_ARGS_LOG%"\r\n',
-            encoding="utf-8",
-        )
 
         result = self.run_script(
             "-Lane",
@@ -1976,12 +2279,8 @@ Write-Output 'reservation released'
         )
 
     def test_completed_command_keeps_fresh_hourly_gc_stamp(self) -> None:
-        fake_bin = self.fake_cargo_bin()
+        fake_bin = self.fake_python('echo %* >> "%CODEX_TEST_GC_ARGS_LOG%"\r\n')
         args_log = self.temp_root / "post-build-gc-args.txt"
-        (fake_bin / "python.cmd").write_text(
-            '@echo off\r\necho %* >> "%CODEX_TEST_GC_ARGS_LOG%"\r\n',
-            encoding="utf-8",
-        )
         self.mark_lanes_root()
         stamp = self.lanes_root / ".gc-stamp"
         stamp.write_text("fresh\n", encoding="utf-8")

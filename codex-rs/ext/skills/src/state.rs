@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
 
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::McpResourceClient;
-use codex_mcp::McpResourceClientCacheKey;
+use codex_mcp::McpResourceServerCacheKey;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use tokio::sync::OnceCell;
 
@@ -184,7 +185,8 @@ impl SkillsThreadState {
         mcp_resources: Option<&McpResourceClient>,
         initialize: impl Future<Output = Result<SkillCatalog, SkillProviderError>> + Send,
     ) -> SkillCatalog {
-        let cache_key = mcp_resources.map(McpResourceClient::cache_key);
+        let cache_key = mcp_resources
+            .and_then(|resources| resources.server_cache_key(CODEX_APPS_MCP_SERVER_NAME));
         let cache = self
             .orchestrator_cache
             .lock()
@@ -264,7 +266,8 @@ impl SkillsThreadState {
             .orchestrator_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cache_key = mcp_resources.map(McpResourceClient::cache_key);
+        let cache_key = mcp_resources
+            .and_then(|resources| resources.server_cache_key(CODEX_APPS_MCP_SERVER_NAME));
         if let Some(cache) = cache
             .as_ref()
             .filter(|cache| cache.mcp_cache_key == cache_key)
@@ -336,7 +339,7 @@ struct CachedExecutorCatalog {
 }
 
 struct OrchestratorGenerationCache {
-    mcp_cache_key: Option<McpResourceClientCacheKey>,
+    mcp_cache_key: Option<McpResourceServerCacheKey>,
     catalog: OnceCell<SkillProviderResult<SkillCatalog>>,
     continued_catalog: tokio::sync::Mutex<Option<SkillCatalog>>,
     resources: Mutex<OrchestratorResourceCache>,

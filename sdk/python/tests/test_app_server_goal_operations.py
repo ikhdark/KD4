@@ -1,5 +1,9 @@
+import json
+import re
+
 from app_server_harness import (
     AppServerHarness,
+    CapturedResponsesRequest,
     ev_assistant_message,
     ev_completed,
     ev_function_call,
@@ -15,6 +19,24 @@ from openai_codex.generated.notification_registry import notification_turn_id
 from openai_codex.generated.v2_all import TurnStatus
 
 
+def _complete_goal(request: CapturedResponsesRequest) -> str:
+    """Mark the goal complete, citing the latest goal reference shown to the model."""
+    references = re.findall(
+        r"Goal reference for update_goal: (\S+)",
+        "\n".join(request.message_input_texts("user")),
+    )
+    arguments = {"status": "complete"}
+    if references:
+        arguments["goal_ref"] = references[-1]
+    return sse(
+        [
+            ev_response_created("goal-complete-tool"),
+            ev_function_call("call-goal-complete", "update_goal", json.dumps(arguments)),
+            ev_completed("goal-complete-tool"),
+        ]
+    )
+
+
 def test_private_goal_operation_coalesces_runtime_continuations(tmp_path) -> None:
     """The private engine should expose automatic continuations as one turn."""
     with AppServerHarness(tmp_path) as harness:
@@ -22,19 +44,7 @@ def test_private_goal_operation_coalesces_runtime_continuations(tmp_path) -> Non
             "Initial pass complete.",
             response_id="goal-initial",
         )
-        harness.responses.enqueue_sse(
-            sse(
-                [
-                    ev_response_created("goal-complete-tool"),
-                    ev_function_call(
-                        "call-goal-complete",
-                        "update_goal",
-                        '{"status":"complete"}',
-                    ),
-                    ev_completed("goal-complete-tool"),
-                ]
-            )
-        )
+        harness.responses.enqueue_sse(_complete_goal)
         harness.responses.enqueue_sse(
             sse(
                 [

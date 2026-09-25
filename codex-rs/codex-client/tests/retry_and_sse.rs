@@ -8,6 +8,7 @@ use codex_client::capped_backoff;
 use codex_client::run_with_retry;
 use codex_client::run_with_retry_non_idempotent;
 use codex_client::sse_stream;
+use codex_http_client::RetryAfter;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
@@ -17,6 +18,53 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+#[tokio::test(start_paused = true)]
+async fn retry_after_deadline_is_not_restarted_and_does_not_allow_unsafe_replay() {
+    for (elapsed, expected_wait) in [(4, 6), (12, 0)] {
+        let advice = RetryAfter::from_delay(Duration::from_secs(10)).unwrap();
+        tokio::time::advance(Duration::from_secs(elapsed)).await;
+        let started = tokio::time::Instant::now();
+        let mut policy = retry_policy(1);
+        policy.base_delay = Duration::from_secs(30);
+        let result = run_with_retry(policy, request, |_request, attempt| async move {
+            if attempt == 0 {
+                Err(TransportError::Http {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    url: None,
+                    headers: None,
+                    body: None,
+                    retry_after: Some(advice),
+                })
+            } else {
+                Ok("recovered")
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "recovered");
+        assert_eq!(started.elapsed(), Duration::from_secs(expected_wait));
+    }
+    let advice = RetryAfter::from_delay(Duration::from_secs(10)).unwrap();
+    let started = tokio::time::Instant::now();
+    let attempts = AtomicU64::new(0);
+    let error = run_with_retry_non_idempotent(retry_policy(2), request, |_request, _attempt| {
+        attempts.fetch_add(1, Ordering::Relaxed);
+        async {
+            Err::<(), _>(TransportError::Http {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                url: None,
+                headers: None,
+                body: None,
+                retry_after: Some(advice),
+            })
+        }
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(error.retry_after(), Some(advice));
+}
 
 fn request() -> Request {
     Request::new(Method::GET, "https://example.test".to_string())
@@ -217,6 +265,7 @@ async fn final_underlying_error_is_preserved() {
             let mut headers = HeaderMap::new();
             headers.insert("x-request-id", HeaderValue::from_static("request-123"));
             Err::<(), _>(TransportError::Http {
+                retry_after: None,
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 url: Some("https://example.test".to_string()),
                 headers: Some(headers),
@@ -227,6 +276,7 @@ async fn final_underlying_error_is_preserved() {
     .await;
 
     let Err(TransportError::Http {
+        retry_after: _,
         status,
         url,
         headers,
@@ -273,6 +323,7 @@ async fn retry_classifier_retries_only_proven_safe_failures() {
         TransportError::Network("ambiguous socket failure".to_string()),
         TransportError::Timeout,
         TransportError::Http {
+            retry_after: None,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             url: None,
             headers: None,

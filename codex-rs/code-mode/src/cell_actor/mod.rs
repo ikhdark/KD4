@@ -52,7 +52,7 @@ pub(crate) struct CellActor;
 impl CellActor {
     pub(crate) async fn prepare<H: CellHost>(
         request: CellRequest,
-        stored_values: HashMap<String, JsonValue>,
+        stored_values: HashMap<String, Arc<JsonValue>>,
         host: Arc<H>,
         initial_observe_mode: ObserveMode,
         cell_state: Arc<CellState>,

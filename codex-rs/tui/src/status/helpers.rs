@@ -101,8 +101,12 @@ pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {
         "Business".to_string()
     } else if plan_type.is_business_like() {
         "Enterprise".to_string()
+    } else if plan_type == PlanType::Pro {
+        "Pro (More)".to_string()
+    } else if plan_type == PlanType::ProMax {
+        "Pro (Max)".to_string()
     } else if plan_type == PlanType::ProLite {
-        "Pro Lite".to_string()
+        "Pro".to_string()
     } else {
         title_case(format!("{plan_type:?}").as_str())
     }
@@ -218,8 +222,9 @@ mod tests {
             (PlanType::Free, "Free"),
             (PlanType::Go, "Go"),
             (PlanType::Plus, "Plus"),
-            (PlanType::Pro, "Pro"),
-            (PlanType::ProLite, "Pro Lite"),
+            (PlanType::Pro, "Pro (More)"),
+            (PlanType::ProLite, "Pro"),
+            (PlanType::ProMax, "Pro (Max)"),
             (PlanType::Team, "Business"),
             (PlanType::SelfServeBusinessUsageBased, "Business"),
             (PlanType::Business, "Enterprise"),

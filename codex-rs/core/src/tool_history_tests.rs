@@ -1359,7 +1359,7 @@ fn nested_workspace_evidence_retains_only_current_results_after_resume() {
 }
 
 #[test]
-fn command_dependencies_cover_search_test_and_ownership_inputs() {
+fn command_dependencies_cover_search_test_and_read_inputs() {
     let cwd = Path::new("/repo");
     let search = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -1403,23 +1403,6 @@ fn command_dependencies_cover_search_test_and_ownership_inputs() {
             false,
         )])
     );
-
-    let ownership = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "program": "python",
-            "args": ["scripts/source_owners.py", "check"]
-        })
-        .to_string(),
-    };
-    let ownership_dependencies = source_dependencies_for_tool_call("exec_command", &ownership, cwd);
-    assert!(ownership_dependencies.contains(&SourceDependencyV1::new(
-        Path::new("/repo/source_owners.toml"),
-        false,
-    )));
-    assert!(ownership_dependencies.contains(&SourceDependencyV1::new(
-        Path::new("/repo/architecture_index.json"),
-        false,
-    )));
 
     let powershell = ToolPayload::Function {
         arguments: serde_json::json!({

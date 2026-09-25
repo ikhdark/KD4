@@ -104,15 +104,33 @@ def _summary(values: Iterable[float]) -> dict[str, float | int | None]:
     }
 
 
-def _delta(end: object, start: object) -> float | None:
-    if not isinstance(end, (int, float)) or not isinstance(start, (int, float)):
-        return None
-    return max(0.0, float(end) - float(start))
+def _ordered_summary(intervals: Iterable[float]) -> dict[str, float | int | None]:
+    # Boundaries may come from different tool calls or records. An end before
+    # its start is an ordering inconsistency, not a zero or negative latency.
+    values = list(intervals)
+    ordered = [value for value in values if value >= 0]
+    return {**_summary(ordered), "outOfOrderCount": len(values) - len(ordered)}
+
+
+def _interval_summary(
+    rows: Sequence[dict[str, float]], end_key: str, start_key: str
+) -> dict[str, float | int | None]:
+    return _ordered_summary(
+        row[end_key] - row[start_key]
+        for row in rows
+        if end_key in row and start_key in row
+    )
+
+
+def _turn_id(payload: dict[str, Any]) -> str | None:
+    turn_id = payload.get("turn_id")
+    return turn_id if isinstance(turn_id, str) and turn_id else None
 
 
 @dataclass
 class _Turn:
     started_ms: float
+    turn_id: str | None = None
     user_input_ms: float | None = None
     useful_tool_emitted_ms: float | None = None
     useful_tool_name: str | None = None
@@ -173,6 +191,10 @@ def analyze_records(
         "incompleteTurns": 0,
         "supersededTurns": 0,
         "unterminatedTurns": 0,
+        "abortedTurns": 0,
+        "terminalWithoutStart": 0,
+        "duplicateTerminalEvents": 0,
+        "invalidTimingProfiles": 0,
         "incompleteCanonicalMilestones": 0,
     }
     legacy_rows: list[dict[str, float]] = []
@@ -180,6 +202,7 @@ def analyze_records(
     independent_rows: list[dict[str, float]] = []
     snapshot_metadata: list[dict[str, str | int]] = []
     completed_turns = 0
+    terminal_turns = 0
     record_count = 0
     started_turns = 0
     schema_versions: dict[str, int] = {}
@@ -187,6 +210,7 @@ def analyze_records(
     for metadata, records in record_sets:
         snapshot_metadata.append(metadata)
         active: _Turn | None = None
+        terminated_ids: set[str] = set()
         for record in records:
             record_count += 1
             if not isinstance(record, dict):
@@ -207,15 +231,43 @@ def analyze_records(
                 if active is not None:
                     exclusions["incompleteTurns"] += 1
                     exclusions["supersededTurns"] += 1
-                active = _Turn(started_ms=timestamp_ms)
+                active = _Turn(started_ms=timestamp_ms, turn_id=_turn_id(payload))
                 continue
-            if active is None:
+            if record_type == "event_msg" and payload_type in (
+                "task_complete",
+                "turn_aborted",
+            ):
+                turn_id = _turn_id(payload)
+                if turn_id is not None and turn_id in terminated_ids:
+                    exclusions["duplicateTerminalEvents"] += 1
+                    continue
+                if (
+                    active is not None
+                    and None not in (active.turn_id, turn_id)
+                    and active.turn_id != turn_id
+                ):
+                    # This terminal belongs to a turn whose start was not
+                    # captured; the active turn never received its own terminal.
+                    exclusions["incompleteTurns"] += 1
+                    exclusions["unterminatedTurns"] += 1
+                    active = None
+                if turn_id is not None:
+                    terminated_ids.add(turn_id)
+                terminal_turns += 1
+                if active is None:
+                    exclusions["terminalWithoutStart"] += 1
+                if payload_type == "turn_aborted":
+                    # Aborted work never completed; later records must not pair with it.
+                    exclusions["abortedTurns"] += 1
+                    active = None
+                    continue
+            elif active is None:
                 continue
-            if record_type == "event_msg" and payload_type == "user_message":
+            elif record_type == "event_msg" and payload_type == "user_message":
                 if active.user_input_ms is None:
                     active.user_input_ms = timestamp_ms
                 continue
-            if record_type == "response_item":
+            elif record_type == "response_item":
                 tool_name = _tool_name(payload)
                 if (
                     tool_name is not None
@@ -225,17 +277,27 @@ def analyze_records(
                     active.useful_tool_emitted_ms = timestamp_ms
                     active.useful_tool_name = tool_name
                 continue
-            if record_type != "event_msg" or payload_type != "task_complete":
+            else:
                 continue
 
             completed_turns += 1
             timing = payload.get("timing")
-            milestones = canonical_milestones(timing)
-            if (
-                isinstance(timing, dict)
-                and type(timing.get("schemaVersion")) is int
-                and timing["schemaVersion"] >= CANONICAL_TIMING_SCHEMA_VERSION
-            ):
+            schema_version = (
+                timing.get("schemaVersion") if isinstance(timing, dict) else None
+            )
+            version_key = (
+                str(schema_version) if type(schema_version) is int else "missing"
+            )
+            schema_versions[version_key] = schema_versions.get(version_key, 0) + 1
+            canonical_schema = (
+                type(schema_version) is int
+                and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
+            )
+            if canonical_schema and timing.get("profileValid") is not True:
+                # The runtime marks clock regressions and invalid transitions;
+                # milestones from such a profile are not measurements.
+                exclusions["invalidTimingProfiles"] += 1
+            elif canonical_schema:
                 independent_rows.append(
                     {
                         key: value
@@ -245,21 +307,14 @@ def analyze_records(
                         and value >= 0
                     }
                 )
-            schema_version = (
-                timing.get("schemaVersion") if isinstance(timing, dict) else None
-            )
-            version_key = (
-                str(schema_version) if type(schema_version) is int else "missing"
-            )
-            schema_versions[version_key] = schema_versions.get(version_key, 0) + 1
-            if milestones is not None:
-                canonical_rows.append(milestones)
-            elif (
-                isinstance(schema_version, int)
-                and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
-            ):
-                exclusions["incompleteCanonicalMilestones"] += 1
-            elif active.useful_tool_emitted_ms is not None:
+                milestones = canonical_milestones(timing)
+                if milestones is not None:
+                    canonical_rows.append(milestones)
+                else:
+                    exclusions["incompleteCanonicalMilestones"] += 1
+            # Legacy reconstruction needs the captured start; canonical
+            # milestones above are self-contained turn-clock offsets.
+            elif active is not None and active.useful_tool_emitted_ms is not None:
                 row = {
                     "startToUsefulToolEmittedMs": active.useful_tool_emitted_ms
                     - active.started_ms
@@ -283,37 +338,18 @@ def analyze_records(
             for row in canonical_rows
             if "userInputRecordedMs" in row
         ),
-        "userInputToUsefulAcceptedMs": _summary(
-            value
-            for row in canonical_rows
-            if (
-                value := _delta(
-                    row.get("firstUsefulToolAcceptedMs"), row.get("userInputRecordedMs")
-                )
-            )
-            is not None
+        "userInputToUsefulAcceptedMs": _interval_summary(
+            canonical_rows, "firstUsefulToolAcceptedMs", "userInputRecordedMs"
         ),
-        "usefulParallelGateWaitMs": _summary(
-            value
-            for row in canonical_rows
-            if (
-                value := _delta(
-                    row.get("firstUsefulToolGateAdmittedMs"),
-                    row.get("firstUsefulToolAcceptedMs"),
-                )
-            )
-            is not None
+        "usefulParallelGateWaitMs": _interval_summary(
+            canonical_rows,
+            "firstUsefulToolGateAdmittedMs",
+            "firstUsefulToolAcceptedMs",
         ),
-        "usefulAuthorizationAndDispatchMs": _summary(
-            value
-            for row in canonical_rows
-            if (
-                value := _delta(
-                    row.get("firstUsefulActionMs"),
-                    row.get("firstUsefulToolGateAdmittedMs"),
-                )
-            )
-            is not None
+        "usefulAuthorizationAndDispatchMs": _interval_summary(
+            canonical_rows,
+            "firstUsefulActionMs",
+            "firstUsefulToolGateAdmittedMs",
         ),
         "startToFirstUsefulActionMs": _summary(
             row["firstUsefulActionMs"] for row in canonical_rows
@@ -336,20 +372,12 @@ def analyze_records(
             for row in canonical_rows
             if "firstSuccessfulDomainActionMs" in row
         ),
-        "usefulExecutionToSuccessMs": _summary(
-            value
-            for row in canonical_rows
-            if (
-                value := _delta(
-                    row.get("firstSuccessfulUsefulActionMs"),
-                    row.get("firstUsefulActionMs"),
-                )
-            )
-            is not None
+        "usefulExecutionToSuccessMs": _interval_summary(
+            canonical_rows, "firstSuccessfulUsefulActionMs", "firstUsefulActionMs"
         ),
     }
     legacy_metrics = {
-        key: _summary(row[key] for row in legacy_rows if key in row)
+        key: _ordered_summary(row[key] for row in legacy_rows if key in row)
         for key in (
             "startToUserInputEventMs",
             "userInputEventToUsefulToolEmittedMs",
@@ -374,17 +402,23 @@ def analyze_records(
             summary["coverage"] = (
                 summary["count"] / completed_turns if completed_turns else None
             )
+    canonical_schema_turns = sum(
+        count
+        for version, count in schema_versions.items()
+        if version != "missing" and int(version) >= CANONICAL_TIMING_SCHEMA_VERSION
+    )
     denominators = {
         "invalidJsonLines": record_count,
         "invalidTimestamps": record_count - exclusions["invalidJsonLines"],
         "incompleteTurns": started_turns,
         "supersededTurns": started_turns,
         "unterminatedTurns": started_turns,
-        "incompleteCanonicalMilestones": sum(
-            count
-            for version, count in schema_versions.items()
-            if version != "missing" and int(version) >= CANONICAL_TIMING_SCHEMA_VERSION
-        ),
+        "abortedTurns": terminal_turns,
+        "terminalWithoutStart": terminal_turns,
+        "duplicateTerminalEvents": terminal_turns
+        + exclusions["duplicateTerminalEvents"],
+        "invalidTimingProfiles": canonical_schema_turns,
+        "incompleteCanonicalMilestones": canonical_schema_turns,
     }
     return {
         "schemaVersion": 1,
@@ -392,7 +426,10 @@ def analyze_records(
             "quantileMethod": "linear interpolation at (n-1)*q",
             "spread": "population standard deviation of observed values",
             "coverage": "Each metric reports its observed count over all completed turns. Optional or inapplicable milestones are not zero latency.",
-            "incompleteTurns": "supersededTurns counts a start before the active turn completed; unterminatedTurns counts an active turn at end of input. These describe evidence shape, not its cause.",
+            "incompleteTurns": "supersededTurns counts a start before the active turn completed; unterminatedTurns counts an active turn that never received its own terminal (end of input, or a terminal for a different turn id). These describe evidence shape, not its cause. abortedTurns are terminal but not completed and never enter a metric.",
+            "terminals": "terminalWithoutStart counts a terminal whose start was not captured (for example a truncated rollout head); it remains a completed turn, canonical milestones stay usable, and legacy reconstruction is unavailable. duplicateTerminalEvents repeat an already-terminated turn id and are never counted twice.",
+            "intervals": "Gaps may span different tool calls or records; an end before its start is counted as outOfOrderCount, never as zero or negative latency.",
+            "profileValidity": "Schema 25+ milestones require profileValid=true; invalid profiles (clock regression, invalid transition, saturation) are excluded and counted.",
             "canonical": (
                 "timing schema 25+: separate authorized infrastructure, tool-discovery, "
                 "domain, and successful-domain handler boundaries"

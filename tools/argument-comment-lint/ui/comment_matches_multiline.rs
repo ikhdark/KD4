@@ -12,4 +12,7 @@ fn main() {
         vec!["rev-parse", "HEAD"],
         /*env*/ None,
     );
+    // The 64-byte lookbehind before `None` starts inside a multi-byte character, so this
+    // comment is only found by measuring from the `vec!` call site.
+    let _ = run_git_for_stdout("éééééééééééééééééééééééé", vec!["xy"], /*env*/ None);
 }

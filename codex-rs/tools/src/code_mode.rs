@@ -60,7 +60,7 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
                             default_timeout_ms: None,
-                            output_schema: tool.output_schema.clone(),
+                            output_schema: tool.output_schema.as_ref().map(crate::ToolOutputSchema::to_value),
                         };
                         tool.description =
                             codex_code_mode::augment_tool_definition(definition).description;
@@ -164,7 +164,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 kind: CodeModeToolKind::Function,
                 input_schema: serde_json::to_value(&tool.parameters).ok(),
                 default_timeout_ms: None,
-                output_schema: tool.output_schema.clone(),
+                output_schema: tool.output_schema.as_ref().map(crate::ToolOutputSchema::to_value),
             }]
         }
         ToolSpec::Freeform(tool) => {
@@ -192,7 +192,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                     kind: CodeModeToolKind::Function,
                     input_schema: serde_json::to_value(&tool.parameters).ok(),
                     default_timeout_ms: None,
-                    output_schema: tool.output_schema.clone(),
+                    output_schema: tool.output_schema.as_ref().map(crate::ToolOutputSchema::to_value),
                 },
             })
             .collect(),

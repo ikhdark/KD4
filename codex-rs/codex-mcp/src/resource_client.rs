@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -55,6 +56,21 @@ impl PartialEq for McpResourceClientCacheKey {
 
 impl Eq for McpResourceClientCacheKey {}
 
+/// Resource identity for one connection, without retaining it or starting it.
+#[derive(Clone)]
+pub struct McpResourceServerCacheKey {
+    pub(crate) connection: Weak<AtomicUsize>,
+    pub(crate) generation: u64,
+}
+
+impl PartialEq for McpResourceServerCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.connection.ptr_eq(&other.connection) && self.generation == other.generation
+    }
+}
+
+impl Eq for McpResourceServerCacheKey {}
+
 impl std::fmt::Debug for McpResourceClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -83,6 +99,10 @@ impl McpResourceClient {
     /// Returns an identity that changes whenever the published manager changes.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
         McpResourceClientCacheKey((self.lease)().map(|lease| Arc::downgrade(&lease.manager)))
+    }
+
+    pub fn server_cache_key(&self, server: &str) -> Option<McpResourceServerCacheKey> {
+        (self.lease)().and_then(|lease| lease.manager.resource_cache_key(server))
     }
 
     /// Returns whether the current manager contains the named server.

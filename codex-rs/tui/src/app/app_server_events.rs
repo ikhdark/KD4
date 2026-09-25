@@ -100,6 +100,12 @@ impl App {
                 return;
             }
             ServerNotification::AccountUpdated(notification) => {
+                if let Some(crate::pager_overlay::Overlay::Analytics(view)) = &mut self.overlay {
+                    view.refresh();
+                }
+                if let Some(view) = &mut self.retained_analytics {
+                    view.cancel_loads();
+                }
                 let has_codex_backend_auth = matches!(
                     notification.auth_mode,
                     Some(

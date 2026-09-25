@@ -249,7 +249,7 @@ impl ToolSearchNameIndex {
             .map(|name| normalize_tool_search_query(name))
             .collect::<HashSet<_>>();
         let mut output_names = HashMap::<String, HashSet<String>>::new();
-        match &search_info.entry.output {
+        match search_info.entry.output.as_ref() {
             LoadableToolSpec::Function(tool) => {
                 index_output_name(
                     &mut entry_names,
@@ -856,18 +856,27 @@ impl ToolSearchHandler {
                 .collect::<HashSet<_>>();
             let mut definitions = Vec::new();
             for info in self.search_infos.iter() {
-                match &info.entry.output {
+                match info.entry.output.as_ref() {
                     LoadableToolSpec::Function(tool) => {
+                        if !newly_active.contains(&ToolName::plain(tool.name.clone())) {
+                            continue;
+                        }
                         let spec = LoadableToolSpec::Function(tool.clone());
                         if loadable_tool_names(&spec)
                             .iter()
                             .any(|name| newly_active.contains(name))
                         {
-                            definitions.push(spec);
+                            definitions.push(info.entry.normalize_output(spec));
                         }
                     }
                     LoadableToolSpec::Namespace(namespace) => {
                         for tool in &namespace.tools {
+                            let ResponsesApiNamespaceTool::Function(function) = tool;
+                            if !newly_active.contains(&ToolName::namespaced(
+                                namespace.name.clone(), function.name.clone(),
+                            )) {
+                                continue;
+                            }
                             let spec = LoadableToolSpec::Namespace(ResponsesApiNamespace {
                                 name: namespace.name.clone(),
                                 description: namespace.description.clone(),
@@ -877,7 +886,7 @@ impl ToolSearchHandler {
                                 .iter()
                                 .any(|name| newly_active.contains(name))
                             {
-                                definitions.push(spec);
+                                definitions.push(info.entry.normalize_output(spec));
                             }
                         }
                     }
@@ -1041,9 +1050,9 @@ impl ToolSearchHandler {
             });
             // Select callable identities before charging the receipt budget.
             // A namespace is a container, not one callable.
-            let candidates: Box<dyn Iterator<Item = LoadableToolSpec> + '_> = match &result.output {
+            let candidates: Box<dyn Iterator<Item = LoadableToolSpec> + '_> = match result.output.as_ref() {
                 LoadableToolSpec::Function(_) => {
-                    Box::new(std::iter::once_with(|| result.output.clone()))
+                    Box::new(std::iter::once_with(|| result.output.as_ref().clone()))
                 }
                 LoadableToolSpec::Namespace(namespace) => Box::new(
                     namespace
@@ -1072,6 +1081,7 @@ impl ToolSearchHandler {
                 }
                 selected.extend(names.iter().cloned());
                 activation_tools.extend(names.iter().cloned());
+                let candidate = result.normalize_output(candidate);
                 if !retained.try_push(&candidate) {
                     supplemental_tools.extend(names);
                     let local_names = match &candidate {
@@ -1211,9 +1221,10 @@ fn compact_recovery_tool(tool: &ResponsesApiTool, qualified_name: &str) -> Respo
         // JSON Schema cannot express. Budget recovery must not change the call
         // contract; if it still does not fit, the omission path supplies a locator.
         parameters: tool.parameters.clone(),
-        output_schema: tool.output_schema.clone().map(|mut schema| {
+        output_schema: tool.output_schema.clone().map(|schema| {
+            let mut schema = schema.into_value();
             strip_output_schema_descriptions(&mut schema);
-            schema
+            schema.into()
         }),
     }
 }
@@ -1338,7 +1349,7 @@ fn tool_search_cache_entry_fits_budget(
 
     // Output schemas are owned by the typed tools but skipped by their serializer.
     let mut schema_fits =
-        |tool: &ResponsesApiTool| serde_json::to_writer(&mut writer, &tool.output_schema).is_ok();
+        |tool: &ResponsesApiTool| serde_json::to_writer(&mut writer, &tool.output_schema.as_ref().map(codex_tools::ToolOutputSchema::to_value)).is_ok();
     result.tools.iter().all(|tool| match tool {
         LoadableToolSpec::Function(tool) => schema_fits(tool),
         LoadableToolSpec::Namespace(namespace) => namespace.tools.iter().all(|tool| {
@@ -1486,7 +1497,7 @@ mod tests {
     #[tokio::test]
     async fn exact_function_search_returns_and_activates_only_the_requested_function() {
         let mut info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
             panic!("expected namespace");
         };
         let ResponsesApiNamespaceTool::Function(create) = &namespace.tools[0];
@@ -1597,7 +1608,7 @@ mod tests {
             let normal = search_info("publication", None, "normal", "small");
             let normal_definition = serde_json::to_value(&normal.entry.output).unwrap();
             let mut oversized = search_info("publication", None, "large", "oversized");
-            let LoadableToolSpec::Namespace(namespace) = &mut oversized.entry.output else {
+            let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut oversized.entry.output) else {
                 panic!("expected namespace");
             };
             if compacted {
@@ -1749,7 +1760,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_namespace_member_keeps_rank_and_activates_with_partial_receipt() {
         let mut info = search_info("scheduling mcp__calendar", None, "calendar", "oversized");
-        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
             panic!("expected namespace");
         };
         let ResponsesApiNamespaceTool::Function(oversized) = &mut namespace.tools[0];
@@ -1824,7 +1835,7 @@ mod tests {
     async fn unicode_exact_search_activates_compact_schema_without_losing_its_contract() {
         let name = "Créer_Événement";
         let mut info = search_info("unrelated ranking terms", None, "calendar", name);
-        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
             panic!("expected namespace");
         };
         let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
@@ -1850,10 +1861,10 @@ mod tests {
             serde_json::json!("item annotation");
         verbose_schema["$defs"]["attendee"]["description"] =
             serde_json::json!("definition annotation");
-        tool.output_schema = Some(verbose_schema);
+        tool.output_schema = Some(verbose_schema.into());
         assert_eq!(
             compact_recovery_tool(tool, &tool.name).output_schema,
-            Some(expected_schema)
+            Some(expected_schema.into())
         );
         let handler = ToolSearchHandler::new(vec![info]);
 
@@ -2191,7 +2202,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &changed_source));
 
         let mut changed_output_infos = search_infos;
-        match &mut changed_output_infos[0].entry.output {
+        match Arc::make_mut(&mut changed_output_infos[0].entry.output) {
             LoadableToolSpec::Function(tool) => tool.description.push_str(" changed"),
             LoadableToolSpec::Namespace(namespace) => namespace.description.push_str(" changed"),
         }
@@ -2386,7 +2397,7 @@ mod tests {
     #[tokio::test]
     async fn namespace_limit_counts_callables_and_caches_selected_result() {
         let mut info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
             panic!("expected namespace");
         };
         let ResponsesApiNamespaceTool::Function(template) = namespace.tools[0].clone();
@@ -2399,7 +2410,7 @@ mod tests {
             })
             .collect();
         let names = loadable_tool_names(&info.entry.output);
-        let LoadableToolSpec::Namespace(namespace) = info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = info.entry.to_loadable_spec() else {
             panic!("expected namespace");
         };
         let handler = ToolSearchHandler::new(vec![
@@ -2448,13 +2459,13 @@ mod tests {
     #[test]
     fn search_cache_counts_output_schemas_skipped_by_serialization() {
         let mut info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
             panic!("expected namespace");
         };
         let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
         tool.output_schema = Some(serde_json::json!({
             "const": "x".repeat(MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES)
-        }));
+        }).into());
         let handler = ToolSearchHandler::new(vec![info]);
 
         let result = handler.search("calendar", 1).unwrap();
@@ -2563,7 +2574,7 @@ mod tests {
     #[test]
     fn exact_name_search_recovers_a_definition_that_exceeds_the_result_budget() {
         let mut search_info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output) else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
@@ -2671,14 +2682,14 @@ mod tests {
                 Some(Vec::new()),
                 Some(false.into()),
             ),
-            output_schema: Some(output_schema.clone()),
+            output_schema: Some(output_schema.clone().into()),
         };
 
         let compact = compact_recovery_tool(&source, "strict_tool");
 
         assert!(compact.strict);
         assert!(compact.description.starts_with(&source.description));
-        assert_eq!(compact.output_schema, Some(output_schema));
+        assert_eq!(compact.output_schema, Some(output_schema.into()));
         assert_eq!(compact.parameters.required, Some(Vec::new()));
         assert_eq!(compact.parameters.additional_properties, Some(false.into()));
     }
@@ -2686,7 +2697,7 @@ mod tests {
     #[test]
     fn oversized_tool_description_uses_omission_instead_of_a_partial_contract() {
         let mut info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
             panic!("namespace fixture");
         };
         let [ResponsesApiNamespaceTool::Function(tool)] = namespace.tools.as_mut_slice() else {
@@ -2711,7 +2722,7 @@ mod tests {
     #[test]
     fn token_backfire_oversized_exact_match_stays_activatable() {
         let mut search_info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output) else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
@@ -2772,7 +2783,7 @@ mod tests {
         let mut first = search_info("first", None, "first", "run");
         let mut second = search_info("second", None, "second", "run");
         for search_info in [&mut first, &mut second] {
-            let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
+            let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output) else {
                 panic!("test search info should be a namespace");
             };
             namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES / 2);
@@ -2798,7 +2809,7 @@ mod tests {
     fn semantic_search_preserves_best_match_when_receipt_requires_compaction() {
         let mut oversized = search_info("capability", None, "oversized", "run");
         let later = search_info("capability extra terms", None, "later", "run");
-        let LoadableToolSpec::Namespace(namespace) = &mut oversized.entry.output else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut oversized.entry.output) else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
@@ -3093,7 +3104,7 @@ mod tests {
             entry: ToolSearchEntry {
                 search_text: search_text.to_string(),
                 tool_names: vec![tool_name.to_string()],
-                output: LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                output: Arc::new(LoadableToolSpec::Namespace(ResponsesApiNamespace {
                     name: format!("mcp__{namespace_name}"),
                     description: format!("Tools in the {namespace_name} namespace."),
                     tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
@@ -3108,7 +3119,8 @@ mod tests {
                         ),
                         output_schema: None,
                     })],
-                }),
+                })),
+                normalize_on_selection: false,
             },
             source_info: source_name.map(|source_name| ToolSearchSourceInfo {
                 name: source_name.to_string(),

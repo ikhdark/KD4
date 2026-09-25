@@ -18,7 +18,6 @@ class CheckDuplicateDepsTest(unittest.TestCase):
                     [
                         "cargo",
                         "tree",
-                        "--locked",
                         "-d",
                         "-p",
                         "codex-cli",
@@ -59,7 +58,7 @@ class CheckDuplicateDepsTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(shutil.which("cargo"), "cargo is required")
-    def test_manifest_drift_fails_without_rewriting_lockfile(self) -> None:
+    def test_manifest_drift_updates_lockfile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "src").mkdir()
@@ -87,11 +86,12 @@ class CheckDuplicateDepsTest(unittest.TestCase):
                 check = kwargs.pop("check")
                 return subprocess.run(*args, cwd=root, check=check, **kwargs)
 
-            self.assertNotEqual(
+            self.assertEqual(
                 check_duplicate_deps.check_duplicate_deps(["--offline"], runner=runner),
                 0,
             )
-            self.assertEqual((root / "Cargo.lock").read_bytes(), before)
+            self.assertNotEqual((root / "Cargo.lock").read_bytes(), before)
+            self.assertIn('version = "0.2.0"', (root / "Cargo.lock").read_text("utf-8"))
 
 
 if __name__ == "__main__":

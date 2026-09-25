@@ -52,6 +52,9 @@ pub(crate) struct SessionState {
     previous_turn_settings: Option<PreviousTurnSettings>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
+    token_budget_reminder_emitted: bool,
+    auto_compact_fallback_emitted: bool,
+    pub(crate) new_context_window_requested: bool,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     /// Transport-only preconnect scheduled before MCP/tool initialization.
@@ -88,6 +91,9 @@ impl SessionState {
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
+            token_budget_reminder_emitted: false,
+            auto_compact_fallback_emitted: false,
+            new_context_window_requested: false,
             startup_prewarm: None,
             startup_transport: None,
             current_time_reminder: CurrentTimeReminderState::default(),
@@ -241,7 +247,28 @@ impl SessionState {
         window_number: u64,
         ids: AutoCompactWindowIds,
     ) {
+        if self.auto_compact_window.ids() != ids {
+            self.token_budget_reminder_emitted = false;
+            self.auto_compact_fallback_emitted = false;
+            self.new_context_window_requested = false;
+        }
         self.auto_compact_window.restore(window_number, ids);
+    }
+
+    pub(crate) fn claim_token_budget_reminder(&mut self) -> bool {
+        !std::mem::replace(&mut self.token_budget_reminder_emitted, true)
+    }
+
+    pub(crate) fn claim_auto_compact_fallback(&mut self) -> bool {
+        !std::mem::replace(&mut self.auto_compact_fallback_emitted, true)
+    }
+
+    pub(crate) fn release_token_budget_reminder(&mut self) {
+        self.token_budget_reminder_emitted = false;
+    }
+
+    pub(crate) fn release_auto_compact_fallback(&mut self) {
+        self.auto_compact_fallback_emitted = false;
     }
 
     #[cfg(test)]

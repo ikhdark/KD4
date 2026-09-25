@@ -45,6 +45,7 @@ fn model_with_approval_messages(
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
+        token_budget: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: Some(ApprovalMessages {

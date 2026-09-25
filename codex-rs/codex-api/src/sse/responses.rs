@@ -663,7 +663,7 @@ mod tests {
             .expect("SSE task should exit cleanly");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn error_when_error_event() {
         let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894","object":"response","created_at":1755041560,"status":"failed","background":false,"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for gpt-5.1 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."}, "usage":null,"user":null,"metadata":{}}}"#;
 
@@ -679,7 +679,10 @@ mod tests {
                     message,
                     "Rate limit reached for gpt-5.1 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."
                 );
-                assert_eq!(*delay, Some(Duration::from_secs_f64(11.054)));
+                assert_eq!(
+                    delay.map(codex_http_client::RetryAfter::remaining_delay),
+                    Some(Duration::from_secs_f64(11.054))
+                );
             }
             other => panic!("unexpected second event: {other:?}"),
         }

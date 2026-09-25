@@ -14,13 +14,10 @@
 * A no-change result is valid and preferred when the requested capability already exists adequately. Before adding a mechanism, identify the concrete missing capability and explain, using relevant source evidence, why existing abstractions are insufficient. Prefer reuse, consolidation, or deletion over adding parallel machinery.
 * When edits overlap, preserve independent changes and combine compatible behavior against the requested contract. Verify the combined runtime path; ask only when conflicting intended behavior cannot be resolved from current evidence.
 * Partial wiring of implemented code is forbidden. End-to-end wiring is mandatory.
-* Add no new frameworks, redesigns, or cleanup projects unless a confirmed failure requires them. Add acceptance checks only when required to validate the requested behavior or a confirmed failure.
 
 ## Validation
 
-* Use the smallest existing check that proves the changed contract. Inspection or a direct assertion is sufficient when behavior does not require execution. Run a full suite only when explicitly required by the user or repository. Do not run additional validation solely for extra confidence.
-* Every test must assert an expected result and fail for a plausible incorrect implementation of the behavior or logic under test.
-* Reuse existing coverage; add or repair a test only for a concrete changed-behavior gap that blocks sufficient validation. Report unrelated weaknesses without starting a broader test audit.
-* Let a valid, progressing validation run finish. Repair failures caused by the change or blocking its required validation in one batch, then rerun only the affected checks. Report unrelated failures without expanding the task; an unchanged failure does not justify another run.
-* Reuse passed validation checks until an overlapping source or dependency mutation invalidates them. Never rerun an unchanged failing check. After a relevant repair, rerun the affected check once; repeat only after another relevant change.
-* A freshness notice is not a request to rerun tests or builds. Revalidate only evidence essential to the current task, using the cheapest scoped check; otherwise report the affected claim as unverified.
+* Use the smallest existing check that proves the changed contract. Inspection or a direct assertion is sufficient when execution is unnecessary. Run a full suite only when explicitly required by the user or repository.
+* Every test must assert the expected behavior and fail for a plausible incorrect implementation. Reuse existing coverage; add or repair tests only when a concrete changed-behavior gap prevents sufficient validation.
+* Let a valid, progressing validation run finish. Diagnose relevant failures, repair them in one batch, and rerun only affected checks. Report unrelated failures without expanding the task.
+* Reuse passed validation until an overlapping source or dependency change makes it stale. Never rerun an unchanged failing check. A freshness notice alone does not require revalidation; if stale evidence is essential, use the cheapest scoped check, otherwise report the claim as unverified.

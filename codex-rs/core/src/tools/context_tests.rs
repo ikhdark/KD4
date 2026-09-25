@@ -868,7 +868,7 @@ fn command_semantic_evidence_normalizes_read_only_presentations() {
     let presentations = [
         source_fact.to_string(),
         format!("src/lib.rs:10:{source_fact}"),
-        format!("SOURCEMAP.md:494:{source_fact}"),
+        format!("README.md:494:{source_fact}"),
         format!("diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+{source_fact}"),
         format!("  --> src/lib.rs:10:1\n10 | {source_fact}\n   | ^^^"),
     ];

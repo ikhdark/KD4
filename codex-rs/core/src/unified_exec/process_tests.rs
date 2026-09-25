@@ -62,6 +62,34 @@ struct TerminationControl {
     calls: AtomicUsize,
 }
 
+#[tokio::test]
+async fn output_chunk_updates_are_cancellation_atomic() {
+    let pending = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let completion = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let stream = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    for blocked in [&completion, &stream] {
+        let guard = blocked.lock().await;
+        let mut append = Box::pin(super::process::append_output_chunk(
+            &pending,
+            &completion,
+            &stream,
+            b"cancelled",
+        ));
+        assert!(futures::poll!(append.as_mut()).is_pending());
+        drop(append);
+        drop(guard);
+        for buffer in [&pending, &completion, &stream] {
+            assert_eq!(buffer.lock().await.retained_bytes(), 0);
+        }
+    }
+    super::process::append_output_chunk(&pending, &completion, &stream, b"kept").await;
+    assert_eq!(pending.lock().await.drain_chunks(), vec![b"kept".to_vec()]);
+    assert_eq!(pending.lock().await.retained_bytes(), 0);
+    for buffer in [&completion, &stream] {
+        assert_eq!(buffer.lock().await.to_bytes_with_loss_notice(&[]), b"kept");
+    }
+}
+
 impl TerminationControl {
     fn new() -> Self {
         let (allowed, _allowed_rx) = watch::channel(false);

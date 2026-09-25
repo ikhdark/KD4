@@ -1,7 +1,6 @@
 schema_version = 2
 fork = "KD4"
-# Feature comparison baseline. This is independent of the later upstream mirror
-# audit pinned in SOURCEMAP.md; it does not select the checkout or sync revision.
+# Feature comparison baseline; it does not select the checkout or sync revision.
 upstream_commit = "9e552e9d15ba52bed7077d5357f3e18e330f8f38"
 status_semantics = "implementation_lifecycle"
 
@@ -35,16 +34,6 @@ kind = "registration"
 path = "codex-rs/core/src/session/turn.rs"
 contains = "let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);"
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/tests/suite/client.rs"
-contains = "configured_effort_survives_tools_and_followup"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/multi_agents_tests.rs"
-contains = "kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents"
-
 [[features]]
 id = "known-delta-store"
 version = 1
@@ -76,11 +65,6 @@ kind = "registration"
 path = "codex-rs/core/src/tools/handlers/shell.rs"
 contains = "turn.config.features.enabled(Feature::KnownDeltaStore)"
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs"
-contains = "known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches"
-
 [[features]]
 id = "deferred-executor"
 version = 1
@@ -106,11 +90,6 @@ contains = "self.snapshot_with_wait_policy(!self.non_blocking_snapshots)"
 kind = "registration"
 path = "codex-rs/core/src/session/session.rs"
 contains = "config.features.enabled(Feature::DeferredExecutor)"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/tests/suite/remote_env.rs"
-contains = "deferred_executor_updates_context_and_tools_after_startup"
 
 [[features]]
 id = "code-mode-runtime"
@@ -138,11 +117,6 @@ kind = "registration"
 path = "codex-rs/core/src/thread_manager.rs"
 contains = "config.features.enabled(Feature::CodeModeHost)"
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/tests/suite/code_mode.rs"
-contains = "code_mode_can_return_exec_command_output"
-
 [[features]]
 id = "code-mode-only"
 version = 1
@@ -159,9 +133,9 @@ benchmark_on = false
 benchmark_control = { kind = "runtime", reason = "Existing switch remains false in the benchmark fork; enabling other implemented controls does not activate unfinished tool restrictions." }
 
 [[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/features/src/lib.rs"
-contains = "key: \"code_mode_only\""
+kind = "registration"
+path = "codex-rs/core/src/tools/mod.rs"
+contains = "turn_context.config.features.enabled(Feature::CodeModeOnly)"
 
 [[features]]
 id = "direct-runtime"
@@ -179,9 +153,9 @@ benchmark_on = false
 benchmark_control = { kind = "runtime", reason = "Existing independent switch stays false; it is not an alternative way to disable the selected KD4 controls." }
 
 [[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/features/src/lib.rs"
-contains = "key: \"direct_runtime\""
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
+contains = "turn.config.features.enabled(Feature::DirectRuntime)"
 
 [[features]]
 id = "task-model-guidance"
@@ -213,6 +187,15 @@ summary = "Declared KD4 feature ownership with deterministic static evidence che
 upstream_equivalent = "none"
 config_keys = []
 benchmark_control = { kind = "lacking_off_state", reason = "Repository workflow, library, or retired capability; not a selected native runtime on/off difference." }
+retired_paths = [
+  "SOURCEMAP.md",
+  "source_owners.toml",
+  "architecture_index.json",
+  "scripts/source_map_check.py",
+  "scripts/test_source_map_check.py",
+  "scripts/source_owners.py",
+  "scripts/test_source_owners.py",
+]
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -227,7 +210,7 @@ contains = "check-kd4-features *args:"
 [[features.evidence]]
 kind = "test"
 path = "scripts/test_check_kd4_features.py"
-contains = "test_repository_manifest_passes_non_strict"
+contains = "def test_repository_manifest_passes("
 
 [[features]]
 id = "kd4-sync-audit"
@@ -285,13 +268,13 @@ contains = "test_phase0_profile_covers_required_baseline_categories"
 id = "extension-boundary-core"
 version = 1
 status = "enabled"
-capability_kind = "runtime"
+# Guidance only: every cited contributor API is upstream code, so no fork test can falsify it.
+capability_kind = "guidance"
 owner = "codex-rs/ext/extension-api"
 summary = "Reuse ToolContributor, ToolLifecycleContributor, and ContextContributor before adding KD4-only hooks."
 upstream_equivalent = "codex extension-api contributor registry"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
-runtime_verification = { kind = "contract_test", path = "codex-rs/ext/extension-api/tests/registry.rs", symbol = "build_round_trips_every_contributor_category", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-extension-boundary-core", "--profile", "fast"] }
+benchmark_control = { kind = "lacking_off_state", reason = "Development guidance for reusing upstream extension hooks; not a selected native runtime on/off difference." }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -322,11 +305,6 @@ contains = "pub fn tool_lifecycle_contributor(&mut self, contributor: Arc<dyn To
 kind = "registration"
 path = "codex-rs/ext/extension-api/src/registry.rs"
 contains = "pub fn prompt_contributor(&mut self, contributor: Arc<dyn ContextContributor>)"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/ext/extension-api/tests/registry.rs"
-contains = "build_round_trips_every_contributor_category"
 
 [[features]]
 id = "structured-command-execution"
@@ -360,11 +338,6 @@ kind = "registration"
 path = "codex-rs/core/src/tools/handlers/unified_exec.rs"
 contains = "CommandInvocation::from_parts"
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs"
-contains = "tagged_script_is_canonical_and_tagged_legacy_is_rejected"
-
 [[features]]
 id = "command-preflight"
 version = 2
@@ -396,11 +369,6 @@ kind = "registration"
 path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
 contains = "preflight_invocation_for_kd4_runtime("
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/command_preflight_tests.rs"
-contains = "never_repairs_mutating_command_flag_typos"
-
 [[features]]
 id = "shell-output-summary"
 version = 2
@@ -427,11 +395,6 @@ contains = "summarize_shell_output_for_model("
 kind = "registration"
 path = "codex-rs/core/src/tools/context.rs"
 contains = "=> summarize_shell_output_for_model("
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/shell_output_summary_tests.rs"
-contains = "failed_output_keeps_exact_error_lines"
 
 [[features]]
 id = "command-attempt-ledger"
@@ -465,11 +428,6 @@ kind = "registration"
 path = "codex-rs/core/src/unified_exec/async_watcher.rs"
 contains = ".mark_process_exited("
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/command_execution.rs"
-contains = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses"
-
 [[features]]
 id = "command-output-artifacts"
 version = 1
@@ -502,16 +460,6 @@ kind = "registration"
 path = "codex-rs/core/src/unified_exec/process.rs"
 contains = "RawOutputArtifactWriter::open(Some(&task_state)).await"
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs"
-contains = "kd4_latency_unpolled_background_failure_retires_live_metadata"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs"
-contains = "foreground_output_artifact_retains_bytes_beyond_transcript_cap"
-
 [[features]]
 id = "preferred-powershell-host"
 version = 1
@@ -533,11 +481,6 @@ contains = "fn select_powershell_host("
 kind = "registration"
 path = "codex-rs/shell-command/src/shell_detect.rs"
 contains = "let shell_path = select_powershell_host("
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/shell-command/src/shell_detect.rs"
-contains = "powershell_resolver_prefers_pwsh_then_compatibility_host"
 
 [[features]]
 id = "windows-command-corpus"
@@ -596,11 +539,6 @@ kind = "registration"
 path = "codex-rs/app-server/src/request_processors/initialize_processor.rs"
 contains = "runtime_info: Some(crate::runtime_provenance::current())"
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/app-server/tests/suite/v2/initialize.rs"
-contains = "initialize_response_includes_local_runtime_metadata"
-
 [[features]]
 id = "local-desktop-publish"
 version = 1
@@ -654,11 +592,6 @@ kind = "registration"
 path = "codex-rs/core/src/tools/router.rs"
 contains = "ToolSearchHandlerCache"
 
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/spec_plan_tests.rs"
-contains = "tool_search_cache_rebuilds_when_deferred_sources_change"
-
 [[features]]
 id = "config-explain"
 version = 1
@@ -684,12 +617,7 @@ contains = "mod config_explain;"
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/cli/src/main.rs"
-contains = "Config(config_cmd::ConfigCli)"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/cli/src/main.rs"
-contains = "config_explain_parses_optional_filter"
+contains = "config_cmd::run(config_cli)"
 
 [[features]]
 id = "coding-budgets"
@@ -702,22 +630,6 @@ upstream_equivalent = "owner-local constants and typed config defaults"
 config_keys = []
 benchmark_control = { kind = "lacking_off_state", reason = "Repository workflow, library, or retired capability; not a selected native runtime on/off difference." }
 retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
-
-[[features]]
-id = "repository-intelligence"
-version = 2
-status = "enabled"
-capability_kind = "workflow"
-owner = "scripts"
-summary = "Deterministic source-owner relationship graph with bounded architecture slices and generated map/index mirrors."
-upstream_equivalent = "none"
-config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "Repository workflow, library, or retired capability; not a selected native runtime on/off difference." }
-source_owner = "source-owner-index"
-generated_artifacts = [
-  "SOURCEMAP.md",
-  "architecture_index.json",
-]
 
 [[features]]
 id = "shared-worktree-reliability"
@@ -765,16 +677,6 @@ contains = "begin_exec_mutation_evidence"
 kind = "registration"
 path = "codex-rs/core/src/tools/runtimes/unified_exec.rs"
 contains = "begin_exec_mutation_evidence"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/agent-task-store/src/tests.rs"
-contains = "completed_receipt_rejects_workspace_change_after_validation"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/events.rs"
-contains = "shell_and_unified_exec_finalize_typed_mutation_evidence"
 
 [[features]]
 id = "validation-authorization"

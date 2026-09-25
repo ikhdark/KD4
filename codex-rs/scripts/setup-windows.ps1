@@ -179,7 +179,7 @@ if (-not (Ensure-Command 'cargo')) {
 Write-Host "==> Configuring Rust toolchain per rust-toolchain.toml" -ForegroundColor Cyan
 
 # Pin to the workspace toolchain and install components
-$toolchain = '1.95.0'
+$toolchain = '1.98.1'
 & rustup toolchain install $toolchain --profile minimal | Out-Host
 & rustup default $toolchain | Out-Host
 & rustup component add clippy rustfmt rust-src --toolchain $toolchain | Out-Host
@@ -221,7 +221,7 @@ $hasLink = $false
 try { & where.exe link | Out-Null; $hasLink = $true } catch {}
 if ($hasLink) {
   Write-Host "-- Installing cargo-insta" -ForegroundColor DarkCyan
-  & cargo install cargo-insta --locked | Out-Host
+  & cargo install cargo-insta | Out-Host
 } else {
   Write-Host "-- Skipping cargo-insta for now (MSVC linker not found yet)" -ForegroundColor Yellow
 }
@@ -234,8 +234,10 @@ if ($SkipBuild) {
 Write-Host "==> Building workspace (cargo build)" -ForegroundColor Cyan
 pushd "$PSScriptRoot\.." | Out-Null
 try {
-  # Clear RUSTFLAGS if coming from constrained environments
-  $env:RUSTFLAGS = ''
+  # Clear RUSTFLAGS if coming from constrained environments. Remove it rather
+  # than assigning '': PowerShell 7.5+ keeps an empty RUSTFLAGS, which makes
+  # Cargo ignore the target rustflags in .cargo/config.toml.
+  Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
   Enter-VsDevShell
   & cargo build
 }

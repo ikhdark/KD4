@@ -245,6 +245,13 @@ async fn run_remote_compact_task_inner_impl(
             if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
+            if let Some(advice) = error.retry_after() {
+                crate::responses_retry::wait_for_retry_deadline(
+                    advice.deadline(),
+                    cancellation_token,
+                )
+                .await?;
+            }
             let fallback_turn_context = &fallback_step_context.turn;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
@@ -655,7 +662,10 @@ mod tests {
         use codex_protocol::protocol::CodexErrorInfo;
 
         let cases = [
-            (CodexErr::ServerOverloaded, CodexErrorInfo::ServerOverloaded),
+            (
+                CodexErr::ServerOverloaded { retry_after: None },
+                CodexErrorInfo::ServerOverloaded,
+            ),
             (
                 CodexErr::UsageLimitReached(UsageLimitReachedError {
                     plan_type: None,

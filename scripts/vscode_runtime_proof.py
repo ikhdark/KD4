@@ -44,6 +44,11 @@ def run_version(path: str | None, *, enabled: bool) -> str | None:
 
 
 def desktop_target() -> str | None:
+    # Same precedence as `codex doctor`: Desktop launches CODEX_CLI_PATH, which
+    # the publisher sets to the installed target.
+    cli_path = os.environ.get("CODEX_CLI_PATH")
+    if cli_path:
+        return cli_path
     publish_dir = os.environ.get("CODEX_LOCAL_PUBLISH_DIR")
     if publish_dir:
         return str(Path(publish_dir) / "codex.exe")
@@ -65,7 +70,9 @@ def extension_candidates(limit: int = 8) -> list[str]:
         for directory, dirnames, filenames in os.walk(
             root, onerror=lambda _error: None
         ):
-            dirnames.sort()
+            # VS Code leaves `.<uuid>` VSIX staging folders here; they sort first
+            # and would fill the limit with binaries no installed extension uses.
+            dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
             for name in sorted(filenames):
                 if len(matches) >= limit:
                     return matches
@@ -125,7 +132,8 @@ def print_probes(probes: Sequence[BinaryProbe]) -> None:
         version = f" version={probe.version}" if probe.version else ""
         print(f"- {probe.label}: {status} path={probe.path or '<none>'}{version}")
     print(
-        "Extension candidates are inventory, not proof of the active extension runtime."
+        "The Desktop target and extension candidates are inventory, not proof of "
+        "the runtime Desktop or the extension launches."
     )
 
 

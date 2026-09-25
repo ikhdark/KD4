@@ -272,7 +272,7 @@ unified_exec = false
 future_toggle = true
 [tool_registry]
 error_on_tool_collisions = true
-[token_budget]
+[future_structured_feature]
 enabled = true
 limit_tokens = 1000
 [code_mode]
@@ -306,7 +306,7 @@ excluded_tool_namespaces = ["example"]
     assert_eq!(resolved, expected);
     let serialized = toml::to_string(&parsed).unwrap();
     assert!(!serialized.contains("tool_registry"));
-    assert!(!serialized.contains("token_budget"));
+    assert!(!serialized.contains("future_structured_feature"));
     assert!(serialized.contains("excluded_tool_namespaces"));
 }
 

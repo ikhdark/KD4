@@ -232,6 +232,7 @@ use codex_protocol::exec_output::StreamOutput;
 mod code_mode_warning;
 mod config_lock;
 pub(crate) mod context_window;
+pub(crate) mod token_budget;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -825,6 +826,18 @@ impl Codex {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        let mut config = config;
+        if !matches!(&conversation_history, InitialHistory::Forked(_))
+            || config.token_budget_startup_config.is_none()
+        {
+            let config = Arc::make_mut(&mut config);
+            config.prepare_token_budget_for_startup()
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+            let auth = auth_manager.auth_cached();
+            token_budget::apply_experimental_context(config, auth.as_ref(), &model_info)
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+            token_budget::apply_model_defaults(config, &model_info);
+        }
         let multi_agent_version =
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version);
         let history_mode = conversation_history.get_history_mode(
@@ -1093,8 +1106,7 @@ impl Codex {
     }
 
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
-        let state = self.session.state.lock().await;
-        state.session_configuration.thread_config_snapshot()
+        self.session.thread_config_snapshot().await
     }
 
     pub(crate) async fn instruction_sources(&self) -> Vec<PathUri> {
@@ -1154,7 +1166,7 @@ fn new_submission_id() -> String {
     Uuid::now_v7().to_string()
 }
 
-fn get_service_tier(
+pub(crate) fn get_service_tier(
     configured_service_tier: Option<String>,
     fast_mode_enabled: bool,
     model_info: &ModelInfo,
@@ -2322,6 +2334,11 @@ impl Session {
             .clone()
     }
 
+    pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
+        let state = self.state.lock().await;
+        state.session_configuration.thread_config_snapshot()
+    }
+
     pub(crate) async fn user_instructions(&self) -> Option<codex_extension_api::UserInstructions> {
         self.services.agents_md_manager.user_instructions()
     }
@@ -2382,6 +2399,10 @@ impl Session {
             // Cancellation during hook discovery leaves both accepted values intact.
             // Preserve ordinary session updates accepted while the build was pending.
             state.session_configuration.original_config_do_not_use = config;
+            self.services
+                .latest_mcp_runtime()
+                .manager()
+                .invalidate_resource_caches();
             self.services.hooks.store(Arc::new(hooks));
             let new_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
@@ -4258,37 +4279,41 @@ impl Session {
             .config
             .features
             .enabled(Feature::DeferredExecutor);
+        let turn = &turn_context;
+        let prepare_tools = |environments: TurnEnvironmentSnapshot| async move {
+            let selected_capability_roots = self
+                .resolve_selected_capability_roots_for_step(&environments)
+                .await;
+            let mcp = self
+                .mcp_runtime_for_step(turn.as_ref(), &environments, &selected_capability_roots)
+                .await?;
+            Ok::<_, CodexErr>((selected_capability_roots, mcp))
+        };
         // Keep the turn-frozen environment view unless deferred executors are enabled, but refresh
         // AGENTS.md for every sampling step in either mode. The deferred path captures live
         // environments inside refresh serialization so the snapshot and returned instructions stay
         // ordered as one request-scoped value.
-        let (environments, agents_md_observation) = if deferred_executor_enabled {
+        let (environments, agents_md_observation, prepared_tools) = if deferred_executor_enabled {
             self.services
                 .agents_md_manager
                 .refresh_for_step(
                     &turn_context.config,
                     self.services.turn_environments.as_ref(),
+                    prepare_tools,
                 )
                 .await
         } else {
-            (
-                turn_context.environments.clone(),
-                self.services
-                    .agents_md_manager
-                    .refresh_and_observe_shared(&turn_context.config, &turn_context.environments)
-                    .await,
-            )
+            let refresh = self
+                .services
+                .agents_md_manager
+                .refresh_and_observe_shared(&turn_context.config, &turn_context.environments);
+            let (observation, prepared) = tokio::join!(
+                Box::pin(refresh),
+                Box::pin(prepare_tools(turn_context.environments.clone())),
+            );
+            (turn_context.environments.clone(), observation, prepared)
         };
-        let selected_capability_roots = self
-            .resolve_selected_capability_roots_for_step(&environments)
-            .await;
-        let mcp = self
-            .mcp_runtime_for_step(
-                turn_context.as_ref(),
-                &environments,
-                &selected_capability_roots,
-            )
-            .await?;
+        let (selected_capability_roots, mcp) = prepared_tools?;
         Ok(Arc::new(StepContext::new_with_agents_md_freshness(
             turn_context,
             environments,
@@ -4449,10 +4474,16 @@ impl Session {
             } else {
                 None
             };
-            let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
             // Reserve the next window under the ordered commit gate, but leave
             // live metadata unchanged until its rollout record is durable.
             let (window_number, window_ids) = session.state.lock().await.next_auto_compact_window();
+            let mut items = items;
+            if turn_context.config.features.enabled(Feature::TokenBudget) {
+                // Render reserved IDs into the same durable replacement that publishes them.
+                // Never advance live window state before the ordered append succeeds.
+                token_budget::update_window_metadata(&mut items, &turn_context, window_ids);
+            }
+            let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
             let compacted_item = CompactedItem {
                 replacement_history: Some(items.clone()),
                 window_number: Some(window_number),

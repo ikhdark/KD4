@@ -182,6 +182,7 @@ pub struct McpConnectionManager {
     tool_plugin_provenance: Arc<ToolPluginProvenance>,
     tool_catalog_revision: Arc<AtomicU64>,
     tool_catalog_cache: StdMutex<Option<CachedToolCatalog>>,
+    resource_cache_generation: Arc<AtomicU64>,
     prefix_mcp_tool_names: bool,
     elicitation_requests: ElicitationRequestManager,
     client_reuse_context: ClientReuseContext,
@@ -572,6 +573,10 @@ impl McpConnectionManager {
             tool_plugin_provenance,
             tool_catalog_revision,
             tool_catalog_cache: StdMutex::new(None),
+            resource_cache_generation: previous_manager.map_or_else(
+                || Arc::new(AtomicU64::new(0)),
+                |previous| Arc::clone(&previous.resource_cache_generation),
+            ),
             prefix_mcp_tool_names,
             elicitation_requests: elicitation_requests.clone(),
             client_reuse_context,
@@ -664,6 +669,7 @@ impl McpConnectionManager {
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             tool_catalog_revision: Arc::new(AtomicU64::new(0)),
             tool_catalog_cache: StdMutex::new(None),
+            resource_cache_generation: Arc::new(AtomicU64::new(0)),
             prefix_mcp_tool_names,
             elicitation_requests: ElicitationRequestManager::new(
                 approval_policy.value(),
@@ -697,6 +703,25 @@ impl McpConnectionManager {
 
     pub fn has_servers(&self) -> bool {
         !self.clients.is_empty()
+    }
+
+    /// Invalidates resource contents even when a runtime update reuses live connections.
+    pub fn invalidate_resource_caches(&self) {
+        self.resource_cache_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn resource_cache_key(
+        &self,
+        server: &str,
+    ) -> Option<crate::resource_client::McpResourceServerCacheKey> {
+        self.clients.get(server).map(|client| {
+            crate::resource_client::McpResourceServerCacheKey {
+                // This shared ownership token identifies the connection across manager reuse.
+                connection: Arc::downgrade(&client.manager_owners),
+                generation: self.resource_cache_generation.load(Ordering::Acquire),
+            }
+        })
     }
 
     /// Monotonic identity for in-place changes to this manager's model-facing

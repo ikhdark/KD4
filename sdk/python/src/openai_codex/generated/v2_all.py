@@ -2593,6 +2593,7 @@ class PlanType(Enum):
     plus = "plus"
     pro = "pro"
     prolite = "prolite"
+    promax = "promax"
     team = "team"
     self_serve_business_prolite = "self_serve_business_prolite"
     self_serve_business_usage_based = "self_serve_business_usage_based"

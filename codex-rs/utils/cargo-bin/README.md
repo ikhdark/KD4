@@ -4,7 +4,7 @@
 workspace.
 
 - `cargo_bin` reads Cargo's `CARGO_BIN_EXE_*` environment variables and falls
-  back to `assert_cmd` when necessary.
+  back to the binary beside the running test executable's target directory.
 - `find_resource!` resolves fixtures relative to the consuming crate's
   `CARGO_MANIFEST_DIR`.
 - `repo_root` walks from this crate's checked-in `repo_root.marker` to the

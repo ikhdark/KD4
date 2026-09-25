@@ -62,7 +62,7 @@ async fn poll_advertises_noninteractive_session_capabilities() {
     else {
         panic!("write_stdin must advertise a function schema");
     };
-    let schema = spec.output_schema.expect("published output schema");
+    let schema = spec.output_schema.expect("published output schema").into_value();
     jsonschema::validator_for(&schema)
         .expect("valid output schema")
         .validate(&value)

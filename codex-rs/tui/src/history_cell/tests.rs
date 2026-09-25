@@ -894,6 +894,7 @@ fn error_event_oversized_input_snapshot() {
 #[test]
 fn error_event_bedrock_expired_signature_snapshot() {
     let error = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::UNAUTHORIZED,
         body: "Signature expired: 20260609T133205Z is now earlier than 20260614T062525Z \
 (20260614T063025Z - 5 min.)"

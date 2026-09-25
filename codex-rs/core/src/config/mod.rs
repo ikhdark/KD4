@@ -149,6 +149,11 @@ pub(crate) mod agent_roles;
 mod auth_keyring;
 pub mod edit;
 mod managed_features;
+mod token_budget;
+mod token_budget_startup;
+pub use token_budget::TokenBudgetConfig;
+pub(crate) use token_budget::resolve_token_budget_config;
+pub use token_budget_startup::TokenBudgetStartupConfig;
 mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
@@ -978,6 +983,8 @@ pub struct Config {
 
     /// Current-time reminder and clock tool configuration, when enabled.
     pub current_time_reminder: Option<CurrentTimeReminderConfig>,
+    pub token_budget: Option<TokenBudgetConfig>,
+    pub token_budget_startup_config: Option<TokenBudgetStartupConfig>,
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
@@ -3119,6 +3126,7 @@ impl Config {
         let code_mode = resolve_code_mode_config(&cfg);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
+        let token_budget = resolve_token_budget_config(&cfg, &features)?;
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
@@ -3581,6 +3589,8 @@ impl Config {
             background_terminal_max_timeout,
             multi_agent_v2,
             current_time_reminder,
+            token_budget,
+            token_budget_startup_config: None,
             features,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning

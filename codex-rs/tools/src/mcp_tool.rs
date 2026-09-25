@@ -1,4 +1,5 @@
 use crate::ToolDefinition;
+use crate::ToolOutputSchema;
 use crate::json_schema::parse_owned_tool_input_schema;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -20,25 +21,19 @@ pub fn parse_mcp_tool(tool: &rmcp::model::Tool) -> Result<ToolDefinition, serde_
     }
 
     let input_schema = parse_owned_tool_input_schema(serialized_input_schema)?;
-    let structured_content_schema = tool
-        .output_schema
-        .as_ref()
-        .map(|output_schema| serde_json::Value::Object(output_schema.as_ref().clone()))
-        .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
-
     Ok(ToolDefinition {
         name: tool.name.to_string(),
         description: tool.description.clone().map(Into::into).unwrap_or_default(),
         input_schema,
-        output_schema: Some(mcp_call_tool_result_output_schema(
-            structured_content_schema,
+        output_schema: Some(ToolOutputSchema::from_mcp_output_schema(
+            tool.output_schema.clone(),
         )),
         defer_loading: false,
     })
 }
 
 pub fn mcp_call_tool_result_output_schema(structured_content_schema: JsonValue) -> JsonValue {
-    json!({
+    let mut schema = json!({
         (codex_code_mode::MCP_RESULT_SCHEMA_MARKER): true,
         "type": "object",
         "properties": {
@@ -48,7 +43,7 @@ pub fn mcp_call_tool_result_output_schema(structured_content_schema: JsonValue) 
                     "type": "object"
                 }
             },
-            "structuredContent": structured_content_schema,
+            "structuredContent": null,
             "isError": {
                 "type": "boolean"
             },
@@ -58,7 +53,10 @@ pub fn mcp_call_tool_result_output_schema(structured_content_schema: JsonValue) 
         },
         "required": ["content"],
         "additionalProperties": false
-    })
+    });
+    // Move the payload without changing the envelope's property order or KD4 marker.
+    schema["properties"]["structuredContent"] = structured_content_schema;
+    schema
 }
 
 #[cfg(test)]

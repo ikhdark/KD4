@@ -13,16 +13,15 @@ import hashlib
 import html
 import json
 import re
+import subprocess
 import sys
 import uuid
 from pathlib import Path, PurePosixPath
 
 if __package__:
     from .atomic_json import write_bytes_atomic, write_json_atomic
-    from .source_map_check import repository_source_records
 else:
     from atomic_json import write_bytes_atomic, write_json_atomic
-    from source_map_check import repository_source_records
 
 PRUNE = (
     ".git",
@@ -39,6 +38,75 @@ MAX_SCAN_BYTES = 64 * 1024 * 1024
 RESULT_FORMAT = "source_inventory_result_v1"
 PAGE_RECORDS = 50
 SUMMARY_PAGE_BYTES = 16 * 1024
+
+
+def repository_source_records(
+    repo_root: Path, *, include_untracked: bool = True, prune: tuple[str, ...] = (),
+    paths: tuple[str, ...] = (),
+) -> dict[str, str]:
+    # One listing answers everything the inventory needs: `--deleted` tags
+    # tracked paths missing from the working tree (R) and `--stage` exposes
+    # the index mode, so gitlinks (160000) drop out without a stat per path.
+    args = [
+        "git",
+        "ls-files",
+        "-t",
+        "--stage",
+        "--cached",
+        "--deleted",
+        "--exclude-standard",
+        "-z",
+    ]
+    if include_untracked:
+        args.append("--others")
+    # Git prunes these untracked directories before descending. Filtering its
+    # output alone would still walk arbitrarily large build/dependency trees.
+    args.extend(f"--exclude={name}/" for name in prune)
+    if paths:
+        args.extend(["--", *(f":(literal){path}" for path in paths)])
+    result = subprocess.run(
+        args,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"git ls-files exited {result.returncode}"
+        raise ValueError(f"failed to enumerate repository sources: {detail}")
+    deleted_paths: set[str] = set()
+    entries: list[tuple[str, str]] = []
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        if len(record) < 3 or record[1] != " ":
+            raise ValueError("git ls-files returned an invalid tagged path record")
+        tag, body = record[0], record[2:]
+        if tag == "?":
+            path = PurePosixPath(body).as_posix()
+        else:
+            stage_fields, separator, path_text = body.partition("\t")
+            if not separator:
+                raise ValueError("git ls-files returned an invalid staged path record")
+            mode = stage_fields.split(" ", 1)[0]
+            path = PurePosixPath(path_text).as_posix()
+            if tag == "R":
+                deleted_paths.add(path)
+                continue
+            if mode == "160000":
+                # A submodule gitlink is a directory in the working tree.
+                continue
+        entries.append((tag, path))
+    records: dict[str, str] = {}
+    for tag, path in entries:
+        if any(part in prune for part in PurePosixPath(path).parts[:-1]):
+            continue
+        records[path] = "deleted" if path in deleted_paths else (
+            "untracked" if tag == "?" else "tracked"
+        )
+    return records
 
 
 def digest(value):

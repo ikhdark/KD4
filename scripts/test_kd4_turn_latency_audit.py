@@ -946,6 +946,128 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertIn("repeated_orchestration_majority_turns", decision["reasonCodes"])
         self.assertNotIn("limited_representative_evidence", decision["reasonCodes"])
 
+    @staticmethod
+    def audit_rows(rows: list[str]) -> dict:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout.jsonl"
+            source.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            return kd4_turn_latency_audit.analyze_session_path(source, root)
+
+    @staticmethod
+    def paired_call(call_id: str, started: str, finished: str) -> list[str]:
+        return [
+            _response(
+                {"type": "function_call", "call_id": call_id, "name": "shell_command"},
+                f"2026-08-17T{started}Z",
+            ),
+            _response(
+                {"type": "function_call_output", "call_id": call_id, "output": "ok"},
+                f"2026-08-17T{finished}Z",
+            ),
+        ]
+
+    def test_parallel_tool_round_trips_report_sum_and_wall_union(self) -> None:
+        # a: 0-4 s and b: 1-3 s overlap; c: 10-11 s. Sum 7 s, wall union 5 s.
+        a_call, a_output = self.paired_call("a", "00:00:00", "00:00:04")
+        b_call, b_output = self.paired_call("b", "00:00:01", "00:00:03")
+        report = self.audit_rows(
+            [
+                _event({"type": "task_started", "turn_id": "turn"}),
+                a_call,
+                b_call,
+                b_output,
+                a_output,
+                *self.paired_call("c", "00:00:10", "00:00:11"),
+                _event(
+                    {"type": "task_complete", "turn_id": "turn", "timing": _timing()},
+                    "2026-08-17T00:00:12Z",
+                ),
+            ]
+        )
+        loop = report["executionLoop"]
+        self.assertEqual(loop["pairedToolRoundTripNs"], 7_000_000_000)
+        self.assertEqual(loop["pairedToolRoundTripUnionNs"], 5_000_000_000)
+        self.assertIn(
+            "tool-round-trip per-call-sum=7.0s wall-union=5.0s",
+            kd4_turn_latency_audit.render_report(report),
+        )
+
+    def test_slow_tool_evidence_comes_only_from_the_valid_turns_it_explains(
+        self,
+    ) -> None:
+        timing = _timing()
+        timing["exclusive"] = {
+            **timing["exclusive"],
+            "modelOnlyNs": 100_000_000,
+            "toolOnlyNs": 700_000_000,
+        }
+        slow_calls = [
+            *self.paired_call("slow-1", "00:01:00", "00:01:06"),
+            *self.paired_call("slow-2", "00:01:06", "00:01:12"),
+        ]
+        start = _event({"type": "task_started", "turn_id": "turn"})
+        complete = _event(
+            {"type": "task_complete", "turn_id": "turn", "timing": timing},
+            "2026-08-17T00:02:00Z",
+        )
+        # Slow calls in a turn that never terminated cannot corroborate the
+        # tool-dominant phase measured on the valid turn.
+        outside = self.audit_rows(
+            [
+                start,
+                complete,
+                _event(
+                    {"type": "task_started", "turn_id": "open"},
+                    "2026-08-17T00:03:00Z",
+                ),
+                *[row.replace("T00:01:", "T00:03:") for row in slow_calls],
+            ]
+        )
+        self.assertEqual(outside["auditDecision"]["dominantPhase"], "tool")
+        self.assertEqual(outside["commandOrchestration"]["slowToolCallCount"], 2)
+        self.assertIn(
+            "limited_representative_evidence", outside["auditDecision"]["reasonCodes"]
+        )
+        self.assertNotIn(
+            "repeated_slow_tool_execution", outside["auditDecision"]["reasonCodes"]
+        )
+        inside = self.audit_rows([start, *slow_calls, complete])
+        self.assertIn(
+            "repeated_slow_tool_execution", inside["auditDecision"]["reasonCodes"]
+        )
+
+    def test_generation_without_request_does_not_hide_a_retry(self) -> None:
+        # Three generations started; the third never dispatched. The first
+        # generation was retried once: 3 attempts over 2 requested generations.
+        timing = _timing()
+        first, second = timing["modelRequests"]
+        timing["counters"]["logicalGenerationCount"] = 3
+        timing["modelRequests"] = [first, {**first, "attemptKind": "retry"}, second]
+        report = self.audit_rows(
+            [
+                _event({"type": "task_started", "turn_id": "turn"}),
+                _event(
+                    {"type": "task_complete", "turn_id": "turn", "timing": timing},
+                    "2026-08-17T00:00:01Z",
+                ),
+            ]
+        )
+        model = report["latencyBreakdown"]["modelInference"]
+        self.assertEqual(
+            (
+                model["logicalGenerations"],
+                model["generationsWithRequests"],
+                model["physicalAttempts"],
+                model["retryAttempts"],
+            ),
+            (3, 2, 3, 1),
+        )
+        self.assertIn(
+            "generations/requested/attempts/retries=3/2/3/1",
+            kd4_turn_latency_audit.render_report(report),
+        )
+
     def test_empty_token_report_keeps_the_per_turn_schema_complete(self) -> None:
         tokens = kd4_turn_latency_audit._token_report([])
 
@@ -1577,9 +1699,9 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             ("rg -n Widget", "scripts/widget.py:10:class Widget"),
             ("rg -n Widget", "scripts/widget.py:10:class Widget"),
             ("Get-Content scripts/widget.py", "class Widget: pass"),
-            ("Get-Content -Raw SOURCEMAP.md", "scripts/source_owners.py"),
+            ("Get-Content -Raw README.md", "scripts/widget.py"),
             (
-                "python scripts/source_owners.py slice --owner audit --focus Widget",
+                "Get-Content scripts/test_widget.py",
                 "scripts/test_widget.py",
             ),
             (
@@ -1664,7 +1786,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertTrue(discovery["events"][0]["newEvidence"])
         self.assertFalse(discovery["events"][2]["newEvidence"])
         self.assertEqual(discovery["searchCount"], 3)
-        self.assertEqual(discovery["readCount"], 3)
+        self.assertEqual(discovery["readCount"], 4)
         self.assertEqual(discovery["broadSearchCount"], 2)
         self.assertEqual(discovery["repeatedSearchSignatureCount"], 1)
         self.assertEqual(
@@ -1685,8 +1807,6 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             ],
             [3],
         )
-        self.assertEqual(signal_counts["broad_source_map_before_owner_slice"], 1)
-        self.assertEqual(signal_counts["ownership_evidence_late"], 1)
         self.assertEqual(signal_counts["callers_evidence_late"], 1)
         self.assertEqual(signal_counts["tests_evidence_late"], 1)
         self.assertEqual(signal_counts["contracts_evidence_late"], 1)

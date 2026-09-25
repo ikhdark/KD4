@@ -10,7 +10,7 @@ fn search_results_defer_functions_and_namespace_children_without_output_schemas(
         strict: true,
         defer_loading: Some(false),
         parameters: JsonSchema::string(Some("Record ID".to_string())),
-        output_schema: Some(serde_json::json!({"type": "string", "description": "Record"})),
+        output_schema: Some(serde_json::json!({"type": "string", "description": "Record"}).into()),
     };
     let mut expected_function = function.clone();
     expected_function.defer_loading = Some(true);
@@ -37,8 +37,31 @@ fn search_results_defer_functions_and_namespace_children_without_output_schemas(
     ] {
         let original = spec.clone();
         let info = ToolSearchInfo::from_tool_spec(&spec, None).expect("searchable tool");
-        assert_eq!(info.entry.output, expected);
+        assert_eq!(info.entry.to_loadable_spec(), expected);
         assert_eq!(spec, original);
+        let raw = std::sync::Arc::new(match spec {
+            ToolSpec::Function(tool) => LoadableToolSpec::Function(tool),
+            ToolSpec::Namespace(mut namespace) => {
+                namespace.description.clear();
+                LoadableToolSpec::Namespace(namespace)
+            }
+            _ => unreachable!(),
+        });
+        let shared = ToolSearchInfo::from_shared_spec("lookup".to_string(), raw.clone(), None);
+        assert!(std::sync::Arc::ptr_eq(&raw, &shared.entry.output));
+        assert!(std::sync::Arc::ptr_eq(&raw, &shared.clone().entry.output));
+        let expected = ToolSearchInfo::from_tool_spec(&raw.as_ref().clone().into(), None).unwrap();
+        assert_eq!(shared.entry.to_loadable_spec(), expected.entry.to_loadable_spec());
+        let raw_function = match raw.as_ref() {
+            LoadableToolSpec::Function(tool) => tool,
+            LoadableToolSpec::Namespace(namespace) => {
+                assert!(namespace.description.is_empty());
+                let ResponsesApiNamespaceTool::Function(tool) = &namespace.tools[0];
+                tool
+            }
+        };
+        assert_eq!(raw_function.defer_loading, Some(false));
+        assert!(raw_function.output_schema.is_some());
     }
 }
 

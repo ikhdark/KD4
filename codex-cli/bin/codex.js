@@ -166,13 +166,21 @@ async function main() {
       : packageManager === "pnpm"
         ? "CODEX_MANAGED_BY_PNPM"
         : "CODEX_MANAGED_BY_NPM";
-  const env = {
-    ...process.env,
-    CODEX_MANAGED_PACKAGE_ROOT: codexPackageRoot,
-  };
-  delete env.CODEX_MANAGED_BY_NPM;
-  delete env.CODEX_MANAGED_BY_BUN;
-  delete env.CODEX_MANAGED_BY_PNPM;
+  const env = { ...process.env };
+  // Windows environment names are case-insensitive, so a stale variable with
+  // different casing would otherwise still reach the native process.
+  const managedEnvVars = new Set([
+    "CODEX_MANAGED_BY_NPM",
+    "CODEX_MANAGED_BY_BUN",
+    "CODEX_MANAGED_BY_PNPM",
+    "CODEX_MANAGED_PACKAGE_ROOT",
+  ]);
+  for (const name of Object.keys(env)) {
+    if (managedEnvVars.has(name.toUpperCase())) {
+      delete env[name];
+    }
+  }
+  env.CODEX_MANAGED_PACKAGE_ROOT = codexPackageRoot;
   env[packageManagerEnvVar] = "1";
 
   const startupError = (error) =>
@@ -194,6 +202,12 @@ async function main() {
   // exiting immediately; once the child has been signaled we simply wait for
   // its exit event which will in turn terminate the parent (see below).
   const forwardSignal = (signal) => {
+    // Console Ctrl-C is delivered to every process attached to the console,
+    // including the child. On Windows child.kill() is TerminateProcess, which
+    // would pre-empt Codex's own Ctrl-C handling, so wait for its exit instead.
+    if (platform === "win32" && signal === "SIGINT") {
+      return;
+    }
     let detail = "the child process may still be running";
     try {
       if (child.kill(signal)) {

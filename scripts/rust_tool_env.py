@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
@@ -11,6 +12,38 @@ SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
 DEFAULT_SCCACHE_CACHE_SIZE = "80G"
 WINDOWS_LLVM_LLD_LINK_DEFAULT = Path("C:/Program Files/LLVM/bin/lld-link.exe")
 _SCOOP_LLVM_LLD_LINK = Path("apps/llvm/current/bin/lld-link.exe")
+
+
+def local_rust_env(
+    env: Mapping[str, str],
+    *,
+    repo_root: Path | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+) -> dict[str, str]:
+    """Shared, probe-free defaults for Just, lane and direct test entrypoints."""
+    if env.get("CI", "").lower() not in ("", "0", "false", "no"):
+        return {}
+    updates: dict[str, str] = {}
+    if not env.get("CARGO_NET_GIT_FETCH_WITH_CLI"):
+        updates["CARGO_NET_GIT_FETCH_WITH_CLI"] = "true"
+    wrapper = env.get("RUSTC_WRAPPER")
+    if wrapper is None:
+        wrapper = which("sccache")
+        if wrapper:
+            updates["RUSTC_WRAPPER"] = wrapper
+    if wrapper and is_sccache_wrapper(wrapper) and repo_root is not None:
+        if not env.get("SCCACHE_BASEDIR"):
+            updates["SCCACHE_BASEDIR"] = os.path.abspath(repo_root)
+        if not env.get("SCCACHE_CACHE_SIZE"):
+            updates["SCCACHE_CACHE_SIZE"] = sccache_cache_size(env)
+    missing_linkers = [
+        f"CARGO_TARGET_{target}_PC_WINDOWS_MSVC_LINKER"
+        for target in ("X86_64", "AARCH64")
+        if not env.get(f"CARGO_TARGET_{target}_PC_WINDOWS_MSVC_LINKER")
+    ]
+    if missing_linkers and (linker := find_windows_lld_link(env, which=which)):
+        updates.update(dict.fromkeys(missing_linkers, linker))
+    return updates
 
 
 def cargo_package_specs(args: Sequence[str]) -> list[str]:

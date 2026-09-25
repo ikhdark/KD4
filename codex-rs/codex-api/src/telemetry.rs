@@ -296,6 +296,7 @@ mod tests {
                 |_| async move {
                     Err(match expected_status {
                         Some(status) => TransportError::Http {
+                            retry_after: None,
                             status,
                             url: None,
                             headers: None,

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 
+import contextlib
+import io
 import json
+import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -125,6 +129,30 @@ class DesktopProtocolDriftTest(unittest.TestCase):
             self.assertEqual(
                 drift.main(["--logs", str(logs), "--schema", str(schema), "--json"]), 0
             )
+
+    def test_no_recent_logs_is_missing_evidence_not_a_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            logs = root / "Logs"
+            logs.mkdir()
+            stale = logs / "old.log"
+            stale.write_text("unknown variant `audit/missingMethod`", encoding="utf-8")
+            month_ago = time.time() - 30 * 86_400
+            os.utime(stale, (month_ago, month_ago))
+            schema = root / "ClientRequest.json"
+            schema.write_text(
+                json.dumps(schema_with_methods("initialize")), encoding="utf-8"
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = drift.main(
+                    ["--logs", str(logs), "--schema", str(schema), "--days", "7"]
+                )
+
+        self.assertEqual(code, 2)
+        self.assertIn(
+            "no Desktop logs modified in the last 7 day(s)", stderr.getvalue()
+        )
 
 
 if __name__ == "__main__":

@@ -215,7 +215,7 @@ fn search_error(error: codex_api::ApiError) -> FunctionCallError {
         ApiError::CyberPolicy { .. } => {
             "Web search was blocked by policy. Do not retry the same operation."
         }
-        ApiError::RateLimit(_) | ApiError::ServerOverloaded | ApiError::Retryable { .. } => {
+        ApiError::RateLimit(_) | ApiError::ServerOverloaded { .. } | ApiError::Retryable { .. } => {
             "Web search is temporarily unavailable or rate limited. Retry later if the evidence is still needed."
         }
         _ => {
@@ -426,7 +426,10 @@ mod tests {
                 },
                 "Correct the commands",
             ),
-            (ApiError::ServerOverloaded, "Retry later"),
+            (
+                ApiError::ServerOverloaded { retry_after: None },
+                "Retry later",
+            ),
         ] {
             let FunctionCallError::RespondToModel(message) = super::search_error(error) else {
                 panic!("recoverable error");

@@ -38,19 +38,21 @@ def _load_runtime_setup_module():
     return module
 
 
-def _write_fake_codex_package(package_dir: Path, script) -> Path:
+def _write_fake_codex_package(package_dir: Path, script, version: str = "1.2.3") -> Path:
     (package_dir / "bin").mkdir(parents=True)
     (package_dir / "codex-resources").mkdir()
     (package_dir / "codex-path").mkdir()
-    (package_dir / "codex-package.json").write_text('{"variant":"codex"}\n')
+    (package_dir / "codex-package.json").write_text(
+        f'{{"variant":"codex","version":"{version}"}}\n'
+    )
     (package_dir / "bin" / script.runtime_binary_name()).write_text("fake codex\n")
     (package_dir / "bin" / script.runtime_code_mode_host_name()).write_text("fake code mode host\n")
     (package_dir / "codex-path" / "rg").write_text("fake rg\n")
     return package_dir
 
 
-def _write_fake_codex_package_archive(tmp_path: Path, script) -> Path:
-    package_dir = _write_fake_codex_package(tmp_path / "codex-package", script)
+def _write_fake_codex_package_archive(tmp_path: Path, script, version: str = "1.2.3") -> Path:
+    package_dir = _write_fake_codex_package(tmp_path / "codex-package", script, version)
     archive_path = tmp_path / "codex-package.tar.gz"
     _write_package_archive(package_dir, archive_path)
     return archive_path
@@ -339,7 +341,7 @@ def test_stage_runtime_release_copies_package_layout_and_sets_version(
         "code_mode_host": (package_root / "bin" / script.runtime_code_mode_host_name()).read_text(),
         "rg": (package_root / "codex-path" / "rg").read_text(),
     } == {
-        "metadata": '{"variant":"codex"}\n',
+        "metadata": '{"variant":"codex","version":"1.2.3"}\n',
         "codex": "fake codex\n",
         "code_mode_host": "fake code mode host\n",
         "rg": "fake rg\n",
@@ -379,7 +381,7 @@ def test_stage_runtime_release_replaces_existing_staging_dir(tmp_path: Path) -> 
 
 def test_stage_runtime_release_can_pin_wheel_platform_tag(tmp_path: Path) -> None:
     script = _load_update_script_module()
-    package_archive = _write_fake_codex_package_archive(tmp_path, script)
+    package_archive = _write_fake_codex_package_archive(tmp_path, script, "0.116.0-alpha.1")
 
     staged = script.stage_python_runtime_package(
         tmp_path / "runtime-stage",
@@ -390,6 +392,14 @@ def test_stage_runtime_release_can_pin_wheel_platform_tag(tmp_path: Path) -> Non
 
     pyproject = (staged / "pyproject.toml").read_text()
     assert 'platform-tag = "win_amd64"' in pyproject
+
+
+def test_stage_runtime_release_rejects_archive_built_for_another_version(tmp_path: Path) -> None:
+    script = _load_update_script_module()
+    package_archive = _write_fake_codex_package_archive(tmp_path, script, "1.2.4")
+
+    with pytest.raises(RuntimeError, match="contains Codex version '1.2.4'; expected 1.2.3"):
+        script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_archive)
 
 
 def test_stage_runtime_release_rejects_incomplete_package_layout(tmp_path: Path) -> None:

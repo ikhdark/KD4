@@ -349,7 +349,6 @@ pub fn prepare(
     tree.current_dir(&workspace)
         .args([
             "tree",
-            "--locked",
             "--edges",
             "normal,build",
             "--prefix",

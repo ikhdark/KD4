@@ -2360,6 +2360,7 @@ async fn local_policy_remote_refresh_keeps_fork_prompt_and_server_capabilities()
             model.context_window = Some(400_000);
             model.max_context_window = Some(872_000);
             model.model_messages = Some(codex_protocol::openai_models::ModelMessages {
+                token_budget: None,
                 instructions_template: Some(
                     "remote verbosity policy {{ personality }}".to_string(),
                 ),

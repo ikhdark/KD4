@@ -251,10 +251,11 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
         Poll::Pending
     }
 
-    /// Map a crossterm event to a [`TuiEvent`], skipping events we don't use (mouse events, etc.).
+    /// Map terminal input and focus bookkeeping to a [`TuiEvent`].
     fn map_crossterm_event(&mut self, event: Event) -> Option<TuiEvent> {
         match event {
             Event::Key(key_event) => Some(TuiEvent::Key(key_event)),
+            Event::Mouse(mouse) => Some(TuiEvent::Mouse(mouse)),
             Event::Resize(_, _) => Some(TuiEvent::Resize),
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
@@ -266,7 +267,6 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 self.terminal_focused.store(false, Ordering::Relaxed);
                 None
             }
-            _ => None,
         }
     }
 }

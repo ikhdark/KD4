@@ -17,4 +17,9 @@ impl Options {
 fn main() {
     let _ = create_openai_url(/*api_base*/ None);
     let _ = Options.enabled(/*value*/ false);
+    let _ = join_args(/*argv*/ vec!["a"]);
+}
+
+fn join_args(args: Vec<&str>) -> String {
+    args.join(" ")
 }

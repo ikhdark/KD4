@@ -113,11 +113,11 @@ class MessageRouter:
             if turn_id in self._abandoned_turns:
                 raise RuntimeError(f"turn {turn_id!r} was abandoned")
             # A turn can emit events immediately after turn/start, before the
-            # caller receives the TurnHandle and starts streaming.
-            pending = self._pending_turn_notifications.pop(turn_id, deque())
+            # caller receives the TurnHandle and starts streaming. Replay them
+            # before publishing the queue so newer routed events stay behind.
+            for notification in self._pending_turn_notifications.pop(turn_id, ()):
+                turn_queue.put(notification)
             self._turn_notifications[turn_id] = turn_queue
-        for notification in pending:
-            turn_queue.put(notification)
 
     def unregister_turn(self, turn_id: str) -> None:
         """Stop retaining events for a turn that the caller will not consume."""

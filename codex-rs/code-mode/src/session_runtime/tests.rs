@@ -119,7 +119,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     let commit = host.commit_completion(
         HashMap::from([(
             "candidate".to_string(),
-            JsonValue::String("lost".to_string()),
+            Arc::new(JsonValue::String("lost".to_string())),
         )]),
         completion.clone(),
         /*pending_initial_yield_items*/ None,
@@ -180,10 +180,10 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
     let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
     runtime.inner.stored_values.lock().await.insert(
         "stable".to_string(),
-        JsonValue::String("preserved".to_string()),
+        Arc::new(JsonValue::String("preserved".to_string())),
     );
     let writes = (0..crate::runtime::MAX_SESSION_STORED_VALUES)
-        .map(|index| (format!("new-{index}"), JsonValue::Bool(true)))
+        .map(|index| (format!("new-{index}"), Arc::new(JsonValue::Bool(true))))
         .collect();
     let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let host = RuntimeCellHost {
@@ -211,7 +211,7 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
     let stored_values = runtime.inner.stored_values.lock().await;
     assert_eq!(stored_values.len(), 1);
     assert_eq!(
-        stored_values.get("stable"),
+        stored_values.get("stable").map(Arc::as_ref),
         Some(&JsonValue::String("preserved".to_string()))
     );
 }

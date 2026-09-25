@@ -204,7 +204,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                     .to_string(),
             ),
         ),
-        output_schema: Some(read_tool_output_output_schema(selector_schema)),
+        output_schema: Some(read_tool_output_output_schema(selector_schema).into()),
     })
 }
 
@@ -457,7 +457,7 @@ mod tests {
             panic!("recovery uses a function spec");
         };
         let declaration = codex_code_mode::render_json_schema_to_typescript(
-            spec.output_schema.as_ref().expect("recovery output schema"),
+            &spec.output_schema.as_ref().expect("recovery output schema").to_value(),
         );
         for field in [
             "complete: boolean",

@@ -41,8 +41,6 @@ Use the [session audit](../../../scripts/kd4_turn_latency_audit.py) for a record
 session and Repo Benchmark for comparisons between revisions. The audit shares
 definitions with [timing analysis](../../../scripts/kd4_timing_analysis.py) and
 [first-action analysis](../../../scripts/kd4_first_useful_action_analysis.py).
-These files and the benchmark are routed through the `repo-benchmark` source
-owner in [source_owners.toml](../../../source_owners.toml).
 
 | Question | Existing evidence | Limits |
 |---|---|---|
@@ -142,8 +140,10 @@ python scripts/kd4_perf_snapshot.py --scenario local-cli-build --iterations 2 --
 
 The snapshot records revision, dirty paths, platform, Python version, CPU count,
 and installed binary identity (hashing is opt-in). Its `cold_ms` field means the
-first invocation and `warm_p50_ms` means subsequent invocations; these labels do
-not establish OS, compiler, or provider cache state. It does not measure actual
+first invocation, `warm_p50_ms` and `warm_p95_ms` describe subsequent
+invocations, and `p50_ms`/`p95_ms` include the first invocation; these labels do
+not establish OS, compiler, or provider cache state. A failed invocation stays in
+`samples` but is excluded from every statistic. It does not measure actual
 Desktop installation, end-user paint latency, or a complete edit-to-runtime loop.
 Record background builds and other competing work when interpreting differences.
 
@@ -574,8 +574,8 @@ Summed thread durations are not elapsed task time.
 
 ## Focused validation
 
-Use `cargo test --locked -p repo-benchmark --jobs 6`, the affected feature/core gates, the Python
-audit/timing tests, and `just source-map-check`. Do not run the full repository suite. Completion
+Use `cargo test -p repo-benchmark --jobs 6`, the affected feature/core gates, the Python
+audit/timing tests, and `just check-kd4-features --static-only`. Do not run the full repository suite. Completion
 requires a full-mode execution covering scripted work and all nine live attempts with preserved
 evidence; fast selection is checked without another paid matrix.
 

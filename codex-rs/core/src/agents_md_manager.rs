@@ -180,28 +180,46 @@ impl AgentsMdManager {
         }
     }
 
-    pub(crate) async fn refresh_for_step(
+    pub(crate) async fn refresh_for_step<T, F>(
         &self,
         config: &Arc<Config>,
         environments: &ThreadEnvironments,
-    ) -> (TurnEnvironmentSnapshot, AgentsMdObservation) {
-        let refresh = async {
-            let _permit = self.refresh_gate.acquire().await.ok()?;
+        prepare: impl FnOnce(TurnEnvironmentSnapshot) -> F,
+    ) -> (TurnEnvironmentSnapshot, AgentsMdObservation, T)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let deadline = tokio::time::Instant::now() + REFRESH_TIMEOUT;
+        let capture = async {
+            let permit = self.refresh_gate.acquire().await.ok()?;
             let snapshot = environments.snapshot().await;
-            let observation = self
-                .refresh_with_gate_held(Arc::clone(config), &snapshot)
-                .await;
-            Some((snapshot, observation))
+            Some((snapshot, permit))
         };
-        match tokio::time::timeout(REFRESH_TIMEOUT, refresh).await {
-            Ok(Some(result)) => result,
+        let (snapshot, permit) = match tokio::time::timeout_at(deadline, capture).await {
+            Ok(Some((snapshot, permit))) => (snapshot, Some(permit)),
             _ => {
                 // Capture ready identities without awaiting a stalled resolver.
-                let snapshot = environments.snapshot_now().await;
-                let observation = self.scoped_fallback(config, &snapshot);
-                (snapshot, observation)
+                (environments.snapshot_now().await, None)
             }
-        }
+        };
+        let refresh = Box::pin(async {
+            if let Some(_permit) = permit {
+                if let Ok(observation) = tokio::time::timeout_at(
+                    deadline,
+                    self.refresh_with_gate_held(Arc::clone(config), &snapshot),
+                )
+                .await
+                {
+                    return observation;
+                }
+            }
+            // Preparation already uses this snapshot; even a timeout must not switch scopes.
+            self.scoped_fallback(config, &snapshot)
+        });
+        // Do not short-circuit instruction refresh when preparation returns an error, or keep
+        // the refresh gate held while waiting for preparation after instructions are ready.
+        let (observation, prepared) = tokio::join!(refresh, Box::pin(prepare(snapshot.clone())));
+        (snapshot, observation, prepared)
     }
 
     fn scoped_fallback(

@@ -6,6 +6,7 @@ use crate::client::ModelClientSession;
 use crate::retry::backoff;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use codex_http_client::RetryAfter;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::EventMsg;
@@ -63,6 +64,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     if !should_retry_response_stream(&err) {
         return Err(err);
     }
+    let retry_after = err.retry_after();
 
     let wait_for_connection_recovery = should_wait_for_connection_recovery(
         request,
@@ -92,6 +94,9 @@ pub(crate) async fn handle_retryable_response_stream_error(
         // budget; exhausted recovery must not start a second full retry window.
         if retry_budget_exhausted {
             exhaust_retry_budget_for_http_fallback(&mut retry_state.retries, max_retries);
+        }
+        if let Some(advice) = retry_after {
+            wait_for_retry_deadline(advice.deadline(), cancellation_token).await?;
         }
         return Ok(());
     }
@@ -128,6 +133,9 @@ pub(crate) async fn handle_retryable_response_stream_error(
         retry_state.retries += 1;
         let retry_count = retry_state.retries;
         let delay = response_stream_retry_delay(&err, retry_count);
+        let retry_at = retry_after
+            .map(RetryAfter::deadline)
+            .unwrap_or_else(|| tokio::time::Instant::now() + delay);
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
         // Surface retry information from the first attempt so a reconnect never looks frozen.
@@ -138,7 +146,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         )
         .await;
         let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-        wait_for_retry_delay(delay, cancellation_token).await?;
+        wait_for_retry_deadline(retry_at, cancellation_token).await?;
         return Ok(());
     }
 
@@ -178,9 +186,16 @@ async fn wait_for_retry_delay(
     delay: Duration,
     cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
+    wait_for_retry_deadline(tokio::time::Instant::now() + delay, cancellation_token).await
+}
+
+pub(crate) async fn wait_for_retry_deadline(
+    deadline: tokio::time::Instant,
+    cancellation_token: &CancellationToken,
+) -> Result<(), CodexErr> {
     tokio::select! {
         _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
-        _ = tokio::time::sleep(delay) => Ok(()),
+        _ = tokio::time::sleep_until(deadline) => Ok(()),
     }
 }
 
@@ -205,8 +220,8 @@ fn should_switch_fallback_transport(err: &CodexErr) -> bool {
 fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {
     // Server delays are a minimum wait, not a suggestion to retry sooner.
     // Only our own exponential backoff is capped; all waits remain cancellable.
-    if let CodexErr::Stream(_, Some(requested_delay)) = err {
-        return *requested_delay;
+    if let Some(advice) = err.retry_after() {
+        return advice.remaining_delay();
     }
     backoff(retry_count).min(MAX_RESPONSE_STREAM_RETRY_DELAY)
 }

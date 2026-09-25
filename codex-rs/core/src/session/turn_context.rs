@@ -536,6 +536,7 @@ impl TurnContext {
                 .or_else(|| model_info.default_reasoning_level.clone())
         };
         config.model_reasoning_effort = reasoning_effort.clone();
+        config.token_budget = super::token_budget::resolve_for_model(&config, &model_info);
 
         let collaboration_mode = self.collaboration_mode.with_updates(
             Some(model.clone()),
@@ -838,6 +839,8 @@ impl Session {
             &model_info,
         );
         let mut per_turn_config = per_turn_config;
+        let resolved_token_budget = super::token_budget::resolve_for_model(&per_turn_config, &model_info);
+        Arc::make_mut(&mut per_turn_config).token_budget = resolved_token_budget;
         if per_turn_config.service_tier != resolved_service_tier {
             Arc::make_mut(&mut per_turn_config).service_tier = resolved_service_tier;
         }

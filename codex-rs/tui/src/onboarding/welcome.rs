@@ -143,7 +143,7 @@ mod tests {
         let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT);
         let mut buf = Buffer::empty(area);
         let frame_lines = widget.animation.current_frame().lines().count() as u16;
-        (&widget).render(area, &mut buf);
+        (&widget).render_ref(area, &mut buf);
 
         let welcome_row = row_containing(&buf, "Welcome");
         assert_eq!(welcome_row, Some(frame_lines + 1));
@@ -159,7 +159,7 @@ mod tests {
         );
         let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT - 1);
         let mut buf = Buffer::empty(area);
-        (&widget).render(area, &mut buf);
+        (&widget).render_ref(area, &mut buf);
 
         let welcome_row = row_containing(&buf, "Welcome");
         assert_eq!(welcome_row, Some(0));
@@ -169,7 +169,7 @@ mod tests {
                 .is_err()
         );
         let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT);
-        (&widget).render(area, &mut Buffer::empty(area));
+        (&widget).render_ref(area, &mut Buffer::empty(area));
         tokio::time::timeout(std::time::Duration::from_secs(1), draw_rx.recv())
             .await
             .unwrap()

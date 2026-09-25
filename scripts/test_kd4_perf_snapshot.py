@@ -106,6 +106,82 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(result.status, "passed")
         self.assertEqual(result.samples[0].elapsed_ms, 25)
 
+    def test_failed_sample_leaves_statistics_and_warm_percentiles_exclude_cold(
+        self,
+    ) -> None:
+        # Cold 100 ms, warm 10 and 20 ms, then a 1 ms failed invocation.
+        runs = iter(
+            [(100_000_000, 0), (10_000_000, 0), (20_000_000, 0), (1_000_000, 1)]
+        )
+        clock_ns = 0
+
+        def run(command, **kwargs):
+            nonlocal clock_ns
+            elapsed_ns, returncode = next(runs)
+            clock_ns += elapsed_ns
+            return subprocess.CompletedProcess(command, returncode)
+
+        scenario = kd4_perf_snapshot.Scenario(
+            "fixture", (sys.executable,), Path.cwd(), 4, "test"
+        )
+        with (
+            mock.patch.object(kd4_perf_snapshot, "_run_scenario", side_effect=run),
+            mock.patch.object(
+                kd4_perf_snapshot.time, "perf_counter_ns", side_effect=lambda: clock_ns
+            ),
+        ):
+            result = kd4_perf_snapshot.measure_scenario(scenario)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual([sample.elapsed_ms for sample in result.samples], [100, 10, 20, 1])
+        self.assertEqual(result.cold_ms, 100)
+        self.assertAlmostEqual(result.warm_p50_ms, 15)
+        self.assertAlmostEqual(result.warm_p95_ms, 19.5)
+        self.assertAlmostEqual(result.p50_ms, 20)
+        self.assertAlmostEqual(result.p95_ms, 92)
+        self.assertEqual((result.min_ms, result.max_ms), (10, 100))
+
+    def test_model_attempt_latency_discloses_unmeasured_inter_attempt_gaps(
+        self,
+    ) -> None:
+        def attempt(request_id, attempt_id, retry_index, outcome):
+            return {
+                "sampling_request_id": request_id,
+                "attempt_id": attempt_id,
+                "retry_index": retry_index,
+                "outcome": outcome,
+                "dispatch_ready_us": 0,
+                "first_actionable_output_us": 100,
+                "completed_us": 200,
+                "input_token_count": 10,
+                "cached_input_token_count": 0,
+                "uncached_input_token_count": 10,
+            }
+
+        analysis = kd4_model_attempt_analysis.analyze(
+            [
+                attempt("retried", "a", 0, "failed"),
+                attempt("retried", "b", 1, "failed"),
+                attempt("retried", "c", 2, "success"),
+                attempt("clean", "d", 0, "success"),
+            ]
+        )
+
+        self.assertEqual(analysis["includedLogicalRequests"], 2)
+        self.assertEqual(analysis["retriedLogicalRequests"], 1)
+        self.assertEqual(analysis["unmeasuredInterAttemptGaps"], 2)
+        retried = next(
+            row for row in analysis["rows"] if row["sampling_request_id"] == "retried"
+        )
+        # Two nonterminal attempts (200 us each) plus terminal 100 us; the
+        # backoff between attempts is absent because it cannot be observed.
+        self.assertEqual(retried["decision_latency_us"], 500.0)
+        self.assertIn("not observable", analysis["interpretation"])
+        self.assertIn(
+            "excluded from decision latency): 2 across 1 retried requests",
+            kd4_model_attempt_analysis.render(analysis),
+        )
+
     def test_conflicting_attempts_are_quarantined_and_missing_context_is_not_zero(self):
         attempt = {
             "event.name": "codex.model_attempt",
@@ -677,6 +753,23 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(stable["localConstructedBytes"], 4000.0)
         self.assertEqual(stable["localReusedBytes"], 36_000.0)
         self.assertEqual(stable["componentCacheHits"], 9.0)
+
+    def test_provider_cached_share_pairs_cached_and_input_from_one_attempt(
+        self,
+    ) -> None:
+        # Unreported cached input is unknown, not a cache miss; cached input
+        # without its input total cannot enter the numerator.
+        stable = kd4_model_attempt_analysis._stable_context_summary(
+            [
+                {"input_token_count": 1000, "cached_input_token_count": None},
+                {"input_token_count": 1000, "cached_input_token_count": 900},
+                {"input_token_count": None, "cached_input_token_count": 500},
+                {"input_token_count": 100, "cached_input_token_count": 101},
+            ]
+        )
+        self.assertEqual(stable["providerCachedShare"], 0.9)
+        self.assertEqual(stable["providerCacheCoveredAttempts"], 1)
+        self.assertEqual(stable["providerCacheUncoveredAttempts"], 3)
 
     def test_stable_context_summary_tolerates_missing_provider_cache_fields(
         self,

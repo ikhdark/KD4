@@ -4,6 +4,7 @@
 // The process for this will change
 
 // Config
+pub mod analytics;
 pub(crate) mod config_bundle_response;
 pub use self::config_bundle_response::ConfigBundleResponse;
 

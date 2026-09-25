@@ -199,7 +199,7 @@ fn prepare_dependencies_inner(
 ) -> Result<()> {
     let mut command = if fixture.task == LiveTask::RustBugfix {
         let mut c = Command::new("cargo");
-        c.args(["test", "--offline", "--locked", "--no-run", "--jobs", "6"]);
+        c.args(["test", "--offline", "--no-run", "--jobs", "6"]);
         c
     } else if fixture.task == LiveTask::TypescriptFeature {
         let mut c = Command::new("node");

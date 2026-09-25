@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 import re
-import tomllib
 from functools import cache
 from pathlib import Path
+
+# Python < 3.11 lacks tomllib; dev_env_doctor must still import and report the floor.
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUSTFMT_TOOLCHAIN = "nightly-2025-09-18"
+RUST_TOOLCHAIN_FILE = REPO_ROOT / "codex-rs" / "rust-toolchain.toml"
 
 
 @cache
@@ -24,6 +30,22 @@ def scripts_ruff_requirement() -> str:
         ):
             return dependency
     raise RuntimeError("scripts/pyproject.toml must declare a ruff dependency")
+
+
+@cache
+def rust_toolchain_channel() -> str | None:
+    """Return the codex-rs pinned channel, or None when this Python lacks tomllib."""
+    if tomllib is None:
+        return None
+    try:
+        data = tomllib.loads(RUST_TOOLCHAIN_FILE.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"could not read {RUST_TOOLCHAIN_FILE}: {error}") from None
+    toolchain = data.get("toolchain")
+    channel = toolchain.get("channel") if isinstance(toolchain, dict) else None
+    if not isinstance(channel, str) or not channel:
+        raise RuntimeError(f"{RUST_TOOLCHAIN_FILE} must pin toolchain.channel")
+    return channel
 
 
 @cache

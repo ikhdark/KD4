@@ -399,13 +399,16 @@ pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
         "cyber_policy" => ApiError::CyberPolicy {
             message: cyber_policy_message(Some(message)),
         },
-        "server_is_overloaded" | "slow_down" => ApiError::ServerOverloaded,
+        "server_is_overloaded" | "slow_down" => ApiError::ServerOverloaded { retry_after: None },
         "server_error" | "internal_server_error" | "rate_limit_exceeded" => {
             let delay = try_parse_retry_after(&Error {
                 code: code.map(str::to_owned),
                 message: Some(message.clone()),
             });
-            ApiError::Retryable { message, delay }
+            ApiError::Retryable {
+                message,
+                delay: delay.and_then(codex_http_client::RetryAfter::from_delay),
+            }
         }
         "invalid_request_error"
         | "invalid_prompt"
@@ -1209,8 +1212,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_retry_after_units() {
+    #[tokio::test(start_paused = true)]
+    async fn parses_retry_after_units() {
         for (message, expected) in [
             ("Please try again in 28ms.", Duration::from_millis(28)),
             ("Please try again in 1.5ms.", Duration::from_micros(1_500)),
@@ -1233,7 +1236,7 @@ mod tests {
                 matches!(error, ResponsesEventError::Api(ApiError::Retryable {
                 delay: Some(actual_delay),
                 message: actual_message,
-            }) if actual_delay == expected && actual_message == message)
+            }) if actual_delay.remaining_delay() == expected && actual_message == message)
             );
         }
     }

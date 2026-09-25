@@ -59,7 +59,7 @@ create_openai_url(None, 3);
 Install the required tooling once:
 
 ```powershell
-cargo install --locked cargo-dylint dylint-link
+cargo install cargo-dylint dylint-link
 rustup toolchain install nightly-2025-09-18 `
   --component llvm-tools-preview `
   --component rustc-dev `
@@ -73,72 +73,29 @@ Set-Location tools/argument-comment-lint
 cargo test
 ```
 
-GitHub releases also publish a DotSlash file named
-`argument-comment-lint` for Windows x64. The published package contains a small runner executable, a
-bundled
-`cargo-dylint`, and the prebuilt lint library.
-
-The package is not a full Rust toolchain. Running the prebuilt path still
-requires the pinned nightly toolchain to be installed via `rustup`:
-
-```powershell
-rustup toolchain install nightly-2025-09-18 `
-  --component llvm-tools-preview `
-  --component rustc-dev `
-  --component rust-src
-```
-
-The checked-in DotSlash file lives at `tools/argument-comment-lint/argument-comment-lint`.
-`run-prebuilt-linter.py` resolves that file via `dotslash` and is the default
-path for both repository-wide and targeted runs such as
-`just argument-comment-lint -p codex-core`. The source-build path remains
-available in `run.py` for people iterating on the lint crate itself.
-
-The Windows archive is a `.zip` containing `.exe` runner/tool files and the `.dll` lint library.
-
-DotSlash resolves the package entrypoint to
-`argument-comment-lint/bin/argument-comment-lint.exe`. That runner finds the sibling bundled
-`cargo-dylint`
-binary and the single packaged Dylint library under `lib/`, normalizes the
-host-qualified nightly filename to the plain `nightly-2025-09-18` channel when
-needed, and then invokes `cargo-dylint dylint --lib-path <that-library>` with
-the repo's default `DYLINT_RUSTFLAGS` and `CARGO_INCREMENTAL=0` settings.
-
-The checked-in `run-prebuilt-linter.py` wrapper uses the fetched package
-contents directly so the current checked-in alpha artifact works the same way.
-It also makes sure the `rustup` shims stay ahead of any direct toolchain
-`cargo` binary on `PATH`, and sets `RUSTUP_HOME` from `rustup show home` when
-the environment does not already provide it. That extra `RUSTUP_HOME` export is
-required for the current Windows Dylint driver path.
-
-If you are changing the lint crate itself, use the source-build wrapper:
-
-```powershell
-python tools/argument-comment-lint/run.py -p codex-core
-```
+`just argument-comment-lint` runs `run.py`, which builds this crate from source
+with `cargo dylint --path tools/argument-comment-lint` before checking
+`codex-rs`, so the enforced rules are always the checked-in ones.
 
 Run the lint against `codex-rs` from the repo root:
 
 ```powershell
 just argument-comment-lint
-python tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core
 just argument-comment-lint -p codex-core
+python tools/argument-comment-lint/run.py -p codex-core
 ```
 
-If no package selection is provided, `just argument-comment-lint` runs the
-prebuilt lint across the Cargo workspace. The Python wrappers default the
-underlying Cargo invocation to `--all-targets` unless you explicitly narrow the
-target set, so targeted wrapper runs cover test-only call sites by default.
+If no package selection is provided, `just argument-comment-lint` checks the
+whole Cargo workspace. The wrapper defaults the underlying Cargo invocation to
+`--all-targets` unless you explicitly narrow the target set, so targeted runs
+cover test-only call sites by default. It also passes `--ignore-rust-version`:
+the pinned lint nightly (Rust 1.92) is older than the `rust-version` some
+`codex-rs` dependencies declare, and the lint only needs the code to type-check.
 
 Repo runs also promote `argument_comment_mismatch` and
-`uncommented_anonymous_literal_argument` to errors by default:
-
-```powershell
-python tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core
-```
-
-The wrapper does that by setting `DYLINT_RUSTFLAGS`, and it leaves an explicit
-existing setting alone. It also defaults `CARGO_INCREMENTAL=0` unless you have
+`uncommented_anonymous_literal_argument` to errors by default. The wrapper does
+that by setting `DYLINT_RUSTFLAGS`, and it leaves an explicit level for either
+lint alone. It also defaults `CARGO_INCREMENTAL=0` unless you have
 already set it, because the current nightly Dylint flow can otherwise hit a
 rustc incremental compilation ICE locally. To override that behavior for an ad
 hoc run:
@@ -152,5 +109,5 @@ python tools/argument-comment-lint/run.py -p codex-core
 To override an explicitly narrow target selection, or to be explicit in scripts:
 
 ```powershell
-python tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core -- --all-targets
+python tools/argument-comment-lint/run.py -p codex-core -- --all-targets
 ```

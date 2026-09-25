@@ -54,6 +54,7 @@ pub(crate) struct RuntimeInspection {
     heap_bytes: usize,
     completion_collections: usize,
     stored_payload_address: usize,
+    stored_payload_shared: bool,
     rust_conversion_bytes: usize,
 }
 
@@ -78,7 +79,7 @@ pub(crate) enum RuntimeEvent {
         text: String,
     },
     Result {
-        stored_value_writes: HashMap<String, JsonValue>,
+        stored_value_writes: HashMap<String, Arc<JsonValue>>,
         error_text: Option<String>,
         output_loss: Option<codex_code_mode_protocol::OutputLoss>,
     },
@@ -213,7 +214,7 @@ impl Drop for StartupTestExit {
 }
 
 pub(crate) async fn spawn_runtime(
-    stored_values: HashMap<String, JsonValue>,
+    stored_values: HashMap<String, Arc<JsonValue>>,
     request: ExecuteRequest,
     default_tool_timeout_ms: u64,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
@@ -352,7 +353,7 @@ struct RuntimeConfig {
     tool_call_id: String,
     enabled_tools: Arc<EnabledToolCatalog>,
     source: String,
-    stored_values: HashMap<String, JsonValue>,
+    stored_values: HashMap<String, Arc<JsonValue>>,
     default_tool_timeout_ms: u64,
     output_admission: Arc<OutputAdmission>,
 }
@@ -413,10 +414,10 @@ pub(super) struct RuntimeState {
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     unhandled_rejections: Vec<v8::Global<v8::Promise>>,
     rejection_tracking_overflow: bool,
-    stored_values: HashMap<String, JsonValue>,
+    stored_values: HashMap<String, Arc<JsonValue>>,
     stored_value_bytes: HashMap<String, usize>,
     total_stored_value_bytes: usize,
-    stored_value_writes: HashMap<String, JsonValue>,
+    stored_value_writes: HashMap<String, Arc<JsonValue>>,
     stored_value_limit_error: Option<String>,
     #[cfg(test)]
     completion_collections: usize,
@@ -464,8 +465,8 @@ fn stored_value_entry_bytes(key: &str, value: &JsonValue) -> usize {
 }
 
 pub(crate) fn stored_values_with_writes_within_limits(
-    current: &HashMap<String, JsonValue>,
-    writes: &HashMap<String, JsonValue>,
+    current: &HashMap<String, Arc<JsonValue>>,
+    writes: &HashMap<String, Arc<JsonValue>>,
 ) -> bool {
     let entry_count = current.len().saturating_add(
         writes
@@ -505,7 +506,7 @@ impl RuntimeState {
         }
     }
 
-    pub(super) fn stored_value_completion(&mut self) -> (HashMap<String, JsonValue>, Option<String>) {
+    pub(super) fn stored_value_completion(&mut self) -> (HashMap<String, Arc<JsonValue>>, Option<String>) {
         #[cfg(test)]
         { self.completion_collections += 1; }
         match self.stored_value_limit_error.as_ref() {
@@ -518,7 +519,7 @@ impl RuntimeState {
 pub(super) enum CompletionState {
     Pending,
     Completed {
-        stored_value_writes: HashMap<String, JsonValue>,
+        stored_value_writes: HashMap<String, Arc<JsonValue>>,
         error_text: Option<String>,
     },
 }
@@ -631,7 +632,10 @@ fn run_runtime(
                     completion_collections: state.completion_collections,
                     rust_conversion_bytes: state.rust_conversion_bytes,
                     stored_payload_address: state.stored_value_writes.get("payload")
-                        .and_then(JsonValue::as_str).map(|value| value.as_ptr() as usize).unwrap_or(0),
+                        .and_then(|value| value.as_str()).map(|value| value.as_ptr() as usize).unwrap_or(0),
+                    stored_payload_shared: state.stored_value_writes.get("payload")
+                        .zip(state.stored_values.get("payload"))
+                        .is_some_and(|(writes, local)| Arc::ptr_eq(writes, local)),
                 });
             }
             RuntimeCommand::ToolResponse { id, result } => {
@@ -728,7 +732,7 @@ fn capture_scope_send_error(
 fn send_result(
     scope: &v8::PinScope<'_, '_>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    stored_value_writes: HashMap<String, JsonValue>,
+    stored_value_writes: HashMap<String, Arc<JsonValue>>,
     error_text: Option<String>,
 ) {
     let _ = event_tx.send(RuntimeEvent::Result {

@@ -7,6 +7,11 @@ turns silent Desktop toasts into a list of missing protocol methods. This is a
 name-level smoke check: a method that is present may still differ in params,
 response, or notifications, so it complements rather than replaces contract
 tests.
+
+The default schema is the stable one, so methods registered as experimental are
+reported missing. To compare against the experimental surface Desktop uses, run
+``codex app-server generate-json-schema --experimental --out DIR`` with the
+binary under test and pass ``--schema DIR/ClientRequest.json``.
 """
 
 from __future__ import annotations
@@ -130,10 +135,13 @@ def main(argv: list[str] | None = None) -> int:
         "--schema",
         type=Path,
         default=DEFAULT_SCHEMA,
-        help="ClientRequest JSON schema to compare against",
+        help="ClientRequest JSON schema to compare against (default: stable only)",
     )
     parser.add_argument(
-        "--days", type=float, default=7.0, help="Only scan logs modified in the last N days"
+        "--days",
+        type=float,
+        default=7.0,
+        help="Only scan logs modified in the last N days",
     )
     parser.add_argument("--json", action="store_true", help="Emit a JSON report")
     args = parser.parse_args(argv)
@@ -145,8 +153,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"schema not found: {args.schema}", file=sys.stderr)
         return 2
 
+    log_files = recent_log_files(args.logs, args.days)
+    if not log_files:
+        # No scanned logs is missing evidence, not an absence of drift.
+        print(
+            f"no Desktop logs modified in the last {args.days:g} day(s) under {args.logs}",
+            file=sys.stderr,
+        )
+        return 2
     registered = schema_methods(json.loads(args.schema.read_text(encoding="utf-8")))
-    rejected = rejected_methods(recent_log_files(args.logs, args.days))
+    rejected = rejected_methods(log_files)
     missing, present = drift_report(rejected, registered)
 
     if args.json:
@@ -166,11 +182,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         if not rejected:
-            print("no rejected methods found in recent Desktop logs")
+            print(
+                f"no rejected methods found in {len(log_files)} recent Desktop log(s)"
+            )
         for entry in missing:
-            print(f"MISSING  {entry.method}  (rejected {entry.count}x in {len(entry.logs)} log(s))")
+            print(
+                f"MISSING  {entry.method}  (rejected {entry.count}x in {len(entry.logs)} log(s))"
+            )
         for entry in present:
-            print(f"present  {entry.method}  (rejected {entry.count}x before it was registered)")
+            # The schema proves registration here, not that the runtime that
+            # rejected the method has since been updated.
+            print(
+                f"present  {entry.method}  (rejected {entry.count}x; registered in schema)"
+            )
     return 1 if missing else 0
 
 

@@ -455,7 +455,7 @@ mod tests {
         )
         .expect("function extension should be discoverable");
 
-        let codex_tools::LoadableToolSpec::Function(discovered) = search_info.entry.output else {
+        let codex_tools::LoadableToolSpec::Function(discovered) = search_info.entry.output.as_ref() else {
             panic!("expected a function search result");
         };
         assert_eq!(discovered.description, "schema snapshot 0");

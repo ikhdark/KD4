@@ -2,10 +2,58 @@ use super::*;
 use base64::Engine;
 use pretty_assertions::assert_eq;
 
+#[tokio::test(start_paused = true)]
+async fn retry_after_survives_mapping_and_exhaustion_without_restarting() {
+    use codex_http_client::RetryAfter;
+    use std::time::Duration;
+    let advice = RetryAfter::from_delay(Duration::from_secs(10)).unwrap();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for (status, body, retryable) in [
+        (500, None, true),
+        (503, None, true),
+        (429, None, false),
+        (
+            503,
+            Some(r#"{"error":{"code":"server_error","message":"retry"}}"#),
+            true,
+        ),
+        (
+            503,
+            Some(r#"{"error":{"code":"server_is_overloaded"}}"#),
+            false,
+        ),
+        (401, None, false),
+    ] {
+        let mapped = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::from_u16(status).unwrap(),
+            url: None,
+            headers: None,
+            body: body.map(str::to_owned),
+            retry_after: Some(advice),
+        }));
+        assert_eq!(mapped.retry_after(), Some(advice));
+        assert_eq!(
+            mapped.retry_after().unwrap().remaining_delay(),
+            Duration::from_secs(6)
+        );
+        assert_eq!(mapped.is_retryable(), retryable);
+    }
+    tokio::time::advance(Duration::from_secs(8)).await;
+    let mapped = map_api_error(ApiError::Retryable {
+        message: "delayed delivery".into(),
+        delay: Some(advice),
+    });
+    assert_eq!(mapped.retry_after(), Some(advice));
+    assert_eq!(
+        mapped.retry_after().unwrap().remaining_delay(),
+        Duration::ZERO
+    );
+}
+
 #[test]
 fn map_api_error_maps_server_overloaded() {
-    let err = map_api_error(ApiError::ServerOverloaded);
-    assert!(matches!(err, CodexErr::ServerOverloaded));
+    let err = map_api_error(ApiError::ServerOverloaded { retry_after: None });
+    assert!(matches!(err, CodexErr::ServerOverloaded { .. }));
 }
 
 #[test]
@@ -18,6 +66,7 @@ fn bad_request_transport_errors_publish_bad_request_events() {
         ),
     ] {
         let error = map_api_error(ApiError::Transport(TransportError::Http {
+            retry_after: None,
             status: http::StatusCode::BAD_REQUEST,
             url: Some("https://example.test/responses".to_string()),
             headers: None,
@@ -89,13 +138,14 @@ fn map_api_error_maps_server_overloaded_from_503_body() {
     })
     .to_string();
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::SERVICE_UNAVAILABLE,
         url: Some("http://example.com/v1/responses".to_string()),
         headers: None,
         body: Some(body),
     }));
 
-    assert!(matches!(err, CodexErr::ServerOverloaded));
+    assert!(matches!(err, CodexErr::ServerOverloaded { .. }));
 }
 
 #[test]
@@ -103,6 +153,7 @@ fn map_api_error_maps_cloudflare_blocked_response_to_user_message() {
     let mut headers = HeaderMap::new();
     headers.insert(CF_RAY_HEADER, http::HeaderValue::from_static("ray-id"));
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::FORBIDDEN,
         url: Some("http://example.com/blocked".to_string()),
         headers: Some(headers),
@@ -137,6 +188,7 @@ fn map_api_error_maps_cyber_policy_from_400_body() {
     })
     .to_string();
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::BAD_REQUEST,
         url: Some("http://example.com/v1/responses".to_string()),
         headers: None,
@@ -165,6 +217,7 @@ fn map_api_error_maps_wrapped_websocket_cyber_policy_from_400_body() {
     })
     .to_string();
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::BAD_REQUEST,
         url: Some("ws://example.com/v1/responses".to_string()),
         headers: None,
@@ -186,6 +239,7 @@ fn map_api_error_uses_cyber_policy_fallback_for_missing_message() {
     })
     .to_string();
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::BAD_REQUEST,
         url: Some("http://example.com/v1/responses".to_string()),
         headers: None,
@@ -211,6 +265,7 @@ fn map_api_error_keeps_unknown_400_errors_generic() {
     })
     .to_string();
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::BAD_REQUEST,
         url: Some("http://example.com/v1/responses".to_string()),
         headers: None,
@@ -230,6 +285,7 @@ fn http_provider_codes_preserve_context_and_quota_identity() {
         (http::StatusCode::TOO_MANY_REQUESTS, "insufficient_quota"),
     ] {
         let error = map_api_error(ApiError::Transport(TransportError::Http {
+            retry_after: None,
             status,
             url: None,
             headers: None,
@@ -268,6 +324,7 @@ fn map_api_error_maps_usage_limit_limit_name_header() {
     })
     .to_string();
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::TOO_MANY_REQUESTS,
         url: Some("http://example.com/v1/responses".to_string()),
         headers: Some(headers),
@@ -301,6 +358,7 @@ fn map_api_error_does_not_fallback_limit_name_to_limit_id() {
     })
     .to_string();
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::TOO_MANY_REQUESTS,
         url: Some("http://example.com/v1/responses".to_string()),
         headers: Some(headers),
@@ -337,6 +395,7 @@ fn map_api_error_ignores_unparseable_rate_limit_reached_type_headers() {
         })
         .to_string();
         let err = map_api_error(ApiError::Transport(TransportError::Http {
+            retry_after: None,
             status: http::StatusCode::TOO_MANY_REQUESTS,
             url: Some("http://example.com/v1/responses".to_string()),
             headers: Some(headers),
@@ -367,6 +426,7 @@ fn map_api_error_extracts_identity_auth_details_from_headers() {
     );
 
     let err = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
         status: http::StatusCode::UNAUTHORIZED,
         url: Some("https://chatgpt.com/backend-api/codex/models".to_string()),
         headers: Some(headers),
@@ -392,6 +452,7 @@ fn audit_usage_limit_identity_survives_malformed_optional_fields() {
         r#"{"error":{"type":"usage_limit_reached","plan_type":[],"resets_at":{}}}"#,
     ] {
         let mapped = map_api_error(ApiError::Transport(TransportError::Http {
+            retry_after: None,
             status: http::StatusCode::TOO_MANY_REQUESTS,
             url: None,
             headers: None,

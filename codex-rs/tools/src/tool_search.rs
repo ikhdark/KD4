@@ -6,12 +6,44 @@ use crate::ToolSearchSourceInfo;
 use crate::ToolSpec;
 use crate::code_mode_name_for_tool_name;
 use crate::default_namespace_description;
+use std::sync::Arc;
 
 #[derive(Clone, PartialEq)]
 pub struct ToolSearchEntry {
     pub search_text: String,
     pub tool_names: Vec<String>,
-    pub output: LoadableToolSpec,
+    pub output: Arc<LoadableToolSpec>,
+    /// Shared MCP definitions are normalized only after selection; owned entries already are.
+    pub normalize_on_selection: bool,
+}
+
+impl ToolSearchEntry {
+    pub fn to_loadable_spec(&self) -> LoadableToolSpec {
+        self.normalize_output(self.output.as_ref().clone())
+    }
+
+    /// Normalize a selected callable without cloning unrelated namespace children.
+    pub fn normalize_output(&self, mut output: LoadableToolSpec) -> LoadableToolSpec {
+        if self.normalize_on_selection {
+            match &mut output {
+                LoadableToolSpec::Function(tool) => {
+                    tool.defer_loading = Some(true);
+                    tool.output_schema = None;
+                }
+                LoadableToolSpec::Namespace(namespace) => {
+                    if namespace.description.trim().is_empty() {
+                        namespace.description = default_namespace_description(&namespace.name);
+                    }
+                    for tool in &mut namespace.tools {
+                        let ResponsesApiNamespaceTool::Function(tool) = tool;
+                        tool.defer_loading = Some(true);
+                        tool.output_schema = None;
+                    }
+                }
+            }
+        }
+        output
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -21,6 +53,18 @@ pub struct ToolSearchInfo {
 }
 
 impl ToolSearchInfo {
+    pub fn from_shared_spec(
+        search_text: String,
+        output: Arc<LoadableToolSpec>,
+        source_info: Option<ToolSearchSourceInfo>,
+    ) -> Self {
+        let tool_names = output.callable_tool_names().into_iter().map(|name| name.name).collect();
+        Self {
+            entry: ToolSearchEntry { search_text, tool_names, output, normalize_on_selection: true },
+            source_info,
+        }
+    }
+
     pub fn from_tool_spec(
         spec: &ToolSpec,
         source_info: Option<ToolSearchSourceInfo>,
@@ -64,7 +108,8 @@ impl ToolSearchInfo {
             entry: ToolSearchEntry {
                 search_text,
                 tool_names,
-                output,
+                output: Arc::new(output),
+                normalize_on_selection: false,
             },
             source_info,
         })

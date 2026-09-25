@@ -5,7 +5,7 @@ set shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
 rust_min_stack := "8388608" # 8 MiB
-rust_parallelism := "8" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
+rust_parallelism := "2" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
 cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
 export CARGO_BUILD_JOBS := cargo_build_jobs
 rust_test_threads := env_var_or_default("RUST_TEST_THREADS", rust_parallelism)
@@ -36,7 +36,7 @@ repo-benchmark *args:
     env.update(CARGO_PROFILE_RELEASE_OPT_LEVEL="3", CARGO_PROFILE_RELEASE_LTO="thin", CARGO_PROFILE_RELEASE_CODEGEN_UNITS="4", CARGO_PROFILE_RELEASE_INCREMENTAL="false", CARGO_INCREMENTAL="0")
     if shutil.which("sccache"):
         env["RUSTC_WRAPPER"] = shutil.which("sccache")
-    command = ["cargo", "build", "--release", "--locked", "--jobs", "6", "--message-format=json-render-diagnostics", "--target-dir", "target/repo-benchmark/harness", "-p", "repo-benchmark", "--bin", "repo-benchmark"]
+    command = ["cargo", "build", "--release", "--jobs", "6", "--message-format=json-render-diagnostics", "--target-dir", "target/repo-benchmark/harness", "-p", "repo-benchmark", "--bin", "repo-benchmark"]
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True)
     executable = None
     for line in process.stdout:
@@ -194,7 +194,7 @@ clippy-workspace *args:
 
 [windows]
 cargo-shear *args:
-    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; cargo shear --version *> $null; if ($LASTEXITCODE -ne 0) { Write-Error "cargo-shear is not installed. Install with: cargo install --locked cargo-shear"; exit 2 }; cargo shear --deny-warnings @forwarded_args
+    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; cargo shear --version *> $null; if ($LASTEXITCODE -ne 0) { Write-Error "cargo-shear is not installed. Install with: cargo install cargo-shear"; exit 2 }; cargo shear --deny-warnings @forwarded_args
 
 [windows]
 rust-dead-code-matrix *args:
@@ -220,7 +220,7 @@ install:
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     rustup toolchain install $rustfmtToolchain --profile minimal --component rustfmt
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    cargo fetch --locked
+    cargo fetch
     exit $LASTEXITCODE
 
 [no-cd]
@@ -242,15 +242,16 @@ _sign-codex-release-preflight:
 _publish-codex-release-preflight:
     if ([string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_CERTIFICATE_IDENTITY) -or [string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_OIDC_ISSUER)) { throw "Set CODEX_RELEASE_CERTIFICATE_IDENTITY and CODEX_RELEASE_OIDC_ISSUER to the authorized Sigstore identity" }; if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "gh is required" }
 
+# Dot-prefixed files in a release dir are packager state (publication locks), not assets.
 [no-cd]
 [windows]
 sign-codex-release version: _sign-codex-release-preflight (prepare-codex-release version)
-    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign sign-blob --yes --bundle "$($asset.FullName).sigstore.json" $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "cosign failed for $($asset.Name)" } }
+    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' -and $_.Name -notlike '.*' })) { cosign sign-blob --yes --bundle "$($asset.FullName).sigstore.json" $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "cosign failed for $($asset.Name)" } }
 
 [no-cd]
 [windows]
 publish-codex-release version: _publish-codex-release-preflight (sign-codex-release version)
-    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; $tag = "rust-v{{ version }}"; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign verify-blob --bundle "$($asset.FullName).sigstore.json" --certificate-identity $env:CODEX_RELEASE_CERTIFICATE_IDENTITY --certificate-oidc-issuer $env:CODEX_RELEASE_OIDC_ISSUER $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "Sigstore verification failed for $($asset.Name)" } }; $assets = @(Get-ChildItem -LiteralPath $releaseDir -File | Select-Object -ExpandProperty FullName); gh release create $tag @assets --repo ikhdark/KD4 --verify-tag --title $tag; if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }; $expected = @($assets | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object); $actual = @(gh release view $tag --repo ikhdark/KD4 --json assets --jq '.assets[].name' | Sort-Object); if (Compare-Object $expected $actual) { throw "Published release inventory does not match the prepared assets" }
+    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; $tag = "rust-v{{ version }}"; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' -and $_.Name -notlike '.*' })) { cosign verify-blob --bundle "$($asset.FullName).sigstore.json" --certificate-identity $env:CODEX_RELEASE_CERTIFICATE_IDENTITY --certificate-oidc-issuer $env:CODEX_RELEASE_OIDC_ISSUER $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "Sigstore verification failed for $($asset.Name)" } }; $assets = @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '.*' } | Select-Object -ExpandProperty FullName); gh release create $tag @assets --repo ikhdark/KD4 --verify-tag --title $tag; if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }; $expected = @($assets | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object); $actual = @(gh release view $tag --repo ikhdark/KD4 --json assets --jq '.assets[].name' | Sort-Object); if (Compare-Object $expected $actual) { throw "Published release inventory does not match the prepared assets" }
 
 [no-cd]
 [windows]
@@ -273,7 +274,7 @@ rust-perf-env *args:
 
 # Run nextest with --no-fail-fast so all tests are run.
 #
-# Run `cargo install --locked cargo-nextest` if you don't have it installed.
+# Run `cargo install cargo-nextest` if you don't have it installed.
 # The process-ID test feature is selected by core_test_support. Other workspace
 # crate features remain disallowed; there is no need to add `--all-features`.
 [windows]
@@ -294,8 +295,10 @@ test-fast *args:
 # with another build invalidates the whole graph whenever the two disagree on a
 # compiler setting, which costs far more than the tests themselves. They share
 # one lane rather than taking one each, so the codex-core library and its
-# dependencies stay compiled once and warm between targets; concurrent runs
-# overflow to a numbered sibling lane instead of blocking.
+# dependencies stay compiled once and warm between targets. A concurrent run
+# reuses an idle warm sibling lane with matching build settings (such as
+# `core-tests-2`); without one it waits up to 30 s, then stops instead of
+# starting a duplicate cold build (`run-lane --allow-cold-overflow` opts in).
 
 # Run a named core target in the shared core lane; finish the whole selection.
 [windows]
@@ -365,13 +368,13 @@ test-compile *args:
 test-windows-sandbox-processes *args:
     $forwarded_args = @($args | Select-Object -Skip 1); $env:CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS = "1"; just core-gate windows-process windows-sandbox-core-exec @forwarded_args; exit $LASTEXITCODE
 
-# Full local test gate plus benchmark startup smoke.
+# Package-scoped `just test` (requires -p/--package) plus benchmark startup smoke.
 test-full-with-bench *args:
     just test {args}
     just bench-smoke
 
 cargo-fetch:
-    cargo fetch --locked
+    cargo fetch
 
 build-dev-small package:
     cargo build --profile dev-small -p {{ package }}
@@ -409,10 +412,11 @@ _test-lane-local-reserved *args:
 _test-lane-fast-reserved *args:
     $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
 
-# Emit nextest timing reports for the selected local test slice.
+# Emit Cargo's build-timing HTML report for the selected local test slice,
+# built in the same automatic package lane as test and test-fast.
 [windows]
 test-timings *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast --timings=html,json @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast --timings @forwarded_args
 
 # Focused crate test without repo-wide formatting.
 validate-crate-focused crate:
@@ -493,7 +497,7 @@ _watch-lane-reserved package *args:
 coverage-lane package *args:
     @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" -- cargo llvm-cov -p "{{ package }}" @($args | Select-Object -Skip 2)
 
-# Match the Windows variant: fix only the named package in its own lane.
+# Fix only the named package in its own lane.
 [windows]
 fix-lane package *args:
     @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" -- cargo clippy --fix --tests --allow-dirty -p "{{ package }}" @($args | Select-Object -Skip 2)
@@ -551,11 +555,11 @@ generate-config-proto-check:
 # Regenerate or verify the checked-in exec-server relay protobuf binding.
 [no-cd]
 generate-exec-server-relay-proto:
-    cargo run --locked --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-exec-server --example generate-relay-proto
+    cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-exec-server --example generate-relay-proto
 
 [no-cd]
 generate-exec-server-relay-proto-check:
-    cargo run --locked --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-exec-server --example generate-relay-proto -- --check
+    cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-exec-server --example generate-relay-proto -- --check
 
 # Check both checked-in protobuf bindings using their existing freshness checks.
 [windows]
@@ -579,37 +583,6 @@ config-schema-regenerate owner:
 app-server-runtime-check:
     just core-gate app-server-command-exec app-server-process-exec app-server-thread-status
     cargo check -p codex-app-server
-
-# Synchronize the tracked-path snapshot, then validate source-map inventories.
-source-map-check:
-    {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md"
-    {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"
-    {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" --require-markers "{{ justfile_directory() }}/SOURCEMAP.md"
-    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
-
-source-owners-generate:
-    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" generate
-
-source-owners-check:
-    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
-    {{ python }} "{{ justfile_directory() }}/scripts/test_source_owners.py"
-
-# Show the most specific owner's declared test/gate commands for a repository path.
-[script("python")]
-gate-for path:
-    import subprocess
-    import sys
-    raise SystemExit(subprocess.call([sys.executable, r"{{ justfile_directory() }}/scripts/source_owners.py", "validation", "--path", sys.argv[1]]))
-
-# Accept an owner ID, or --path followed by a repository path.
-[script("python")]
-source-owners-slice selector *args:
-    import subprocess
-    import sys
-    selector_args = sys.argv[1:]
-    if selector_args[0] not in ("--owner", "--path"):
-        selector_args.insert(0, "--owner")
-    raise SystemExit(subprocess.call([sys.executable, r"{{ justfile_directory() }}/scripts/source_owners.py", "slice", *selector_args]))
 
 tui-large-widget-check:
     just core-gate tui-large-widget
@@ -639,19 +612,26 @@ deps-policy-check *args:
 
 [windows]
 _cargo-deny-installed:
-    @cargo deny --version *> $null; if ($LASTEXITCODE -ne 0) { Write-Error "cargo-deny is not installed. Install with: cargo install --locked cargo-deny"; exit 2 }
+    @cargo deny --version *> $null; if ($LASTEXITCODE -ne 0) { Write-Error "cargo-deny is not installed. Install with: cargo install cargo-deny"; exit 2 }
 
-# Typecheck and test the TypeScript SDK.
-[no-cd]
+# Typecheck the TypeScript SDK, then test it against this checkout's runtime.
+[windows]
 sdk-ts-check:
     pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run typecheck
-    pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run test
+    python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane sdk-runtime -- just _sdk-runtime-reserved pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run test
 
-# Lint and run the Python SDK test suite (default marker exclusions apply).
-[no-cd]
+# Lint the Python SDK, then run its suite against this checkout's runtime
+# (default marker exclusions apply).
+[windows]
 sdk-python-check:
     uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev ruff check .
-    uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest
+    python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane sdk-runtime -- just _sdk-runtime-reserved uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest
+
+# Build the runtime helper pair in the reserved lane, then run an SDK suite
+# with CODEX_EXEC_PATH pointing at that build.
+[windows]
+_sdk-runtime-reserved *args:
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; cargo build --target-dir $target_dir -p codex-cli -p codex-code-mode-host; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:CODEX_EXEC_PATH = Join-Path $target_dir "debug\codex.exe"; & $forwarded_args[0] @($forwarded_args | Select-Object -Skip 1); exit $LASTEXITCODE
 
 # Lint the codex-cli npm wrapper entrypoint.
 [no-cd]
@@ -689,7 +669,7 @@ app-server-schema-protocol-check:
 # CODEX_SCHEMA_COMPATIBILITY_BASELINE; choose the contract revision explicitly.
 [no-cd]
 app-server-schema-check *args:
-    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check {{ args }}
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check {args}
 
 # Explicitly regenerate app-server schemas under the repository generation lock.
 # Stable regeneration requires CODEX_SCHEMA_COMPATIBILITY_BASELINE.
@@ -710,11 +690,6 @@ hooks-schema-check:
 [no-cd]
 [windows]
 argument-comment-lint *args:
-    $forwarded_args = {args}; {{ python }} "{{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py" @forwarded_args
-
-[no-cd]
-[windows]
-argument-comment-lint-from-source *args:
     $forwarded_args = {args}; {{ python }} "{{ justfile_directory() }}/tools/argument-comment-lint/run.py" @forwarded_args
 
 # Tail logs from the state SQLite database

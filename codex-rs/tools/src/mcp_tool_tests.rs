@@ -37,7 +37,7 @@ fn parse_mcp_tool_inserts_empty_properties() {
                         "content":{"type":"array", "items":{"type":"object"}},
                         "structuredContent":{}, "isError":{"type":"boolean"}, "_meta":{"type":"object"}
                     }, "required":["content"], "additionalProperties":false
-                })),
+                }).into()),
                 defer_loading: false,
             }
         );
@@ -85,7 +85,7 @@ fn parse_mcp_tool_preserves_top_level_output_schema() {
                     }
                 },
                 "required": ["result"]
-            }))),
+            })).into()),
             defer_loading: false,
         }
     );
@@ -118,7 +118,7 @@ fn parse_mcp_tool_preserves_output_schema_without_inferred_type() {
             ),
             output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({
                 "enum": ["ok", "error"]
-            }))),
+            })).into()),
             defer_loading: false,
         }
     );
@@ -141,7 +141,7 @@ fn mcp_registration_preserves_payload_reference_root_in_code_mode() {
     )));
     let parsed = parse_mcp_tool(&tool).unwrap();
     assert_eq!(
-        parsed.output_schema.as_ref().unwrap()["x-codex-mcp-result"],
+        parsed.output_schema.as_ref().unwrap().to_value()["x-codex-mcp-result"],
         true
     );
     let specs = [crate::ToolSpec::Function(crate::ResponsesApiTool {

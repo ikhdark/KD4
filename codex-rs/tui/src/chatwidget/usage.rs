@@ -67,6 +67,14 @@ impl ChatWidget {
                     dismiss_on_select: true,
                     ..Default::default()
                 },
+                SelectionItem {
+                    name: "Explore analytics".to_string(),
+                    description: Some("Explore account usage, activity, and credits.".to_string()),
+                    is_disabled: !self.has_chatgpt_account,
+                    actions: vec![Box::new(|tx| tx.send(AppEvent::OpenAnalytics))],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         }

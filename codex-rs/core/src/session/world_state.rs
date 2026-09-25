@@ -49,6 +49,19 @@ impl Session {
         };
 
         let mut world_state = WorldState::default();
+        if turn_context.config.features.enabled(codex_features::Feature::TokenBudget) {
+            let ids = self.state.lock().await.auto_compact_window_ids();
+            world_state.add_section(crate::context::TokenBudgetContext::new(
+                turn_context.session_source.get_agent_path().unwrap_or_else(codex_protocol::AgentPath::root),
+                ids.first_window_id,
+                ids.previous_window_id,
+                ids.window_id,
+                turn_context.config.token_budget.as_ref()
+                    .and_then(|config| config.guidance_message.as_deref())
+                    .map(|guidance| crate::context::ContextualUserFragment::render(
+                        &crate::context::ContextWindowGuidance::new(guidance))),
+            ));
+        }
         world_state.add_section(AgentsMdState::new_cached(
             step_context.loaded_agents_md.as_deref(),
             step_context.agents_md_stable_context.as_ref(),

@@ -250,13 +250,13 @@ impl From<&CodexErr> for CodexErrKind {
             CodexErr::InvalidRequest(_) => CodexErrKind::InvalidRequest,
             CodexErr::InvalidImageRequest() => CodexErrKind::InvalidImageRequest,
             CodexErr::UsageLimitReached(_) => CodexErrKind::UsageLimitReached,
-            CodexErr::ServerOverloaded => CodexErrKind::ServerOverloaded,
+            CodexErr::ServerOverloaded { .. } => CodexErrKind::ServerOverloaded,
             CodexErr::CyberPolicy { .. } => CodexErrKind::CyberPolicy,
             CodexErr::ResponseStreamFailed(_) => CodexErrKind::ResponseStreamFailed,
             CodexErr::ConnectionFailed(_) => CodexErrKind::ConnectionFailed,
             CodexErr::QuotaExceeded => CodexErrKind::QuotaExceeded,
             CodexErr::UsageNotIncluded => CodexErrKind::UsageNotIncluded,
-            CodexErr::InternalServerError => CodexErrKind::InternalServerError,
+            CodexErr::InternalServerError { .. } => CodexErrKind::InternalServerError,
             CodexErr::RetryLimit(_) => CodexErrKind::RetryLimit,
             CodexErr::InternalAgentDied => CodexErrKind::InternalAgentDied,
             CodexErr::Sandbox(_) => CodexErrKind::Sandbox,
@@ -675,6 +675,7 @@ mod tests {
     #[test]
     fn region_restriction_keeps_unexpected_status_analytics_kind() {
         let kind = CodexErrKind::from(&CodexErr::RegionRestricted(UnexpectedResponseError {
+            retry_after: None,
             status: "403".parse().expect("valid status"),
             body: String::new(),
             user_message: None,

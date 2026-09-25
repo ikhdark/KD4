@@ -113,7 +113,11 @@ where
                     .should_retry(&err, attempt, policy.max_retries) =>
             {
                 let retry_number = attempt + 1;
-                sleep(backoff(policy.base_delay, retry_number)).await;
+                if let Some(advice) = err.retry_after() {
+                    tokio::time::sleep_until(advice.deadline()).await;
+                } else {
+                    sleep(backoff(policy.base_delay, retry_number)).await;
+                }
                 attempt = retry_number;
             }
             Err(err) => return Err(err),

@@ -556,6 +556,10 @@ impl Session {
                 }
             };
 
+        self.services
+            .latest_mcp_runtime()
+            .manager()
+            .invalidate_resource_caches();
         let mut refresh_config = self.get_config().await.as_ref().clone();
         refresh_config.mcp_oauth_credentials_store_mode = store_mode;
         let secret_auth_storage_enabled = match keyring_backend_kind {
@@ -643,6 +647,10 @@ impl Session {
         turn_context: &TurnContext,
         refresh_config: &Config,
     ) {
+        self.services
+            .latest_mcp_runtime()
+            .manager()
+            .invalidate_resource_caches();
         let (mcp_projection, available_environment_ids, expected_runtime) = loop {
             let expected_runtime = self.services.latest_mcp_runtime();
             let available_environment_ids = expected_runtime.available_environment_ids().to_vec();

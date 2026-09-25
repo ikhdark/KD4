@@ -314,6 +314,80 @@ class RunnerTestCase(unittest.TestCase):
 
 
 class WallClockRunnerTest(RunnerTestCase):
+    def test_repository_retry_output_gate_avoids_discovery_and_helper_builds(self):
+        manifest = Manifest.load(
+            REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml"
+        )
+        step = manifest.gates["core-retry-output"].steps[0]
+        source = (REPO_ROOT / "codex-rs/core/src/responses_retry_tests.rs").read_text()
+        lines = source.splitlines()
+        expected = {
+            "responses_retry::tests::" + line.split("fn ", 1)[1].split("(", 1)[0]
+            for attribute, line in zip(lines, lines[1:])
+            if attribute.startswith(("#[test]", "#[tokio::test"))
+        }
+        expected.add(
+            "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic"
+        )
+        self.assertEqual(set(step.tests), expected)
+        self.assertEqual(
+            manifest.targets["core_lib"].helpers_by_test_prefix[
+                "responses_retry::tests::"
+            ],
+            (),
+        )
+        runner, executor = self.runner(
+            manifest=manifest,
+            executor=FakeExecutor(default_listing=dict.fromkeys(expected, False)),
+        )
+        result = runner.run_gates(["core-retry-output"], quiet=True)
+        self.assertEqual(set(result["core-retry-output"]), expected)
+        self.assertEqual(executor.commands(["cargo", "build"]), [])
+        self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+        runs = executor.commands(["cargo", "nextest", "run"])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(
+            runs[0][runs[0].index("-E") + 1],
+            " | ".join(f"test(={test})" for test in step.tests),
+        )
+        self.assertEqual(runs[0][runs[0].index("--target-dir") + 1], str(self.target_dir))
+
+    def test_cache_disconnect_during_discovery_without_cargo_summary(self):
+        transport = "sccache: caused by: error reading compile response from server\n"
+        for verb, suffix, retries in (
+            ("list", "sccache: caused by: Failed to read response header", 1),
+            ("list", "error[E0063]: missing fields", 0),
+            ("list", ' {"level":"error"}', 0),
+            ("run", "", 0),
+        ):
+            with self.subTest(verb=verb, suffix=suffix):
+                runner, _ = self.runner()
+                runner.executor = mock.Mock(side_effect=[
+                    subprocess.CompletedProcess([], 4294967295, "", transport + suffix),
+                    subprocess.CompletedProcess([], 0, "listed", ""),
+                ])
+                command = ["cargo", "nextest", verb, "--target-dir", str(self.target_dir)]
+                with contextlib.redirect_stderr(io.StringIO()):
+                    if retries:
+                        result = runner._checked(
+                            command,
+                            env={"RUSTC_WRAPPER": "sccache"},
+                            capture=rust_test_runner.CAPTURE_STDOUT,
+                        )
+                        self.assertEqual(result.stdout, "listed")
+                        self.assertEqual(runner.executor.call_args.args[0], command)
+                        self.assertEqual(
+                            runner.executor.call_args.kwargs["env"]["RUSTC_WRAPPER"], ""
+                        )
+                    else:
+                        with self.assertRaises(RunnerError):
+                            runner._checked(
+                                command,
+                                env={"RUSTC_WRAPPER": "sccache"},
+                                capture=rust_test_runner.CAPTURE_STDOUT,
+                            )
+                self.assertEqual(runner.executor.call_count, 1 + retries)
+
     def test_cache_fallback_with_real_children_retains_both_attempts(self):
         runner, _ = self.runner()
         child = (
@@ -362,7 +436,9 @@ class WallClockRunnerTest(RunnerTestCase):
         self.assertEqual(len(builds), 1)
         self.assertEqual(builds[0].count("--bin"), 1)
         self.assertEqual(builds[0][-2:], ["--bin", "codex"])
-        self.assertNotIn("CARGO_BIN_EXE_codex-command-runner", executor.last_env())
+        self.assertFalse(
+            Path(executor.last_env()["CARGO_BIN_EXE_codex-command-runner"]).exists()
+        )
 
     def test_verified_selection_skips_helpers_and_keeps_original_filter(self):
         data = copy.deepcopy(MANIFEST_DATA)
@@ -398,7 +474,6 @@ class WallClockRunnerTest(RunnerTestCase):
                     "cargo",
                     "nextest",
                     "list",
-                    "--locked",
                     "--target-dir",
                     str(self.target_dir),
                     "-p",
@@ -924,6 +999,7 @@ class MetadataValidationTest(RunnerTestCase):
             executor, command_timeout_seconds=123.5
         )
         self.assertEqual(metadata.target_directory, self.target_dir)
+        self.assertNotIn("--locked", executor.call_args.args[0])
         self.assertEqual(
             executor.call_args.kwargs["env"]["CODEX_RUST_TEST_TIMEOUT_SECS"], "123.5"
         )
@@ -1211,6 +1287,82 @@ class TargetDirectoryPropagationTest(RunnerTestCase):
 
 
 class RunTargetTest(RunnerTestCase):
+    def test_phase_report_separates_build_from_tests_without_extra_commands(
+        self,
+    ) -> None:
+        runner, executor = self.runner(executor=self.build_executor())
+        original = runner.executor
+
+        def execute(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            result = original(args, **kwargs)
+            if args[:3] == ["cargo", "nextest", "run"]:
+                result.stderr = "Finished test profile in 3m 37s\nSummary [ 1.527s] 31 tests run: 31 passed\n"
+            return result
+
+        runner.executor = execute
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            runner.run_target("core_all", ["-E", "test(one)"])
+        self.assertEqual(len(executor.calls), 2)
+        self.assertIn("helper upper bound=codex", output.getvalue())
+        self.assertIn("Rust phase helper-build:", output.getvalue())
+        self.assertIn(
+            "cargo-reported=217.000s; tests-reported=1.527s", output.getvalue()
+        )
+
+    def test_abnormal_process_exit_is_diagnosed_without_retry(self) -> None:
+        runner, executor = self.runner()
+
+        def failed(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            result = executor(args, **kwargs)
+            result.returncode = 0xFFFFFFFF
+            return result
+
+        runner.executor = failed
+        with self.assertRaisesRegex(RunnerError, "Process exited 0xFFFFFFFF"):
+            runner._checked(
+                ["cargo", "nextest", "list"],
+                env={},
+                capture=rust_test_runner.CAPTURE_BOTH,
+            )
+        self.assertEqual(len(executor.calls), 1)
+
+    def test_repository_helper_free_selection_skips_build_but_unknown_keeps_helpers(
+        self,
+    ) -> None:
+        repository = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
+        prefixes = [
+            "context_manager::history::tests::",
+            "tools::handlers::tool_search::tests::",
+            "tools::handlers::mcp::search_tests::",
+            "tools::handlers::shell_spec::tests::",
+        ]
+        mappings = repository.targets["core_lib"].helpers_by_test_prefix
+        for prefix in prefixes:
+            self.assertEqual(mappings[prefix], ())
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {
+            prefix: [] for prefix in prefixes
+        }
+        for known in (True, False):
+            listing = (
+                {prefix + "case": False for prefix in prefixes}
+                if known
+                else {"unknown::case": False}
+            )
+            executor = self.build_executor(default_listing=listing)
+            executor.artifacts["codex-command-runner"] = self.helper_executable(
+                "codex-command-runner"
+            )
+            runner, _ = self.runner(
+                executor=executor, manifest=Manifest.from_data(data)
+            )
+            runner.run_target("core_lib", ["-E", "test(case)"])
+            self.assertEqual(
+                len(executor.commands(["cargo", "build"])), 0 if known else 1
+            )
+            self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
+
     def test_cross_package_helpers_build_once_before_exact_run_without_discovery(
         self,
     ) -> None:
@@ -1363,6 +1515,33 @@ class RunTargetTest(RunnerTestCase):
         ):
             runner.run_target("core_lib", [])
         self.assertEqual(executor.calls, [])
+
+    def test_every_name_for_the_core_library_requires_a_filter(self) -> None:
+        # Another manifest name for codex-core's library must not bypass the
+        # full-suite guard, directly or through the CLI.
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib_alias"] = {
+            "package": "codex-core",
+            "lib": True,
+            "helpers": [],
+        }
+        manifest = Manifest.from_data(data)
+        runner, executor = self.runner(manifest=manifest)
+        message = "core_lib_alias requires an explicit test filter"
+        with self.assertRaisesRegex(RunnerError, message):
+            runner.run_target("core_lib_alias", [])
+        self.assertEqual(executor.calls, [])
+        with (
+            mock.patch.object(Manifest, "load", return_value=manifest),
+            mock.patch.object(rust_test_runner, "load_metadata") as metadata,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(rust_test_runner.main(["run-target", "core_lib_alias"]), 2)
+        metadata.assert_not_called()
+        self.assertIn(message, stderr.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            runner.run_target("core_lib_alias", ["alpha"])
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
 
     def build_executor(self, **kwargs: Any) -> FakeExecutor:
         artifacts = {
@@ -1713,7 +1892,9 @@ class RunGateTest(RunnerTestCase):
             captures,
             {
                 ("nextest", "list"): rust_test_runner.CAPTURE_STDOUT,
-                ("build", "--locked"): (rust_test_runner.CAPTURE_STDOUT),
+                ("build", "--message-format=json-render-diagnostics"): (
+                    rust_test_runner.CAPTURE_STDOUT
+                ),
                 # Gate completion evidence is parsed out of the run's own
                 # status lines, so this one stream stays captured.
                 ("nextest", "run"): rust_test_runner.CAPTURE_BOTH,
@@ -1803,7 +1984,7 @@ class RunGateTest(RunnerTestCase):
         self.assertNotIn("--lib", command)
         self.assertEqual(executor.commands(["cargo", "build"]), [])
 
-    def test_cli_batch_deduplicates_tests_and_prepares_only_required_helpers(
+    def test_cli_batch_shares_helper_builds_but_runs_each_helper_set_separately(
         self,
     ) -> None:
         data = copy.deepcopy(MANIFEST_DATA)
@@ -1823,9 +2004,12 @@ class RunGateTest(RunnerTestCase):
                 ]
             },
         }
-        executor = self.gate_executor(
-            {"--lib": {"tests::alpha": False, "tests::beta": False}}
-        )
+        executor = self.gate_executor({})
+        executor._listing_for = lambda args: {
+            test: False
+            for test in ("tests::alpha", "tests::beta")
+            if f"test(={test})" in args[args.index("-E") + 1]
+        }
         runner = RustTestRunner(
             Manifest.from_data(data),
             self.metadata(),
@@ -1848,10 +2032,19 @@ class RunGateTest(RunnerTestCase):
             )
         metadata.assert_called_once_with()
         self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
-        runs = executor.commands(["cargo", "nextest", "run"])
-        self.assertEqual(len(runs), 1)
-        self.assertIn("test(=tests::alpha)", runs[0][runs[0].index("-E") + 1])
-        self.assertIn("test(=tests::beta)", runs[0][runs[0].index("-E") + 1])
+        # The library-only proof of `pure` must not borrow `runtime`'s helper.
+        runs = [
+            call
+            for call in executor.calls
+            if call["args"][:3] == ["cargo", "nextest", "run"]
+        ]
+        self.assertEqual(
+            [run["args"][run["args"].index("-E") + 1] for run in runs],
+            ["test(=tests::alpha)", "test(=tests::alpha) | test(=tests::beta)"],
+        )
+        codex = str(executor.artifacts["codex"].resolve())
+        self.assertFalse(Path(runs[0]["env"]["CARGO_BIN_EXE_codex"]).exists())
+        self.assertEqual(runs[1]["env"]["CARGO_BIN_EXE_codex"], codex)
         self.assertEqual(
             [
                 cmd[cmd.index("--bin") + 1]
@@ -1859,7 +2052,49 @@ class RunGateTest(RunnerTestCase):
             ],
             ["codex"],
         )
-        self.assertEqual(executor.last_env()["INSTA_UPDATE"], "no")
+        for run in runs:
+            self.assertEqual(run["env"]["INSTA_UPDATE"], "no")
+
+    def test_each_step_runs_with_only_its_declared_helpers(self) -> None:
+        # One gate's library-only step must not pass by borrowing the helpers
+        # another step of the batch declared for a different test binary.
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "mixed": {
+                "steps": [
+                    {
+                        "target": "core_lib",
+                        "tests": ["mod::tests::alpha"],
+                        "helpers": [],
+                    },
+                    {"target": "core_all", "tests": ["suite::mod::beta"]},
+                ]
+            }
+        }
+        executor = self.gate_executor(self.matching_listings())
+        runner, _ = self.runner(manifest=Manifest.from_data(data), executor=executor)
+        runner.run_gates(["mixed"], quiet=True)
+        self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
+        envs = {
+            executor._selector_for(call["args"]): call["env"]
+            for call in executor.calls
+            if call["args"][:3] == ["cargo", "nextest", "run"]
+        }
+        declared = ("codex", "codex-code-mode-host", "test_stdio_server")
+        for name in (*declared, "codex-command-runner"):
+            for alias in (name, name.replace("-", "_")):
+                with self.subTest(step="core_lib", helper=alias):
+                    self.assertFalse(
+                        Path(envs["--lib"][f"CARGO_BIN_EXE_{alias}"]).exists()
+                    )
+        helper_dir = str(executor.artifacts["codex"].resolve().parent)
+        self.assertNotIn(helper_dir, envs["--lib"]["PATH"].split(os.pathsep))
+        for name in declared:
+            self.assertEqual(
+                envs["all"][f"CARGO_BIN_EXE_{name}"],
+                str(executor.artifacts[name].resolve()),
+            )
+        self.assertFalse(Path(envs["all"]["CARGO_BIN_EXE_codex-command-runner"]).exists())
 
     def test_pure_gate_needs_no_helper_artifacts(self) -> None:
         data = copy.deepcopy(MANIFEST_DATA)
@@ -2173,6 +2408,34 @@ class ParityTest(RunnerTestCase):
         with self.assertRaisesRegex(RunnerError, "cannot also be a replacement"):
             runner.parity("core_all", ["core_all"])
 
+    def test_unconfirmed_cleanup_is_a_classified_failure_outside_checked_runs(
+        self,
+    ) -> None:
+        # Parity behavior runs and metadata discovery call the executor
+        # directly; an unconfirmed process tree must still be reported as
+        # cleanup_failed (and quarantine the lane) rather than escape.
+        listings = {"all": {"suite::a::one": False}, "core_shard": {"suite::a::one": False}}
+        executor = self.parity_executor(listings)
+
+        def execute(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if args[:3] == ["cargo", "nextest", "run"]:
+                raise rust_test_runner.CleanupFailed("owned job still active")
+            return executor(args, **kwargs)
+
+        runner, _ = self.runner(executor=executor)
+        runner.executor = execute
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(RunnerError) as parity_failure:
+                runner.parity("core_all", ["core_shard"])
+        self.assertEqual(parity_failure.exception.outcome, "cleanup_failed")
+        self.assertTrue((self.target_dir / ".lane-cleanup-unconfirmed").is_file())
+
+        with self.assertRaises(RunnerError) as metadata_failure:
+            rust_test_runner.load_metadata(
+                mock.Mock(side_effect=rust_test_runner.CleanupFailed("stuck"))
+            )
+        self.assertEqual(metadata_failure.exception.outcome, "cleanup_failed")
+
 
 class RepositoryManifestTest(unittest.TestCase):
     """The checked-in manifest must satisfy the runner's own schema."""
@@ -2324,7 +2587,6 @@ class RepositoryManifestTest(unittest.TestCase):
             "test_stdio_server",
             "test_streamable_http_server",
         ]
-        expected_helpers["core_thread_state"].append("test_stdio_server")
         expected_helpers["core_exec_permissions"] += [
             "codex-windows-sandbox-setup",
             "codex-command-runner",
@@ -2427,6 +2689,84 @@ class RunEnvironmentTest(RunnerTestCase):
         runner.run_target("core_shard", [])
         self.assertEqual(executor.last_env()["NEXTEST_PROFILE"], "local")
         self.assertEqual(executor.last_env()["RUST_MIN_STACK"], "42")
+
+    def test_inherited_snapshot_force_pass_cannot_reach_tests(self) -> None:
+        executor = FakeExecutor(artifacts={"codex": self.helper_executable("codex")})
+        runner = RustTestRunner(
+            self.manifest(),
+            self.metadata(),
+            target_dir=self.target_dir,
+            platform="windows",
+            executor=executor,
+            env={"INSTA_FORCE_PASS": "1", "INSTA_UPDATE": "always"},
+        )
+        runner.run_target("core_shard", [])
+        for call in executor.calls:
+            with self.subTest(args=call["args"]):
+                self.assertEqual(call["env"]["INSTA_FORCE_PASS"], "0")
+                self.assertEqual(call["env"]["INSTA_UPDATE"], "no")
+
+    def test_undeclared_or_inherited_helpers_cannot_resolve(self) -> None:
+        # `cargo_bin` reads CARGO_BIN_EXE_* and otherwise falls back to
+        # `<lane>/debug/<name>`. Neither an older lane build nor a caller's
+        # variable may satisfy a helper the selection did not declare.
+        stale = self.helper_executable("codex-code-mode-host")
+        executor = FakeExecutor(artifacts={"codex": self.helper_executable("codex")})
+        runner = RustTestRunner(
+            self.manifest(),
+            self.metadata(),
+            target_dir=self.target_dir,
+            platform="windows",
+            executor=executor,
+            env={
+                "CARGO_BIN_EXE_test_stdio_server": str(stale),
+                "CARGO_BIN_EXE_unrelated": str(stale),
+            },
+        )
+        runner.run_target("core_shard", [])
+        env = executor.last_env()
+        self.assertEqual(
+            env["CARGO_BIN_EXE_codex"], str(executor.artifacts["codex"].resolve())
+        )
+        for name in (
+            "codex-code-mode-host",
+            "test_stdio_server",
+            "test_streamable_http_server",
+            "codex-command-runner",
+        ):
+            for alias in (name, name.replace("-", "_")):
+                with self.subTest(helper=alias):
+                    denied = Path(env[f"CARGO_BIN_EXE_{alias}"])
+                    self.assertTrue(denied.is_absolute())
+                    self.assertFalse(denied.exists())
+        self.assertNotIn("CARGO_BIN_EXE_unrelated", env)
+
+        # Cargo builds a package's own binaries for its integration tests, so
+        # the runner must leave those reachable instead of denying them.
+        packages = copy.deepcopy(METADATA_PACKAGES)
+        cli = next(package for package in packages if package["name"] == "codex-cli")
+        cli["targets"].append({"name": "cli_suite", "kind": ["test"]})
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["cli_suite"] = {
+            "package": "codex-cli",
+            "test": "cli_suite",
+            "helpers": [],
+        }
+        executor = FakeExecutor()
+        RustTestRunner(
+            Manifest.from_data(data),
+            MetadataIndex.from_json(
+                {"target_directory": str(self.target_dir), "packages": packages}
+            ),
+            target_dir=self.target_dir,
+            platform="windows",
+            executor=executor,
+            env={},
+        ).run_target("cli_suite", [])
+        self.assertNotIn("CARGO_BIN_EXE_codex", executor.last_env())
+        self.assertFalse(
+            Path(executor.last_env()["CARGO_BIN_EXE_codex-code-mode-host"]).exists()
+        )
 
 
 class CommandLineTest(unittest.TestCase):

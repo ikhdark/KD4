@@ -7,6 +7,7 @@ use codex_core::ModelClient;
 use codex_core::ModelClientSession;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
+use codex_core::X_CODEX_ROUTING_HINT_HEADER;
 use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 use codex_features::Feature;
 use codex_http_client::OutboundProxyPolicy;
@@ -29,6 +30,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -407,7 +409,12 @@ async fn responses_websocket_preconnect_does_not_replace_turn_trace_payload() {
     let mut client_session = harness.client.new_session();
     let responses_metadata = websocket_connection_metadata(&harness);
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &responses_metadata)
+        .preconnect_websocket(
+            &harness.model_info,
+            None,
+            &harness.session_telemetry,
+            &responses_metadata,
+        )
         .await
         .expect("websocket preconnect failed");
     let prompt = prompt_with_input(vec![message_item("hello")]);
@@ -444,7 +451,12 @@ async fn responses_websocket_preconnect_reuses_connection() {
     let mut client_session = harness.client.new_session();
     let responses_metadata = websocket_connection_metadata(&harness);
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &responses_metadata)
+        .preconnect_websocket(
+            &harness.model_info,
+            None,
+            &harness.session_telemetry,
+            &responses_metadata,
+        )
         .await
         .expect("websocket preconnect failed");
     let prompt = prompt_with_input(vec![message_item("hello")]);
@@ -456,12 +468,97 @@ async fn responses_websocket_preconnect_reuses_connection() {
         Some(codex_login::default_client::get_codex_user_agent())
     );
     assert_eq!(
+        server
+            .single_handshake()
+            .header(X_CODEX_ROUTING_HINT_HEADER),
+        None
+    );
+    assert_eq!(
         server.single_handshake().header("x-codex-window-id"),
         Some(TEST_WINDOW_ID.to_string())
     );
     let connection = server.single_connection();
     assert_eq!(connection.len(), 1);
 
+    server.shutdown().await;
+}
+
+#[test_case::test_case(None, false; "model only")]
+#[test_case::test_case(Some("priority"), false; "supported tier")]
+#[test_case::test_case(Some("unsupported"), false; "unsupported tier omitted")]
+#[test_case::test_case(Some("priority"), true; "guardian omits routing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_preconnect_routing_is_advisory(tier: Option<&str>, guardian: bool) {
+    require_network!();
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-1"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    provider.supports_websockets = true;
+    if guardian {
+        provider.http_headers = Some(std::collections::HashMap::from([(
+            "x-codex-guardian".to_string(),
+            "reviewer".to_string(),
+        )]));
+    }
+    let harness = websocket_harness_with_auth(
+        provider,
+        false,
+        false,
+        &[],
+        Some(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+    )
+    .await;
+    let mut model_info = harness.model_info.clone();
+    model_info.service_tiers = vec![ModelServiceTier {
+        id: "priority".to_string(),
+        name: "Fast".to_string(),
+        description: "Priority processing".to_string(),
+    }];
+    let mut session = harness.client.new_session();
+    let metadata = websocket_connection_metadata(&harness);
+    session
+        .preconnect_websocket(
+            &model_info,
+            tier.map(str::to_string),
+            &harness.session_telemetry,
+            &metadata,
+        )
+        .await
+        .expect("eager handshake should connect");
+    assert!(
+        server.single_connection().is_empty(),
+        "preconnect must not send a request"
+    );
+    let expected = if guardian {
+        None
+    } else if tier == Some("priority") {
+        Some(format!("model={MODEL};tier=priority"))
+    } else {
+        Some(format!("model={MODEL}"))
+    };
+    assert_eq!(
+        server
+            .single_handshake()
+            .header(X_CODEX_ROUTING_HINT_HEADER),
+        expected
+    );
+    // Routing is advisory: a different model/tier must not force a new socket.
+    model_info.slug = "changed-model".to_string();
+    session
+        .preconnect_websocket(&model_info, None, &harness.session_telemetry, &metadata)
+        .await
+        .expect("second preconnect should reuse the connection");
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    stream_until_complete_with_model_info(&mut session, &harness, &prompt, &model_info, "resp-1")
+        .await;
+    assert_eq!(server.handshakes().len(), 1);
+    let request = server.single_connection()[0].body_json();
+    assert_eq!(request["model"], "changed-model");
+    assert!(request.get("service_tier").is_none());
     server.shutdown().await;
 }
 
@@ -876,7 +973,12 @@ async fn responses_websocket_preconnect_is_reused_even_with_header_changes() {
     let mut client_session = harness.client.new_session();
     let preconnect_metadata = websocket_connection_metadata(&harness);
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &preconnect_metadata)
+        .preconnect_websocket(
+            &harness.model_info,
+            None,
+            &harness.session_telemetry,
+            &preconnect_metadata,
+        )
         .await
         .expect("websocket preconnect failed");
     let prompt = prompt_with_input(vec![message_item("hello")]);
@@ -1054,7 +1156,12 @@ async fn responses_websocket_preconnect_runs_when_only_v2_feature_enabled() {
     let mut client_session = harness.client.new_session();
     let responses_metadata = websocket_connection_metadata(&harness);
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &responses_metadata)
+        .preconnect_websocket(
+            &harness.model_info,
+            None,
+            &harness.session_telemetry,
+            &responses_metadata,
+        )
         .await
         .expect("websocket preconnect failed");
 
@@ -2455,6 +2562,23 @@ async fn websocket_harness_with_provider_options(
     concurrent_reasoning_summaries_enabled: bool,
     enabled_features: &[Feature],
 ) -> WebsocketTestHarness {
+    websocket_harness_with_auth(
+        provider,
+        runtime_metrics_enabled,
+        concurrent_reasoning_summaries_enabled,
+        enabled_features,
+        None,
+    )
+    .await
+}
+
+async fn websocket_harness_with_auth(
+    provider: ModelProviderInfo,
+    runtime_metrics_enabled: bool,
+    concurrent_reasoning_summaries_enabled: bool,
+    enabled_features: &[Feature],
+    auth: Option<CodexAuth>,
+) -> WebsocketTestHarness {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model = Some(MODEL.to_string());
@@ -2507,7 +2631,7 @@ async fn websocket_harness_with_provider_options(
     let effort = None;
     let summary = ReasoningSummary::Auto;
     let client = ModelClient::new(
-        /*auth_manager*/ None,
+        auth.map(codex_core::test_support::auth_manager_from_auth),
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         provider.clone(),

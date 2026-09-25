@@ -15,7 +15,7 @@ def check_duplicate_deps(
     extra_args: Sequence[str], *, runner: Runner = subprocess.run
 ) -> int:
     result = runner(
-        ["cargo", "tree", "--locked", "-d", "-p", "codex-cli", *extra_args],
+        ["cargo", "tree", "-d", "-p", "codex-cli", *extra_args],
         capture_output=True,
         text=True,
         check=False,

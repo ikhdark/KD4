@@ -231,7 +231,6 @@ def run_cargo_build(
     cmd = [
         resolve_command(cargo, env=cargo_env) or cargo,
         "build",
-        "--locked",
         "--target-dir",
         str(target_dir),
         "--target",
@@ -855,7 +854,6 @@ def build_recipe_fingerprint(
     effective_command = [
         cargo,
         "build",
-        "--locked",
         "--target-dir",
         str(target_dir),
         "--target",

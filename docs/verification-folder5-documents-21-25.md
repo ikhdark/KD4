@@ -30,7 +30,7 @@ The baseline is the existing modified checkout. Unrelated changes were preserved
 | 24.4 Compact output bounded against pretty JSON | Confirmed. Both bounding stages use the selected wire encoding, including the complete envelope and newline. |
 | 24.5 Repeated owner-symbol interpretation and query reread | Confirmed. Identical symbol/mode checks are memoized per capture; query receives the fingerprints already captured during validation. No timestamp-only or persistent source cache was added. |
 | 25.3 Feature checker bypasses lane ownership | Confirmed. Feature export and runtime verification acquire/reuse an operation lease and pass its target explicitly. The CLI acquires the lease lazily and keeps it across both phases; helper/gate batching remains. |
-| 25.4 Validation may update Cargo.lock | Confirmed missing policy. Metadata, helpers, nextest selection/execution, and feature-default export now supply runner-owned `--locked`; no unlocked retry was added. |
+| 25.4 Validation may update Cargo.lock | Superseded by the user's local-workflow preference: metadata, helpers, nextest selection/execution, and feature-default export no longer force `--locked`; Cargo may update the lockfile when needed. |
 
 The reports' claims about no measured upstream advantage, token savings, or
 production frequency are correct limitations. Their preserved safeguardsâ€”exact

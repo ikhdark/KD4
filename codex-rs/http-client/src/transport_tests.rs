@@ -191,51 +191,63 @@ async fn non_connection_errors_redact_request_urls() {
 #[tokio::test]
 async fn interrupted_error_body_retains_http_status_and_headers() {
     use std::io::Read;
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(std::time::Instant::now() < deadline, "request must arrive");
-                    std::thread::sleep(Duration::from_millis(10));
+    for streaming in [false, true] {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "request must arrive");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
                 }
-                Err(error) => panic!("accept: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
             }
+            stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 100\r\nRetry-After: 7\r\nConnection: close\r\n\r\npartial").unwrap();
+        });
+        let transport = ReqwestTransport::from_http_client(HttpClient::new(test_reqwest_client()));
+        let request = Request::new(Method::GET, format!("http://{address}/"));
+        let error = if streaming {
+            match transport.stream(request).await {
+                Err(error) => error,
+                Ok(_) => panic!("expected HTTP failure"),
+            }
+        } else {
+            transport.execute(request).await.expect_err("HTTP failure")
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            stream.read_exact(&mut byte).unwrap();
-            request.push(byte[0]);
-        }
-        stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 100\r\nRetry-After: 7\r\nConnection: close\r\n\r\npartial").unwrap();
-    });
-    let transport = ReqwestTransport::from_http_client(HttpClient::new(test_reqwest_client()));
-    let error = transport
-        .execute(Request::new(Method::GET, format!("http://{address}/")))
-        .await
-        .expect_err("HTTP failure");
-    server.join().unwrap();
-    let TransportError::Http {
-        status,
-        headers,
-        body,
-        ..
-    } = error
-    else {
-        panic!("lost HTTP metadata: {error}");
-    };
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(headers.expect("HTTP headers retained")["retry-after"], "7");
-    assert_eq!(body, None);
+        let remaining = error
+            .retry_after()
+            .expect("retry deadline retained")
+            .remaining_delay();
+        assert!(remaining > Duration::ZERO && remaining <= Duration::from_secs(7));
+        server.join().unwrap();
+        let TransportError::Http {
+            status,
+            headers,
+            body,
+            ..
+        } = error
+        else {
+            panic!("lost HTTP metadata: {error}");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.expect("HTTP headers retained")["retry-after"], "7");
+        assert_eq!(body, None);
+    }
 }

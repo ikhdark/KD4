@@ -103,7 +103,7 @@ fn usage_limit_reached_error_formats_rate_limit_reached_types() {
 
 #[test]
 fn server_overloaded_maps_to_protocol() {
-    let err = CodexErr::ServerOverloaded;
+    let err = CodexErr::ServerOverloaded { retry_after: None };
     assert_eq!(
         err.to_codex_protocol_error(),
         CodexErrorInfo::ServerOverloaded
@@ -165,6 +165,7 @@ fn workspace_failure_takes_precedence_over_named_model_limit() {
 fn unexpected_status_caps_structured_message_and_preserves_diagnostics() {
     let body = serde_json::json!({"error": {"message": "界".repeat(400)}}).to_string();
     let err = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::BAD_GATEWAY,
         body: body.clone(),
         user_message: None,
@@ -187,6 +188,7 @@ fn unexpected_status_caps_structured_message_and_preserves_diagnostics() {
 
 fn unexpected_response(status: StatusCode) -> CodexErr {
     CodexErr::UnexpectedStatus(UnexpectedResponseError {
+        retry_after: None,
         status,
         body: String::new(),
         user_message: None,
@@ -495,17 +497,19 @@ fn usage_limit_reached_error_formats_pro_plan_with_reset() {
     let resets_at = base + ChronoDuration::hours(1);
     with_now_override(base, move || {
         let expected_time = "1:00 PM";
-        let err = UsageLimitReachedError {
-            plan_type: Some(PlanType::Known(KnownPlan::Pro)),
-            resets_at: Some(resets_at),
-            rate_limits: Some(Box::new(rate_limit_snapshot())),
-            promo_message: None,
-            rate_limit_reached_type: None,
-        };
         let expected = format!(
             "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {expected_time}."
         );
-        assert_eq!(err.to_string(), expected);
+        for plan in [KnownPlan::Pro, KnownPlan::ProLite, KnownPlan::ProMax] {
+            let err = UsageLimitReachedError {
+                plan_type: Some(PlanType::Known(plan)),
+                resets_at: Some(resets_at),
+                rate_limits: Some(Box::new(rate_limit_snapshot())),
+                promo_message: None,
+                rate_limit_reached_type: None,
+            };
+            assert_eq!(err.to_string(), expected);
+        }
     });
 }
 
@@ -565,6 +569,7 @@ fn usage_limit_reached_includes_minutes_when_available() {
 #[test]
 fn unexpected_status_non_html_is_unchanged() {
     let err = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::FORBIDDEN,
         body: "plain text error".to_string(),
         user_message: None,
@@ -585,6 +590,7 @@ fn unexpected_status_non_html_is_unchanged() {
 #[test]
 fn unexpected_status_uses_user_message_and_preserves_response_context() {
     let err = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::UNAUTHORIZED,
         body: "provider-specific response".to_string(),
         user_message: Some("Provider-specific guidance".to_string()),
@@ -604,6 +610,7 @@ fn unexpected_status_uses_user_message_and_preserves_response_context() {
 #[test]
 fn unexpected_status_prefers_error_message_when_present() {
     let err = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::UNAUTHORIZED,
         body: r#"{"error":{"message":"Workspace is not authorized in this region."},"status":401}"#
             .to_string(),
@@ -627,6 +634,7 @@ fn unexpected_status_prefers_error_message_when_present() {
 fn unexpected_status_truncates_long_body_with_ellipsis() {
     let long_body = "x".repeat(UNEXPECTED_RESPONSE_BODY_MAX_BYTES + 10);
     let err = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::BAD_GATEWAY,
         body: long_body,
         user_message: None,
@@ -649,6 +657,7 @@ fn unexpected_status_truncates_long_body_with_ellipsis() {
 #[test]
 fn unexpected_status_includes_cf_ray_and_request_id() {
     let err = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::UNAUTHORIZED,
         body: "plain text error".to_string(),
         user_message: None,
@@ -670,6 +679,7 @@ fn unexpected_status_includes_cf_ray_and_request_id() {
 #[test]
 fn unexpected_status_includes_identity_auth_details() {
     let err = UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::UNAUTHORIZED,
         body: "plain text error".to_string(),
         user_message: None,

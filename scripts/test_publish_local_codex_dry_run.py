@@ -49,6 +49,35 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 result.stdout + result.stderr,
             )
 
+    def test_runtime_proof_outside_dry_run_doctor_is_rejected(self) -> None:
+        # Only the dry-run doctor honors -RuntimeProof; elsewhere it would be
+        # echoed as requested while nothing proved the Desktop runtime.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_dir = Path(temp_dir) / "install"
+            for flags in ((), ("-RunDoctor",), ("-DryRun",)):
+                with self.subTest(flags=flags):
+                    result = self.run_script(
+                        *flags,
+                        "-RuntimeProof",
+                        "-SkipBuild",
+                        "-SourceExe",
+                        str(self.source_exe),
+                        "-InstallDir",
+                        str(install_dir),
+                    )
+
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    self.assertIn(
+                        "-RuntimeProof only applies to -DryRun -RunDoctor",
+                        result.stderr,
+                    )
+                    self.assertNotIn("publishCommitted: true", result.stdout)
+                    self.assertFalse((install_dir / "codex.exe").exists())
+
     def test_dry_run_reports_proof_without_writing_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             install_dir = Path(temp_dir) / "install"
@@ -138,6 +167,45 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assertIn("-RustyV8Archive", result.stdout)
             self.assertIn("-AllowRustyV8Download", result.stdout)
 
+    def test_rusty_v8_cache_follows_cargo_home_like_the_v8_build(self) -> None:
+        self.write_cargo_lock_with_v8()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            user_profile = temp_path / "profile"
+            cargo_home = temp_path / "cargo-home"
+            archive = temp_path / self.rusty_v8_archive_name()
+            archive.write_bytes(b"fake rusty v8 archive")
+            self.write_rusty_v8_checksum(archive)
+            cache_name = self.rusty_v8_cache_path(user_profile).name
+            expected_path = cargo_home / ".rusty_v8" / cache_name
+            # Only the build's CARGO_HOME counts; a stale copy under the default
+            # user Cargo home must not satisfy the gate.
+            for cached_in, expected in (
+                (cargo_home, "cached"),
+                (user_profile / ".cargo", "missing"),
+            ):
+                with self.subTest(cached_in=cached_in.name):
+                    cache = cached_in / ".rusty_v8" / cache_name
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    cache.write_bytes(archive.read_bytes())
+                    env = self.publish_env_without_v8_archive(user_profile)
+                    env["CARGO_HOME"] = str(cargo_home)
+                    result = self.run_script(
+                        "-DryRun",
+                        "-InstallDir",
+                        str(temp_path / "install"),
+                        env=env,
+                    )
+                    cache.unlink()
+
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    self.assertIn(f"v8ArchiveCachePath: {expected_path}", result.stdout)
+                    self.assertIn(f"v8ArchiveStatus: {expected}", result.stdout)
+
     def test_rusty_v8_gate_covers_local_release_and_debug_archives(self) -> None:
         self.write_cargo_lock_with_v8()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -175,6 +243,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
         self,
     ) -> None:
         self.write_cargo_lock_with_v8()
+        self.init_repo_fixture()
         target = self.expected_windows_rusty_v8_target()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -186,13 +255,9 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             calls = temp_path / "cargo-calls.txt"
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
-            (fake_bin / "cargo.cmd").write_text(
-                f'@echo off\necho invoked>>"{calls}"\nexit /b 0\n', encoding="utf-8"
-            )
+            self.write_fake_cargo(fake_bin, f'echo invoked>>"{calls}"')
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
             result = self.run_script(
-                "-SourceExe",
-                str(self.source_exe),
                 "-InstallDir",
                 str(install_dir),
                 env=env,
@@ -217,35 +282,18 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             install_dir = temp_path / "install"
             user_profile = temp_path / "profile"
             user_profile.mkdir()
-            fake_codex = self.copy_valid_codex(
-                temp_path / "fake-codex.exe",
-                timestamp=FRESH_SOURCE_TIME,
-                append_padding=True,
-            )
             archive = temp_path / self.rusty_v8_archive_name()
             archive.write_bytes(b"fake rusty v8 archive")
             checksum = self.write_rusty_v8_checksum(archive, binary_marker=True)
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
-            fake_cargo = fake_bin / "cargo.cmd"
-            fake_cargo.write_text(
-                "\r\n".join(
-                    [
-                        "@echo off",
-                        "echo fake cargo %*",
-                        "exit /b 0",
-                    ]
-                ),
-                encoding="utf-8",
-            )
+            self.write_fake_cargo(fake_bin, "echo fake cargo %*")
             env = self.publish_env_without_v8_archive(user_profile)
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
 
             result = self.run_script(
                 "-RustyV8Archive",
                 str(archive),
-                "-SourceExe",
-                str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
                 env=env,

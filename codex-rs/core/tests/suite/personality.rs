@@ -696,6 +696,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: Some(ModelMessages {
+            token_budget: None,
             instructions_template: Some("Base instructions\n{{ personality }}\n".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: Some(default_personality_message.to_string()),
@@ -715,6 +716,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
+        supports_experimental_context: false,
         context_window: Some(128_000),
         max_context_window: None,
         auto_compact_token_limit: None,
@@ -819,6 +821,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: Some(ModelMessages {
+            token_budget: None,
             instructions_template: Some("Base instructions\n{{ personality }}\n".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -838,6 +841,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
+        supports_experimental_context: false,
         context_window: Some(128_000),
         max_context_window: None,
         auto_compact_token_limit: None,

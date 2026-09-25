@@ -24,14 +24,15 @@ tungstenite = { workspace = true }
 tracing = { workspace = true }
 eventsource-stream = { workspace = true }
 regex-lite = { workspace = true }
-tokio-util = { workspace = true, features = ["codec", "io"] }
 url = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 assert_matches = { workspace = true }
 pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 wiremock = { workspace = true }
 
 [lints]

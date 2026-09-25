@@ -379,7 +379,18 @@ def continuation_count(timing: dict[str, Any]) -> int | None:
         or _request_retention([timing])["complete"] is False
     ):
         return None
-    return sum(row.get("isContinuation") is True for row in _selected_requests(timing))
+    # The runtime flags every row after the turn's first as a continuation,
+    # including retry and fallback attempts; count logical generations only.
+    return len(
+        {
+            row["generationIndex"]
+            if type(row.get("generationIndex")) is int
+            else ("row", index)
+            for index, row in enumerate(_selected_requests(timing))
+            if row.get("isContinuation") is True
+            and row.get("attemptKind", "primary") == "primary"
+        }
+    )
 
 
 def analyze_timing(
@@ -1290,6 +1301,16 @@ def _population_report(
         ):
             totals[key] += int(counters.get(key, 0))
         request_count += sum(_physical_attempt_count(request) for request in requests)
+        # A generation can start and end before dispatch; only generations with
+        # retained attempts can own retries.
+        totals["requestedGenerations"] += len(
+            {
+                request["generationIndex"]
+                if type(request.get("generationIndex")) is int
+                else ("row", index)
+                for index, request in enumerate(requests)
+            }
+        )
         decision_ready = [
             request
             for request in requests

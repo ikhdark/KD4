@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import re
 import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +29,7 @@ _TARGET_SELECTION_ARGS = {
 }
 _TARGET_SELECTION_PREFIXES = ("--bin=", "--test=", "--example=", "--bench=")
 _TARGET_SELECTION_WITH_VALUE = {"--bin", "--test", "--example", "--bench"}
-_NIGHTLY_LIBRARY_PATTERN = re.compile(r"^(.+@nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})-.+$")
+_PACKAGE_SELECTION_PREFIXES = ("--package=", "-p")
 
 
 @dataclass
@@ -65,6 +62,8 @@ def parse_wrapper_args(argv: Sequence[str]) -> ParsedWrapperArgs:
                 or arg.startswith(_TARGET_SELECTION_PREFIXES)
             ):
                 parsed.has_cargo_target_selection = True
+            elif arg == "--package" or arg.startswith(_PACKAGE_SELECTION_PREFIXES):
+                parsed.has_package_selection = True
             continue
 
         if arg == "--":
@@ -89,7 +88,7 @@ def parse_wrapper_args(argv: Sequence[str]) -> ParsedWrapperArgs:
             parsed.has_manifest_path = True
         elif arg in {"-p", "--package"}:
             expect_value = "package_selection"
-        elif arg.startswith("--package="):
+        elif arg.startswith(_PACKAGE_SELECTION_PREFIXES):
             parsed.has_package_selection = True
         elif arg == "--fix":
             parsed.has_fix = True
@@ -117,6 +116,10 @@ def build_final_args(parsed: ParsedWrapperArgs, manifest_path: Path) -> list[str
         final_args.append("--no-deps")
     if not parsed.has_fix and not parsed.has_cargo_target_selection:
         cargo_args.append("--all-targets")
+    # The pinned lint nightly is older than the rust-version some dependencies
+    # declare; the code still checks, so do not let Cargo refuse the run.
+    if "--ignore-rust-version" not in cargo_args:
+        cargo_args.append("--ignore-rust-version")
     final_args.extend(parsed.lint_args)
     if cargo_args:
         final_args.extend(["--", *cargo_args])
@@ -134,7 +137,10 @@ def append_env_flag(env: MutableMapping[str, str], key: str, flag: str) -> None:
 
 def set_default_lint_env(env: MutableMapping[str, str]) -> None:
     for strict_lint in STRICT_LINTS:
-        append_env_flag(env, "DYLINT_RUSTFLAGS", f"-D {strict_lint}")
+        # rustc applies the last level given for a lint, so appending `-D` would
+        # override an explicit ad hoc level such as `-A <lint>`.
+        if strict_lint not in env.get("DYLINT_RUSTFLAGS", "").replace("_", "-"):
+            append_env_flag(env, "DYLINT_RUSTFLAGS", f"-D {strict_lint}")
     append_env_flag(env, "DYLINT_RUSTFLAGS", f"-A {NOISE_LINT}")
     if not env.get("CARGO_INCREMENTAL"):
         env["CARGO_INCREMENTAL"] = "0"
@@ -181,13 +187,13 @@ def ensure_source_prerequisites(env: MutableMapping[str, str]) -> None:
         "cargo-dylint",
         "argument-comment-lint source wrapper requires cargo-dylint and dylint-link.\n"
         "Install them with:\n"
-        "  cargo install --locked cargo-dylint dylint-link",
+        "  cargo install cargo-dylint dylint-link",
     )
     require_command(
         "dylint-link",
         "argument-comment-lint source wrapper requires cargo-dylint and dylint-link.\n"
         "Install them with:\n"
-        "  cargo install --locked cargo-dylint dylint-link",
+        "  cargo install cargo-dylint dylint-link",
     )
     require_command(
         "rustup",
@@ -209,72 +215,6 @@ def ensure_source_prerequisites(env: MutableMapping[str, str]) -> None:
             "    --component rustc-dev \\\n"
             "    --component rust-src"
         )
-
-
-def prefer_rustup_shims(env: MutableMapping[str, str]) -> None:
-    if env.get("CODEX_ARGUMENT_COMMENT_LINT_SKIP_RUSTUP_SHIMS") == "1":
-        return
-
-    rustup = shutil.which("rustup", path=env.get("PATH"))
-    if rustup is None:
-        return
-
-    rustup_bin_dir = str(Path(rustup).resolve().parent)
-    path_entries = [
-        entry
-        for entry in env.get("PATH", "").split(os.pathsep)
-        if entry and entry != rustup_bin_dir
-    ]
-    env["PATH"] = os.pathsep.join([rustup_bin_dir, *path_entries])
-
-    if not env.get("RUSTUP_HOME"):
-        rustup_home = run_capture(["rustup", "show", "home"], env=env)
-        if rustup_home:
-            env["RUSTUP_HOME"] = rustup_home
-
-
-def fetch_packaged_entrypoint(
-    dotslash_manifest: Path, env: MutableMapping[str, str]
-) -> Path:
-    require_command(
-        "dotslash",
-        "argument-comment-lint prebuilt wrapper requires dotslash.\n"
-        "Install dotslash, or use:\n"
-        "  ./tools/argument-comment-lint/run.py ...",
-    )
-    entrypoint = run_capture(
-        ["dotslash", "--", "fetch", str(dotslash_manifest)], env=env
-    )
-    return Path(entrypoint).resolve()
-
-
-def find_packaged_cargo_dylint(package_entrypoint: Path) -> Path:
-    bin_dir = package_entrypoint.parent
-    cargo_dylint = bin_dir / "cargo-dylint"
-    if not cargo_dylint.is_file():
-        cargo_dylint = bin_dir / "cargo-dylint.exe"
-    if not cargo_dylint.is_file():
-        die(f"bundled cargo-dylint executable not found under {bin_dir}")
-    return cargo_dylint
-
-
-def normalize_packaged_library(package_entrypoint: Path) -> Path:
-    library_dir = package_entrypoint.parent.parent / "lib"
-    libraries = sorted(path for path in library_dir.glob("*@*") if path.is_file())
-    if not libraries:
-        die(f"no packaged Dylint library found in {library_dir}")
-    if len(libraries) != 1:
-        die(f"expected exactly one packaged Dylint library in {library_dir}")
-
-    library_path = libraries[0]
-    match = _NIGHTLY_LIBRARY_PATTERN.match(library_path.stem)
-    if match is None:
-        return library_path
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="argument-comment-lint."))
-    normalized_library_path = temp_dir / f"{match.group(1)}{library_path.suffix}"
-    shutil.copy2(library_path, normalized_library_path)
-    return normalized_library_path
 
 
 def exec_command(command: Sequence[str], env: MutableMapping[str, str]) -> Never:

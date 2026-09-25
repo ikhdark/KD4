@@ -8,6 +8,7 @@ use serde_json::json;
 fn search_info_uses_mcp_tool_metadata_and_parameter_names() {
     let handler = McpHandler::new(tool_info()).expect("MCP tool spec should build");
     let search_info = handler.search_info().expect("MCP search info");
+    assert!(Arc::ptr_eq(&handler.spec, &search_info.entry.output));
 
     assert_eq!(
         search_info.entry.search_text,
@@ -29,7 +30,7 @@ fn search_info_uses_connector_name_for_output_namespace_description() {
     let handler = McpHandler::new(tool_info).expect("MCP tool spec should build");
     let search_info = handler.search_info().expect("MCP search info");
 
-    let LoadableToolSpec::Namespace(namespace) = search_info.entry.output else {
+    let LoadableToolSpec::Namespace(namespace) = search_info.entry.to_loadable_spec() else {
         panic!("expected namespace search output");
     };
     assert_eq!(namespace.description, "Tools for working with Calendar.");
@@ -39,6 +40,25 @@ fn search_info_uses_connector_name_for_output_namespace_description() {
             name: "Calendar".to_string(),
             description: None,
         })
+    );
+}
+
+#[test]
+fn registered_contract_override_is_not_replaced_by_shared_mcp_spec() {
+    let handler = McpHandler::new(tool_info()).unwrap();
+    let ToolSpec::Namespace(mut namespace) = handler.spec() else {
+        panic!("expected namespace");
+    };
+    let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
+    tool.name = "overridden".to_string();
+    tool.parameters = codex_tools::JsonSchema::string(Some("Override input".to_string()));
+    let registered = ToolSpec::Namespace(namespace);
+    let info = handler.search_info_for_registered_spec(&registered).unwrap();
+    assert!(!Arc::ptr_eq(&handler.spec, &info.entry.output));
+    assert_eq!(info.entry.tool_names, vec!["overridden"]);
+    assert_eq!(
+        info.entry.to_loadable_spec(),
+        ToolSearchInfo::from_tool_spec(&registered, None).unwrap().entry.to_loadable_spec()
     );
 }
 

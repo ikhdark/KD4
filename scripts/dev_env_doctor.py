@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -15,9 +16,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
+try:
+    from scripts import tool_versions
+except ModuleNotFoundError:
+    import tool_versions
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_JSON = REPO_ROOT / "package.json"
+# Recipes run Rust tools here, where codex-rs/rust-toolchain.toml selects the toolchain.
+RUST_WORKSPACE = REPO_ROOT / "codex-rs"
 
 
 class PackageJsonError(RuntimeError):
@@ -35,11 +43,13 @@ class ToolCheck:
     guidance: str
 
 
-def run_version(command: Sequence[str]) -> str | None:
+def run_version(command: Sequence[str], cwd: Path = REPO_ROOT) -> str | None:
     try:
         completed = subprocess.run(
             list(command),
-            cwd=REPO_ROOT,
+            cwd=cwd,
+            # A probe must not start installing a missing pinned toolchain.
+            env={**os.environ, "RUSTUP_AUTO_INSTALL": "0"},
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -64,24 +74,35 @@ def run_version(command: Sequence[str]) -> str | None:
     return None
 
 
-def package_manager_pin() -> str:
+def package_json() -> dict[str, object]:
     if not PACKAGE_JSON.exists():
-        return "pnpm"
+        return {}
     try:
         data = json.loads(PACKAGE_JSON.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PackageJsonError(f"could not read {PACKAGE_JSON}: {error}") from None
     if not isinstance(data, dict):
         raise PackageJsonError(f"{PACKAGE_JSON} must contain a JSON object")
-    value = str(data.get("packageManager", "pnpm"))
+    return data
+
+
+def package_manager_pin() -> str:
+    value = str(package_json().get("packageManager", "pnpm"))
     return value.split("+", 1)[0]
 
 
-def node_major(version: str | None) -> int | None:
-    if version is None:
+def node_engine_floor() -> tuple[int, ...] | None:
+    """Return the `engines.node` floor that pnpm enforces for this workspace."""
+    engines = package_json().get("engines")
+    value = engines.get("node") if isinstance(engines, dict) else None
+    if value is None:
         return None
-    match = re.search(r"v?(\d+)", version)
-    return int(match.group(1)) if match else None
+    match = re.fullmatch(r"\s*>=\s*v?(\d+(?:\.\d+)*)\s*", str(value))
+    if match is None:
+        raise PackageJsonError(
+            f"{PACKAGE_JSON} engines.node must be a '>=X.Y.Z' floor, got {value!r}"
+        )
+    return tuple(int(part) for part in match.group(1).split("."))
 
 
 def numeric_version(version: str | None) -> tuple[int, ...] | None:
@@ -104,19 +125,24 @@ def check_tool(
     *,
     required: bool,
     guidance: str,
-    min_node_major: int | None = None,
+    cwd: Path = REPO_ROOT,
     min_version: tuple[int, ...] | None = None,
+    pinned_version: tuple[int, ...] | None = None,
     required_version: str | None = None,
 ) -> ToolCheck:
     executable = shutil.which(command[0])
-    version = run_version(command) if executable else None
+    version = run_version(command, cwd) if executable else None
     ok = executable is not None and version is not None
-    if min_node_major is not None:
-        major = node_major(version)
-        ok = ok and major is not None and major >= min_node_major
     if min_version is not None:
         actual = numeric_version(version)
         ok = ok and actual is not None and actual >= min_version
+    if pinned_version is not None:
+        actual = numeric_version(version)
+        ok = (
+            ok
+            and actual is not None
+            and actual[: len(pinned_version)] == pinned_version
+        )
     if required_version is not None:
         ok = ok and version == required_version
     return ToolCheck(
@@ -132,6 +158,10 @@ def check_tool(
 
 def collect_checks() -> list[ToolCheck]:
     pnpm_pin = package_manager_pin()
+    node_floor = node_engine_floor()
+    node_text = f" {'.'.join(map(str, node_floor))}+" if node_floor else ""
+    rust_channel = tool_versions.rust_toolchain_channel()
+    rustfmt_toolchain = tool_versions.RUSTFMT_TOOLCHAIN
     checks = [
         partial(
             check_tool,
@@ -153,14 +183,24 @@ def collect_checks() -> list[ToolCheck]:
             "cargo",
             ["cargo", "--version"],
             required=True,
-            guidance="Install Rust with rustup, then run `rustup component add rustfmt clippy`.",
+            guidance=(
+                "Install Rust with rustup; `cargo` on PATH must be the rustup proxy "
+                f"so codex-rs/rust-toolchain.toml ({rust_channel}) applies."
+            ),
+            cwd=RUST_WORKSPACE,
+            pinned_version=numeric_version(rust_channel),
         ),
         partial(
             check_tool,
             "rustfmt",
-            ["cargo", "fmt", "--version"],
+            # The exact toolchain invocation scripts/format.py uses.
+            ["rustup", "run", rustfmt_toolchain, "cargo", "fmt", "--version"],
             required=True,
-            guidance="Install with `rustup component add rustfmt`.",
+            guidance=(
+                f"Install with `rustup toolchain install {rustfmt_toolchain} "
+                "--profile minimal --component rustfmt`."
+            ),
+            cwd=RUST_WORKSPACE,
         ),
         partial(
             check_tool,
@@ -168,20 +208,22 @@ def collect_checks() -> list[ToolCheck]:
             ["cargo", "clippy", "--version"],
             required=True,
             guidance="Install with `rustup component add clippy`.",
+            cwd=RUST_WORKSPACE,
         ),
         partial(
             check_tool,
             "just",
             ["just", "--version"],
             required=True,
-            guidance="Install with `cargo install --locked just`.",
+            guidance="Install with `cargo install just`.",
         ),
         partial(
             check_tool,
             "cargo-nextest",
             ["cargo", "nextest", "--version"],
             required=True,
-            guidance="Install with `cargo install --locked cargo-nextest`.",
+            guidance="Install with `cargo install cargo-nextest`.",
+            cwd=RUST_WORKSPACE,
         ),
         partial(
             check_tool,
@@ -195,8 +237,8 @@ def collect_checks() -> list[ToolCheck]:
             "node",
             ["node", "--version"],
             required=True,
-            guidance="Install Node 22+; this repo uses the root packageManager pin.",
-            min_node_major=22,
+            guidance=f"Install Node{node_text} (package.json engines.node).",
+            min_version=node_floor,
         ),
         partial(
             check_tool,
@@ -270,7 +312,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         checks = collect_checks()
-    except PackageJsonError as error:
+    except RuntimeError as error:  # PackageJsonError or an unreadable toolchain pin.
         print(f"Development environment check failed: {error}", file=sys.stderr)
         return 1
     failed = [check for check in checks if check.required and not check.ok]

@@ -139,6 +139,8 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         env = clean_env()
         env["USERPROFILE"] = str(user_profile)
         for name in (
+            # The machine's Cargo home would otherwise supply a real archive.
+            "CARGO_HOME",
             "RUSTY_V8_ARCHIVE",
             "RUSTY_V8_MIRROR",
             "V8_FROM_SOURCE",
@@ -238,15 +240,89 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             self.fail(f"git {' '.join(args)} failed:\n{result.stderr}")
         return result
 
+    def built_artifact_paths(
+        self, profile: str = "local-release"
+    ) -> tuple[Path, Path, Path, Path]:
+        profile_dir = "debug" if profile == "debug" else profile
+        built_dir = (
+            self.repo_root / "codex-rs" / "target" / f"publish-{profile}" / profile_dir
+        )
+        return (
+            built_dir / "codex.exe",
+            built_dir / "codex-code-mode-host.exe",
+            built_dir / "codex-windows-sandbox-setup.exe",
+            built_dir / "codex-command-runner.exe",
+        )
+
+    def write_built_artifacts(
+        self,
+        profile: str = "local-release",
+        *,
+        codex_bytes: bytes | None = None,
+        timestamp: float | None = None,
+    ) -> tuple[Path, Path, Path, Path]:
+        paths = self.built_artifact_paths(profile)
+        paths[0].parent.mkdir(parents=True, exist_ok=True)
+        contents = (
+            self.source_exe_bytes if codex_bytes is None else codex_bytes,
+            self.source_code_mode_host_bytes,
+            self.source_windows_sandbox_setup_bytes,
+            self.source_command_runner_bytes,
+        )
+        for path, content in zip(paths, contents, strict=True):
+            path.write_bytes(content)
+            if timestamp is not None:
+                os.utime(path, (timestamp, timestamp))
+        return paths
+
+    def write_fake_cargo(
+        self,
+        fake_bin: Path,
+        *lines: str,
+        profile: str = "local-release",
+    ) -> Path:
+        # Builds materialize all four publish artifacts where real Cargo would;
+        # toolchain identity probes stay side-effect free.
+        codex, code_mode_host, sandbox_setup, command_runner = (
+            self.built_artifact_paths(profile)
+        )
+        fake_cargo = fake_bin / "cargo.cmd"
+        fake_cargo.write_text(
+            "\r\n".join(
+                [
+                    "@echo off",
+                    'if "%1"=="--version" exit /b 0',
+                    f'if not exist "{codex.parent}" mkdir "{codex.parent}"',
+                    f'copy /y "%ComSpec%" "{codex}" >nul',
+                    f'copy /y "{self.source_code_mode_host}" "{code_mode_host}" >nul',
+                    f'copy /y "{self.source_windows_sandbox_setup}" "{sandbox_setup}" >nul',
+                    f'copy /y "{self.source_command_runner}" "{command_runner}" >nul',
+                    *lines,
+                    "exit /b 0",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return fake_cargo
+
     def write_build_stamp(
         self,
         profile: str,
         timestamp: float,
-        source_exe: Path,
+        source_exe: Path | None = None,
         source_code_mode_host: Path | None = None,
         *,
         env: dict[str, str] | None = None,
     ) -> Path:
+        # Without explicit binaries, stamp the Cargo output paths publish reads.
+        if source_exe is None:
+            source_exe, code_mode_host, sandbox_setup, command_runner = (
+                self.built_artifact_paths(profile)
+            )
+        else:
+            code_mode_host = source_code_mode_host or self.source_code_mode_host
+            sandbox_setup = self.source_windows_sandbox_setup
+            command_runner = self.source_command_runner
         stamp = (
             self.repo_root
             / "codex-rs"
@@ -258,7 +334,6 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         source_newest = (
             f"{stamp_time:%Y-%m-%dT%H:%M:%S}.{stamp_time.microsecond * 10:07d}Z"
         )
-        code_mode_host = source_code_mode_host or self.source_code_mode_host
         command = (
             "Set-StrictMode -Version Latest; "
             "$ErrorActionPreference = 'Stop'; "
@@ -269,8 +344,8 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             "-SourceFingerprint $fingerprint "
             f"-SourceExe {ps_single_quote(source_exe)} "
             f"-SourceCodeModeHostExe {ps_single_quote(code_mode_host)} "
-            f"-SourceWindowsSandboxSetupExe {ps_single_quote(self.source_windows_sandbox_setup)} "
-            f"-SourceCommandRunnerExe {ps_single_quote(self.source_command_runner)} "
+            f"-SourceWindowsSandboxSetupExe {ps_single_quote(sandbox_setup)} "
+            f"-SourceCommandRunnerExe {ps_single_quote(command_runner)} "
             f"-SourceNewestUtc ([DateTime]::Parse({ps_single_quote(source_newest)}, "
             "[Globalization.CultureInfo]::InvariantCulture, "
             "[Globalization.DateTimeStyles]::RoundtripKind))"
@@ -460,21 +535,24 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         observe_commands: dict[str, Path] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         publish_args = list(self.publish_args(args))
-        if "-SourceCodeModeHostExe" not in publish_args:
-            publish_args.extend(
-                ["-SourceCodeModeHostExe", str(self.source_code_mode_host)]
-            )
-        if "-SourceWindowsSandboxSetupExe" not in publish_args:
-            publish_args.extend(
-                [
-                    "-SourceWindowsSandboxSetupExe",
-                    str(self.source_windows_sandbox_setup),
-                ]
-            )
-        if "-SourceCommandRunnerExe" not in publish_args:
-            publish_args.extend(
-                ["-SourceCommandRunnerExe", str(self.source_command_runner)]
-            )
+        # Only prebuilt (-SkipBuild) runs may name binaries; builds publish the
+        # Cargo outputs, so fixtures reach them through write_fake_cargo.
+        if "-SkipBuild" in publish_args:
+            if "-SourceCodeModeHostExe" not in publish_args:
+                publish_args.extend(
+                    ["-SourceCodeModeHostExe", str(self.source_code_mode_host)]
+                )
+            if "-SourceWindowsSandboxSetupExe" not in publish_args:
+                publish_args.extend(
+                    [
+                        "-SourceWindowsSandboxSetupExe",
+                        str(self.source_windows_sandbox_setup),
+                    ]
+                )
+            if "-SourceCommandRunnerExe" not in publish_args:
+                publish_args.extend(
+                    ["-SourceCommandRunnerExe", str(self.source_command_runner)]
+                )
         if "-BackupDir" not in publish_args and "-InstallDir" in publish_args:
             install_dir = Path(publish_args[publish_args.index("-InstallDir") + 1])
             backup_dir = install_dir.parent / "publisher-backups"

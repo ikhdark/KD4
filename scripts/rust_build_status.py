@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.process_owner import run_owned, CleanupFailed  # noqa: E402
 
 from scripts.tool_versions import cargo_lane_patterns  # noqa: E402
+from scripts.rust_tool_env import cargo_package_specs, local_rust_env  # noqa: E402
 
 from scripts.rust_build_status_support import (  # noqa: E402
     add_prune_arguments,
@@ -109,7 +110,12 @@ BYTES_PER_MIB = BYTES_PER_KIB * 1024
 BYTES_PER_GIB = BYTES_PER_MIB * 1024
 DEFAULT_TARGET_WARN_BYTES = 250 * BYTES_PER_GIB
 TIMESTAMPED_LANE_RE = re.compile(r"^(?P<base>.+)-\d{14}$")
-LANE_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<suffix>\d+)$")
+# Reservations create siblings `<base>-2` through `<base>-65` only. A wider
+# match would group names like `cargo-12345678` (an all-digit auto-lane
+# digest) as siblings and let the warm budget prune them before they expire.
+LANE_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<suffix>[2-9]|[1-5][0-9]|6[0-5])$")
+# Pruning renames a lane to `<name>.trash-<17 digits>` before deleting it.
+LANE_TRASH_RE = re.compile(r"\.trash-\d{17}$", re.IGNORECASE)
 WINDOWS_RUST_PROCESS_FILTER = " OR ".join(
     f"Name = '{name}.exe'"
     for name in (*RUST_PROCESS_NAMES, *RUST_WRAPPER_PROCESS_NAMES)
@@ -143,6 +149,10 @@ RUST_MIN_STACK_BYTES = "8388608"
 
 class CargoLanesRootValidationError(ValueError):
     pass
+
+
+class RustProcessScanError(RuntimeError):
+    """Process discovery failed: Rust activity is unknown, not absent."""
 
 
 def default_cargo_lanes_root(repo_root: Path = REPO_ROOT) -> Path:
@@ -236,6 +246,10 @@ class BuildStatusSnapshot:
     active_lanes: set[str]
     stale_lanes: list[Path]
     _lane_mtime: Callable[[Path], float] = field(repr=False)
+    # Set when process evidence is missing; lanes then cannot be proven idle.
+    process_scan_error: str | None = None
+    # Kept in active_lanes for safety, but reported as quarantined, not active.
+    quarantined_lanes: set[str] = field(default_factory=set)
     _lane_mtimes: dict[Path, float] = field(default_factory=dict, repr=False)
     _lane_sizes: dict[Path, tuple[int, int]] = field(default_factory=dict, repr=False)
 
@@ -247,8 +261,24 @@ class BuildStatusSnapshot:
         processes: Sequence[RustProcess] | None = None,
         lane_mtime: Callable[[Path], float] | None = None,
     ) -> "BuildStatusSnapshot":
-        discovered = active_rust_processes() if processes is None else processes
-        process_list = list(discovered)
+        process_scan_error = None
+        if processes is None:
+            try:
+                processes = active_rust_processes()
+            except RustProcessScanError as exc:
+                processes, process_scan_error = [], str(exc)
+        process_list = list(processes)
+        # A hidden command line (e.g. an elevated cargo) could name any lane.
+        hidden = [
+            process.pid
+            for process in process_list
+            if process.classification.is_rust and not process.command_line.strip()
+        ]
+        if hidden and process_scan_error is None:
+            process_scan_error = (
+                "command line unreadable for Rust process id(s) "
+                + ", ".join(str(pid) for pid in sorted(hidden))
+            )
         lane_root = cargo_lanes_root(repo_root)
         lane_dirs = existing_lane_dirs(lane_root)
         lane_names_by_process: dict[tuple[int, str, str], str] = {}
@@ -278,6 +308,12 @@ class BuildStatusSnapshot:
             active_lanes=active_lanes,
             stale_lanes=stale_lanes,
             _lane_mtime=(lane_last_used_mtime if lane_mtime is None else lane_mtime),
+            process_scan_error=process_scan_error,
+            quarantined_lanes={
+                path.name
+                for path in lane_dirs
+                if os.path.exists(path / ".lane-cleanup-unconfirmed")
+            },
         )
 
     def lane_name_for(self, process: RustProcess) -> str | None:
@@ -330,19 +366,16 @@ def active_rust_processes_windows() -> list[RustProcess]:
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        print(f"warning: Windows Rust process scan failed: {exc}", file=sys.stderr)
-        return []
+        raise RustProcessScanError(f"Windows Rust process scan failed: {exc}") from exc
 
     if not result.stdout.strip():
         return []
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        print(
-            f"warning: Windows Rust process scan returned invalid JSON: {exc}",
-            file=sys.stderr,
-        )
-        return []
+        raise RustProcessScanError(
+            f"Windows Rust process scan returned invalid JSON: {exc}"
+        ) from exc
     rows = payload if isinstance(payload, list) else [payload]
     processes = []
     for row in rows:
@@ -487,7 +520,11 @@ def locked_lane_names(lane_dirs: Sequence[Path]) -> set[str]:
 
 
 def lane_active_lock_is_held(lane_dir: Path) -> bool:
-    if (lane_dir / ".lane-cleanup-unconfirmed").exists():
+    try:
+        if (lane_dir / ".lane-cleanup-unconfirmed").exists():
+            return True
+    except OSError:
+        # Python 3.11 raises for an unreadable marker; unknown means busy.
         return True
     lock_path = lane_dir / ".lane-active.lock"
     try:
@@ -626,7 +663,7 @@ def _safe_lane_name(value: str) -> str:
         not value
         or re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
         or re.fullmatch(r"\.+", value) is not None
-        or re.search(r"\.trash-\d{17}$", value, re.IGNORECASE) is not None
+        or LANE_TRASH_RE.search(value) is not None
     ):
         raise ValueError(f"invalid Cargo lane name {value!r}")
     return value
@@ -771,6 +808,8 @@ def reserve_cargo_lane(
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
     warm_wait_seconds: float = 30.0,
+    allow_cold_overflow: bool = False,
+    build_context: Mapping[str, object] | None = None,
 ) -> Iterator[tuple[str, Path]]:
     explicit = requested_lane != "auto"
     base_lane = _safe_lane_name(
@@ -786,7 +825,7 @@ def reserve_cargo_lane(
     deadline = time.monotonic() + max(0.0, warm_wait_seconds)
     announced_wait = False
     while active_handle is None:
-        busy_warm = False
+        busy_reusable = False
         deferred_cold = False
         with cargo_lane_coordination_lock(root, timeout_seconds=lock_timeout_seconds):
             candidates = _lane_reservation_candidates(
@@ -801,7 +840,18 @@ def reserve_cargo_lane(
                     for profile in ("debug", "release", "dev-small")
                 )
             }
-            candidates.sort(key=lambda candidate: candidate.path not in warm_paths)
+            compatible_paths = {
+                path
+                for path in warm_paths
+                if build_context is None
+                or _read_lane_build_context(path) == build_context
+            }
+            candidates.sort(
+                key=lambda candidate: (
+                    candidate.path not in compatible_paths,
+                    candidate.path not in warm_paths,
+                )
+            )
             for candidate in candidates:
                 candidate_name = _safe_lane_name(candidate.name)
                 candidate_dir = candidate.path
@@ -813,12 +863,20 @@ def reserve_cargo_lane(
                 if (candidate_dir / ".lane-cleanup-unconfirmed").exists():
                     continue
                 warm = candidate_dir in warm_paths
-                if not warm and busy_warm and time.monotonic() < deadline:
-                    deferred_cold = True
-                    break
+                compatible = candidate_dir in compatible_paths
+                if busy_reusable and not compatible and (compatible_paths or not warm):
+                    if time.monotonic() < deadline:
+                        deferred_cold = True
+                        break
+                    if not allow_cold_overflow:
+                        raise RuntimeError(
+                            f"Cargo lane {base_lane!r} is busy; no cold overflow was started. "
+                            "Wait for its owner, increase --warm-wait-seconds, or explicitly "
+                            "use --allow-cold-overflow."
+                        )
                 candidate_dir.mkdir(exist_ok=True)
                 if cargo_lock_is_busy(candidate_dir):
-                    busy_warm |= warm
+                    busy_reusable |= compatible or not compatible_paths
                     continue
                 active_handle = _try_acquire_binary_file_lock(
                     candidate_dir / ".lane-active.lock"
@@ -827,12 +885,12 @@ def reserve_cargo_lane(
                     target_dir = candidate_dir.resolve()
                     resolved_lane = candidate_name
                     break
-                busy_warm |= warm
+                busy_reusable |= compatible or not compatible_paths
         if active_handle is not None or not deferred_cold:
             break
         if not announced_wait:
             print(
-                f"waiting up to {warm_wait_seconds:g}s for a warm Cargo lane for {base_lane!r}",
+                f"waiting up to {warm_wait_seconds:g}s for a reusable Cargo lane for {base_lane!r}",
                 file=sys.stderr,
             )
             announced_wait = True
@@ -1362,6 +1420,96 @@ def request_cargo_lane_maintenance(repo_root: Path, lane_root: Path) -> None:
     threading.Thread(target=child.wait, daemon=True).start()
 
 
+def _read_lane_build_context(target_dir: Path) -> object:
+    try:
+        return json.loads(
+            (target_dir / ".lane-build-context.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def cargo_build_context(
+    repo_root: Path, command: Sequence[str], env: Mapping[str, str]
+) -> dict[str, object]:
+    """Rank recorded build settings, never replace Cargo's freshness checks."""
+    settings = {
+        key: value
+        for key, value in env.items()
+        if key
+        in {
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_INCREMENTAL",
+            "CARGO_BUILD_TARGET",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+        }
+        or key.startswith("CARGO_PROFILE_")
+        or (key.startswith("CARGO_TARGET_") and key.endswith(("_LINKER", "_RUSTFLAGS")))
+    }
+    tools = {}
+    for name in ("cargo", "rustc"):
+        path = shutil.which(env.get(name.upper(), name), path=env.get("PATH"))
+        if path:
+            resolved = Path(path).resolve()
+            try:
+                observation = resolved.stat()
+                tools[name] = [
+                    str(resolved),
+                    observation.st_size,
+                    observation.st_mtime_ns,
+                ]
+            except OSError:
+                tools[name] = [str(resolved)]
+    configs = {}
+    for name in (
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        "codex-rs/rust-toolchain.toml",
+        ".cargo/config.toml",
+        "codex-rs/.cargo/config.toml",
+    ):
+        path = repo_root / name
+        if path.is_file():
+            configs[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    options = []
+    tokens = iter(command)
+    for token in tokens:
+        if token == "--":
+            break
+        if token in ("--profile", "--target", "--features", "-F"):
+            options.extend(["--features" if token == "-F" else token, next(tokens, "")])
+        elif token.startswith(("--profile=", "--target=", "--features=")):
+            options.extend(token.split("=", 1))
+        elif token in (
+            "--release",
+            "--all-features",
+            "--no-default-features",
+        ) or token.startswith("+"):
+            options.append(token)
+    # Named core selectors also select their feature graph through the manifest.
+    named_selection = []
+    if len(command) >= 4 and Path(command[0]).stem.lower() == "just":
+        if command[1] == "_core-test-reserved":
+            named_selection = [command[1], command[3]]
+        elif command[1] in ("_core-gate-reserved", "_core-parity-reserved"):
+            named_selection = list(command[1:])
+    return {
+        "version": 1,
+        "environment": settings,
+        "tools": tools,
+        "configs": configs,
+        "packages": sorted(cargo_package_specs(command)),
+        "options": options,
+        "namedSelection": named_selection,
+    }
+
+
 def run_in_cargo_lane(
     *,
     repo_root: Path,
@@ -1370,6 +1518,8 @@ def run_in_cargo_lane(
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
     timing_path: Path | None = None,
+    warm_wait_seconds: float = 30.0,
+    allow_cold_overflow: bool = False,
 ) -> int:
     if not command:
         raise ValueError("run-lane requires a command after --")
@@ -1401,12 +1551,29 @@ def run_in_cargo_lane(
         phase, previous = name, now
 
     try:
+        child_env = os.environ.copy()
+        updates = local_rust_env(child_env, repo_root=repo_root, which=shutil.which)
+        child_env.update(updates)
+        # Lane commands such as `cargo llvm-cov` and `cargo test` run libtest
+        # workers, which size their stacks from RUST_MIN_STACK; keep the 8 MiB
+        # default cargo-lane.ps1 applies to every lane command.
+        child_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
+        build_context = cargo_build_context(repo_root, command, child_env)
+        record["buildContext"] = build_context
+        if updates:
+            print(
+                "Rust environment defaults: " + json.dumps(updates, sort_keys=True),
+                file=sys.stderr,
+            )
         with reserve_cargo_lane(
             repo_root=repo_root,
             requested_lane=requested_lane,
             command=command,
             lane_root=lane_root,
             lock_timeout_seconds=lock_timeout_seconds,
+            warm_wait_seconds=warm_wait_seconds,
+            allow_cold_overflow=allow_cold_overflow,
+            build_context=build_context,
         ) as (resolved_lane, target_dir):
             next_phase("setup")
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
@@ -1416,7 +1583,18 @@ def run_in_cargo_lane(
                     f"using {resolved_lane!r}",
                     file=sys.stderr,
                 )
-            child_env = os.environ.copy()
+            previous_context = _read_lane_build_context(target_dir)
+            compatibility = (
+                "matching recorded settings"
+                if previous_context == build_context
+                else "changed settings; Cargo may rebuild"
+                if previous_context is not None
+                else "unrecorded settings; warm reuse unverified"
+            )
+            print(
+                f"Cargo lane {resolved_lane}: {target_dir} ({compatibility})",
+                file=sys.stderr,
+            )
             # Keep the lane out of Cargo's environment so its absolute path does
             # not fragment compiler-cache keys. Nested recipes consume CODEX's value.
             child_env.pop("CARGO_TARGET_DIR", None)
@@ -1465,6 +1643,17 @@ def run_in_cargo_lane(
                     exitCode=exit_code,
                     status="completed" if exit_code == 0 else "failed",
                 )
+                if exit_code == 0:
+                    # Hold the lane lock until its successful context is recorded.
+                    try:
+                        (target_dir / ".lane-build-context.json").write_text(
+                            json.dumps(build_context, indent=2) + "\n", encoding="utf-8"
+                        )
+                    except OSError as error:
+                        print(
+                            f"warning: could not record lane build context: {error}",
+                            file=sys.stderr,
+                        )
                 return exit_code
             finally:
                 next_phase("release")
@@ -1565,11 +1754,26 @@ def existing_lane_dirs(lane_root: Path) -> list[Path]:
     # Junctions are not symlinks to Path.is_symlink(); pruning through one
     # would delete its target (possibly another, active lane) or abort on the
     # containment check when it points outside the root.
+    # Trash trees are already detached from their lane name; treating them as
+    # lanes misreports them and makes each prune rename them again.
     return sorted(
         path
         for path in lane_root.iterdir()
-        if path.is_dir() and not is_indirect_directory(path)
+        if path.is_dir()
+        and LANE_TRASH_RE.search(path.name) is None
+        and not is_indirect_directory(path)
     )
+
+
+def lane_trash_dirs(lane_root: Path) -> list[Path]:
+    try:
+        return sorted(
+            path
+            for path in lane_root.iterdir()
+            if LANE_TRASH_RE.search(path.name) is not None and path.is_dir()
+        )
+    except OSError:
+        return []
 
 
 def is_windows_junction(path: Path) -> bool:
@@ -1700,6 +1904,13 @@ def prunable_lane_dirs(
         processes=processes,
         lane_mtime=lane_mtime,
     )
+    # Every prune, plan and report selects through here. Without process
+    # evidence, "no activity seen" is a guess and must not authorize deletion.
+    if snapshot.process_scan_error is not None:
+        raise RustProcessScanError(
+            "refusing to select Cargo lanes for pruning; lane activity is "
+            f"unverified: {snapshot.process_scan_error}"
+        )
     lane_dirs = snapshot.stale_lanes
     protected = protected_warm_lane_names(
         lane_dirs,
@@ -1888,6 +2099,27 @@ def prune_stale_lanes(
                 )
                 continue
         removed.append(path)
+    # Retry trees an earlier prune renamed but could not delete. Their unique
+    # names cannot be reserved again, so delete them in place instead of
+    # renaming them once more.
+    for trash_path in lane_trash_dirs(lane_root):
+        if trash_path in failures or is_indirect_directory(trash_path):
+            continue
+        if cargo_lock_is_busy(trash_path) or lane_active_lock_is_held(trash_path):
+            continue
+        if not dry_run:
+            try:
+                remove_tree_allow_readonly(trash_path)
+            except OSError as exc:
+                if isinstance(exc, FileNotFoundError) and not trash_path.exists():
+                    continue
+                failures.append(trash_path)
+                print(
+                    f"warning: deferred lane cleanup still pending for {trash_path}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+        removed.append(trash_path)
     if failures:
         raise OSError(f"Cargo lane cleanup incomplete; pending paths: {failures}")
     return removed
@@ -2088,6 +2320,17 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     run_lane_parser.add_argument("--lanes-root", type=Path)
     run_lane_parser.add_argument(
+        "--warm-wait-seconds",
+        type=positive_float,
+        default=30.0,
+        help="Wait for reusable work before failing or explicitly overflowing (default: 30).",
+    )
+    run_lane_parser.add_argument(
+        "--allow-cold-overflow",
+        action="store_true",
+        help="Allow a cold sibling build after the warm-lane wait; may duplicate compilation.",
+    )
+    run_lane_parser.add_argument(
         "--timing-json",
         type=Path,
         help="Write phase durations to a new JSON file (never overwrite).",
@@ -2168,6 +2411,8 @@ def main(argv: list[str] | None = None) -> int:
                 lane_root=args.lanes_root,
                 lock_timeout_seconds=args.lock_timeout_seconds,
                 timing_path=args.timing_json,
+                warm_wait_seconds=args.warm_wait_seconds,
+                allow_cold_overflow=args.allow_cold_overflow,
             )
         else:
             parser.error(f"unknown command {args.command}")

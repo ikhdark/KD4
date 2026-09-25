@@ -269,7 +269,6 @@ fn cargo_build_command(
         .args([
             "build",
             "--release",
-            "--locked",
             "--jobs",
             jobs,
             "--message-format=json-render-diagnostics",
@@ -542,7 +541,7 @@ mod tests {
                 .any(|pair| pair == ["--jobs", recorded_jobs]),
             "Cargo fanout must match the job count recorded in build provenance"
         );
-        assert!(arguments.contains(&"--locked".into()));
+        assert!(!arguments.contains(&"--locked".into()));
         assert!(arguments.contains(&"--release".into()));
         Ok(())
     }

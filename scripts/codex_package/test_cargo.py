@@ -555,7 +555,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         for call in calls:
             self.assertEqual(call.cwd, codex_rs)
             self.assertTrue(call.check)
-            self.assertIn("--locked", call.cmd)
+            self.assertNotIn("--locked", call.cmd)
             self.assertEqual(call.env["RUST_MIN_STACK"], "8388608")
             self.assertEqual(call.env["CODEX_RELEASE_VERSION"], "1.2.3")
             self.assertEqual(call.env["RUSTC_WRAPPER"], "sccache")

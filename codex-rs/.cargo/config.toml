@@ -1,7 +1,7 @@
 [build]
 # Bound compiler fanout so local Cargo commands do not saturate the host.
 # CARGO_BUILD_JOBS or Cargo's -j/--jobs flag can opt into a different limit.
-jobs = 8
+jobs = 2
 # Incremental compilation speeds up local edits to workspace/path crates.
 # sccache can cache eligible dependency compilations, but cannot cache rustc
 # invocations with -C incremental, regardless of where it was configured.
@@ -12,18 +12,13 @@ incremental = true
 [env]
 # Bound direct `cargo test` libtest fanout. An existing process environment
 # value or libtest's `--test-threads` flag can opt into a different limit.
-RUST_TEST_THREADS = { value = "16", force = false }
+RUST_TEST_THREADS = { value = "2", force = false }
 
+# Shared by x64 and ARM64. KD4 tooling links both with lld-link when installed
+# (scripts/rust_tool_env.py), and lld-link rejects link.exe-only arguments such
+# as upstream's ARM64 /arm64hazardfree warning suppressor, so add none here.
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static"]
-
-# Cargo joins these target-specific flags with the matching MSVC cfg flags above,
-# so keep only the ARM64-specific linker override here.
-# MSVC emits a warning about code that may trip "Cortex-A53 MPCore processor bug #843419" (see
-# https://developer.arm.com/documentation/epm048406/latest) which is sometimes emitted by LLVM.
-# Since Arm64 Windows 10+ isn't supported on that processor, it's safe to disable the warning.
-[target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/arm64hazardfree"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

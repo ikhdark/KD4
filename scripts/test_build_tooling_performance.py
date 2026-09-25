@@ -66,8 +66,11 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("cargoIncremental=0", result.stdout)
         self.assertIn("rustcWrapper=<empty>", result.stdout)
         self.assertIn("sccacheBaseDir=<unset>", result.stdout)
-        self.assertIn("cargoTargetDir=", result.stdout)
-        self.assertIn("perf-nextest-nosccache", result.stdout)
+        # run-lane resolves the directory; the proof must not guess a path.
+        self.assertIn(
+            "cargoTargetDir=<run-lane reservation for perf-nextest-nosccache>",
+            result.stdout,
+        )
 
     def test_no_sccache_isolates_child_and_restores_workspace_wrapper(self):
         shell = pwsh_only()
@@ -600,6 +603,69 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["True"] * 7,
         )
 
+    def test_sccache_perf_stats_reports_size_drift_without_restarting(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp_root = Path(tempdir)
+            fake_bin = temp_root / "bin"
+            fake_bin.mkdir()
+            calls = temp_root / "sccache-calls.txt"
+            (fake_bin / "sccache.cmd").write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
+                        'if "%1"=="--show-stats" (',
+                        "  echo Compile requests                    42",
+                        "  echo Max cache size                       10 GiB",
+                        "  exit /b 0",
+                        ")",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.pop("CODEX_SCCACHE_CACHE_SIZE", None)
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["FAKE_SCCACHE_CALLS"] = str(calls)
+            script = REPO_ROOT / "scripts" / "sccache-perf.ps1"
+
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "stats",
+                ],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=30,
+            )
+            call_lines = calls.read_text(encoding="utf-8").splitlines()
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        # A restart would zero the counters being reported.
+        self.assertEqual(call_lines, ["--show-stats"])
+        self.assertIn("Compile requests                    42", result.stdout)
+        # The host wraps warnings at console width.
+        self.assertIn(
+            'run "just sccache-restart" to apply it', " ".join(output.split())
+        )
+
     def test_sccache_perf_restart_ignores_stop_failure_and_checks_start(self) -> None:
         shell = powershell()
         if shell is None:
@@ -856,18 +922,13 @@ class BuildToolingPerformanceTest(unittest.TestCase):
 
         self.assertEqual(actual_agent_files, sorted(expected_agent_files))
         self.assertEqual(actual_eol_attributes, expected_eol_attributes)
-        source_map = REPO_ROOT / "SOURCEMAP.md"
         root_policy_bytes = (REPO_ROOT / "AGENTS.md").stat().st_size
-        source_map_text = source_map.read_text(encoding="utf-8")
 
         self.assertLessEqual(
             root_policy_bytes,
             16 * 1024,
             "the root automatic instruction file is too large",
         )
-        self.assertIn("## Validation routes", source_map_text)
-        self.assertIn("## Rust workflow reference", source_map_text)
-        self.assertIn("just rust-build-doctor", source_map_text)
 
 
 if __name__ == "__main__":

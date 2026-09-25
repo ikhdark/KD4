@@ -726,11 +726,13 @@ pub(crate) async fn run_turn(
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
 
-            let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+            let mut responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
+            responses_metadata.history_ingest_requested = turn_context.config.token_budget
+                .as_ref().is_some_and(|config| config.use_history_notes_extension).then_some(true);
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
@@ -899,6 +901,14 @@ pub(crate) async fn run_turn(
                     turn_context.turn_timing_state.record_wait_only_generation();
                 }
                 let token_limit_reached = token_status.token_limit_reached;
+                let new_context_requested = turn_context.config.features.enabled(Feature::TokenBudget)
+                    && sess.new_context_window_requested().await;
+                super::token_budget::maybe_record(
+                    &sess,
+                    &turn_context,
+                    token_status.base_window_tokens_remaining,
+                    needs_follow_up && !new_context_requested,
+                ).await?;
 
                 trace!(
                     turn_id = %turn_context.sub_id,
@@ -933,7 +943,7 @@ pub(crate) async fn run_turn(
                 }
 
                 // Automatic compaction verifies that the replacement fits before continuing.
-                if needs_follow_up && token_limit_reached {
+                if new_context_requested || (needs_follow_up && token_limit_reached) {
                     record_convergence_decision(
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -3037,7 +3047,12 @@ async fn run_auto_compact(
         None => Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await),
     };
     let initial_context_injection = InitialContextInjection::AtStart(world_state);
-    if should_use_remote_compact_task(
+    if turn_context.config.features.enabled(Feature::TokenBudget) {
+        crate::compact_token_budget::run_inline_auto_compact_task(
+            Arc::clone(sess), step_context, initial_context_injection, cancellation_token,
+        ).await?;
+        client_session.invalidate_provider_history_inheritance("installed fresh context window");
+    } else if should_use_remote_compact_task(
         turn_context.provider.info(),
         turn_context.config.compact_prompt.as_deref(),
     ) {

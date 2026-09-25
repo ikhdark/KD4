@@ -31,7 +31,10 @@ impl SessionTask for CompactTask {
         cancellation_token: CancellationToken,
     ) -> BoxFuture<'static, SessionTaskResult> {
         Box::pin(async move {
-            let result = if crate::compact::should_use_remote_compact_task(
+            let result = if ctx.config.features.enabled(codex_features::Feature::TokenBudget) {
+                crate::compact_token_budget::run_manual_compact_task(session.clone(), ctx, &cancellation_token).await?;
+                Ok(())
+            } else if crate::compact::should_use_remote_compact_task(
                 ctx.provider.info(),
                 ctx.config.compact_prompt.as_deref(),
             ) {

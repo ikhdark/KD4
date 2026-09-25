@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import os
 import re
@@ -64,19 +63,15 @@ def validation_lane(repo_root):
         finally:
             _validation_lane.reset(token)
         return
-    reservation = rust_build_status.reserve_cargo_lane(
-        repo_root=repo_root,
-        requested_lane="core-tests",
-        command=["cargo", "nextest", "run", "-p", "codex-core"],
-    )
     session = _validation_session.get()
     if session is not None:
-        _, target = session.enter_context(reservation)
+        target = _enter_core_lane(session, repo_root)
         token = _validation_lane.set((repo_root.resolve(), target))
         session.callback(_validation_lane.reset, token)
         yield target
         return
-    with reservation as (_, target):
+    with ExitStack() as stack:
+        target = _enter_core_lane(stack, repo_root)
         token = _validation_lane.set((repo_root.resolve(), target))
         try:
             yield target
@@ -84,10 +79,27 @@ def validation_lane(repo_root):
             _validation_lane.reset(token)
 
 
+def _enter_core_lane(stack: ExitStack, repo_root: Path) -> Path:
+    reservation = rust_build_status.reserve_cargo_lane(
+        repo_root=repo_root,
+        requested_lane="core-tests",
+        command=["cargo", "nextest", "run", "-p", "codex-core"],
+    )
+    try:
+        _, target = stack.enter_context(reservation)
+    except (RuntimeError, ValueError) as exc:
+        # A busy shared lane refuses a duplicate cold build. Nothing ran, so
+        # report it through the runner's error path instead of crashing.
+        raise rust_test_runner.RunnerError(
+            f"no Cargo lane is available for KD4 validation: {exc}",
+            outcome="not_executed",
+        ) from exc
+    return target
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_FILE_NAME = "kd4_features.toml"
 DEFAULT_MANIFEST = REPO_ROOT / MANIFEST_FILE_NAME
-SOURCE_OWNERS_FILE_NAME = "source_owners.toml"
 SELF_FEATURE_ID = "kd4-feature-manifest"
 SCHEMA_VERSION = 2
 STATUS_SEMANTICS = "implementation_lifecycle"
@@ -98,6 +110,13 @@ ALLOWED_EVIDENCE_KINDS = frozenset(
     {"entrypoint", "module", "registration", "config", "protocol", "test", "workflow"}
 )
 ALLOWED_RUNTIME_VERIFICATION_KINDS = frozenset({"contract_test", "integration_test"})
+# Strict like kd4-rust-tests.toml: a misspelled optional key would skip its check.
+ALLOWED_FEATURE_KEYS = frozenset(
+    "id version status capability_kind owner external_owner summary "
+    "upstream_equivalent config_keys runtime_feature_key runtime_status "
+    "runtime_status_source benchmark_on benchmark_control runtime_verification "
+    "evidence generated_artifacts retired_paths".split()
+)
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -270,7 +289,6 @@ def _verification_route(
     verification: dict[str, Any],
     repo_root: Path,
     rust_manifest: rust_test_runner.Manifest | None = None,
-    python_tree: ast.Module | None = None,
 ) -> str:
     """Accept only a single test selector in its declared source owner/binary."""
     command = verification.get("command")
@@ -286,33 +304,9 @@ def _verification_route(
     source, error = _safe_repo_path(repo_root, verification.get("path"))
     if error or source is None:
         raise ValueError(error or "missing source")
-    if source.suffix == ".py":
-        module = (
-            source.relative_to(repo_root).with_suffix("").as_posix().replace("/", ".")
-        )
-        tree = (
-            python_tree
-            if python_tree is not None
-            else ast.parse(source.read_text(encoding="utf-8"))
-        )
-        selectors = {
-            f"{module}.{node.name}.{symbol}"
-            for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            if any(
-                isinstance(item, ast.FunctionDef) and item.name == symbol
-                for item in node.body
-            )
-        }
-        if (
-            len(command) == 4
-            and re.fullmatch(r"python(?:3(?:\.\d+)?)?(?:\.exe)?", Path(command[0]).name)
-            and command[1:3] == ["-m", "unittest"]
-            and command[3] in selectors
-        ):
-            return "unittest"
+    if source.suffix != ".rs":
         raise ValueError(
-            "Python verification must select the declared module, class and test with unittest"
+            "runtime verification must name a Rust test selected by an exact-test gate"
         )
     cargo_path = next(
         (
@@ -402,66 +396,9 @@ def _verification_route(
         for test in step.tests
     ):
         raise ValueError(
-            "capability gate must require the exact source-qualified test identity"
+            f"capability gate must require the exact source-qualified test identity of {symbol!r}"
         )
     return "nextest"
-
-
-@dataclass
-class _TestOutcome:
-    symbol: str
-    route: str
-    selector: str
-    passed: set[str]
-    skipped: bool = False
-    failed: bool = False
-    zero_tests: bool = False
-
-    def record(self, status: str) -> None:
-        if status == "ok":
-            self.passed.add(self.selector)
-        elif status.startswith("skipped"):
-            self.skipped = True
-        else:
-            self.failed = True
-
-    def verdict(self, returncode: int) -> str:
-        if self.failed:
-            return "failed"
-        if self.skipped:
-            return "skipped"
-        if len(self.passed) == 1:
-            return "passed"
-        if len(self.passed) > 1:
-            return "ambiguous_test_identity"
-        return "zero_tests" if self.zero_tests else "not_executed"
-
-
-def _observe_unittest_output(
-    line: str, observers: dict[str, _TestOutcome], pending: str | None
-) -> str | None:
-    line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
-    header = re.match(r"^(\w+) \(([^)]+)\)(.*)$", line)
-    if header:
-        symbol, owner, suffix = header.groups()
-        identity = owner if owner.endswith("." + symbol) else owner + "." + symbol
-        pending = identity if identity in observers else None
-        line = suffix.strip()
-    if pending is not None:
-        status = line.rsplit("... ", 1)[-1]
-        if status in {
-            "ok",
-            "FAIL",
-            "ERROR",
-            "expected failure",
-            "unexpected success",
-        } or status.startswith("skipped"):
-            observers[pending].record(status)
-            pending = None
-    if re.search(r"\bRan 0 tests\b", line):
-        for observer in observers.values():
-            observer.zero_tests = True
-    return pending
 
 
 def execute_runtime_verification(
@@ -499,166 +436,82 @@ def execute_runtime_verification(
                 f"runtime verification feature must resolve exactly once: {feature_id!r}"
             )
         return 2
-    # Resolve every route before executing anything. Rust uses the same gate
-    # runner as `just core-gate`; compatible Python selectors share one process.
-    rust_manifest = None
-    rust_features = []
-    python_groups: dict[str, list[dict[str, Any]]] = {}
+    if not matching:
+        return 0
+    # Resolve every route before executing anything. Capability gates use the
+    # same runner as `just core-gate`.
     try:
+        rust_manifest = rust_test_runner.Manifest.load(
+            repo_root / "codex-rs/.config/kd4-rust-tests.toml"
+        )
         for feature in matching:
             verification = feature.get("runtime_verification")
             if not isinstance(feature.get("id"), str) or not isinstance(
                 verification, dict
             ):
                 raise TypeError("feature has no executable runtime verification")
-            if (
-                str(verification.get("path", "")).endswith(".rs")
-                and rust_manifest is None
-            ):
-                rust_manifest = rust_test_runner.Manifest.load(
-                    repo_root / "codex-rs/.config/kd4-rust-tests.toml"
-                )
-            route = _verification_route(verification, repo_root, rust_manifest)
-            if route == "nextest":
-                rust_features.append(feature)
-            else:
-                python_groups.setdefault(verification["command"][0], []).append(feature)
+            _verification_route(verification, repo_root, rust_manifest)
     except (
         TypeError,
         ValueError,
         OSError,
         KeyError,
-        SyntaxError,
         rust_test_runner.RunnerError,
     ) as exc:
         if not quiet:
             print(f"invalid runtime verification: {exc}")
         return 2
 
-    if rust_features:
-        gates = list(
-            dict.fromkeys(
-                feature["runtime_verification"]["command"][3]
-                for feature in rust_features
-            )
+    gates = list(
+        dict.fromkeys(
+            feature["runtime_verification"]["command"][3] for feature in matching
         )
-        try:
-            assert rust_manifest is not None
-            cwd = repo_root / "codex-rs"
-            with validation_lane(repo_root) as target:
-                metadata = rust_test_runner.load_metadata(cwd=cwd)
-                runner = rust_test_runner.RustTestRunner(
-                    rust_manifest,
-                    metadata,
-                    cwd=cwd,
-                    profile="fast",
-                    target_dir=target,
-                )
-                # Exact selectors and the same execution's outcomes supply proof.
-                # The runner still validates any explicitly declared filters before
-                # batching; generated exact selectors need no preliminary discovery.
-                completed = runner.run_gates(gates, quiet=quiet, discover=False)
-        except (rust_test_runner.RunnerError, OSError) as exc:
-            for feature in rust_features:
-                if outcomes is not None:
-                    outcomes.append(
-                        {
-                            "feature_id": feature["id"],
-                            "outcome": getattr(exc, "outcome", "failed"),
-                            "test_identities": [],
-                            "returncode": 2,
-                            "evidence_kind": feature["runtime_verification"]["kind"],
-                            "error": str(exc),
-                        }
-                    )
-            if not quiet:
-                print(f"KD4 RUNTIME VERIFICATION failed: {exc}")
-            return 2
-        for feature in rust_features:
-            verification = feature["runtime_verification"]
+    )
+    try:
+        cwd = repo_root / "codex-rs"
+        with validation_lane(repo_root) as target:
+            metadata = rust_test_runner.load_metadata(cwd=cwd)
+            runner = rust_test_runner.RustTestRunner(
+                rust_manifest,
+                metadata,
+                cwd=cwd,
+                profile="fast",
+                target_dir=target,
+            )
+            # Exact selectors and the same execution's outcomes supply proof.
+            # The runner still validates any explicitly declared filters before
+            # batching; generated exact selectors need no preliminary discovery.
+            completed = runner.run_gates(gates, quiet=quiet, discover=False)
+    except (rust_test_runner.RunnerError, OSError) as exc:
+        for feature in matching:
             if outcomes is not None:
                 outcomes.append(
                     {
                         "feature_id": feature["id"],
-                        "outcome": "passed",
-                        "test_identities": completed[verification["command"][3]],
-                        "returncode": 0,
-                        "evidence_kind": verification["kind"],
+                        "outcome": getattr(exc, "outcome", "failed"),
+                        "test_identities": [],
+                        "returncode": 2,
+                        "evidence_kind": feature["runtime_verification"]["kind"],
+                        "error": str(exc),
                     }
                 )
-            if not quiet:
-                print(f"KD4 TEST RESULT [{feature['id']}]: passed")
-
-    for interpreter, features in python_groups.items():
-        observers = {
-            feature["runtime_verification"]["command"][3]: _TestOutcome(
-                feature["runtime_verification"]["symbol"],
-                "unittest",
-                feature["runtime_verification"]["command"][3],
-                set(),
-            )
-            for feature in features
-        }
-        command = [interpreter, "-m", "unittest", "-v", *observers]
         if not quiet:
-            print(f"KD4 RUNTIME VERIFICATION: {' '.join(command)}")
-        pending = None
-        buffered = ""
-        oversized_line = False
-
-        def observe(chunk, observers=observers):
-            nonlocal pending, buffered, oversized_line
-            for part in chunk.splitlines(keepends=True):
-                buffered += part
-                if len(buffered) > 65536:
-                    oversized_line = True
-                    buffered = ""
-                    pending = None
-                if part.endswith("\n"):
-                    if not oversized_line:
-                        pending = _observe_unittest_output(buffered, observers, pending)
-                    oversized_line = False
-                    buffered = ""
-
-        try:
-            process = run_finite(
-                command,
-                cwd=repo_root,
-                observe=observe,
-                env={**os.environ, "INSTA_UPDATE": "no"},
+            print(f"KD4 RUNTIME VERIFICATION failed: {exc}")
+        return 2
+    for feature in matching:
+        verification = feature["runtime_verification"]
+        if outcomes is not None:
+            outcomes.append(
+                {
+                    "feature_id": feature["id"],
+                    "outcome": "passed",
+                    "test_identities": completed[verification["command"][3]],
+                    "returncode": 0,
+                    "evidence_kind": verification["kind"],
+                }
             )
-            if buffered and not oversized_line:
-                _observe_unittest_output(buffered, observers, pending)
-            if not quiet:
-                if process.output_truncated:
-                    print("[output truncated; retaining final 65536 bytes]")
-                print(process.stdout, end="")
-            returncode = process.returncode
-        except OSError as exc:
-            if not quiet:
-                print(f"runtime verification could not start: {exc}")
-            return 2
-        failed = returncode != 0
-        for feature in features:
-            verification = feature["runtime_verification"]
-            outcome = observers[verification["command"][3]]
-            verdict = outcome.verdict(returncode)
-            if outcomes is not None:
-                outcomes.append(
-                    {
-                        "feature_id": feature["id"],
-                        "outcome": verdict,
-                        "test_identities": sorted(outcome.passed),
-                        "returncode": returncode,
-                        "batch_status": process.status,
-                        "evidence_kind": verification["kind"],
-                    }
-                )
-            if not quiet:
-                print(f"KD4 TEST RESULT [{feature['id']}]: {verdict}")
-            failed |= verdict != "passed"
-        if failed:
-            return returncode or 1
+        if not quiet:
+            print(f"KD4 TEST RESULT [{feature['id']}]: passed")
     return 0
 
 
@@ -741,7 +594,6 @@ def _load_feature_defaults(repo_root: Path) -> dict[str, bool] | None:
                 [
                     "cargo",
                     "run",
-                    "--locked",
                     "--target-dir",
                     str(target),
                     "--quiet",
@@ -756,6 +608,10 @@ def _load_feature_defaults(repo_root: Path) -> dict[str, bool] | None:
                 output_limit=4 * 1024 * 1024,
                 stderr=None,
             )
+    except rust_test_runner.RunnerError as exc:
+        # Keep the cause visible next to the unresolved-runtime-status finding.
+        print(f"KD4 feature defaults unavailable: {exc}", file=sys.stderr)
+        return None
     except (OSError, UnicodeError):
         return None
     if completed.returncode != 0 or completed.output_truncated:
@@ -1059,27 +915,12 @@ def _validate_evidence(
             continue
 
         contains = evidence.get("contains")
-        regex = evidence.get("regex")
-        contains_present = "contains" in evidence
-        regex_present = "regex" in evidence
-        if contains_present == regex_present:
+        if not isinstance(contains, str) or not contains:
             findings.append(
                 Finding(
                     "error",
                     "invalid-evidence-match",
-                    f"evidence[{index}] must set exactly one of contains or regex",
-                    feature_id,
-                )
-            )
-            continue
-        match_value = contains if contains_present else regex
-        if not isinstance(match_value, str) or not match_value:
-            match_name = "contains" if contains_present else "regex"
-            findings.append(
-                Finding(
-                    "error",
-                    "invalid-evidence-match",
-                    f"evidence[{index}] {match_name} must be a non-empty string",
+                    f"evidence[{index}] contains must be a non-empty string",
                     feature_id,
                 )
             )
@@ -1098,43 +939,12 @@ def _validate_evidence(
             )
             continue
 
-        if isinstance(contains, str) and contains not in text:
+        if contains not in text:
             findings.append(
                 Finding(
                     "error",
                     "stale-evidence",
                     f"{evidence['path']} no longer contains {contains!r}",
-                    feature_id,
-                )
-            )
-        elif isinstance(regex, str):
-            try:
-                matched = re.search(regex, text, flags=re.MULTILINE) is not None
-            except re.error as exc:
-                findings.append(
-                    Finding(
-                        "error",
-                        "invalid-evidence-regex",
-                        f"{evidence['path']} regex is invalid: {exc}",
-                        feature_id,
-                    )
-                )
-            else:
-                if not matched:
-                    findings.append(
-                        Finding(
-                            "error",
-                            "stale-evidence",
-                            f"{evidence['path']} no longer matches {regex!r}",
-                            feature_id,
-                        )
-                    )
-        elif not isinstance(contains, str):
-            findings.append(
-                Finding(
-                    "error",
-                    "invalid-evidence-match",
-                    f"evidence[{index}] match value must be a string",
                     feature_id,
                 )
             )
@@ -1147,9 +957,7 @@ def _validate_runtime_verification(
     verification: object,
     repo_root: Path,
     findings: list[Finding],
-    text_cache: dict[Path, str],
     rust_manifest_cache: dict[Path, rust_test_runner.Manifest],
-    python_ast_cache: dict[Path, ast.Module],
 ) -> bool:
     if not isinstance(verification, dict):
         findings.append(
@@ -1192,57 +1000,8 @@ def _validate_runtime_verification(
         )
         return False
 
-    symbol = verification.get("symbol")
-    command = verification.get("command")
-    if not isinstance(symbol, str) or not symbol:
-        findings.append(
-            Finding(
-                "error",
-                "invalid-runtime-verification",
-                "runtime_verification.symbol must be a non-empty string",
-                feature_id,
-            )
-        )
-        return False
-    if (
-        not isinstance(command, list)
-        or not command
-        or not all(isinstance(argument, str) and argument for argument in command)
-    ):
-        findings.append(
-            Finding(
-                "error",
-                "invalid-runtime-verification",
-                "runtime_verification.command must be a non-empty string array selecting symbol",
-                feature_id,
-            )
-        )
-        return False
-
-    try:
-        if path not in text_cache:
-            text_cache[path] = path.read_text(encoding="utf-8")
-        text = _executable_source_text(path, text_cache[path])
-    except (OSError, UnicodeError) as exc:
-        findings.append(
-            Finding(
-                "error",
-                "unreadable-runtime-verification",
-                f"failed to read {path}: {exc}",
-                feature_id,
-            )
-        )
-        return False
-    if symbol not in text:
-        findings.append(
-            Finding(
-                "error",
-                "stale-runtime-verification",
-                f"{verification.get('path')} no longer contains {symbol!r}",
-                feature_id,
-            )
-        )
-        return False
+    # The route resolves the gate's exact test identity to one `fn` declaration
+    # in this source, so a renamed, commented, or relocated test fails here.
     try:
         rust_manifest = None
         if path.suffix == ".rs":
@@ -1252,385 +1011,18 @@ def _validate_runtime_verification(
                     manifest_path
                 )
             rust_manifest = rust_manifest_cache[manifest_path]
-        module = None
-        if path.suffix == ".py":
-            if path not in python_ast_cache:
-                python_ast_cache[path] = ast.parse(text_cache[path])
-            module = python_ast_cache[path]
-        _verification_route(verification, repo_root, rust_manifest, module)
+        _verification_route(verification, repo_root, rust_manifest)
     except (
         ValueError,
         OSError,
         KeyError,
-        SyntaxError,
         rust_test_runner.RunnerError,
     ) as exc:
         findings.append(
             Finding("error", "invalid-runtime-verification", str(exc), feature_id)
         )
         return False
-
-    if path.suffix.lower() == ".py":
-        assert module is not None
-        class_name = command[3].rsplit(".", 2)[-2]
-        matching_tests = [
-            method
-            for node in module.body
-            if isinstance(node, ast.ClassDef) and node.name == class_name
-            for method in node.body
-            if isinstance(method, ast.FunctionDef) and method.name == symbol
-        ]
-        if not matching_tests or all(
-            all(
-                isinstance(statement, ast.Pass)
-                or (
-                    isinstance(statement, ast.Expr)
-                    and isinstance(statement.value, ast.Constant)
-                    and isinstance(statement.value.value, str)
-                )
-                for statement in test.body
-            )
-            for test in matching_tests
-        ):
-            findings.append(
-                Finding(
-                    "error",
-                    "vacuous-runtime-verification",
-                    f"{verification.get('path')} test {symbol!r} has no executable contract body",
-                    feature_id,
-                )
-            )
-            return False
     return True
-
-
-def _validate_contract_schema(
-    *,
-    feature: dict[str, Any],
-    feature_id: str,
-    repo_root: Path,
-    findings: list[Finding],
-    text_cache: dict[Path, str],
-) -> None:
-    declared = feature.get("contract_schema_version")
-    source_text = feature.get("contract_schema_source")
-    symbol = feature.get("contract_schema_symbol")
-    present = [
-        key in feature
-        for key in (
-            "contract_schema_version",
-            "contract_schema_source",
-            "contract_schema_symbol",
-        )
-    ]
-    if not any(present):
-        return
-    if not all(present):
-        findings.append(
-            Finding(
-                "error",
-                "invalid-contract-schema",
-                "contract schema version, source, and symbol must be declared together",
-                feature_id,
-            )
-        )
-        return
-    if not isinstance(declared, int) or declared < 1:
-        findings.append(
-            Finding(
-                "error",
-                "invalid-contract-schema",
-                "contract_schema_version must be a positive integer",
-                feature_id,
-            )
-        )
-        return
-    path, path_error = _safe_repo_path(repo_root, source_text)
-    if path_error is not None:
-        findings.append(
-            Finding("error", "invalid-contract-schema", path_error, feature_id)
-        )
-        return
-    if not isinstance(symbol, str) or not symbol:
-        findings.append(
-            Finding(
-                "error",
-                "invalid-contract-schema",
-                "contract_schema_symbol must be a non-empty string",
-                feature_id,
-            )
-        )
-        return
-    assert path is not None
-    if not path.is_file():
-        findings.append(
-            Finding(
-                "error",
-                "stale-contract-schema",
-                f"contract schema source {source_text!r} does not exist",
-                feature_id,
-            )
-        )
-        return
-    try:
-        if path not in text_cache:
-            text_cache[path] = path.read_text(encoding="utf-8")
-        text = _executable_source_text(path, text_cache[path])
-    except (OSError, UnicodeError) as exc:
-        findings.append(
-            Finding(
-                "error",
-                "unreadable-contract-schema",
-                f"failed to read {path}: {exc}",
-                feature_id,
-            )
-        )
-        return
-    match = re.search(
-        rf"\b{re.escape(symbol)}\b\s*:\s*[^=]+?=\s*(\d+)\s*;",
-        text,
-    )
-    if match is None:
-        findings.append(
-            Finding(
-                "error",
-                "stale-contract-schema",
-                f"{source_text} no longer declares integer constant {symbol!r}",
-                feature_id,
-            )
-        )
-    elif int(match.group(1)) != declared:
-        findings.append(
-            Finding(
-                "error",
-                "contract-schema-drift",
-                f"declared schema version {declared} does not match {symbol}={match.group(1)}",
-                feature_id,
-            )
-        )
-
-
-def _source_owner_evidence(
-    *,
-    source_owner_id: object,
-    repo_root: Path,
-    feature_id: str,
-    findings: list[Finding],
-    owner_cache: dict[str, dict[str, Any]] | None,
-    owner_observation_cache: dict[str, tuple[frozenset[str], Counter[str]]],
-    text_cache: dict[Path, str],
-) -> tuple[Counter[str], dict[str, dict[str, Any]] | None]:
-    kinds: Counter[str] = Counter()
-    if not isinstance(source_owner_id, str) or not source_owner_id.strip():
-        findings.append(
-            Finding(
-                "error",
-                "invalid-source-owner",
-                "source_owner must be a non-empty source_owners.toml owner id",
-                feature_id,
-            )
-        )
-        return kinds, owner_cache
-
-    if owner_cache is None:
-        owner_path = repo_root / SOURCE_OWNERS_FILE_NAME
-        try:
-            with owner_path.open("rb") as owner_file:
-                owner_manifest = tomllib.load(owner_file)
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            findings.append(
-                Finding(
-                    "error",
-                    "source-owner-load",
-                    f"failed to load {SOURCE_OWNERS_FILE_NAME}: {exc}",
-                    feature_id,
-                )
-            )
-            return kinds, {}
-        owners = owner_manifest.get("owners")
-        if not isinstance(owners, list):
-            findings.append(
-                Finding(
-                    "error",
-                    "source-owner-load",
-                    f"{SOURCE_OWNERS_FILE_NAME} owners must be an array",
-                    feature_id,
-                )
-            )
-            return kinds, {}
-        owner_cache = {
-            owner["id"]: owner
-            for owner in owners
-            if isinstance(owner, dict)
-            and isinstance(owner.get("id"), str)
-            and owner["id"]
-        }
-
-    owner = owner_cache.get(source_owner_id)
-    if owner is None:
-        findings.append(
-            Finding(
-                "error",
-                "missing-source-owner",
-                f"{SOURCE_OWNERS_FILE_NAME} has no owner {source_owner_id!r}",
-                feature_id,
-            )
-        )
-        return kinds, owner_cache
-
-    cached_observation = owner_observation_cache.get(source_owner_id)
-    if cached_observation is not None:
-        feature_ids, cached_kinds = cached_observation
-        if feature_id not in feature_ids:
-            findings.append(
-                Finding(
-                    "error",
-                    "source-owner-feature-mismatch",
-                    f"owner {source_owner_id!r} does not declare feature {feature_id!r}",
-                    feature_id,
-                )
-            )
-            return kinds, owner_cache
-        return Counter(cached_kinds), owner_cache
-
-    declared_feature_ids = owner.get("feature_ids")
-    feature_ids = (
-        frozenset(item for item in declared_feature_ids if isinstance(item, str))
-        if isinstance(declared_feature_ids, list)
-        else frozenset()
-    )
-    if feature_id not in feature_ids:
-        findings.append(
-            Finding(
-                "error",
-                "source-owner-feature-mismatch",
-                f"owner {source_owner_id!r} does not declare feature {feature_id!r}",
-                feature_id,
-            )
-        )
-        return kinds, owner_cache
-
-    finding_count_before_observation = len(findings)
-
-    def marker_is_live(marker: object, label: str) -> bool:
-        if isinstance(marker, str):
-            path_text = marker
-            symbol = None
-        elif isinstance(marker, dict):
-            path_text = marker.get("path")
-            symbol = marker.get("symbol")
-        else:
-            findings.append(
-                Finding(
-                    "error",
-                    "invalid-source-owner-evidence",
-                    f"{label} must be a path string or evidence table",
-                    feature_id,
-                )
-            )
-            return False
-
-        path, path_error = _safe_repo_path(repo_root, path_text)
-        if path_error is not None:
-            findings.append(
-                Finding(
-                    "error",
-                    "invalid-source-owner-evidence",
-                    f"{label}: {path_error}",
-                    feature_id,
-                )
-            )
-            return False
-        assert path is not None
-        if not path.is_file():
-            findings.append(
-                Finding(
-                    "error",
-                    "stale-source-owner-evidence",
-                    f"{label} path {path_text!r} does not exist",
-                    feature_id,
-                )
-            )
-            return False
-        if symbol is None:
-            return True
-        if not isinstance(symbol, str) or not symbol:
-            findings.append(
-                Finding(
-                    "error",
-                    "invalid-source-owner-evidence",
-                    f"{label} symbol must be a non-empty string",
-                    feature_id,
-                )
-            )
-            return False
-        try:
-            if path not in text_cache:
-                text_cache[path] = path.read_text(encoding="utf-8")
-            text = _executable_source_text(path, text_cache[path])
-        except (OSError, UnicodeError) as exc:
-            findings.append(
-                Finding(
-                    "error",
-                    "unreadable-source-owner-evidence",
-                    f"failed to read {path}: {exc}",
-                    feature_id,
-                )
-            )
-            return False
-        if symbol not in text:
-            findings.append(
-                Finding(
-                    "error",
-                    "stale-source-owner-evidence",
-                    f"{label} path {path_text!r} no longer contains {symbol!r}",
-                    feature_id,
-                )
-            )
-            return False
-        return True
-
-    primary_entries = owner.get("primary_entries")
-    if isinstance(primary_entries, list):
-        kinds["entrypoint"] = sum(
-            marker_is_live(marker, f"primary_entries[{index}]")
-            for index, marker in enumerate(primary_entries)
-        )
-    tests = owner.get("tests")
-    if isinstance(tests, list):
-        kinds["test"] = sum(
-            marker_is_live(marker, f"tests[{index}]")
-            for index, marker in enumerate(tests)
-        )
-    relationships = owner.get("relationships")
-    if isinstance(relationships, list):
-        for index, relationship in enumerate(relationships):
-            if (
-                not isinstance(relationship, dict)
-                or relationship.get("category") != "runtime_registration"
-            ):
-                continue
-            evidence = relationship.get("evidence")
-            if not isinstance(evidence, list) or not evidence:
-                findings.append(
-                    Finding(
-                        "error",
-                        "invalid-source-owner-evidence",
-                        f"relationships[{index}] runtime registration has no evidence",
-                        feature_id,
-                    )
-                )
-                continue
-            if all(
-                marker_is_live(
-                    marker, f"relationships[{index}].evidence[{marker_index}]"
-                )
-                for marker_index, marker in enumerate(evidence)
-            ):
-                kinds["registration"] += 1
-    if len(findings) == finding_count_before_observation:
-        owner_observation_cache[source_owner_id] = (feature_ids, Counter(kinds))
-    return kinds, owner_cache
 
 
 def validate_manifest(
@@ -1716,11 +1108,8 @@ def validate_manifest(
     text_cache: dict[Path, str] = {}
     stripped_cache: dict[Path, str] = {}
     rust_manifest_cache: dict[Path, rust_test_runner.Manifest] = {}
-    python_ast_cache: dict[Path, ast.Module] = {}
     feature_registry_cache: dict[str, dict[str, bool] | None] = {}
     project_config_cache: dict[str, object] = {}
-    owner_cache: dict[str, dict[str, Any]] | None = None
-    owner_observation_cache: dict[str, tuple[frozenset[str], Counter[str]]] = {}
     for index, feature in enumerate(features):
         if not isinstance(feature, dict):
             findings.append(
@@ -1872,14 +1261,6 @@ def validate_manifest(
         if runtime_status is not None:
             runtime_status_counts[runtime_status] += 1
 
-        _validate_contract_schema(
-            feature=feature,
-            feature_id=feature_id,
-            repo_root=repo_root,
-            findings=findings,
-            text_cache=text_cache,
-        )
-
         _validate_declared_paths(
             feature_id=feature_id,
             field="generated_artifacts",
@@ -1897,46 +1278,33 @@ def validate_manifest(
             findings=findings,
         )
 
-        source_owner = feature.get("source_owner")
-        if status == "planned" and (
-            source_owner is not None or feature.get("evidence")
-        ):
+        unknown_keys = sorted(set(feature) - ALLOWED_FEATURE_KEYS)
+        if unknown_keys:
+            findings.append(
+                Finding(
+                    "error",
+                    "unknown-feature-key",
+                    f"unsupported feature keys: {', '.join(unknown_keys)}",
+                    feature_id,
+                )
+            )
+        if status == "planned" and feature.get("evidence"):
             findings.append(
                 Finding(
                     "error",
                     "planned-feature-has-production-route",
-                    "planned feature must not declare live source-owner or inline route evidence",
+                    "planned feature must not declare live inline route evidence",
                     feature_id,
                 )
             )
-        if source_owner is None:
-            evidence_kinds = _validate_evidence(
-                feature_id=feature_id,
-                evidence_items=feature.get("evidence", []),
-                repo_root=repo_root,
-                findings=findings,
-                text_cache=text_cache,
-                stripped_cache=stripped_cache,
-            )
-        else:
-            if feature.get("evidence"):
-                findings.append(
-                    Finding(
-                        "error",
-                        "duplicate-evidence-authority",
-                        "source_owner and inline evidence cannot both author reachability",
-                        feature_id,
-                    )
-                )
-            evidence_kinds, owner_cache = _source_owner_evidence(
-                source_owner_id=source_owner,
-                repo_root=repo_root,
-                feature_id=feature_id,
-                findings=findings,
-                owner_cache=owner_cache,
-                owner_observation_cache=owner_observation_cache,
-                text_cache=text_cache,
-            )
+        evidence_kinds = _validate_evidence(
+            feature_id=feature_id,
+            evidence_items=feature.get("evidence", []),
+            repo_root=repo_root,
+            findings=findings,
+            text_cache=text_cache,
+            stripped_cache=stripped_cache,
+        )
         if status == "enabled":
             if evidence_kinds["entrypoint"] == 0:
                 findings.append(
@@ -1959,15 +1327,13 @@ def validate_manifest(
                         feature_id,
                     )
                 )
-            if (
-                capability_kind in ("runtime", "workflow")
-                and evidence_kinds["test"] == 0
-            ):
+            # Runtime features prove their test through runtime_verification.
+            if capability_kind == "workflow" and evidence_kinds["test"] == 0:
                 findings.append(
                     Finding(
                         "error",
                         "missing-test",
-                        "enabled runtime/workflow feature has no declared test evidence",
+                        "enabled workflow feature has no declared test evidence",
                         feature_id,
                     )
                 )
@@ -1977,9 +1343,7 @@ def validate_manifest(
                     verification=feature.get("runtime_verification"),
                     repo_root=repo_root,
                     findings=findings,
-                    text_cache=text_cache,
                     rust_manifest_cache=rust_manifest_cache,
-                    python_ast_cache=python_ast_cache,
                 )
         if status == "orphaned":
             findings.append(

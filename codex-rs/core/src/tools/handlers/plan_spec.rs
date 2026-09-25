@@ -91,6 +91,6 @@ pub fn create_update_plan_tool() -> ToolSpec {
             },
             "required": ["current_plan", "message", "effect", "no_progress"],
             "additionalProperties": false
-        })),
+        }).into()),
     })
 }

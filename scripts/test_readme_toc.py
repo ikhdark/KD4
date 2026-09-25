@@ -155,8 +155,8 @@ class ReadmeTocTest(unittest.TestCase):
 
     def test_check_can_require_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "SOURCEMAP.md"
-            path.write_text("# Source Map\n\n## Inventory\n", encoding="utf-8")
+            path = Path(tmp) / "README.md"
+            path.write_text("# Project\n\n## Usage\n", encoding="utf-8")
             stderr = io.StringIO()
 
             with contextlib.redirect_stderr(stderr):

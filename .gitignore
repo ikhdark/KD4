@@ -111,3 +111,12 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
+
+# Retired repository map/ownership artifacts and generators. Do not restore.
+/SOURCEMAP.md
+/source_owners.toml
+/architecture_index.json
+/scripts/source_map_check.py
+/scripts/test_source_map_check.py
+/scripts/source_owners.py
+/scripts/test_source_owners.py

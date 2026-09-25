@@ -332,6 +332,41 @@ class ScriptReportRegressions(unittest.TestCase):
             time.sleep(0.7)
             self.assertFalse(marker.exists())
 
+    def test_owner_cli_quarantines_a_tree_it_cannot_confirm_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / ".lane-cleanup-unconfirmed"
+            with (
+                mock.patch.object(
+                    process_owner,
+                    "run_owned",
+                    side_effect=process_owner.CleanupFailed("still running"),
+                ),
+                self.assertRaises(process_owner.CleanupFailed),
+            ):
+                process_owner.main(
+                    ["--cleanup-failed-marker", str(marker), "--", "cargo", "check"]
+                )
+            self.assertIn("quarantine", marker.read_text())
+
+    def test_owner_cli_stops_the_tree_when_its_parent_exits(self):
+        parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+        try:
+            started = time.monotonic()
+            code = process_owner.main(
+                [
+                    "--parent-pid",
+                    str(parent.pid),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(60)",
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertLess(time.monotonic() - started, 20)
+        finally:
+            parent.wait(timeout=10)
+
     def test_pool_failure_cancels_owned_sibling_and_preserves_primary_error(self):
         started = __import__("threading").Event()
 

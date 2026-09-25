@@ -1427,6 +1427,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
                 supports_parallel_tool_calls: false,
                 supports_image_detail_original: false,
+                supports_experimental_context: false,
                 context_window: Some(272_000),
                 max_context_window: None,
                 auto_compact_token_limit: None,

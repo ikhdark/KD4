@@ -1,5 +1,6 @@
 //! Errors returned by the shared Codex HTTP transport.
 
+use crate::RetryAfter;
 use crate::client::HttpError;
 use http::HeaderMap;
 use http::StatusCode;
@@ -13,6 +14,7 @@ pub enum TransportError {
         url: Option<String>,
         headers: Option<HeaderMap>,
         body: Option<String>,
+        retry_after: Option<RetryAfter>,
     },
     #[error("retry limit reached")]
     RetryLimit,
@@ -29,6 +31,16 @@ pub enum TransportError {
     PreDispatch(String),
     #[error("request build error: {0}")]
     Build(String),
+}
+
+impl TransportError {
+    /// Returns advice captured at response receipt, without restarting its clock.
+    pub fn retry_after(&self) -> Option<RetryAfter> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

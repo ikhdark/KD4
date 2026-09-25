@@ -332,7 +332,7 @@ fn classifies_repository_wide_and_owner_scoped_rg() {
             "powershell.exe",
             "-NoProfile",
             "-Command",
-            "$files = rg --files -g 'SOURCEMAP.md' -g 'AGENTS.md' -g '*terminal*' -g '*bench*' -g '*rollout*' -g '*eval*' -g '*prompt*'; Write-Output '---FILES---'; $files; Write-Output '---STATUS---'; git status --short; Write-Output '---ROOT---'; Get-Content -Path AGENTS.md -TotalCount 260; Write-Output '---SOURCEMAP MATCHES---'; rg -n -i 'terminal|benchmark|rollout|prompt|agent loop|tool' SOURCEMAP.md | Select-Object -First 180",
+            "$files = rg --files -g 'README.md' -g 'AGENTS.md' -g '*terminal*' -g '*bench*' -g '*rollout*' -g '*eval*' -g '*prompt*'; Write-Output '---FILES---'; $files; Write-Output '---STATUS---'; git status --short; Write-Output '---ROOT---'; Get-Content -Path AGENTS.md -TotalCount 260; Write-Output '---README MATCHES---'; rg -n -i 'terminal|benchmark|rollout|prompt|agent loop|tool' README.md | Select-Object -First 180",
         ]),
         Some(ShellType::PowerShell),
         root,

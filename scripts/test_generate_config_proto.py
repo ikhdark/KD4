@@ -143,14 +143,13 @@ class GenerateConfigProtoTest(unittest.TestCase):
             env=fixture.env,
         )
 
-    def assert_locked_lane_args(self, fixture: ProtoFixture) -> None:
+    def assert_lane_args(self, fixture: ProtoFixture) -> None:
         lane_args = fixture.cargo_lane_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(
             lane_args[:-1],
             [
                 "cargo",
                 "run",
-                "--locked",
                 "-p",
                 "codex-config",
                 "--example",
@@ -173,7 +172,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             [f"{path}: text: set", f"{path}: eol: lf"],
         )
 
-    def test_check_uses_default_cargo_home_and_locked_generation(self) -> None:
+    def test_check_uses_default_cargo_home_and_lane_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = create_fixture(Path(temp_dir))
             generated_before = fixture.checked_generated.read_bytes()
@@ -192,7 +191,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
             self.assertNotIn(b"\r", generated_before)
             self.assertFalse(generated_before.startswith(b"\xef\xbb\xbf"))
-            self.assert_locked_lane_args(fixture)
+            self.assert_lane_args(fixture)
 
     def test_explicit_protoc_precedes_environment_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -218,7 +217,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             )
             self.assertIn(f"Using protoc: {explicit_protoc}", result.stdout)
             self.assertNotIn(f"Using protoc: {env_protoc}", result.stdout)
-            self.assert_locked_lane_args(fixture)
+            self.assert_lane_args(fixture)
 
     def test_stale_check_fails_without_replacing_binding_or_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -238,7 +237,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertIn("Generated config proto is stale", result.stderr)
             self.assertEqual(fixture.checked_generated.read_bytes(), generated_before)
             self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
-            self.assert_locked_lane_args(fixture)
+            self.assert_lane_args(fixture)
 
     def test_write_replaces_stale_binding_atomically_without_touching_lock(
         self,
@@ -268,7 +267,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
                 list(fixture.checked_generated.parent.glob(".*.tmp*")),
                 [],
             )
-            self.assert_locked_lane_args(fixture)
+            self.assert_lane_args(fixture)
 
     def test_failed_replacement_preserves_binding_and_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -308,7 +307,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertEqual(fixture.checked_generated.read_bytes(), generated_before)
             self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
             self.assertEqual(list(fixture.checked_generated.parent.glob(".*.tmp*")), [])
-            self.assert_locked_lane_args(fixture)
+            self.assert_lane_args(fixture)
 
     def test_just_recipes_expose_write_arguments_and_named_check(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

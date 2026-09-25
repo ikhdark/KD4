@@ -57,7 +57,7 @@ codex-terminal-detection = { workspace = true }
 codex-tui = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-build-info = { workspace = true }
-codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
+codex-windows-sandbox = { workspace = true }
 crossterm = { workspace = true }
 http = { workspace = true }
 os_info = { workspace = true }

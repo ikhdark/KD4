@@ -190,9 +190,9 @@ impl ToolPlanProbe {
             .collect();
         let tool_search_namespace_descriptions = search_infos
             .into_iter()
-            .filter_map(|info| match info.entry.output {
+            .filter_map(|info| match info.entry.output.as_ref() {
                 codex_tools::LoadableToolSpec::Namespace(namespace) => {
-                    Some((namespace.name, namespace.description))
+                    Some((namespace.name.clone(), namespace.description.clone()))
                 }
                 codex_tools::LoadableToolSpec::Function(_) => None,
             })
@@ -363,6 +363,21 @@ async fn removed_workspace_workers_are_not_exposed_or_registered() {
         plan.assert_registered_lacks(&["semantic_context", "workspace_validation"]);
         for name in ["semantic_context", "workspace_validation"] {
             assert!(plan.tool_search_texts.iter().all(|text| !text.contains(name)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn token_budget_tools_require_feature_activation() {
+    for enabled in [false, true] {
+        let plan = probe(|turn| set_feature(turn, Feature::TokenBudget, enabled)).await;
+        let names = &["new_context", "get_context_remaining"];
+        if enabled {
+            plan.assert_visible_contains(names);
+            plan.assert_registered_contains(names);
+        } else {
+            plan.assert_visible_lacks(names);
+            plan.assert_registered_lacks(names);
         }
     }
 }

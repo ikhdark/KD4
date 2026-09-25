@@ -87,6 +87,9 @@ function Get-FileSha256 {
 # Proof, freshness, and local-build inspection helpers.
 
 $script:LocalPublishContentHashCache = @{}
+# Git pathspec of the tracked publish inputs; the build fingerprint and the
+# embedded dirty flag must describe the same files.
+$script:LocalPublishBuildInputPathspec = @("codex-rs", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
 
 function Get-TextSha256 {
     param([string]$Value)
@@ -152,41 +155,90 @@ function Get-VerifiedFileHashObservation {
 function Get-LocalPublishBuildRecipeFingerprint {
     param([string]$RepoRoot)
 
+    $codexRs = Join-Path $RepoRoot "codex-rs"
     $identity = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         command = "cargo build -p codex-cli -p codex-code-mode-host -p codex-windows-sandbox --profile <profile>"
         noSccache = [bool]$NoSccache
         cargo = $null
         rustc = $null
-        linker = Get-CodexRustLldLinkPath
+        linker = $null
         environment = [ordered]@{}
+        cargoConfig = [ordered]@{}
     }
-    foreach ($tool in @(
-            [pscustomobject]@{ Name = "cargo"; Arguments = @("--version", "--verbose") },
-            [pscustomobject]@{ Name = "rustc"; Arguments = @("-Vv") }
-        )) {
-        $command = Get-Command $tool.Name -ErrorAction SilentlyContinue
-        if ($null -eq $command) {
-            $identity[$tool.Name] = @{ status = "unavailable" }
-            continue
-        }
-        $toolArguments = @($tool.Arguments)
-        $output = @(& $command.Source @toolArguments 2>&1)
-        $identity[$tool.Name] = @{
-            path = [IO.Path]::GetFullPath($command.Source)
-            versionSha256 = Get-TextSha256 -Value ($output -join "`n")
+    # The linker is the lld-link publish injects; its version, not just its
+    # path, is identity because scoop's `current` junction keeps the path stable.
+    $linkerPath = Get-CodexRustLldLinkPath
+    # Probe from codex-rs so rustup resolves the toolchain (rust-toolchain.toml
+    # and directory overrides) the publish build uses. Hash stdout only: rustup
+    # progress on stderr is not toolchain identity, and Windows PowerShell 5.1
+    # would promote redirected stderr to a terminating error under Stop.
+    Push-Location -LiteralPath $codexRs
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        foreach ($tool in @(
+                [pscustomobject]@{ Name = "cargo"; Command = "cargo"; Arguments = @("--version", "--verbose") },
+                [pscustomobject]@{ Name = "rustc"; Command = "rustc"; Arguments = @("-Vv") },
+                [pscustomobject]@{ Name = "linker"; Command = $linkerPath; Arguments = @("--version") }
+            )) {
+            $command = if ([string]::IsNullOrWhiteSpace($tool.Command)) {
+                $null
+            }
+            else {
+                Get-Command $tool.Command -ErrorAction SilentlyContinue
+            }
+            if ($null -eq $command) {
+                $identity[$tool.Name] = @{ status = "unavailable" }
+                continue
+            }
+            $toolArguments = @($tool.Arguments)
+            $output = @(& $command.Source @toolArguments 2>$null)
+            $identity[$tool.Name] = @{
+                path = [IO.Path]::GetFullPath($command.Source)
+                versionSha256 = Get-TextSha256 -Value ($output -join "`n")
+            }
         }
     }
+    finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+        Pop-Location
+    }
+    # CARGO_* is Cargo's whole environment configuration surface; the cc/cmake
+    # compiler and flag variables (including cc's HOST_/TARGET_ and per-target
+    # forms) feed the vendored C builds; the rest are compiler, build-script,
+    # and compile-time inputs outside those namespaces.
     $environmentNames = @(
         Get-ChildItem Env: | Where-Object {
-            $_.Name -like "CARGO_PROFILE_*" -or
-            $_.Name -like "CARGO_TARGET_*" -or
+            $_.Name -like "CARGO_*" -or
+            $_.Name -match "^(HOST_|TARGET_)?(CC|CXX|AR|CFLAGS|CXXFLAGS|ARFLAGS)(_.+)?$" -or
+            $_.Name -like "CMAKE_*" -or
             $_.Name -like "*V8*" -or
-            $_.Name -in @("AR", "CC", "CXX", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CODEX_SCCACHE_CACHE_SIZE")
+            $_.Name -in @("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "CODEX_SCCACHE_CACHE_SIZE", "CODEX_RELEASE_VERSION", "SOURCE_DATE_EPOCH")
         } | Select-Object -ExpandProperty Name | Sort-Object -Unique
     )
     foreach ($name in $environmentNames) {
         $identity.environment[$name] = Get-TextSha256 -Value ([string][Environment]::GetEnvironmentVariable($name, "Process"))
+    }
+    # Cargo merges every ancestor .cargo config and CARGO_HOME's config into the
+    # build; only codex-rs/.cargo is covered by the tracked input scan.
+    $configDirectories = [System.Collections.Generic.List[string]]::new()
+    for ($directory = [IO.Path]::GetFullPath($codexRs); -not [string]::IsNullOrEmpty($directory); $directory = [IO.Path]::GetDirectoryName($directory)) {
+        $configDirectories.Add((Join-Path $directory ".cargo"))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
+        $configDirectories.Add($env:CARGO_HOME)
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $configDirectories.Add((Join-Path $env:USERPROFILE ".cargo"))
+    }
+    foreach ($configDirectory in $configDirectories) {
+        foreach ($configName in @("config.toml", "config")) {
+            $configPath = [IO.Path]::GetFullPath((Join-Path $configDirectory $configName))
+            if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+                $identity.cargoConfig[$configPath.ToLowerInvariant()] = Get-FileSha256 -Path $configPath
+            }
+        }
     }
     return Get-TextSha256 -Value ($identity | ConvertTo-Json -Depth 6 -Compress)
 }
@@ -707,7 +759,7 @@ function Get-LocalPublishBuildInputSnapshot {
         $inputPathsResult = Invoke-GitNulDelimitedList `
             -GitPath $git.Source `
             -RepoRoot $RepoRoot `
-            -Arguments @("-c", "core.quotepath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "codex-rs", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
+            -Arguments (@("-c", "core.quotepath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--") + $script:LocalPublishBuildInputPathspec)
         $inputPaths = @($inputPathsResult.Records)
         $inputPathsExitCode = $inputPathsResult.ExitCode
         $headCommit = @(& $git.Source -C $RepoRoot rev-parse --verify HEAD 2>$null)
@@ -881,7 +933,7 @@ function Get-AutoSkipBuildDecision {
         -not (Test-Path -LiteralPath $SourceWindowsSandboxSetupExe -PathType Leaf) -or
         -not (Test-Path -LiteralPath $SourceCommandRunnerExe -PathType Leaf)
     ) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact missing"; SourceSnapshot = $null }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact missing"; SourceSnapshot = $null; StampedArtifactsCurrent = $false }
     }
 
     $stamp = Read-BuildStamp -StampPath $StampPath
@@ -892,10 +944,10 @@ function Get-AutoSkipBuildDecision {
         else {
             "build stamp missing"
         }
-        return [pscustomobject]@{ CanSkip = $false; Reason = $reason; SourceSnapshot = $null }
+        return [pscustomobject]@{ CanSkip = $false; Reason = $reason; SourceSnapshot = $null; StampedArtifactsCurrent = $false }
     }
     if ($stamp.Profile -cne $Profile) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "build stamp profile mismatch"; SourceSnapshot = $null }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "build stamp profile mismatch"; SourceSnapshot = $null; StampedArtifactsCurrent = $false }
     }
 
     if ($null -eq $SourceSnapshot) {
@@ -908,29 +960,29 @@ function Get-AutoSkipBuildDecision {
         $SourceSnapshot.Fingerprint
     }
     if (-not (Test-Sha256Text -Value $sourceFingerprint)) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "publish input fingerprint unavailable"; SourceSnapshot = $null }
-    }
-    if ($stamp.SourceFingerprint -cne $sourceFingerprint) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "tracked publish inputs changed"; SourceSnapshot = $SourceSnapshot }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "publish input fingerprint unavailable"; SourceSnapshot = $null; StampedArtifactsCurrent = $false }
     }
 
-    $codexSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceExe
-    $codeModeHostSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceCodeModeHostExe
-    $windowsSandboxSetupSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceWindowsSandboxSetupExe
-    $commandRunnerSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceCommandRunnerExe
-    if (
-        $stamp.CodexSha256 -cne $codexSha256 -or
-        $stamp.CodeModeHostSha256 -cne $codeModeHostSha256 -or
-        $stamp.WindowsSandboxSetupSha256 -cne $windowsSandboxSetupSha256 -or
-        $stamp.CommandRunnerSha256 -cne $commandRunnerSha256
-    ) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact differs from stamped build"; SourceSnapshot = $SourceSnapshot }
+    # Compare artifacts even when inputs changed: artifacts that still equal the
+    # stamp are provably the build of the stamped inputs, not merely old files.
+    $stampedArtifactsCurrent = (
+        $stamp.CodexSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceExe) -and
+        $stamp.CodeModeHostSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceCodeModeHostExe) -and
+        $stamp.WindowsSandboxSetupSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceWindowsSandboxSetupExe) -and
+        $stamp.CommandRunnerSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceCommandRunnerExe)
+    )
+    if ($stamp.SourceFingerprint -cne $sourceFingerprint) {
+        return [pscustomobject]@{ CanSkip = $false; Reason = "tracked publish inputs changed"; SourceSnapshot = $SourceSnapshot; StampedArtifactsCurrent = $stampedArtifactsCurrent }
+    }
+    if (-not $stampedArtifactsCurrent) {
+        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact differs from stamped build"; SourceSnapshot = $SourceSnapshot; StampedArtifactsCurrent = $false }
     }
 
     return [pscustomobject]@{
         CanSkip = $true
         Reason = "source artifacts and tracked publish inputs match build stamp"
         SourceSnapshot = $SourceSnapshot
+        StampedArtifactsCurrent = $true
     }
 }
 
@@ -992,7 +1044,10 @@ function Write-BuildStamp {
         -not (Test-Sha256Text -Value $windowsSandboxSetupSha256) -or
         -not (Test-Sha256Text -Value $commandRunnerSha256)
     ) {
-        throw "Cannot write local publish build stamp because a built source artifact is missing."
+        $missingArtifact = @($SourceExe, $SourceCodeModeHostExe, $SourceWindowsSandboxSetupExe, $SourceCommandRunnerExe) |
+            Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) } |
+            Select-Object -First 1
+        throw "Cannot write local publish build stamp because a built source artifact is missing: $missingArtifact"
     }
 
     $parent = Split-Path -Parent $StampPath
@@ -2409,11 +2464,14 @@ function Get-GitBuildDirty {
         return "unknown"
     }
 
+    # Dirty means the publish inputs differ from HEAD, so a binary reused by an
+    # unchanged build fingerprint still reports the flag a rebuild would embed.
+    $pathspec = @($script:LocalPublishBuildInputPathspec) + @(":(exclude)codex-rs/target")
     # Keep Windows PowerShell 5.1 safe around redirected native Git stderr.
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $status = (& git -C $RepoRoot status --porcelain=v1 -z -uall -- 2>$null)
+        $status = (& git -C $RepoRoot status --porcelain=v1 -z -uall -- @pathspec 2>$null)
         $statusExitCode = $LASTEXITCODE
     }
     finally {
@@ -2681,12 +2739,24 @@ function Assert-RustyV8ArchiveReadyForPublish {
     $archiveUrl = "https://github.com/denoland/rusty_v8/releases/download/v$v8Version/$archiveName"
     $cacheFileName = ConvertTo-RustyV8CacheFileName -Url $archiveUrl
 
-    if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        Write-ProofLine "v8ArchiveStatus" "<skipped: USERPROFILE not set>"
+    # rusty_v8's build script reads `home::cargo_home()`: CARGO_HOME wins, then
+    # the default user Cargo home. Checking any other directory would bless an
+    # archive the build never reads.
+    $cargoHome = if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
+        [System.IO.Path]::GetFullPath($env:CARGO_HOME)
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        Join-Path $env:USERPROFILE ".cargo"
+    }
+    else {
+        $null
+    }
+    if ($null -eq $cargoHome) {
+        Write-ProofLine "v8ArchiveStatus" "<skipped: neither CARGO_HOME nor USERPROFILE is set>"
         return
     }
 
-    $cachePath = Join-Path (Join-Path $env:USERPROFILE ".cargo\.rusty_v8") $cacheFileName
+    $cachePath = Join-Path (Join-Path $cargoHome ".rusty_v8") $cacheFileName
     Write-ProofLine "v8ArchiveVersion" $v8Version
     Write-ProofLine "v8ArchiveUrl" $archiveUrl
     Write-ProofLine "v8ArchiveCachePath" $cachePath
@@ -2856,6 +2926,20 @@ function Invoke-CodexBuild {
         return
     }
 
+    # Cargo re-links up-to-date outputs from deps even when nothing recompiles,
+    # so clearing them lets the build stamp bind only files this run produced at
+    # the paths publish reads.
+    foreach ($builtArtifact in @(
+            (Get-BuiltCodexPath -RepoRoot $RepoRoot -Profile $Profile),
+            (Get-BuiltCodeModeHostPath -RepoRoot $RepoRoot -Profile $Profile),
+            (Get-BuiltWindowsSandboxSetupPath -RepoRoot $RepoRoot -Profile $Profile),
+            (Get-BuiltCommandRunnerPath -RepoRoot $RepoRoot -Profile $Profile)
+        )) {
+        if (Test-Path -LiteralPath $builtArtifact -PathType Leaf) {
+            Remove-Item -LiteralPath $builtArtifact -Force
+        }
+    }
+
     $previousSccacheEnv = @{
         SCCACHE_BASEDIR = $env:SCCACHE_BASEDIR
         SCCACHE_CACHE_SIZE = $env:SCCACHE_CACHE_SIZE
@@ -2893,91 +2977,6 @@ function Invoke-CodexBuild {
 }
 
 # Atomic publish, rollback, backup, and mutex helpers.
-
-function Publish-CodexBinary {
-    param(
-        [string]$SourcePath,
-        [string]$TargetPath,
-        [string]$BackupPath
-    )
-
-    $installDir = Split-Path -Parent $TargetPath
-    $tempPath = Join-Path $installDir (".codex-local-publish." + [System.Guid]::NewGuid().ToString("N") + ".tmp")
-
-    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    [IO.File]::Copy($SourcePath, $tempPath, $true)
-
-    try {
-        if (Test-Path -LiteralPath $TargetPath -PathType Leaf) {
-            $backupParent = Split-Path -Parent $BackupPath
-            New-Item -ItemType Directory -Path $backupParent -Force | Out-Null
-            $targetRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($TargetPath))
-            $backupRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($BackupPath))
-            if (
-                [string]::Equals(
-                    $targetRoot,
-                    $backupRoot,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
-            ) {
-                [System.IO.File]::Replace($tempPath, $TargetPath, $BackupPath, $false)
-            }
-            else {
-                # File.Replace requires its backup to share the destination
-                # volume. Copy the previous target first, then atomically swap
-                # the staged file on the target volume.
-                [System.IO.File]::Copy($TargetPath, $BackupPath, $true)
-                [System.IO.File]::Replace($tempPath, $TargetPath, $null, $false)
-            }
-        }
-        else {
-            [System.IO.File]::Move($tempPath, $TargetPath)
-        }
-    }
-    finally {
-        if (Test-Path -LiteralPath $tempPath) {
-            Remove-Item -LiteralPath $tempPath -Force
-        }
-    }
-}
-
-function Restore-CodexBinaryPublish {
-    param(
-        [string]$TargetPath,
-        [string]$BackupPath,
-        [bool]$HadPreviousTarget,
-        [string]$ProofPrefix = ""
-    )
-
-    $rollbackResultKey = if ([string]::IsNullOrWhiteSpace($ProofPrefix)) {
-        "rollbackResult"
-    }
-    else {
-        "${ProofPrefix}RollbackResult"
-    }
-    $targetSha256AfterRollbackKey = if ([string]::IsNullOrWhiteSpace($ProofPrefix)) {
-        "targetSha256AfterRollback"
-    }
-    else {
-        "${ProofPrefix}TargetSha256AfterRollback"
-    }
-
-    if ($HadPreviousTarget) {
-        if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
-            throw "Cannot roll back: backup binary is missing: $BackupPath"
-        }
-
-        [IO.File]::Copy($BackupPath, $TargetPath, $true)
-        Write-ProofLine $rollbackResultKey "restored backup"
-        Write-ProofLine $targetSha256AfterRollbackKey (Get-FileSha256 $TargetPath)
-        return
-    }
-
-    if (Test-Path -LiteralPath $TargetPath -PathType Leaf) {
-        Remove-Item -LiteralPath $TargetPath -Force
-    }
-    Write-ProofLine $rollbackResultKey "removed newly published target"
-}
 
 function Write-CodexPublishTransactionJournal {
     param([object]$Transaction)
@@ -3364,8 +3363,10 @@ $hasExplicitSourceBinary = @(
     $SourceCommandRunnerExe
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
 $sourceBundle = $null
-if ($SkipBuild -and $null -ne $hasExplicitSourceBinary -and [string]::IsNullOrWhiteSpace($SourceBundleManifest)) {
-    throw "Explicit source binaries require -SourceBundleManifest so target, version, bundle identity, and digests are verified."
+# Builds stamp and publish only Cargo's outputs; any other binary must arrive
+# as a digest-verified bundle.
+if ($null -ne $hasExplicitSourceBinary -and [string]::IsNullOrWhiteSpace($SourceBundleManifest)) {
+    throw "Explicit source binaries require -SkipBuild -SourceBundleManifest so target, version, bundle identity, and digests are verified."
 }
 if (-not [string]::IsNullOrWhiteSpace($SourceBundleManifest)) {
     if (-not $SkipBuild) {
@@ -3464,6 +3465,9 @@ if ($TestRun -and $BuildOnly) {
 if ($TestRun -and $SkipBuild) {
     throw "-TestRun cannot be combined with -SkipBuild."
 }
+if ($RuntimeProof -and -not ($DryRun -and $RunDoctor)) {
+    throw "-RuntimeProof only applies to -DryRun -RunDoctor; use -RestartDesktop or -RestartDesktopIfNeeded to prove the Desktop runtime after publishing."
+}
 
 $buildLease = $null
 try {
@@ -3512,7 +3516,6 @@ if ($AutoSkipBuild -and -not $SkipBuild) {
 if (-not $SkipBuild) {
     $buildInputFingerprintBefore = $null
     if (-not $DryRun) {
-        Remove-BuildStamp -StampPath $buildStampPath
         # Reuse the live scan that rejected auto-skip. The independent post-build
         # scan still rejects any input changes before or during compilation.
         $buildInputFingerprintBefore = if ($null -ne $buildInputSnapshotBefore) {
@@ -3522,9 +3525,9 @@ if (-not $SkipBuild) {
             Get-LocalPublishBuildInputFingerprint -RepoRoot $repoRoot
         }
         if (-not (Test-Sha256Text -Value $buildInputFingerprintBefore)) {
-            Write-ProofLine "buildStamp" "disabled: publish input fingerprint unavailable"
-            $buildInputFingerprintBefore = $null
+            throw "Could not fingerprint local publish inputs before the build; refusing to produce an unbound build."
         }
+        Remove-BuildStamp -StampPath $buildStampPath
     }
     Invoke-CodexBuild -RepoRoot $repoRoot -Profile $Profile -DryRun:$DryRun
     if (-not $DryRun -and $null -ne $buildInputFingerprintBefore) {
@@ -3728,6 +3731,7 @@ Write-ProofLine "windowsSandboxSetupTargetBeforeLastWriteUtc" (Format-UtcTimesta
 Write-ProofLine "commandRunnerTargetBeforeLastWriteUtc" (Format-UtcTimestamp $commandRunnerTargetBeforeLastWriteUtc)
 $sourceBuildFreshnessProvenByStamp = $false
 $sourceBuildStampInvalidated = $false
+$sourceBuildStaleByStamp = $false
 if ($SkipBuild -or $sourceBuildStampMustRemainValid) {
     $finalBuildStampDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot `
@@ -3745,6 +3749,11 @@ if ($SkipBuild -or $sourceBuildStampMustRemainValid) {
     elseif ($sourceBuildStampMustRemainValid) {
         $sourceBuildStampInvalidated = $true
     }
+    elseif ($finalBuildStampDecision.StampedArtifactsCurrent) {
+        # These exact artifacts are stamped as the build of other inputs, so
+        # newer artifact timestamps cannot make them current.
+        $sourceBuildStaleByStamp = $true
+    }
 }
 if ($sourceBuildFreshnessProvenByStamp) {
     $codexSourceBuildStale = $false
@@ -3760,12 +3769,12 @@ elseif ($null -ne $sourceBundle) {
     $commandRunnerSourceBuildStale = $false
     Write-ProofLine "sourceBuildFreshnessBasis" "digest-bound source bundle manifest"
 }
-elseif ($sourceBuildStampInvalidated) {
+elseif ($sourceBuildStampInvalidated -or $sourceBuildStaleByStamp) {
     $codexSourceBuildStale = $true
     $codeModeHostSourceBuildStale = $true
     $windowsSandboxSetupSourceBuildStale = $true
     $commandRunnerSourceBuildStale = $true
-    Write-ProofLine "sourceBuildFreshnessBasis" "content-bound build stamp invalidated before publish"
+    Write-ProofLine "sourceBuildFreshnessBasis" $(if ($sourceBuildStampInvalidated) { "content-bound build stamp invalidated before publish" } else { "content-bound build stamp from different publish inputs" })
 }
 else {
     $codexSourceBuildStale = Test-FileStaleAgainstSource `
@@ -4002,6 +4011,9 @@ if ($skipBuildBlockedByStaleSource) {
     Write-ProofLine "restartRequired" "unknown until rebuild"
     if ($sourceBuildStampInvalidated) {
         throw "The content-bound build stamp no longer matches the source bundle at the final publish gate. Rerun just publish-local-codex-final."
+    }
+    if ($sourceBuildStaleByStamp) {
+        throw "SkipBuild cannot publish these source artifacts because their content-bound build stamp records different publish inputs. Run just publish-local-codex-final."
     }
     throw "SkipBuild cannot publish the newest Codex bundle because tracked source files are newer than one or more source artifacts. Run just publish-local-codex-final."
 }

@@ -12,6 +12,7 @@ fn connection_failed() -> CodexErr {
 
 fn unexpected_status(status: StatusCode) -> CodexErr {
     CodexErr::UnexpectedStatus(UnexpectedResponseError {
+        retry_after: None,
         status,
         body: String::new(),
         user_message: None,
@@ -52,7 +53,7 @@ fn transport_fallback_requires_a_transport_class_error() {
         None,
     )));
     assert!(!should_switch_fallback_transport(
-        &CodexErr::InternalServerError
+        &CodexErr::InternalServerError { retry_after: None }
     ));
 }
 
@@ -84,6 +85,7 @@ fn deterministic_4xx_do_not_retry_or_fallback() {
 #[test]
 fn region_restricted_status_skips_every_outer_response_retry() {
     let error = CodexErr::RegionRestricted(UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::FORBIDDEN,
         body: "Cloudflare blocked".to_string(),
         user_message: Some("service unavailable in this region".to_string()),
@@ -199,9 +201,11 @@ async fn server_requested_retry_delay_above_local_backoff_cap_is_preserved() {
     let mut client_session = session.services.model_client.new_session();
     let mut retry_state = ResponsesStreamRetryState::default();
     let cancellation_token = CancellationToken::new();
-    let err = CodexErr::Stream("retry later".to_string(), Some(Duration::from_secs(60)));
-
     tokio::time::pause();
+    let err = CodexErr::Stream(
+        "retry later".to_string(),
+        RetryAfter::from_delay(Duration::from_secs(60)),
+    );
     let started = tokio::time::Instant::now();
     let retry = handle_retryable_response_stream_error(
         &mut retry_state,
@@ -242,12 +246,17 @@ fn local_retry_backoff_remains_bounded() {
     assert!(saturated <= MAX_RESPONSE_STREAM_RETRY_DELAY);
 }
 
-#[test]
-fn server_requested_retry_delay_below_the_ceiling_is_preserved() {
+#[tokio::test(start_paused = true)]
+async fn server_requested_retry_delay_below_the_ceiling_is_preserved() {
     let requested_delay = Duration::from_secs(2);
-    let err = CodexErr::Stream("retry shortly".to_string(), Some(requested_delay));
+    let err = CodexErr::Stream(
+        "retry shortly".to_string(),
+        RetryAfter::from_delay(requested_delay),
+    );
 
     assert_eq!(response_stream_retry_delay(&err, 1), requested_delay);
+    tokio::time::advance(requested_delay).await;
+    assert_eq!(response_stream_retry_delay(&err, 1), Duration::ZERO);
 }
 
 #[tokio::test]
@@ -264,10 +273,13 @@ async fn exhausted_retry_budget_without_fallback_returns_the_error() {
         retries: 5,
         ..Default::default()
     };
+    let advice = RetryAfter::from_delay(Duration::from_secs(30)).unwrap();
     let result = handle_retryable_response_stream_error(
         &mut retry_state,
         5,
-        CodexErr::RequestTimeout,
+        CodexErr::InternalServerError {
+            retry_after: Some(advice),
+        },
         &mut client_session,
         &session,
         &turn_context,
@@ -275,12 +287,46 @@ async fn exhausted_retry_budget_without_fallback_returns_the_error() {
         &CancellationToken::new(),
     )
     .await;
-    assert!(matches!(result, Err(CodexErr::RequestTimeout)));
+    assert_eq!(result.unwrap_err().retry_after(), Some(advice));
     assert_eq!(retry_state.retries, 5);
     assert!(
         events.try_recv().is_err(),
         "exhaustion must not schedule or announce another retry"
     );
+}
+
+#[tokio::test]
+async fn transport_fallback_honors_the_original_retry_after_deadline() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |config| config.model_provider.supports_websockets = true,
+        )
+        .await;
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState::default();
+    tokio::time::pause();
+    let advice = RetryAfter::from_delay(Duration::from_secs(10)).unwrap();
+    let error = unexpected_status(StatusCode::SERVICE_UNAVAILABLE).with_retry_after(Some(advice));
+    tokio::time::advance(Duration::from_secs(4)).await;
+    let started = tokio::time::Instant::now();
+    handle_retryable_response_stream_error(
+        &mut retry_state,
+        0,
+        error,
+        &mut client_session,
+        &session,
+        &turn_context,
+        ResponsesStreamRequest::Sampling,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(6));
+    assert!(!session.services.model_client.responses_websocket_enabled());
 }
 
 #[tokio::test]

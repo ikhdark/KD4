@@ -22,6 +22,7 @@ use crate::tool_history::ToolOutputBudgetDrops;
 use crate::tool_history::item_call_id;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -2202,6 +2203,35 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Option
 
 fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
     match item {
+        ResponseItem::Message { content, .. } => content
+            .iter()
+            .map(|part| match part {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    text_bytes(text)
+                }
+                ContentItem::InputImage { image_url, detail } => {
+                    estimate_image_bytes(image_url, *detail)
+                }
+            })
+            .fold(0i64, i64::saturating_add),
+        ResponseItem::AgentMessage {
+            author,
+            recipient,
+            content,
+            ..
+        } => content
+            .iter()
+            .map(|part| match part {
+                AgentMessageInputContent::InputText { text } => text_bytes(text),
+                AgentMessageInputContent::EncryptedContent { encrypted_content } => i64::try_from(
+                    estimate_encrypted_function_output_length(encrypted_content.len()),
+                )
+                .unwrap_or(i64::MAX),
+            })
+            .fold(
+                text_bytes(author).saturating_add(text_bytes(recipient)),
+                i64::saturating_add,
+            ),
         ResponseItem::Reasoning {
             encrypted_content: Some(content),
             ..
@@ -2214,24 +2244,72 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             encrypted_content: Some(content),
             ..
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
-        item => {
-            let raw = serialized_json_len(item)
-                .map(|serialized_len| i64::try_from(serialized_len).unwrap_or(i64::MAX))
-                .unwrap_or_default();
-            let (image_payload_bytes, image_replacement_bytes) =
-                image_data_url_estimate_adjustment(item);
-            let (encrypted_payload_bytes, encrypted_replacement_bytes) =
-                encrypted_function_output_estimate_adjustment(item);
-            // Replace raw base64 payload bytes with a per-image estimate.
-            // We intentionally preserve the data URL prefix and JSON
-            // wrapper bytes already included in `raw`.
-            let raw = raw
-                .saturating_sub(image_payload_bytes)
-                .saturating_add(image_replacement_bytes);
-            raw.saturating_sub(encrypted_payload_bytes)
-                .saturating_add(encrypted_replacement_bytes)
+        ResponseItem::FunctionCall {
+            name,
+            namespace,
+            arguments: input,
+            ..
         }
+        | ResponseItem::CustomToolCall {
+            name,
+            namespace,
+            input,
+            ..
+        } => text_bytes(name)
+            .saturating_add(text_bytes(namespace.as_deref().unwrap_or("functions")))
+            .saturating_add(text_bytes(input)),
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } => estimate_function_output_bytes(&output.body).saturating_add(text_bytes(call_id)),
+        ResponseItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output,
+            ..
+        } => estimate_function_output_bytes(&output.body)
+            .saturating_add(text_bytes(call_id))
+            .saturating_add(text_bytes(name.as_deref().unwrap_or_default())),
+        // Preserve syntax for structured payloads, but not transport envelopes or escaping.
+        ResponseItem::AdditionalTools { tools, .. }
+        | ResponseItem::ToolSearchOutput { tools, .. } => json_content_bytes(tools),
+        ResponseItem::ToolSearchCall { arguments, .. } => json_content_bytes(arguments),
+        ResponseItem::LocalShellCall { action, .. } => json_content_bytes(action),
+        ResponseItem::WebSearchCall { action, .. } => {
+            action.as_ref().map(json_content_bytes).unwrap_or_default()
+        }
+        ResponseItem::ImageGenerationCall {
+            revised_prompt,
+            result,
+            ..
+        } => text_bytes(revised_prompt.as_deref().unwrap_or_default()).saturating_add(
+            if result.is_empty() {
+                0
+            } else {
+                RESIZED_IMAGE_BYTES_ESTIMATE
+            },
+        ),
+        // Plaintext reasoning and bookkeeping-only items are not replay content.
+        ResponseItem::ContextCompaction {
+            encrypted_content: None,
+            ..
+        }
+        | ResponseItem::Reasoning {
+            encrypted_content: None,
+            ..
+        }
+        | ResponseItem::CompactionTrigger {}
+        | ResponseItem::Other => 0,
     }
+}
+
+fn text_bytes(text: &str) -> i64 {
+    i64::try_from(text.len()).unwrap_or(i64::MAX)
+}
+
+fn json_content_bytes(value: &(impl Serialize + ?Sized)) -> i64 {
+    serialized_json_len(value)
+        .map(|len| i64::try_from(len).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -2256,11 +2334,7 @@ fn serialized_json_len<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<u
     Ok(counter.bytes)
 }
 
-/// Returns the base64 payload byte length for inline image data URLs that are
-/// eligible for token-estimation discounting.
-///
-/// We only discount payloads for `data:image/...;base64,...` URLs (case
-/// insensitive markers) and leave everything else at raw serialized size.
+/// Extracts inline image bytes for the original-detail dimension estimate.
 fn parse_base64_image_data_url(url: &str) -> Option<&str> {
     if !url
         .get(.."data:".len())
@@ -2347,80 +2421,34 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
     })
 }
 
-/// Scans one response item for discount-eligible inline image data URLs and
-/// returns:
-/// - total base64 payload bytes to subtract from raw serialized size
-/// - total replacement byte estimate for those images
-fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
-    let mut payload_bytes = 0i64;
-    let mut replacement_bytes = 0i64;
-
-    let mut accumulate = |image_url: &str, detail: Option<ImageDetail>| {
-        if let Some(payload_len) = parse_base64_image_data_url(image_url).map(str::len) {
-            payload_bytes =
-                payload_bytes.saturating_add(i64::try_from(payload_len).unwrap_or(i64::MAX));
-            replacement_bytes = replacement_bytes.saturating_add(match detail {
-                Some(ImageDetail::Original) => {
-                    estimate_original_image_bytes(image_url).unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)
-                }
-                _ => RESIZED_IMAGE_BYTES_ESTIMATE,
-            });
-        } else if image_url.starts_with("https://") || image_url.starts_with("http://") {
-            // URL images still consume image tokens even though their encoded
-            // pixels are not embedded in the request.
-            replacement_bytes = replacement_bytes.saturating_add(RESIZED_IMAGE_BYTES_ESTIMATE);
+fn estimate_image_bytes(image_url: &str, detail: Option<ImageDetail>) -> i64 {
+    match detail {
+        Some(ImageDetail::Original) => {
+            estimate_original_image_bytes(image_url).unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)
         }
-    };
-
-    match item {
-        ResponseItem::Message { content, .. } => {
-            for content_item in content {
-                if let ContentItem::InputImage { image_url, detail } = content_item {
-                    accumulate(image_url, *detail);
-                }
-            }
-        }
-        ResponseItem::FunctionCallOutput { output, .. }
-        | ResponseItem::CustomToolCallOutput { output, .. } => {
-            if let FunctionCallOutputBody::ContentItems(items) = &output.body {
-                for content_item in items {
-                    if let FunctionCallOutputContentItem::InputImage { image_url, detail } =
-                        content_item
-                    {
-                        accumulate(image_url, *detail);
-                    }
-                }
-            }
-        }
-        _ => {}
+        _ => RESIZED_IMAGE_BYTES_ESTIMATE,
     }
-
-    (payload_bytes, replacement_bytes)
 }
 
-fn encrypted_function_output_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
-    let ResponseItem::FunctionCallOutput { output, .. } = item else {
-        return (0, 0);
-    };
-    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
-        return (0, 0);
-    };
-
-    items.iter().fold((0i64, 0i64), |acc, item| {
-        let FunctionCallOutputContentItem::EncryptedContent { encrypted_content } = item else {
-            return acc;
-        };
-        let payload_bytes = acc
-            .0
-            .saturating_add(i64::try_from(encrypted_content.len()).unwrap_or(i64::MAX));
-        let replacement_bytes = acc.1.saturating_add(
-            i64::try_from(estimate_encrypted_function_output_length(
-                encrypted_content.len(),
-            ))
-            .unwrap_or(i64::MAX),
-        );
-        (payload_bytes, replacement_bytes)
-    })
+fn estimate_function_output_bytes(output: &FunctionCallOutputBody) -> i64 {
+    match output {
+        FunctionCallOutputBody::Text(text) => text_bytes(text),
+        FunctionCallOutputBody::ContentItems(items) => items
+            .iter()
+            .map(|part| match part {
+                FunctionCallOutputContentItem::InputText { text } => text_bytes(text),
+                FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+                    estimate_image_bytes(image_url, *detail)
+                }
+                FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
+                    i64::try_from(estimate_encrypted_function_output_length(
+                        encrypted_content.len(),
+                    ))
+                    .unwrap_or(i64::MAX)
+                }
+            })
+            .fold(0i64, i64::saturating_add),
+    }
 }
 
 fn is_model_generated_item(item: &ResponseItem) -> bool {

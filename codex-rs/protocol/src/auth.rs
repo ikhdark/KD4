@@ -70,6 +70,7 @@ impl PlanType {
             "plus" => Self::Known(KnownPlan::Plus),
             "pro" => Self::Known(KnownPlan::Pro),
             "prolite" => Self::Known(KnownPlan::ProLite),
+            "promax" => Self::Known(KnownPlan::ProMax),
             "team" => Self::Known(KnownPlan::Team),
             "self_serve_business_prolite" => Self::Known(KnownPlan::SelfServeBusinessProLite),
             "self_serve_business_usage_based" => {
@@ -94,6 +95,7 @@ pub enum KnownPlan {
     Plus,
     Pro,
     ProLite,
+    ProMax,
     Team,
     #[serde(rename = "self_serve_business_prolite")]
     SelfServeBusinessProLite,
@@ -117,8 +119,9 @@ impl KnownPlan {
             Self::Free => "Free",
             Self::Go => "Go",
             Self::Plus => "Plus",
-            Self::Pro => "Pro",
-            Self::ProLite => "Pro Lite",
+            Self::Pro => "Pro (More)",
+            Self::ProLite => "Pro",
+            Self::ProMax => "Pro (Max)",
             Self::Team => "Team",
             Self::SelfServeBusinessProLite => "Self Serve Business ProLite",
             Self::SelfServeBusinessUsageBased => "Self Serve Business Usage Based",
@@ -138,6 +141,7 @@ impl KnownPlan {
             Self::Plus => "plus",
             Self::Pro => "pro",
             Self::ProLite => "prolite",
+            Self::ProMax => "promax",
             Self::Team => "team",
             Self::SelfServeBusinessProLite => "self_serve_business_prolite",
             Self::SelfServeBusinessUsageBased => "self_serve_business_usage_based",
@@ -195,6 +199,27 @@ mod tests {
     use super::KnownPlan;
     use super::PlanType;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn pro_plans_use_expected_wire_and_display_names() {
+        for (raw, known, display) in [
+            ("prolite", KnownPlan::ProLite, "Pro"),
+            ("pro", KnownPlan::Pro, "Pro (More)"),
+            ("promax", KnownPlan::ProMax, "Pro (Max)"),
+        ] {
+            let plan = PlanType::Known(known);
+            assert_eq!(PlanType::from_raw_value(raw), plan);
+            assert_eq!(PlanType::from_raw_value(&raw.to_ascii_uppercase()), plan);
+            assert_eq!(
+                serde_json::from_value::<PlanType>(serde_json::json!(raw)).unwrap(),
+                plan
+            );
+            assert_eq!(serde_json::to_value(&plan).unwrap(), serde_json::json!(raw));
+            assert_eq!(known.raw_value(), raw);
+            assert_eq!(known.display_name(), display);
+            assert!(!known.is_workspace_account());
+        }
+    }
 
     #[test]
     fn plan_type_deserializes_raw_aliases() {

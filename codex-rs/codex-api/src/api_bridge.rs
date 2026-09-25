@@ -32,10 +32,11 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             status: None,
             request_id: None,
         }),
-        ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
+        ApiError::ServerOverloaded { retry_after } => CodexErr::ServerOverloaded { retry_after },
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
             map_unexpected_response(UnexpectedResponseError {
+                retry_after: None,
                 status,
                 body: message,
                 user_message,
@@ -54,6 +55,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 url,
                 headers,
                 body,
+                retry_after,
             } => {
                 let body_text = body.unwrap_or_default();
 
@@ -62,7 +64,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     && let Some(classified) =
                         crate::responses_stream::classify_provider_error(error)
                 {
-                    return map_api_error(classified);
+                    return map_api_error(classified).with_retry_after(retry_after);
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
@@ -86,7 +88,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         CodexErr::InvalidRequest(body_text)
                     }
                 } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
-                    CodexErr::InternalServerError
+                    CodexErr::InternalServerError { retry_after }
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
                     if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
                         if err.error.error_type.as_deref() == Some("usage_limit_reached") {
@@ -118,11 +120,13 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     }
 
                     CodexErr::RetryLimit(RetryLimitReachedError {
+                        retry_after,
                         status,
                         request_id: extract_request_tracking_id(headers.as_ref()),
                     })
                 } else {
                     map_unexpected_response(UnexpectedResponseError {
+                        retry_after,
                         status,
                         user_message: api_error_user_message(status, &body_text),
                         body: body_text,
@@ -138,6 +142,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 }
             }
             TransportError::RetryLimit => CodexErr::RetryLimit(RetryLimitReachedError {
+                retry_after: None,
                 status: http::StatusCode::INTERNAL_SERVER_ERROR,
                 request_id: None,
             }),

@@ -5091,20 +5091,6 @@ fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDe
         .iter()
         .map(|value| value.to_ascii_lowercase())
         .collect::<Vec<_>>();
-    if lower
-        .iter()
-        .any(|value| value.ends_with("source_owners.py"))
-    {
-        return [
-            "source_owners.toml",
-            "architecture_index.json",
-            "SOURCEMAP.md",
-            "scripts/source_owners.py",
-        ]
-        .into_iter()
-        .map(|path| SourceDependencyV1::new(&cwd.join(path), false))
-        .collect();
-    }
     let is_test = (program == "cargo"
         && lower
             .get(1)

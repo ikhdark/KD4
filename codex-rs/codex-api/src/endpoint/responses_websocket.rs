@@ -734,6 +734,7 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
         WsError::Http(response) => {
             let status = response.status();
             let headers = response.headers().clone();
+            let retry_after = codex_http_client::RetryAfter::from_headers(&headers);
             let body = response
                 .body()
                 .as_ref()
@@ -743,6 +744,7 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
                 url: Some(url.to_string()),
                 headers: Some(headers),
                 body,
+                retry_after,
             })
         }
         WsError::ConnectionClosed | WsError::AlreadyClosed => {
@@ -789,6 +791,10 @@ fn map_wrapped_websocket_error_event(
         headers,
         ..
     } = event;
+    let headers = headers.as_ref().map(json_headers_to_http_headers);
+    let retry_after = headers
+        .as_ref()
+        .and_then(codex_http_client::RetryAfter::from_headers);
 
     if let Some(error) = error.as_ref()
         && let Some(code) = error.code.as_deref()
@@ -805,7 +811,7 @@ fn map_wrapped_websocket_error_event(
                 .message
                 .clone()
                 .unwrap_or_else(|| fallback_message.to_string()),
-            delay: None,
+            delay: retry_after,
         });
     }
 
@@ -817,8 +823,9 @@ fn map_wrapped_websocket_error_event(
     Some(ApiError::Transport(TransportError::Http {
         status,
         url: None,
-        headers: headers.as_ref().map(json_headers_to_http_headers),
+        headers,
         body: Some(original_payload),
+        retry_after,
     }))
 }
 
@@ -2075,8 +2082,8 @@ mod tests {
         assert!(config.extensions.permessage_deflate.is_some());
     }
 
-    #[test]
-    fn parse_wrapped_websocket_error_event_maps_to_transport_http() {
+    #[tokio::test(start_paused = true)]
+    async fn parse_wrapped_websocket_error_event_maps_to_transport_http() {
         let payload = json!({
             "type": "error",
             "status": 429,
@@ -2088,7 +2095,8 @@ mod tests {
             },
             "headers": {
                 "x-codex-primary-used-percent": "100.0",
-                "x-codex-primary-window-minutes": 15
+                "x-codex-primary-window-minutes": 15,
+                "retry-after": "7"
             }
         })
         .to_string();
@@ -2098,10 +2106,12 @@ mod tests {
         let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
             .expect("expected websocket error payload to map to ApiError");
 
+        let expected_deadline = tokio::time::Instant::now() + Duration::from_secs(7);
         let ApiError::Transport(TransportError::Http {
             status,
             headers,
             body,
+            retry_after,
             ..
         }) = api_error
         else {
@@ -2109,6 +2119,7 @@ mod tests {
         };
 
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after.unwrap().deadline(), expected_deadline);
         let headers = headers.expect("expected headers");
         assert_eq!(
             headers

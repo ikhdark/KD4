@@ -16,7 +16,6 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import median
 from typing import Any, BinaryIO, Sequence
 
 try:
@@ -82,6 +81,7 @@ class ScenarioResult:
     samples: tuple[Sample, ...]
     cold_ms: float | None
     warm_p50_ms: float | None
+    warm_p95_ms: float | None
     p50_ms: float | None
     p95_ms: float | None
     min_ms: float | None
@@ -276,6 +276,7 @@ def measure_scenario(
             samples=(),
             cold_ms=None,
             warm_p50_ms=None,
+            warm_p95_ms=None,
             p50_ms=None,
             p95_ms=None,
             min_ms=None,
@@ -322,11 +323,17 @@ def measure_scenario(
             )
             break
 
-    elapsed = [sample.elapsed_ms for sample in samples]
     passed = len(samples) == count and all(sample.exit_code == 0 for sample in samples)
+    # A failed invocation times failure handling, not the scenario: it stays in
+    # samples but never enters statistics. The loop stops at the first failure,
+    # so successful samples are a prefix and the first one is the cold run.
+    elapsed = [sample.elapsed_ms for sample in samples if sample.exit_code == 0]
     warm = elapsed[1:]
     p50_ms, p95_ms, min_ms, max_ms = (
         _ordered_sample_statistics(elapsed) if elapsed else (None, None, None, None)
+    )
+    warm_p50_ms, warm_p95_ms = (
+        _ordered_sample_statistics(warm)[:2] if warm else (None, None)
     )
     return ScenarioResult(
         name=scenario.name,
@@ -338,7 +345,8 @@ def measure_scenario(
         reason=reason,
         samples=tuple(samples),
         cold_ms=elapsed[0] if elapsed else None,
-        warm_p50_ms=round(median(warm), 3) if warm else None,
+        warm_p50_ms=round(warm_p50_ms, 3) if warm_p50_ms is not None else None,
+        warm_p95_ms=round(warm_p95_ms, 3) if warm_p95_ms is not None else None,
         p50_ms=round(p50_ms, 3) if p50_ms is not None else None,
         p95_ms=round(p95_ms, 3) if p95_ms is not None else None,
         min_ms=min_ms,
@@ -498,7 +506,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"[{result.status.upper()}] {name}: "
                 f"first_invocation={result.cold_ms}ms warm_p50={result.warm_p50_ms}ms "
-                f"p95={result.p95_ms}ms"
+                f"warm_p95={result.warm_p95_ms}ms"
             )
 
     failed = [result.name for result in results if result.status == "failed"]

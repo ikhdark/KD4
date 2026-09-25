@@ -56,6 +56,7 @@ pub fn install_builtin_extensions(
     codex_mcp_extension::install(builder);
     codex_mcp_extension::install_executor_plugins(builder, Arc::clone(&environment_manager));
     codex_web_search_extension::install(builder, Arc::clone(&auth_manager));
+    codex_history_notes_extension::install(builder, Arc::clone(&auth_manager));
     codex_image_generation_extension::install(builder, auth_manager, |config: &Config| {
         Some(config.codex_home.clone())
     });
@@ -105,11 +106,11 @@ mod tests {
         );
 
         let registry = builder.build();
-        assert_eq!(registry.thread_lifecycle_contributors().len(), 3);
-        assert_eq!(registry.config_contributors().len(), 3);
-        assert_eq!(registry.context_contributors().len(), 1);
+        assert_eq!(registry.thread_lifecycle_contributors().len(), 4);
+        assert_eq!(registry.config_contributors().len(), 4);
+        assert_eq!(registry.context_contributors().len(), 2);
         assert_eq!(registry.turn_input_contributors().len(), 1);
-        assert_eq!(registry.tool_contributors().len(), 3);
+        assert_eq!(registry.tool_contributors().len(), 4);
         assert_eq!(
             registry
                 .mcp_server_contributors()

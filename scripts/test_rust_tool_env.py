@@ -11,6 +11,35 @@ from scripts import rust_tool_env
 
 
 class RustToolEnvTest(unittest.TestCase):
+    def test_local_defaults_are_idempotent_and_preserve_explicit_overrides(
+        self,
+    ) -> None:
+        env = {"CODEX_SCCACHE_CACHE_SIZE": "100G"}
+        which = lambda name: f"/tools/{name}"
+        updates = rust_tool_env.local_rust_env(env, repo_root=Path.cwd(), which=which)
+        self.assertEqual(updates["RUSTC_WRAPPER"], "/tools/sccache")
+        self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "100G")
+        self.assertEqual(
+            updates["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"], "/tools/lld-link"
+        )
+        self.assertEqual(
+            rust_tool_env.local_rust_env(
+                env | updates, repo_root=Path.cwd(), which=which
+            ),
+            {},
+        )
+        explicit = {
+            "RUSTC_WRAPPER": "",
+            "CARGO_INCREMENTAL": "1",
+            "RUSTFLAGS": "custom",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER": "custom-link",
+            "SCCACHE_CACHE_SIZE": "4G",
+        }
+        self.assertFalse(
+            set(rust_tool_env.local_rust_env(explicit, which=which)) & set(explicit)
+        )
+        self.assertEqual(rust_tool_env.local_rust_env({"CI": "1"}, which=which), {})
+
     def test_just_shell_loads_shared_policy_outside_the_repository(self) -> None:
         just_shell = Path(__file__).with_name("just-shell.py").resolve()
         with tempfile.TemporaryDirectory() as temp:

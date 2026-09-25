@@ -294,10 +294,18 @@ UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
 # same-stem test file. Keep that routing explicit so changed PowerShell
 # helpers and shared Python utilities do not receive syntax-only validation.
 SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
+    "codex-cli/scripts/build_npm_package.py": ("scripts.test_stage_npm_packages",),
+    "codex-rs/config/scripts/generate-proto.ps1": (
+        "scripts.test_generate_config_proto",
+    ),
+    "codex-rs/scripts/nextest_windows_stack.py": ("scripts.test_build_tooling_policy",),
+    "codex-rs/scripts/setup-windows.ps1": ("scripts.test_build_tooling",),
     "scripts/app_server_schema_runtime_check.py": ("scripts.test_dev_environment",),
     "scripts/build_codex_package.py": ("scripts.test_stage_npm_packages",),
+    "scripts/cargo-lane-patterns.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
+    "scripts/cargo-workspace-analyzer.ps1": ("scripts.test_build_tooling_policy",),
     "scripts/common-rust-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/codex_package/rg": (
         "scripts.codex_package.test_dotslash",
@@ -329,6 +337,7 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/process_owner.py": ("scripts.test_report_script_regressions",),
     "scripts/rust_build_status.py": ("scripts.test_build_tooling_storage",),
     "scripts/rust_build_status_support.py": ("scripts.test_build_tooling_storage",),
+    "scripts/run-python.js": ("scripts.test_build_tooling_policy",),
     "scripts/rust_packages.py": ("scripts.test_build_tooling_policy",),
     "scripts/sccache-perf.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/stage_npm_packages.py": ("scripts.test_stage_npm_packages",),
@@ -490,7 +499,9 @@ def test_modules_for_changed_path(path_text: str) -> tuple[str, ...]:
     if path is None:
         return tuple(selected)
     if path.name.lower().startswith("test_"):
-        selected.append(python_test_target(path))
+        # A deleted test module cannot be imported; only surviving tests run.
+        if (REPO_ROOT / path).is_file():
+            selected.append(python_test_target(path))
     else:
         adjacent = path.with_name(f"test_{path.stem}.py")
         if (REPO_ROOT / adjacent).is_file():
@@ -518,10 +529,14 @@ def changed_production_script_requires_test(path_text: str) -> bool:
     path = repository_relative_path(path_text)
     if path is None:
         return False
+    absolute = REPO_ROOT / path
+    # A deleted script has no behavior left to verify; any surviving explicit
+    # route is still selected by test_modules_for_changed_path.
+    if not absolute.exists():
+        return False
     path_key = path.as_posix()
     if path_key in SCRIPT_TEST_MODULES:
         return True
-    absolute = REPO_ROOT / path
     if not any(
         root == absolute.parent or root in absolute.parents
         for root in SCRIPT_AUDIT_ROOTS

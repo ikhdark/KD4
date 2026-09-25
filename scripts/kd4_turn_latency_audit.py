@@ -259,8 +259,6 @@ def _source_discovery_event(
         operations.append("search")
     if _SOURCE_DISCOVERY_READ_PATTERN.search(source):
         operations.append("read")
-    if re.search(r"(?i)source_owners\.py\s+slice\b", source):
-        operations.append("owner_slice")
     if not operations:
         return None
 
@@ -273,12 +271,6 @@ def _source_discovery_event(
     evidence: list[str] = []
     if any(path.casefold().endswith("agents.md") for path in requested_paths):
         evidence.append("instructions")
-    if "owner_slice" in operations or any(
-        path.casefold() in {"sourcemap.md", "source_owners.toml"}
-        or path.casefold().endswith("/source_owners.py")
-        for path in requested_paths + result_paths
-    ):
-        evidence.append("ownership")
     combined_paths = requested_paths + result_paths
     if any(
         re.search(r"(?:^|/)(?:tests?|test_[^/]+|[^/]+_tests?)(?:/|\.|$)", path, re.I)
@@ -296,7 +288,7 @@ def _source_discovery_event(
     ) or any(
         term in path.casefold()
         for path in combined_paths
-        for term in ("schema", "protocol", "sourcemap.md")
+        for term in ("schema", "protocol")
     ):
         evidence.append("contracts")
 
@@ -398,28 +390,7 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
                     "ordinal": first_search["ordinal"],
                 }
             )
-        owner_slices = [
-            event for event in turn_events if "owner_slice" in event["operations"]
-        ]
-        broad_map_reads = [
-            event
-            for event in turn_events
-            if any(
-                path.casefold() == "sourcemap.md" for path in event["requestedPaths"]
-            )
-        ]
-        if broad_map_reads and (
-            not owner_slices
-            or broad_map_reads[0]["ordinal"] < owner_slices[0]["ordinal"]
-        ):
-            signals.append(
-                {
-                    "code": "broad_source_map_before_owner_slice",
-                    "turnId": turn_id,
-                    "ordinal": broad_map_reads[0]["ordinal"],
-                }
-            )
-        for evidence_kind in ("ownership", "callers", "tests", "contracts"):
+        for evidence_kind in ("callers", "tests", "contracts"):
             evidence_events = [
                 event for event in turn_events if evidence_kind in event["evidence"]
             ]
@@ -489,6 +460,20 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
             "command after literal decoding within one turn; only excess occurrences count."
         ),
     }
+
+
+def _interval_union(intervals: Iterable[tuple[int, int]]) -> int:
+    """Wall time covered by possibly overlapping [start, end) intervals."""
+    covered = 0
+    covered_end: int | None = None
+    for start, end in sorted(intervals):
+        if covered_end is None or start > covered_end:
+            covered += max(0, end - start)
+            covered_end = end
+        elif end > covered_end:
+            covered += end - covered_end
+            covered_end = end
+    return covered
 
 
 def _reported_runtime_seconds(output: str) -> tuple[list[float], float | None]:
@@ -600,7 +585,6 @@ def _command_orchestration_report(records: list[dict[str, Any]]) -> dict[str, An
 def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
     coverage = report["coverage"]
     population = report["populations"]["all"]
-    command_orchestration = report["commandOrchestration"]
     tool_relay = report.get("toolRelay", {})
     phases = {
         "orchestration": int(population.get("orchestrationNs", 0)),
@@ -655,7 +639,15 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
         if representative_evidence:
             reasons.append("repeated_model_decision_latency")
     elif dominant_phase == "tool":
-        representative_evidence = command_orchestration["slowToolCallCount"] >= 2
+        # The dominant phase comes from valid terminal turns; slow calls from
+        # open, invalid, or untimed turns are not evidence for it.
+        representative_evidence = (
+            sum(
+                int(turn["commandOrchestration"]["slowToolCallCount"])
+                for turn in report.get("perTurn", [])
+            )
+            >= 2
+        )
         if representative_evidence:
             reasons.append("repeated_slow_tool_execution")
     else:
@@ -820,11 +812,7 @@ def _apply_detailed_tool_timing(
             return
 
         round_trip_ns = max(0, model_visible_at - accepted_at) * 1_000_000
-        covered_ms = 0
-        covered_end = accepted_at
-        for start, end in sorted(intervals):
-            covered_ms += max(0, end - max(start, covered_end))
-            covered_end = max(covered_end, end)
+        covered_ms = _interval_union(intervals)
         orchestration_gap_ns = max(0, round_trip_ns - covered_ms * 1_000_000)
         complete = reported_child_calls == len(process_calls)
         record.update(
@@ -919,6 +907,7 @@ def _latency_breakdown(
     }
     model_requests = population["decisionLatency"]["physicalAttempts"]
     logical_generations = int(population.get("logicalGenerations", 0))
+    requested_generations = int(population.get("requestedGenerations", 0))
     return {
         "orchestration": {
             "exclusiveTotalNs": orchestration_ns,
@@ -956,9 +945,11 @@ def _latency_breakdown(
                 "streamProcessingNs": int(population.get("modelStreamProcessingNs", 0)),
             },
             "logicalGenerations": logical_generations,
+            "generationsWithRequests": requested_generations,
             "physicalAttempts": model_requests,
+            # Generations that never dispatched would otherwise offset retries.
             "retryAttempts": (
-                max(0, model_requests - logical_generations)
+                max(0, model_requests - requested_generations)
                 if model_requests is not None
                 else None
             ),
@@ -1383,6 +1374,7 @@ def analyze_session_path(
     source_discovery_events: list[dict[str, Any]] = []
     execution_loop_counts: collections.Counter[str] = collections.Counter()
     execution_loop_ns: collections.Counter[str] = collections.Counter()
+    paired_tool_intervals: list[tuple[int, int]] = []
     first_timestamp_ns: int | None = None
     last_timestamp_ns: int | None = None
     native_events: list[dict[str, Any]] = []
@@ -1447,14 +1439,18 @@ def analyze_session_path(
                         "type": item.get("type"),
                         "payload": {
                             key: payload[key]
-                            for key in ("type", "name", "execution")
+                            for key in ("type", "name", "execution", "turn_id")
                             if key in payload
                         }
                         | (
                             {
                                 "timing": {
                                     key: payload["timing"].get(key)
-                                    for key in ("schemaVersion", "milestones")
+                                    for key in (
+                                        "schemaVersion",
+                                        "profileValid",
+                                        "milestones",
+                                    )
                                 }
                             }
                             if isinstance(payload.get("timing"), dict)
@@ -1536,6 +1532,9 @@ def analyze_session_path(
                         round_trip_ns = max(0, timestamp_ns - started_ns)
                         execution_loop_counts["pairedToolCalls"] += 1
                         execution_loop_ns["pairedToolRoundTripNs"] += round_trip_ns
+                        paired_tool_intervals.append(
+                            (started_ns, started_ns + round_trip_ns)
+                        )
                         last_tool_output_ns = max(
                             last_tool_output_ns or timestamp_ns, timestamp_ns
                         )
@@ -1693,6 +1692,13 @@ def analyze_session_path(
             0,
             execution_loop_counts["toolCalls"]
             - execution_loop_counts["pairedToolCalls"],
+        ),
+        # pairedToolRoundTripNs sums per-call round trips; parallel calls
+        # overlap, so wall time with any paired call in flight is the union.
+        **(
+            {"pairedToolRoundTripUnionNs": _interval_union(paired_tool_intervals)}
+            if paired_tool_intervals
+            else {}
         ),
         "recordSpanNs": (
             last_timestamp_ns - first_timestamp_ns
@@ -1916,7 +1922,9 @@ def render_report(report: dict[str, Any]) -> str:
             f"multi-call passes={execution_loop.get('multiToolCallSamplingPasses', 0)}/"
             f"{execution_loop.get('samplingPassesWithTools', 0)}; "
             f"sampling-to-call={execution_loop.get('samplingToFirstToolCallNs', 0) / 1e9:.1f}s "
-            f"tool-round-trip={execution_loop.get('pairedToolRoundTripNs', 0) / 1e9:.1f}s "
+            f"tool-round-trip per-call-sum="
+            f"{execution_loop.get('pairedToolRoundTripNs', 0) / 1e9:.1f}s "
+            f"wall-union={execution_loop.get('pairedToolRoundTripUnionNs', 0) / 1e9:.1f}s "
             f"handoff={execution_loop.get('postToolHandoffNs', 0) / 1e9:.1f}s"
         )
     orchestration = report["commandOrchestration"]
@@ -1925,6 +1933,7 @@ def render_report(report: dict[str, Any]) -> str:
             "command orchestration: "
             f"{orchestration['reportedChildRuntimeCalls']}/"
             f"{orchestration['pairedToolCalls']} paired calls with child runtime; "
+            f"per-call sums (parallel calls overlap): "
             f"round-trip={orchestration['roundTripNs'] / 1e9:.1f}s "
             f"child-work={orchestration['reportedChildWorkNs'] / 1e9:.1f}s "
             f"persisted-gap={orchestration['orchestrationGapLowerBoundNs'] / 1e9:.1f}-"
@@ -1959,7 +1968,7 @@ def render_report(report: dict[str, Any]) -> str:
             f"{relay['nestedCalls']} nested; "
             f"{relay['timingOverflowCalls']} overflow); "
             f"batched={relay['batchedCalls']} calls in {relay['batchGroups']} generations; "
-            f"queue={phases.get('itemToFirstPollMs', 0) / 1e3:.1f}s "
+            f"per-call sums: queue={phases.get('itemToFirstPollMs', 0) / 1e3:.1f}s "
             f"gate={phases.get('parallelGateWaitMs', 0) / 1e3:.1f}s "
             f"handler={phases.get('handlerDurationMs', 0) / 1e3:.1f}s "
             f"process={phases.get('processRuntimeMs', 0) / 1e3:.1f}s "
@@ -2105,7 +2114,8 @@ def render_report(report: dict[str, Any]) -> str:
         f"request-wait={request_phases['requestWaitNs'] / 1e9:.1f}s "
         f"stream-wait={request_phases['streamWaitNs'] / 1e9:.1f}s "
         f"stream-processing={request_phases['streamProcessingNs'] / 1e9:.1f}s; "
-        f"generations/attempts/retries={model_breakdown['logicalGenerations']}/"
+        f"generations/requested/attempts/retries={model_breakdown['logicalGenerations']}/"
+        f"{model_breakdown.get('generationsWithRequests', 'n/a')}/"
         f"{model_breakdown['physicalAttempts']}/{model_breakdown['retryAttempts']}; "
         f"actionable={decision_latency['totalNs'] / 1e9:.1f}s "
         f"coverage={decision_latency['decisionReadyAttempts']}/"
@@ -2457,7 +2467,10 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "startToUsefulToolEmittedMs"
             ]
         },
-        "exclusions": first_useful["exclusions"],
+        # Nonzero only; the full report keeps the complete exclusion vocabulary.
+        "exclusions": {
+            key: count for key, count in first_useful["exclusions"].items() if count
+        },
     }
     latency_breakdown = report["latencyBreakdown"]
     orchestration_breakdown = latency_breakdown["orchestration"]

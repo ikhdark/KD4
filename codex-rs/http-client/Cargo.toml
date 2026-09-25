@@ -10,6 +10,7 @@ codex-utils-der = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+httpdate = { workspace = true }
 opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = [
     "blocking",
@@ -52,6 +53,7 @@ opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 
 [lib]

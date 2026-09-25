@@ -282,6 +282,9 @@ impl Session {
         let model_client = self.services.model_client.clone();
         let session_telemetry = self.services.session_telemetry.clone();
         let startup_timing = Arc::clone(&self.startup_timing);
+        let config = self.get_config().await;
+        let thread_config = self.thread_config_snapshot().await;
+        let models_manager = Arc::clone(&self.services.models_manager);
         let responses_metadata = CodexResponsesMetadata::new(
             self.installation_id.clone(),
             self.thread_id.to_string(),
@@ -290,9 +293,24 @@ impl Session {
         );
         let task = tokio::spawn(async move {
             let _preconnect = startup_timing.begin_phase(StartupPhase::TransportPreconnect);
+            // Resolve routing without building a turn context or waiting for tool discovery.
+            // The thread snapshot includes the tier inherited by spawned agents.
+            let model_info = models_manager
+                .get_model_info(&thread_config.model, &config.to_models_manager_config())
+                .await;
+            let service_tier = crate::session::get_service_tier(
+                thread_config.service_tier,
+                config.features.enabled(Feature::FastMode),
+                &model_info,
+            );
             let mut client_session = model_client.new_speculative_session();
             let result = client_session
-                .preconnect_websocket(&session_telemetry, &responses_metadata)
+                .preconnect_websocket(
+                    &model_info,
+                    service_tier,
+                    &session_telemetry,
+                    &responses_metadata,
+                )
                 .await;
             startup_timing.record_prewarm_status(if result.is_ok() {
                 "transport_ready"

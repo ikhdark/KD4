@@ -15,8 +15,8 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 codex-api = { workspace = true }
-http = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
 pretty_assertions = { workspace = true }

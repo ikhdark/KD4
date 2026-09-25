@@ -73,7 +73,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ("environment_id".to_string(), JsonSchema::string(Some("Environment id; omit to use the primary environment.".to_string()))),
                 ("selectors".to_string(), selectors),
             ]), Some(vec!["path".to_string()]), Some(false.into())),
-            output_schema: Some(output),
+            output_schema: Some(output.into()),
         })
     }
 
@@ -575,7 +575,7 @@ mod tests {
                 );
                 assert!(result["artifact_id"].as_str().is_some());
             }
-            jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+            jsonschema::validator_for(&spec.output_schema.as_ref().unwrap().to_value())
                 .unwrap()
                 .validate(&result)
                 .unwrap();
@@ -720,7 +720,7 @@ mod tests {
             let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
                 panic!("function tool")
             };
-            jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+            jsonschema::validator_for(&spec.output_schema.as_ref().unwrap().to_value())
                 .unwrap()
                 .validate(&result)
                 .unwrap();
@@ -755,7 +755,7 @@ mod tests {
         let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
             panic!("function tool expected")
         };
-        jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+        jsonschema::validator_for(&spec.output_schema.as_ref().unwrap().to_value())
             .unwrap()
             .validate(&result)
             .unwrap();
@@ -808,7 +808,7 @@ mod tests {
         let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
             panic!("function tool expected")
         };
-        jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+        jsonschema::validator_for(&spec.output_schema.as_ref().unwrap().to_value())
             .unwrap()
             .validate(&result)
             .unwrap();
@@ -910,7 +910,7 @@ mod tests {
         let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
             panic!("function tool expected")
         };
-        jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
+        jsonschema::validator_for(&spec.output_schema.as_ref().unwrap().to_value())
             .unwrap()
             .validate(&result)
             .unwrap();

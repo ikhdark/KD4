@@ -115,6 +115,10 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        if !matches!(self.overlay, Some(Overlay::Transcript(_))) {
+            self.overlay_forward_event(tui, event)?;
+            return Ok(true);
+        }
         if self.backtrack.overlay_preview_active {
             match event {
                 TuiEvent::Key(KeyEvent {
@@ -284,6 +288,7 @@ impl App {
 
     /// Close transcript overlay and restore normal UI.
     pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        tui.set_mouse_capture(false)?;
         tui.leave_alt_screen()?;
         let was_backtrack = self.backtrack.overlay_preview_active;
         if !self.deferred_history_lines.is_empty() {
@@ -293,7 +298,10 @@ impl App {
                 self.history_line_wrap_policy(),
             );
         }
-        self.overlay = None;
+        if let Some(Overlay::Analytics(mut view)) = self.overlay.take() {
+            view.cancel_loads();
+            self.retained_analytics = Some(view);
+        }
         self.backtrack.overlay_preview_active = false;
         tui.frame_requester().schedule_frame();
         if was_backtrack {

@@ -36,7 +36,7 @@ fn augment_tool_spec_for_code_mode_augments_function_tools() {
                     "ok": {"type": "boolean"}
                 },
                 "required": ["ok"],
-            })),
+            }).into()),
         })),
         ToolSpec::Function(ResponsesApiTool {
             name: "lookup_order".to_string(),
@@ -63,7 +63,7 @@ declare const tools: { lookup_order(args: { order_id: string; }, options?: { tim
                     "ok": {"type": "boolean"}
                 },
                 "required": ["ok"],
-            })),
+            }).into()),
         })
     );
 }

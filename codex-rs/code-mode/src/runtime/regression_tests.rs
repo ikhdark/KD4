@@ -66,6 +66,7 @@ async fn pending_checks_do_not_collect_writes_and_response_heap_does_not_accumul
     let RuntimeEvent::ToolCall { mut id, .. } = next(&mut rx).await else { panic!("tool call"); };
     let baseline = inspect(&tx).await;
     assert_ne!(baseline.stored_payload_address, 0);
+    assert!(baseline.stored_payload_shared, "store must share its immutable payload");
     assert_eq!(baseline.completion_collections, 0);
     for _ in 0..64 {
         tx.send(RuntimeCommand::ToolResponse { id, result: json!({"data": "r".repeat(1_000_000)}) }).unwrap();

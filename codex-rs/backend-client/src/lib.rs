@@ -1,4 +1,13 @@
+mod analytics_session;
 mod client;
+pub use analytics_session::{AnalyticsAccount, AnalyticsSession};
+pub use client::analytics::{AnalyticsReport, AnalyticsResponse};
+pub use client::profile::{AccountProfile, ProfileIdentity, ProfileInvocation, ProfileInvocationKind, ProfileMetadata, ProfileStats};
+pub use client::plan_history::{PlanLimitBreakdown, PlanLimitDimension, PlanLimitHistory, PlanLimitPeriod, PlanLimitValue};
+pub use client::task_usage::{TaskCredits, TaskUsage, TaskUsageAmounts, TaskUsageGroup, TaskUsageResponse, TaskUsageStatus, TaskUsageThread};
+pub use client::thread_usage::{ThreadUsage, ThreadUsageBreakdownGroup};
+pub use types::{AccountEntry, AccountsCheckResponse};
+pub use codex_backend_openapi_models::models::analytics as analytics_models;
 pub(crate) mod types;
 
 pub use client::AddCreditsNudgeCreditType;

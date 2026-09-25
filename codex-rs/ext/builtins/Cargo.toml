@@ -19,6 +19,7 @@ codex-exec-server = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-features = { workspace = true }
 codex-goal-extension = { workspace = true }
+codex-history-notes-extension = { workspace = true }
 codex-image-generation-extension = { workspace = true }
 codex-login = { workspace = true }
 codex-mcp-extension = { workspace = true }

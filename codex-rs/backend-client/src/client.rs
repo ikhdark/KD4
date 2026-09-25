@@ -34,6 +34,11 @@ use serde::de::DeserializeOwned;
 use std::fmt;
 
 mod rate_limit_resets;
+pub(crate) mod analytics;
+pub(crate) mod plan_history;
+pub(crate) mod profile;
+pub(crate) mod task_usage;
+pub(crate) mod thread_usage;
 
 const MAX_DIAGNOSTIC_BODY_BYTES: usize = 8 * 1024;
 
@@ -162,6 +167,26 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
+    /// Account analytics must never forward credentials through a redirect.
+    pub fn new_without_redirects(base_url: impl Into<String>, http_client_factory: HttpClientFactory) -> Self {
+        let mut client = Self::new(base_url, http_client_factory.clone());
+        client.http = RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_redirects_or_request_logging(
+            http_client_factory,
+            ClientRouteClass::Api,
+        );
+        client
+    }
+
+    pub async fn get_accounts_check(&self) -> std::result::Result<crate::types::AccountsCheckResponse, RequestError> {
+        let url = self.endpoint_url(match self.path_style {
+            PathStyle::CodexApi => "/api/codex/accounts/check",
+            PathStyle::ChatGptApi => "/wham/accounts/check",
+        });
+        let request = self.request(Method::GET, &url).headers(self.headers()?);
+        let (body, _) = self.exec_request_detailed(request, "GET", &url).await?;
+        serde_json::from_str(&body).map_err(|_| RequestError::Other(anyhow::anyhow!("Invalid accounts response.")))
+    }
+
     pub fn new(base_url: impl Into<String>, http_client_factory: HttpClientFactory) -> Self {
         let mut base_url = base_url.into();
         if let Ok(mut parsed) = url::Url::parse(&base_url) {
@@ -683,6 +708,7 @@ impl Client {
             crate::types::PlanType::Plus => AccountPlanType::Plus,
             crate::types::PlanType::Pro => AccountPlanType::Pro,
             crate::types::PlanType::ProLite => AccountPlanType::ProLite,
+            crate::types::PlanType::ProMax => AccountPlanType::ProMax,
             crate::types::PlanType::Team => AccountPlanType::Team,
             crate::types::PlanType::SelfServeBusinessProLite => {
                 AccountPlanType::SelfServeBusinessProLite

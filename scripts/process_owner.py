@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import codecs
 import contextlib
 import ctypes
@@ -9,11 +10,13 @@ import os
 import queue
 import signal
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class Operation:
@@ -360,3 +363,58 @@ def run_finite(
         tail.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n"),
         total > output_limit,
     )
+
+
+def _cancel_after_exit(pid, owned):
+    from ctypes import wintypes as w
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    api.OpenProcess.restype = w.HANDLE
+    api.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+    api.WaitForSingleObject.restype = w.DWORD
+    handle = api.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if handle:
+        api.WaitForSingleObject(handle, 0xFFFFFFFF)  # INFINITE
+    owned.cancelled.set()
+
+
+def main(argv=None):
+    """Run one command as an owned process tree (used by cargo-lane.ps1)."""
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        help="Windows: stop the command's tree once this process exits.",
+    )
+    parser.add_argument(
+        "--cleanup-failed-marker",
+        type=Path,
+        help="Write this file if the tree's exit cannot be confirmed.",
+    )
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        parser.error("a command is required after --")
+    with operation() as owned:
+        if args.parent_pid is not None:
+            threading.Thread(
+                target=_cancel_after_exit, args=(args.parent_pid, owned), daemon=True
+            ).start()
+        try:
+            return run_owned(command, stdout=sys.stdout, stderr=sys.stderr).returncode
+        except CleanupFailed:
+            if args.cleanup_failed_marker is not None:
+                args.cleanup_failed_marker.write_text(
+                    "Process cleanup was not confirmed; inspect descendants "
+                    "before removing this quarantine.\n"
+                )
+            raise
+        except CancelledError:
+            # The parent is gone and run_owned has already stopped the tree.
+            return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

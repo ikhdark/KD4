@@ -94,17 +94,28 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 self.assertEqual("format checked" in result.output, expected_calls == 2)
 
     def test_recipe_startup_does_not_restart_shared_sccache(self):
+        # Probing or restarting the shared server at startup would interrupt
+        # compilations owned by concurrent recipes; spawn nothing before them.
         shell = load_just_shell_module()
         with (
+            tempfile.TemporaryDirectory() as cache_dir,
             mock.patch.object(sys, "argv", ["just-shell.py", "cargo check"]),
+            mock.patch.object(shell, "probe_cache_dir", return_value=Path(cache_dir)),
             mock.patch.object(shell, "python_tool_env", return_value={}),
             mock.patch.object(shell, "rust_tool_env", return_value={}),
             mock.patch.object(shell, "run_powershell", return_value=7),
-            mock.patch.object(shell, "ensure_sccache_server_env") as restart,
-            mock.patch.dict(os.environ),
+            mock.patch.object(shell.subprocess, "Popen") as spawn,
+            # A configured sccache wrapper is exactly what a startup probe targets.
+            mock.patch.dict(
+                os.environ,
+                {
+                    "RUSTC_WRAPPER": str(Path(cache_dir) / "sccache.exe"),
+                    "SCCACHE_CACHE_SIZE": "80G",
+                },
+            ),
         ):
             self.assertEqual(shell.main(), 7)
-        restart.assert_not_called()
+        spawn.assert_not_called()
 
     def test_just_shell_limits_rust_setup_to_rust_commands(self) -> None:
         just_shell = load_just_shell_module()
@@ -202,179 +213,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertNotIn("RUSTC_WRAPPER", updates)
         self.assertNotIn("SCCACHE_BASEDIR", updates)
         self.assertNotIn("SCCACHE_CACHE_SIZE", updates)
-
-    def test_local_just_shell_restarts_stale_sccache_server_cache_size(self) -> None:
-        just_shell = load_just_shell_module()
-        calls = []
-        stats_calls = 0
-
-        def fake_run(command, **_kwargs):
-            nonlocal stats_calls
-            calls.append(command)
-            stdout = ""
-            if command[1:] == ["--show-stats"]:
-                stats_calls += 1
-                size = "10 GiB" if stats_calls == 1 else "80 GiB"
-                stdout = f"Max cache size                       {size}\n"
-            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
-
-        restarted = just_shell.ensure_sccache_server_env(
-            {
-                "RUSTC_WRAPPER": "/tools/sccache",
-                "SCCACHE_CACHE_SIZE": "80G",
-            },
-            which=lambda program: f"/tools/{program}" if program == "sccache" else None,
-            run=fake_run,
-        )
-
-        self.assertTrue(restarted)
-        self.assertEqual(
-            calls,
-            [
-                ["/tools/sccache", "--show-stats"],
-                ["/tools/sccache", "--stop-server"],
-                ["/tools/sccache", "--start-server"],
-                ["/tools/sccache", "--show-stats"],
-            ],
-        )
-
-    def test_local_just_shell_compares_sccache_sizes_by_bytes(self) -> None:
-        just_shell = load_just_shell_module()
-
-        expected_sizes = {
-            "512M": "512 MiB",
-            "1T": "1 TiB",
-            "80GB": "80 GiB",
-            "80GiB": "80 GiB",
-            "1024G": "1 TiB",
-        }
-        for configured, reported in expected_sizes.items():
-            with self.subTest(configured=configured):
-                calls = []
-
-                def fake_run(command, *, calls=calls, reported=reported, **_kwargs):
-                    calls.append(command)
-                    return subprocess.CompletedProcess(
-                        command,
-                        0,
-                        stdout=f"Max cache size                       {reported}\n",
-                        stderr="",
-                    )
-
-                restarted = just_shell.ensure_sccache_server_env(
-                    {
-                        "RUSTC_WRAPPER": "/tools/sccache",
-                        "SCCACHE_CACHE_SIZE": configured,
-                    },
-                    which=lambda program: (
-                        f"/tools/{program}" if program == "sccache" else None
-                    ),
-                    run=fake_run,
-                )
-
-                self.assertFalse(restarted)
-                self.assertEqual(calls, [["/tools/sccache", "--show-stats"]])
-
-    def test_local_just_shell_does_not_cache_failed_sccache_restart(self) -> None:
-        just_shell = load_just_shell_module()
-        calls = []
-
-        def fake_run(command, **_kwargs):
-            calls.append(command)
-            if command[1:] == ["--show-stats"]:
-                return subprocess.CompletedProcess(
-                    command,
-                    0,
-                    stdout="Max cache size                       10 GiB\n",
-                    stderr="",
-                )
-            return subprocess.CompletedProcess(
-                command,
-                9 if command[1:] == ["--start-server"] else 0,
-                stdout="",
-                stderr="",
-            )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            restarted = just_shell.ensure_sccache_server_env(
-                {
-                    "RUSTC_WRAPPER": "/tools/sccache",
-                    "SCCACHE_CACHE_SIZE": "80G",
-                },
-                which=lambda program: (
-                    f"/tools/{program}" if program == "sccache" else None
-                ),
-                run=fake_run,
-                cache_dir=Path(tmp),
-            )
-            self.assertFalse(restarted)
-            first_calls = list(calls)
-            calls.clear()
-            restarted = just_shell.ensure_sccache_server_env(
-                {
-                    "RUSTC_WRAPPER": "/tools/sccache",
-                    "SCCACHE_CACHE_SIZE": "80G",
-                },
-                which=lambda program: (
-                    f"/tools/{program}" if program == "sccache" else None
-                ),
-                run=fake_run,
-                cache_dir=Path(tmp),
-            )
-            self.assertEqual(calls, [])
-            self.assertFalse(restarted)
-            with mock.patch.object(
-                just_shell.time, "time", return_value=time.time() + 31
-            ):
-                restarted = just_shell.ensure_sccache_server_env(
-                    {"RUSTC_WRAPPER": "/tools/sccache", "SCCACHE_CACHE_SIZE": "80G"},
-                    which=lambda _: "/tools/sccache",
-                    run=fake_run,
-                    cache_dir=Path(tmp),
-                )
-            self.assertEqual(calls, first_calls)
-
-        self.assertFalse(restarted)
-        self.assertEqual(calls[-1], ["/tools/sccache", "--start-server"])
-
-    def test_local_just_shell_caches_matching_sccache_server_cache_size(self) -> None:
-        just_shell = load_just_shell_module()
-        calls = []
-
-        def fake_run(command, **_kwargs):
-            calls.append(command)
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout="Max cache size                       80 GiB\n",
-                stderr="",
-            )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            env = {
-                "RUSTC_WRAPPER": "/tools/sccache",
-                "SCCACHE_CACHE_SIZE": "80G",
-            }
-            first = just_shell.ensure_sccache_server_env(
-                env,
-                which=lambda program: (
-                    f"/tools/{program}" if program == "sccache" else None
-                ),
-                run=fake_run,
-                cache_dir=Path(tmp),
-            )
-            second = just_shell.ensure_sccache_server_env(
-                env,
-                which=lambda program: (
-                    f"/tools/{program}" if program == "sccache" else None
-                ),
-                run=fake_run,
-                cache_dir=Path(tmp),
-            )
-
-        self.assertFalse(first)
-        self.assertFalse(second)
-        self.assertEqual(calls, [["/tools/sccache", "--show-stats"]])
 
     def test_ci_does_not_override_rust_wrapper_or_linker(self) -> None:
         just_shell = load_just_shell_module()
@@ -889,10 +727,10 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         nextest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
 
         self.assertIn(
-            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast',
+            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\\scripts\\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast @forwarded_args',
             justfile,
         )
-        self.assertEqual(nextest["profile"]["default"]["test-threads"], 4)
+        self.assertEqual(nextest["profile"]["default"]["test-threads"], 2)
         local_profile = nextest["profile"]["local"]
         self.assertEqual(local_profile["inherits"], "default")
         self.assertEqual(local_profile["retries"], 0)
@@ -927,7 +765,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )[0]
         self.assertIn('$env:NEXTEST_PROFILE = "fast"', no_sccache_recipe)
         self.assertIn(
-            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast --timings=html,json',
+            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\\scripts\\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast --timings @forwarded_args',
             justfile,
         )
         self.assertNotIn("changed-validation", justfile)
@@ -965,12 +803,14 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         cargo_config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertEqual(cargo_config["build"]["jobs"], 8)
+        self.assertEqual(cargo_config["build"]["jobs"], 2)
         self.assertEqual(
             cargo_config["env"]["RUST_TEST_THREADS"],
-            {"value": "16", "force": False},
+            {"value": "2", "force": False},
         )
-        self.assertIn('rust_parallelism := "8"', justfile)
+        nextest_config = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
+        self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 2)
+        self.assertIn('rust_parallelism := "2"', justfile)
         self.assertIn(
             'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
             justfile,
@@ -989,7 +829,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         targets = cargo_config["target"]
         msvc_flags = targets['cfg(all(windows, target_env = "msvc"))']["rustflags"]
-        arm64_flags = targets["aarch64-pc-windows-msvc"]["rustflags"]
         self.assertEqual(
             msvc_flags,
             [
@@ -999,12 +838,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 "target-feature=+crt-static",
             ],
         )
-        self.assertEqual(arm64_flags, ["-C", "link-arg=/arm64hazardfree"])
-
-        effective_arm64_flags = [*msvc_flags, *arm64_flags]
-        self.assertEqual(effective_arm64_flags.count("link-arg=/STACK:8388608"), 1)
-        self.assertEqual(effective_arm64_flags.count("target-feature=+crt-static"), 1)
-        self.assertEqual(effective_arm64_flags.count("link-arg=/arm64hazardfree"), 1)
+        # ARM64 links with lld-link like x64, so it takes exactly the shared
+        # MSVC flags; lld-link rejects link.exe-only /arm64hazardfree.
+        self.assertNotIn("aarch64-pc-windows-msvc", targets)
 
     def test_cargo_audit_policy_is_wired_and_synchronized(self) -> None:
         audit = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "audit.toml")
@@ -1027,7 +863,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             "toolchain"
         ]
 
-        self.assertEqual(toolchain["channel"], "1.95.0")
+        self.assertEqual(toolchain["channel"], "1.98.1")
         self.assertEqual(toolchain["components"], ["clippy", "rustfmt", "rust-src"])
         self.assertNotIn("profile", toolchain)
         self.assertNotIn("targets", toolchain)

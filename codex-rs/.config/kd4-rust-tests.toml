@@ -18,6 +18,8 @@ version = 1
 # `codex_utils_cargo_bin::cargo_bin`, which reads `CARGO_BIN_EXE_*`. The runner
 # builds exactly the helpers declared by the selected target into the active
 # lane's target directory and exports both the dashed and underscored aliases.
+# Every helper a run does not declare is exported as a missing path, so
+# `cargo_bin` cannot fall back to an older build left in the persistent lane.
 # ---------------------------------------------------------------------------
 
 [helpers.codex]
@@ -64,11 +66,13 @@ helpers = [
 # These modules use pure data or the in-process session fixture. Unknown test
 # modules retain the conservative helper set above. Nextest resolves filters.
 [targets.core_lib.helpers_by_test_prefix]
+# These suites use data-only checks or the in-process session/Code Mode fixture.
+"context_manager::history::tests::" = []
+"tools::handlers::tool_search::tests::" = []
+"tools::handlers::mcp::search_tests::" = []
+"tools::handlers::shell_spec::tests::" = []
 "tools::command_output_artifact::tests::" = []
 "tools::handlers::read_tool_output::tests::" = []
-"tools::handlers::semantic_context::tests::" = []
-"tools::handlers::workspace_validation::tests::" = []
-"tools::handlers::context_checkpoint::tests::" = []
 "tools::handlers::apply_patch_retries::tests::" = []
 "tools::handlers::apply_patch::tests::" = []
 "tools::spec_plan::tests::" = []
@@ -76,13 +80,27 @@ helpers = [
 "compact_remote::tests::" = []
 "compact_remote_v2::tests::" = []
 "plan_store::tests::" = []
+"responses_retry::tests::" = []
 "session::rollout_reconstruction_tests::" = []
+"session::token_budget::tests::" = []
+"session::token_budget::runtime_tests::" = []
 "tool_history::tests::" = []
+
+[targets.history_notes_lib]
+package = "codex-history-notes-extension"
+lib = true
+helpers = []
+
+[targets.backend_client_lib]
+package = "codex-backend-client"
+lib = true
+helpers = []
 
 [targets.available_skills_instructions]
 package = "codex-core"
 test = "available_skills_instructions"
-helpers = ["codex", "codex-code-mode-host"]
+# Pure rendering checks; this target never builds a `test_codex()` session.
+helpers = []
 
 [targets.responses_headers]
 package = "codex-core"
@@ -126,7 +144,7 @@ helpers = [
 [targets.core_thread_state]
 package = "codex-core"
 test = "core_thread_state"
-helpers = ["codex", "codex-code-mode-host", "test_stdio_server"]
+helpers = ["codex", "codex-code-mode-host"]
 
 [targets.core_transport_telemetry]
 package = "codex-core"
@@ -180,6 +198,35 @@ tests = [
 # `check-gates` explicitly verifies discovery without running tests or helpers.
 # ---------------------------------------------------------------------------
 
+[gates.core-retry-output]
+description = "Response retry and cancellation-atomic output regressions without unrelated helper builds."
+
+[[gates.core-retry-output.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "responses_retry::tests::response_stream_retries_transport_timeouts",
+  "responses_retry::tests::sampling_stream_error_keeps_its_outer_retry",
+  "responses_retry::tests::transport_fallback_requires_a_transport_class_error",
+  "responses_retry::tests::unauthorized_status_skips_every_outer_response_retry",
+  "responses_retry::tests::deterministic_4xx_do_not_retry_or_fallback",
+  "responses_retry::tests::region_restricted_status_skips_every_outer_response_retry",
+  "responses_retry::tests::first_stream_read_failure_switches_to_https_with_bounded_remaining_retries",
+  "responses_retry::tests::server_requested_retry_delay_above_local_backoff_cap_is_preserved",
+  "responses_retry::tests::local_retry_backoff_remains_bounded",
+  "responses_retry::tests::server_requested_retry_delay_below_the_ceiling_is_preserved",
+  "responses_retry::tests::exhausted_retry_budget_without_fallback_returns_the_error",
+  "responses_retry::tests::transport_fallback_honors_the_original_retry_after_deadline",
+  "responses_retry::tests::retry_backoff_is_cancelled_by_owner",
+  "responses_retry::tests::lost_connection_on_a_sampling_turn_waits_instead_of_spending_the_retry_budget",
+  "responses_retry::tests::connection_recovery_wait_is_limited_to_user_facing_sampling_turns",
+  "responses_retry::tests::connection_retry_delay_backs_off_and_is_bounded",
+  "responses_retry::tests::connection_recovery_reaches_https_fallback_without_exhausting_network_waits",
+  "responses_retry::tests::batch_and_subagent_sources_do_not_opt_into_unlimited_recovery",
+  "responses_retry::tests::audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_transport",
+  "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
+]
+
 [gates.config-schema-protocol]
 description = "Config schema fixture parity without regenerating generated output."
 
@@ -231,11 +278,6 @@ tests = [
 package = "codex-app-server"
 bin = "codex-app-server"
 
-[targets.extension_registry]
-package = "codex-extension-api"
-test = "registry"
-helpers = []
-
 [targets.shell_command_lib]
 package = "codex-shell-command"
 lib = true
@@ -256,25 +298,27 @@ package = "codex-agent-task-store"
 lib = true
 helpers = []
 
-[gates.capability-extension-boundary-core]
-description = "Reuse ToolContributor, ToolLifecycleContributor, and ContextContributor before adding KD4-only hooks."
-[[gates.capability-extension-boundary-core.steps]]
-target = "extension_registry"
-tests = ["build_round_trips_every_contributor_category"]
-helpers = []
-
 [gates.capability-structured-command-execution]
 description = "Script and argv command shapes with untagged legacy compatibility; explicitly tagged legacy input is rejected."
 [[gates.capability-structured-command-execution.steps]]
 target = "core_lib"
-tests = ["tools::handlers::command_shape::command_shape_tests::tagged_script_is_canonical_and_tagged_legacy_is_rejected"]
+# Parser contract plus both handler boundaries: shell argv exec params and exec_command decoding.
+tests = [
+  "tools::handlers::command_shape::command_shape_tests::tagged_script_is_canonical_and_tagged_legacy_is_rejected",
+  "tools::handlers::shell::tests::shell_command_handler_preserves_structured_argv_shape",
+  "tools::handlers::unified_exec::tests::exec_command_boundary_normalizes_unambiguous_legacy_forms",
+]
 helpers = []
 
 [gates.capability-command-preflight]
 description = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
 [[gates.capability-command-preflight.steps]]
 target = "core_lib"
-tests = ["tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos"]
+# The off-state test proves the declared features.kd4_runtime switch controls preflight.
+tests = [
+  "tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos",
+  "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
+]
 helpers = []
 
 [gates.capability-kd4-turn-execution]
@@ -288,6 +332,7 @@ tests = [
     "session::turn::tests::passing_focused_validation_keeps_the_second_change_executable",
     "session::turn::tests::repeated_failed_read_preserves_a_different_required_action",
     "session::turn::tests::legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not",
+    "tools::handlers::multi_agents::tests::kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents",
 ]
 [[gates.capability-kd4-turn-execution.steps]]
 target = "core_transport_telemetry"
@@ -334,7 +379,11 @@ tests = ["suite::code_mode::code_mode_can_return_exec_command_output"]
 description = "Bounded failure-focused output on classic and unified execution paths."
 [[gates.capability-shell-output-summary.steps]]
 target = "core_lib"
-tests = ["tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines"]
+# The context test proves exec tool output reaches the model through the summarizer.
+tests = [
+  "tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines",
+  "tools::context::tests::exec_command_tool_output_summarizes_and_links_retained_raw_output",
+]
 helpers = []
 
 [gates.capability-command-attempt-ledger]
@@ -348,15 +397,21 @@ helpers = []
 description = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
 [[gates.capability-command-output-artifacts.steps]]
 target = "core_lib"
-tests = ["tools::handlers::unified_exec::tests::foreground_output_artifact_retains_bytes_beyond_transcript_cap"]
-# The fixture runs Python directly and uses in-process code mode.
+tests = [
+  "tools::handlers::unified_exec::tests::foreground_output_artifact_retains_bytes_beyond_transcript_cap",
+  "tools::handlers::unified_exec::tests::kd4_latency_unpolled_background_failure_retires_live_metadata",
+]
+# The fixtures run Python directly and use in-process code mode.
 helpers = []
 
 [gates.capability-preferred-powershell-host]
 description = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
 [[gates.capability-preferred-powershell-host.steps]]
 target = "shell_command_lib"
-tests = ["shell_detect::tests::powershell_resolver_prefers_pwsh_then_compatibility_host"]
+tests = [
+  "shell_detect::tests::explicit_powershell_host_overrides_preference_order",
+  "shell_detect::tests::powershell_resolver_prefers_pwsh_then_compatibility_host",
+]
 helpers = []
 
 [gates.capability-app-server-runtime-provenance]
@@ -379,12 +434,22 @@ description = "Human-readable configuration reference exposed through codex conf
 target = "cli_bin"
 tests = ["tests::config_explain_parses_optional_filter"]
 helpers = []
+# Parsing alone is syntax; the rendered, filtered reference is the behavior.
+[[gates.capability-config-explain.steps]]
+target = "config_lib"
+tests = ["config_explain::tests::filters_config_reference_by_option_name"]
+helpers = []
 
 [gates.capability-shared-worktree-reliability]
 description = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
 [[gates.capability-shared-worktree-reliability.steps]]
 target = "agent_task_store_lib"
 tests = ["tests::completed_receipt_rejects_workspace_change_after_validation"]
+helpers = []
+# Core shell and unified-exec events must record mutation evidence in the store.
+[[gates.capability-shared-worktree-reliability.steps]]
+target = "core_lib"
+tests = ["tools::events::tests::shell_and_unified_exec_finalize_typed_mutation_evidence"]
 helpers = []
 
 [gates.search-scope-regressions]
@@ -453,7 +518,20 @@ helpers = []
 [targets.tui_lib]
 package = "codex-tui"
 lib = true
-helpers = []
+# `session_archive_commands` tests spawn the CLI as their app-server subprocess.
+helpers = ["codex"]
+
+# Only `session_archive_commands` resolves a helper binary; these modules hold
+# most of the suite and need none.
+[targets.tui_lib.helpers_by_test_prefix]
+"chatwidget::" = []
+"bottom_pane::" = []
+"app::" = []
+"analytics::" = []
+"history_cell::" = []
+"markdown_render::" = []
+"resume_picker::" = []
+"keymap::" = []
 
 [targets.pty_lib]
 package = "codex-utils-pty"
@@ -537,7 +615,6 @@ tests = [
 [[gates.windows-process.steps]]
 target = "windows_sandbox_lib"
 tests = [
-  "unified_exec::tests::legacy_capture_cancellation_terminates_descendants_without_timeout",
   "windows_impl::tests::process_wait_failure_is_not_treated_as_exit",
 ]
 
@@ -553,6 +630,7 @@ description = "Exact test contract for the tui-large-widget recipe."
 
 [[gates.tui-large-widget.steps]]
 target = "tui_lib"
+helpers = []
 tests = [
   "bottom_pane::chat_composer::tests::footer_collapse_snapshots",
   "bottom_pane::chat_composer::tests::handle_paste_large_uses_placeholder_and_replaces_on_submit",
@@ -688,10 +766,10 @@ tests = [
   "tools::shell_output_summary::tests::validation_summary_keeps_typescript_and_npm_errors_outside_tail",
   "tools::shell_output_summary::tests::summary_declines_output_that_would_grow",
   "tools::shell_output_summary::optimization_tests::selection_storage_is_bounded_for_large_logs",
-  "tools::shell_output_summary::optimization_tests::line_classification_reuses_normalization_without_retaining_previous_signals",
+  "tools::shell_output_summary::optimization_tests::line_classification_is_case_insensitive_without_retained_scratch",
   "tools::shell_output_summary::optimization_tests::selection_flags_emit_each_index_once_in_source_order",
   "context_manager::history::tests::prepared_prompt_truncation_releases_large_discarded_storage",
-  "context_manager::history::tests::tool_search_compaction_preserves_metadata_and_nested_identities",
+  "context_manager::history::tests::tool_search_acknowledgement_preserves_full_schema_bytes",
   "context_manager::history::tests::idless_token_estimates_are_cached_and_invalidated_on_rewrite",
   "context_manager::history::tests::prepared_token_estimates_cache_existing_items_and_only_measure_appends",
   "context_manager::history::tests::total_token_usage_caches_raw_items_without_reusing_projected_estimates",
@@ -716,17 +794,16 @@ helpers = []
 
 [gates.audit-docs-26-30-integration]
 description = "Failure continuation, restored-tool quarantine, and single review projection."
+# These tests build `test_codex()` sessions, which resolve codex-code-mode-host
+# (CodeModeHost is on by default); keep each shard's declared helpers.
 [[gates.audit-docs-26-30-integration.steps]]
 target = "core_exec_permissions"
-helpers = []
 tests = ["suite::unified_exec::exec_command_fast_success_and_failure_lifecycles_finish_inline"]
 [[gates.audit-docs-26-30-integration.steps]]
 target = "core_thread_state"
-helpers = []
 tests = ["suite::sqlite_state::resume_quarantines_invalid_dynamic_tools_from_rollout"]
 [[gates.audit-docs-26-30-integration.steps]]
 target = "core_agents_review"
-helpers = []
 tests = ["suite::review::review_history_surfaces_in_parent_session", "suite::review::review_op_emits_lifecycle_and_review_output"]
 
 [targets.goal_extension_backend]

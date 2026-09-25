@@ -790,7 +790,7 @@ fn output_just_over_budget_keeps_most_lines_after_diagnostic_pruning() {
         .map(|index| format!("{index:03}: let value_{index} = compute(input_{index}, &mut state);"))
         .collect::<Vec<_>>();
     lines[111] = "warning: in the working copy of 'README.md', CRLF will be replaced by LF".into();
-    lines[113] = "SOURCEMAP.md:242: declared owner has no repository source: .github".into();
+    lines[113] = "README.md:242: declared path has no repository source: .github".into();
     let output = lines.join("\n");
     let limit = codex_utils_string::approx_token_count(&output) * 9 / 10;
 
@@ -798,7 +798,7 @@ fn output_just_over_budget_keeps_most_lines_after_diagnostic_pruning() {
         &output,
         1,
         false,
-        options(Some("python scripts/source_map_check.py"), Some(limit)),
+        options(Some("python scripts/check_docs.py"), Some(limit)),
     )
     .expect("failed output over its budget is summarized");
 

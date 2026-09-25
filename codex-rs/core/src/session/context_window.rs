@@ -12,6 +12,7 @@ pub(crate) struct ContextWindowTokenStatus {
     pub(crate) auto_compact_window_prefill_tokens: Option<i64>,
     pub(crate) full_context_window_limit_reached: bool,
     pub(crate) token_limit_reached: bool,
+    pub(crate) base_window_tokens_remaining: Option<i64>,
 }
 
 struct BodyAfterPrefixWindowStatus {
@@ -83,17 +84,39 @@ async fn context_window_token_status_for_pressure(
                 )
             }
         };
+    let token_budget_enabled = turn_context
+        .config
+        .features
+        .enabled(codex_features::Feature::TokenBudget);
     let full_context_window_limit = body_window
         .as_ref()
-        .and_then(|window| window.full_context_window_limit);
+        .and_then(|window| window.full_context_window_limit)
+        .or_else(|| {
+            token_budget_enabled
+                .then(|| turn_context.model_context_window())
+                .flatten()
+        });
     let auto_compact_window_prefill_tokens = body_window
         .as_ref()
         .and_then(|window| window.auto_compact_window_prefill_tokens);
     let full_context_window_limit_reached =
         full_context_window_limit.is_some_and(|limit| pressure_context_tokens >= limit);
-    let soft_limit_reached =
-        auto_compact_scope_limit.is_some_and(|limit| auto_compact_scope_tokens >= limit);
+    let fallback_buffer = if token_budget_enabled {
+        turn_context
+            .config
+            .token_budget
+            .as_ref()
+            .map_or(0, |config| config.fallback_buffer_tokens())
+    } else {
+        0
+    };
+    let soft_limit_reached = auto_compact_scope_limit
+        .is_some_and(|limit| auto_compact_scope_tokens >= limit.saturating_add(fallback_buffer));
     let token_limit_reached = soft_limit_reached || full_context_window_limit_reached;
+    let base_window_tokens_remaining = remaining_tokens(
+        auto_compact_scope_limit.map(|limit| limit.saturating_sub(auto_compact_scope_tokens)),
+        full_context_window_limit.map(|limit| limit.saturating_sub(pressure_context_tokens)),
+    );
 
     ContextWindowTokenStatus {
         active_context_tokens,
@@ -103,5 +126,14 @@ async fn context_window_token_status_for_pressure(
         auto_compact_window_prefill_tokens,
         full_context_window_limit_reached,
         token_limit_reached,
+        base_window_tokens_remaining,
+    }
+}
+
+fn remaining_tokens(soft: Option<i64>, physical: Option<i64>) -> Option<i64> {
+    match (soft, physical) {
+        (Some(soft), Some(physical)) => Some(soft.min(physical).max(0)),
+        (Some(tokens), None) | (None, Some(tokens)) => Some(tokens.max(0)),
+        (None, None) => None,
     }
 }

@@ -243,8 +243,20 @@ def stage_python_runtime_package(
         pyproject_text = _rewrite_runtime_platform_tag(pyproject_text, platform_tag)
     pyproject_path.write_text(pyproject_text)
 
-    _extract_codex_package_archive(package_archive, staged_runtime_package_root(staging_dir))
+    runtime_package_root = staged_runtime_package_root(staging_dir)
+    _extract_codex_package_archive(package_archive, runtime_package_root)
+    _require_codex_package_version(runtime_package_root, package_archive, package_version)
     return staging_dir
+
+
+def _require_codex_package_version(package_dir: Path, package_archive: Path, version: str) -> None:
+    """Reject archives whose canonical metadata names a different Codex version."""
+    metadata = json.loads((package_dir / CODEX_PACKAGE_METADATA).read_text(encoding="utf-8"))
+    archive_version = metadata.get("version") if isinstance(metadata, dict) else None
+    if not isinstance(archive_version, str) or normalize_codex_version(archive_version) != version:
+        raise RuntimeError(
+            f"{package_archive} contains Codex version {archive_version!r}; expected {version}"
+        )
 
 
 def _extract_codex_package_archive(package_archive: Path, runtime_package_root: Path) -> None:

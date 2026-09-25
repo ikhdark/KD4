@@ -244,7 +244,7 @@ async fn registered_user_input_output_schema_covers_answers_empty_and_interrupte
     let codex_tools::ToolSpec::Function(spec) = spec else {
         panic!("user input uses a function spec");
     };
-    let validator = jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+    let validator = jsonschema::validator_for(&spec.output_schema.as_ref().expect("output schema").to_value())
         .expect("valid user input output schema");
     for expected in [
         json!({"answers":{"pick_one":{"answers":["B"]}},"interrupted":false}),

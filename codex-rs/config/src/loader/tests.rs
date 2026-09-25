@@ -700,7 +700,7 @@ async fn session_feature_tables_from_newer_clients_do_not_block_config_loading()
                 TomlValue::Boolean(true),
             ),
             (
-                "features.token_budget".to_string(),
+                "features.future_structured_feature".to_string(),
                 toml::toml! { enabled = true }.into(),
             ),
             (
@@ -718,7 +718,7 @@ async fn session_feature_tables_from_newer_clients_do_not_block_config_loading()
     assert_eq!(features.get("unified_exec"), Some(&false));
     assert_eq!(features.get("goals"), Some(&false));
     assert!(!features.contains_key("tool_registry"));
-    assert!(!features.contains_key("token_budget"));
+    assert!(!features.contains_key("future_structured_feature"));
     assert_eq!(std::fs::read_to_string(config_path).unwrap(), saved_config);
 }
 

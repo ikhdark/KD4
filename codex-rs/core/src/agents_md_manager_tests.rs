@@ -530,14 +530,19 @@ async fn step_refresh_captures_environments_after_entering_refresh_gate() {
         .acquire()
         .await
         .expect("refresh gate should remain open");
-    let mut refresh = Box::pin(manager.refresh_for_step(&config, &thread_environments));
+    let mut refresh = Box::pin(manager.refresh_for_step(
+        &config,
+        &thread_environments,
+        |snapshot| async move { snapshot.generation },
+    ));
 
     assert!(futures::poll!(refresh.as_mut()).is_pending());
     thread_environments.update_selections(&[]);
     drop(refresh_guard);
 
-    let (environments, observation) = refresh.await;
+    let (environments, observation, prepared_generation) = refresh.await;
     assert_eq!(environments.generation, initial_generation + 1);
+    assert_eq!(prepared_generation, environments.generation);
     assert!(environments.turn_environments.is_empty());
     assert!(observation.loaded.is_none());
     assert_eq!(observation.freshness, AgentsMdFreshness::Refreshed);
@@ -546,6 +551,156 @@ async fn step_refresh_captures_environments_after_entering_refresh_gate() {
         cache.key.as_ref().map(|key| key.environment_generation),
         Some(initial_generation + 1)
     );
+}
+
+#[tokio::test]
+async fn step_refresh_overlaps_preparation_and_finishes_after_preparation_failure() {
+    let root = tempfile::tempdir().expect("workspace");
+    fs::write(root.path().join("AGENTS.md"), "fresh instructions").unwrap();
+    let config = Arc::new(config_for(&root).await);
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let thread_environments = ThreadEnvironments::new(
+        Arc::new(EnvironmentManager::default_for_tests()),
+        default_user_shell(),
+        ShellSnapshot::disabled(),
+        environment_snapshot_with_environment(&config.cwd, 3, environment),
+        /*non_blocking_snapshots*/ false,
+    );
+    let manager = AgentsMdManager::new(None);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    filesystem.set_next_project_read(NextProjectRead::Block {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+
+    let (snapshot, observation, prepared) = timeout(
+        REFRESH_TIMEOUT,
+        manager.refresh_for_step(&config, &thread_environments, |snapshot| async move {
+            started.notified().await;
+            assert_eq!(snapshot.generation, 3);
+            release.notify_one();
+            Err::<(), _>("preparation failed")
+        }),
+    )
+    .await
+    .expect("preparation must unblock instruction reading before its timeout");
+
+    assert_eq!(snapshot.generation, 3);
+    assert_eq!(prepared, Err("preparation failed"));
+    assert_eq!(observation.freshness, AgentsMdFreshness::Refreshed);
+    assert!(
+        observation
+            .loaded
+            .unwrap()
+            .text()
+            .contains("fresh instructions")
+    );
+    assert!(manager.refresh_gate.try_acquire().is_ok());
+}
+
+#[tokio::test]
+async fn step_refresh_timeout_keeps_preparation_scope_and_releases_gate() {
+    let root = tempfile::tempdir().expect("workspace");
+    fs::write(root.path().join("AGENTS.md"), "cached instructions").unwrap();
+    let config = Arc::new(config_for(&root).await);
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
+    let manager = AgentsMdManager::new(None);
+    let cached = manager
+        .refresh_and_observe_shared(&config, &environments)
+        .await;
+    let thread_environments = ThreadEnvironments::new(
+        Arc::new(EnvironmentManager::default_for_tests()),
+        default_user_shell(),
+        ShellSnapshot::disabled(),
+        environments,
+        /*non_blocking_snapshots*/ false,
+    );
+    let started = Arc::new(Notify::new());
+    filesystem.set_next_project_read(NextProjectRead::Block {
+        started: Arc::clone(&started),
+        release: Arc::new(Notify::new()),
+    });
+
+    let (snapshot, observation, prepared_generation) = timeout(
+        REFRESH_TIMEOUT + Duration::from_secs(1),
+        manager.refresh_for_step(&config, &thread_environments, |snapshot| {
+            let started = &started;
+            let thread_environments = &thread_environments;
+            let manager = &manager;
+            async move {
+                started.notified().await;
+                thread_environments.update_selections(&[]);
+                // Instruction timeout must release serialization even while preparation is pending.
+                let _permit = manager.refresh_gate.acquire().await.unwrap();
+                snapshot.generation
+            }
+        }),
+    )
+    .await
+    .expect("instruction timeout must not retain the gate while waiting for preparation");
+
+    assert_eq!(snapshot.generation, 3);
+    assert_eq!(prepared_generation, snapshot.generation);
+    assert_eq!(observation.freshness, AgentsMdFreshness::CachedFallback);
+    assert_eq!(
+        observation.loaded.unwrap().text(),
+        cached.loaded.unwrap().text()
+    );
+    assert!(
+        thread_environments
+            .snapshot_now()
+            .await
+            .turn_environments
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_step_refresh_drops_preparation_and_releases_gate() {
+    let root = tempfile::tempdir().expect("workspace");
+    fs::write(root.path().join("AGENTS.md"), "fresh instructions").unwrap();
+    let config = Arc::new(config_for(&root).await);
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let thread_environments = ThreadEnvironments::new(
+        Arc::new(EnvironmentManager::default_for_tests()),
+        default_user_shell(),
+        ShellSnapshot::disabled(),
+        environment_snapshot_with_environment(&config.cwd, 3, environment),
+        /*non_blocking_snapshots*/ false,
+    );
+    let manager = AgentsMdManager::new(None);
+    let started = Arc::new(Notify::new());
+    filesystem.set_next_project_read(NextProjectRead::Block {
+        started: Arc::clone(&started),
+        release: Arc::new(Notify::new()),
+    });
+    let preparation_dropped = tokio_util::sync::CancellationToken::new();
+    let prepare = |_| async {
+        let _guard = preparation_dropped.clone().drop_guard();
+        std::future::pending::<()>().await;
+    };
+    let mut refresh = Box::pin(manager.refresh_for_step(&config, &thread_environments, prepare));
+    tokio::select! {
+        _ = &mut refresh => panic!("blocked refresh must not finish"),
+        _ = started.notified() => {}
+    }
+    assert!(!preparation_dropped.is_cancelled());
+    drop(refresh);
+
+    assert!(preparation_dropped.is_cancelled());
+    assert!(manager.refresh_gate.try_acquire().is_ok());
+    assert!(manager.get_loaded().await.is_none());
 }
 
 #[tokio::test]

@@ -23,6 +23,11 @@ mod subagent_notification;
 mod task_capsule;
 mod task_model_guidance;
 mod turn_aborted;
+mod token_budget_context;
+pub(crate) use token_budget_context::{
+    AutoCompactFallbackPrompt, ContextWindowGuidance, TokenBudgetContext,
+    TokenBudgetRemainingContext, TokenBudgetReminder,
+};
 mod user_instructions;
 mod user_shell_command;
 pub(crate) mod world_state;

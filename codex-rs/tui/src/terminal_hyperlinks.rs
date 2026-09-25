@@ -6,6 +6,7 @@
 use std::ops::Range;
 
 use ratatui::buffer::Buffer;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -524,7 +525,7 @@ pub(crate) fn mark_buffer_hyperlinks(
                 let mut column = 0;
                 while column < layout_area.width {
                     let cell = &layout[(column, row)];
-                    if !cell.skip {
+                    if cell.diff_option != CellDiffOption::Skip {
                         text.push_str(cell.symbol());
                     }
                     // Wide graphemes occupy continuation cells with blank symbols.
@@ -546,7 +547,7 @@ pub(crate) fn mark_buffer_hyperlinks(
                     let x = area.x + column as u16;
                     let y = area.y + (row - scroll_rows) as u16;
                     let cell = &mut buf[(x, y)];
-                    if cell.skip || cell.symbol().trim().is_empty() {
+                    if cell.diff_option == CellDiffOption::Skip || cell.symbol().trim().is_empty() {
                         continue;
                     }
                     let symbol = validated_osc8_hyperlink(&destination, cell.symbol());
@@ -581,7 +582,10 @@ fn mark_matching_cells(
     };
     for position in area.positions() {
         let cell = &mut buf[position];
-        if !cell.skip && !cell.symbol().trim().is_empty() && matches(cell) {
+        if cell.diff_option != CellDiffOption::Skip
+            && !cell.symbol().trim().is_empty()
+            && matches(cell)
+        {
             let symbol = validated_osc8_hyperlink(&destination, cell.symbol());
             cell.set_symbol(&symbol);
         }

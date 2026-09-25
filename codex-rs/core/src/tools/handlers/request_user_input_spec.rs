@@ -114,7 +114,7 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
             },
             "required": ["answers", "interrupted"],
             "additionalProperties": false
-        })),
+        }).into()),
     })
 }
 

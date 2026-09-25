@@ -207,7 +207,7 @@ mod tests {
             panic!("permissions uses a function spec");
         };
         let validator =
-            jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+            jsonschema::validator_for(&spec.output_schema.as_ref().expect("output schema").to_value())
                 .expect("valid permission output schema");
         for expected in [
             json!({"permissions":{"network":null,"file_system":null},"scope":"turn"}),

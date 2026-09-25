@@ -47,7 +47,7 @@ pub fn create_view_image_tool(options: ViewImageToolOptions) -> ToolSpec {
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, Some(vec!["path".to_string()]), Some(false.into())),
-        output_schema: Some(view_image_output_schema()),
+        output_schema: Some(view_image_output_schema().into()),
     })
 }
 
@@ -93,7 +93,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                spec.output_schema.unwrap()["properties"]["detail"]["enum"],
+                spec.output_schema.unwrap().into_value()["properties"]["detail"]["enum"],
                 json!(["low", "high", "original"])
             );
         }

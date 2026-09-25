@@ -165,6 +165,7 @@ mod tests {
                 )),
                 RetryProbeFailure::Timeout => Err(TransportError::Timeout),
                 RetryProbeFailure::Http5xx => Err(TransportError::Http {
+                    retry_after: None,
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     url: None,
                     headers: None,

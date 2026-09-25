@@ -21,6 +21,7 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
         on_request: Some("user approvals".to_string()),
     };
     model.model_messages = Some(ModelMessages {
+        token_budget: None,
         instructions_template: Some("template".to_string()),
         instructions_variables: Some(ModelInstructionsVariables {
             personality_default: Some("default".to_string()),
@@ -41,6 +42,7 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
     assert_eq!(
         updated.model_messages,
         Some(ModelMessages {
+            token_budget: None,
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(approvals),
@@ -55,6 +57,7 @@ fn disabled_personality_preserves_catalog_approval_messages() {
         on_request: Some("user approvals".to_string()),
     };
     model.model_messages = Some(ModelMessages {
+        token_budget: None,
         instructions_template: Some("template".to_string()),
         instructions_variables: None,
         approvals: Some(approvals.clone()),
@@ -69,6 +72,7 @@ fn disabled_personality_preserves_catalog_approval_messages() {
     assert_eq!(
         updated.model_messages,
         Some(ModelMessages {
+            token_budget: None,
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(approvals),

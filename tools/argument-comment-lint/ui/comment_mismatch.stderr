@@ -19,5 +19,13 @@ LL |     let _ = Options.enabled(/*value*/ false);
    |
    = help: use `/*enabled*/`
 
-warning: 2 warnings emitted
+warning: argument comment `/*argv*/` does not match parameter `args`
+  --> $DIR/comment_mismatch.rs:20:32
+   |
+LL |     let _ = join_args(/*argv*/ vec!["a"]);
+   |                                ^^^^^^^^^
+   |
+   = help: use `/*args*/`
+
+warning: 3 warnings emitted
 

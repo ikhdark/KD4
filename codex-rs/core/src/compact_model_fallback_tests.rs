@@ -10,6 +10,7 @@ fn current_model_fallback_matches_model_specific_failures() {
     let fallback_errors = [
         CodexErr::InvalidRequest("invalid request".to_string()),
         CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            retry_after: None,
             status: StatusCode::BAD_GATEWAY,
             body: String::new(),
             user_message: None,
@@ -27,9 +28,10 @@ fn current_model_fallback_matches_model_specific_failures() {
             promo_message: None,
             rate_limit_reached_type: None,
         }),
-        CodexErr::ServerOverloaded,
-        CodexErr::InternalServerError,
+        CodexErr::ServerOverloaded { retry_after: None },
+        CodexErr::InternalServerError { retry_after: None },
         CodexErr::RetryLimit(RetryLimitReachedError {
+            retry_after: None,
             status: StatusCode::TOO_MANY_REQUESTS,
             request_id: None,
         }),
@@ -43,6 +45,7 @@ fn current_model_fallback_matches_model_specific_failures() {
 
     let non_fallback_errors = [
         CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            retry_after: None,
             status: StatusCode::UNAUTHORIZED,
             body: String::new(),
             user_message: None,
@@ -70,6 +73,7 @@ fn current_model_fallback_matches_model_specific_failures() {
 #[test]
 fn region_restricted_does_not_trigger_current_model_fallback() {
     let error = CodexErr::RegionRestricted(UnexpectedResponseError {
+        retry_after: None,
         status: StatusCode::FORBIDDEN,
         body: "Cloudflare blocked".to_string(),
         user_message: Some("service unavailable in this region".to_string()),

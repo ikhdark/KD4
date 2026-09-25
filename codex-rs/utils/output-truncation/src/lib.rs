@@ -444,8 +444,6 @@ fn just_validation_invocation(mut args: &[&str]) -> bool {
                 | "config-schema-check"
                 | "config-schema-protocol-check"
                 | "app-server-schema-check"
-                | "source-map-check"
-                | "source-owners-check"
                 | "check"
                 | "fix",
             ..,

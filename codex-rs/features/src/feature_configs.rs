@@ -11,6 +11,65 @@ use std::collections::BTreeMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ContextManagementConfigToml {
+    /// Enables experimental context management.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_mode: Option<bool>,
+}
+
+impl FeatureConfig for ContextManagementConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.experimental_mode
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.experimental_mode = Some(enabled);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TokenBudgetConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Whether to expose the built-in history and notes extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_history_notes_extension: Option<bool>,
+    /// Number of tokens remaining before auto-compaction when the wrap-up reminder is emitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub reminder_threshold_tokens: Option<i64>,
+    /// Reminder template. `{n_remaining}` is replaced with the tokens remaining before
+    /// auto-compaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 2000))]
+    pub reminder_message_template: Option<String>,
+    /// Guidance appended to the context-window metadata in a developer message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2000))]
+    pub guidance_message: Option<String>,
+    /// Developer message sampled before an automatic context-window rollover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2000))]
+    pub auto_compact_fallback_prompt: Option<String>,
+    /// Additional tokens available after the compaction threshold for fallback note-taking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub auto_compact_fallback_buffer_tokens: Option<i64>,
+}
+
+impl FeatureConfig for TokenBudgetConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = Some(enabled);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemovedAppsMcpPathOverrideConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,

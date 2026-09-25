@@ -1,5 +1,6 @@
 mod client;
 mod client_api;
+mod client_error;
 mod client_transport;
 mod connection;
 mod environment;

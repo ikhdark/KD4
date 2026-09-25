@@ -9,7 +9,10 @@ if ($args.Count -le $analyzerIndex -or $args[$analyzerIndex] -notin @("clippy", 
 $Analyzer = [string]$args[$analyzerIndex]
 $ForwardedArgs = @($args | Select-Object -Skip ($analyzerIndex + 1))
 
-$cargoLaneScript = Join-Path $PSScriptRoot "cargo-lane.ps1"
+# Reserve lanes through the same runner as every other lane recipe, so a busy
+# workspace lane reuses a matching warm sibling or refuses a cold duplicate.
+$laneRunner = Join-Path $PSScriptRoot "rust_build_status.py"
+$python = Get-Command python -ErrorAction Stop
 $v8SandboxPackage = "codex-code-mode"
 
 function Invoke-CargoLane {
@@ -21,8 +24,8 @@ function Invoke-CargoLane {
         [string[]]$CargoArgs
     )
 
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $cargoLaneScript `
-        -Lane $Lane cargo @CargoArgs
+    $runLaneArgs = @($laneRunner, "run-lane", "--lane", $Lane, "--", "cargo") + $CargoArgs
+    & $python.Source @runLaneArgs
     $script:CargoLaneExitCode = $LASTEXITCODE
 }
 

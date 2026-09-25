@@ -49,6 +49,11 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
                     dev_env_doctor, "package_manager_pin", return_value="pnpm@99.0.0"
                 ),
                 mock.patch.object(
+                    dev_env_doctor.tool_versions,
+                    "rust_toolchain_channel",
+                    return_value="99.0.0",
+                ),
+                mock.patch.object(
                     dev_env_doctor.shutil,
                     "which",
                     side_effect=lambda name: (
@@ -166,10 +171,87 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
         self.assertIn("clippy", checks)
         self.assertIn("pwsh", checks)
 
-    def test_node_major_parses_version_prefix(self) -> None:
-        self.assertEqual(dev_env_doctor.node_major("v22.13.1"), 22)
-        self.assertEqual(dev_env_doctor.node_major("node 23.0.0"), 23)
-        self.assertIsNone(dev_env_doctor.node_major("not a version"))
+    def test_node_floor_comes_from_package_json_engines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_json = Path(temp_dir) / "package.json"
+            with mock.patch.object(dev_env_doctor, "PACKAGE_JSON", package_json):
+                package_json.write_text(
+                    '{"engines":{"node":">=22.22.2"}}', encoding="utf-8"
+                )
+                floor = dev_env_doctor.node_engine_floor()
+                package_json.write_text('{"engines":{"node":"^22"}}', encoding="utf-8")
+                with self.assertRaisesRegex(
+                    dev_env_doctor.PackageJsonError, "engines.node"
+                ):
+                    dev_env_doctor.node_engine_floor()
+
+        self.assertEqual(floor, (22, 22, 2))
+        for version, ok in (("v22.22.1", False), ("v22.22.2", True), ("v26.9.0", True)):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(dev_env_doctor.shutil, "which", return_value="node"),
+                mock.patch.object(dev_env_doctor, "run_version", return_value=version),
+            ):
+                check = dev_env_doctor.check_tool(
+                    "node",
+                    ["node", "--version"],
+                    required=True,
+                    guidance="node",
+                    min_version=floor,
+                )
+                self.assertEqual(check.ok, ok)
+
+    def test_rust_probes_use_the_toolchains_workflows_run(self) -> None:
+        with (
+            mock.patch.object(
+                dev_env_doctor.tool_versions,
+                "rust_toolchain_channel",
+                return_value="1.95.0",
+            ),
+            mock.patch.object(
+                dev_env_doctor,
+                "check_tool",
+                side_effect=lambda name, command, **kwargs: (name, command, kwargs),
+            ),
+        ):
+            checks = {
+                name: (tuple(command), kwargs)
+                for name, command, kwargs in dev_env_doctor.collect_checks()
+            }
+
+        for name in ("cargo", "rustfmt", "clippy", "cargo-nextest"):
+            self.assertEqual(
+                checks[name][1]["cwd"], dev_env_doctor.REPO_ROOT / "codex-rs", name
+            )
+        self.assertEqual(
+            checks["rustfmt"][0],
+            (
+                "rustup",
+                "run",
+                tool_versions.RUSTFMT_TOOLCHAIN,
+                "cargo",
+                "fmt",
+                "--version",
+            ),
+        )
+        self.assertEqual(checks["cargo"][1]["pinned_version"], (1, 95, 0))
+        for version, ok in (
+            ("cargo 1.98.1 (797e8a9bc 2026-08-05)", False),
+            ("cargo 1.95.0 (f2d3ce0bd 2026-03-21)", True),
+        ):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(dev_env_doctor.shutil, "which", return_value="cargo"),
+                mock.patch.object(dev_env_doctor, "run_version", return_value=version),
+            ):
+                check = dev_env_doctor.check_tool(
+                    "cargo",
+                    ["cargo", "--version"],
+                    required=True,
+                    guidance="pin",
+                    pinned_version=(1, 95, 0),
+                )
+                self.assertEqual(check.ok, ok)
 
     def test_package_manager_pin_strips_integrity_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -215,6 +297,7 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
             )
 
         self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(run.call_args.kwargs["env"]["RUSTUP_AUTO_INSTALL"], "0")
 
     def test_run_version_uses_stderr_when_stdout_is_empty(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -327,10 +410,26 @@ class GitDoctorTest(unittest.TestCase):
 
 class VscodeRuntimeProofTest(unittest.TestCase):
     def test_default_target_matches_publisher_bin_directory(self) -> None:
-        with mock.patch.dict(os.environ, {"CODEX_LOCAL_PUBLISH_DIR": ""}):
+        with mock.patch.dict(
+            os.environ, {"CODEX_LOCAL_PUBLISH_DIR": "", "CODEX_CLI_PATH": ""}
+        ):
             self.assertEqual(
                 Path(vscode_runtime_proof.desktop_target()),
                 Path.home() / "Desktop" / "LOCAL-KD" / "bin" / "codex.exe",
+            )
+
+    def test_desktop_target_is_the_cli_desktop_launches(self) -> None:
+        # The publisher routes Desktop through CODEX_CLI_PATH, which can name a
+        # non-default install; the Desktop row must report that binary.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_CLI_PATH": r"D:\kd\bin\codex.exe",
+                "CODEX_LOCAL_PUBLISH_DIR": r"C:\tmp\local",
+            },
+        ):
+            self.assertEqual(
+                vscode_runtime_proof.desktop_target(), r"D:\kd\bin\codex.exe"
             )
 
     def test_expected_binary_checks_only_path(self) -> None:
@@ -390,7 +489,7 @@ class VscodeRuntimeProofTest(unittest.TestCase):
     def test_desktop_target_uses_publish_dir_env(self) -> None:
         with mock.patch.dict(
             vscode_runtime_proof.os.environ,
-            {"CODEX_LOCAL_PUBLISH_DIR": "C:/tmp/local"},
+            {"CODEX_LOCAL_PUBLISH_DIR": "C:/tmp/local", "CODEX_CLI_PATH": ""},
             clear=False,
         ):
             self.assertEqual(
@@ -415,6 +514,25 @@ class VscodeRuntimeProofTest(unittest.TestCase):
 
         self.assertEqual(len(matches), 1)
         self.assertTrue(matches[0].endswith("codex.exe"))
+
+    def test_extension_candidates_skip_vsix_staging_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            extensions = home / ".vscode" / "extensions"
+            for folder in (".0a1b2c3d-staging", "openai.chatgpt-1.0.0-win32-x64"):
+                binary = extensions / folder / "bin" / "windows-x86_64" / "codex.exe"
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b"")
+
+            with mock.patch.object(
+                vscode_runtime_proof.Path, "home", return_value=home
+            ):
+                matches = vscode_runtime_proof.extension_candidates(limit=1)
+
+        self.assertEqual(
+            [Path(match).relative_to(extensions).parts[0] for match in matches],
+            ["openai.chatgpt-1.0.0-win32-x64"],
+        )
 
 
 class ToolVersionsTest(unittest.TestCase):

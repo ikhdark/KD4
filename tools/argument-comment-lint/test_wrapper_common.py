@@ -28,21 +28,12 @@ def load_entrypoint(filename: str):
 
 
 class WrapperCommonTest(unittest.TestCase):
-    def test_wrappers_forward_options_environment_and_linter_exit_status(self) -> None:
-        """Both CLI entrypoints must deliver the same options to the real exec boundary."""
+    def test_wrapper_forwards_options_environment_and_linter_exit_status(self) -> None:
+        """The CLI entrypoint must deliver the requested options to the real exec boundary."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest = str(root / "codex-rs" / "Cargo.toml")
             custom_manifest = str(root / "custom" / "Cargo.toml")
-            bin_dir = root / "package" / "bin"
-            library_dir = root / "package" / "lib"
-            bin_dir.mkdir(parents=True)
-            library_dir.mkdir()
-            packaged_entrypoint = bin_dir / "entrypoint"
-            cargo_dylint = bin_dir / "cargo-dylint.exe"
-            cargo_dylint.write_text("")
-            library = library_dir / "lint@stable.dll"
-            library.write_text("")
             cases = [
                 (
                     [],
@@ -53,6 +44,7 @@ class WrapperCommonTest(unittest.TestCase):
                         "--no-deps",
                         "--",
                         "--all-targets",
+                        "--ignore-rust-version",
                     ],
                 ),
                 (
@@ -65,6 +57,32 @@ class WrapperCommonTest(unittest.TestCase):
                         "codex-core",
                         "--",
                         "--tests",
+                        "--ignore-rust-version",
+                    ],
+                ),
+                (
+                    ["-pcodex-core"],
+                    [
+                        "--manifest-path",
+                        manifest,
+                        "--no-deps",
+                        "-pcodex-core",
+                        "--",
+                        "--all-targets",
+                        "--ignore-rust-version",
+                    ],
+                ),
+                (
+                    ["--", "-p", "codex-core"],
+                    [
+                        "--manifest-path",
+                        manifest,
+                        "--no-deps",
+                        "--",
+                        "-p",
+                        "codex-core",
+                        "--all-targets",
+                        "--ignore-rust-version",
                     ],
                 ),
                 (
@@ -76,6 +94,8 @@ class WrapperCommonTest(unittest.TestCase):
                         "--fix",
                         "-p",
                         "codex-core",
+                        "--",
+                        "--ignore-rust-version",
                     ],
                 ),
                 (
@@ -86,6 +106,7 @@ class WrapperCommonTest(unittest.TestCase):
                         "--no-deps",
                         "--",
                         "--bins",
+                        "--ignore-rust-version",
                     ],
                     [
                         "--manifest-path",
@@ -94,6 +115,7 @@ class WrapperCommonTest(unittest.TestCase):
                         "--no-deps",
                         "--",
                         "--bins",
+                        "--ignore-rust-version",
                     ],
                 ),
                 (
@@ -104,6 +126,7 @@ class WrapperCommonTest(unittest.TestCase):
                         custom_manifest,
                         "--",
                         "--all-targets",
+                        "--ignore-rust-version",
                     ],
                 ),
                 (
@@ -117,66 +140,67 @@ class WrapperCommonTest(unittest.TestCase):
                         "chosen",
                         "--",
                         "--all-targets",
+                        "--ignore-rust-version",
                     ],
                 ),
             ]
-            for filename in ("run.py", "run-prebuilt-linter.py"):
-                module = load_entrypoint(filename)
-                prefix = (
-                    [
-                        "cargo",
-                        "dylint",
-                        "--path",
-                        str(root / "tools" / "argument-comment-lint"),
-                    ]
-                    if filename == "run.py"
-                    else [str(cargo_dylint), "dylint", "--lib-path", str(library)]
-                )
-                for argv, expected in cases:
-                    with self.subTest(wrapper=filename, argv=argv):
-                        with (
-                            mock.patch.object(module, "repo_root", return_value=root),
-                            mock.patch.object(sys, "argv", [filename, *argv]),
-                            mock.patch.dict(
-                                os.environ,
-                                {"CODEX_ARGUMENT_COMMENT_LINT_SKIP_RUSTUP_SHIMS": "1"},
-                                clear=True,
-                            ),
-                            mock.patch.object(
-                                wrapper_common,
-                                "require_command",
-                                side_effect=lambda name, *args: name,
-                            ),
-                            mock.patch.object(
-                                wrapper_common,
-                                "run_capture",
-                                side_effect=lambda command, **kwargs: (
-                                    wrapper_common.TOOLCHAIN_CHANNEL
-                                    if command[0] == "rustup"
-                                    else str(packaged_entrypoint)
-                                ),
-                            ),
-                            mock.patch.object(
-                                wrapper_common.subprocess,
-                                "run",
-                                return_value=subprocess.CompletedProcess([], 7),
-                            ) as run,
-                            self.assertRaises(SystemExit) as exit_info,
-                        ):
-                            module.main()
-                        self.assertEqual(exit_info.exception.code, 7)
-                        run.assert_called_once()
-                        command = run.call_args.args[0]
-                        library_selection = [] if "--lib" in argv else ["--all"]
-                        self.assertEqual(
-                            command, [*prefix, *library_selection, *expected]
-                        )
-                        env = run.call_args.kwargs["env"]
-                        self.assertEqual(env["CARGO_INCREMENTAL"], "0")
-                        self.assertEqual(
-                            env["DYLINT_RUSTFLAGS"],
-                            "-D argument-comment-mismatch -D uncommented-anonymous-literal-argument -A unknown_lints",
-                        )
+            module = load_entrypoint("run.py")
+            prefix = [
+                "cargo",
+                "dylint",
+                "--path",
+                str(root / "tools" / "argument-comment-lint"),
+            ]
+            for argv, expected in cases:
+                with self.subTest(argv=argv):
+                    with (
+                        mock.patch.object(module, "repo_root", return_value=root),
+                        mock.patch.object(sys, "argv", ["run.py", *argv]),
+                        mock.patch.dict(os.environ, {}, clear=True),
+                        mock.patch.object(
+                            wrapper_common,
+                            "require_command",
+                            side_effect=lambda name, *args: name,
+                        ),
+                        mock.patch.object(
+                            wrapper_common,
+                            "run_capture",
+                            return_value=wrapper_common.TOOLCHAIN_CHANNEL,
+                        ),
+                        mock.patch.object(
+                            wrapper_common.subprocess,
+                            "run",
+                            return_value=subprocess.CompletedProcess([], 7),
+                        ) as run,
+                        self.assertRaises(SystemExit) as exit_info,
+                    ):
+                        module.main()
+                    self.assertEqual(exit_info.exception.code, 7)
+                    run.assert_called_once()
+                    command = run.call_args.args[0]
+                    library_selection = [] if "--lib" in argv else ["--all"]
+                    self.assertEqual(command, [*prefix, *library_selection, *expected])
+                    env = run.call_args.kwargs["env"]
+                    self.assertEqual(env["CARGO_INCREMENTAL"], "0")
+                    self.assertEqual(
+                        env["DYLINT_RUSTFLAGS"],
+                        "-D argument-comment-mismatch -D uncommented-anonymous-literal-argument -A unknown_lints",
+                    )
+
+    def test_explicit_lint_levels_override_strict_defaults(self) -> None:
+        """rustc applies the last level per lint, so an explicit level must not get a trailing `-D`."""
+        env = {
+            "DYLINT_RUSTFLAGS": "-A argument_comment_mismatch -A uncommented-anonymous-literal-argument",
+            "CARGO_INCREMENTAL": "1",
+        }
+        wrapper_common.set_default_lint_env(env)
+        self.assertEqual(
+            env,
+            {
+                "DYLINT_RUSTFLAGS": "-A argument_comment_mismatch -A uncommented-anonymous-literal-argument -A unknown_lints",
+                "CARGO_INCREMENTAL": "1",
+            },
+        )
 
 
 if __name__ == "__main__":

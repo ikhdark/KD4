@@ -37,6 +37,7 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
         truncation_policy: TruncationPolicyConfig::tokens(/*limit*/ 1024),
         supports_parallel_tool_calls: true,
         supports_image_detail_original: false,
+        supports_experimental_context: false,
         context_window: None,
         max_context_window: None,
         auto_compact_token_limit: None,

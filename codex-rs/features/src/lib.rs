@@ -28,6 +28,8 @@ pub const MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS: i64 = MULTI_AGENT_MIN_WAIT_TIMEOU
 mod feature_configs;
 pub use feature_configs::CodeModeConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
+pub use feature_configs::ContextManagementConfigToml;
+pub use feature_configs::TokenBudgetConfigToml;
 pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
 pub use feature_configs::MultiAgentV2ConfigToml;
@@ -110,6 +112,10 @@ pub enum Feature {
     SecretAuthStorage,
 
     // Experimental
+    /// Show the optional consumer plan-limit history analytics report.
+    AnalyticsPlanHistory,
+    ContextManagement,
+    TokenBudget,
     /// Enable JavaScript code mode backed by the in-process V8 runtime.
     CodeMode,
     /// Run JavaScript code mode in the standalone host process.
@@ -543,6 +549,10 @@ pub fn is_known_feature_key(key: &str) -> bool {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<FeatureToml<ContextManagementConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<FeatureToml<TokenBudgetConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<FeatureToml<CodeModeConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
@@ -605,6 +615,12 @@ impl FeaturesToml {
 
     pub fn entries(&self) -> BTreeMap<String, bool> {
         let mut entries = self.entries.clone();
+        if let Some(enabled) = self.context_management.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::ContextManagement.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self.token_budget.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::TokenBudget.key().to_string(), enabled);
+        }
         if let Some(enabled) = self.code_mode.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::CodeMode.key().to_string(), enabled);
         }
@@ -627,6 +643,8 @@ impl FeaturesToml {
     pub fn materialize_resolved_enabled(&mut self, features: &Features) {
         self.clear_removed_compatibility_entries();
         let Self {
+            context_management,
+            token_budget,
             code_mode,
             multi_agent_v2,
             current_time_reminder,
@@ -640,7 +658,13 @@ impl FeaturesToml {
                 continue;
             }
             let enabled = features.enabled(spec.id);
-            if spec.id == Feature::CodeMode {
+            if spec.id == Feature::ContextManagement {
+                entries.remove(spec.key);
+                materialize_resolved_feature_enabled(context_management, enabled);
+            } else if spec.id == Feature::TokenBudget {
+                entries.remove(spec.key);
+                materialize_resolved_feature_enabled(token_budget, enabled);
+            } else if spec.id == Feature::CodeMode {
                 entries.remove(spec.key);
                 materialize_resolved_feature_enabled(code_mode, enabled);
             } else if spec.id == Feature::MultiAgentV2 {
@@ -672,6 +696,8 @@ fn materialize_resolved_feature_enabled<T: FeatureConfig>(
 impl From<BTreeMap<String, bool>> for FeaturesToml {
     fn from(mut entries: BTreeMap<String, bool>) -> Self {
         Self {
+            context_management: entries.remove(Feature::ContextManagement.key()).map(FeatureToml::Enabled),
+            token_budget: entries.remove(Feature::TokenBudget.key()).map(FeatureToml::Enabled),
             code_mode: entries
                 .remove(Feature::CodeMode.key())
                 .map(FeatureToml::Enabled),
@@ -799,6 +825,25 @@ macro_rules! define_features {
 }
 
 define_features! {
+    FeatureSpec {
+        id: Feature::ContextManagement,
+        key: "context_management",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::TokenBudget,
+        key: "token_budget",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AnalyticsPlanHistory,
+        key: "analytics_plan_history",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+        consumer: FeatureConsumer::Client,
+    },
     // Stable features.
     FeatureSpec {
         id: Feature::Kd4Runtime,

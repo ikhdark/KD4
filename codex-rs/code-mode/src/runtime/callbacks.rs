@@ -1,5 +1,6 @@
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS;
+use std::sync::Arc;
 
 use super::EXIT_SENTINEL;
 use super::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
@@ -311,7 +312,8 @@ pub(super) fn store_callback(
         {
             state.total_stored_value_bytes = total_bytes;
             state.stored_value_bytes.insert(key.clone(), bytes);
-            state.stored_values.insert(key.clone(), serialized.clone());
+            let serialized = Arc::new(serialized);
+            state.stored_values.insert(key.clone(), Arc::clone(&serialized));
             state.stored_value_writes.insert(key, serialized);
             return None;
         }

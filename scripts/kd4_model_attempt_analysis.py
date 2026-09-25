@@ -191,6 +191,7 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
     wire_bytes = 0.0
     cached_tokens = 0.0
     input_tokens = 0.0
+    provider_cache_attempts = 0
     requests_over_120k = 0
     for record in records:
         active_total = 0.0
@@ -268,8 +269,17 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         ):
             successful_rebases += 1
         wire_bytes += _number(record.get("wire_request_bytes")) or 0.0
-        cached_tokens += _number(record.get("cached_input_token_count")) or 0.0
-        input_tokens += _number(record.get("input_token_count")) or 0.0
+        # Providers report these independently; a share needs both from one attempt.
+        attempt_cached = _number(record.get("cached_input_token_count"))
+        attempt_input = _number(record.get("input_token_count"))
+        if (
+            attempt_cached is not None
+            and attempt_input is not None
+            and attempt_cached <= attempt_input
+        ):
+            cached_tokens += attempt_cached
+            input_tokens += attempt_input
+            provider_cache_attempts += 1
     top = sorted(
         grouped.values(),
         key=lambda component: (
@@ -295,6 +305,8 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         "providerCachedShare": round(cached_tokens / input_tokens, 6)
         if input_tokens
         else None,
+        "providerCacheCoveredAttempts": provider_cache_attempts,
+        "providerCacheUncoveredAttempts": len(records) - provider_cache_attempts,
         "failOpenAttempts": fail_open_attempts,
         "successfulRebases": successful_rebases,
     }
@@ -557,8 +569,13 @@ def analyze(
         "interpretation": (
             "observational and non-causal; logical decision latency is retry overhead "
             "(dispatch-to-completion for nonterminal attempts) plus terminal "
-            "dispatch-to-first-actionable-output"
+            "dispatch-to-first-actionable-output. It excludes every gap between "
+            "attempts (retry backoff, reconnection) and pre-dispatch work: each "
+            "attempt has its own clock, so those gaps are not observable and "
+            "retried requests are understated by an unknown amount"
         ),
+        "retriedLogicalRequests": sum(row["retry_count"] > 0 for row in rows),
+        "unmeasuredInterAttemptGaps": sum(row["retry_count"] for row in rows),
         "quantileMethod": "linear interpolation at (n - 1) * p on sorted samples",
         "sampleLimitations": (
             "Percentiles describe the observed samples, not population tail estimates. "
@@ -601,6 +618,11 @@ def render(analysis: dict[str, Any]) -> str:
         f"included physical attempts: {analysis['includedPhysicalAttempts']}",
         f"logical requests: {analysis['totalLogicalRequests']}",
         f"clean included requests: {analysis['includedLogicalRequests']}",
+        (
+            "unmeasured inter-attempt gaps (backoff/reconnect, excluded from "
+            f"decision latency): {analysis['unmeasuredInterAttemptGaps']} across "
+            f"{analysis['retriedLogicalRequests']} retried requests"
+        ),
         f"outcomes: {json.dumps(analysis['outcomeCounts'], sort_keys=True)}",
         f"exclusions: {json.dumps(analysis['exclusionCounts'], sort_keys=True)}",
     ]
@@ -648,6 +670,8 @@ def render(analysis: dict[str, Any]) -> str:
         f"component_cache_hits={stable['componentCacheHits']} "
         f"wire_bytes={stable['wireRequestBytes']} "
         f"provider_cached_share={stable['providerCachedShare']} "
+        f"(covered_attempts={stable['providerCacheCoveredAttempts']}/"
+        f"{stable['providerCacheCoveredAttempts'] + stable['providerCacheUncoveredAttempts']}) "
         f"successful_rebases={stable['successfulRebases']} "
         f"fail_open_attempts={stable['failOpenAttempts']}"
     )

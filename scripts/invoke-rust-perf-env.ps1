@@ -151,13 +151,14 @@ try {
     $cargoTargetDirProof = Format-EnvProofValue -Name "CARGO_TARGET_DIR"
     if (-not [string]::IsNullOrWhiteSpace($CargoTargetLane)) {
         $laneName = ConvertTo-SafeCargoLaneName -Value $CargoTargetLane
-        $laneTargetDir = Join-Path $repoRoot "codex-rs\target\lanes\$laneName"
         $hasExplicitCargoTargetDir = Test-ProgramArgsHaveCargoTargetDir -CommandArgs $ProgramArgs
         if ($hasExplicitCargoTargetDir) {
             $cargoTargetDirProof = "<explicit command argument>"
         }
         else {
-            $cargoTargetDirProof = $laneTargetDir
+            # run-lane may pick a busy lane's suffixed sibling or a
+            # CODEX_CARGO_LANES_ROOT location, so the path is unknown here.
+            $cargoTargetDirProof = "<run-lane reservation for $laneName>"
         }
         # The Python reservation owner holds .lane-active.lock for the entire
         # child lifetime and injects --target-dir for Cargo build commands.

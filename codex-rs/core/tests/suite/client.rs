@@ -1283,12 +1283,52 @@ async fn provider_auth_command_refreshes_after_401() {
     send_provider_auth_request(&server, auth_fixture.auth()).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_auth_command_refreshes_during_websocket_preconnect() {
+    require_network!();
+    let server = MockServer::start().await;
+    let auth_fixture = ProviderAuthCommandFixture::new(&["first-token", "second-token"]).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .and(header_regex("Authorization", "Bearer first-token"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .and(header_regex("Authorization", "Bearer second-token"))
+        .respond_with(ResponseTemplate::new(426))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header_regex("Authorization", "Bearer second-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    send_provider_auth_request_with_preconnect(&server, auth_fixture.auth(), true).await;
+}
+
 /// Issues one streamed Responses request through a provider configured with command-backed auth.
 ///
 /// The caller owns the server-side assertions, so this helper only validates that the request
 /// reaches `Completed` without surfacing an auth or transport error to the client.
-#[expect(clippy::unwrap_used)]
 async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuthInfo) {
+    send_provider_auth_request_with_preconnect(server, auth, false).await;
+}
+
+#[expect(clippy::unwrap_used)]
+async fn send_provider_auth_request_with_preconnect(
+    server: &MockServer,
+    auth: ModelProviderAuthInfo,
+    preconnect: bool,
+) {
     let provider = ModelProviderInfo {
         name: "corp".into(),
         base_url: Some(format!("{}/v1", server.uri())),
@@ -1306,7 +1346,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         stream_idle_timeout_ms: Some(5_000),
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
-        supports_websockets: false,
+        supports_websockets: preconnect,
         supports_standalone_web_search: false,
     };
 
@@ -1356,6 +1396,16 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
+    if preconnect {
+        client_session
+            .preconnect_websocket(&model_info, None, &session_telemetry, &responses_metadata)
+            .await
+            .expect("preconnect should recover auth and accept HTTP fallback");
+        assert!(
+            !client.responses_websocket_enabled(),
+            "426 must disable websockets before the turn"
+        );
+    }
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
         id: None,
@@ -1382,11 +1432,17 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         .await
         .expect("responses stream to start");
 
+    let mut completed = false;
     while let Some(event) = stream.next().await {
-        if let Ok(ResponseEvent::Completed { .. }) = event {
+        if let ResponseEvent::Completed { .. } = event.expect("response stream must succeed") {
+            completed = true;
             break;
         }
     }
+    assert!(
+        completed,
+        "request must complete after authentication recovery"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -23,6 +23,28 @@ function Test-CargoLaneCommandToken {
     return $leaf -in @("cargo", "just", "rustup", "powershell", "pwsh")
 }
 
+# Mirror rust_build_status._safe_lane_name for every lane that reaches the
+# filesystem, explicit or derived. The character class is case-sensitive:
+# PowerShell's default matching admits non-ASCII letters such as U+212A.
+function Assert-CargoLaneName {
+    param(
+        [string]$Lane
+    )
+
+    if ($Lane -cnotmatch "^[A-Za-z0-9_.-]+\z") {
+        throw "Lane '$Lane' contains unsupported characters."
+    }
+    if ($Lane -match "\.trash-\d{17}$") {
+        throw "Lane names ending in a trash timestamp are reserved for cleanup."
+    }
+    if ($Lane -match "^\.+$") {
+        # Pure-dot names pass the character filter but Windows path
+        # normalization can collapse them to a parent directory, escaping lane
+        # isolation.
+        throw "Lane '$Lane' is not a valid lane name."
+    }
+}
+
 function Parse-CargoLaneArguments {
     param(
         [object[]]$RawArgs
@@ -97,18 +119,7 @@ function Parse-CargoLaneArguments {
     if ($parsedLane.StartsWith("-", [StringComparison]::Ordinal)) {
         throw "-Lane requires a value that does not start with '-'."
     }
-    if ($parsedLane -notmatch "^[A-Za-z0-9_.-]+$") {
-        throw "Lane '$parsedLane' contains unsupported characters."
-    }
-    if ($parsedLane -match "\.trash-\d{17}$") {
-        throw "Lane names ending in a trash timestamp are reserved for cleanup."
-    }
-    if ($parsedLane -match "^\.+$") {
-        # Pure-dot names pass the character filter but Windows path
-        # normalization can collapse them to a parent directory, escaping lane
-        # isolation.
-        throw "Lane '$parsedLane' is not a valid lane name."
-    }
+    Assert-CargoLaneName -Lane $parsedLane
 
     return [pscustomobject]@{
         Lane = $parsedLane
@@ -265,23 +276,11 @@ function ConvertTo-SafeLaneName {
         [string]$Value
     )
 
-    $safe = ([string]$Value -replace "[^A-Za-z0-9_.-]", "-").Trim("-")
+    $safe = ([string]$Value -creplace "[^A-Za-z0-9_.-]", "-").Trim("-")
     if ([string]::IsNullOrWhiteSpace($safe)) {
         return "auto"
     }
     return $safe
-}
-
-function Normalize-RequestedLaneName {
-    param(
-        [string]$Value
-    )
-
-    if ($Value -eq "auto") {
-        return "auto"
-    }
-
-    return ConvertTo-SafeLaneName $Value
 }
 
 function Get-StableCommandHash {
@@ -415,12 +414,17 @@ function Test-ExclusiveLaneFileBusy {
 
     $stream = $null
     try {
+        # Probe like rust_build_status.py: share the handle and test the
+        # byte-range lock. An exclusive open makes a Cargo build that is just
+        # starting in this lane fail with a sharing violation (os error 32).
         $stream = [System.IO.File]::Open(
             $lockPath,
             [System.IO.FileMode]::Open,
             [System.IO.FileAccess]::ReadWrite,
-            [System.IO.FileShare]::None
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
         )
+        $stream.Lock(0, 1)
+        $stream.Unlock(0, 1)
         return $false
     }
     catch [System.IO.IOException] {
@@ -760,6 +764,9 @@ function Acquire-CargoLaneReservation {
             }
             $target = Join-Path $LaneRoot $candidate
             if (Test-CargoLanesRootReparsePoint -LanesRoot $target) { continue }
+            # rust_build_status.py quarantines a lane whose owned process tree
+            # was not confirmed stopped; never hand that lane to new work.
+            if (Test-Path -LiteralPath (Join-Path $target ".lane-cleanup-unconfirmed")) { continue }
             New-Item -ItemType Directory -Force -Path $target | Out-Null
             if (Test-CargoLanesRootReparsePoint -LanesRoot $target) { continue }
             # The earlier process/lock snapshot can be stale while waiting for
@@ -768,7 +775,9 @@ function Acquire-CargoLaneReservation {
             $lockPath = Join-Path $target ".lane-active.lock"
             $stream = $null
             try {
-                $stream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                # Exclusive but inheritable: the process_owner.py that runs
+                # the command co-holds the reservation until its tree is gone.
+                $stream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Inheritable)
                 $stream.SetLength(0)
                 $lockText = "pid=$PID`nlane=$candidate`nstarted=$([DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture))`n"
                 $bytes = [Text.Encoding]::UTF8.GetBytes($lockText)
@@ -867,6 +876,39 @@ function Enable-SccacheForLane {
     Enable-SccacheEnvironment -RepoRoot $RepoRoot
 }
 
+function Get-CargoLaneOwnedCommand {
+    param(
+        [string]$TargetDir,
+        [string[]]$CommandArgs
+    )
+
+    # Run lane work under scripts/process_owner.py, as rust_build_status.py
+    # run-lane does: it stops the command's whole process tree when the
+    # command ends or this host dies, and it inherits the reservation handle,
+    # so the lane stays reserved until that tree is gone.
+    $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $python) {
+        throw "Lane commands need python for scripts\process_owner.py, which owns their process tree."
+    }
+    $command = Get-Command -Name $CommandArgs[0] -CommandType Application, ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $command) {
+        throw "Lane command '$($CommandArgs[0])' is not a program or script."
+    }
+    $owned = @($command.Source) + @($CommandArgs | Select-Object -Skip 1)
+    if ($command.CommandType -eq [Management.Automation.CommandTypes]::ExternalScript) {
+        $owned = @((Get-Process -Id $PID).Path, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File") + $owned
+    }
+    return @(
+        $python.Source,
+        (Join-Path $PSScriptRoot "process_owner.py"),
+        "--parent-pid",
+        [string]$PID,
+        "--cleanup-failed-marker",
+        (Join-Path $TargetDir ".lane-cleanup-unconfirmed"),
+        "--"
+    ) + $owned
+}
+
 function Update-CargoLaneLastUsed {
     param(
         [string]$TargetDir
@@ -899,12 +941,16 @@ if ($commandArgs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($commandArgs[0]))
     $commandArgs = @()
 }
 
-$requestedLane = Normalize-RequestedLaneName $Lane
+# Use the validated name verbatim, as rust_build_status.py does, so a lane
+# names the same directory from either entrypoint.
+$requestedLane = $Lane
 $activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
-$candidateLane = if ($requestedLane -eq "auto") { Get-AffinityLaneBase -CommandArgs $commandArgs } else { $requestedLane }
+$candidateLane = if ($requestedLane -ceq "auto") { Get-AffinityLaneBase -CommandArgs $commandArgs } else { $requestedLane }
+# Affinity names come from command text; hold them to the explicit-name rules.
+Assert-CargoLaneName -Lane $candidateLane
 $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
-$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames -PreferWarm:($requestedLane -eq "auto")
+$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames -PreferWarm:($requestedLane -ceq "auto")
 try {
     $resolvedLane = $reservation.Lane
     $targetDir = $reservation.TargetDir
@@ -912,7 +958,7 @@ try {
     $didPushLocation = $true
     $commandArgs = @(Add-CargoTargetDirArgument -CommandArgs $commandArgs -TargetDir $targetDir)
     $env:CODEX_CARGO_LANE_TARGET_DIR = $targetDir
-    if ($requestedLane -ne "auto" -and $resolvedLane -ne $requestedLane) {
+    if ($requestedLane -cne "auto" -and $resolvedLane -ne $requestedLane) {
         Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
     }
     Update-CargoLaneLastUsed -TargetDir $targetDir
@@ -958,7 +1004,8 @@ try {
     }
 
     if ($Fetch) {
-        cargo fetch --locked
+        $fetch = @(Get-CargoLaneOwnedCommand -TargetDir $targetDir -CommandArgs @("cargo", "fetch"))
+        & $fetch[0] @($fetch | Select-Object -Skip 1)
         if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
         }
@@ -987,16 +1034,12 @@ try {
     # cargo itself uses --target-dir, so never export the lane and drop any
     # inherited value; cargo commands receive the lane as an argument instead.
     Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-    $program = $commandArgs[0]
-    $arguments = @($commandArgs | Select-Object -Skip 1)
-    $global:LASTEXITCODE = $null
+    # Invoke at script level so the command writes straight to this host's
+    # output handles instead of being captured as function output.
+    $owned = @(Get-CargoLaneOwnedCommand -TargetDir $targetDir -CommandArgs $commandArgs)
+    $program = $owned[0]
+    $arguments = @($owned | Select-Object -Skip 1)
     & $program @arguments
-    if ($null -eq $LASTEXITCODE) {
-        if ($?) {
-            exit 0
-        }
-        exit 1
-    }
     exit $LASTEXITCODE
 }
 finally {

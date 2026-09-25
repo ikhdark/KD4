@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import re
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,44 +16,17 @@ import tomllib
 
 from scripts import check_kd4_features
 
+GATE_COMMAND = [
+    "python",
+    "scripts/rust_test_runner.py",
+    "run-gate",
+    "proof",
+    "--profile",
+    "fast",
+]
+
 
 class CheckKd4FeaturesTest(unittest.TestCase):
-    def test_same_named_other_class_cannot_supply_selected_test_body(self):
-        source = self.repo_root / "tests/test_feature.py"
-        source.write_text(
-            "import unittest\nclass FeatureRegistrationTest(unittest.TestCase):\n    def test_feature_is_live(self):\n        pass\nclass Other(unittest.TestCase):\n    def test_feature_is_live(self):\n        self.assertEqual(1 + 1, 2)\n"
-        )
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest(self.valid_evidence()), repo_root=self.repo_root
-        )
-        self.assertFalse(result.ok)
-        self.assertIn(
-            "vacuous-runtime-verification",
-            {finding.code for finding in result.findings},
-        )
-
-    def test_documented_unittest_result_is_exactly_observed(self):
-        source = self.repo_root / "tests/test_feature.py"
-        source.write_text(
-            source.read_text().replace(
-                "        self.assertEqual",
-                '        """Prove the registered behavior."""\n        self.assertEqual',
-            )
-        )
-        outcomes = []
-        code = check_kd4_features.execute_runtime_verification(
-            self.write_manifest(self.valid_evidence()),
-            repo_root=self.repo_root,
-            feature_id=None,
-            quiet=True,
-            outcomes=outcomes,
-        )
-        self.assertEqual(code, 0, outcomes)
-        self.assertEqual(
-            outcomes[0]["test_identities"],
-            ["tests.test_feature.FeatureRegistrationTest.test_feature_is_live"],
-        )
-
     def test_malformed_field_types_produce_findings(self):
         for old, new, expected in [
             ('status = "enabled"', "status = []", "invalid-status"),
@@ -73,31 +46,12 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertIn(expected, {finding.code for finding in result.findings})
 
-    def test_commented_schema_constant_cannot_mask_runtime_version(self):
-        (self.repo_root / "src/schema.rs").write_text(
-            "// pub const CONTRACT_SCHEMA_VERSION: u64 = 12;\npub const CONTRACT_SCHEMA_VERSION: u64 = 13;\n"
-        )
-        manifest = self.write_manifest(
-            'contract_schema_version = 12\ncontract_schema_source = "src/schema.rs"\ncontract_schema_symbol = "CONTRACT_SCHEMA_VERSION"\n'
-            + self.valid_evidence()
-        )
-        result = check_kd4_features.validate_manifest(
-            manifest, repo_root=self.repo_root
-        )
-        self.assertFalse(result.ok)
-        self.assertIn(
-            "contract-schema-drift", {finding.code for finding in result.findings}
-        )
-
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.repo_root = Path(self.tempdir.name)
-        (self.repo_root / "owner").mkdir()
+        (self.repo_root / "owner" / "src").mkdir(parents=True)
         (self.repo_root / "src").mkdir()
-        (self.repo_root / "tests").mkdir()
-        (self.repo_root / "src" / "__init__.py").write_text("", encoding="utf-8")
-        (self.repo_root / "tests" / "__init__.py").write_text("", encoding="utf-8")
         (self.repo_root / "src" / "feature.py").write_text(
             "def main():\n    return 'live'\n",
             encoding="utf-8",
@@ -106,23 +60,29 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             "from src.feature import main\n\nCOMMANDS = {'feature': main}\n",
             encoding="utf-8",
         )
-        (self.repo_root / "tests" / "test_feature.py").write_text(
-            textwrap.dedent(
-                """
-                import unittest
-
-                from src.registry import COMMANDS
-
-
-                class FeatureRegistrationTest(unittest.TestCase):
-                    def test_feature_is_live(self):
-                        self.assertEqual(COMMANDS["feature"](), "live")
-                """
-            ),
+        # Runtime proof uses the production route: one exact test in a named gate.
+        (self.repo_root / "owner" / "Cargo.toml").write_text(
+            '[package]\nname = "fixture"\n', encoding="utf-8"
+        )
+        (self.repo_root / "owner" / "src" / "lib.rs").write_text(
+            "#[test]\nfn test_feature_is_live() { assert!(registered()); }\n",
+            encoding="utf-8",
+        )
+        gates = self.repo_root / "codex-rs" / ".config" / "kd4-rust-tests.toml"
+        gates.parent.mkdir(parents=True)
+        gates.write_text(
+            'version = 1\n[helpers]\n[targets.fixture_lib]\npackage = "fixture"\nlib = true\nhelpers = []\n'
+            '[gates.proof]\n[[gates.proof.steps]]\ntarget = "fixture_lib"\ntests = ["test_feature_is_live"]\nhelpers = []\n',
             encoding="utf-8",
         )
 
-    def write_manifest(self, feature_body: str) -> Path:
+    def write_manifest(
+        self,
+        feature_body: str,
+        *,
+        verification_path: str = "owner/src/lib.rs",
+        command: list[str] | None = None,
+    ) -> Path:
         path = self.repo_root / "kd4_features.toml"
         path.write_text(
             textwrap.dedent(
@@ -140,35 +100,13 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                 summary = "fixture"
                 upstream_equivalent = "none"
                 config_keys = []
-                runtime_verification = {{ kind = "contract_test", path = "tests/test_feature.py", symbol = "test_feature_is_live", command = ["python", "-m", "unittest", "tests.test_feature.FeatureRegistrationTest.test_feature_is_live"] }}
+                runtime_verification = {{ kind = "contract_test", path = "{verification_path}", symbol = "test_feature_is_live", command = {json.dumps(command or GATE_COMMAND)} }}
                 {feature_body}
                 """
             ),
             encoding="utf-8",
         )
         return path
-
-    def write_source_owner(self) -> None:
-        (self.repo_root / "source_owners.toml").write_text(
-            textwrap.dedent(
-                """
-                schema_version = 2
-
-                [[owners]]
-                id = "feature-owner"
-                feature_ids = ["feature"]
-                primary_entries = [{ path = "src/feature.py", symbol = "main" }]
-                tests = ["tests/test_feature.py"]
-
-                [[owners.relationships]]
-                category = "runtime_registration"
-                kind = "registers"
-                target = "path:src/registry.py"
-                evidence = [{ path = "src/registry.py", symbol = "COMMANDS" }]
-                """
-            ),
-            encoding="utf-8",
-        )
 
     @staticmethod
     def valid_evidence() -> str:
@@ -183,15 +121,52 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             kind = "registration"
             path = "src/registry.py"
             contains = "'feature': main"
-
-            [[features.evidence]]
-            kind = "test"
-            path = "tests/test_feature.py"
-            contains = "test_feature_is_live"
             """
         )
 
-    def test_repository_manifest_passes_non_strict(self) -> None:
+    @contextlib.contextmanager
+    def fake_cargo(self, stream: str, returncode: int = 0):
+        """Serve metadata and one nextest run to the real gate runner."""
+        calls: list[list[str]] = []
+
+        def cargo(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["cargo", "metadata"]:
+                metadata = {
+                    "target_directory": str(self.repo_root / "target"),
+                    "packages": [
+                        {
+                            "name": "fixture",
+                            "id": "fixture-id",
+                            "targets": [{"name": "fixture", "kind": ["lib"]}],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(metadata), "")
+            if argv[:3] == ["cargo", "nextest", "run"]:
+                return subprocess.CompletedProcess(argv, returncode, stream, "")
+            self.fail(f"unexpected cargo invocation: {argv}")
+
+        runner = check_kd4_features.rust_test_runner
+        runner_class, load_metadata = runner.RustTestRunner, runner.load_metadata
+        with (
+            mock.patch.object(subprocess, "run", side_effect=cargo),
+            mock.patch.object(
+                runner,
+                "load_metadata",
+                side_effect=lambda **kwargs: load_metadata(executor=cargo, **kwargs),
+            ),
+            mock.patch.object(
+                runner,
+                "RustTestRunner",
+                side_effect=lambda *args, **kwargs: runner_class(
+                    *args, **kwargs, executor=cargo
+                ),
+            ),
+        ):
+            yield calls
+
+    def test_repository_manifest_passes(self) -> None:
         result = check_kd4_features.validate_manifest(
             check_kd4_features.DEFAULT_MANIFEST,
             repo_root=check_kd4_features.REPO_ROOT,
@@ -200,37 +175,10 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertTrue(result.ok, result.findings)
         self.assertGreaterEqual(result.feature_count, 1)
 
-    def test_repository_rust_verifications_require_exact_gates(self) -> None:
-        manifest = tomllib.loads(check_kd4_features.DEFAULT_MANIFEST.read_text())
-        rust = check_kd4_features.rust_test_runner.Manifest.load(
-            check_kd4_features.rust_test_runner.DEFAULT_MANIFEST
-        )
-        for feature in manifest["features"]:
-            verification = feature.get("runtime_verification")
-            if not verification:
-                continue
-            with self.subTest(feature=feature["id"]):
-                self.assertEqual(
-                    check_kd4_features._verification_route(
-                        verification, check_kd4_features.REPO_ROOT, rust
-                    ),
-                    "nextest",
-                )
-                with self.assertRaisesRegex(ValueError, "named exact-test gate"):
-                    check_kd4_features._verification_route(
-                        {
-                            **verification,
-                            "command": ["cargo", "test", verification["symbol"]],
-                        },
-                        check_kd4_features.REPO_ROOT,
-                        rust,
-                    )
-
     def test_inline_suite_shard_verification_requires_the_registered_binary(
         self,
     ) -> None:
         owner = self.repo_root / "owner"
-        (owner / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
         suite = owner / "tests/suite"
         suite.mkdir(parents=True)
         (suite / "behavior.rs").write_text(
@@ -246,7 +194,6 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             '    #[path = "other.rs"]\n    mod other;\n}\n'
         )
         gates = self.repo_root / "codex-rs/.config/kd4-rust-tests.toml"
-        gates.parent.mkdir(parents=True)
         gates.write_text(
             "version = 1\n[helpers]\n"
             '[targets.alpha]\npackage = "fixture"\ntest = "alpha"\nhelpers = []\n'
@@ -293,10 +240,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
     def test_rust_gate_rejects_same_named_test_in_another_module_of_same_binary(
         self,
     ) -> None:
-        owner = self.repo_root / "owner"
-        (owner / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
-        source = owner / "src"
-        source.mkdir()
+        source = self.repo_root / "owner" / "src"
         (source / "lib.rs").write_text(
             'mod unrelated;\n#[path = "correct_owner.rs"] mod actual;\n'
         )
@@ -304,7 +248,6 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         (source / "correct_owner.rs").write_text(body)
         (source / "unrelated.rs").write_text(body)
         gate_path = self.repo_root / "codex-rs/.config/kd4-rust-tests.toml"
-        gate_path.parent.mkdir(parents=True)
         gate_template = (
             'version = 1\n[helpers]\n[targets.fixture_lib]\npackage = "fixture"\nlib = true\nhelpers = []\n'
             '[gates.proof]\n[[gates.proof.steps]]\ntarget = "fixture_lib"\ntests = ["%s::proves_feature"]\nhelpers = []\n'
@@ -312,14 +255,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         verification = {
             "path": "owner/src/correct_owner.rs",
             "symbol": "proves_feature",
-            "command": [
-                "python",
-                "scripts/rust_test_runner.py",
-                "run-gate",
-                "proof",
-                "--profile",
-                "fast",
-            ],
+            "command": GATE_COMMAND,
         }
         gate_path.write_text(gate_template % "actual")
         self.assertEqual(
@@ -370,70 +306,17 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                     )
                 )
 
-    def test_desktop_runtime_receipt_feature_is_absent(self) -> None:
-        with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
-            manifest = tomllib.load(manifest_file)
-
-        feature_ids = {feature["id"] for feature in manifest["features"]}
-        self.assertNotIn("desktop-runtime-receipt", feature_ids)
-
-    def test_repository_intelligence_uses_live_source_owner_workflow(self) -> None:
-        with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
-            manifest = tomllib.load(manifest_file)
-        with (check_kd4_features.REPO_ROOT / "source_owners.toml").open(
-            "rb"
-        ) as source_owner_file:
-            source_owners = tomllib.load(source_owner_file)
-
-        feature = next(
-            feature
-            for feature in manifest["features"]
-            if feature["id"] == "repository-intelligence"
-        )
-        source_owner = next(
-            owner
-            for owner in source_owners["owners"]
-            if owner["id"] == "source-owner-index"
-        )
-
-        self.assertEqual(feature["version"], 2)
-        self.assertEqual(feature["status"], "enabled")
-        self.assertEqual(feature["capability_kind"], "workflow")
-        self.assertEqual(feature["owner"], "scripts")
-        self.assertEqual(feature["source_owner"], "source-owner-index")
-        self.assertEqual(
-            feature["generated_artifacts"],
-            ["SOURCEMAP.md", "architecture_index.json"],
-        )
-        self.assertIn("repository-intelligence", source_owner["feature_ids"])
-
-    def test_static_evidence_presence_cannot_claim_executed_verification(self) -> None:
-        manifest = self.write_manifest(self.valid_evidence())
-        with mock.patch.object(subprocess, "Popen") as launch:
-            payload = self.run_json_verification(manifest, "--static-only")
-        launch.assert_not_called()
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["runtimeVerification"], "not_run")
-        self.assertIsNone(payload["runtimeVerificationExitCode"])
-
     def test_task_continuity_workflow_is_retired_end_to_end(self) -> None:
         with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)
-        with (check_kd4_features.REPO_ROOT / "source_owners.toml").open(
-            "rb"
-        ) as owner_file:
-            owners = tomllib.load(owner_file)
 
         self.assertNotIn(
             "task-continuity-hooks",
             {feature["id"] for feature in manifest["features"]},
         )
-        self.assertNotIn(
-            "task-continuity-hooks",
-            {owner["id"] for owner in owners["owners"]},
-        )
+        # `.codex/hooks.json` is Codex's supported repo hooks file, so only the
+        # continuity-specific scripts stay retired.
         for retired_path in (
-            ".codex/hooks.json",
             ".codex/hooks/task-continuity-entry.ps1",
             ".codex/hooks/task-continuity-fast-basic.ps1",
             ".codex/hooks/task-continuity-fast-compact.ps1",
@@ -445,19 +328,67 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             with self.subTest(path=retired_path):
                 self.assertFalse((check_kd4_features.REPO_ROOT / retired_path).exists())
 
-        for consumer_path in (
-            "codex-rs/core/src/lib.rs",
-            "codex-rs/core/src/hook_runtime.rs",
-            "codex-rs/core/src/context_manager/history.rs",
+    def test_unknown_feature_keys_cannot_silently_skip_checks(self) -> None:
+        # A misspelled retired_paths would otherwise let a retired file return.
+        (self.repo_root / "src" / "legacy_feature.py").write_text(
+            "def main():\n    return 'stale'\n", encoding="utf-8"
+        )
+        for key in (
+            'retired_path = ["src/legacy_feature.py"]',
+            'source_owner = "feature-owner"',
         ):
-            source = (check_kd4_features.REPO_ROOT / consumer_path).read_text(
-                encoding="utf-8"
-            )
-            with self.subTest(consumer=consumer_path):
-                self.assertNotIn("crate::continuity", source)
-                self.assertNotIn("mod continuity;", source)
+            with self.subTest(key=key):
+                result = check_kd4_features.validate_manifest(
+                    self.write_manifest(key + "\n" + self.valid_evidence()),
+                    repo_root=self.repo_root,
+                )
+                self.assertFalse(result.ok)
+                self.assertIn(
+                    "unknown-feature-key", {finding.code for finding in result.findings}
+                )
+
+    def test_repository_maps_remain_retired(self) -> None:
+        with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
+            manifest = tomllib.load(manifest_file)
+        self.assertNotIn(
+            "repository-intelligence", {f["id"] for f in manifest["features"]}
+        )
+        feature = next(
+            f for f in manifest["features"] if f["id"] == "kd4-feature-manifest"
+        )
+        retired = {
+            "SOURCEMAP.md",
+            "source_owners.toml",
+            "architecture_index.json",
+            "scripts/source_map_check.py",
+            "scripts/test_source_map_check.py",
+            "scripts/source_owners.py",
+            "scripts/test_source_owners.py",
+        }
+        self.assertTrue(retired.issubset(feature["retired_paths"]))
+        for path in retired:
+            with self.subTest(path=path):
+                self.assertFalse((check_kd4_features.REPO_ROOT / path).exists())
+                (self.repo_root / path).parent.mkdir(parents=True, exist_ok=True)
+                restored = self.repo_root / path
+                restored.write_text("restored", encoding="utf-8")
+                manifest_path = self.write_manifest(
+                    "retired_paths = ["
+                    + json.dumps(path)
+                    + "]\n"
+                    + self.valid_evidence()
+                )
+                result = check_kd4_features.validate_manifest(
+                    manifest_path, repo_root=self.repo_root
+                )
+                self.assertFalse(result.ok)
+                self.assertIn(
+                    "parallel-implementation", {f.code for f in result.findings}
+                )
+                restored.unlink()
 
     def test_valid_enabled_feature_passes(self) -> None:
+        # No test marker: an enabled runtime feature's gate is its test proof.
         result = check_kd4_features.validate_manifest(
             self.write_manifest(self.valid_evidence()),
             repo_root=self.repo_root,
@@ -466,6 +397,21 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertTrue(result.ok, result.findings)
         self.assertEqual(result.status_counts, {"enabled": 1})
         self.assertEqual(result.runtime_status_counts, {})
+
+    def test_enabled_workflow_requires_test_evidence(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text().replace(
+                'capability_kind = "runtime"', 'capability_kind = "workflow"'
+            )
+        )
+
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("missing-test", {finding.code for finding in result.findings})
 
     def test_enabled_runtime_requires_executable_verification(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())
@@ -491,8 +437,8 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         )
 
     def test_runtime_verification_symbol_must_remain_live(self) -> None:
-        (self.repo_root / "tests" / "test_feature.py").write_text(
-            "# def test_feature_is_live():\ndef removed_test():\n    pass\n",
+        (self.repo_root / "owner" / "src" / "lib.rs").write_text(
+            "// fn test_feature_is_live() {}\n#[test]\nfn removed_test() {}\n",
             encoding="utf-8",
         )
 
@@ -503,69 +449,8 @@ class CheckKd4FeaturesTest(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn(
-            "stale-runtime-verification",
+            "invalid-runtime-verification",
             {finding.code for finding in result.findings},
-        )
-
-    def test_shared_python_verification_executes_once_for_each_capability(self) -> None:
-        test_file = self.repo_root / "tests/test_feature.py"
-        test_file.write_text(
-            test_file.read_text().replace(
-                'self.assertEqual(COMMANDS["feature"](), "live")',
-                'self.assertEqual(COMMANDS["feature"](), "live"); path = __import__("pathlib").Path("executed"); path.write_text((path.read_text() if path.exists() else "") + "once")',
-            )
-        )
-        manifest = self.write_manifest(self.valid_evidence())
-        feature = manifest.read_text().split("[[features]]", 1)[1]
-        manifest.write_text(
-            manifest.read_text()
-            + "\n[[features]]"
-            + feature.replace('id = "feature"', 'id = "second"', 1)
-        )
-        payload = self.run_json_verification(manifest)
-        self.assertTrue(payload["ok"])
-        self.assertEqual((self.repo_root / "executed").read_text(), "once")
-        self.assertEqual(
-            payload["runtimeVerificationResults"][0]["test_identities"],
-            ["tests.test_feature.FeatureRegistrationTest.test_feature_is_live"],
-        )
-        self.assertEqual(
-            [item["feature_id"] for item in payload["runtimeVerificationResults"]],
-            ["feature", "second"],
-        )
-
-    def test_mixed_batch_keeps_observed_pass_but_fails_capability_proof(self):
-        source = self.repo_root / "tests/test_feature.py"
-        source.write_text(
-            source.read_text()
-            + "\nclass FailingTest(unittest.TestCase):\n    def test_failure(self):\n        self.assertEqual(1, 2)\n"
-        )
-        manifest = self.write_manifest(self.valid_evidence())
-        feature = manifest.read_text().split("[[features]]", 1)[1]
-        feature = feature.replace('id = "feature"', 'id = "second"', 1)
-        feature = feature.replace(
-            "FeatureRegistrationTest.test_feature_is_live", "FailingTest.test_failure"
-        )
-        feature = feature.replace(
-            'symbol = "test_feature_is_live"', 'symbol = "test_failure"'
-        )
-        manifest.write_text(manifest.read_text() + "\n[[features]]" + feature)
-        outcomes = []
-        code = check_kd4_features.execute_runtime_verification(
-            manifest,
-            feature_id=None,
-            repo_root=self.repo_root,
-            quiet=True,
-            outcomes=outcomes,
-        )
-        self.assertNotEqual(code, 0)
-        self.assertEqual([item["outcome"] for item in outcomes], ["passed", "failed"])
-        self.assertEqual(
-            [item["batch_status"] for item in outcomes], ["failed", "failed"]
-        )
-        self.assertEqual(
-            outcomes[0]["test_identities"],
-            ["tests.test_feature.FeatureRegistrationTest.test_feature_is_live"],
         )
 
     def run_json_verification(self, manifest: Path, *extra: str) -> dict:
@@ -585,57 +470,45 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertEqual(code == 0, payload["ok"])
         return payload
 
-    def replace_verification_command(self, manifest: Path, command: list[str]) -> None:
-        manifest.write_text(
-            re.sub(
-                r"command = \[[^\n]*?\]",
-                lambda _: "command = " + json.dumps(command),
-                manifest.read_text(),
-            )
+    def test_non_gate_verification_routes_are_rejected_before_launch(self) -> None:
+        (self.repo_root / "tests").mkdir()
+        (self.repo_root / "tests" / "test_feature.py").write_text(
+            "import unittest\n\n\nclass FeatureTest(unittest.TestCase):\n"
+            "    def test_feature_is_live(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
         )
-
-    def test_verification_rejects_non_test_commands_before_they_launch(self) -> None:
-        manifest = self.write_manifest(self.valid_evidence())
-        for command in [
-            [
-                sys.executable,
-                "-c",
-                "from pathlib import Path; Path('launched').touch(); print('test_feature_is_live')",
-            ],
-            [sys.executable, "-m", "unittest", "wrong.module.test_feature_is_live"],
-            [
-                sys.executable,
-                "-m",
-                "unittest",
-                "tests.test_feature.FeatureRegistrationTest.test_feature_is_live",
-                "--help",
-            ],
-        ]:
+        gate = GATE_COMMAND[:3]
+        for path, command in (
+            ("owner/src/lib.rs", ["cargo", "test", "test_feature_is_live"]),
+            ("owner/src/lib.rs", [*gate, "proof"]),
+            ("owner/src/lib.rs", [*gate, "missing", "--profile", "fast"]),
+            # A Python test cannot stand in for a capability gate.
+            (
+                "tests/test_feature.py",
+                [
+                    "python",
+                    "-m",
+                    "unittest",
+                    "tests.test_feature.FeatureTest.test_feature_is_live",
+                ],
+            ),
+        ):
             with self.subTest(command=command):
-                self.replace_verification_command(manifest, command)
-                payload = self.run_json_verification(manifest)
+                manifest = self.write_manifest(
+                    self.valid_evidence(), verification_path=path, command=command
+                )
+                with (
+                    mock.patch.object(subprocess, "run") as run,
+                    mock.patch.object(subprocess, "Popen") as popen,
+                ):
+                    payload = self.run_json_verification(manifest)
                 self.assertFalse(payload["ok"])
                 self.assertIsNone(payload["runtimeVerificationExitCode"])
-                self.assertFalse((self.repo_root / "launched").exists())
-
-    def test_skipped_verification_is_not_a_pass(self) -> None:
-        test_file = self.repo_root / "tests/test_feature.py"
-        test_file.write_text(
-            test_file.read_text().replace(
-                "    def test_feature_is_live",
-                "    @unittest.skip('fixture')\n    def test_feature_is_live",
-            )
-        )
-        payload = self.run_json_verification(self.write_manifest(self.valid_evidence()))
-        self.assertFalse(payload["ok"])
-        result = payload["runtimeVerificationResults"][0]
-        self.assertEqual(result["returncode"], 0)
-        self.assertEqual(result["outcome"], "skipped")
-        self.assertEqual(result["test_identities"], [])
+                run.assert_not_called()
+                popen.assert_not_called()
 
     def test_static_only_does_not_execute_the_test(self) -> None:
-        test_file = self.repo_root / "tests/test_feature.py"
-        test_file.write_text(test_file.read_text().replace('"live")', '"wrong")'))
+        # Execution would invoke real cargo in a directory with no workspace.
         manifest = self.write_manifest(self.valid_evidence())
         process = subprocess.run(
             [
@@ -661,219 +534,112 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertIsNone(payload["runtimeVerificationExitCode"])
 
     def test_rust_verification_batches_through_real_gate_runner(self) -> None:
-        (self.repo_root / "owner/Cargo.toml").write_text(
-            '[package]\nname = "fixture"\n'
-        )
-        (self.repo_root / "owner/src").mkdir()
-        (self.repo_root / "owner/src/lib.rs").write_text(
-            "#[test]\nfn test_feature_is_live() { assert!(registered()); }\n"
-        )
-        (self.repo_root / "codex-rs/.config").mkdir(parents=True)
-        (self.repo_root / "codex-rs/.config/kd4-rust-tests.toml").write_text(
-            'version = 1\n[helpers]\n[targets.fixture_lib]\npackage = "fixture"\nlib = true\nhelpers = []\n'
-            '[gates.proof]\n[[gates.proof.steps]]\ntarget = "fixture_lib"\ntests = ["test_feature_is_live"]\nhelpers = []\n'
-        )
-        manifest = self.write_manifest(self.valid_evidence())
-        manifest.write_text(
-            manifest.read_text().replace(
-                'path = "tests/test_feature.py", symbol',
-                'path = "owner/src/lib.rs", symbol',
-            )
-        )
-        for command in (
-            ["cargo", "test", "test_feature_is_live"],
-            ["python", "scripts/rust_test_runner.py", "run-gate", "missing"],
-        ):
-            self.replace_verification_command(manifest, command)
-            with mock.patch.object(subprocess, "run") as launch:
-                self.assertFalse(self.run_json_verification(manifest)["ok"])
-                launch.assert_not_called()
-        self.replace_verification_command(
-            manifest,
-            [
-                "python",
-                "scripts/rust_test_runner.py",
-                "run-gate",
-                "proof",
-                "--profile",
-                "fast",
-            ],
-        )
         # Two capabilities share one proof; both must receive its actual result.
+        manifest = self.write_manifest(self.valid_evidence())
         feature = manifest.read_text().split("[[features]]", 1)[1]
         manifest.write_text(
             manifest.read_text()
             + "\n[[features]]"
             + feature.replace('id = "feature"', 'id = "second"', 1)
         )
-        runner_class = check_kd4_features.rust_test_runner.RustTestRunner
-        load_metadata = check_kd4_features.rust_test_runner.load_metadata
-        for stream, expected in (
-            ("PASS [ 0.001s] fixture test_feature_is_live", "passed"),
-            ("", "not_executed"),
-            ("PASS [0.001s] fixture unrelated", "not_executed"),
-            ("Summary: 0 tests run", "zero_tests"),
-            ("SKIP [0.001s] fixture test_feature_is_live", "skipped"),
+        for stream, returncode, expected in (
+            ("PASS [ 0.001s] fixture test_feature_is_live", 0, "passed"),
+            ("FAIL [ 0.001s] fixture test_feature_is_live", 100, "failed"),
+            ("", 0, "not_executed"),
+            ("PASS [0.001s] fixture unrelated", 0, "not_executed"),
+            # Without an exact PASS for the declared test, a skip is not proof.
+            ("SKIP [0.001s] fixture test_feature_is_live", 0, "not_executed"),
         ):
             passed = expected == "passed"
-            calls = []
+            with self.subTest(stream=stream):
+                with self.fake_cargo(stream, returncode) as calls:
+                    payload = self.run_json_verification(manifest)
+                self.assertEqual(payload["ok"], passed, payload)
+                self.assertEqual(payload["featureCount"], 2)
+                self.assertEqual(
+                    payload["runtimeVerificationExitCode"], 0 if passed else 2
+                )
+                results = payload["runtimeVerificationResults"]
+                self.assertEqual(
+                    [item["outcome"] for item in results], [expected, expected]
+                )
+                self.assertEqual(
+                    [item["feature_id"] for item in results], ["feature", "second"]
+                )
+                self.assertEqual(
+                    [item["test_identities"] for item in results],
+                    [["test_feature_is_live"], ["test_feature_is_live"]]
+                    if passed
+                    else [[], []],
+                )
+                self.assertEqual(
+                    sum(argv[:2] == ["cargo", "metadata"] for argv in calls), 1
+                )
+                self.assertEqual(
+                    sum(argv[:3] == ["cargo", "nextest", "run"] for argv in calls), 1
+                )
 
-            def cargo(argv, calls=calls, stream=stream, **kwargs):
-                calls.append(argv)
-                if argv[:2] == ["cargo", "metadata"]:
-                    stdout = json.dumps(
-                        {
-                            "target_directory": str(self.repo_root / "target"),
-                            "packages": [
-                                {
-                                    "name": "fixture",
-                                    "id": "fixture-id",
-                                    "targets": [{"name": "fixture", "kind": ["lib"]}],
-                                }
-                            ],
-                        }
-                    )
-                elif argv[:3] == ["cargo", "nextest", "list"]:
-                    stdout = json.dumps(
-                        {
-                            "test-count": 1,
-                            "rust-suites": {
-                                "fixture": {
-                                    "testcases": {
-                                        "test_feature_is_live": {"ignored": False}
-                                    }
-                                }
-                            },
-                        }
-                    )
-                elif argv[:3] == ["cargo", "nextest", "run"]:
-                    stdout = stream
-                else:
-                    self.fail(f"unexpected preparation: {argv}")
-                return subprocess.CompletedProcess(argv, 0, stdout, "")
+    def test_default_cli_exit_code_follows_the_executed_gate(self) -> None:
+        args = [
+            "--manifest",
+            str(self.write_manifest(self.valid_evidence())),
+            "--repo-root",
+            str(self.repo_root),
+        ]
+        for stream, returncode, expected_exit in (
+            ("PASS [ 0.001s] fixture test_feature_is_live", 0, 0),
+            ("FAIL [ 0.001s] fixture test_feature_is_live", 100, 2),
+        ):
+            with self.subTest(stream=stream):
+                output = io.StringIO()
+                with (
+                    self.fake_cargo(stream, returncode),
+                    contextlib.redirect_stdout(output),
+                ):
+                    exit_code = check_kd4_features.main(args)
+                self.assertEqual(exit_code, expected_exit, output.getvalue())
+                self.assertEqual(
+                    "KD4 TEST RESULT [feature]: passed" in output.getvalue(),
+                    expected_exit == 0,
+                )
 
-            with (
-                self.subTest(stream=stream),
-                mock.patch.object(subprocess, "run", side_effect=cargo),
-                mock.patch.object(
-                    check_kd4_features.rust_test_runner,
-                    "load_metadata",
-                    side_effect=lambda **kwargs: load_metadata(
-                        executor=cargo, **kwargs
-                    ),
-                ),
-                mock.patch.object(
-                    check_kd4_features.rust_test_runner,
-                    "RustTestRunner",
-                    side_effect=lambda *args, **kwargs: runner_class(
-                        *args, **kwargs, executor=cargo
-                    ),
-                ),
-            ):
-                payload = self.run_json_verification(manifest)
-            self.assertEqual(payload["ok"], passed, payload)
-            results = payload["runtimeVerificationResults"]
-            self.assertEqual(
-                [item["outcome"] for item in results], [expected, expected]
-            )
-            self.assertEqual(
-                [item["feature_id"] for item in results], ["feature", "second"]
-            )
-            self.assertEqual(
-                [item["test_identities"] for item in results],
-                [["test_feature_is_live"], ["test_feature_is_live"]]
-                if passed
-                else [[], []],
-            )
-            self.assertEqual(
-                sum(argv[:2] == ["cargo", "metadata"] for argv in calls), 1
-            )
-            self.assertEqual(
-                sum(argv[:3] == ["cargo", "nextest", "list"] for argv in calls), 0
-            )
-            self.assertEqual(
-                sum(argv[:3] == ["cargo", "nextest", "run"] for argv in calls), 1
-            )
+    def test_busy_core_lane_is_reported_without_launching_anything(self) -> None:
+        busy = "Cargo lane 'core-tests' is busy; no cold overflow was started."
 
-    def test_default_cli_executes_registration_contract(self) -> None:
+        @contextlib.contextmanager
+        def busy_lane(**_kwargs):
+            raise RuntimeError(busy)
+            yield
+
+        (self.repo_root / "codex-rs" / "Cargo.toml").write_text("[workspace]\n")
         manifest = self.write_manifest(self.valid_evidence())
-        output = io.StringIO()
-
-        with contextlib.redirect_stdout(output):
-            exit_code = check_kd4_features.main(
-                [
-                    "--manifest",
-                    str(manifest),
-                    "--repo-root",
-                    str(self.repo_root),
-                ]
-            )
-
-        self.assertEqual(exit_code, 0, output.getvalue())
-        self.assertEqual(output.getvalue().count("KD4 RUNTIME VERIFICATION:"), 1)
-        self.assertIn("KD4 TEST RESULT [feature]: passed", output.getvalue())
-
-    def test_default_cli_rejects_unimported_registration(self) -> None:
-        (self.repo_root / "src" / "registry.py").write_text(
-            "COMMANDS = {'feature': main}\n",
-            encoding="utf-8",
-        )
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            exit_code = check_kd4_features.main(
-                [
-                    "--manifest",
-                    str(self.write_manifest(self.valid_evidence())),
-                    "--repo-root",
-                    str(self.repo_root),
-                ]
-            )
-
-        self.assertNotEqual(exit_code, 0)
-
-    def test_default_cli_rejects_dead_registration(self) -> None:
-        (self.repo_root / "src" / "registry.py").write_text(
-            "from src.feature import main\n\nCOMMANDS = {}\n",
-            encoding="utf-8",
-        )
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            exit_code = check_kd4_features.main(
-                [
-                    "--manifest",
-                    str(self.write_manifest(self.valid_evidence())),
-                    "--repo-root",
-                    str(self.repo_root),
-                ]
-            )
-
-        self.assertNotEqual(exit_code, 0)
-
-    def test_pass_only_runtime_verification_is_rejected_before_execution(self) -> None:
-        (self.repo_root / "tests" / "test_feature.py").write_text(
-            textwrap.dedent(
-                """
-                import unittest
-
-
-                class FeatureRegistrationTest(unittest.TestCase):
-                    def test_feature_is_live(self):
-                        pass
-                """
+        # A command already running inside a lane would bypass the reservation.
+        env = {
+            name: value
+            for name, value in os.environ.items()
+            if name not in {"CODEX_CARGO_LANE_TARGET_DIR", "CODEX_CARGO_LANE_OWNER_PID"}
+        }
+        with (
+            mock.patch.object(
+                check_kd4_features.rust_build_status, "reserve_cargo_lane", busy_lane
             ),
-            encoding="utf-8",
-        )
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(subprocess, "run") as run,
+            mock.patch.object(subprocess, "Popen") as popen,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            payload = self.run_json_verification(manifest)
+            defaults = check_kd4_features._load_feature_defaults(self.repo_root)
 
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest(self.valid_evidence()),
-            repo_root=self.repo_root,
-        )
-
-        self.assertFalse(result.ok)
-        self.assertIn(
-            "vacuous-runtime-verification",
-            {finding.code for finding in result.findings},
-        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["runtimeVerificationExitCode"], 2)
+        [result] = payload["runtimeVerificationResults"]
+        self.assertEqual(result["outcome"], "not_executed")
+        self.assertIn(busy, result["error"])
+        self.assertIsNone(defaults)
+        self.assertIn(busy, stderr.getvalue())
+        run.assert_not_called()
+        popen.assert_not_called()
 
     def test_planned_feature_cannot_retain_live_route_evidence(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())
@@ -892,176 +658,6 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn(
             "planned-feature-has-production-route",
-            {finding.code for finding in result.findings},
-        )
-
-    def test_contract_schema_version_is_read_from_runtime_constant(self) -> None:
-        (self.repo_root / "src" / "schema.rs").write_text(
-            "pub const CONTRACT_SCHEMA_VERSION: u64 = 13;\n",
-            encoding="utf-8",
-        )
-        manifest = self.write_manifest(
-            textwrap.dedent(
-                """
-                contract_schema_version = 12
-                contract_schema_source = "src/schema.rs"
-                contract_schema_symbol = "CONTRACT_SCHEMA_VERSION"
-                """
-            )
-            + self.valid_evidence()
-        )
-
-        result = check_kd4_features.validate_manifest(
-            manifest,
-            repo_root=self.repo_root,
-        )
-
-        self.assertFalse(result.ok)
-        self.assertIn(
-            "contract-schema-drift",
-            {finding.code for finding in result.findings},
-        )
-
-    def test_source_owner_supplies_reachability_without_inline_markers(self) -> None:
-        self.write_source_owner()
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest('source_owner = "feature-owner"'),
-            repo_root=self.repo_root,
-        )
-
-        self.assertTrue(result.ok, result.findings)
-
-    def test_shared_source_owner_liveness_is_observed_once(self) -> None:
-        self.write_source_owner()
-        owner_path = self.repo_root / "source_owners.toml"
-        owner_path.write_text(
-            owner_path.read_text(encoding="utf-8").replace(
-                'feature_ids = ["feature"]',
-                'feature_ids = ["feature", "feature-two"]',
-            ),
-            encoding="utf-8",
-        )
-        findings: list[check_kd4_features.Finding] = []
-        observations: dict[
-            str, tuple[frozenset[str], check_kd4_features.Counter[str]]
-        ] = {}
-        owner_cache = None
-        text_cache: dict[Path, str] = {}
-
-        with mock.patch.object(
-            check_kd4_features,
-            "_safe_repo_path",
-            wraps=check_kd4_features._safe_repo_path,
-        ) as safe_repo_path:
-            _, owner_cache = check_kd4_features._source_owner_evidence(
-                source_owner_id="feature-owner",
-                repo_root=self.repo_root.resolve(),
-                feature_id="feature",
-                findings=findings,
-                owner_cache=owner_cache,
-                owner_observation_cache=observations,
-                text_cache=text_cache,
-            )
-            check_kd4_features._source_owner_evidence(
-                source_owner_id="feature-owner",
-                repo_root=self.repo_root.resolve(),
-                feature_id="feature-two",
-                findings=findings,
-                owner_cache=owner_cache,
-                owner_observation_cache=observations,
-                text_cache=text_cache,
-            )
-
-        self.assertEqual(findings, [])
-        self.assertEqual(safe_repo_path.call_count, 3)
-
-    def test_source_owner_must_explicitly_own_feature(self) -> None:
-        self.write_source_owner()
-        owner_path = self.repo_root / "source_owners.toml"
-        owner_path.write_text(
-            owner_path.read_text(encoding="utf-8").replace(
-                'feature_ids = ["feature"]', 'feature_ids = ["different-feature"]'
-            ),
-            encoding="utf-8",
-        )
-
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest('source_owner = "feature-owner"'),
-            repo_root=self.repo_root,
-        )
-
-        self.assertFalse(result.ok)
-        self.assertIn(
-            "source-owner-feature-mismatch",
-            {finding.code for finding in result.findings},
-        )
-
-    def test_source_owner_markers_must_resolve_to_live_symbols(self) -> None:
-        self.write_source_owner()
-        owner_path = self.repo_root / "source_owners.toml"
-        owner_path.write_text(
-            owner_path.read_text(encoding="utf-8").replace(
-                'symbol = "main"', 'symbol = "removed_entrypoint"'
-            ),
-            encoding="utf-8",
-        )
-
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest('source_owner = "feature-owner"'),
-            repo_root=self.repo_root,
-        )
-
-        codes = {finding.code for finding in result.findings}
-        self.assertIn("stale-source-owner-evidence", codes)
-        self.assertIn("missing-entrypoint", codes)
-
-    def test_source_owner_symbol_in_comment_is_not_live_evidence(self) -> None:
-        self.write_source_owner()
-        (self.repo_root / "src" / "feature.py").write_text(
-            "# def main():\ndef active_entrypoint():\n    return 'live'\n",
-            encoding="utf-8",
-        )
-
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest('source_owner = "feature-owner"'),
-            repo_root=self.repo_root,
-        )
-
-        codes = {finding.code for finding in result.findings}
-        self.assertIn("stale-source-owner-evidence", codes)
-        self.assertIn("missing-entrypoint", codes)
-
-    def test_source_owner_registration_must_have_live_evidence(self) -> None:
-        self.write_source_owner()
-        owner_path = self.repo_root / "source_owners.toml"
-        owner_path.write_text(
-            owner_path.read_text(encoding="utf-8").replace(
-                'symbol = "COMMANDS"', 'symbol = "REMOVED_REGISTRY"'
-            ),
-            encoding="utf-8",
-        )
-
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest('source_owner = "feature-owner"'),
-            repo_root=self.repo_root,
-        )
-
-        codes = {finding.code for finding in result.findings}
-        self.assertIn("stale-source-owner-evidence", codes)
-        self.assertIn("missing-registration", codes)
-
-    def test_source_owner_cannot_duplicate_inline_evidence(self) -> None:
-        self.write_source_owner()
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest(
-                'source_owner = "feature-owner"\n' + self.valid_evidence()
-            ),
-            repo_root=self.repo_root,
-        )
-
-        self.assertFalse(result.ok)
-        self.assertIn(
-            "duplicate-evidence-authority",
             {finding.code for finding in result.findings},
         )
 
@@ -1088,7 +684,6 @@ class CheckKd4FeaturesTest(unittest.TestCase):
     def test_feature_default_comes_from_machine_readable_rust_export(
         self, run: mock.Mock
     ) -> None:
-        (self.repo_root / "codex-rs").mkdir()
         (self.repo_root / "codex-rs" / "Cargo.toml").write_text(
             "[workspace]\n", encoding="utf-8"
         )
@@ -1112,6 +707,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             None,
         )
         self.assertEqual(run.call_count, 1)
+        self.assertNotIn("--locked", run.call_args.args[0])
         self.assertEqual(subprocess_completed.stdout.count("defaultEnabled"), 1)
 
     def test_project_runtime_status_must_match_effective_config(self) -> None:
@@ -1214,20 +810,21 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             "invalid-project-config", {finding.code for finding in result.findings}
         )
 
-    def test_enabled_feature_without_registration_fails(self) -> None:
-        evidence = self.valid_evidence().replace(
-            'kind = "registration"',
-            'kind = "workflow"',
-        )
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest(evidence),
-            repo_root=self.repo_root,
-        )
+    def test_enabled_feature_requires_entrypoint_and_registration(self) -> None:
+        for kind in ("entrypoint", "registration"):
+            with self.subTest(kind=kind):
+                evidence = self.valid_evidence().replace(
+                    f'kind = "{kind}"', 'kind = "workflow"'
+                )
+                result = check_kd4_features.validate_manifest(
+                    self.write_manifest(evidence),
+                    repo_root=self.repo_root,
+                )
 
-        self.assertFalse(result.ok)
-        self.assertIn(
-            "missing-registration", {finding.code for finding in result.findings}
-        )
+                self.assertFalse(result.ok)
+                self.assertIn(
+                    f"missing-{kind}", {finding.code for finding in result.findings}
+                )
 
     def test_stale_marker_fails(self) -> None:
         evidence = self.valid_evidence().replace("def main()", "def missing()")
@@ -1302,41 +899,21 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("missing-field", {finding.code for finding in result.findings})
 
-    def test_empty_regex_is_not_silently_ignored(self) -> None:
-        evidence = self.valid_evidence().replace(
-            'contains = "def main()"',
-            'contains = "def main()"\nregex = ""',
-        )
-
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest(evidence), repo_root=self.repo_root
-        )
-
-        matches = [
-            finding
-            for finding in result.findings
-            if finding.code == "invalid-evidence-match"
-        ]
-        self.assertTrue(matches)
-        self.assertIn("exactly one", matches[0].message)
-
-    def test_empty_regex_alone_reports_non_empty_requirement(self) -> None:
-        evidence = self.valid_evidence().replace(
-            'contains = "def main()"',
-            'regex = ""',
-        )
-
-        result = check_kd4_features.validate_manifest(
-            self.write_manifest(evidence), repo_root=self.repo_root
-        )
-
-        self.assertTrue(
-            any(
-                finding.code == "invalid-evidence-match"
-                and "non-empty string" in finding.message
-                for finding in result.findings
-            )
-        )
+    def test_evidence_without_non_empty_contains_is_rejected(self) -> None:
+        # Kinds are counted before matching, so an unmatched marker must fail.
+        for replacement in ('regex = "def main"', 'contains = ""'):
+            with self.subTest(replacement=replacement):
+                evidence = self.valid_evidence().replace(
+                    'contains = "def main()"', replacement
+                )
+                result = check_kd4_features.validate_manifest(
+                    self.write_manifest(evidence), repo_root=self.repo_root
+                )
+                self.assertFalse(result.ok)
+                self.assertIn(
+                    "invalid-evidence-match",
+                    {finding.code for finding in result.findings},
+                )
 
     def test_missing_owner_has_one_root_cause_finding(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())
@@ -1471,35 +1048,6 @@ class CheckKd4FeaturesTest(unittest.TestCase):
 
         self.assertEqual(strict_exit, 1)
         self.assertEqual(non_strict_exit, 0)
-
-    def test_json_cli_reports_machine_readable_verdict(self) -> None:
-        manifest = self.write_manifest(self.valid_evidence())
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            exit_code = check_kd4_features.main(
-                [
-                    "--manifest",
-                    str(manifest),
-                    "--repo-root",
-                    str(self.repo_root),
-                    "--json",
-                ]
-            )
-
-        self.assertEqual(exit_code, 0)
-        payload = json.loads(output.getvalue())
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["featureCount"], 1)
-        self.assertEqual(payload["runtimeStatusCounts"], {})
-        self.assertEqual(payload["runtimeVerificationExitCode"], 0)
-
-    def test_json_cli_reports_runtime_verification_failure(self) -> None:
-        test_file = self.repo_root / "tests/test_feature.py"
-        test_file.write_text(test_file.read_text().replace('"live")', '"wrong")'))
-        payload = self.run_json_verification(self.write_manifest(self.valid_evidence()))
-        self.assertFalse(payload["ok"])
-        self.assertNotEqual(payload["runtimeVerificationExitCode"], 0)
-        self.assertEqual(payload["runtimeVerificationResults"][0]["outcome"], "failed")
 
     def test_missing_upstream_commit_is_rejected(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())

@@ -38,7 +38,7 @@ fn assert_plan_output_schema(response: &serde_json::Value) {
     let ToolSpec::Function(spec) = create_update_plan_tool() else {
         panic!("plan uses a function spec");
     };
-    let validator = jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+    let validator = jsonschema::validator_for(&spec.output_schema.as_ref().expect("output schema").to_value())
         .expect("valid plan output schema");
     assert!(
         validator.is_valid(response),

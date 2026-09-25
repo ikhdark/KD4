@@ -14,6 +14,8 @@ from typing import Mapping
 from typing import Sequence
 from typing import TYPE_CHECKING
 
+from scripts.rust_tool_env import local_rust_env
+
 if TYPE_CHECKING:
     from scripts.rust_build_status import BuildStatusSnapshot
     from scripts.rust_build_status import RustProcess
@@ -28,6 +30,10 @@ DEFAULT_LANE_SIZE_WORKERS = 2
 MAX_LANE_SIZE_WORKERS = 4
 DEFAULT_PRUNE_KEEP_WARM_PER_BASE = 1
 DEFAULT_PRUNE_MAX_AGE_DAYS = 7.0
+# Cargo hardlinks uplifted binaries, PDBs and build scripts. Checking link
+# identity only for files of at least 1 MiB removed 94% of the double-counted
+# bytes in a 43 GiB target for about 0.4 s instead of 11 s for every file.
+HARDLINK_CHECK_MIN_BYTES = BYTES_PER_MIB
 WINDOWS_MSVC_TARGETS = (
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
@@ -56,6 +62,7 @@ def directory_size_bytes(path: Path, *, exclude: Path | None = None) -> tuple[in
 
     total = 0
     errors = 0
+    linked: set[tuple[int, int]] = set()
     stack = [os.fspath(path.resolve())]
     while stack:
         current = stack.pop()
@@ -70,7 +77,19 @@ def directory_size_bytes(path: Path, *, exclude: Path | None = None) -> tuple[in
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
-                            total += entry.stat(follow_symlinks=False).st_size
+                            size = entry.stat(follow_symlinks=False).st_size
+                            if size >= HARDLINK_CHECK_MIN_BYTES:
+                                # scandir leaves st_ino/st_nlink zero on Windows.
+                                try:
+                                    identity = os.stat(entry.path, follow_symlinks=False)
+                                except OSError:
+                                    identity = None
+                                if identity is not None and identity.st_nlink > 1:
+                                    key = (identity.st_dev, identity.st_ino)
+                                    if key in linked:
+                                        continue
+                                    linked.add(key)
+                            total += size
                     except OSError:
                         errors += 1
         except OSError:
@@ -180,11 +199,14 @@ def target_disk_report_lines(
         lines.append(f"target disk scan errors: {errors}")
     if size_bytes > warn_bytes:
         lines.append(
-            "target disk warning: codex-rs/target is above the local budget; "
-            "automatic lane GC will recheck after active lane builds finish. "
-            "Use `just target-prune` only for an immediate idle cleanup, or remove "
-            "`codex-rs/target` only after `just rust-build-doctor` shows no active "
-            "Rust jobs."
+            "target disk warning: codex-rs/target is above the warning threshold. "
+            "Automatic lane GC enforces only lane age and warm-lane limits unless "
+            "CODEX_CARGO_LANE_MAX_TOTAL_BYTES or CODEX_CARGO_TARGET_MAX_TOTAL_BYTES "
+            "is set. Preview a size-bounded cleanup with `just target-prune --dry-run "
+            "--max-total-target-gib <GiB>`; it removes only lanes proven idle by "
+            "their locks and never shared profiles or stray targets. This report "
+            "cannot prove that nothing is using codex-rs/target, so it is not a "
+            "basis for deleting that directory."
         )
     strays = _runtime().stray_cargo_target_dirs(repo_root=repo_root)
     if strays:
@@ -227,19 +249,36 @@ def build_doctor_report(
         f"RUSTC_WRAPPER: {env.get('RUSTC_WRAPPER') or '(unset)'}",
     ]
     for target in WINDOWS_MSVC_TARGETS:
+        env_name = f"CARGO_TARGET_{target.upper().replace('-', '_')}_LINKER"
         lines.append(
             f"MSVC linker config {target}: {msvc_linkers.get(target) or '(unset)'}"
         )
-
+        lines.append(f"MSVC linker env {env_name}: {env.get(env_name) or '(unset)'}")
+    # Just recipes and run-lane add these to the values above before Cargo runs.
+    additions = local_rust_env(env, repo_root=repo_root, which=tool_lookup)
     lines.append(
-        f"active Rust processes: {len(processes)} total, {len(shared)} shared-target, {len(lane_processes)} lane"
+        "just/run-lane env additions: "
+        + (
+            "; ".join(f"{name}={value}" for name, value in sorted(additions.items()))
+            or "(none)"
+        )
     )
+
+    if snapshot.process_scan_error is not None:
+        lines.append(f"active Rust processes: unknown ({snapshot.process_scan_error})")
+    else:
+        lines.append(
+            f"active Rust processes: {len(processes)} total, {len(lane_processes)} lane, "
+            f"{len(shared)} without lane"
+        )
     if shared:
         lines.append(
-            "shared-target jobs are active; prefer `just test-lane-fast <lane> ...`"
+            "Rust jobs without a lane are running; their target dir is not verified "
+            "(codex-rs/target or another workspace). For codex-rs builds prefer "
+            "`just test-lane-fast <lane> ...`"
         )
-    if snapshot.active_lanes:
-        active_lanes = sorted(snapshot.active_lanes)
+    active_lanes = sorted(snapshot.active_lanes - snapshot.quarantined_lanes)
+    if active_lanes:
         lines.append(
             "active lanes: " + ", ".join(lane for lane in active_lanes if lane)
         )
@@ -303,37 +342,71 @@ def lane_report_lines(
         processes=processes,
     )
     lane_root = _runtime().cargo_lanes_root(repo_root)
-    existing_names = {path.name for path in snapshot.lane_dirs}
-    active_lanes = snapshot.active_lanes
-    active_existing = sorted(active_lanes & existing_names)
-    active_external = sorted(active_lanes - existing_names)
+    # Match on-disk names case-insensitively, as stale detection does.
+    existing_by_folded = {path.name.casefold(): path.name for path in snapshot.lane_dirs}
+    active_existing = sorted(
+        {
+            existing_by_folded[name.casefold()]
+            for name in snapshot.active_lanes
+            if name.casefold() in existing_by_folded
+        }
+        - snapshot.quarantined_lanes
+    )
+    active_external = sorted(
+        name
+        for name in snapshot.active_lanes
+        if name.casefold() not in existing_by_folded
+    )
     stale = snapshot.stale_lanes
     protected = _runtime().protected_warm_lane_names(
         stale,
         keep_warm_per_base=DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
         lane_mtime=snapshot.lane_mtime,
     )
-    prunable = set(
-        _runtime().prunable_lane_dirs(
-            repo_root=repo_root,
-            processes=snapshot.processes,
-            snapshot=snapshot,
+    prune_refusal = None
+    try:
+        prunable = set(
+            _runtime().prunable_lane_dirs(
+                repo_root=repo_root,
+                processes=snapshot.processes,
+                snapshot=snapshot,
+            )
         )
-    )
+    except (
+        _runtime().RustProcessScanError,
+        _runtime().CargoLanesRootValidationError,
+    ) as exc:
+        prunable, prune_refusal = set(), str(exc)
 
     lines = ["lane report", f"lane root: {lane_root}"]
     lines.append(
         "active: " + (", ".join(active_existing) if active_existing else "(none)")
     )
+    if snapshot.quarantined_lanes:
+        lines.append(
+            "quarantined (process cleanup unconfirmed; not pruned or reused until "
+            ".lane-cleanup-unconfirmed is removed after checking for leftover "
+            "processes): " + ", ".join(sorted(snapshot.quarantined_lanes))
+        )
     if active_external:
         lines.append("active without directory: " + ", ".join(active_external))
     lines.append(
         "stale: " + (", ".join(path.name for path in stale) if stale else "(none)")
     )
-    warm_protected = sorted(path.name for path in stale if path.name in protected)
+    warm_protected = sorted(
+        path.name for path in stale if path.name in protected and path not in prunable
+    )
     if warm_protected:
         lines.append("warm-protected: " + ", ".join(warm_protected))
-    if prunable:
+    trash = _runtime().lane_trash_dirs(lane_root)
+    if trash:
+        lines.append(
+            "pending deletion (renamed by an earlier prune): "
+            + ", ".join(path.name for path in trash)
+        )
+    if prune_refusal is not None:
+        lines.append(f"pruning refused: {prune_refusal}")
+    elif prunable:
         lines.append("prunable:")
         for path in sorted(prunable):
             lines.append(f"  {path.name}")

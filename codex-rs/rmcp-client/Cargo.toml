@@ -27,7 +27,6 @@ codex-utils-pty = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["std"] }
 http = { workspace = true }
-keyring = { workspace = true, features = ["crypto-rust", "windows-native"] }
 memchr = { workspace = true }
 oauth2 = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
@@ -67,6 +66,7 @@ which = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 codex-utils-cargo-bin = { workspace = true }
+keyring = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 wiremock = { workspace = true }

@@ -6,7 +6,6 @@ use crate::parse_mcp_tool;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -35,7 +34,7 @@ pub struct ResponsesApiTool {
     pub defer_loading: Option<bool>,
     pub parameters: JsonSchema,
     #[serde(skip)]
-    pub output_schema: Option<Value>,
+    pub output_schema: Option<crate::ToolOutputSchema>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

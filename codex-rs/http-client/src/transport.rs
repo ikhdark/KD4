@@ -1,3 +1,4 @@
+use crate::RetryAfter;
 use crate::client::HttpClient;
 use crate::client::RequestBuilder;
 use crate::error::TransportError;
@@ -123,6 +124,7 @@ impl HttpTransport for ReqwestTransport {
         let status = resp.status();
         let headers = resp.headers().clone();
         if !(status.is_success() || status == StatusCode::NOT_MODIFIED && accepts_not_modified) {
+            let retry_after = RetryAfter::from_headers(&headers);
             let body = resp
                 .bytes()
                 .await
@@ -133,6 +135,7 @@ impl HttpTransport for ReqwestTransport {
                 url: Some(url),
                 headers: Some(headers),
                 body,
+                retry_after,
             });
         }
         let bytes = resp.bytes().await.map_err(Self::map_error)?;
@@ -152,12 +155,14 @@ impl HttpTransport for ReqwestTransport {
         let status = resp.status();
         let headers = resp.headers().clone();
         if !status.is_success() {
+            let retry_after = RetryAfter::from_headers(&headers);
             let body = resp.text().await.ok();
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
                 headers: Some(headers),
                 body,
+                retry_after,
             });
         }
         let stream = resp

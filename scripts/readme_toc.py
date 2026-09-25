@@ -58,7 +58,7 @@ def main() -> int:
         description="Check and optionally fix a Markdown Table of Contents."
     )
     parser.add_argument(
-        "file", nargs="?", default="SOURCEMAP.md", help="Markdown file to process"
+        "file", help="Markdown file to process"
     )
     parser.add_argument(
         "--fix", action="store_true", help="Rewrite file with updated ToC"

@@ -132,6 +132,23 @@ pub(crate) fn with_test_terminal_colors<T>(
     color_level: StdoutColorLevel,
     render: impl FnOnce() -> T,
 ) -> T {
+    with_test_colors(DefaultColors { fg: (255, 255, 255), bg: background }, color_level, render)
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_default_colors<T>(
+    colors: crate::terminal_probe::DefaultColors,
+    render: impl FnOnce() -> T,
+) -> T {
+    with_test_colors(DefaultColors { fg: colors.fg, bg: colors.bg }, StdoutColorLevel::TrueColor, render)
+}
+
+#[cfg(test)]
+fn with_test_colors<T>(
+    colors: DefaultColors,
+    color_level: StdoutColorLevel,
+    render: impl FnOnce() -> T,
+) -> T {
     struct Restore(Option<(DefaultColors, StdoutColorLevel)>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -139,10 +156,7 @@ pub(crate) fn with_test_terminal_colors<T>(
         }
     }
     let _restore = Restore(TEST_TERMINAL_COLORS.replace(Some((
-        DefaultColors {
-            fg: (255, 255, 255),
-            bg: background,
-        },
+        colors,
         color_level,
     ))));
     render()

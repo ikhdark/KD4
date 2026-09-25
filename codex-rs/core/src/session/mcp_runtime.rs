@@ -303,6 +303,24 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), old_manager.list_all_tools()).await?;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].tool.name.as_ref(), "echo");
+        let weak_session = Arc::downgrade(&session);
+        let resources = codex_mcp::McpResourceClient::new(move || {
+            let runtime = weak_session.upgrade()?.services.latest_mcp_runtime();
+            let manager = runtime.manager_arc();
+            Some((runtime, manager))
+        });
+        let before_refresh = resources
+            .server_cache_key("lifecycle")
+            .expect("resource key");
+        session.refresh_runtime_config(configured.clone()).await;
+        let after_refresh = resources
+            .server_cache_key("lifecycle")
+            .expect("refreshed key");
+        assert!(before_refresh != after_refresh);
+        assert!(Arc::ptr_eq(
+            &old_runtime,
+            &session.services.latest_mcp_runtime()
+        ));
         let step = session
             .capture_step_context(Arc::clone(&turn_context))
             .await?;
@@ -316,6 +334,7 @@ mod tests {
         let replacement = session.services.latest_mcp_runtime();
         assert!(!Arc::ptr_eq(&old_runtime, &replacement));
         assert!(replacement.manager().list_all_tools().await.is_empty());
+        assert!(resources.server_cache_key("lifecycle").is_none());
         let mut old_runtime = Some(old_runtime);
         for message in [
             "snapshot and step retain the connection",

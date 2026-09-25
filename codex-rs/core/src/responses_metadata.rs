@@ -30,6 +30,7 @@ pub(crate) const SESSION_ID_KEY: &str = "session_id";
 pub(crate) const THREAD_ID_KEY: &str = "thread_id";
 pub(crate) const TURN_ID_KEY: &str = "turn_id";
 pub(crate) const WINDOW_ID_KEY: &str = "window_id";
+pub(crate) const HISTORY_INGEST_REQUESTED_KEY: &str = "history_ingest_requested";
 pub(crate) const REQUEST_KIND_KEY: &str = "request_kind";
 pub(crate) const COMPACTION_KEY: &str = "compaction";
 pub(crate) const TURN_STARTED_AT_UNIX_MS_KEY: &str = "turn_started_at_unix_ms";
@@ -44,6 +45,7 @@ pub(crate) const WORKSPACES_KEY: &str = "workspaces";
 // App-server clients can specify additional metadata in the `responsesapi_client_metadata` param
 // when submitting a turn, but they must not override fields owned by core.
 const RESERVED_METADATA_KEYS: &[&str] = &[
+    HISTORY_INGEST_REQUESTED_KEY,
     INSTALLATION_ID_KEY,
     X_CODEX_INSTALLATION_ID_HEADER,
     SESSION_ID_KEY,
@@ -143,6 +145,7 @@ pub struct CodexResponsesMetadata {
     pub(crate) thread_id: String,
     pub(crate) turn_id: Option<String>,
     pub(crate) window_id: String,
+    pub(crate) history_ingest_requested: Option<bool>,
     pub(crate) request_kind: Option<CodexResponsesRequestKind>,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -169,6 +172,7 @@ impl CodexResponsesMetadata {
             thread_id,
             turn_id: None,
             window_id,
+            history_ingest_requested: None,
             request_kind: None,
             forked_from_thread_id: None,
             parent_thread_id: None,
@@ -273,6 +277,7 @@ impl CodexResponsesMetadata {
             thread_id: Some(self.thread_id.as_str()),
             turn_id: self.turn_id.as_deref(),
             window_id: has_request_identity.then_some(self.window_id.as_str()),
+            history_ingest_requested: self.history_ingest_requested,
             request_kind: request_kind_value,
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
@@ -345,6 +350,8 @@ fn non_empty_workspaces(
 
 #[derive(Serialize)]
 struct CodexTurnMetadataPayload<'a> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_ingest_requested: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installation_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -152,7 +152,7 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         parameters.required.as_ref(),
         Some(&vec!["task_name".to_string()])
     );
-    let output_schema = output_schema.expect("spawn_agent output schema")["oneOf"][0].clone();
+    let output_schema = output_schema.expect("spawn_agent output schema").into_value()["oneOf"][0].clone();
     assert_eq!(
         output_schema["required"],
         json!(["task_name", "nickname", "assignment_id", "integration_plan"])
@@ -509,7 +509,7 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     assert_wait_timeout_schema_matches_runtime_bounds(&parameters);
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
-        output_schema.expect("wait output schema")["properties"]["message"]["description"],
+        output_schema.expect("wait output schema").into_value()["properties"]["message"]["description"],
         json!("Brief wait summary without the agent's final content.")
     );
 }
@@ -566,7 +566,7 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         )
     );
     assert_eq!(
-        output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],
+        output_schema.expect("list_agents output schema").into_value()["properties"]["agents"]["items"]["required"],
         json!(["agent_name", "agent_status", "last_task_message"])
     );
 }
@@ -579,7 +579,7 @@ fn list_agents_tool_status_schema_includes_interrupted() {
     };
 
     assert_eq!(
-        output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["properties"]
+        output_schema.expect("list_agents output schema").into_value()["properties"]["agents"]["items"]["properties"]
             ["agent_status"]["allOf"][0]["oneOf"][0]["enum"],
         json!([
             "pending_init",
