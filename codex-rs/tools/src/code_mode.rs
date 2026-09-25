@@ -5,7 +5,7 @@ use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
 use std::collections::HashSet;
 
-const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count.";
+const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count. A returned namespace tool is callable as `resolve_tool(\"<namespace>.<name>\")`.";
 
 pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
     serde_json::json!({

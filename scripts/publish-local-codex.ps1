@@ -2076,24 +2076,33 @@ function Get-CodexDesktopProcessesForPath {
 function Test-DesktopRuntimeProof {
     param(
         [string]$TargetPath,
-        [int]$TimeoutMilliseconds = 5000
+        [string]$LocalCodexHome,
+        [int]$TimeoutMilliseconds = 15000,
+        [ref]$FailureReason
     )
 
-    if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
-        return $false
+    if ($null -ne $FailureReason) {
+        $FailureReason.Value = $null
     }
 
     $process = [System.Diagnostics.Process]::new()
     try {
+        if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+            throw "Local runtime target is missing: $TargetPath"
+        }
         $process.StartInfo.FileName = $TargetPath
-        $process.StartInfo.Arguments = "doctor --json --summary"
+        $process.StartInfo.Arguments = "doctor --json --summary --runtime-only"
+        $process.StartInfo.EnvironmentVariables["CODEX_CLI_PATH"] = $TargetPath
+        if (-not [string]::IsNullOrWhiteSpace($LocalCodexHome)) {
+            $process.StartInfo.EnvironmentVariables["CODEX_HOME"] = $LocalCodexHome
+        }
         $process.StartInfo.RedirectStandardInput = $true
         $process.StartInfo.RedirectStandardOutput = $true
         $process.StartInfo.RedirectStandardError = $true
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.CreateNoWindow = $true
         if (-not $process.Start()) {
-            return $false
+            throw "Could not start the Desktop runtime probe."
         }
         $process.StandardInput.Close()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
@@ -2105,31 +2114,38 @@ function Test-DesktopRuntimeProof {
             }
             catch {
             }
-            return $false
+            throw "Desktop runtime probe timed out after $TimeoutMilliseconds ms."
         }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
-        [void]$stderrTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         $doctor = ConvertFrom-DoctorOutput -OutputLines @($stdout)
         if ($null -eq $doctor) {
-            return $false
+            throw "Desktop runtime probe returned no JSON report (exit $($process.ExitCode)): $($stderr.Trim())"
         }
         $checksProperty = $doctor.PSObject.Properties["checks"]
         if ($null -eq $checksProperty -or $null -eq $checksProperty.Value) {
-            return $false
+            throw "Desktop runtime probe report is missing checks."
         }
         foreach ($checkId in @("local_publish.readiness", "desktop.runtime_chain")) {
             $checkProperty = $checksProperty.Value.PSObject.Properties[$checkId]
             if ($null -eq $checkProperty -or $null -eq $checkProperty.Value) {
-                return $false
+                throw "Desktop runtime probe report is missing $checkId."
             }
             $statusProperty = $checkProperty.Value.PSObject.Properties["status"]
             if ($null -eq $statusProperty -or [string]$statusProperty.Value -ne "ok") {
-                return $false
+                $check = $checkProperty.Value | ConvertTo-Json -Compress -Depth 10
+                throw "Desktop runtime probe rejected ${checkId}: $check"
             }
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "Desktop runtime probe exited with $($process.ExitCode): $($stderr.Trim())"
         }
         return $true
     }
     catch {
+        if ($null -ne $FailureReason) {
+            $FailureReason.Value = $_.Exception.Message
+        }
         return $false
     }
     finally {
@@ -2253,16 +2269,18 @@ function Restart-CodexDesktop {
         }
 
         $runtimeProofMatched = $false
+        $runtimeProofFailure = "Desktop runtime proof did not complete."
         do {
             $remainingMilliseconds = [Math]::Max(
                 1,
                 [int][Math]::Ceiling(($activationDeadline - [DateTime]::UtcNow).TotalMilliseconds)
             )
-            $probeTimeoutMilliseconds = [Math]::Min(5000, $remainingMilliseconds)
             if (
                 (Test-DesktopRuntimeProof `
                     -TargetPath $LocalCliPath `
-                    -TimeoutMilliseconds $probeTimeoutMilliseconds) -and
+                    -LocalCodexHome $LocalCodexHome `
+                    -TimeoutMilliseconds $remainingMilliseconds `
+                    -FailureReason ([ref]$runtimeProofFailure)) -and
                 @(Get-CodexDesktopProcessesForPath -DesktopPath $desktopPath).Count -gt 0
             ) {
                 $runtimeProofMatched = $true
@@ -2271,7 +2289,7 @@ function Restart-CodexDesktop {
             Start-Sleep -Milliseconds 100
         } while ([DateTime]::UtcNow -lt $activationDeadline)
         if (-not $runtimeProofMatched) {
-            throw "Codex Desktop started, but its live binary, build, or CODEX_HOME receipt did not match the intended local fork."
+            throw "Codex Desktop started, but its runtime could not be verified: $runtimeProofFailure"
         }
     }
     finally {
@@ -3933,7 +3951,7 @@ if ($ConfigureDesktopLocalCli) {
 if ($RestartDesktopIfNeeded -and -not $RestartDesktop) {
     $RestartDesktop = $binaryChanged -or $desktopRoutingResult.RestartRequired
     if (-not $RestartDesktop -and -not $DryRun) {
-        $RestartDesktop = -not (Test-DesktopRuntimeProof -TargetPath $targetPath)
+        $RestartDesktop = -not (Test-DesktopRuntimeProof -TargetPath $targetPath -LocalCodexHome $LocalCodexHome)
     }
     if (-not $RestartDesktop) {
         Write-ProofLine "desktopRestart" "skipped: current runtime or dry-run no-op"

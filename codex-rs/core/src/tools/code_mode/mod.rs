@@ -67,6 +67,9 @@ pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
 const FAILED_CELL_ITEM_NAMESPACE: &str = "codex.internal";
 const FAILED_CELL_ITEM_TOOL: &str = "code_mode_cell";
+/// Essential-inline marker: the model-visible packet omits output that the
+/// canonical artifact retains, so admission must name that artifact.
+pub(crate) const VISIBLE_OUTPUT_TRUNCATED_KEY: &str = "visible_output_truncated";
 
 /// Returns true for the un-namespaced code-mode `exec` tool.
 pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
@@ -887,7 +890,7 @@ fn format_runtime_response(
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
     let mut canonical_content_items = content_items.clone();
     canonical_content_items.extend(canonical_nested);
-    let mut content_items = truncate_code_mode_result(
+    let (mut content_items, visible_output_truncated) = truncate_code_mode_result(
         content_items,
         max_output_tokens,
         outcome,
@@ -933,11 +936,17 @@ fn format_runtime_response(
     } else {
         crate::tools::context::semantic_failure_sampling_signal(semantic_evidence)
     };
-    let output = FunctionToolOutput::from_content(content_items, Some(success))
+    let mut output = FunctionToolOutput::from_content(content_items, Some(success))
         .with_canonical_body(canonical_content_items)
         .with_outcome(typed_outcome)
         .with_sampling_request_signal(sampling_request_signal)
         .with_deterministic_continuation_owner_key(continuation_owner_key);
+    if visible_output_truncated {
+        output.essential_inline.insert(
+            VISIBLE_OUTPUT_TRUNCATED_KEY.to_string(),
+            JsonValue::Bool(true),
+        );
+    }
     match required_terminal {
         Some(terminal) => fold_nested_required_terminal(output, terminal),
         None => output,
@@ -979,13 +988,14 @@ fn prepend_script_status(
     content_items.insert(0, FunctionCallOutputContentItem::InputText { text: header });
 }
 
+/// Returns the model-visible packet and whether it omits any output.
 fn truncate_code_mode_result(
     items: Vec<FunctionCallOutputContentItem>,
     max_output_tokens: Option<usize>,
     outcome: OutputOutcome,
     hard_limit: usize,
     diagnostic_index: Option<usize>,
-) -> Vec<FunctionCallOutputContentItem> {
+) -> (Vec<FunctionCallOutputContentItem>, bool) {
     let diagnostic_text = code_mode_text_content(&items);
     let requested_limit =
         max_output_tokens.unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
@@ -1004,20 +1014,27 @@ fn truncate_code_mode_result(
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
-        let text = code_mode_text_content(&items);
-        return vec![FunctionCallOutputContentItem::InputText {
-            text: codex_utils_output_truncation::truncate_model_text(&text, limits.applied_limit),
-        }];
+        let truncated = codex_utils_output_truncation::truncate_model_text(
+            &diagnostic_text,
+            limits.applied_limit,
+        );
+        let omitted = truncated != diagnostic_text;
+        return (
+            vec![FunctionCallOutputContentItem::InputText { text: truncated }],
+            omitted,
+        );
     }
 
-    truncate_function_output_items_with_policy(&items, policy)
+    let projected = truncate_function_output_items_with_policy(&items, policy);
+    let omitted = projected != items;
+    (projected, omitted)
 }
 
 fn truncate_code_mode_failure(
     mut items: Vec<FunctionCallOutputContentItem>,
     error_index: usize,
     token_limit: usize,
-) -> Vec<FunctionCallOutputContentItem> {
+) -> (Vec<FunctionCallOutputContentItem>, bool) {
     let FunctionCallOutputContentItem::InputText { text: error_text } = items.remove(error_index)
     else {
         unreachable!("the caller identifies a script-error text item")
@@ -1025,28 +1042,33 @@ fn truncate_code_mode_failure(
     let error_tokens = codex_utils_output_truncation::model_token_count(&error_text);
     let reserved_error_tokens = error_tokens.min(token_limit);
     let other_policy = TruncationPolicy::Tokens(token_limit.saturating_sub(reserved_error_tokens));
-    let mut projected = if items
+    let (mut projected, mut omitted) = if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
-        vec![FunctionCallOutputContentItem::InputText {
-            text: codex_utils_output_truncation::truncate_model_text(
-                &code_mode_text_content(&items),
-                other_policy.token_budget(),
-            ),
-        }]
+        let text = code_mode_text_content(&items);
+        let truncated =
+            codex_utils_output_truncation::truncate_model_text(&text, other_policy.token_budget());
+        let omitted = truncated != text;
+        (
+            vec![FunctionCallOutputContentItem::InputText { text: truncated }],
+            omitted,
+        )
     } else {
-        truncate_function_output_items_with_policy(&items, other_policy)
+        let projected = truncate_function_output_items_with_policy(&items, other_policy);
+        let omitted = projected != items;
+        (projected, omitted)
     };
     let error_text = if error_tokens <= reserved_error_tokens {
         error_text
     } else {
+        omitted = true;
         codex_utils_output_truncation::truncate_model_text(&error_text, reserved_error_tokens)
     };
     if !error_text.is_empty() {
         projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
     }
-    projected
+    (projected, omitted)
 }
 
 fn code_mode_text_content(items: &[FunctionCallOutputContentItem]) -> String {
@@ -2812,8 +2834,9 @@ mod tests {
             text: "0123456789012345678901234567890123456789".to_string(),
         }];
 
-        let truncated_items =
+        let (truncated_items, omitted) =
             truncate_code_mode_result(items, Some(5), OutputOutcome::Success, usize::MAX, None);
+        assert!(omitted);
         let [FunctionCallOutputContentItem::InputText { text }] = truncated_items.as_slice() else {
             panic!("expected text");
         };
@@ -2921,6 +2944,11 @@ mod tests {
             );
             assert!(!projected.contains("Warning: truncated output"));
             assert!(
+                !outer
+                    .essential_inline
+                    .contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY)
+            );
+            assert!(
                 codex_utils_string::approx_token_count(&projected) <= 10_000,
                 "actual outer status plus recovery must fit the requested exec budget"
             );
@@ -2953,6 +2981,13 @@ mod tests {
                 .expect("projected code-mode text");
         assert!(projected.contains('…'));
         assert!(!projected.contains(sentinel));
+        assert_eq!(
+            output
+                .essential_inline
+                .get(super::VISIBLE_OUTPUT_TRUNCATED_KEY),
+            Some(&serde_json::Value::Bool(true)),
+            "admission must learn that the visible packet omitted output"
+        );
 
         let canonical = output
             .canonical_result(&ToolPayload::Custom {
@@ -2977,7 +3012,9 @@ mod tests {
             text: "x".repeat(400),
         }];
 
-        let truncated = truncate_code_mode_result(items, Some(20), OutputOutcome::Success, 5, None);
+        let (truncated, omitted) =
+            truncate_code_mode_result(items, Some(20), OutputOutcome::Success, 5, None);
+        assert!(omitted);
         let [FunctionCallOutputContentItem::InputText { text }] = truncated.as_slice() else {
             panic!("expected one truncated text item");
         };
@@ -3003,9 +3040,10 @@ mod tests {
             },
         ];
 
-        let projected =
+        let (projected, omitted) =
             truncate_code_mode_result(items, Some(40), OutputOutcome::Failure, usize::MAX, Some(2));
 
+        assert!(omitted, "the truncated log must be reported as omitted");
         assert!(projected.iter().any(|item| matches!(
             item,
             FunctionCallOutputContentItem::InputText { text }
@@ -3021,7 +3059,7 @@ mod tests {
         assert!(original_tokens < codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
         let items = vec![FunctionCallOutputContentItem::InputText { text: text.clone() }];
 
-        let projected =
+        let (projected, omitted) =
             truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX, None);
 
         let [
@@ -3033,12 +3071,14 @@ mod tests {
             panic!("expected one projected text item");
         };
         assert_eq!(projected_text, &text);
+        assert!(!omitted, "a fitting packet must not claim omitted output");
 
         let oversized = vec![FunctionCallOutputContentItem::InputText {
             text: "source line test\n".repeat(6_000),
         }];
-        let capped =
+        let (capped, omitted) =
             truncate_code_mode_result(oversized, None, OutputOutcome::Success, usize::MAX, None);
+        assert!(omitted);
         let [FunctionCallOutputContentItem::InputText { text: capped_text }] = capped.as_slice()
         else {
             panic!("expected one capped text item");

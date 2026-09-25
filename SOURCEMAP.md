@@ -404,6 +404,15 @@ Code-mode JavaScript orchestrates tools; unified exec owns subprocess execution,
 including when invoked as a nested tool. The model-visible batching guidance is
 owned by `code-mode-protocol/src/description/exec_prompt.rs`.
 
+`code-mode/src/runtime/globals.rs` owns tool discovery and call aliases.
+`resolve_tool(name)` returns a callable with canonical `name` and `description`
+properties; JSON serialization preserves the discovery metadata object. It also
+accepts the `namespace.name` identity that `tool_search` reports for a
+namespaced tool and resolves only a unique enabled match.
+Two-part `namespace__member` names also expose `tools.namespace.member` unless
+the namespace is itself a canonical tool. Aliases use the same dispatch and
+never expose tools outside the enabled catalog.
+
 The runtime admits at most 128 pending timers per cell; clearing or firing a
 timer releases its slot. Cancelled scheduler deadlines are removed immediately.
 Final error text is bounded to 16 KiB, including an explicit truncation marker,

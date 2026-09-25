@@ -68,6 +68,56 @@ def timing_profile() -> dict:
 
 
 class SharedTimingAnalysisTest(unittest.TestCase):
+    def test_response_outputs_pair_by_call_id_without_crossing_turns_or_threads(self):
+        events = []
+        for call_type in ("function_call", "custom_tool_call"):
+            for thread, turn in (("a", "1"), ("b", "1"), ("a", "2")):
+                events.append(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "thread_id": thread,
+                            "turn_id": turn,
+                            "type": call_type,
+                            "id": "item-" + call_type,
+                            "call_id": call_type,
+                            "name": "tool",
+                        },
+                    }
+                )
+            events.append(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "thread_id": "a",
+                        "turn_id": "1",
+                        "type": call_type + "_output",
+                        "id": "output-" + call_type,
+                        "call_id": call_type,
+                        "output": "done",
+                    },
+                }
+            )
+        report = analysis.analyze_runner_evidence(
+            {"schemaVersion": 1, "events": events}
+        )
+        self.assertEqual(len(report["tools"]), 6)
+        self.assertEqual(len(report["pendingTools"]), 4)
+        self.assertEqual(
+            {
+                (call["threadId"], call["turnId"], call["id"])
+                for call in report["pendingTools"]
+            },
+            {
+                (thread, turn, call_type)
+                for thread, turn in (("b", "1"), ("a", "2"))
+                for call_type in ("function_call", "custom_tool_call")
+            },
+        )
+        completed = [call for call in report["tools"] if "completionEventIndex" in call]
+        self.assertEqual(len(completed), 2)
+        self.assertTrue(all(call["status"] == "output_observed" for call in completed))
+
     def test_provider_usage_replay_is_deduplicated_and_conflicts_are_visible(self):
         profile = timing_profile()
         request = profile["modelRequests"][0]

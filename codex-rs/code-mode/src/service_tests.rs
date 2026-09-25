@@ -387,6 +387,141 @@ async fn compact_tool_discovery_resolves_one_exact_description() {
 }
 
 #[tokio::test]
+async fn discovered_tools_are_callable_and_namespace_aliases_keep_exact_dispatch() {
+    let service = InProcessCodeModeSession::with_delegate(Arc::new(EchoDelegate));
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![ToolDefinition {
+                name: "web__run".to_string(),
+                tool_name: ToolName::plain("web__run"),
+                description: "web schema".to_string(),
+                ..exec_command_definition()
+            }],
+            source: r#"
+const web = await resolve_tool("web__run");
+text({name: web.name, description: web.description, metadata: JSON.parse(JSON.stringify(web))});
+text(await web({query: "resolved"}));
+text(await tools.web.run({query: "namespace"}));
+text(await tools.web__run({query: "canonical"}));
+text({same: tools.web.run === tools.web__run,
+      missing: resolve_tool("web__missing") === undefined,
+      notEnabled: tools.web.missing === undefined,
+      names: ALL_TOOL_NAMES});
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    let values: Vec<serde_json::Value> = result_text(&response)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON result"))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            serde_json::json!({"name":"web__run", "description":"web schema", "metadata":{"name":"web__run", "description":"web schema"}}),
+            serde_json::json!({"tool":"web__run", "input":{"query":"resolved"}}),
+            serde_json::json!({"tool":"web__run", "input":{"query":"namespace"}}),
+            serde_json::json!({"tool":"web__run", "input":{"query":"canonical"}}),
+            serde_json::json!({"same":true, "missing":true, "notEnabled":true, "names":["web__run"]}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn namespace_aliases_do_not_shadow_tools_or_inherit_prototype_members() {
+    let service = InProcessCodeModeSession::with_delegate(Arc::new(EchoDelegate));
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: ["web__run", "web", "other__run", "__proto____run"]
+                .into_iter()
+                .map(|name| ToolDefinition {
+                    name: name.to_string(),
+                    tool_name: ToolName::plain(name),
+                    ..exec_command_definition()
+                })
+                .collect(),
+            source: r#"
+text(await tools.web({query: "canonical namespace collision"}));
+text(await tools.web__run({query: "flat survives"}));
+text({noAlias: tools.web.run === undefined,
+      noInheritedMember: tools.other.toString === undefined,
+      prototypeUnchanged: Object.getPrototypeOf(tools) === Object.prototype,
+      noPollution: Object.prototype.run === undefined});
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    let values: Vec<serde_json::Value> = result_text(&response)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON result"))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            serde_json::json!({"tool":"web", "input":{"query":"canonical namespace collision"}}),
+            serde_json::json!({"tool":"web__run", "input":{"query":"flat survives"}}),
+            serde_json::json!({"noAlias":true, "noInheritedMember":true, "prototypeUnchanged":true, "noPollution":true}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn resolve_tool_accepts_the_namespace_identity_reported_by_tool_search() {
+    let service = InProcessCodeModeSession::with_delegate(Arc::new(EchoDelegate));
+    let namespaced = |name: &str, namespace: &str, member: &str| ToolDefinition {
+        name: name.to_string(),
+        tool_name: ToolName::namespaced(namespace, member),
+        description: format!("{member} schema"),
+        ..exec_command_definition()
+    };
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![
+                namespaced("mcp__github_fetch", "mcp__github", "_fetch"),
+                namespaced("mcp__github_fetch_file", "mcp__github", "_fetch_file"),
+                // One identity registered twice must not dispatch arbitrarily.
+                namespaced("mcp__dup__first", "mcp__dup", "run"),
+                namespaced("mcp__dup__second", "mcp__dup", "run"),
+            ],
+            source: r#"
+const fetch = resolve_tool("mcp__github._fetch");
+text({name: fetch.name, description: fetch.description});
+text(await fetch({url: "namespaced"}));
+text({canonical: resolve_tool("mcp__github_fetch_file").name,
+      wrongNamespace: resolve_tool("mcp__other._fetch") === undefined,
+      missingMember: resolve_tool("mcp__github._missing") === undefined,
+      ambiguous: resolve_tool("mcp__dup.run") === undefined});
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    let values: Vec<serde_json::Value> = result_text(&response)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON result"))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            serde_json::json!({"name":"mcp__github_fetch", "description":"_fetch schema"}),
+            serde_json::json!({"tool":"mcp__github_fetch", "input":{"url":"namespaced"}}),
+            serde_json::json!({"canonical":"mcp__github_fetch_file", "wrongNamespace":true, "missingMember":true, "ambiguous":true}),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn stored_values_are_shared_between_cells_but_not_sessions() {
     let first_session = InProcessCodeModeSession::new();
     let second_session = InProcessCodeModeSession::new();

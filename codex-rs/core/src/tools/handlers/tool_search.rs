@@ -165,14 +165,23 @@ impl ToolSearchIndex {
         }
     }
 
-    fn top_matches(&self, query: &str, limit: usize) -> Vec<ToolSearchDocumentId> {
+    fn top_matches(
+        &self,
+        query: &str,
+        limit: usize,
+        expand_identifiers: bool,
+    ) -> Vec<ToolSearchDocumentId> {
         if limit == 0 || self.document_count == 0 {
             return Vec::new();
         }
 
         let tokenizer = ToolSearchTokenizer;
+        let mut tokens = tokenizer.tokenize(query);
+        if expand_identifiers {
+            tokens = expand_query_identifiers(tokens);
+        }
         let mut scores = HashMap::<ToolSearchDocumentId, f32>::new();
-        for token in tokenizer.tokenize(query) {
+        for token in tokens {
             let Some(postings) = self.postings.get(&token) else {
                 continue;
             };
@@ -204,6 +213,26 @@ impl ToolSearchIndex {
         best.sort_unstable_by(|left, right| right.cmp(left));
         best.into_iter().map(|candidate| candidate.id).collect()
     }
+}
+
+/// Documents index each tool name whole and split at underscores. Expand
+/// query identifiers the same way so a guessed snake_case name still reaches
+/// tools that share its words. Exact-name queries stay unexpanded so their
+/// results are not padded with loosely related tools.
+fn expand_query_identifiers(mut tokens: Vec<String>) -> Vec<String> {
+    let parts = tokens
+        .iter()
+        .filter(|token| token.contains('_'))
+        .flat_map(|token| token.split('_'))
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for part in parts {
+        if !tokens.contains(&part) {
+            tokens.push(part);
+        }
+    }
+    tokens
 }
 
 struct ToolSearchNameIndex {
@@ -941,7 +970,9 @@ impl ToolSearchHandler {
         }
         let exact_match_count = exact_matches.len();
         let candidate_limit = tool_search_candidate_limit(limit, self.search_infos.len());
-        let candidates = self.search_index.top_matches(&key.query, candidate_limit);
+        let candidates =
+            self.search_index
+                .top_matches(&key.query, candidate_limit, exact_matches.is_empty());
         let candidate_count = candidates.len();
         let trace_enabled = tracing::enabled!(tracing::Level::TRACE);
         let candidate_source_count = trace_enabled.then(|| {
@@ -1667,6 +1698,51 @@ mod tests {
         assert_eq!(
             ToolSearchTokenizer.tokenize("Launch CALENDAR-events for José"),
             vec!["launch", "calendar", "events", "for", "josé"]
+        );
+    }
+
+    #[test]
+    fn snake_case_query_reaches_tools_sharing_its_name_words() {
+        // Underscores join words into one token, so an unexpanded guessed name
+        // matches only its other terms and the shortest document wins.
+        assert_eq!(
+            ToolSearchTokenizer.tokenize("get_file_contents"),
+            vec!["get_file_contents"]
+        );
+        let handler = ToolSearchHandler::new(vec![
+            search_info(
+                "github get_profile get profile",
+                Some("GitHub"),
+                "github",
+                "get_profile",
+            ),
+            search_info(
+                "github fetch_file fetch file get file contents from a repository",
+                Some("GitHub"),
+                "github",
+                "fetch_file",
+            ),
+        ]);
+
+        let result = handler
+            .search("github get_file_contents", 1)
+            .expect("search");
+
+        assert_eq!(
+            result.activation_tools,
+            vec![ToolName::namespaced("mcp__github", "fetch_file")]
+        );
+        // An exact name is not split, so shared words do not pad its results.
+        let exact = handler
+            .search("get_profile", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("exact search");
+        assert_eq!(
+            exact.activation_tools,
+            vec![ToolName::namespaced("mcp__github", "get_profile")]
+        );
+        assert_eq!(
+            expand_query_identifiers(vec!["get_file".to_string(), "file".to_string()]),
+            vec!["get_file", "file", "get"]
         );
     }
 

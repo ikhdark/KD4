@@ -18,7 +18,9 @@
 
 ## Validation
 
+* Use the smallest existing check that proves the changed contract. Inspection or a direct assertion is sufficient when behavior does not require execution. Run a full suite only when explicitly required by the user or repository. Do not run additional validation solely for extra confidence.
 * Every test must assert an expected result and fail for a plausible incorrect implementation of the behavior or logic under test.
-* Repair weak tests covering the changed behavior or blocking its validation. Report unrelated weaknesses encountered without starting a broader test audit.
-* When validation or tests report errors, warnings, or failures, let the current run finish and diagnose all reported issues before making repair edits. Apply related fixes in consolidated batches and rerun affected tests or validation checks that have not yet passed. Repeat only if failures remain or new evidence requires it.
+* Reuse existing coverage; add or repair a test only for a concrete changed-behavior gap that blocks sufficient validation. Report unrelated weaknesses without starting a broader test audit.
+* Let a valid, progressing validation run finish. Repair failures caused by the change or blocking its required validation in one batch, then rerun only the affected checks. Report unrelated failures without expanding the task; an unchanged failure does not justify another run.
 * Reuse passed validation checks until an overlapping source or dependency mutation invalidates them. Never rerun an unchanged failing check. After a relevant repair, rerun the affected check once; repeat only after another relevant change.
+* A freshness notice is not a request to rerun tests or builds. Revalidate only evidence essential to the current task, using the cheapest scoped check; otherwise report the affected claim as unverified.

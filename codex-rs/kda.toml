@@ -1,0 +1,26 @@
+# Agent workflow: run commands from this Cargo workspace, not the Git root.
+# Check analyzer freshness with KDA_ANALYZER_CHECKOUT_ROOT set to the KDA
+# checkout, then: cargo kda op --root . --json '{"op":"status"}'
+# Discover operations/schema with catalog; do not invent contracts or tool IDs.
+# Diagnose: cargo kda op --root . --json '{"op":"gate","execute_workspace":true}'
+# Review: cargo kda op --root . --json '{"op":"review","base":"HEAD"}'
+# Follow returned next_calls and artifact IDs for retained evidence, witnesses,
+# consumers, unknown boundaries, and focused test plans before making repairs.
+# Apply only reviewed, revision-matching edits. Verify the observable behavior
+# with focused tests, then rerun only checks invalidated by the changes.
+# A partial report or an unresolved obligation is not a clean gate or repair
+# authority. Preserve existing user edits; never activate Desktop as a side effect.
+version = 1
+
+# Reuse KDA's exact KD4 runtime contracts instead of duplicating guessed symbols.
+policy-pack = ["kd4@1"]
+exclude = ["target/**", "target-*/**", ".kda/**"]
+
+# Keep built-in severities, including denials and uncertainty diagnostics.
+# Analyze the supported Windows host with normal Cargo default features.
+# Trusted loading enables build scripts/proc macros and compiler preflight;
+# agent gate operations must also explicitly set execute_workspace=true.
+[[analysis-profile]]
+name = "windows-default"
+target = "x86_64-pc-windows-msvc"
+workspace-execution = "trusted"

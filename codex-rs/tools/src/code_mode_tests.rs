@@ -188,6 +188,13 @@ fn tool_search_code_mode_declaration_matches_structured_result_contract() {
     assert_eq!(definition.name, "tool_search");
     assert!(definition.description.contains("Inspect `status`"));
     assert!(definition.description.contains("`aborted`"));
+    // Results list namespace members separately from their flattened callable
+    // name; the advertised identity is the one `resolve_tool` accepts.
+    assert!(
+        definition
+            .description
+            .contains("callable as `resolve_tool(\"<namespace>.<name>\")`")
+    );
     assert!(
         definition
             .description

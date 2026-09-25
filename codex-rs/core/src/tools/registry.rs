@@ -2911,6 +2911,28 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
     let supersession_identity = invocation_sha256
         .map(|invocation_sha256| format!("{tool_name}:{invocation_sha256}:{}", canonical.sha256));
     if materialization == ProjectionMaterialization::AdmissionOnly {
+        // Code mode bounds its own packet before admission. When that packet
+        // dropped output, name the durable canonical artifact so the omitted
+        // range is recoverable without rerunning the producer.
+        let (original_response, original_output_text) = if essential_inline
+            .get(crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY)
+            == Some(&Value::Bool(true))
+        {
+            let text = format!(
+                "{original_output_text}\n{}",
+                serde_json::json!({
+                    "output_truncated": true,
+                    "artifact_id": artifact_id,
+                    "recovery_tool": "read_tool_output",
+                })
+            );
+            (
+                projected_response_item(original_response, text.clone(), true),
+                text,
+            )
+        } else {
+            (original_response, original_output_text)
+        };
         let bounded = BoundedModelProjection::Fallback {
             value: serde_json::from_str(&original_output_text)
                 .unwrap_or_else(|_| Value::String(original_output_text.clone())),

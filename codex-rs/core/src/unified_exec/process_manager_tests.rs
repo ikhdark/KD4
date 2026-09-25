@@ -626,6 +626,7 @@ fn unified_exec_env_injects_defaults() {
         ("LANG".to_string(), "C.UTF-8".to_string()),
         ("LC_CTYPE".to_string(), "C.UTF-8".to_string()),
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+        ("PYTHONUTF8".to_string(), "1".to_string()),
         ("COLORTERM".to_string(), String::new()),
         ("PAGER".to_string(), UNIFIED_EXEC_PAGER.to_string()),
         ("GIT_PAGER".to_string(), UNIFIED_EXEC_PAGER.to_string()),

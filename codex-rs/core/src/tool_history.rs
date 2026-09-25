@@ -2330,7 +2330,7 @@ impl ToolHistoryState {
                 let (reason_code, reason) = if observation.is_none() {
                     (
                         "missing_observation",
-                        "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
+                        "no workspace observation is available for this tool result; it may be unrecorded or evicted; current workspace freshness is unverified",
                     )
                 } else if observation.is_some_and(|observation| {
                     !observation.source_dependencies_current
@@ -2341,12 +2341,12 @@ impl ToolHistoryState {
                 }) {
                     (
                         "source_dependencies_invalidated",
-                        "source dependencies were invalidated after capture; this does not establish which dependency changed; obtain or revalidate current evidence before relying on it",
+                        "source dependencies were invalidated after capture; this does not establish which dependency changed; current workspace freshness is unverified",
                     )
                 } else if !output_matches {
                     (
                         "output_mismatch",
-                        "the tool output does not match its recorded workspace observation; rerun the tool before relying on it",
+                        "the tool output does not match its recorded workspace observation; it is not verified evidence",
                     )
                 } else if observation
                     .and_then(|observation| observation.revision.as_ref())
@@ -2355,19 +2355,19 @@ impl ToolHistoryState {
                 {
                     (
                         "workspace_identity_unavailable",
-                        "a repository identity is unavailable; freshness is unknown, not proof of a source change; obtain or revalidate current evidence before relying on it",
+                        "a repository identity is unavailable; freshness is unknown, not proof of a source change",
                     )
                 } else if observation.and_then(|observation| observation.revision.as_ref())
                     != workspace_identity
                 {
                     (
                         "workspace_identity_changed",
-                        "the repository identity changed after capture; rerun the evidence-producing read before relying on it",
+                        "the repository identity changed after capture; current workspace freshness is unverified",
                     )
                 } else {
                     (
                         "workspace_freshness_unverified",
-                        "matching repository identities do not verify this result's dependencies; obtain or revalidate current evidence before relying on it",
+                        "matching repository identities do not verify this result's dependencies; current workspace freshness is unverified",
                     )
                 };
                 tracing::debug!(
@@ -2402,7 +2402,7 @@ impl ToolHistoryState {
                 let mut notice = serde_json::json!({
                     "call_id": call_id,
                     "rerun": {
-                        "instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."
+                        "instruction": "This notice is not a request to rerun tests or builds. Revalidate only if current evidence is essential to the task, using the cheapest scoped read or check with supported arguments; otherwise report the affected claim as unverified. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."
                     },
                     "reason": reason,
                     "reason_code": reason_code,
@@ -2434,7 +2434,7 @@ impl ToolHistoryState {
                         );
                     }
                     notice["rerun"]["instruction"] = serde_json::json!(
-                        "Recovered bytes are authenticated historical evidence. If current workspace state matters, revalidate the original source; rereading this immutable artifact cannot establish freshness."
+                        "Recovered bytes are authenticated historical evidence. This notice is not a request to rerun tests or builds. Only if current evidence is essential to the task, revalidate the original source with the cheapest scoped read or check; otherwise report the affected claim as unverified; rereading this immutable artifact cannot establish freshness."
                     );
                     // read_tool_output authenticates retained artifacts before returning
                     // this bounded excerpt. Freshness controls current proof, not access
@@ -2459,7 +2459,7 @@ impl ToolHistoryState {
                     notice["rerun"] = serde_json::json!({
                         "tool": name,
                         "arguments": arguments,
-                        "instruction": "Repeat this read-only call to read current filesystem state; read_tool_output recovers only the old snapshot.",
+                        "instruction": "This notice is not a request to rerun tests or builds. Only if current evidence is essential to the task, repeat this read-only call to read current filesystem state; otherwise report the affected claim as unverified. read_tool_output recovers only the old snapshot.",
                     });
                 }
                 if !current_nested_results.is_empty() {

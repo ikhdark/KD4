@@ -129,13 +129,17 @@ const NARROW_TERMINAL_ROWS: u16 = 24;
 
 /// Options for building a local Codex diagnostic report.
 ///
-/// The command always runs the full bounded diagnostic set. Human output includes
+/// By default the command runs the full bounded diagnostic set. Human output includes
 /// detailed diagnostics by default; --summary keeps the terminal output compact.
 #[derive(Debug, Parser)]
 pub struct DoctorCommand {
     /// Emit a redacted machine-readable report.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Only verify runtime provenance and the local Desktop runtime, without loading config or probing services.
+    #[arg(long, default_value_t = false)]
+    runtime_only: bool,
 
     /// Only show grouped check rows and the final count summary.
     #[arg(long, default_value_t = false)]
@@ -327,10 +331,12 @@ async fn build_report(
 ) -> DoctorReport {
     let progress = doctor_progress(command.json);
     let mut checks = Vec::new();
-    checks.push(run_sync_check("system", progress.clone(), system_check));
-    checks.push(run_sync_check("installation", progress.clone(), || {
-        installation_check(!command.summary)
-    }));
+    if !command.runtime_only {
+        checks.push(run_sync_check("system", progress.clone(), system_check));
+        checks.push(run_sync_check("installation", progress.clone(), || {
+            installation_check(!command.summary)
+        }));
+    }
     checks.push(run_sync_check("runtime", progress.clone(), runtime_check));
     if let Some(local_target) = runtime::local_publish_target_path() {
         let expected_codex_home = find_codex_home()
@@ -357,6 +363,16 @@ async fn build_report(
             )
             .await,
         );
+    }
+    if command.runtime_only {
+        progress.settle();
+        return DoctorReport {
+            schema_version: 1,
+            generated_at: generated_at(),
+            overall_status: overall_status(&checks),
+            codex_version: env!("CARGO_PKG_VERSION").to_string(),
+            checks,
+        };
     }
     checks.push(run_async_check("search", progress.clone(), search_check()).await);
 
@@ -3199,6 +3215,36 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_only_report_skips_config_and_unrelated_checks() {
+        let command = DoctorCommand::parse_from(["doctor", "--json", "--runtime-only"]);
+        let report = build_report(
+            &command,
+            CliConfigOverrides {
+                // A full report would try to parse this and emit config.load.
+                raw_overrides: vec!["not-a-key-value-override".to_string()],
+            },
+            &TuiCli::parse_from(["codex"]),
+            &Arg0DispatchPaths {
+                codex_self_exe: None,
+            },
+        )
+        .await;
+        let mut expected = vec!["runtime.provenance"];
+        if runtime::local_publish_target_path().is_some() {
+            expected.extend(["local_publish.readiness", "desktop.runtime_chain"]);
+        }
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+        assert!(!DoctorCommand::parse_from(["doctor"]).runtime_only);
+    }
 
     #[derive(Default)]
     struct RecordingProgress {

@@ -3,8 +3,8 @@
 Any previous mode-specific instructions no longer apply. Only a later developer
 message can change the active mode.
 
-- Review, audit, diagnosis, explanation, and status requests are read-only unless
-  the user also asks for changes.
+- Treat user-sent issues, errors, logs, screenshots, and findings as fix requests.
+- Explicit no-edit, review-only, explanation-only, and status-only requests are read-only.
 - Change and build requests authorize only the scoped implementation and the
   focused validation needed to prove it.
 - Resolve discoverable facts from fresh context or the environment. Ask only

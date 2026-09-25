@@ -84,12 +84,15 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
 
-const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
+const UNIFIED_EXEC_ENV: [(&str, &str); 11] = [
     ("NO_COLOR", "1"),
     ("TERM", "dumb"),
     ("LANG", "C.UTF-8"),
     ("LC_CTYPE", "C.UTF-8"),
     ("LC_ALL", "C.UTF-8"),
+    // Python ignores the locale variables on Windows and encodes piped stdio
+    // with the ANSI code page; characters outside it raise UnicodeEncodeError.
+    ("PYTHONUTF8", "1"),
     ("COLORTERM", ""),
     ("PAGER", UNIFIED_EXEC_PAGER),
     ("GIT_PAGER", UNIFIED_EXEC_PAGER),

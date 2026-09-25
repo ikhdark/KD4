@@ -1758,7 +1758,12 @@ def analyze_runner_evidence(
             "custom_tool_call",
         )
         is_output = item_type in ("function_call_output", "custom_tool_call_output")
-        call_id = str(item.get("id", item.get("call_id", params.get("itemId", ""))))
+        # Response item IDs identify separate call/output records; call_id links
+        # those records. Native item notifications instead share their item ID.
+        if is_output or item_type in ("function_call", "custom_tool_call"):
+            call_id = str(item.get("call_id", item.get("id", "")))
+        else:
+            call_id = str(item.get("id", params.get("itemId", "")))
         if is_call and call_id:
             key = (thread_id, active_turn, call_id)
             call = calls.setdefault(

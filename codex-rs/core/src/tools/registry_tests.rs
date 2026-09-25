@@ -4089,6 +4089,104 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
 }
 
 #[tokio::test]
+async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_output() {
+    let temp = tempfile::tempdir().expect("temporary Codex home");
+    let sentinel = "OMITTED_MIDDLE_SENTINEL";
+    let canonical_text = (0..400)
+        .map(|line| {
+            if line == 200 {
+                sentinel.to_string()
+            } else {
+                format!("line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let visible = "line 0\nWarning: truncated output (4000 tokens)\nline 399".to_string();
+    let canonical = CanonicalToolResult::text(canonical_text.clone());
+    let original_response = ResponseInputItem::CustomToolCallOutput {
+        call_id: "exec-call".to_string(),
+        name: Some("exec".to_string()),
+        output: FunctionCallOutputPayload::from_text(visible.clone()),
+    };
+    let mut essential_inline = serde_json::json!({"success": true});
+    essential_inline[crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY] = Value::Bool(true);
+    let projection = project_model_output(ModelProjectionInput {
+        spillable_text: canonical_text.clone(),
+        outcome: ToolOutputOutcome::Success,
+        essential_inline,
+        origin_call_id: "exec-call".to_string(),
+        selection_facts: ProjectionSelectionFacts {
+            mode: "generic_fallback",
+            available_fragments: 0,
+            selected_fragments: 0,
+            exact_duplicates_removed: 0,
+            selected_ids: Vec::new(),
+            omitted_inline_ids: Vec::new(),
+            partial_ids: Vec::new(),
+        },
+        applied_token_limit: 10_000,
+        projected_text: visible.clone(),
+        preserved_content: Vec::new(),
+        codex_home: temp.path().to_path_buf(),
+        thread_id: "exec-thread".to_string(),
+        tool_name: "exec".to_string(),
+        original_output_sha256: crate::tool_history::sha256(visible.as_bytes()),
+        original_output_tokens: canonical.approximate_tokens,
+        original_output_text: visible.clone(),
+        invocation_sha256: None,
+        canonical,
+        semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
+        projection_eligible: true,
+        projection_truncated: true,
+        canonical_artifact_required: true,
+        predetermined_ranges: Vec::new(),
+        predetermined_json_pointers: Vec::new(),
+        original_response,
+        materialization: ProjectionMaterialization::AdmissionOnly,
+    })
+    .await
+    .expect("admission-only projection");
+
+    let ResponseInputItem::CustomToolCallOutput { output, .. } = projection.response() else {
+        panic!("expected exec output");
+    };
+    let rendered = output.body.to_text().expect("exec text");
+    let (shown, notice) = rendered.rsplit_once('\n').expect("recovery notice line");
+    assert_eq!(shown, visible, "the bounded packet itself is unchanged");
+    let notice: Value = serde_json::from_str(notice).expect("notice is JSON");
+    let candidate = projection.candidate.expect("admission candidate");
+    assert_eq!(notice["output_truncated"], true);
+    assert_eq!(notice["recovery_tool"], "read_tool_output");
+    assert_eq!(notice["artifact_id"], candidate.artifact_id.as_str());
+    assert_eq!(
+        candidate.bounded_model_output, rendered,
+        "history must track exactly the text the model received"
+    );
+
+    let (recovered, _) = crate::tools::handlers::execute_recovery_transaction(
+        temp.path(),
+        "exec-thread",
+        &candidate.artifact_id,
+        vec![
+            crate::tools::command_output_artifact::ToolOutputSelector::Lines {
+                start: 201,
+                end: 201,
+            },
+        ],
+        /*code_mode_recovery*/ true,
+    )
+    .await
+    .expect("named artifact is recoverable");
+    assert_eq!(
+        recovered.results[0].text.as_deref().map(str::trim_end),
+        Some(sentinel),
+        "the named artifact must hold the output omitted from the visible packet"
+    );
+}
+
+#[tokio::test]
 async fn admission_only_projection_preserves_original_response_when_artifact_storage_fails() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let blocked_home = temp.path().join("not-a-directory");

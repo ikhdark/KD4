@@ -639,6 +639,10 @@ fn workspace_evidence_remains_visible_only_for_its_captured_revision() {
     let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
     assert_eq!(notice["reason_code"], "workspace_identity_changed");
     assert_eq!(notice["valid_for_current_workspace"], false);
+    let instruction = notice["rerun"]["instruction"].as_str().unwrap();
+    assert!(instruction.contains("This notice is not a request to rerun tests or builds."));
+    assert!(instruction.contains("Revalidate only if current evidence is essential to the task"));
+    assert!(instruction.contains("otherwise report the affected claim as unverified"));
     assert_eq!(
         notice["observed_revision"],
         serde_json::to_value(&captured).unwrap()
@@ -840,7 +844,7 @@ fn workspace_evidence_output_mismatch_does_not_claim_the_repository_changed() {
     assert!(notice["rerun"].get("force_fresh").is_none());
     assert_eq!(
         notice["reason"],
-        "the tool output does not match its recorded workspace observation; rerun the tool before relying on it"
+        "the tool output does not match its recorded workspace observation; it is not verified evidence"
     );
     assert!(!output.contains("different output"));
 }
@@ -4473,8 +4477,8 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
                     value,
                     serde_json::json!({
                         "call_id": case,
-                        "rerun": { "instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence." },
-                        "reason": "source dependencies were invalidated after capture; this does not establish which dependency changed; obtain or revalidate current evidence before relying on it",
+                        "rerun": { "instruction": "This notice is not a request to rerun tests or builds. Revalidate only if current evidence is essential to the task, using the cheapest scoped read or check with supported arguments; otherwise report the affected claim as unverified. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence." },
+                        "reason": "source dependencies were invalidated after capture; this does not establish which dependency changed; current workspace freshness is unverified",
                         "stale_workspace_evidence": true,
                         "reason_code": "source_dependencies_invalidated",
                         "valid_for_current_workspace": false,

@@ -334,6 +334,7 @@ mod tests {
         assert!(description.contains("external and omitted contracts remain lazy"));
         assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
         assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(description.contains("callable with `.name`/`.description`"));
         assert!(description.contains("Search only if local discovery fails"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
         assert!(description.contains(
@@ -427,6 +428,9 @@ mod tests {
         assert!(!description.contains("the cell budget is separate"));
         assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 10000}`"#));
         assert!(description.contains("queues a model-visible message without yielding"));
+        // Cells run in fresh isolates; only session storage carries values forward.
+        assert!(description.contains("JS bindings reset per exec"));
+        assert!(description.contains("`store(key, value)`/`load(key)` keep JSON values"));
         // Retired guidance that pushed the model into wait rounds or extra
         // sampling passes must stay out of the contract.
         assert!(!description.contains("per settlement"));
@@ -436,7 +440,7 @@ mod tests {
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
-        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 3_600;
+        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 3_700;
         assert!(
             description.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
             "the exec contract must stay within {COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET} bytes; got {}",

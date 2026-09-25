@@ -708,6 +708,90 @@ catch {{
         self.assertIn("did not start", result.stdout)
         self.assertNotIn("desktopRestart: restarted", result.stdout)
 
+    def test_runtime_probe_is_scoped_and_reports_failures(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        fixture = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        target = fixture / "probe.exe"
+        source = r"""
+using System;
+using System.Threading;
+public class RuntimeProbe {
+    public static int Main(string[] args) {
+        if (String.Join(" ", args) != "doctor --json --summary --runtime-only") {
+            Thread.Sleep(10000);
+            return 2;
+        }
+        if (Environment.GetEnvironmentVariable("CODEX_HOME") != Environment.GetEnvironmentVariable("EXPECTED_HOME") ||
+            Environment.GetEnvironmentVariable("CODEX_CLI_PATH") != Environment.GetEnvironmentVariable("EXPECTED_TARGET")) {
+            Console.Error.WriteLine("wrong probe routing");
+            return 2;
+        }
+        string mode = Environment.GetEnvironmentVariable("PROBE_MODE");
+        if (mode == "timeout") { Thread.Sleep(10000); }
+        if (mode == "malformed") {
+            Console.WriteLine("not JSON");
+            Console.Error.WriteLine("unsupported probe option");
+            return 2;
+        }
+        if (mode == "missing") { Console.WriteLine("{\"checks\":{}}"); return 0; }
+        string status = mode == "mismatch" ? "warning" : "ok";
+        Console.WriteLine("{\"checks\":{\"local_publish.readiness\":{\"status\":\"ok\"},\"desktop.runtime_chain\":{\"status\":\"" + status + "\",\"details\":[\"receipt CODEX_HOME does not match\"]}}}");
+        return mode == "exit" ? 3 : 0;
+    }
+}
+"""
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+Add-Type -TypeDefinition @'
+{source}
+'@ -OutputAssembly {ps_single_quote(target)} -OutputType ConsoleApplication
+$env:EXPECTED_HOME = {ps_single_quote(fixture)}
+$env:EXPECTED_TARGET = {ps_single_quote(target)}
+$env:CODEX_HOME = 'wrong-home'
+$env:CODEX_CLI_PATH = 'wrong-cli'
+$results = foreach ($mode in @('ok', 'mismatch', 'malformed', 'missing', 'exit', 'timeout')) {{
+    $env:PROBE_MODE = $mode
+    $reason = 'stale failure'
+    $timeout = if ($mode -eq 'timeout') {{ 100 }} else {{ 3000 }}
+    $matched = Test-DesktopRuntimeProof -TargetPath $env:EXPECTED_TARGET `
+        -LocalCodexHome $env:EXPECTED_HOME -TimeoutMilliseconds $timeout -FailureReason ([ref]$reason)
+    [pscustomobject]@{{ Mode = $mode; Matched = $matched; Reason = $reason }}
+}}
+$reason = $null
+$matched = Test-DesktopRuntimeProof -TargetPath {ps_single_quote(fixture / "missing.exe")} -FailureReason ([ref]$reason)
+$results += [pscustomobject]@{{ Mode = 'absent'; Matched = $matched; Reason = $reason }}
+[pscustomobject]@{{ Results = @($results); Home = $env:CODEX_HOME; Cli = $env:CODEX_CLI_PATH }} | ConvertTo-Json -Compress -Depth 5
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+            env=clean_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["Home"], "wrong-home")
+        self.assertEqual(output["Cli"], "wrong-cli")
+        results = {row["Mode"]: row for row in output["Results"]}
+        self.assertTrue(results["ok"]["Matched"])
+        self.assertIsNone(results["ok"]["Reason"])
+        for mode, reason in {
+            "mismatch": "receipt CODEX_HOME does not match",
+            "malformed": "unsupported probe option",
+            "missing": "missing local_publish.readiness",
+            "exit": "exited with 3",
+            "timeout": "timed out after 100 ms",
+            "absent": "target is missing",
+        }.items():
+            with self.subTest(mode=mode):
+                self.assertFalse(results[mode]["Matched"])
+                self.assertIn(reason, results[mode]["Reason"])
+
     def test_live_desktop_with_mismatched_runtime_receipt_fails_restart(self) -> None:
         shell = powershell()
         if shell is None:
@@ -721,7 +805,11 @@ function Get-CodexDesktopProcessesForPath {{
     if (-not $script:Launched) {{ return @() }}
     return @([pscustomobject]@{{ Id = 91; Path = $DesktopPath }})
 }}
-function Test-DesktopRuntimeProof {{ return $false }}
+function Test-DesktopRuntimeProof {{
+    param([string]$TargetPath, [string]$LocalCodexHome, [int]$TimeoutMilliseconds, [ref]$FailureReason)
+    $FailureReason.Value = 'receipt CODEX_HOME does not match'
+    return $false
+}}
 function Start-Process {{ $script:Launched = $true }}
 try {{
     Restart-CodexDesktop `
@@ -747,7 +835,10 @@ catch {{
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("did not match", result.stdout)
+        self.assertIn(
+            "runtime could not be verified: receipt CODEX_HOME does not match",
+            result.stdout,
+        )
         self.assertNotIn("desktopRestart: restarted", result.stdout)
 
     def test_noop_restart_failure_is_terminal_after_committed_publish(self) -> None:

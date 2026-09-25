@@ -183,37 +183,17 @@ fn resolve_tool_callback(
     let enabled_tools = scope
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools));
-    let Some(tool) = enabled_tools
+    let Some(index) = enabled_tools
         .as_deref()
-        .and_then(|enabled_tools| enabled_tools.resolve(&requested_name))
+        .and_then(|enabled_tools| enabled_tools.resolve_requested_name(&requested_name))
     else {
         retval.set(v8::undefined(scope).into());
         return;
     };
-    let item = v8::Object::new(scope);
-    let Some(name_key) = v8::String::new(scope, "name") else {
-        retval.set(v8::undefined(scope).into());
-        return;
-    };
-    let Some(description_key) = v8::String::new(scope, "description") else {
-        retval.set(v8::undefined(scope).into());
-        return;
-    };
-    let Some(name) = v8::String::new(scope, &tool.global_name) else {
-        retval.set(v8::undefined(scope).into());
-        return;
-    };
-    let Some(description) = v8::String::new(scope, &tool.description) else {
-        retval.set(v8::undefined(scope).into());
-        return;
-    };
-    if item.set(scope, name_key.into(), name.into()) != Some(true)
-        || item.set(scope, description_key.into(), description.into()) != Some(true)
-    {
-        retval.set(v8::undefined(scope).into());
-        return;
+    match tool_function(scope, index) {
+        Ok(function) => retval.set(function.into()),
+        Err(error) => throw_type_error(scope, &error),
     }
-    retval.set(item.into());
 }
 
 fn build_tools_object<'s>(
@@ -226,7 +206,43 @@ fn build_tools_object<'s>(
         let name = v8::String::new(scope, &tool.global_name)
             .ok_or_else(|| "failed to allocate tool name".to_string())?;
         let function = tool_function(scope, tool_index)?;
-        tools.set(scope, name.into(), function.into());
+        tools.create_data_property(scope, name.into(), function.into());
+    }
+    for tool in enabled_tools {
+        let Some((namespace, member)) = tool.global_name.split_once("__") else {
+            continue;
+        };
+        // Aliases never shadow canonical tools or guess deeper namespaces.
+        if namespace.is_empty() || member.is_empty() || member.contains("__") {
+            continue;
+        }
+        let namespace_key = v8::String::new(scope, namespace)
+            .ok_or_else(|| "failed to allocate tool namespace".to_string())?;
+        let namespace = if tools.has_own_property(scope, namespace_key.into()) == Some(true) {
+            let value = tools
+                .get(scope, namespace_key.into())
+                .ok_or_else(|| "failed to read tool namespace".to_string())?;
+            if value.is_function() {
+                continue;
+            }
+            value
+                .to_object(scope)
+                .ok_or_else(|| "failed to read tool namespace".to_string())?
+        } else {
+            let namespace = v8::Object::new(scope);
+            let null = v8::null(scope);
+            namespace.set_prototype(scope, null.into());
+            tools.create_data_property(scope, namespace_key.into(), namespace.into());
+            namespace
+        };
+        let member = v8::String::new(scope, member)
+            .ok_or_else(|| "failed to allocate tool member".to_string())?;
+        let name = v8::String::new(scope, &tool.global_name)
+            .ok_or_else(|| "failed to allocate tool name".to_string())?;
+        let function = tools
+            .get(scope, name.into())
+            .ok_or_else(|| "failed to read tool function".to_string())?;
+        namespace.create_data_property(scope, member.into(), function);
     }
     Ok(tools)
 }
@@ -284,15 +300,45 @@ fn tool_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     tool_index: usize,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
+    let tool = scope
+        .get_slot::<RuntimeState>()
+        .and_then(|state| state.enabled_tools.get(tool_index))
+        .cloned()
+        .ok_or_else(|| "missing enabled tool".to_string())?;
     let index =
         u32::try_from(tool_index).map_err(|_| "tool callback index exceeds u32".to_string())?;
     let data = v8::Integer::new_from_unsigned(scope, index);
     let template = v8::FunctionTemplate::builder(tool_callback)
         .data(data.into())
         .build(scope);
-    template
+    let function = template
         .get_function(scope)
-        .ok_or_else(|| "failed to create tool function".to_string())
+        .ok_or_else(|| "failed to create tool function".to_string())?;
+    let metadata = v8::Object::new(scope);
+    let name = v8::String::new(scope, &tool.global_name)
+        .ok_or_else(|| "failed to allocate tool name".to_string())?;
+    function.set_name(name);
+    set_global(scope, metadata, "name", name.into())?;
+    let description = v8::String::new(scope, &tool.description)
+        .ok_or_else(|| "failed to allocate tool description".to_string())?;
+    set_global(scope, metadata, "description", description.into())?;
+    set_global(scope, function.into(), "description", description.into())?;
+    // Keep JSON discovery receipts compatible while allowing direct invocation.
+    let to_json = v8::FunctionTemplate::builder(tool_metadata_callback)
+        .data(metadata.into())
+        .build(scope)
+        .get_function(scope)
+        .ok_or_else(|| "failed to create tool metadata serializer".to_string())?;
+    set_global(scope, function.into(), "toJSON", to_json.into())?;
+    Ok(function)
+}
+
+fn tool_metadata_callback(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    retval.set(args.data());
 }
 
 fn set_global<'s>(

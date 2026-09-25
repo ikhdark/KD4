@@ -6,7 +6,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
 - `text(...)` emits values; on failure/no output, the host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions. Emit needed results explicitly.
 - Reuse current schemas and results; resolve missing/stale schemas before calls.
-- Nested tools: use a present schema; otherwise filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally by name or description and use `resolve_tool(name)` to obtain a missing schema. Search only if local discovery fails.
+- Nested tools: use a present schema; filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally; use `resolve_tool(name)` to obtain a missing schema and callable with `.name`/`.description`. Search only if local discovery fails.
 - Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results.
 - Choose tools whose scope, evidence, and cost fit the task. Process returned results in JavaScript.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
@@ -15,11 +15,12 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - Empty `write_stdin` polls: use default waits; avoid one-second loops.
 - Parallelize only when tools permit and build locks, outputs, and services are independent. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
 - Output defaults to the 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, so a printed result fits the cell. Read whole useful regions; use retained-artifact selectors after truncation.
-- Continue independent work in the same cell; `notify(...)` reports progress.
+- Continue independent work in the same cell.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
 - `notify(value): Promise<void>` queues a model-visible message without yielding.
+- JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values for later cells.
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awaited continuation runs. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()`, input interruption, or bounded host wait; a completed cell never needs `wait`.
 - `cell_id` identifies the running `exec` cell to resume.

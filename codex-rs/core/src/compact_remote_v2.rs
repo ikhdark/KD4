@@ -496,7 +496,21 @@ async fn collect_compaction_output(
         };
         let _model_stream_processing_timing_guard =
             timing_state.map(super::turn_timing::TurnTimingState::begin_model_stream_processing);
-        match event? {
+        let event = event?;
+        if let Some(timing) = timing_state {
+            // Ignored compactor messages are not user-visible or actionable.
+            if matches!(
+                &event,
+                ResponseEvent::OutputItemDone(ResponseItem::Compaction { .. })
+                    | ResponseEvent::Completed { .. }
+            ) {
+                timing.record_response_event_milestones(&event);
+            }
+            if let ResponseEvent::Completed { token_usage, .. } = &event {
+                timing.record_generation_token_usage(token_usage.as_ref());
+            }
+        }
+        match event {
             ResponseEvent::OutputItemDone(item) => {
                 output_item_count += 1;
                 if let ResponseItem::Compaction { .. } = item {
@@ -1357,6 +1371,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_compaction_output_does_not_invent_usage_or_completion() {
+        for completed in [false, true] {
+            let mut events = vec![Ok(ResponseEvent::OutputItemDone(
+                ResponseItem::Compaction {
+                    id: None,
+                    encrypted_content: "encrypted".to_string(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ))];
+            if completed {
+                events.push(Ok(ResponseEvent::Completed {
+                    response_id: "resp-compact".to_string(),
+                    token_usage: None,
+                    end_turn: Some(true),
+                }));
+            }
+            let timing = Arc::new(TurnTimingState::default());
+            timing.mark_turn_started();
+            timing.begin_compaction_generation();
+            drop(timing.begin_model_request_wait());
+
+            let result = collect_compaction_output(
+                response_stream(events),
+                Some(&timing),
+                &CancellationToken::new(),
+            )
+            .await;
+
+            if completed {
+                assert!(result.expect("completed compaction").token_usage.is_none());
+            } else {
+                assert!(matches!(result, Err(CodexErr::Stream(..))));
+            }
+            let profile = timing.complete_snapshot().protocol_timing();
+            assert_eq!(profile.model_requests.len(), 1);
+            let request = &profile.model_requests[0];
+            assert!(request.token_usage.is_none());
+            assert_eq!(request.completed_ms.is_some(), completed);
+            assert!(request.first_model_output_ms.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn collect_compaction_output_accepts_additional_output_items() {
         let compaction = ResponseItem::Compaction {
             id: None,
@@ -1383,7 +1440,11 @@ mod tests {
             }),
         ]);
 
-        let output = collect_compaction_output(stream, None, &CancellationToken::new())
+        let timing = Arc::new(TurnTimingState::default());
+        timing.mark_turn_started();
+        timing.begin_compaction_generation();
+        drop(timing.begin_model_request_wait());
+        let output = collect_compaction_output(stream, Some(&timing), &CancellationToken::new())
             .await
             .expect("compaction should be collected");
 
@@ -1398,5 +1459,23 @@ mod tests {
                 total_tokens: 123_498,
             })
         );
+        let profile = timing.complete_snapshot().protocol_timing();
+        assert_eq!(profile.model_requests.len(), 1);
+        let request = &profile.model_requests[0];
+        let usage = request.token_usage.as_ref().expect("compaction usage");
+        assert_eq!(usage.input_tokens, 123_456);
+        assert_eq!(usage.cached_input_tokens, 7_890);
+        assert_eq!(usage.visible_output_tokens, 37);
+        assert_eq!(usage.reasoning_tokens, 5);
+        assert_eq!(usage.total_tokens, 123_498);
+        assert_eq!(request.output_tokens, 42);
+        assert_eq!(request.reasoning_output_tokens, 5);
+        assert!(request.first_model_output_ms.is_some());
+        assert!(request.completed_ms.is_some());
+        assert_eq!(
+            request.first_actionable_output_ms,
+            request.first_model_output_ms
+        );
+        assert_eq!(profile.milestones.first_visible_output_ms, None);
     }
 }

@@ -386,14 +386,23 @@ impl EnabledToolCatalog {
         self.tools.get(index)
     }
 
-    fn resolve(&self, global_name: &str) -> Option<&EnabledToolMetadata> {
-        self.by_global_name
-            .get(global_name)
-            .and_then(|index| self.tools.get(*index))
-    }
-
     fn index_of(&self, global_name: &str) -> Option<usize> {
         self.by_global_name.get(global_name).copied()
+    }
+
+    /// Resolves a global name or the `namespace.name` identity that tool
+    /// discovery reports for a namespaced tool. Ambiguous identities stay
+    /// unresolved rather than dispatching to an arbitrary tool.
+    fn resolve_requested_name(&self, requested_name: &str) -> Option<usize> {
+        if let Some(index) = self.index_of(requested_name) {
+            return Some(index);
+        }
+        let (namespace, name) = requested_name.split_once('.')?;
+        let mut matches = self.tools.iter().enumerate().filter(|(_, tool)| {
+            tool.tool_name.namespace.as_deref() == Some(namespace) && tool.tool_name.name == name
+        });
+        let (index, _) = matches.next()?;
+        matches.next().is_none().then_some(index)
     }
 }
 
@@ -787,17 +796,19 @@ mod tests {
 
         assert_eq!(
             catalog
-                .resolve("sample_tool")
+                .index_of("sample_tool")
+                .and_then(|index| catalog.get(index))
                 .map(|tool| tool.description.as_str()),
             Some("first")
         );
         assert_eq!(
             catalog
-                .resolve("sample_tool_extra")
+                .index_of("sample_tool_extra")
+                .and_then(|index| catalog.get(index))
                 .map(|tool| tool.description.as_str()),
             Some("other")
         );
-        assert!(catalog.resolve("sample").is_none());
+        assert!(catalog.index_of("sample").is_none());
     }
 
     #[tokio::test(start_paused = true)]

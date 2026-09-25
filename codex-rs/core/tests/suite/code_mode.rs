@@ -1774,6 +1774,59 @@ async fn output_only_preserves_running_command_and_recovers_middle(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_truncated_cell_output_names_a_recoverable_artifact() -> Result<()> {
+    require_network!();
+    let server = responses::start_mock_server().await;
+    // The printed packet exceeds the default cell budget, so its middle is
+    // omitted from the model-visible result.
+    let code = r#"
+const filler = "filler evidence line\n".repeat(4000);
+text(`HEAD\n${filler}OMITTED_CELL_MIDDLE_SENTINEL\n${filler}TAIL`);
+"#;
+    let (test, observed) = run_code_mode_turn(&server, "Print the large report.", code).await?;
+    let raw = custom_tool_output_last_non_empty_text(&observed.single_request(), "call-1")
+        .expect("exec output");
+    assert!(raw.contains("HEAD"), "{raw}");
+    assert!(!raw.contains("OMITTED_CELL_MIDDLE_SENTINEL"), "{raw}");
+    let (_, notice) = raw.rsplit_once('\n').expect("recovery notice line");
+    let notice: Value = serde_json::from_str(notice)?;
+    assert_eq!(notice["output_truncated"], true, "{notice}");
+    assert_eq!(notice["recovery_tool"], "read_tool_output", "{notice}");
+    let artifact_id = notice["artifact_id"]
+        .as_str()
+        .expect("named artifact")
+        .to_string();
+
+    // Canonical text keeps the completion header (three lines and a blank
+    // separator), so the sentinel follows HEAD and 4,000 filler lines.
+    let recover = format!(
+        "const r = await tools.read_tool_output({{artifact_id: {artifact_id:?}, selectors: [{{kind: 'lines', start: 4006, end: 4006}}]}}); text(r.results[0].text);"
+    );
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_custom_tool_call("recover", "exec", &recover),
+            ev_completed("recover-response"),
+        ]),
+    )
+    .await;
+    let recovered = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("recovered", "done"),
+            ev_completed("recovered-response"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Recover the omitted middle from the named artifact.")
+        .await?;
+    let raw = custom_tool_output_last_non_empty_text(&recovered.single_request(), "recover")
+        .expect("recovered output");
+    assert_eq!(raw.trim_end(), "OMITTED_CELL_MIDDLE_SENTINEL");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_return_exec_command_output() -> Result<()> {
     require_network!();
 
@@ -2303,8 +2356,9 @@ if (!tool) {
         })
         .expect("exec description should be present");
     assert!(exec_description.contains("Nested tools: use a present schema"));
-    assert!(exec_description.contains("`resolve_tool(name)` when the name is known"));
-    assert!(exec_description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
+    assert!(exec_description.contains("`resolve_tool(name)` to obtain a missing schema"));
+    assert!(exec_description.contains("callable with `.name`/`.description`"));
+    assert!(exec_description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
     assert!(!exec_description.contains("### `tool_search`"));
     assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
     assert!(exec_description.contains("execution: \"client\";"));
