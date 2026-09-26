@@ -22,7 +22,6 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_otlp::WithHttpConfig;
 use opentelemetry_otlp::WithTonicConfig;
 use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
-use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::InstrumentKind;
 use opentelemetry_sdk::metrics::ManualReader;
@@ -628,17 +627,12 @@ fn build_otlp_metric_exporter(
                 }
             })?;
 
-            let base_tls_config = ClientTlsConfig::new()
-                .with_enabled_roots()
-                .assume_http2(true);
-
-            let tls_config = match tls.as_ref() {
-                Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)
-                    .map_err(|err| MetricsError::InvalidConfig {
+            let tls_config =
+                crate::otlp::grpc_tls_config(&endpoint, tls.as_ref()).map_err(|err| {
+                    MetricsError::InvalidConfig {
                         message: err.to_string(),
-                    })?,
-                None => base_tls_config,
-            };
+                    }
+                })?;
 
             opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()

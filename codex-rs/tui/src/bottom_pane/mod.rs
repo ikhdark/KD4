@@ -520,8 +520,7 @@ impl BottomPane {
         }
 
         // Promote the oldest delayed approval once typing has been idle long enough.
-        // `ApprovalOverlay` advances its internal queue with `pop()`, so drain the
-        // remaining delayed approvals from the back to preserve FIFO display order.
+        // `ApprovalOverlay` presents its queue in arrival order, so keep FIFO order here.
         let Some(first) = self.delayed_approval_requests.pop_front() else {
             return;
         };
@@ -532,7 +531,7 @@ impl BottomPane {
             self.keymap.approval.clone(),
             self.keymap.list.clone(),
         );
-        while let Some(delayed) = self.delayed_approval_requests.pop_back() {
+        for delayed in self.delayed_approval_requests.drain(..) {
             modal.enqueue_request(delayed.request);
         }
         self.pause_status_timer_for_modal();
@@ -662,9 +661,9 @@ impl BottomPane {
         if let Some(view) = self.view_stack.last_mut() {
             let needs_redraw = view.handle_paste(pasted);
             let view_complete = view.is_complete();
+            let completion = view.completion();
             if view_complete {
-                self.view_stack.clear();
-                self.on_active_view_complete();
+                self.pop_active_view_with_completion(completion);
             }
             if needs_redraw || view_complete {
                 self.request_redraw();
@@ -702,9 +701,10 @@ impl BottomPane {
         };
         let needs_redraw = view.pre_draw_tick(now);
         let view_complete = view.is_complete();
+        let completion = view.completion();
         if view_complete {
-            self.view_stack.clear();
-            self.on_active_view_complete();
+            // Only the timed-out view closes; views beneath it may hold unresolved requests.
+            self.pop_active_view_with_completion(completion);
         }
         if needs_redraw || view_complete {
             self.request_redraw();
@@ -1848,6 +1848,30 @@ mod tests {
         }
     }
 
+    fn exec_request_with_id(request_id: &str) -> ApprovalRequest {
+        let mut request = exec_request();
+        if let ApprovalRequest::Exec { id, .. } = &mut request {
+            *id = request_id.to_string();
+        }
+        request
+    }
+
+    fn submitted_exec_decisions(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) -> Vec<(String, CommandExecutionApprovalDecision)> {
+        let mut decisions = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SubmitThreadOp {
+                op: Op::ExecApproval { id, decision, .. },
+                ..
+            } = event
+            {
+                decisions.push((id, decision));
+            }
+        }
+        decisions
+    }
+
     #[derive(Default)]
     struct DismissibleView {
         id: Option<&'static str>,
@@ -2192,6 +2216,114 @@ mod tests {
 
         pane.pre_draw_tick_at(now + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
         assert!(pane.view_stack.is_empty());
+    }
+
+    #[test]
+    fn queued_approvals_resolve_in_arrival_order_and_ignore_key_repeats() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let mut pane = test_pane(AppEventSender::new(tx_raw));
+        let features = Features::with_defaults();
+        for id in ["first", "second", "third"] {
+            pane.push_approval_request(exec_request_with_id(id), &features);
+        }
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            submitted_exec_decisions(&mut rx),
+            [(
+                "first".to_string(),
+                CommandExecutionApprovalDecision::Accept
+            )]
+        );
+
+        // Held keys must not decide the request revealed by the previous decision.
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('1'),
+        ] {
+            pane.handle_key_event(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ));
+        }
+        assert!(submitted_exec_decisions(&mut rx).is_empty());
+        assert!(pane.has_active_view());
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            submitted_exec_decisions(&mut rx),
+            [
+                (
+                    "second".to_string(),
+                    CommandExecutionApprovalDecision::Cancel
+                ),
+                (
+                    "third".to_string(),
+                    CommandExecutionApprovalDecision::Accept
+                ),
+            ]
+        );
+        assert!(!pane.has_active_view());
+    }
+
+    #[test]
+    fn delayed_approvals_are_shown_in_arrival_order() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let mut pane = test_pane(AppEventSender::new(tx_raw));
+        let features = Features::with_defaults();
+        let now = Instant::now();
+        pane.last_composer_activity_at = Some(now);
+        for id in ["first", "second", "third"] {
+            pane.push_approval_request(exec_request_with_id(id), &features);
+        }
+        assert_eq!(pane.delayed_approval_requests.len(), 3);
+
+        pane.pre_draw_tick_at(now + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
+        for _ in 0..3 {
+            pane.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        }
+
+        assert_eq!(
+            submitted_exec_decisions(&mut rx)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn auto_resolved_user_input_keeps_buried_approval_actionable() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let mut pane = test_pane(AppEventSender::new(tx_raw));
+        let features = Features::with_defaults();
+        pane.push_approval_request(exec_request(), &features);
+        pane.push_user_input_request(ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "call-1".to_string(),
+            questions: Vec::new(),
+            auto_resolution_ms: Some(1),
+        });
+        assert_eq!(pane.view_stack.len(), 2);
+
+        pane.pre_draw_tick_at(Instant::now() + Duration::from_secs(/*secs*/ 1));
+
+        assert_eq!(
+            pane.view_stack.len(),
+            1,
+            "only the auto-resolved prompt closes"
+        );
+        pane.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            submitted_exec_decisions(&mut rx),
+            [("1".to_string(), CommandExecutionApprovalDecision::Accept)]
+        );
+        assert!(!pane.has_active_view());
     }
 
     #[test]
@@ -2968,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn paste_completion_clears_stacked_views_and_restores_composer_input() {
+    fn paste_completion_closes_only_the_active_view() {
         #[derive(Default)]
         struct BlockingView {
             handle_calls: Rc<Cell<usize>>,
@@ -3036,15 +3168,12 @@ mod tests {
 
         pane.handle_paste("hello".to_string());
 
-        assert!(
-            pane.view_stack.is_empty(),
-            "paste completion should tear down the active modal flow"
-        );
+        // Like key and Ctrl+C completion, a paste closes only the view it completed; the view
+        // beneath may hold an unresolved request and must stay actionable.
+        assert_eq!(pane.view_stack.len(), 1, "only the completed view closes");
 
         pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
 
-        let area = Rect::new(0, 0, 40, pane.desired_height(/*width*/ 40).max(2));
-        assert!(pane.cursor_pos(area).is_some());
-        assert_eq!(lower_view_handle_calls.get(), 0);
+        assert_eq!(lower_view_handle_calls.get(), 1);
     }
 }

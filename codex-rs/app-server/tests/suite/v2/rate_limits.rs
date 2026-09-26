@@ -38,8 +38,10 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const INTERNAL_ERROR_CODE: i64 = -32603;
 
+/// Both account-owner endpoints require a Codex account, and API-key auth is
+/// still rejected because they need ChatGPT auth.
 #[tokio::test]
-async fn get_account_rate_limits_requires_auth() -> Result<()> {
+async fn account_owner_endpoints_require_chatgpt_auth() -> Result<()> {
     let codex_home = TempDir::new()?;
 
     let mut mcp = TestAppServer::builder()
@@ -51,50 +53,44 @@ async fn get_account_rate_limits_requires_auth() -> Result<()> {
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_get_account_rate_limits_request().await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    expect_invalid_request(
+        &mut mcp,
+        request_id,
+        "codex account authentication required to read rate limits",
     )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        error.error.message,
-        "codex account authentication required to read rate limits"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn get_account_rate_limits_requires_chatgpt_auth() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
+    .await?;
+    let request_id = mcp
+        .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
+            credit_type: AddCreditsNudgeCreditType::Credits,
+        })
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    expect_invalid_request(
+        &mut mcp,
+        request_id,
+        "codex account authentication required to notify workspace owner",
+    )
+    .await?;
 
     login_with_api_key(&mut mcp, "sk-test-key").await?;
 
     let request_id = mcp.send_get_account_rate_limits_request().await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    expect_invalid_request(
+        &mut mcp,
+        request_id,
+        "chatgpt authentication required to read rate limits",
     )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        error.error.message,
-        "chatgpt authentication required to read rate limits"
-    );
+    .await?;
+    let request_id = mcp
+        .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
+            credit_type: AddCreditsNudgeCreditType::UsageLimit,
+        })
+        .await?;
+    expect_invalid_request(
+        &mut mcp,
+        request_id,
+        "chatgpt authentication required to notify workspace owner",
+    )
+    .await?;
 
     Ok(())
 }
@@ -426,75 +422,6 @@ async fn get_account_rate_limits_preserves_count_when_reset_credit_details_fail(
 }
 
 #[tokio::test]
-async fn send_add_credits_nudge_email_requires_auth() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
-            credit_type: AddCreditsNudgeCreditType::Credits,
-        })
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        error.error.message,
-        "codex account authentication required to notify workspace owner"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn send_add_credits_nudge_email_requires_chatgpt_auth() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let request_id = mcp
-        .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
-            credit_type: AddCreditsNudgeCreditType::UsageLimit,
-        })
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        error.error.message,
-        "chatgpt authentication required to notify workspace owner"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn send_add_credits_nudge_email_posts_expected_body() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_chatgpt_auth(
@@ -645,6 +572,24 @@ async fn send_add_credits_nudge_email_surfaces_backend_failure() -> Result<()> {
         error.error.message
     );
     assert_eq!(error.error.data, None);
+
+    Ok(())
+}
+
+async fn expect_invalid_request(
+    mcp: &mut TestAppServer,
+    request_id: i64,
+    expected_message: &str,
+) -> Result<()> {
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(error.id, RequestId::Integer(request_id));
+    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(error.error.message, expected_message);
 
     Ok(())
 }

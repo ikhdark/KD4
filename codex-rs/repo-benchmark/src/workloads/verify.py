@@ -85,7 +85,8 @@ def check_test_completion(result, kind, expected_names, failing):
         outcomes = [(name, '') for name in outcomes]
     else:
         summaries = re.findall(r'^Ran (\d+) tests? in .+$', output, re.MULTILINE)
-        outcomes = re.findall(r'^(test\w+) \(.*?\).*? \.\.\. (ok|FAIL|ERROR)$', output, re.MULTILINE)
+        # Verbose unittest prints a docstring's first line before the outcome.
+        outcomes = re.findall(r'^(test\w+) \(.*?\).*?(?:\n.*?)? \.\.\. (ok|FAIL|ERROR)$', output, re.MULTILINE)
         terminal = re.search(r'^(OK|FAILED \(.*?\))$', output, re.MULTILINE)
         failed = sum(state in ('FAIL', 'ERROR') for _, state in outcomes)
         passed = len(outcomes) - failed

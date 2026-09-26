@@ -1,8 +1,6 @@
 *** Begin Patch
 *** Add File: created.txt
 +hello
-*** Update File: missing.txt
-@@
--old
-+new
+*** Add File: blocked
++never written
 *** End Patch

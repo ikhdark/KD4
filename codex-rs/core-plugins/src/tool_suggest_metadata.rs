@@ -15,8 +15,8 @@ use tokio::sync::Semaphore;
 
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
 use crate::loader::PluginSkillInventory;
-use crate::loader::load_plugin_apps;
-use crate::loader::load_plugin_mcp_servers;
+use crate::loader::load_plugin_apps_from_manifest;
+use crate::loader::load_plugin_mcp_servers_from_manifest;
 use crate::loader::load_plugin_skill_inventory;
 use crate::manager::ConfiguredMarketplacePlugin;
 use crate::manager::remote_plugin_install_required_description;
@@ -213,6 +213,8 @@ async fn load_plugin_metadata(
     })
     .await
     .map_err(|err| format!("failed to read plugin manifest: {err}"))??;
+    // Auth routing is projected per lookup, so load the declared capabilities from the
+    // manifest already parsed above.
     let (skill_inventory, mcp_servers, app_declarations) = tokio::join!(
         load_plugin_skill_inventory(
             plugin_root,
@@ -221,8 +223,12 @@ async fn load_plugin_metadata(
             restriction_product,
             /*plugin_skill_snapshots*/ None,
         ),
-        load_plugin_mcp_servers(plugin_root.as_path(), /*auth_mode*/ None),
-        load_plugin_apps(plugin_root.as_path())
+        load_plugin_mcp_servers_from_manifest(
+            plugin_root.as_path(),
+            &manifest.paths,
+            /*plugin_policy*/ None,
+        ),
+        load_plugin_apps_from_manifest(plugin_root.as_path(), &manifest.paths)
     );
     let mcp_servers = mcp_servers.into_keys().map(|name| (name, ())).collect();
 

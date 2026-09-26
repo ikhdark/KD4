@@ -103,7 +103,8 @@ def build_marketplace_entry(
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    with path.open() as handle:
+    # Marketplace files are UTF-8; the Windows locale codec would corrupt non-ASCII names.
+    with path.open(encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -187,7 +188,7 @@ def write_json(path: Path, data: dict, force: bool) -> None:
     if path.exists() and not force:
         raise FileExistsError(f"{path} already exists. Use --force to overwrite.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as handle:
+    with path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
         handle.write("\n")
 
@@ -196,7 +197,7 @@ def create_stub_file(path: Path, payload: dict, force: bool) -> None:
     if path.exists() and not force:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as handle:
+    with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
 

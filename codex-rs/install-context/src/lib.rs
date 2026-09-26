@@ -55,42 +55,42 @@ pub enum InstallMethod {
     Other,
 }
 
+/// Latest release of this fork. Update checks, release notes, and the standalone
+/// installer must all use this channel: upstream releases and npm packages would
+/// replace the fork with a different build.
+pub const LATEST_RELEASE_URL: &str = "https://github.com/ikhdark/KD4/releases/latest";
+/// GitHub API endpoint for [`LATEST_RELEASE_URL`].
+pub const LATEST_RELEASE_API_URL: &str = "https://api.github.com/repos/ikhdark/KD4/releases/latest";
+
 /// Update action appropriate for a detected Codex installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
-    /// Update a global npm installation.
-    NpmGlobalLatest,
-    /// Update a global Bun installation.
-    BunGlobalLatest,
-    /// Update a global pnpm installation.
-    PnpmGlobalLatest,
-    /// Rerun the standalone Windows installer.
+    /// Rerun the fork's standalone Windows installer.
     StandaloneWindows,
 }
 
 impl UpdateAction {
+    /// Package-manager installs come from fork release tarballs that are not
+    /// published to a registry, so no package-manager command can update them.
     pub fn from_install_context(context: &InstallContext) -> Option<Self> {
         match &context.method {
-            InstallMethod::Npm => Some(Self::NpmGlobalLatest),
-            InstallMethod::Bun => Some(Self::BunGlobalLatest),
-            InstallMethod::Pnpm => Some(Self::PnpmGlobalLatest),
             InstallMethod::Standalone { .. } => Some(Self::StandaloneWindows),
-            InstallMethod::Other => None,
+            InstallMethod::Npm
+            | InstallMethod::Bun
+            | InstallMethod::Pnpm
+            | InstallMethod::Other => None,
         }
     }
 
     pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
-            Self::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
-            Self::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
             Self::StandaloneWindows => (
                 "powershell",
                 &[
                     "-ExecutionPolicy",
                     "Bypass",
                     "-c",
-                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex",
+                    "$env:CODEX_NON_INTERACTIVE=1; irm https://raw.githubusercontent.com/ikhdark/KD4/main/scripts/install/install.ps1 | iex",
                 ],
             ),
         }
@@ -335,10 +335,12 @@ mod tests {
         let standalone_release_dir =
             AbsolutePathBuf::from_absolute_path(std::env::temp_dir().join("standalone-release"))
                 .expect("temp dir path should be absolute");
+        // Registry package-manager commands would install upstream Codex over
+        // a fork install, so only the fork's standalone installer is offered.
         for (method, expected) in [
-            (InstallMethod::Npm, Some(UpdateAction::NpmGlobalLatest)),
-            (InstallMethod::Bun, Some(UpdateAction::BunGlobalLatest)),
-            (InstallMethod::Pnpm, Some(UpdateAction::PnpmGlobalLatest)),
+            (InstallMethod::Npm, None),
+            (InstallMethod::Bun, None),
+            (InstallMethod::Pnpm, None),
             (
                 InstallMethod::Standalone {
                     release_dir: standalone_release_dir,
@@ -357,10 +359,6 @@ mod tests {
             );
         }
         assert_eq!(
-            UpdateAction::NpmGlobalLatest.command_args(),
-            ("npm", &["install", "-g", "@openai/codex"][..])
-        );
-        assert_eq!(
             UpdateAction::StandaloneWindows.command_args(),
             (
                 "powershell",
@@ -368,9 +366,18 @@ mod tests {
                     "-ExecutionPolicy",
                     "Bypass",
                     "-c",
-                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+                    "$env:CODEX_NON_INTERACTIVE=1; irm https://raw.githubusercontent.com/ikhdark/KD4/main/scripts/install/install.ps1 | iex"
                 ][..],
             )
+        );
+        // The installer and update checks must read the same release channel.
+        assert_eq!(
+            LATEST_RELEASE_API_URL,
+            "https://api.github.com/repos/ikhdark/KD4/releases/latest"
+        );
+        assert_eq!(
+            LATEST_RELEASE_URL,
+            "https://github.com/ikhdark/KD4/releases/latest"
         );
     }
 

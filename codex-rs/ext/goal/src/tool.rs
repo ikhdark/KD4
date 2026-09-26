@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_extension_api::ConversationHistoryRequirement;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ToolCall;
@@ -7,6 +8,7 @@ use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolExposure;
 use codex_extension_api::ToolName;
 use codex_extension_api::ToolOutput;
+use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadGoal;
@@ -164,6 +166,13 @@ impl ToolExecutor<ToolCall> for GoalToolExecutor {
             (true, GoalToolKind::Get | GoalToolKind::Update) => ToolExposure::Direct,
             _ => ToolExposure::Deferred,
         }
+    }
+
+    fn conversation_history_requirement(
+        &self,
+        _payload: &ToolPayload,
+    ) -> ConversationHistoryRequirement {
+        ConversationHistoryRequirement::None
     }
 
     fn handle(&self, invocation: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
@@ -495,7 +504,11 @@ fn completion_budget_report(goal: &ThreadGoal) -> Option<String> {
 
 /// Stable across reloads and unaffected by usage updates; binds completion to intent.
 pub(crate) fn goal_reference(goal: &codex_state::ThreadGoal) -> String {
+    goal_reference_for(&goal.goal_id, &goal.objective)
+}
+
+pub(crate) fn goal_reference_for(goal_id: &str, objective: &str) -> String {
     use sha2::Digest;
-    let digest = sha2::Sha256::digest(goal.objective.as_bytes());
-    format!("{}:{digest:x}", goal.goal_id)
+    let digest = sha2::Sha256::digest(objective.as_bytes());
+    format!("{goal_id}:{digest:x}")
 }

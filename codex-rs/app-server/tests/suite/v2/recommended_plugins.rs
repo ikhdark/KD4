@@ -53,22 +53,11 @@ async fn runtime_tool_suggest_disable_refreshes_active_thread() -> Result<()> {
         .expect(1)
         .mount(&server)
         .await;
-    let responses_mock = responses::mount_sse_sequence(
-        &server,
-        vec![
-            responses::sse(vec![
-                responses::ev_response_created("resp-1"),
-                responses::ev_assistant_message("msg-1", "done"),
-                responses::ev_completed("resp-1"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-2"),
-                responses::ev_assistant_message("msg-2", "done"),
-                responses::ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
+    let response = || responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "done"),
+        responses::ev_completed("resp-1"),
+    ]);
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml_with_chatgpt_base_url(
@@ -121,40 +110,34 @@ async fn runtime_tool_suggest_disable_refreshes_active_thread() -> Result<()> {
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(thread_response)?;
 
-    let turn_id = app_server
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            input: vec![UserInput::Text {
-                text: "suggest a plugin".to_string(),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-    let _: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        app_server.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        app_server.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let requests = responses_mock.requests();
-    let request = requests
-        .iter()
-        .find(|request| {
-            request
-                .message_input_texts("user")
-                .iter()
-                .any(|text| text.contains("suggest a plugin"))
-        })
-        .expect("turn request");
+    // Advisory recommendations refresh in the background rather than delaying
+    // the first turn. Observe readiness through the actual request consumer.
+    let request = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let responses_mock = responses::mount_sse_once(&server, response()).await;
+            let turn_id = app_server.send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "suggest a plugin".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            }).await?;
+            app_server.read_stream_until_response_message(RequestId::Integer(turn_id)).await?;
+            app_server.read_stream_until_notification_message("turn/completed").await?;
+            let request = responses_mock.single_request();
+            if request.message_input_texts("user").iter()
+                .any(|text| text.contains("<recommended_plugins>")) {
+                break Ok::<_, anyhow::Error>(request);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await??;
     let contextual_user_message = request.message_input_texts("user").join("\n");
     assert!(contextual_user_message.contains("<recommended_plugins>"));
     assert!(contextual_user_message.contains("- GitHub (github@openai-curated-remote)"));
+    let recommendation_count = contextual_user_message.matches("<recommended_plugins>").count();
+    assert_eq!(recommendation_count, 1);
     let body = request.body_json();
     let tool_names = body
         .get("tools")
@@ -183,6 +166,7 @@ async fn runtime_tool_suggest_disable_refreshes_active_thread() -> Result<()> {
         }
     );
 
+    let responses_mock = responses::mount_sse_once(&server, response()).await;
     let turn_id = app_server
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id,
@@ -215,7 +199,11 @@ async fn runtime_tool_suggest_disable_refreshes_active_thread() -> Result<()> {
         })
         .expect("turn request after runtime feature disable");
     let contextual_user_message = request.message_input_texts("user").join("\n");
-    assert!(!contextual_user_message.contains("<recommended_plugins>"));
+    assert_eq!(
+        contextual_user_message.matches("<recommended_plugins>").count(),
+        recommendation_count,
+        "disabling suggestions must not inject another catalog or rewrite earlier history"
+    );
     let request_body = request.body_json();
     let has_install_tool = request_body
         .get("tools")

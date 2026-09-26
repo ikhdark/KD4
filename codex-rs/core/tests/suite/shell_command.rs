@@ -234,22 +234,8 @@ async fn shell_command_works() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn output_with_login() -> anyhow::Result<()> {
-    require_network!();
-
-    let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
-
-    let call_id = "shell-command-call-login-true";
-    mount_shell_responses(&harness, call_id, "echo 'hello, world'", Some(true)).await;
-    harness.submit("run the echo command with login").await?;
-
-    let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
-
-    Ok(())
-}
-
+// `shell_command_works` covers the default login shell with single-line output;
+// `multi_line_output_with_login` covers an explicit `login: true`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn output_without_login() -> anyhow::Result<()> {
     require_network!();

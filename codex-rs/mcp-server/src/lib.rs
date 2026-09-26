@@ -36,6 +36,7 @@ pub(crate) mod message_processor;
 mod outgoing_message;
 mod patch_approval;
 
+use crate::codex_tool_config::ToolSessionDefaults;
 use crate::message_processor::MessageProcessor;
 use crate::outgoing_message::OutgoingError;
 use crate::outgoing_message::OutgoingJsonRpcMessage;
@@ -158,7 +159,7 @@ pub async fn run_main(
         )
     })?;
     let config = ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides)
+        .cli_overrides(cli_kv_overrides.clone())
         .strict_config(strict_config)
         .build()
         .await
@@ -268,7 +269,12 @@ pub async fn run_main(
         let output_failed = output_failed.clone();
         let mut processor = MessageProcessor::new(
             outgoing_message_sender,
-            arg0_paths,
+            ToolSessionDefaults {
+                codex_home: None,
+                arg0_paths,
+                cli_overrides: cli_kv_overrides,
+                strict_config,
+            },
             Arc::new(config),
             environment_manager,
             state_db,

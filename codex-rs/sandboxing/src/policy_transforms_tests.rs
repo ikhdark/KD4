@@ -13,6 +13,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::permissions::ReadDenyMatcher;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -596,6 +597,52 @@ fn intersect_permission_profiles_rejects_concrete_grants_matched_by_requested_de
     assert_eq!(
         intersect_permission_profiles(requested, granted, cwd.as_path()),
         PermissionProfile::default()
+    );
+}
+
+#[test]
+fn intersect_permission_profiles_keeps_brace_deny_globs_that_constrain_grants() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let cwd = AbsolutePathBuf::from_absolute_path(
+        canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
+    )
+    .expect("absolute temp dir");
+    let secrets = cwd.join("secrets");
+    // The alternation precedes the first wildcard, so the deny's literal prefix is `cwd`.
+    let permissions = PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries: vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Path {
+                        path: secrets.clone(),
+                    },
+                    access: FileSystemAccessMode::Write,
+                },
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::GlobPattern {
+                        pattern: cwd
+                            .join("{secrets,keys}")
+                            .join("*.pem")
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
+                    access: FileSystemAccessMode::Deny,
+                },
+            ],
+            glob_scan_max_depth: None,
+        }),
+        ..Default::default()
+    };
+
+    let intersected =
+        intersect_permission_profiles(permissions.clone(), permissions.clone(), cwd.as_path());
+
+    assert_eq!(intersected, permissions);
+    let policy =
+        FileSystemSandboxPolicy::restricted(intersected.file_system.unwrap_or_default().entries);
+    assert!(
+        ReadDenyMatcher::new(&policy, cwd.as_path())
+            .is_some_and(|matcher| matcher.is_read_denied(secrets.join("id.pem").as_path()))
     );
 }
 

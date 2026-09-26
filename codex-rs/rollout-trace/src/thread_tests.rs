@@ -62,6 +62,16 @@ fn create_in_root_writes_replayable_lifecycle_events() -> anyhow::Result<()> {
 }
 
 #[test]
+fn empty_trace_root_is_unset_instead_of_the_process_cwd() {
+    assert_eq!(configured_trace_root(None), None);
+    assert_eq!(configured_trace_root(Some(std::ffi::OsString::new())), None);
+    assert_eq!(
+        configured_trace_root(Some("traces".into())),
+        Some(PathBuf::from("traces"))
+    );
+}
+
+#[test]
 fn spawned_thread_start_appends_to_root_bundle() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let root_thread_id = ThreadId::new();

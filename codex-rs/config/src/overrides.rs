@@ -40,11 +40,11 @@ fn apply_toml_override(root: &mut TomlValue, path: &str, value: TomlValue) -> st
         if is_last {
             match current {
                 TomlValue::Table(table) => {
-                    table.insert(segment.to_string(), value);
+                    table.insert(segment, value);
                 }
                 _ => {
                     let mut table = Table::new();
-                    table.insert(segment.to_string(), value);
+                    table.insert(segment, value);
                     *current = TomlValue::Table(table);
                 }
             }
@@ -54,14 +54,14 @@ fn apply_toml_override(root: &mut TomlValue, path: &str, value: TomlValue) -> st
         match current {
             TomlValue::Table(table) => {
                 current = table
-                    .entry(segment.to_string())
+                    .entry(segment)
                     .or_insert_with(|| TomlValue::Table(Table::new()));
             }
             _ => {
                 *current = TomlValue::Table(Table::new());
                 if let TomlValue::Table(tbl) = current {
                     current = tbl
-                        .entry(segment.to_string())
+                        .entry(segment)
                         .or_insert_with(|| TomlValue::Table(Table::new()));
                 }
             }

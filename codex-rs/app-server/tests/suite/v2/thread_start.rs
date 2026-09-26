@@ -6,6 +6,7 @@ use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -202,12 +203,13 @@ async fn thread_start_warns_for_exec_policy_parse_failure_after_initialize() -> 
     let request_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams::default())
         .await?;
-    let response = timeout(
+    let error = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let _: ThreadStartResponse = to_response(response)?;
+    assert!(error.error.message.contains("failed to load rules"));
+    assert!(error.error.message.contains("broken.rules"));
 
     let notification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -285,12 +287,13 @@ async fn thread_start_does_not_repeat_initialize_exec_policy_warning() -> Result
     let request_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams::default())
         .await?;
-    let response = timeout(
+    let error = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let _: ThreadStartResponse = to_response(response)?;
+    assert!(error.error.message.contains("failed to load rules"));
+    assert!(error.error.message.contains("broken.rules"));
 
     let duplicate_warning = timeout(
         std::time::Duration::from_millis(250),
@@ -695,46 +698,7 @@ async fn thread_start_excludes_profile_workspace_roots_from_runtime_workspace_ro
 }
 
 #[tokio::test]
-async fn thread_start_rejects_unknown_environment_as_invalid_request() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_thread_start_request(ThreadStartParams {
-            environments: Some(vec![TurnEnvironmentParams {
-                environment_id: "missing".to_string(),
-                cwd: codex_utils_absolute_path::AbsolutePathBuf::try_from(
-                    codex_home.path().to_path_buf(),
-                )?
-                .into(),
-            }]),
-            ..Default::default()
-        })
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(error.error.message, "unknown turn environment id `missing`");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_start_rejects_relative_environment_cwd_as_invalid_request() -> Result<()> {
+async fn thread_start_rejects_invalid_environment_selections_as_invalid_request() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
@@ -746,29 +710,45 @@ async fn thread_start_rejects_relative_environment_cwd_as_invalid_request() -> R
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     let environment_id = mcp.auto_env_params()?.environment_id;
 
-    let request_id = mcp
-        .send_thread_start_request(ThreadStartParams {
-            environments: Some(vec![TurnEnvironmentParams {
+    // Both selections are rejected before a thread is created.
+    let cases = [
+        (
+            TurnEnvironmentParams {
+                environment_id: "missing".to_string(),
+                cwd: codex_utils_absolute_path::AbsolutePathBuf::try_from(
+                    codex_home.path().to_path_buf(),
+                )?
+                .into(),
+            },
+            "unknown turn environment id `missing`".to_string(),
+        ),
+        (
+            TurnEnvironmentParams {
                 environment_id: environment_id.clone(),
                 cwd: serde_json::from_value(json!("relative"))?,
-            }]),
-            ..Default::default()
-        })
-        .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        error.error.message,
-        format!(
-            "invalid cwd for environment `{environment_id}`: path `relative` does not use absolute Windows drive or UNC path syntax"
+            },
+            format!(
+                "invalid cwd for environment `{environment_id}`: path `relative` does not use absolute Windows drive or UNC path syntax"
+            ),
+        ),
+    ];
+    for (environment, expected_message) in cases {
+        let request_id = mcp
+            .send_thread_start_request(ThreadStartParams {
+                environments: Some(vec![environment]),
+                ..Default::default()
+            })
+            .await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
         )
-    );
+        .await??;
+
+        assert_eq!(error.id, RequestId::Integer(request_id));
+        assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+        assert_eq!(error.error.message, expected_message);
+    }
 
     Ok(())
 }
@@ -968,7 +948,7 @@ async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    write_mock_responses_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
@@ -1392,7 +1372,7 @@ async fn thread_start_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
     let codex_home = TempDir::new()?;
     let model_server = create_mock_responses_server_repeating_assistant("Done").await;
     let chatgpt_base_url = format!("{}/backend-api", server.uri());
-    create_config_toml_with_chatgpt_base_url(
+    write_mock_responses_config_toml_with_chatgpt_base_url(
         codex_home.path(),
         &model_server.uri(),
         &chatgpt_base_url,
@@ -1482,11 +1462,14 @@ model_reasoning_effort = "high"
             ..Default::default()
         })
         .await?;
-    timeout(
+    let first_response: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(first_request)),
     )
     .await??;
+    // The thread that persists trust must itself load the now-trusted project config.
+    let first_response = to_response::<ThreadStartResponse>(first_response)?;
+    assert_eq!(first_response.reasoning_effort, Some(ReasoningEffort::High));
 
     let second_request = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
@@ -1761,34 +1744,6 @@ stream_max_retries = 0
 [permissions.dev.filesystem.":workspace_roots"]
 "." = "write"
 "#,
-        ),
-    )
-}
-
-fn create_config_toml_with_chatgpt_base_url(
-    codex_home: &Path,
-    server_uri: &str,
-    chatgpt_base_url: &str,
-) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-chatgpt_base_url = "{chatgpt_base_url}"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
         ),
     )
 }

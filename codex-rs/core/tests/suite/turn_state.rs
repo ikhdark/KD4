@@ -89,7 +89,7 @@ async fn responses_turn_state_persists_within_turn_and_resets_after() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<()> {
+async fn websocket_turn_state_is_stable_within_turn_and_resets_after() -> Result<()> {
     require_network!();
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
@@ -102,70 +102,6 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
                 }),
                 ev_response_created("resp-1"),
                 ev_reasoning_item("rsn-1", &["thinking"], &[]),
-                ev_shell_command_call("ws-shell-turn-state", "echo websocket"),
-                ev_completed("resp-1"),
-            ],
-            vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ],
-            vec![
-                ev_response_created("resp-3"),
-                ev_assistant_message("msg-2", "done"),
-                ev_completed("resp-3"),
-            ],
-        ],
-        response_headers: Vec::new(),
-        accept_delay: None,
-        close_after_requests: false,
-    }])
-    .await;
-
-    let mut builder = test_codex();
-    let test = builder.build_with_websocket_server(&server).await?;
-    let warmup = server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
-        .await
-        .body_json();
-    assert_eq!(warmup["type"].as_str(), Some("response.create"));
-    assert_eq!(warmup["generate"].as_bool(), Some(false));
-
-    // Phase 1: the first response mints state for its same-turn tool follow-up.
-    test.submit_turn("run the echo command").await?;
-    // Phase 2: the follow-up replays that state on the same physical connection.
-    // Phase 3: the next logical turn reuses the connection but starts with empty state.
-    test.submit_turn("start another turn").await?;
-
-    assert_eq!(server.handshakes().len(), 1);
-    let requests = server.single_connection();
-    assert_eq!(requests.len(), 4);
-    assert_eq!(requests[0].body_json()["generate"], json!(false));
-    assert_eq!(
-        requests
-            .iter()
-            .map(|request| request.body_json()["client_metadata"][TURN_STATE_HEADER].clone())
-            .collect::<Vec<_>>(),
-        vec![json!(null), json!(null), json!("ts-1"), json!(null)]
-    );
-
-    server.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
-    require_network!();
-
-    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
-        requests: vec![
-            vec![ev_response_created("warm-1"), ev_completed("warm-1")],
-            vec![
-                json!({
-                    "type": "response.metadata",
-                    "headers": {(TURN_STATE_HEADER): "ts-1"},
-                }),
-                ev_response_created("resp-1"),
                 ev_shell_command_call("ws-shell-1", "echo one"),
                 ev_completed("resp-1"),
             ],
@@ -183,12 +119,18 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
                 ev_assistant_message("msg-1", "done"),
                 ev_completed("resp-3"),
             ],
+            vec![
+                ev_response_created("resp-4"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-4"),
+            ],
         ],
         response_headers: Vec::new(),
         accept_delay: None,
         close_after_requests: false,
     }])
     .await;
+
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
     let warmup = server
@@ -199,20 +141,27 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
     assert_eq!(warmup["generate"].as_bool(), Some(false));
 
     // Phase 1: the initial request starts empty and receives the first metadata value.
-    // Phase 2: the first tool follow-up replays it and ignores a later value.
-    // Phase 3: the second follow-up sends the original value on the same connection.
+    // Phase 2: both tool follow-ups replay it and ignore a later value.
     test.submit_turn("run two echo commands").await?;
+    // Phase 3: the next logical turn reuses the connection but starts with empty state.
+    test.submit_turn("start another turn").await?;
 
     assert_eq!(server.handshakes().len(), 1);
     let requests = server.single_connection();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(requests[0].body_json()["generate"], json!(false));
     assert_eq!(
         requests
             .iter()
             .map(|request| request.body_json()["client_metadata"][TURN_STATE_HEADER].clone())
             .collect::<Vec<_>>(),
-        vec![json!(null), json!(null), json!("ts-1"), json!("ts-1")]
+        vec![
+            json!(null),
+            json!(null),
+            json!("ts-1"),
+            json!("ts-1"),
+            json!(null)
+        ]
     );
 
     server.shutdown().await;

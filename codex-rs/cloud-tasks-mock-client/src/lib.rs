@@ -54,6 +54,7 @@ impl MockClient {
             let id = TaskId(id_str.to_string());
             let diff = mock_diff_for(&id);
             let (a, d) = count_from_unified(&diff);
+            let attempt_total = mock_sibling_turn_ids(&id).len() + 1;
             out.push(TaskSummary {
                 id,
                 title: title.to_string(),
@@ -67,7 +68,7 @@ impl MockClient {
                     lines_removed: d,
                 },
                 is_review: false,
-                attempt_total: Some(if id_str == "T-1000" { 2 } else { 1 }),
+                attempt_total: Some(attempt_total),
             });
         }
         let limit = match limit {
@@ -116,25 +117,20 @@ impl MockClient {
         Ok(Some(mock_diff_for(&id)))
     }
 
-    async fn get_task_messages(&self, id: TaskId) -> Result<Vec<String>> {
-        self.get_task_summary(id).await?;
-        Ok(vec![
-            "Mock assistant output: fixture changes are ready for review.".to_string(),
-        ])
-    }
-
-    async fn get_task_text(&self, id: TaskId) -> Result<TaskText> {
-        self.get_task_summary(id).await?;
-        Ok(TaskText {
+    async fn get_task_text_and_diff(&self, id: TaskId) -> Result<(TaskText, Option<String>)> {
+        self.get_task_summary(id.clone()).await?;
+        let text = TaskText {
             prompt: Some("Review the fixture changes.".to_string()),
             messages: vec![
                 "Mock assistant output: fixture changes are ready for review.".to_string(),
             ],
             turn_id: Some("mock-turn".to_string()),
-            sibling_turn_ids: Vec::new(),
+            // Like the backend, name the other attempts wherever the list reports more than one.
+            sibling_turn_ids: mock_sibling_turn_ids(&id),
             attempt_placement: Some(0),
             attempt_status: AttemptStatus::Completed,
-        })
+        };
+        Ok((text, Some(mock_diff_for(&id))))
     }
 
     async fn apply_task(&self, id: TaskId, diff_override: Option<String>) -> Result<ApplyOutcome> {
@@ -171,20 +167,22 @@ impl MockClient {
         turn_id: String,
     ) -> Result<Vec<TurnAttempt>> {
         self.get_task_summary(task.clone()).await?;
-        if turn_id != "mock-turn" && !(task.0 == "T-1000" && turn_id == "T-1000-attempt-2") {
+        let sibling_turn_ids = mock_sibling_turn_ids(&task);
+        if turn_id != "mock-turn" && !sibling_turn_ids.contains(&turn_id) {
             return Err(CloudTaskError::Unimplemented("unknown mock turn"));
         }
-        if task.0 == "T-1000" {
-            return Ok(vec![TurnAttempt {
-                turn_id: "T-1000-attempt-2".to_string(),
-                attempt_placement: Some(1),
+        Ok(sibling_turn_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, turn_id)| TurnAttempt {
+                turn_id,
+                attempt_placement: i64::try_from(index + 1).ok(),
                 created_at: Some(fixture_timestamp()),
                 status: AttemptStatus::Completed,
                 diff: Some(mock_diff_for(&task)),
                 messages: vec!["Mock alternate attempt".to_string()],
-            }]);
-        }
-        Ok(Vec::new())
+            })
+            .collect())
     }
 
     async fn validate_apply_input(&self, id: &TaskId, diff: Option<&str>) -> Result<()> {
@@ -230,12 +228,11 @@ impl CloudBackend for MockClient {
         Box::pin(MockClient::get_task_diff(self, id))
     }
 
-    fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>> {
-        Box::pin(MockClient::get_task_messages(self, id))
-    }
-
-    fn get_task_text(&self, id: TaskId) -> CloudBackendFuture<'_, TaskText> {
-        Box::pin(MockClient::get_task_text(self, id))
+    fn get_task_text_and_diff(
+        &self,
+        id: TaskId,
+    ) -> CloudBackendFuture<'_, (TaskText, Option<String>)> {
+        Box::pin(MockClient::get_task_text_and_diff(self, id))
     }
 
     fn apply_task(
@@ -273,6 +270,14 @@ impl CloudBackend for MockClient {
         Box::pin(MockClient::create_task(
             self, env_id, prompt, git_ref, qa_mode, best_of_n,
         ))
+    }
+}
+
+/// Turn ids of a fixture's other best-of-N attempts; the base attempt is always `mock-turn`.
+fn mock_sibling_turn_ids(id: &TaskId) -> Vec<String> {
+    match id.0.as_str() {
+        "T-1000" => vec!["T-1000-attempt-2".to_string()],
+        _ => Vec::new(),
     }
 }
 
@@ -357,10 +362,36 @@ mod tests {
                 );
                 assert!(
                     backend
-                        .get_task_diff(task.id)
+                        .get_task_diff(task.id.clone())
                         .await
                         .expect("diff")
                         .is_some()
+                );
+                // Clients discover best-of-N attempts only through `sibling_turn_ids`, so it
+                // must agree with the listed attempt count and the sibling attempts served.
+                let (text, _) = backend
+                    .get_task_text_and_diff(task.id.clone())
+                    .await
+                    .expect("task text");
+                assert_eq!(
+                    task.attempt_total,
+                    Some(text.sibling_turn_ids.len() + 1),
+                    "{}",
+                    task.id.0
+                );
+                let turn_id = text.turn_id.expect("base attempt turn");
+                let siblings = backend
+                    .list_sibling_attempts(task.id.clone(), turn_id)
+                    .await
+                    .expect("siblings");
+                assert_eq!(
+                    siblings
+                        .into_iter()
+                        .map(|attempt| attempt.turn_id)
+                        .collect::<Vec<_>>(),
+                    text.sibling_turn_ids,
+                    "{}",
+                    task.id.0
                 );
             }
         }
@@ -406,8 +437,7 @@ mod tests {
         let id = TaskId("unknown".into());
         assert!(backend.get_task_summary(id.clone()).await.is_err());
         assert!(backend.get_task_diff(id.clone()).await.is_err());
-        assert!(backend.get_task_messages(id.clone()).await.is_err());
-        assert!(backend.get_task_text(id.clone()).await.is_err());
+        assert!(backend.get_task_text_and_diff(id.clone()).await.is_err());
         assert!(
             backend
                 .list_sibling_attempts(id.clone(), "mock-turn".into())

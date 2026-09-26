@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::common;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
+use crate::engine::ScopedRunGate;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
@@ -75,9 +76,14 @@ pub(crate) fn plan(
     PostToolUsePlan { matched }
 }
 
-pub(crate) fn preview(plan: &PostToolUsePlan, tool_use_id: &str) -> Vec<HookRunSummary> {
+pub(crate) fn preview(
+    plan: &PostToolUsePlan,
+    tool_use_id: &str,
+    gate: &ScopedRunGate<'_>,
+) -> Vec<HookRunSummary> {
     plan.matched
         .iter()
+        .filter(|handler| gate.admits(handler))
         .map(|handler| {
             common::hook_run_for_tool_use(dispatcher::running_summary(handler), tool_use_id)
         })
@@ -88,8 +94,10 @@ pub(crate) async fn run(
     plan: PostToolUsePlan,
     shell: &CommandShell,
     request: PostToolUseRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> PostToolUseOutcome {
-    let matched = plan.matched;
+    let mut matched = plan.matched;
+    matched.retain(|handler| gate.claim(handler));
     if matched.is_empty() {
         return PostToolUseOutcome {
             hook_events: Vec::new(),
@@ -334,6 +342,7 @@ mod tests {
     use super::plan;
     use super::preview;
     use crate::engine::ConfiguredHandler;
+    use crate::engine::ScopedRunGate;
     use crate::engine::command_runner::CommandRunResult;
     use crate::events::common;
 
@@ -540,7 +549,7 @@ mod tests {
     fn preview_and_completed_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-456");
         let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
-        let runs = preview(&plan, &request.tool_use_id);
+        let runs = preview(&plan, &request.tool_use_id, &ScopedRunGate::unscoped());
 
         assert_eq!(runs.len(), 1);
         assert_eq!(
@@ -565,7 +574,7 @@ mod tests {
     fn serialization_failure_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-456");
         let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
-        let runs = preview(&plan, &request.tool_use_id);
+        let runs = preview(&plan, &request.tool_use_id, &ScopedRunGate::unscoped());
 
         let completed = common::serialization_failure_hook_events_for_tool_use(
             vec![handler()],
@@ -583,9 +592,10 @@ mod tests {
         let request = request_for_tool_use("tool-call-456");
         let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
 
+        let gate = ScopedRunGate::unscoped();
         assert_eq!(plan.matched.len(), 1);
-        assert_eq!(preview(&plan, &request.tool_use_id).len(), 1);
-        assert_eq!(preview(&plan, "another-call").len(), 1);
+        assert_eq!(preview(&plan, &request.tool_use_id, &gate).len(), 1);
+        assert_eq!(preview(&plan, "another-call", &gate).len(), 1);
     }
 
     fn handler() -> ConfiguredHandler {

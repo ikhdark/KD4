@@ -1,16 +1,9 @@
-// Shared bootstrap for every `suite` integration target.
+// Shared Windows sandbox helpers for every `suite` integration target.
 //
-// This file is `include!`d (not declared as a module) so each root integration
-// target gets its own copy of the ctor below while the test IDs stay
-// `suite::<module>::<test>`. Keep it free of `mod` declarations: the including
-// target owns the module list it compiles.
-use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
-use codex_exec_server::CODEX_FS_HELPER_ARG1;
-use codex_test_binary_support::TestBinaryDispatchGuard;
-use codex_test_binary_support::TestBinaryDispatchMode;
-use codex_test_binary_support::configure_test_binary_dispatch;
-use ctor::ctor;
-
+// This file is `include!`d (not declared as a module) so the test IDs stay
+// `suite::<module>::<test>`. Arg0 helper dispatch comes from the ctor in
+// `core_test_support`, which every shard links. Keep it free of `mod`
+// declarations: the including target owns the module list it compiles.
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 pub(crate) fn lock_windows_sandbox_tests() -> anyhow::Result<std::fs::File> {
@@ -133,19 +126,3 @@ pub(crate) fn stage_windows_sandbox_helpers_in(
     }
     Ok(())
 }
-
-// This code runs before any other tests are run.
-// It allows the test binary to dispatch to the bundled helper entrypoints.
-// NOTE: this doesn't work on ARM
-#[ctor(unsafe)]
-pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
-    configure_test_binary_dispatch("codex-core-tests", |_exe_name, argv1| {
-        if argv1 == Some(CODEX_CORE_APPLY_PATCH_ARG1) {
-            return TestBinaryDispatchMode::DispatchArg0Only;
-        }
-        if argv1 == Some(CODEX_FS_HELPER_ARG1) {
-            return TestBinaryDispatchMode::DispatchArg0Only;
-        }
-        TestBinaryDispatchMode::InstallAliases
-    })
-};

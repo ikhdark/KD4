@@ -1664,11 +1664,11 @@ async fn registered_exec_minimal_and_explicit_defaults_preserve_process_and_perm
             })
             .await;
             let text = output.body.to_text().expect("process output");
-            assert!(
-                text.contains(&format!("Process exited with code {exit_code}")),
-                "{text}"
-            );
-            let proof = text
+            let result: serde_json::Value = serde_json::from_str(&text).expect("exec result");
+            assert_eq!(result["exit_code"], exit_code, "{text}");
+            let proof = result["output"]
+                .as_str()
+                .expect("child stdout")
                 .lines()
                 .find_map(|line| line.strip_prefix("PROOF="))
                 .expect("child process proof");
@@ -2266,19 +2266,20 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     let model_output = code_mode["output"].as_str().expect("model output");
     assert!(model_output.len() < segment_bytes);
     assert!(!model_output.contains("MIDDLE_MARKER"));
-    assert!(model_output.contains(
-        "[command output reduced; read a bounded selection from the retained output with read_tool_output"
-    ));
+    assert_eq!(code_mode["output_reduced"], true);
+    assert_eq!(code_mode["output_complete"], false);
     let response = output.to_response_item(
         "full-output-artifact",
         &ToolPayload::Function {
             arguments: "{}".to_string(),
         },
     );
-    let rendered = serde_json::to_string(&response).expect("model response");
-    assert!(rendered.contains(
-        "[command output reduced; read a bounded selection from the retained output with read_tool_output"
-    ));
+    let rendered = serde_json::to_value(&response).expect("model response");
+    let direct: serde_json::Value =
+        serde_json::from_str(rendered["output"].as_str().expect("direct output"))
+            .expect("direct exec result");
+    assert_eq!(direct["artifact_id"], artifact_id);
+    assert_eq!(direct["exit_code"], 0);
 }
 
 #[test]
@@ -3118,27 +3119,21 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
     let code_mode = completed.code_mode_result(&payload);
     assert_eq!(code_mode["exit_code"], 0);
     let text = code_mode["output"].as_str().expect("code-mode output");
-    assert!(
-        text.contains(
-            "[command output reduced; read a bounded selection from the retained output with read_tool_output"
-        ),
-        "{text}"
-    );
+    assert_eq!(code_mode["output_reduced"], true);
+    assert_eq!(code_mode["output_complete"], false);
     assert!(!text.contains("stdin-notice-0128"));
     let response =
-        serde_json::to_string(&completed.to_response_item("notice-write_stdin", &payload))
+        serde_json::to_value(&completed.to_response_item("notice-write_stdin", &payload))
             .expect("model response");
-    // The 100-token direct-output budget cannot fit the complete selector notice.
-    // Its documented fallback must retain the artifact ID without a partial instruction.
-    assert!(response.contains("Raw output artifact:"), "{response}");
-    assert!(!response.contains("[command output reduced;"), "{response}");
+    let direct: serde_json::Value =
+        serde_json::from_str(response["output"].as_str().expect("direct output"))
+            .expect("direct stdin result");
     let id = code_mode["raw_output_artifact_id"]
         .as_str()
         .expect("advertised artifact");
-    assert!(
-        response.contains(id),
-        "model recovery notice must retain its artifact ID"
-    );
+    assert_eq!(direct["artifact_id"], id);
+    assert_eq!(direct["exit_code"], 0);
+    assert!(!direct["output"].as_str().unwrap().contains("stdin-notice-0128"));
     let retained = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
         &home, &thread_id, id,
     )
@@ -3438,17 +3433,19 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
             };
             let mut text = output.body.to_text().unwrap();
             if rejection.is_none() {
+                let result: serde_json::Value = serde_json::from_str(&text).unwrap();
                 assert!(
-                    text.contains("Process running with session ID "),
+                    result["session_id"].is_u64() && result.get("exit_code").is_none(),
                     "remote output is intentionally pending: {text}"
                 );
                 read_release
                     .send(())
                     .expect("remote output consumer remains owned");
                 text = tokio::time::timeout(Duration::from_secs(15), async {
-                    while let Some((_, status)) = text.split_once("Process running with session ID ") {
+                    loop {
+                        let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let Some(id) = result["session_id"].as_u64() else { break };
                         assert!(text.contains("remote-declared-scope") && text.contains("unverified"), "running result retains attribution: {text}");
-                        let id = status.split(';').next().unwrap().parse::<u32>().unwrap();
                         let response = runtime.clone().handle_tool_call(
                             crate::tools::router::ToolCall {
                                 tool_name: codex_tools::ToolName::plain("write_stdin"),
@@ -3483,7 +3480,9 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                     "rejected permissions must never launch remotely"
                 );
             } else {
-                assert!(text.contains("Process exited with code 7"), "{text}");
+                let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(result["exit_code"], 7, "{text}");
+                assert!(result.get("session_id").is_none());
                 assert!(text.contains("remote-uri-proof"), "{text}");
                 assert!(text.contains("remote-declared-scope"), "{text}");
                 assert!(text.contains("unverified"), "{text}");
@@ -3664,8 +3663,12 @@ fn registered_shell_analysis_yields_and_preserves_search_results() {
                     } else {
                         assert!(text.contains("2:needle-worker-proof"), "{text}");
                     }
-                    let expected_exit = if tool_name == "shell_command" { "Exit code: 0" } else { "Process exited with code 0" };
-                    assert!(text.contains(expected_exit), "{text}");
+                    if tool_name == "shell_command" {
+                        assert!(text.contains("Exit code: 0"), "{text}");
+                    } else {
+                        let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(result["exit_code"], 0, "{text}");
+                    }
                     if repaired {
                         assert!(text.contains("known_flag_typo"), "{text}");
                     }
@@ -3742,15 +3745,9 @@ async fn registered_exec_declared_validation_survives_yield_and_stdin_completion
         "{text}"
     );
     assert!(text.contains("unverified"), "{text}");
-    let id = text
-        .split_once("Process running with session ID ")
-        .expect("child must yield")
-        .1
-        .split(';')
-        .next()
-        .unwrap()
-        .parse::<u32>()
-        .unwrap();
+    let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let id = result["session_id"].as_u64().expect("child must yield");
+    assert!(result.get("exit_code").is_none());
     tokio::fs::write(&release, b"finish").await.unwrap();
     let settled = tokio::time::timeout(
         Duration::from_secs(15),
@@ -3775,7 +3772,9 @@ async fn registered_exec_declared_validation_survives_yield_and_stdin_completion
     };
     let text = output.body.to_text().unwrap();
     assert!(text.contains("CHILD_FINISHED"), "{text}");
-    assert!(text.contains("Process exited with code 0"), "{text}");
+    let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["exit_code"], 0, "{text}");
+    assert!(result.get("session_id").is_none());
     assert!(
         text.contains("src/declared-only.rs") && text.contains("tests/declared-only.rs"),
         "{text}"
@@ -3793,10 +3792,9 @@ async fn registered_exec_declared_validation_survives_yield_and_stdin_completion
         panic!("normal plain output")
     };
     let text = output.body.to_text().unwrap();
-    assert!(
-        text.contains("PLAIN_CHILD") && text.contains("Process exited with code 0"),
-        "{text}"
-    );
+    let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(result["output"].as_str().unwrap().contains("PLAIN_CHILD"));
+    assert_eq!(result["exit_code"], 0);
     assert!(
         !text.contains("declared-only") && !text.contains("coverage_status"),
         "{text}"

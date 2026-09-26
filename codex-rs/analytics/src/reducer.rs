@@ -99,6 +99,7 @@ use crate::usize_to_u64;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponse;
 use codex_app_server_protocol::CodexErrorInfo;
+use codex_app_server_protocol::CollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
@@ -109,7 +110,10 @@ use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallStatus;
 use codex_app_server_protocol::FileChangeApprovalDecision;
+use codex_app_server_protocol::FileUpdateChange;
+use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::InitializeParams;
+use codex_app_server_protocol::McpToolCallError;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::NetworkPolicyRuleAction;
 use codex_app_server_protocol::PatchApplyStatus;
@@ -1396,6 +1400,15 @@ impl AnalyticsReducer {
                     .turn
                     .completed_at
                     .and_then(|completed_at| u64::try_from(completed_at).ok());
+                // `completed_at` is whole seconds; prefer core's millisecond timing so
+                // abandoned items that started in the final second keep a valid duration.
+                let completed_at_ms = notification
+                    .timing
+                    .as_ref()
+                    .or(notification.turn.timing.as_ref())
+                    .and_then(|timing| timing.completed_at_unix_ms)
+                    .and_then(|milliseconds| u64::try_from(milliseconds).ok())
+                    .or_else(|| completed_at.and_then(|seconds| seconds.checked_mul(1000)));
                 let Some(turn_state) = self.turn_state(&turn_id) else {
                     return;
                 };
@@ -1412,10 +1425,9 @@ impl AnalyticsReducer {
                         .duration_ms
                         .and_then(|duration_ms| u64::try_from(duration_ms).ok()),
                 });
-                if let (Some(terminal_status), Some(completed_at_ms)) = (
-                    abandoned_tool_status,
-                    completed_at.and_then(|seconds| seconds.checked_mul(1000)),
-                ) {
+                if let (Some(terminal_status), Some(completed_at_ms)) =
+                    (abandoned_tool_status, completed_at_ms)
+                {
                     self.emit_abandoned_tool_items(
                         &thread_id,
                         &turn_id,
@@ -1882,6 +1894,168 @@ pub(crate) fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
         | ThreadItem::ExitedReviewMode { .. }
         | ThreadItem::ContextCompaction { .. } => None,
     }
+}
+
+/// Copies a tracked tool item for queueing, or returns `None` for untracked items.
+/// Payloads the reducer never reads (command output, MCP arguments and results,
+/// dynamic tool content, collab prompts and agent messages, per-file diffs, and
+/// generated images) can each reach megabytes; queued facts must not retain them.
+pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
+    Some(match item {
+        ThreadItem::CommandExecution {
+            id,
+            cwd,
+            source,
+            status,
+            command_actions,
+            exit_code,
+            duration_ms,
+            ..
+        } => ThreadItem::CommandExecution {
+            id: id.clone(),
+            command: String::new(),
+            cwd: cwd.clone(),
+            process_id: None,
+            parent_call_id: None,
+            parent_cell_id: None,
+            runtime_tool_call_id: None,
+            execution_id: None,
+            source: *source,
+            status: status.clone(),
+            command_actions: command_actions.clone(),
+            aggregated_output: None,
+            exit_code: *exit_code,
+            duration_ms: *duration_ms,
+        },
+        ThreadItem::FileChange {
+            id,
+            changes,
+            status,
+        } => ThreadItem::FileChange {
+            id: id.clone(),
+            changes: changes
+                .iter()
+                .map(|change| FileUpdateChange {
+                    path: String::new(),
+                    kind: change.kind.clone(),
+                    diff: String::new(),
+                })
+                .collect(),
+            status: status.clone(),
+        },
+        ThreadItem::McpToolCall {
+            id,
+            server,
+            tool,
+            status,
+            plugin_id,
+            error,
+            duration_ms,
+            ..
+        } => ThreadItem::McpToolCall {
+            id: id.clone(),
+            server: server.clone(),
+            tool: tool.clone(),
+            status: status.clone(),
+            arguments: serde_json::Value::Null,
+            app_context: None,
+            mcp_app_resource_uri: None,
+            plugin_id: plugin_id.clone(),
+            result: None,
+            error: error.as_ref().map(|_| McpToolCallError {
+                message: String::new(),
+            }),
+            duration_ms: *duration_ms,
+        },
+        ThreadItem::DynamicToolCall {
+            id,
+            tool,
+            status,
+            content_items,
+            success,
+            duration_ms,
+            ..
+        } => ThreadItem::DynamicToolCall {
+            id: id.clone(),
+            namespace: None,
+            tool: tool.clone(),
+            arguments: serde_json::Value::Null,
+            status: status.clone(),
+            content_items: content_items.as_ref().map(|items| {
+                items
+                    .iter()
+                    .map(|item| match item {
+                        DynamicToolCallOutputContentItem::InputText { .. } => {
+                            DynamicToolCallOutputContentItem::InputText {
+                                text: String::new(),
+                            }
+                        }
+                        DynamicToolCallOutputContentItem::InputImage { .. } => {
+                            DynamicToolCallOutputContentItem::InputImage {
+                                image_url: String::new(),
+                            }
+                        }
+                    })
+                    .collect()
+            }),
+            success: *success,
+            error: None,
+            duration_ms: *duration_ms,
+        },
+        ThreadItem::CollabAgentToolCall {
+            id,
+            tool,
+            status,
+            sender_thread_id,
+            receiver_thread_ids,
+            model,
+            reasoning_effort,
+            agents_states,
+            ..
+        } => ThreadItem::CollabAgentToolCall {
+            id: id.clone(),
+            tool: tool.clone(),
+            status: status.clone(),
+            sender_thread_id: sender_thread_id.clone(),
+            receiver_thread_ids: receiver_thread_ids.clone(),
+            prompt: None,
+            model: model.clone(),
+            reasoning_effort: reasoning_effort.clone(),
+            agents_states: agents_states
+                .iter()
+                .map(|(thread_id, state)| {
+                    (
+                        thread_id.clone(),
+                        CollabAgentState {
+                            status: state.status.clone(),
+                            message: None,
+                            surfaced_result: None,
+                            last_agent_message: None,
+                        },
+                    )
+                })
+                .collect(),
+        },
+        ThreadItem::WebSearch(item) => ThreadItem::WebSearch(item.clone()),
+        ThreadItem::ImageGeneration(item) => ThreadItem::ImageGeneration(ImageGenerationItem {
+            id: item.id.clone(),
+            status: item.status.clone(),
+            revised_prompt: item.revised_prompt.as_ref().map(|_| String::new()),
+            result: String::new(),
+            saved_path: item.saved_path.clone(),
+        }),
+        ThreadItem::UserMessage { .. }
+        | ThreadItem::HookPrompt { .. }
+        | ThreadItem::AgentMessage { .. }
+        | ThreadItem::Plan { .. }
+        | ThreadItem::Reasoning { .. }
+        | ThreadItem::SubAgentActivity { .. }
+        | ThreadItem::ImageView { .. }
+        | ThreadItem::Sleep { .. }
+        | ThreadItem::EnteredReviewMode { .. }
+        | ThreadItem::ExitedReviewMode { .. }
+        | ThreadItem::ContextCompaction { .. } => return None,
+    })
 }
 
 fn item_review_summary_key(pending_review: &PendingReviewState) -> Option<ToolItemKey> {

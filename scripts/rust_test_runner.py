@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import filecmp
 import fnmatch
 import json
 import math
@@ -42,6 +43,10 @@ SCHEMA_VERSION = 1
 # and `scripts/rust_build_status.py`.
 RUST_MIN_STACK_BYTES = "8388608"
 MAX_FAILURE_STREAM_CHARS = 4096
+
+# Windows sandbox helpers that sandbox code locates by file name rather than
+# through `CARGO_BIN_EXE_*`.
+WINDOWS_RESOURCE_HELPERS = ("codex-windows-sandbox-setup", "codex-command-runner")
 
 
 class RunnerError(RuntimeError):
@@ -438,8 +443,6 @@ def _stdout_text(result: subprocess.CompletedProcess[str]) -> str:
 
 def _stop_process_tree(process: subprocess.Popen) -> None:
     if getattr(process, "_codex_owned_job", None) is not None:
-        import time
-
         process._codex_owned_job.stop(time.monotonic() + 15)
     elif os.name == "nt":
         subprocess.run(
@@ -599,6 +602,50 @@ def current_platform() -> str:
     return "linux"
 
 
+def _nextest_binary_id(target: Target) -> str:
+    """The binary ID nextest reports for the target's test binary."""
+    if target.selector_kind == "lib":
+        return target.package
+    suffix = (
+        f"bin/{target.selector_value}"
+        if target.selector_kind == "bin"
+        else target.selector_value
+    )
+    return f"{target.package}::{suffix}"
+
+
+def _exact_test_ids(args: Sequence[str]) -> list[str] | None:
+    """IDs an exact `-E 'test(=ID) | ...'` selection can reach, else None.
+
+    Nextest unions filtersets, and the remaining filtering options only narrow
+    that union. Name filters and libtest arguments need discovery instead.
+    """
+    ids: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in {"-E", "--filterset"}:
+            expression = args[index + 1]
+            index += 2
+        elif token.startswith("--filterset="):
+            expression = token.split("=", 1)[1]
+            index += 1
+        elif token == "--run-ignored":
+            index += 2
+            continue
+        elif token.startswith("-") and token != "--":
+            index += 1
+            continue
+        else:
+            return None
+        for term in expression.split("|"):
+            match = re.fullmatch(r"\s*test\(=([^()\s]+)\)\s*", term)
+            if match is None:
+                return None
+            ids.append(match[1])
+    return ids or None
+
+
 class RustTestRunner:
     def __init__(
         self,
@@ -743,7 +790,8 @@ class RustTestRunner:
                 "target_dir": str(self.target_dir),
                 "selection": target.selection_args(),
                 "helpers": [helper.name for helper in helpers],
-                "helper_selection": "upper bound; nextest discovery narrows helpers"
+                "helper_selection": "upper bound; exact test(=ID) filters or "
+                "nextest discovery narrow helpers"
                 if target.helpers_by_test_prefix
                 else "exact",
                 "discovery_builds_test_binary": bool(target.helpers_by_test_prefix),
@@ -757,21 +805,26 @@ class RustTestRunner:
                 helper for step in grouped for helper in step.helpers or ()
             )
             steps = []
-            for step in grouped:
-                target = self.target(step.target)
-                filter_args = self._gate_filter_args(step)
-                steps.append(
-                    {
-                        "target": step.target,
-                        "tests": list(step.tests),
-                        "helpers": list(step.helpers or ()),
-                        "list": self._list_command(target, filter_args),
-                        "run": self._gate_run_command(
-                            target,
-                            ["-E", " | ".join(f"test(={test})" for test in step.tests)],
-                        ),
-                    }
+            for batch in self._gate_batches(grouped):
+                targets = [self.target(step.target) for step in batch]
+                # Steps of one batch share the invocation that proves them.
+                run = self._gate_run_command(
+                    targets[0],
+                    self._batch_filter_args(targets, batch),
+                    batch=targets[1:],
                 )
+                for target, step in zip(targets, batch):
+                    steps.append(
+                        {
+                            "target": step.target,
+                            "tests": list(step.tests),
+                            "helpers": list(step.helpers or ()),
+                            "list": self._list_command(
+                                target, self._gate_filter_args(step)
+                            ),
+                            "run": run,
+                        }
+                    )
             return {
                 "kind": "gate",
                 "name": name,
@@ -806,19 +859,23 @@ class RustTestRunner:
                 + json.dumps(self.environment_updates, sort_keys=True),
                 file=sys.stderr,
             )
-        # Discovery is worthwhile only if some prefix can omit an active helper.
+        # Narrowing is worthwhile only if some prefix can omit an active helper.
         # Otherwise the direct run already rejects an empty selection.
         if any(
             len(self._active_helper_names(names)) < len(helpers)
             for names in target.helpers_by_test_prefix.values()
         ):
-            # Let nextest interpret filters, exclusions and ignored tests. Listing
-            # builds the unit binary without building unrelated helper binaries.
-            print(
-                "Selecting tests with nextest list (this compiles the test binary).",
-                file=sys.stderr,
-            )
-            selected = self._list_tests(target, args)
+            # Exact IDs already bound the selection, so their helpers need no
+            # discovery invocation; an ID the run cannot select only adds helpers.
+            selected = _exact_test_ids(args)
+            if selected is None:
+                # Let nextest interpret filters, exclusions and ignored tests.
+                # Listing builds the unit binary without unrelated helpers.
+                print(
+                    "Selecting tests with nextest list (this compiles the test binary).",
+                    file=sys.stderr,
+                )
+                selected = self._list_tests(target, args)
             required = []
             for test in selected:
                 required.extend(
@@ -902,54 +959,65 @@ class RustTestRunner:
             )
         )
         failures: list[RunnerError] = []
-        for step in grouped:
-            target = self.target(step.target)
+        for batch in self._gate_batches(grouped):
+            targets = [self.target(step.target) for step in batch]
             env = self._helper_environment(
-                [target], self._active_helper_names(step.helpers or ()), artifacts
+                targets, self._active_helper_names(batch[0].helpers or ()), artifacts
             )
-            filter_args = ["-E", " | ".join(f"test(={test})" for test in step.tests)]
             try:
                 result = self._checked(
-                    self._gate_run_command(target, filter_args),
+                    self._gate_run_command(
+                        targets[0],
+                        self._batch_filter_args(targets, batch),
+                        batch=targets[1:],
+                    ),
                     env=env,
                     capture=CAPTURE_BOTH,
                 )
             except RunnerError as error:
                 if error.outcome in {"cancelled", "timed_out", "cleanup_failed"}:
-                    raise
+                    if not failures:
+                        raise
+                    # Gate runs capture their output, so an earlier group's
+                    # failure is reported nowhere else; the stop keeps its outcome.
+                    raise RunnerError(
+                        f"{error}\ngate runs that failed before the stop:\n"
+                        + "\n".join(str(failure) for failure in failures),
+                        outcome=error.outcome,
+                    ) from error
                 failures.append(error)
                 continue
             # Require completed per-test results from this execution, not just
             # a successful exit or discovery. Suppress summary repetitions and
             # unrelated filtered-out skips, and disallow retries for this proof.
-            passed: dict[str, int] = {}
+            # Each result must come from the binary of the step declaring it.
+            expected = {
+                _nextest_binary_id(target): set(step.tests)
+                for target, step in zip(targets, batch)
+            }
+            passed: dict[tuple[str, str], int] = {}
             unexpected = False
-            expected = set(step.tests)
-            suffix = (
-                f"bin/{target.selector_value}"
-                if target.selector_kind == "bin"
-                else target.selector_value
-            )
-            expected_binary = (
-                target.package
-                if target.selector_kind == "lib"
-                else f"{target.package}::{suffix}"
-            )
             for stream in ("stdout", "stderr"):
                 for line in _output_lines(result, stream):
+                    # Nextest reports a passing test that leaked handles as
+                    # LEAK; LEAK-FAIL does not match and fails the run.
                     match = re.fullmatch(
-                        r"\s*PASS\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
+                        r"\s*(?:PASS|LEAK)\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
                         line,
                     )
                     if match:
                         binary, test = match.groups()
-                        if binary == expected_binary and test in expected:
-                            passed[test] = min(2, passed.get(test, 0) + 1)
+                        if test in expected.get(binary, ()):
+                            key = (binary, test)
+                            passed[key] = min(2, passed.get(key, 0) + 1)
                         else:
                             unexpected = True
+            required = {
+                (binary, test) for binary, tests in expected.items() for test in tests
+            }
             if (
                 unexpected
-                or set(passed) != expected
+                or set(passed) != required
                 or any(count != 1 for count in passed.values())
             ):
                 if not quiet:
@@ -957,15 +1025,19 @@ class RustTestRunner:
                 # `--status-level pass` hides SKIP lines and `--no-tests=fail`
                 # fails an empty run before this point, so a missing or ignored
                 # test is only known as not executed; `check-gates` names it.
+                steps = ", ".join(repr(step.target) for step in batch)
+                reported = {f"{binary} {test}": n for (binary, test), n in passed.items()}
                 failures.append(
                     RunnerError(
-                        f"gate {step.target!r} did not report every required test passed exactly once: "
-                        f"expected={sorted(step.tests)}, passed={passed}, unexpected={unexpected}",
+                        f"gate {steps} did not report every required test passed exactly once: "
+                        f"expected={sorted(f'{binary} {test}' for binary, test in required)}, "
+                        f"passed={reported}, unexpected={unexpected}",
                         outcome="not_executed",
                     )
                 )
             elif not quiet:
-                print(f"gate {step.target}: {len(passed)} passed")
+                for step in batch:
+                    print(f"gate {step.target}: {len(step.tests)} passed")
         if failures:
             outcomes = {error.outcome for error in failures}
             raise RunnerError(
@@ -980,156 +1052,62 @@ class RustTestRunner:
             for name in dict.fromkeys(names)
         }
 
-    def parity(self, legacy_name: str, replacement_names: Sequence[str]) -> None:
-        if not replacement_names:
-            raise RunnerError("parity requires at least one replacement target")
-        legacy = self.target(legacy_name)
-        replacements = [self.target(name) for name in replacement_names]
-        if legacy_name in replacement_names:
-            raise RunnerError("legacy target cannot also be a replacement target")
-        _reject_duplicates(list(replacement_names), "parity replacement targets")
-
-        parity_list_args = ["--ignore-default-filter", "--run-ignored", "all"]
-        legacy_tests = self._list_tests(legacy, parity_list_args)
-        replacement_tests: dict[str, bool] = {}
-        duplicates: list[str] = []
-        for replacement in replacements:
-            for test_id, ignored in self._list_tests(
-                replacement, parity_list_args
-            ).items():
-                if test_id in replacement_tests:
-                    duplicates.append(test_id)
-                else:
-                    replacement_tests[test_id] = ignored
-        if duplicates:
-            raise RunnerError(
-                "replacement targets contain duplicate canonical test IDs: "
-                + ", ".join(sorted(set(duplicates)))
-            )
-
-        legacy_ids = set(legacy_tests)
-        replacement_ids = set(replacement_tests)
-        missing = sorted(legacy_ids - replacement_ids)
-        added = sorted(replacement_ids - legacy_ids)
-        ignored_changes = sorted(
-            test_id
-            for test_id in legacy_ids & replacement_ids
-            if legacy_tests[test_id] != replacement_tests[test_id]
-        )
-        if missing or added or ignored_changes:
-            raise RunnerError(
-                "legacy/replacement parity mismatch: "
-                f"missing={missing}, additions={added}, ignored_state_changes={ignored_changes}"
-            )
-
-        helpers = self.active_helpers([legacy_name, *replacement_names])
-        env = self._helper_environment(
-            [legacy, *replacements], helpers, self._build_helpers(helpers)
-        )
-        legacy_env = dict(env)
-        legacy_env["INSTA_UPDATE"] = "no"
-        replacement_env = dict(env)
-        replacement_env["INSTA_UPDATE"] = "no"
-        behavior_args = [
-            "--ignore-default-filter",
-            "--no-fail-fast",
-            "--retries",
-            "0",
-            "--run-ignored",
-            "default",
-        ]
-        behavior_runs = [
-            (legacy, legacy_env),
-            *((replacement, replacement_env) for replacement in replacements),
-        ]
-        failed_runs: list[str] = []
-        for target, run_env in behavior_runs:
-            command = self._run_command(target, behavior_args, internal_args=True)
-            result = self._execute(command, env=run_env, capture=CAPTURE_NONE)
-            if result.returncode != 0:
-                detail = self._failure_detail(result)
-                rendered = subprocess.list2cmdline(command)
-                failed_runs.append(
-                    f"{target.name}: {rendered}" + (f"\n{detail}" if detail else "")
-                )
-        if failed_runs:
-            raise RunnerError(
-                "parity behavior runs failed after executing every target:\n"
-                + "\n".join(failed_runs)
-            )
-        self._assert_snapshot_parity(legacy, replacements)
-
-    @staticmethod
-    def _assert_snapshot_parity(legacy: Target, replacements: Sequence[Target]) -> None:
-        if legacy.package != "codex-core" or legacy.selector_kind != "test":
-            return
-
-        snapshots_dir = CODEX_RS_ROOT / "core" / "tests" / "suite" / "snapshots"
-        legacy_prefix = f"{legacy.selector_value}__"
-        legacy_snapshots = {
-            path.name.removeprefix(legacy_prefix): path
-            for path in snapshots_dir.glob(f"{legacy_prefix}*.snap")
-        }
-        if not legacy_snapshots:
-            return
-
-        replacements_by_suffix: dict[str, list[Path]] = {}
-        for replacement in replacements:
-            if (
-                replacement.package != legacy.package
-                or replacement.selector_kind != "test"
-            ):
-                continue
-            replacement_prefix = f"{replacement.selector_value}__"
-            for path in snapshots_dir.glob(f"{replacement_prefix}*.snap"):
-                suffix = path.name.removeprefix(replacement_prefix)
-                replacements_by_suffix.setdefault(suffix, []).append(path)
-
-        missing = sorted(set(legacy_snapshots) - set(replacements_by_suffix))
-        additions = sorted(set(replacements_by_suffix) - set(legacy_snapshots))
-        duplicates = sorted(
-            suffix for suffix, paths in replacements_by_suffix.items() if len(paths) > 1
-        )
-        mismatched = sorted(
-            suffix
-            for suffix, legacy_path in legacy_snapshots.items()
-            if len(replacements_by_suffix.get(suffix, [])) == 1
-            and RustTestRunner._snapshot_semantics(legacy_path)
-            != RustTestRunner._snapshot_semantics(replacements_by_suffix[suffix][0])
-        )
-        if missing or additions or duplicates or mismatched:
-            raise RunnerError(
-                "legacy/replacement snapshot parity mismatch: "
-                f"missing={missing}, additions={additions}, "
-                f"duplicates={duplicates}, content_changes={mismatched}"
-            )
-
-    @staticmethod
-    def _snapshot_semantics(path: Path) -> str:
-        text = path.read_text(encoding="utf-8")
-        if not text.startswith("---\n"):
-            return text
-        header, separator, body = text[4:].partition("\n---\n")
-        if not separator:
-            return text
-        # A shard can move its source file. Retain expression, info, and the
-        # complete approved payload; only source-location metadata is incidental.
-        header = "\n".join(
-            line for line in header.splitlines() if not line.startswith("source:")
-        )
-        return f"---\n{header}\n---\n{body}"
-
     def _gate_filter_args(self, step: GateStep) -> list[str]:
         expression = step.filterset or " | ".join(
             f"test(={test})" for test in step.tests
         )
         return ["-E", expression]
 
-    def _gate_run_command(
-        self, target: Target, filter_args: Sequence[str]
+    def _gate_batches(self, grouped: Sequence[GateStep]) -> list[list[GateStep]]:
+        """Share one nextest invocation among compatible grouped steps.
+
+        Cargo resolves one package's test features identically for each of its
+        test targets, so steps of one package with the same helper set run in a
+        single invocation: one metadata and build pass whose graph compiles
+        their test binaries together. Integration tests also receive their
+        package's own binaries, so they batch only with each other.
+        """
+        batches: dict[tuple[str, frozenset[str], bool], list[GateStep]] = {}
+        for step in grouped:
+            target = self.target(step.target)
+            key = (
+                target.package,
+                frozenset(step.helpers or ()),
+                target.selector_kind == "test",
+            )
+            batches.setdefault(key, []).append(step)
+        return list(batches.values())
+
+    @staticmethod
+    def _batch_filter_args(
+        targets: Sequence[Target], steps: Sequence[GateStep]
     ) -> list[str]:
+        def exact(step: GateStep) -> str:
+            return " | ".join(f"test(={test})" for test in step.tests)
+
+        if len(steps) == 1:
+            return ["-E", exact(steps[0])]
+        # Qualify each step's IDs by binary so a same-named test in a sibling
+        # binary of the batch is never selected.
         return [
-            *self._run_command(target, filter_args),
+            "-E",
+            " | ".join(
+                f"(binary_id(={_nextest_binary_id(target)}) & ({exact(step)}))"
+                for target, step in zip(targets, steps)
+            ),
+        ]
+
+    def _gate_run_command(
+        self,
+        target: Target,
+        filter_args: Sequence[str],
+        *,
+        batch: Sequence[Target] = (),
+    ) -> list[str]:
+        # The proof owns its execution policy: no profile may let one failing
+        # test cancel another step's tests, least of all in a shared batch.
+        return [
+            *self._run_command(target, filter_args, no_fail_fast=True, batch=batch),
             "--color",
             "never",
             "--status-level",
@@ -1140,7 +1118,10 @@ class RustTestRunner:
             "0",
         ]
 
-    def _selection_command(self, verb: str, target: Target) -> list[str]:
+    def _selection_command(
+        self, verb: str, target: Target, *batch: Target
+    ) -> list[str]:
+        # Batched targets share `target`'s package and add only their selector.
         return [
             "cargo",
             "nextest",
@@ -1148,6 +1129,7 @@ class RustTestRunner:
             "--target-dir",
             str(self.target_dir),
             *target.selection_args(),
+            *(arg for other in batch for arg in other.selection_args()[2:]),
         ]
 
     def _list_command(self, target: Target, filter_args: Sequence[str]) -> list[str]:
@@ -1158,15 +1140,13 @@ class RustTestRunner:
         target: Target,
         filter_args: Sequence[str],
         *,
-        internal_args: bool = False,
         no_fail_fast: bool | None = None,
+        batch: Sequence[Target] = (),
     ) -> list[str]:
-        args = (
-            list(filter_args) if internal_args else validate_filtering_args(filter_args)
-        )
+        args = validate_filtering_args(filter_args)
         keep_going = self.no_fail_fast if no_fail_fast is None else no_fail_fast
         return [
-            *self._selection_command("run", target),
+            *self._selection_command("run", target, *batch),
             "--no-tests=fail",
             "--show-progress",
             "none",
@@ -1177,13 +1157,20 @@ class RustTestRunner:
         ]
 
     def _helper_build(self, helpers: Sequence[Helper]) -> list[str] | None:
-        # Active helpers share this runner's profile, features and target lane,
-        # and Cargo resolves `--bin` across every selected package. One
-        # invocation keeps the exact selected binary set while paying a single
-        # dependency-graph resolution instead of one per helper package.
+        # Cargo unifies dependency features across every `-p` package, so a
+        # scope of only the selected helpers' packages compiles a separate
+        # feature variant of a helper's dependency graph for each combination
+        # of helpers. Resolve against every active helper package instead: each
+        # helper keeps one variant that every run reuses, and `--bin` still
+        # builds exactly the selected binaries in a single invocation.
         if not helpers:
             return None
-        packages = list(dict.fromkeys(helper.package for helper in helpers))
+        packages = dict.fromkeys(
+            helper.package
+            for helper in self.manifest.helpers.values()
+            if helper.platform in (None, self.platform)
+            and helper.package in self.metadata.packages
+        )
         return [
             "cargo",
             "build",
@@ -1223,20 +1210,10 @@ class RustTestRunner:
         if command is None:
             return {}
         result = self._checked(command, env=self.base_env, capture=CAPTURE_STDOUT)
-        artifacts: dict[str, Path] = {}
-        for helper in helpers:
-            executable = self._helper_artifact(helper, _output_lines(result, "stdout"))
-            artifacts[helper.name] = executable
-            # Test executables resolve bundled helpers before consulting PATH.
-            # Refresh that generated layout after every helper build as well.
-            if os.name == "nt" and helper.binary in {
-                "codex-windows-sandbox-setup",
-                "codex-command-runner",
-            }:
-                resources = executable.parent / "deps" / "codex-resources"
-                resources.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(executable, resources / executable.name)
-        return artifacts
+        return {
+            helper.name: self._helper_artifact(helper, _output_lines(result, "stdout"))
+            for helper in helpers
+        }
 
     def _helper_environment(
         self,
@@ -1260,18 +1237,64 @@ class RustTestRunner:
                 )
                 env[f"CARGO_BIN_EXE_{helper.binary}"] = undeclared
                 env[f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"] = undeclared
-        helper_dirs: list[str] = []
         for helper in helpers:
             executable = artifacts[helper.name]
-            if str(executable.parent) not in helper_dirs:
-                helper_dirs.append(str(executable.parent))
             env[f"CARGO_BIN_EXE_{helper.binary}"] = str(executable)
             env[f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"] = str(executable)
-        if helper_dirs:
+        resource_dirs = self._stage_windows_resources(helpers, artifacts)
+        if resource_dirs:
             # Native sandbox setup also locates helpers by executable name. Prefer
-            # this build over an older installed executable inherited through PATH.
-            env["PATH"] = os.pathsep.join([*helper_dirs, env.get("PATH", "")])
+            # this build over an older installed executable inherited through PATH
+            # without exposing the other binaries an earlier build left in the lane.
+            env["PATH"] = os.pathsep.join(
+                [*map(str, resource_dirs), env.get("PATH", "")]
+            )
         return env
+
+    def _stage_windows_resources(
+        self, helpers: Sequence[Helper], artifacts: Mapping[str, Path]
+    ) -> list[Path]:
+        """Mirror exactly the selected sandbox helpers beside test executables.
+
+        Windows sandbox code resolves these helpers in `codex-resources` next to
+        the running test binary before it consults PATH. That directory persists
+        in the lane, so a copy staged by an earlier run would otherwise satisfy
+        an undeclared helper or outlive a rebuild.
+        """
+        if self.platform != "windows":
+            return []
+        selected = {
+            helper.binary: artifacts[helper.name]
+            for helper in helpers
+            if helper.binary in WINDOWS_RESOURCE_HELPERS
+        }
+        resource_dirs = list(
+            dict.fromkeys(
+                profile_dir / "deps" / "codex-resources"
+                for profile_dir in (
+                    self.target_dir / "debug",
+                    *(executable.parent for executable in selected.values()),
+                )
+            )
+        )
+        for resources in resource_dirs:
+            for binary in WINDOWS_RESOURCE_HELPERS:
+                staged = resources / f"{binary}.exe"
+                source = selected.get(binary)
+                try:
+                    if source is None:
+                        staged.unlink(missing_ok=True)
+                    elif not staged.is_file() or not filecmp.cmp(
+                        source, staged, shallow=False
+                    ):
+                        resources.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, staged)
+                except OSError as exc:
+                    action = "remove undeclared" if source is None else "stage"
+                    raise RunnerError(
+                        f"cannot {action} Windows helper {staged}: {exc}"
+                    ) from exc
+        return resource_dirs if selected else []
 
     def _helper_artifact(self, helper: Helper, output: str | Iterable[str]) -> Path:
         expected_package_id = self.metadata.package_id(helper.package)
@@ -1837,9 +1860,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_target.add_argument("filter_args", nargs=argparse.REMAINDER)
     run_gate = subparsers.add_parser("run-gate", parents=[run_options])
     run_gate.add_argument("names", nargs="+")
-    parity = subparsers.add_parser("parity", parents=[run_options])
-    parity.add_argument("legacy_target")
-    parity.add_argument("replacement_targets", nargs="+")
     guard = subparsers.add_parser(
         "_guard-generic", aliases=["guard-args"], help=argparse.SUPPRESS
     )
@@ -1936,8 +1956,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner.run_target(args.name, filter_args, allow_all=allow_all)
         elif args.command == "run-gate":
             runner.run_gates(args.names)
-        elif args.command == "parity":
-            runner.parity(args.legacy_target, args.replacement_targets)
         else:  # pragma: no cover - argparse enforces the command set.
             raise RunnerError(f"unsupported command {args.command!r}")
     except RunnerError as exc:

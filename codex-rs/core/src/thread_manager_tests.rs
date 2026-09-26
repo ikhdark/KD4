@@ -2055,7 +2055,7 @@ fn resumed_rollout_reports_only_explicitly_unfinished_turns() {
                 timing: None,
             },
         )),
-        started.clone(),
+        started,
         RolloutItem::ResponseItem(user_msg("now do it.")),
         request.clone(),
     ];
@@ -2080,7 +2080,7 @@ fn resumed_rollout_reports_only_explicitly_unfinished_turns() {
     )));
     assert_eq!(resumed_rollout_unfinished_turn(&completed), None);
 
-    let mut interrupted = unfinished.clone();
+    let mut interrupted = unfinished;
     interrupted.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
         TurnAbortedEvent {
             turn_id: Some("turn-2".to_string()),

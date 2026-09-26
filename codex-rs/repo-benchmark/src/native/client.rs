@@ -192,11 +192,13 @@ impl NativeClient {
     }
 
     fn receive_before(&mut self, until: Instant) -> Result<Option<Value>> {
-        let remaining = self
-            .deadline
-            .min(until)
-            .checked_duration_since(Instant::now())
-            .ok_or(DeadlineExpired)?;
+        let now = Instant::now();
+        if self.deadline < now {
+            return Err(DeadlineExpired.into());
+        }
+        // A short poll window that elapsed before this call is an empty poll,
+        // not an expired attempt; only the attempt deadline classifies a timeout.
+        let remaining = self.deadline.min(until).saturating_duration_since(now);
         let event = match self.incoming.recv_timeout(remaining) {
             Ok(event) => event?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -290,8 +292,12 @@ impl NativeClient {
                     "commandExecution"
                         | "dynamicToolCall"
                         | "mcpToolCall"
+                        | "collabAgentToolCall"
                         | "fileChange"
                         | "webSearch"
+                        | "imageView"
+                        | "imageGeneration"
+                        | "sleep"
                         | "toolCall"
                 );
                 if method == "item/completed"

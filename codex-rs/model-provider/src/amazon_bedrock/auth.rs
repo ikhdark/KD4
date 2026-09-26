@@ -5,6 +5,7 @@ use codex_api::AuthProvider;
 use codex_api::SharedAuthProvider;
 use codex_aws_auth::AwsAuthContext;
 use codex_aws_auth::AwsAuthError;
+use codex_aws_auth::AwsCredentialsCache;
 use codex_aws_auth::AwsRequestToSign;
 use codex_http_client::Request;
 use codex_http_client::RequestBody;
@@ -33,6 +34,7 @@ pub(super) enum BedrockAuthMethod {
 pub(super) async fn resolve_auth_method(
     managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,
+    aws_credentials: &AwsCredentialsCache,
 ) -> Result<BedrockAuthMethod> {
     if let Some(managed_auth) = managed_auth {
         return Ok(BedrockAuthMethod::ManagedBearerToken {
@@ -47,7 +49,7 @@ pub(super) async fn resolve_auth_method(
     }
 
     let config = aws_auth_config(aws);
-    let context = AwsAuthContext::load(config)
+    let context = AwsAuthContext::load(config, aws_credentials.clone())
         .await
         .map_err(aws_auth_error_to_codex_error)?;
     Ok(BedrockAuthMethod::AwsSdkAuth { context })
@@ -56,8 +58,9 @@ pub(super) async fn resolve_auth_method(
 pub(super) async fn resolve_provider_auth(
     managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,
+    aws_credentials: &AwsCredentialsCache,
 ) -> Result<SharedAuthProvider> {
-    Ok(resolve_auth_method(managed_auth, aws)
+    Ok(resolve_auth_method(managed_auth, aws, aws_credentials)
         .await?
         .into_provider())
 }

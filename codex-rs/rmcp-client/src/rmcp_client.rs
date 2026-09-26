@@ -633,7 +633,6 @@ impl RmcpClient {
         params: Option<PaginatedRequestParams>,
         timeout: Option<Duration>,
     ) -> Result<ListToolsResult> {
-        self.refresh_oauth_if_needed().await;
         let result = self
             .run_service_operation("tools/list", timeout, move |service, tracker| {
                 let request = params
@@ -708,7 +707,6 @@ impl RmcpClient {
         params: Option<PaginatedRequestParams>,
         timeout: Option<Duration>,
     ) -> Result<ListResourcesResult> {
-        self.refresh_oauth_if_needed().await;
         let result = self
             .run_service_operation("resources/list", timeout, move |service, tracker| {
                 let request = params
@@ -740,7 +738,6 @@ impl RmcpClient {
         params: Option<PaginatedRequestParams>,
         timeout: Option<Duration>,
     ) -> Result<ListResourceTemplatesResult> {
-        self.refresh_oauth_if_needed().await;
         let result = self
             .run_service_operation(
                 "resources/templates/list",
@@ -776,7 +773,6 @@ impl RmcpClient {
         params: ReadResourceRequestParams,
         timeout: Option<Duration>,
     ) -> Result<ReadResourceResult> {
-        self.refresh_oauth_if_needed().await;
         let result = self
             .run_service_operation("resources/read", timeout, move |service, tracker| {
                 let request = ReadResourceRequest::new(params.clone());
@@ -807,7 +803,6 @@ impl RmcpClient {
         meta: Option<serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<CallToolResult> {
-        self.refresh_oauth_if_needed().await;
         let arguments = match arguments {
             Some(Value::Object(map)) => Some(map),
             Some(other) => {
@@ -861,7 +856,6 @@ impl RmcpClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<()> {
-        self.refresh_oauth_if_needed().await;
         let result = self
             .run_service_operation(
                 "notifications/custom",
@@ -892,7 +886,6 @@ impl RmcpClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<ServerResult> {
-        self.refresh_oauth_if_needed().await;
         let response = self
             .run_service_operation(
                 "requests/custom",
@@ -971,21 +964,16 @@ impl RmcpClient {
         }
     }
 
-    /// This should be called after every tool call so that if a given tool call triggered
-    /// a refresh of the OAuth tokens, they are persisted.
+    /// Persists tokens that RMCP's `AuthClient` refreshed during an operation.
+    ///
+    /// Refresh itself belongs to `AuthClient`: every request re-checks expiry
+    /// under the shared authorization-manager lock, so concurrent operations
+    /// near expiry share one token-endpoint call inside their timeouts.
     async fn persist_oauth_tokens(&self) {
         if let Some(runtime) = self.oauth_persistor().await
             && let Err(error) = runtime.persist_if_needed().await
         {
             warn!("failed to persist OAuth tokens: {error}");
-        }
-    }
-
-    async fn refresh_oauth_if_needed(&self) {
-        if let Some(runtime) = self.oauth_persistor().await
-            && let Err(error) = runtime.refresh_if_needed().await
-        {
-            warn!("failed to refresh OAuth tokens: {error}");
         }
     }
 

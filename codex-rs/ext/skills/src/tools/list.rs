@@ -1,8 +1,10 @@
+use codex_extension_api::ConversationHistoryRequirement;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolExecutorFuture;
 use codex_extension_api::ToolName;
+use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -67,6 +69,13 @@ impl ToolExecutor<ToolCall> for ListTool {
             TOOL_NAME,
             "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor to continue; restart from the first page if stale. An explicit first-page request retries failed discovery.",
         )
+    }
+
+    fn conversation_history_requirement(
+        &self,
+        _payload: &ToolPayload,
+    ) -> ConversationHistoryRequirement {
+        ConversationHistoryRequirement::None
     }
 
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {

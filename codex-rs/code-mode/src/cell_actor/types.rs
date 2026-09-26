@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::StoredValue;
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::ObserveMode;
 use crate::session_runtime::OutputItem;
@@ -59,7 +60,7 @@ pub(crate) trait CellHost: Send + Sync + 'static {
 
     fn commit_completion(
         &self,
-        stored_value_writes: HashMap<String, Arc<JsonValue>>,
+        stored_value_writes: HashMap<String, StoredValue>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,

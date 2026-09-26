@@ -1362,7 +1362,11 @@ async fn execute(
         }
         Args::Create { .. } => unreachable!(),
     }
-    let before = before.expect("mutating inventory operations retain their baseline");
+    let Some(before) = before else {
+        return Err(invalid(
+            "mutating inventory operation lost its retained baseline",
+        ));
+    };
     let reused = before == snapshot;
     let id = if reused {
         id

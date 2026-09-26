@@ -1931,6 +1931,10 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                     json!({"chunks": [{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(status)}], "nextSeq": 4, "exited": true, "exitCode": 0, "closed": true, "failure": null, "sandboxDenied": false})
                 }
                 "fs/open" => json!({"handleId": request["params"]["handleId"]}),
+                "fs/readFileBounded" => {
+                    assert!(request["params"]["maxBytes"].as_u64().unwrap() >= 3);
+                    json!({"dataBase64": base64::engine::general_purpose::STANDARD.encode(if current == 0 { b"aaa" } else { b"bbb" })})
+                }
                 "fs/readBlock" => {
                     json!({"chunk": base64::engine::general_purpose::STANDARD.encode(if current == 0 { b"aaa" } else { b"bbb" }), "eof": true})
                 }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::urls::CloudBaseUrl;
 use crate::urls::DEFAULT_CHATGPT_BASE_URL;
 use codex_cloud_tasks_client::append_error_log;
+use codex_cloud_tasks_client::set_error_log_dir;
 
 pub struct CloudAuthContext {
     pub auth_manager: Option<Arc<AuthManager>>,
@@ -26,9 +27,16 @@ pub async fn load_auth_manager(
     config_overrides: &CliConfigOverrides,
     chatgpt_base_url: Option<&str>,
 ) -> CloudAuthContext {
+    // Every `codex cloud` command loads its config here, so route the diagnostic log here too.
     let config = match load_config(config_overrides).await {
-        Ok(config) => config,
+        Ok(config) => {
+            set_error_log_dir(&config.log_dir);
+            config
+        }
         Err(error) => {
+            if let Ok(codex_home) = codex_core::config::find_codex_home() {
+                set_error_log_dir(&codex_home.join("log"));
+            }
             append_error_log(format!(
                 "failed to load auth config; using transport-default proxy handling: {error}"
             ));
@@ -70,12 +78,12 @@ async fn load_config(config_overrides: &CliConfigOverrides) -> std::io::Result<C
 }
 
 /// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
-/// and optional `ChatGPT-Account-Id`.
+/// and optional `ChatGPT-Account-Id`. The user agent carries the suffix the running command
+/// set at startup, so requests stay attributed to that command.
 pub async fn build_chatgpt_headers(auth_manager: Option<&AuthManager>) -> HeaderMap {
     use http::HeaderValue;
     use http::header::USER_AGENT;
 
-    set_user_agent_suffix("codex_cloud_tui");
     let ua = codex_login::default_client::get_codex_user_agent();
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -115,14 +123,22 @@ mod tests {
         let auth_manager = AuthManager::from_auth_for_testing(
             codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         );
+        // `codex cloud exec` resolves environments with these headers; they must keep its
+        // attribution rather than relabel the process as the TUI.
+        set_user_agent_suffix("codex_cloud_exec");
 
         let headers = build_chatgpt_headers(Some(auth_manager.as_ref())).await;
 
-        assert!(
-            headers
-                .get(http::header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.contains("codex_cloud_tui"))
+        let user_agent = headers
+            .get(http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .expect("user agent");
+        assert!(user_agent.contains("codex_cloud_exec"), "{user_agent}");
+        assert!(!user_agent.contains("codex_cloud_tui"), "{user_agent}");
+        assert_eq!(
+            codex_login::default_client::get_codex_user_agent(),
+            user_agent,
+            "building headers must not change the process user agent"
         );
 
         assert_eq!(

@@ -1,7 +1,7 @@
 //! End-to-end compaction flow tests.
 //!
 //! Phases:
-//! 1) Arrange: mock responses/compact endpoints + config.
+//! 1) Arrange: mock streamed Responses endpoints + config.
 //! 2) Act: start a thread and submit multiple turns to trigger auto-compaction.
 //! 3) Assert: verify item/started + item/completed notifications for context compaction.
 
@@ -300,7 +300,7 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_compact_start_rejects_invalid_thread_id() -> Result<()> {
+async fn thread_compact_start_rejects_invalid_and_unknown_thread_ids() -> Result<()> {
     require_network!();
 
     let server = responses::start_mock_server().await;
@@ -321,58 +321,29 @@ async fn thread_compact_start_rejects_invalid_thread_id() -> Result<()> {
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_thread_compact_start_request(ThreadCompactStartParams {
-            thread_id: "not-a-thread-id".to_string(),
-        })
-        .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    // Both rejections happen before any thread state is touched.
+    for (thread_id, expected_message) in [
+        ("not-a-thread-id", "invalid thread id"),
+        ("67e55044-10b1-426f-9247-bb680e5fe0c8", "thread not found"),
+    ] {
+        let request_id = mcp
+            .send_thread_compact_start_request(ThreadCompactStartParams {
+                thread_id: thread_id.to_string(),
+            })
+            .await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
 
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert!(error.error.message.contains("invalid thread id"));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_compact_start_rejects_unknown_thread_id() -> Result<()> {
-    require_network!();
-
-    let server = responses::start_mock_server().await;
-    let codex_home = TempDir::new()?;
-    write_mock_responses_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        &BTreeMap::default(),
-        AUTO_COMPACT_LIMIT,
-        /*requires_openai_auth*/ None,
-        "mock_provider",
-        COMPACT_PROMPT,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_thread_compact_start_request(ThreadCompactStartParams {
-            thread_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
-        })
-        .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert!(error.error.message.contains("thread not found"));
+        assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE, "{thread_id}");
+        assert!(
+            error.error.message.contains(expected_message),
+            "{thread_id}: {}",
+            error.error.message
+        );
+    }
 
     Ok(())
 }

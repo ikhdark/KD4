@@ -7,10 +7,11 @@ use std::path::PathBuf;
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
 /// `~/.codex`.
 ///
-/// - If `CODEX_HOME` is set, the value must exist and be a directory. The
-///   value will be canonicalized and this function will Err otherwise.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
-///   directory exists.
+/// - If `CODEX_HOME` is set to a non-empty value, the value must exist and be
+///   a directory. The value will be canonicalized and this function will Err
+///   otherwise.
+/// - If `CODEX_HOME` is unset or empty, this function does not verify that
+///   the default directory exists.
 pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
     let codex_home_env = std::env::var_os("CODEX_HOME").filter(|val| !val.is_empty());
     find_codex_home_from_env(codex_home_env.as_deref())
@@ -136,10 +137,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(unix, windows))]
     fn find_codex_home_non_unicode_is_not_treated_as_unset() {
+        #[cfg(windows)]
         let configured = {
             use std::os::windows::ffi::OsStringExt;
             std::ffi::OsString::from_wide(&[0xd800])
+        };
+        #[cfg(unix)]
+        let configured = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0xff])
         };
 
         let err = find_codex_home_from_env(Some(configured.as_os_str()))

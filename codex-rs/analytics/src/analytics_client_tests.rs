@@ -79,6 +79,7 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRequestError;
 use crate::facts::TurnTokenUsageFact;
 use crate::reducer::AnalyticsReducer;
+use crate::reducer::analytics_tool_item;
 use crate::reducer::normalize_path_for_skill_id;
 use crate::reducer::skill_id_for_local_skill;
 use codex_app_server_protocol::AdditionalPermissionProfile;
@@ -86,6 +87,8 @@ use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
+use codex_app_server_protocol::CollabAgentState;
+use codex_app_server_protocol::CollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandAction;
@@ -94,16 +97,21 @@ use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallStatus;
+use codex_app_server_protocol::FileUpdateChange;
 use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
+use codex_app_server_protocol::McpToolCallError;
+use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::NetworkPolicyAmendment;
 use codex_app_server_protocol::NetworkPolicyRuleAction;
 use codex_app_server_protocol::PatchApplyStatus;
+use codex_app_server_protocol::PatchChangeKind;
 use codex_app_server_protocol::PermissionsRequestApprovalParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::RequestPermissionProfile;
@@ -131,6 +139,7 @@ use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::WebSearchAction;
 use codex_app_server_protocol::WebSearchItem;
 use codex_login::default_client::DEFAULT_ORIGINATOR;
 use codex_login::default_client::originator;
@@ -142,6 +151,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
 use codex_protocol::models::PermissionProfile as CorePermissionProfile;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
@@ -150,6 +160,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnTiming;
 use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
@@ -158,6 +169,7 @@ use codex_utils_absolute_path::test_support::test_path_buf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2516,6 +2528,259 @@ async fn failed_turn_flushes_in_progress_tool_item() {
     assert_eq!(payload["event_params"]["started_at_ms"], 455_400);
     assert_eq!(payload["event_params"]["completed_at_ms"], 456_000);
     assert_eq!(payload["event_params"]["duration_ms"], 600);
+}
+
+#[tokio::test]
+async fn abandoned_tool_item_uses_millisecond_turn_completion() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    ingest_review_prerequisites(&mut reducer, &mut events).await;
+    reducer
+        .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
+                sample_turn_resolved_config("thread-1", "turn-1"),
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
+                "thread-1", "turn-1",
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                ItemStartedNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    started_at_ms: 455_400,
+                    item: sample_command_execution_item(
+                        CommandExecutionStatus::InProgress,
+                        None,
+                        None,
+                    ),
+                },
+            ))),
+            &mut events,
+        )
+        .await;
+    let mut notification = sample_turn_completed_notification(
+        "thread-1",
+        "turn-1",
+        AppServerTurnStatus::Interrupted,
+        None,
+    );
+    let ServerNotification::TurnCompleted(completed) = &mut notification else {
+        unreachable!("sample helper must return turn/completed");
+    };
+    // The whole-second turn field truncates to before the item started.
+    completed.turn.completed_at = Some(455);
+    completed.timing = Some(TurnTiming {
+        completed_at_unix_ms: Some(455_900),
+        ..Default::default()
+    });
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(notification)),
+            &mut events,
+        )
+        .await;
+
+    assert_eq!(events.len(), 1);
+    let payload = serde_json::to_value(&events[0]).expect("serialize interrupted tool item event");
+    assert_eq!(payload["event_params"]["terminal_status"], "interrupted");
+    assert_eq!(payload["event_params"]["started_at_ms"], 455_400);
+    assert_eq!(payload["event_params"]["completed_at_ms"], 455_900);
+    assert_eq!(payload["event_params"]["duration_ms"], 500);
+}
+
+/// One item per tracked tool variant, each carrying megabyte-scale payloads.
+pub(crate) fn tool_items_with_output_payloads() -> Vec<ThreadItem> {
+    let payload = "payload ".repeat(128 * 1024);
+    let mut command = sample_command_execution_item_with_actions(
+        CommandExecutionStatus::Completed,
+        Some(0),
+        Some(42),
+        vec![CommandAction::Unknown {
+            command: "cargo test".to_string(),
+        }],
+    );
+    let ThreadItem::CommandExecution {
+        command: command_text,
+        aggregated_output,
+        ..
+    } = &mut command
+    else {
+        unreachable!("sample command execution item should be CommandExecution");
+    };
+    command_text.clone_from(&payload);
+    *aggregated_output = Some(payload.clone());
+    vec![
+        command,
+        ThreadItem::FileChange {
+            id: "file-change-1".to_string(),
+            changes: vec![
+                FileUpdateChange {
+                    path: "src/added.rs".to_string(),
+                    kind: PatchChangeKind::Add,
+                    diff: payload.clone(),
+                },
+                FileUpdateChange {
+                    path: "src/moved.rs".to_string(),
+                    kind: PatchChangeKind::Update {
+                        move_path: Some(PathBuf::from("src/renamed.rs")),
+                    },
+                    diff: payload.clone(),
+                },
+                FileUpdateChange {
+                    path: "src/removed.rs".to_string(),
+                    kind: PatchChangeKind::Delete,
+                    diff: payload.clone(),
+                },
+            ],
+            status: PatchApplyStatus::Completed,
+        },
+        ThreadItem::McpToolCall {
+            id: "mcp-1".to_string(),
+            server: "server".to_string(),
+            tool: "search".to_string(),
+            status: McpToolCallStatus::Failed,
+            arguments: json!({ "query": payload }),
+            app_context: None,
+            mcp_app_resource_uri: Some("ui://widget".to_string()),
+            plugin_id: Some("sample@test".to_string()),
+            result: Some(Box::new(McpToolCallResult {
+                content: vec![json!({ "type": "text", "text": payload })],
+                structured_content: Some(json!({ "text": payload })),
+                meta: None,
+            })),
+            error: Some(McpToolCallError {
+                message: payload.clone(),
+            }),
+            duration_ms: Some(2),
+        },
+        ThreadItem::DynamicToolCall {
+            id: "dynamic-1".to_string(),
+            namespace: Some("namespace".to_string()),
+            tool: "render".to_string(),
+            arguments: json!({ "input": payload }),
+            status: DynamicToolCallStatus::Completed,
+            content_items: Some(vec![
+                DynamicToolCallOutputContentItem::InputText {
+                    text: payload.clone(),
+                },
+                DynamicToolCallOutputContentItem::InputImage {
+                    image_url: format!("data:image/png;base64,{payload}"),
+                },
+                DynamicToolCallOutputContentItem::InputText {
+                    text: payload.clone(),
+                },
+            ]),
+            success: Some(true),
+            error: Some(payload.clone()),
+            duration_ms: Some(3),
+        },
+        ThreadItem::CollabAgentToolCall {
+            id: "collab-1".to_string(),
+            tool: CollabAgentTool::Wait,
+            status: CollabAgentToolCallStatus::Completed,
+            sender_thread_id: "thread-1".to_string(),
+            receiver_thread_ids: vec!["thread-a".to_string(), "thread-b".to_string()],
+            prompt: Some(payload.clone()),
+            model: Some("gpt-5".to_string()),
+            reasoning_effort: Some(ReasoningEffort::High),
+            agents_states: HashMap::from([
+                (
+                    "thread-a".to_string(),
+                    CollabAgentState {
+                        status: CollabAgentStatus::Completed,
+                        message: Some(payload.clone()),
+                        surfaced_result: None,
+                        last_agent_message: Some(payload.clone()),
+                    },
+                ),
+                (
+                    "thread-b".to_string(),
+                    CollabAgentState {
+                        status: CollabAgentStatus::Errored,
+                        message: Some(payload.clone()),
+                        surfaced_result: None,
+                        last_agent_message: None,
+                    },
+                ),
+            ]),
+        },
+        ThreadItem::WebSearch(WebSearchItem {
+            id: "web-1".to_string(),
+            query: "codex".to_string(),
+            action: Some(WebSearchAction::Search {
+                query: Some("codex".to_string()),
+                queries: Some(vec!["codex".to_string(), "rust".to_string()]),
+            }),
+        }),
+        ThreadItem::ImageGeneration(ImageGenerationItem {
+            id: "image-1".to_string(),
+            status: "completed".to_string(),
+            revised_prompt: Some(payload.clone()),
+            result: payload,
+            saved_path: Some(test_path_buf("/tmp/image.png").abs()),
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn compact_tool_items_emit_identical_analytics_events() {
+    for item in tool_items_with_output_payloads() {
+        let compact = analytics_tool_item(&item).expect("tool item is tracked");
+        assert!(
+            serde_json::to_vec(&compact)
+                .expect("serialize compact item")
+                .len()
+                < 1024,
+            "queued copy must not retain output payloads: {compact:?}"
+        );
+        let context = format!("{compact:?}");
+        let mut payloads = Vec::new();
+        for item in [item, compact] {
+            let mut reducer = AnalyticsReducer::default();
+            let mut events = Vec::new();
+            ingest_review_prerequisites(&mut reducer, &mut events).await;
+            for fact in [
+                AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
+                    sample_turn_resolved_config("thread-1", "turn-1"),
+                ))),
+                AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
+                    "thread-1", "turn-1",
+                ))),
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                    ItemStartedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        started_at_ms: 1_000,
+                        item: item.clone(),
+                    },
+                ))),
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
+                    ItemCompletedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        completed_at_ms: 1_042,
+                        item,
+                    },
+                ))),
+            ] {
+                reducer.ingest(fact, &mut events).await;
+            }
+            assert_eq!(events.len(), 1, "{context}");
+            payloads.push(serde_json::to_value(&events).expect("serialize tool item event"));
+        }
+        // Every field the event reads survives compaction.
+        assert_eq!(payloads[0], payloads[1]);
+    }
 }
 
 #[tokio::test]

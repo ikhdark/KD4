@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::FunctionCallError;
+use crate::tools::command_output_artifact::CanonicalOutputArtifact;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::select_file_snapshot;
@@ -165,7 +166,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             let artifact_id = artifact
                 .as_ref()
                 .filter(|artifact| artifact.complete)
-                .and_then(|artifact| artifact.artifact_id());
+                .and_then(CanonicalOutputArtifact::artifact_id);
             if let Some(artifact_id) = &artifact_id {
                 invocation
                     .session

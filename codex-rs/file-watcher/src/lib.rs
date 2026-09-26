@@ -20,6 +20,8 @@ use notify::EventKind;
 use notify::RecommendedWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
+use notify::event::ModifyKind;
+use notify::event::RenameMode;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
@@ -30,9 +32,18 @@ use tokio::time::sleep_until;
 use tracing::warn;
 
 const RAW_EVENT_BUFFER_CAPACITY: usize = 1024;
+/// Raw events reconciled in one pass. Draining a burst into one blocking hop
+/// and one state-lock acquisition keeps the loop ahead of backend bursts
+/// instead of overflowing the queue into a rescan of every subscriber.
+const RAW_EVENT_BATCH_LIMIT: usize = RAW_EVENT_BUFFER_CAPACITY;
 const SUBSCRIBER_PATH_BUFFER_CAPACITY: usize = 4096;
 const DEGRADED_RECONCILE_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const DEGRADED_RECONCILE_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// Watchers returned by [`FileWatcher::shared`], keyed by the Tokio runtime
+/// that runs their event loop.
+static SHARED_WATCHERS: Mutex<Vec<(tokio::runtime::Id, std::sync::Weak<FileWatcher>)>> =
+    Mutex::new(Vec::new());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Coalesced file change notification for a subscriber.
@@ -163,16 +174,12 @@ impl WatchSender {
         }
         let previous_len = changed_paths.len();
         for path in paths {
-            if changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
-                && !changed_paths.contains(path)
-                && !compress_changed_paths(&mut changed_paths, SUBSCRIBER_PATH_BUFFER_CAPACITY)
-            {
+            if !insert_changed_path(&mut changed_paths, path.clone()) {
                 changed_paths.clear();
                 drop(changed_paths);
                 self.mark_rescan_required();
                 return;
             }
-            changed_paths.insert(path.clone());
         }
         if changed_paths.len() != previous_len {
             self.inner.notify.notify_one();
@@ -266,6 +273,58 @@ fn compress_changed_paths(paths: &mut BTreeSet<PathBuf>, capacity: usize) -> boo
     count < capacity
 }
 
+/// Adds one path to a bounded changed-path set, coarsening retained paths when
+/// the set is full. Returns `false` when the path cannot be retained and the
+/// owner must fall back to a rescan.
+fn insert_changed_path(paths: &mut BTreeSet<PathBuf>, path: PathBuf) -> bool {
+    if paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
+        && !paths.contains(&path)
+        && !compress_changed_paths(paths, SUBSCRIBER_PATH_BUFFER_CAPACITY)
+    {
+        return false;
+    }
+    paths.insert(path);
+    true
+}
+
+/// Changes a receiver wrapper has accumulated but not yet emitted.
+#[derive(Default)]
+struct PendingChanges {
+    paths: BTreeSet<PathBuf>,
+    rescan_required: bool,
+}
+
+impl PendingChanges {
+    fn merge(&mut self, event: FileWatcherEvent) {
+        self.rescan_required |= event.rescan_required;
+        if self.rescan_required {
+            self.paths.clear();
+            return;
+        }
+        for path in event.paths {
+            if !insert_changed_path(&mut self.paths, path) {
+                self.paths.clear();
+                self.rescan_required = true;
+                return;
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty() && !self.rescan_required
+    }
+
+    fn take(&mut self) -> Option<FileWatcherEvent> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(FileWatcherEvent {
+            paths: std::mem::take(&mut self.paths).into_iter().collect(),
+            rescan_required: std::mem::take(&mut self.rescan_required),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PathWatchCounts {
     non_recursive: usize,
@@ -321,8 +380,7 @@ pub struct ThrottledWatchReceiver {
     rx: Receiver,
     interval: Duration,
     next_allowed: Option<Instant>,
-    changed_paths: BTreeSet<PathBuf>,
-    rescan_required: bool,
+    pending: PendingChanges,
 }
 
 impl ThrottledWatchReceiver {
@@ -332,8 +390,7 @@ impl ThrottledWatchReceiver {
             rx,
             interval,
             next_allowed: None,
-            changed_paths: BTreeSet::new(),
-            rescan_required: false,
+            pending: PendingChanges::default(),
         }
     }
 
@@ -362,7 +419,7 @@ impl ThrottledWatchReceiver {
                 biased;
                 _ = sleep_until(next_allowed) => {
                     self.next_allowed = None;
-                    if let Some(event) = self.take_pending() {
+                    if let Some(event) = self.pending.take() {
                         self.next_allowed = Some(Instant::now() + self.interval);
                         return Some(event);
                     }
@@ -370,47 +427,12 @@ impl ThrottledWatchReceiver {
                 event = self.rx.recv() => match event {
                     Some(event) => {
                         observe(&event);
-                        self.merge_event(event);
+                        self.pending.merge(event);
                     }
-                    None => return self.take_pending(),
+                    None => return self.pending.take(),
                 },
             }
         }
-    }
-
-    fn merge_event(&mut self, event: FileWatcherEvent) {
-        self.rescan_required |= event.rescan_required;
-        if self.rescan_required {
-            self.changed_paths.clear();
-        } else {
-            for path in event.paths {
-                if self.changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
-                    && !self.changed_paths.contains(&path)
-                    && !compress_changed_paths(
-                        &mut self.changed_paths,
-                        SUBSCRIBER_PATH_BUFFER_CAPACITY,
-                    )
-                {
-                    self.changed_paths.clear();
-                    self.rescan_required = true;
-                    break;
-                }
-                self.changed_paths.insert(path);
-            }
-        }
-    }
-
-    fn take_pending(&mut self) -> Option<FileWatcherEvent> {
-        if self.changed_paths.is_empty() && !self.rescan_required {
-            return None;
-        }
-
-        Some(FileWatcherEvent {
-            paths: std::mem::take(&mut self.changed_paths)
-                .into_iter()
-                .collect(),
-            rescan_required: std::mem::take(&mut self.rescan_required),
-        })
     }
 }
 
@@ -419,8 +441,7 @@ impl ThrottledWatchReceiver {
 pub struct DebouncedWatchReceiver {
     rx: Receiver,
     interval: Duration,
-    changed_paths: BTreeSet<PathBuf>,
-    rescan_required: bool,
+    pending: PendingChanges,
 }
 
 impl DebouncedWatchReceiver {
@@ -429,57 +450,30 @@ impl DebouncedWatchReceiver {
         Self {
             rx,
             interval,
-            changed_paths: BTreeSet::new(),
-            rescan_required: false,
+            pending: PendingChanges::default(),
         }
     }
 
     /// Receives the next debounced event batch.
     pub async fn recv(&mut self) -> Option<FileWatcherEvent> {
-        while self.changed_paths.is_empty() && !self.rescan_required {
+        while self.pending.is_empty() {
             let event = self.rx.recv().await?;
-            self.merge_event(event);
+            self.pending.merge(event);
         }
         let deadline = Instant::now() + self.interval;
 
         loop {
             tokio::select! {
                 event = self.rx.recv() => match event {
-                    Some(event) => self.merge_event(event),
+                    Some(event) => self.pending.merge(event),
                     None => break,
                 },
                 _ = sleep_until(deadline) => break,
             }
         }
 
-        Some(FileWatcherEvent {
-            paths: std::mem::take(&mut self.changed_paths)
-                .into_iter()
-                .collect(),
-            rescan_required: std::mem::take(&mut self.rescan_required),
-        })
-    }
-
-    fn merge_event(&mut self, event: FileWatcherEvent) {
-        self.rescan_required |= event.rescan_required;
-        if self.rescan_required {
-            self.changed_paths.clear();
-        } else {
-            for path in event.paths {
-                if self.changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
-                    && !self.changed_paths.contains(&path)
-                    && !compress_changed_paths(
-                        &mut self.changed_paths,
-                        SUBSCRIBER_PATH_BUFFER_CAPACITY,
-                    )
-                {
-                    self.changed_paths.clear();
-                    self.rescan_required = true;
-                    break;
-                }
-                self.changed_paths.insert(path);
-            }
-        }
+        // Merging never empties pending changes, so this batch is non-empty.
+        self.pending.take()
     }
 }
 
@@ -602,6 +596,36 @@ impl FileWatcher {
         file_watcher.spawn_event_loop(&handle, raw_rx, raw_overflow, raw_overflow_notify);
         file_watcher.spawn_reconcile_loop(&handle, reconcile_rx, &inner);
         Ok(file_watcher)
+    }
+
+    /// Returns the live watcher shared by callers on the current Tokio
+    /// runtime, creating it on first use.
+    ///
+    /// Subscribers stay independent, while overlapping registrations share a
+    /// single backend watch and each backend event is reconciled once for all
+    /// of them. The registry holds watchers weakly, so a shared watcher stops
+    /// once its last user releases it.
+    pub fn shared() -> notify::Result<Arc<Self>> {
+        let runtime_id = Handle::try_current()
+            .map_err(|err| {
+                let message = format!("no Tokio runtime available for file watcher: {err}");
+                notify::Error::generic(&message)
+            })?
+            .id();
+        let mut watchers = SHARED_WATCHERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        watchers.retain(|(_, watcher)| watcher.strong_count() > 0);
+        if let Some(watcher) = watchers
+            .iter()
+            .find(|(id, _)| *id == runtime_id)
+            .and_then(|(_, watcher)| watcher.upgrade())
+        {
+            return Ok(watcher);
+        }
+        let watcher = Arc::new(Self::new()?);
+        watchers.push((runtime_id, Arc::downgrade(&watcher)));
+        Ok(watcher)
     }
 
     /// Creates an inert watcher that only supports test-driven synthetic
@@ -854,44 +878,30 @@ impl FileWatcher {
 
         let existing_mode = guard.watched_paths.get(path).copied();
         if existing_mode == next_mode && !guard.degraded_paths.contains(path) {
-            guard.degraded_paths.remove(path);
             return Ok(());
         }
-        if next_mode.is_some() && !path.exists() {
+        let Some(next_mode) = next_mode else {
+            if existing_mode.is_some() {
+                #[cfg(test)]
+                if std::mem::take(&mut guard.fail_next_unwatch) {
+                    return Err(notify::Error::generic("injected unwatch failure"));
+                }
+                guard.watcher.unwatch(path)?;
+                guard.watched_paths.remove(path);
+            }
+            guard.degraded_paths.remove(path);
+            return Ok(());
+        };
+        if !path.exists() {
             let message = format!("watch path no longer exists: {}", path.display());
             return Err(notify::Error::generic(&message));
         }
 
-        if existing_mode.is_some() {
-            #[cfg(test)]
-            if std::mem::take(&mut guard.fail_next_unwatch) {
-                return Err(notify::Error::generic("injected unwatch failure"));
-            }
-            guard.watcher.unwatch(path)?;
-            guard.watched_paths.remove(path);
-        }
-
-        let Some(next_mode) = next_mode else {
-            guard.degraded_paths.remove(path);
-            return Ok(());
-        };
-
-        let watch_result = Self::watch_backend(guard, path, next_mode);
-        if let Err(err) = watch_result {
-            if let Some(existing_mode) = existing_mode
-                && let Err(restore_err) = Self::watch_backend(guard, path, existing_mode)
-            {
-                warn!(
-                    "failed to restore watch {} after reconfiguration error: {restore_err}",
-                    path.display()
-                );
-            } else if let Some(existing_mode) = existing_mode {
-                guard
-                    .watched_paths
-                    .insert(path.to_path_buf(), existing_mode);
-            }
-            return Err(err);
-        }
+        // Watching a watched path replaces its watch, so a mode change or re-arm
+        // never leaves a window without one for other subscribers of the path.
+        // A failed replacement keeps the previous backend watch, which
+        // `watched_paths` still records.
+        Self::watch_backend(guard, path, next_mode)?;
         guard.watched_paths.insert(path.to_path_buf(), next_mode);
         guard.degraded_paths.remove(path);
         Ok(())
@@ -1021,6 +1031,12 @@ impl FileWatcher {
                 Self::mark_watch_degraded(&path, &mut inner_guard);
             } else {
                 Self::set_watch_degraded(&path, desired_mode, &mut inner_guard);
+                if desired_mode.is_some() {
+                    // Changes made while the backend watch was missing produced
+                    // no events, and the rescan signalled at degradation may
+                    // already have been consumed.
+                    Self::mark_subscribers_rescan_for_path(&state, &path);
+                }
             }
         }
 
@@ -1147,110 +1163,49 @@ impl FileWatcher {
         let reconcile_tx = self.reconcile_tx.clone();
         handle.spawn(async move {
             loop {
-                tokio::select! {
+                let mut changes = ObservedChanges::default();
+                let closed = tokio::select! {
                     biased;
-                    raw_event = raw_rx.recv() => {
-                        let Some(raw_event) = raw_event else {
-                            if raw_overflow.swap(false, Ordering::AcqRel) {
-                                let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
-                                Self::require_rescan_and_reconcile(
-                                    &state,
-                                    inner.as_ref(),
-                                    reconcile_tx.as_ref(),
-                                )
-                                .await;
+                    raw_event = raw_rx.recv() => match raw_event {
+                        Some(raw_event) => {
+                            changes.record(raw_event);
+                            for _ in 1..RAW_EVENT_BATCH_LIMIT {
+                                let Ok(raw_event) = raw_rx.try_recv() else {
+                                    break;
+                                };
+                                changes.record(raw_event);
                             }
-                            break;
-                        };
-                        if raw_overflow.swap(false, Ordering::AcqRel) {
-                            let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
-                            Self::require_rescan_and_reconcile(
-                                &state,
-                                inner.as_ref(),
-                                reconcile_tx.as_ref(),
-                            )
-                            .await;
+                            false
                         }
-                        match raw_event {
-                            Ok(event) => {
-                                if !is_mutating_event(&event) || event.paths.is_empty() {
-                                    continue;
-                                }
-                                let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
-                                Self::notify_subscribers(
-                                    &state,
-                                    inner.as_ref(),
-                                    reconcile_tx.as_ref(),
-                                    &event.paths,
-                                )
-                                .await;
-                            }
-                            Err(err) => {
-                                warn!("file watcher error requiring rescan: {err}");
-                                let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
-                                Self::require_rescan_and_reconcile(
-                                    &state,
-                                    inner.as_ref(),
-                                    reconcile_tx.as_ref(),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    _ = raw_overflow_notify.notified() => {
-                        if raw_overflow.swap(false, Ordering::AcqRel) {
-                            let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
-                            Self::require_rescan_and_reconcile(
-                                &state,
-                                inner.as_ref(),
-                                reconcile_tx.as_ref(),
-                            )
-                            .await;
-                        }
-                    }
+                        None => true,
+                    },
+                    _ = raw_overflow_notify.notified() => false,
+                };
+                changes.rescan_required |= raw_overflow.swap(false, Ordering::AcqRel);
+                if !changes.is_empty() {
+                    let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
+                    Self::reconcile_changes(&state, inner.as_ref(), reconcile_tx.as_ref(), changes)
+                        .await;
+                }
+                if closed {
+                    break;
                 }
             }
         });
     }
 
-    fn mark_all_subscribers_rescan(state: &RwLock<WatchState>) {
-        let state = state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for subscriber in state.subscribers.values() {
-            subscriber.tx.mark_rescan_required();
-        }
-    }
-
-    async fn require_rescan_and_reconcile(
+    async fn reconcile_changes(
         state: &Arc<RwLock<WatchState>>,
         inner: Option<&Arc<Mutex<FileWatcherInner>>>,
         reconcile_tx: Option<&mpsc::Sender<()>>,
+        mut changes: ObservedChanges,
     ) {
-        let rescan_state = Arc::clone(state);
-        if let Err(err) = tokio::task::spawn_blocking(move || {
-            Self::mark_all_subscribers_rescan(&rescan_state);
-        })
-        .await
-        {
-            warn!("file watcher rescan worker failed: {err}");
-            return;
-        }
-        Self::notify_subscribers(state, inner, reconcile_tx, &[]).await;
-    }
-
-    async fn notify_subscribers(
-        state: &Arc<RwLock<WatchState>>,
-        inner: Option<&Arc<Mutex<FileWatcherInner>>>,
-        reconcile_tx: Option<&mpsc::Sender<()>>,
-        event_paths: &[PathBuf],
-    ) {
+        changes.normalize();
         let state = Arc::clone(state);
         let inner = inner.cloned();
         let reconcile_tx = reconcile_tx.cloned();
-        let event_paths = event_paths.to_vec();
         let subscribers_to_notify = tokio::task::spawn_blocking(move || {
-            Self::reconcile_subscribers(&state, inner.as_ref(), reconcile_tx.as_ref(), &event_paths)
+            Self::reconcile_subscribers(&state, inner.as_ref(), reconcile_tx.as_ref(), &changes)
         })
         .await;
         match subscribers_to_notify {
@@ -1267,13 +1222,15 @@ impl FileWatcher {
         state: &RwLock<WatchState>,
         inner: Option<&Arc<Mutex<FileWatcherInner>>>,
         reconcile_tx: Option<&mpsc::Sender<()>>,
-        event_paths: &[PathBuf],
+        changes: &ObservedChanges,
     ) -> Vec<(WatchSender, Vec<PathBuf>)> {
         let mut state = state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rescan = changes.rescan_required;
         let mut actual_watch_moves = Vec::new();
         let mut subscribers_to_notify = Vec::new();
+        let mut relevant_paths = Vec::new();
         #[cfg(test)]
         let mut actual_watch_path_resolution_count = 0;
 
@@ -1281,27 +1238,23 @@ impl FileWatcher {
             let mut changed_paths = BTreeSet::new();
             let mut rescan_required = false;
             for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths {
-                if !subscriber_watch_state.fallback
-                    && !event_paths.is_empty()
-                    && !event_paths.iter().any(|event_path| {
-                        path_namespaces_overlap(event_path, &subscriber_watch.requested.path)
-                            || path_namespaces_overlap(
-                                event_path,
-                                &subscriber_watch_state.matched.path,
-                            )
-                    })
-                {
-                    continue;
+                relevant_paths.clear();
+                if !rescan {
+                    relevant_paths.extend(changes.paths.iter().filter(|event_path| {
+                        event_may_affect_watch(subscriber_watch, subscriber_watch_state, event_path)
+                    }));
+                    if relevant_paths.is_empty() {
+                        continue;
+                    }
                 }
-                let stable_descendant_event =
-                    subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
-                        && event_paths.iter().all(|event_path| {
-                            is_strict_descendant(event_path, &subscriber_watch_state.matched.path)
-                                || is_strict_descendant(
-                                    event_path,
-                                    &subscriber_watch.requested.path,
-                                )
-                        });
+                // Lost events can hide a removed or replaced root, so a rescan
+                // re-resolves every watch rather than only fallback watches.
+                let stable_descendant_event = !rescan
+                    && subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
+                    && relevant_paths.iter().all(|event_path| {
+                        is_strict_descendant(event_path, &subscriber_watch_state.matched.path)
+                            || is_strict_descendant(event_path, &subscriber_watch.requested.path)
+                    });
                 let (new_actual, new_matched, fallback) = if stable_descendant_event {
                     (
                         subscriber_watch_state.actual.clone(),
@@ -1315,7 +1268,7 @@ impl FileWatcher {
                     }
                     actual_watch_path(&subscriber_watch.requested)
                 };
-                for event_path in event_paths {
+                for event_path in &relevant_paths {
                     let changed_path = changed_path_for_event(
                         subscriber_watch,
                         subscriber_watch_state,
@@ -1335,25 +1288,16 @@ impl FileWatcher {
                     });
                     if let Some(path) = changed_path
                         && !rescan_required
+                        && !insert_changed_path(&mut changed_paths, path)
                     {
-                        if changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
-                            && !changed_paths.contains(&path)
-                            && !compress_changed_paths(
-                                &mut changed_paths,
-                                SUBSCRIBER_PATH_BUFFER_CAPACITY,
-                            )
-                        {
-                            changed_paths.clear();
-                            rescan_required = true;
-                        } else {
-                            changed_paths.insert(path);
-                        }
+                        changed_paths.clear();
+                        rescan_required = true;
                     }
                 }
 
                 subscriber_watch_state.fallback |= fallback;
                 if subscriber_watch_state.actual == new_actual {
-                    if subscriber_watch_state.matched != new_matched {
+                    if rescan || subscriber_watch_state.matched != new_matched {
                         subscriber_watch_state.last_exists = new_matched.path.exists();
                     }
                     subscriber_watch_state.matched = new_matched;
@@ -1409,16 +1353,74 @@ impl FileWatcher {
             }
         }
 
+        for root in &changes.lost_watch_roots {
+            // The backend drops a watch whose root is removed. When the root is
+            // back before this pass, resolution keeps the watch where it was,
+            // so re-arm it before subscribers learn that the root changed.
+            let Some(mode) = state
+                .path_ref_counts
+                .get(root)
+                .copied()
+                .and_then(PathWatchCounts::effective_mode)
+            else {
+                continue;
+            };
+            if let Err(err) = Self::rewatch_backend(inner, root, mode, &mut inner_guard) {
+                warn!(
+                    "failed to re-establish file watch {}: {err}",
+                    root.display()
+                );
+                Self::mark_watch_degraded(root, &mut inner_guard);
+                Self::mark_subscribers_rescan_for_path(&state, root);
+                if let Some(reconcile_tx) = reconcile_tx {
+                    request_reconciliation(reconcile_tx);
+                }
+            }
+        }
+
+        if rescan {
+            // Only after every watch is re-resolved and re-armed: a subscriber
+            // must not finish its rescan before the watches it relies on exist.
+            for subscriber in state.subscribers.values() {
+                subscriber.tx.mark_rescan_required();
+            }
+        }
         subscribers_to_notify
+    }
+
+    /// Re-arms a backend watch the backend may have dropped. Watching a path
+    /// replaces a watch the backend still holds, so a surviving watch never
+    /// loses coverage.
+    fn rewatch_backend<'a>(
+        inner: Option<&'a Arc<Mutex<FileWatcherInner>>>,
+        path: &Path,
+        mode: RecursiveMode,
+        inner_guard: &mut Option<std::sync::MutexGuard<'a, FileWatcherInner>>,
+    ) -> notify::Result<()> {
+        let Some(inner) = inner else {
+            return Ok(());
+        };
+        let guard = inner_guard.get_or_insert_with(|| {
+            inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        Self::watch_backend(guard, path, mode)?;
+        guard.watched_paths.insert(path.to_path_buf(), mode);
+        guard.degraded_paths.remove(path);
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) async fn send_paths_for_test(&self, paths: Vec<PathBuf>) {
-        Self::notify_subscribers(
+        Self::reconcile_changes(
             &self.state,
             self.inner.as_ref(),
             self.reconcile_tx.as_ref(),
-            &paths,
+            ObservedChanges {
+                paths,
+                ..Default::default()
+            },
         )
         .await;
     }
@@ -1465,10 +1467,11 @@ fn enqueue_raw_event(
     raw_overflow_notify: &Notify,
     event: notify::Result<Event>,
 ) {
-    if event
-        .as_ref()
-        .is_ok_and(|event| event.paths.len() > SUBSCRIBER_PATH_BUFFER_CAPACITY)
-    {
+    // A backend rescan event (for example a Windows ReadDirectoryChangesW
+    // overflow) means changes were discarded without identifying their paths.
+    if event.as_ref().is_ok_and(|event| {
+        event.need_rescan() || event.paths.len() > SUBSCRIBER_PATH_BUFFER_CAPACITY
+    }) {
         raw_overflow.store(true, Ordering::Release);
         raw_overflow_notify.notify_one();
         return;
@@ -1484,6 +1487,63 @@ fn is_mutating_event(event: &Event) -> bool {
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     )
+}
+
+/// Returns whether the object previously at each event path may be gone. A
+/// backend watch rooted at such a path can be dropped: notify's Windows backend
+/// unwatches a watched directory once it reports that directory's removal.
+fn event_may_drop_watch_root(event: &Event) -> bool {
+    match event.kind {
+        EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Name(mode)) => mode != RenameMode::To,
+        _ => false,
+    }
+}
+
+/// Backend observations reconciled in one pass.
+#[derive(Default)]
+struct ObservedChanges {
+    /// Changed paths reported by the backend.
+    paths: Vec<PathBuf>,
+    /// Paths whose previous object was removed or renamed away, or that a
+    /// backend error named; a backend watch rooted there may be gone.
+    lost_watch_roots: Vec<PathBuf>,
+    /// Whether changes were lost, so every watch is re-resolved and every
+    /// subscriber must rescan instead of relying on `paths`.
+    rescan_required: bool,
+}
+
+impl ObservedChanges {
+    fn record(&mut self, raw_event: notify::Result<Event>) {
+        match raw_event {
+            Ok(event) => {
+                if !is_mutating_event(&event) || event.paths.is_empty() {
+                    return;
+                }
+                if event_may_drop_watch_root(&event) {
+                    self.lost_watch_roots.extend(event.paths.iter().cloned());
+                }
+                self.paths.extend(event.paths);
+            }
+            Err(err) => {
+                warn!("file watcher error requiring rescan: {err}");
+                // An error that stops a backend watch names that watch's root.
+                self.lost_watch_roots.extend(err.paths);
+                self.rescan_required = true;
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.lost_watch_roots.is_empty() && !self.rescan_required
+    }
+
+    fn normalize(&mut self) {
+        self.paths.sort_unstable();
+        self.paths.dedup();
+        self.lost_watch_roots.sort_unstable();
+        self.lost_watch_roots.dedup();
+    }
 }
 
 fn dedupe_watched_paths(mut watched_paths: Vec<WatchPath>) -> Vec<WatchPath> {
@@ -1549,6 +1609,50 @@ fn path_namespaces_overlap(left: &Path, right: &Path) -> bool {
 
 fn is_strict_descendant(path: &Path, root: &Path) -> bool {
     path != root && path.starts_with(root)
+}
+
+/// Returns whether a backend event can change one subscriber watch.
+///
+/// Every watch cares about its requested and canonical namespaces. A fallback
+/// watch also re-resolves for events its non-recursive ancestor watch reports
+/// (the ancestor or a direct child, where a missing component or symlink
+/// target can appear) and for events below the ancestor's canonical location,
+/// which cannot be mapped to the requested spelling without resolving it.
+/// Unrelated events elsewhere in the watcher must not cost every fallback
+/// watch a filesystem resolution under the state lock.
+fn event_may_affect_watch(
+    subscriber_watch: &SubscriberWatchKey,
+    subscriber_watch_state: &SubscriberWatchState,
+    event_path: &Path,
+) -> bool {
+    if path_namespaces_overlap(event_path, &subscriber_watch.requested.path)
+        || path_namespaces_overlap(event_path, &subscriber_watch_state.matched.path)
+    {
+        return true;
+    }
+    if !subscriber_watch_state.fallback {
+        return false;
+    }
+    let actual = subscriber_watch_state.actual.path.as_path();
+    if event_path == actual || event_path.parent() == Some(actual) {
+        return true;
+    }
+    // `matched` is the canonical actual path joined with the requested suffix.
+    let canonical_actual = subscriber_watch
+        .requested
+        .path
+        .strip_prefix(actual)
+        .ok()
+        .and_then(|suffix| {
+            subscriber_watch_state
+                .matched
+                .path
+                .ancestors()
+                .nth(suffix.components().count())
+        });
+    canonical_actual.is_some_and(|canonical_actual| {
+        event_path.starts_with(canonical_actual) && !event_path.starts_with(actual)
+    })
 }
 
 fn subscriber_watch_is_stable(

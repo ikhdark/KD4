@@ -6,29 +6,25 @@ use std::sync::LazyLock;
 const MAX_RENDERED_GOAL_OBJECTIVE_BYTES: usize = MAX_THREAD_GOAL_OBJECTIVE_CHARS * "&amp;".len();
 const GOAL_OBJECTIVE_TRUNCATED_MARKER: &str = "\n[objective truncated]";
 
-static CONTINUATION_PROMPT_TEMPLATE: LazyLock<Template> =
-    LazyLock::new(
-        || match Template::parse(include_str!("../templates/goals/continuation.md")) {
-            Ok(template) => template,
-            Err(err) => panic!("embedded goals/continuation.md template is invalid: {err}"),
-        },
-    );
+static CONTINUATION_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    Template::parse_embedded(
+        include_str!("../templates/goals/continuation.md"),
+        "goals/continuation.md",
+    )
+});
 
-static BUDGET_LIMIT_PROMPT_TEMPLATE: LazyLock<Template> =
-    LazyLock::new(
-        || match Template::parse(include_str!("../templates/goals/budget_limit.md")) {
-            Ok(template) => template,
-            Err(err) => panic!("embedded goals/budget_limit.md template is invalid: {err}"),
-        },
-    );
+static BUDGET_LIMIT_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    Template::parse_embedded(
+        include_str!("../templates/goals/budget_limit.md"),
+        "goals/budget_limit.md",
+    )
+});
 
 static OBJECTIVE_UPDATED_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    match Template::parse(include_str!("../templates/goals/objective_updated.md")) {
-        Ok(template) => template,
-        Err(err) => {
-            panic!("embedded goals/objective_updated.md template is invalid: {err}")
-        }
-    }
+    Template::parse_embedded(
+        include_str!("../templates/goals/objective_updated.md"),
+        "goals/objective_updated.md",
+    )
 });
 
 /// Builds the hidden prompt used to continue an active goal after the previous

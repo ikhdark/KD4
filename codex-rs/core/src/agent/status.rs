@@ -36,7 +36,11 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
                 "The turn was aborted because of an internal error.".to_string(),
             )),
         },
-        EventMsg::Error(ev) => Some(AgentStatus::Errored(ev.message.clone())),
+        EventMsg::Error(ev) if ev.affects_turn_status() => {
+            Some(AgentStatus::Errored(ev.message.clone()))
+        }
+        // A rejected steer or rollback request leaves the active turn and its status unchanged.
+        EventMsg::Error(_) => None,
         EventMsg::ShutdownComplete => Some(AgentStatus::Shutdown),
         _ => None,
     }
@@ -150,7 +154,9 @@ mod tests {
     use codex_agent_task_store::IntegrationPlan;
     use codex_agent_task_store::WorkspaceStrategy;
     use codex_agent_task_store::WorkspaceTaskStatus;
+    use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::ErrorEvent;
+    use codex_protocol::protocol::NonSteerableTurnKind;
     use codex_protocol::protocol::SurfacedToolResult;
     use codex_protocol::protocol::TurnCompleteEvent;
 
@@ -210,6 +216,39 @@ mod tests {
             status,
             Some(AgentStatus::Errored("terminal failure".to_string()))
         );
+    }
+
+    #[test]
+    fn only_turn_failing_errors_finalize_agent_status() {
+        for codex_error_info in [
+            CodexErrorInfo::ThreadRollbackFailed,
+            CodexErrorInfo::ActiveTurnNotSteerable {
+                turn_kind: NonSteerableTurnKind::Review,
+            },
+            CodexErrorInfo::ActiveTurnNotSteerable {
+                turn_kind: NonSteerableTurnKind::Compact,
+            },
+        ] {
+            assert_eq!(
+                agent_status_from_event(&EventMsg::Error(ErrorEvent {
+                    message: "request rejected while the turn continues".to_string(),
+                    codex_error_info: Some(codex_error_info.clone()),
+                })),
+                None,
+                "{codex_error_info:?} must not finalize a running agent"
+            );
+        }
+        for codex_error_info in [None, Some(CodexErrorInfo::Other)] {
+            let status = agent_status_from_event(&EventMsg::Error(ErrorEvent {
+                message: "turn failed".to_string(),
+                codex_error_info,
+            }));
+            assert_eq!(
+                status,
+                Some(AgentStatus::Errored("turn failed".to_string()))
+            );
+            assert!(is_final(status.as_ref().expect("errored status")));
+        }
     }
 
     #[test]

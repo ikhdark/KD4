@@ -325,7 +325,13 @@ async fn transport_fallback_honors_the_original_retry_after_deadline() {
     )
     .await
     .unwrap();
-    assert_eq!(started.elapsed(), Duration::from_secs(6));
+    // Tokio rounds timer deadlines to its millisecond tick; never retry early
+    // or restart the original ten-second delay during transport fallback.
+    assert!(
+        (Duration::from_secs(6)..=Duration::from_millis(6_001)).contains(&started.elapsed()),
+        "fallback waited {:?}",
+        started.elapsed()
+    );
     assert!(!session.services.model_client.responses_websocket_enabled());
 }
 

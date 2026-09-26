@@ -194,11 +194,17 @@ impl HistoryCell for UnifiedExecProcessesCell {
                     out.push(Line::from(chunk_prefix.dim()));
                     continue;
                 }
+                // Chunks are raw terminal output; keep only their visible text.
+                let chunk: String = crate::ansi_escape::ansi_escape_line(chunk)
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
                 let budget = wrap_width.saturating_sub(chunk_prefix_width);
-                let (truncated, remainder, _) = take_prefix_by_width(chunk, budget);
+                let (truncated, remainder, _) = take_prefix_by_width(&chunk, budget);
                 if !remainder.is_empty() && budget > truncation_suffix_width {
                     let available = budget.saturating_sub(truncation_suffix_width);
-                    let (shorter, _, _) = take_prefix_by_width(chunk, available);
+                    let (shorter, _, _) = take_prefix_by_width(&chunk, available);
                     out.push(
                         vec![chunk_prefix.dim(), shorter.dim(), truncation_suffix.dim()].into(),
                     );

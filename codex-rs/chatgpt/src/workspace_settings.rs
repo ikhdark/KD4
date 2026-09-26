@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -24,7 +26,18 @@ struct WorkspaceSettingsResponse {
 #[derive(Debug, Default)]
 pub struct WorkspaceSettingsCache {
     entry: RwLock<Option<CachedWorkspaceSettings>>,
-    refresh: tokio::sync::Mutex<()>,
+    /// Serializes refreshes and holds the latest attempt's failure, if any.
+    refresh: tokio::sync::Mutex<Option<FailedRefresh>>,
+    /// Finished refresh attempts, read before waiting on `refresh`.
+    refresh_attempts: AtomicU64,
+}
+
+/// A failure shared only with callers that were waiting when it happened;
+/// later callers fetch again rather than reuse the fail-open result.
+#[derive(Debug)]
+struct FailedRefresh {
+    key: WorkspaceSettingsCacheKey,
+    error: String,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -64,6 +77,10 @@ impl WorkspaceSettingsCache {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Single-flight refresh: waiters reuse one outcome instead of each paying the timeout"
+)]
 pub async fn codex_plugins_enabled_for_workspace(
     config: &Config,
     auth: Option<&CodexAuth>,
@@ -88,25 +105,48 @@ pub async fn codex_plugins_enabled_for_workspace(
         chatgpt_base_url: config.chatgpt_base_url.clone(),
         account_id: account_id.clone(),
     };
-    if let Some(cache) = cache
-        && let Some(enabled) = cache.get_codex_plugins_enabled(&cache_key)
-    {
+    let Some(cache) = cache else {
+        return fetch_codex_plugins_enabled(config, auth, &account_id).await;
+    };
+    if let Some(enabled) = cache.get_codex_plugins_enabled(&cache_key) {
         return Ok(enabled);
     }
 
     // Catalog operations can request this setting concurrently. Serialize
-    // refreshes and reuse a successful response published while waiting.
-    let _refresh = if let Some(cache) = cache {
-        let refresh = cache.refresh.lock().await;
-        if let Some(enabled) = cache.get_codex_plugins_enabled(&cache_key) {
-            return Ok(enabled);
-        }
-        Some(refresh)
-    } else {
-        None
-    };
+    // refreshes and reuse the outcome of one that finished while waiting, so
+    // an unavailable backend costs one timeout rather than one per waiter.
+    let attempts_before_wait = cache.refresh_attempts.load(Ordering::Acquire);
+    let mut refresh = cache.refresh.lock().await;
+    if let Some(enabled) = cache.get_codex_plugins_enabled(&cache_key) {
+        return Ok(enabled);
+    }
+    if cache.refresh_attempts.load(Ordering::Acquire) != attempts_before_wait
+        && let Some(failed) = refresh.as_ref().filter(|failed| failed.key == cache_key)
+    {
+        anyhow::bail!("{}", failed.error);
+    }
 
-    let encoded_account_id = encode_path_segment(&account_id);
+    let result = fetch_codex_plugins_enabled(config, auth, &account_id).await;
+    *refresh = match &result {
+        Ok(enabled) => {
+            cache.set_codex_plugins_enabled(cache_key, *enabled);
+            None
+        }
+        Err(error) => Some(FailedRefresh {
+            key: cache_key,
+            error: format!("{error:#}"),
+        }),
+    };
+    cache.refresh_attempts.fetch_add(1, Ordering::Release);
+    result
+}
+
+async fn fetch_codex_plugins_enabled(
+    config: &Config,
+    auth: &CodexAuth,
+    account_id: &str,
+) -> anyhow::Result<bool> {
+    let encoded_account_id = encode_path_segment(account_id);
     let http_clients = chatgpt_http_clients(config);
     let settings: WorkspaceSettingsResponse = chatgpt_get_request_with_timeout(
         &config.chatgpt_base_url,
@@ -117,17 +157,11 @@ pub async fn codex_plugins_enabled_for_workspace(
     )
     .await?;
 
-    let codex_plugins_enabled = settings
+    Ok(settings
         .beta_settings
         .get(CODEX_PLUGINS_BETA_SETTING)
         .copied()
-        .unwrap_or(true);
-
-    if let Some(cache) = cache {
-        cache.set_codex_plugins_enabled(cache_key, codex_plugins_enabled);
-    }
-
-    Ok(codex_plugins_enabled)
+        .unwrap_or(true))
 }
 
 /// Reads the workspace setting while preserving the product's fail-open behavior.

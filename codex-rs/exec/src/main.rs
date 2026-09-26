@@ -2,7 +2,6 @@
 //!
 //! Parses the standard `codex-exec` CLI options and launches the non-interactive
 //! Codex agent.
-use clap::Args;
 use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::Parser;
@@ -23,30 +22,13 @@ struct TopCli {
 
 impl TopCli {
     fn parse_exec_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> Cli {
-        // Clap propagates a global Append argument from the deepest subcommand,
-        // replacing earlier values. Parse each level locally and merge in order.
-        let command = Self::command()
-            .mut_arg("raw_overrides", |arg| arg.global(false))
-            .mut_subcommand("resume", |command| {
-                CliConfigOverrides::augment_args(command)
-                    .mut_arg("raw_overrides", |arg| arg.global(false))
-            })
-            .mut_subcommand("review", |command| {
-                CliConfigOverrides::augment_args(command)
-                    .mut_arg("raw_overrides", |arg| arg.global(false))
-            });
+        // Keep `-c` values from every level; plain clap parsing would keep only
+        // the deepest subcommand's values.
+        let command = CliConfigOverrides::scope_to_each_command_level(Self::command());
         let matches = command.get_matches_from(args);
         let top = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
         let mut inner = top.inner;
-        inner.config_overrides = top.config_overrides;
-        if let Some((_, child)) = matches.subcommand() {
-            let child_overrides =
-                CliConfigOverrides::from_arg_matches(child).unwrap_or_else(|error| error.exit());
-            inner
-                .config_overrides
-                .raw_overrides
-                .extend(child_overrides.raw_overrides);
-        }
+        inner.config_overrides = CliConfigOverrides::from_command_levels(&matches);
         inner
     }
 }

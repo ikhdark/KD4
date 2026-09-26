@@ -1,9 +1,7 @@
 use std::borrow::Cow;
-use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -52,7 +50,6 @@ use serde_json::Value;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::task;
-use tokio::time::sleep;
 
 #[derive(Clone)]
 struct TestToolServer {
@@ -114,30 +111,22 @@ struct EchoArgs {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = parse_bind_addr()?;
     let post_failure_state = PostFailureState::default();
-    const MAX_BIND_RETRIES: u32 = 20;
-    const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-    let mut bind_retries = 0;
-    let listener = loop {
-        match tokio::net::TcpListener::bind(&bind_addr).await {
-            Ok(listener) => break listener,
-            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-                eprintln!(
-                    "failed to bind to {bind_addr}: {err}. make sure the process has network access"
-                );
-                return Err(err.into());
-            }
-            Err(err) if err.kind() == ErrorKind::AddrInUse && bind_retries < MAX_BIND_RETRIES => {
-                bind_retries += 1;
-                sleep(BIND_RETRY_DELAY).await;
-            }
-            Err(err) => return Err(err.into()),
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            eprintln!(
+                "failed to bind to {bind_addr}: {err}. make sure the process has network access"
+            );
+            return Err(err.into());
         }
+        Err(err) => return Err(err.into()),
     };
     let actual_bind_addr = listener.local_addr()?;
-    if let Ok(bound_addr_file) = std::env::var("MCP_STREAMABLE_HTTP_BOUND_ADDR_FILE") {
-        fs::write(bound_addr_file, actual_bind_addr.to_string())?;
-    }
+    // Test harnesses bind port 0 and read the bound address from this single
+    // stdout line. The listener already accepts into its backlog, so the line
+    // is also the readiness signal.
+    println!("{actual_bind_addr}");
     eprintln!("starting rmcp streamable http test server on http://{actual_bind_addr}/mcp");
 
     let router = Router::new()

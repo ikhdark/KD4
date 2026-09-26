@@ -4,7 +4,6 @@ use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpResponse;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use std::io;
-use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -14,6 +13,17 @@ pub struct LMStudioClient {
 }
 
 const LMSTUDIO_CONNECTION_ERROR: &str = "LM Studio is not responding. Install from https://lmstudio.ai/download and run 'lms server start'.";
+
+fn error_with_sources(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
 
 impl LMStudioClient {
     pub async fn try_from_provider(config: &Config) -> std::io::Result<Self> {
@@ -62,19 +72,21 @@ impl LMStudioClient {
 
     async fn check_server(&self) -> io::Result<HttpResponse> {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let response = self.client.get(&url).send().await;
-
-        if let Ok(resp) = response {
-            if resp.status().is_success() {
-                Ok(resp)
-            } else {
-                Err(io::Error::other(format!(
-                    "Server returned error: {} {LMSTUDIO_CONNECTION_ERROR}",
-                    resp.status()
-                )))
-            }
+        // Setup can run before logging is initialized, so the returned error is
+        // the only place the transport cause (refused, timeout, proxy) surfaces.
+        let resp = self.client.get(&url).send().await.map_err(|err| {
+            io::Error::other(format!(
+                "{LMSTUDIO_CONNECTION_ERROR} Request to {url} failed: {}",
+                error_with_sources(&err)
+            ))
+        })?;
+        if resp.status().is_success() {
+            Ok(resp)
         } else {
-            Err(io::Error::other(LMSTUDIO_CONNECTION_ERROR))
+            Err(io::Error::other(format!(
+                "Server returned error: {} {LMSTUDIO_CONNECTION_ERROR}",
+                resp.status()
+            )))
         }
     }
 
@@ -144,33 +156,22 @@ impl LMStudioClient {
         Ok(models)
     }
 
-    // Find lms, checking fallback paths if not in PATH
+    // Find lms on PATH, falling back to LM Studio's per-user install location.
     fn find_lms() -> std::io::Result<PathBuf> {
-        Self::find_lms_with_home_dir(/*home_dir*/ None)
-    }
-
-    fn find_lms_with_home_dir(home_dir: Option<&str>) -> std::io::Result<PathBuf> {
-        // First try 'lms' in PATH
         if let Ok(path) = which::which("lms") {
             return Ok(path);
         }
 
-        // Platform-specific fallback paths
-        let home = match home_dir {
-            Some(dir) => dir.to_string(),
-            None => std::env::var("USERPROFILE").unwrap_or_default(),
-        };
-        if home.is_empty() {
+        let Some(home) = std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "LM Studio not found: USERPROFILE is unavailable for the home-directory fallback.",
             ));
-        }
+        };
 
-        let fallback_path = format!("{home}/.lmstudio/bin/lms.exe");
-
-        if Path::new(&fallback_path).exists() {
-            Ok(PathBuf::from(fallback_path))
+        let fallback_path = PathBuf::from(home).join(".lmstudio/bin/lms.exe");
+        if fallback_path.is_file() {
+            Ok(fallback_path)
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -228,6 +229,7 @@ impl LMStudioClient {
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
+    use std::path::Path;
 
     #[tokio::test]
     async fn test_fetch_models_happy_path() {
@@ -371,6 +373,35 @@ mod tests {
                 .to_string()
                 .contains("Server returned error: 404")
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_server_unreachable_reports_endpoint_and_cause() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_check_server_unreachable_reports_endpoint_and_cause",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = LMStudioClient::from_host_root(format!("http://127.0.0.1:{port}"))
+            .expect("shared HTTP client");
+        let message = client.check_server().await.unwrap_err().to_string();
+        assert!(message.starts_with(LMSTUDIO_CONNECTION_ERROR), "{message}");
+        assert!(
+            message.contains(&format!(
+                "Request to http://127.0.0.1:{port}/models failed: "
+            )),
+            "{message}"
+        );
+        // The refused connection is only visible through the error's source chain.
+        assert!(message.contains("(os error"), "{message}");
     }
 
     #[tokio::test]

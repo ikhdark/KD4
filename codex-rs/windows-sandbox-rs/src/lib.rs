@@ -245,8 +245,6 @@ pub use acl::add_deny_read_ace;
 
 pub use acl::add_deny_write_ace;
 
-pub use acl::allow_null_device;
-
 pub use acl::ensure_allow_mask_aces;
 
 pub use acl::ensure_allow_mask_aces_with_inheritance;
@@ -358,6 +356,8 @@ pub use path_normalization::canonicalize_path;
 
 pub use process::ConsoleMode;
 
+pub use process::OUTPUT_DRAIN_AFTER_ROOT_EXIT;
+
 pub use process::PipeSpawnHandles;
 
 pub use process::StderrMode;
@@ -369,6 +369,8 @@ pub use process::create_process_as_user;
 pub use process::read_handle_loop;
 
 pub use process::spawn_process_with_pipes;
+
+pub use process::wait_for_output_readers;
 
 pub use resolved_permissions::ResolvedWindowsSandboxPermissions;
 
@@ -489,7 +491,6 @@ mod windows_impl {
     use super::sandbox_utils::ensure_codex_home_exists;
     use super::spawn_prep::LegacyAclSids;
     use super::spawn_prep::SpawnPrepOptions;
-    use super::spawn_prep::allow_null_device_for_workspace_write;
     use super::spawn_prep::apply_legacy_session_acl_rules;
     use super::spawn_prep::legacy_session_capability_roots;
     use super::spawn_prep::prepare_legacy_session_security;
@@ -500,6 +501,8 @@ mod windows_impl {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use std::collections::HashMap;
     use std::io;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
     use std::path::Path;
     use std::ptr;
     use std::sync::Arc;
@@ -923,7 +926,9 @@ mod windows_impl {
             cwd,
             capability_roots,
         )?;
-        allow_null_device_for_workspace_write(uses_write_capabilities);
+        // SAFETY: successful preparation transfers one valid owned token to this capture. Retain
+        // it through ACL and pipe setup errors until this function returns.
+        let _token_owner = unsafe { OwnedHandle::from_raw_handle(security.h_token.cast()) };
         apply_legacy_session_acl_rules(
             &permissions,
             codex_home,
@@ -941,8 +946,8 @@ mod windows_impl {
         // handles whose cleanup obligations are handled below.
         let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
-        // SAFETY: security retains the valid restricted token, and all child pipe ends remain open
-        // while process creation duplicates them. The command, cwd and environment remain
+        // SAFETY: _token_owner retains the valid restricted token, and all child pipe ends remain
+        // open while process creation duplicates them. The command, cwd and environment remain
         // borrowed throughout the synchronous call.
         let spawn_res = unsafe {
             create_process_as_user(
@@ -960,8 +965,7 @@ mod windows_impl {
             Ok(v) => v,
             Err(err) => {
                 // SAFETY: Process creation failed before ownership transfer; these six successfully
-                // allocated pipe ends and the restricted token are still owned here and are
-                // closed once.
+                // allocated pipe ends are still owned here and are closed once.
                 unsafe {
                     CloseHandle(in_r);
                     CloseHandle(in_w);
@@ -969,7 +973,6 @@ mod windows_impl {
                     CloseHandle(out_w);
                     CloseHandle(err_r);
                     CloseHandle(err_w);
-                    CloseHandle(security.h_token);
                 }
                 return Err(err);
             }
@@ -1066,9 +1069,9 @@ mod windows_impl {
             );
         }
 
-        // SAFETY: This capture invocation still owns the process/thread handles and restricted
-        // token after wait handling; it releases each non-null process handle once before
-        // collecting separately owned pipe readers.
+        // SAFETY: This capture invocation still owns the process/thread handles after wait
+        // handling; it releases each non-null handle once before collecting separately owned
+        // pipe readers.
         unsafe {
             if !pi.hThread.is_null() {
                 CloseHandle(pi.hThread);
@@ -1076,7 +1079,6 @@ mod windows_impl {
             if !pi.hProcess.is_null() {
                 CloseHandle(pi.hProcess);
             }
-            CloseHandle(security.h_token);
         }
         let stdout_result = stdout_reader.stop_and_collect();
         let stderr_result = stderr_reader.stop_and_collect();

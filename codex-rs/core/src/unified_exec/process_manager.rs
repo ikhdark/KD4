@@ -859,10 +859,19 @@ async fn finish_exited_process_result(
                     Err(_) => {
                         if let Ok(response) = &mut result {
                             let notice = "Process exited; completion bookkeeping is pending. Poll the retained session; do not rerun the command.";
-                            response.repair_notice = Some(match response.repair_notice.take() {
-                                Some(receipt) => format!("{receipt}\n{notice}"),
-                                None => notice.to_string(),
-                            });
+                            // The handler and its caller both finish an exited
+                            // process; the second bounded wait must not repeat it.
+                            if !response
+                                .repair_notice
+                                .as_deref()
+                                .is_some_and(|receipt| receipt.contains(notice))
+                            {
+                                response.repair_notice =
+                                    Some(match response.repair_notice.take() {
+                                        Some(receipt) => format!("{receipt}\n{notice}"),
+                                        None => notice.to_string(),
+                                    });
+                            }
                         }
                         return result;
                     }
@@ -947,7 +956,7 @@ impl UnifiedExecProcessManager {
                 };
                 process_id
             } else {
-                // production mode â†’ random
+                // production mode: random
                 rand::rng().random_range(1_000..100_000)
             };
 
@@ -1990,6 +1999,10 @@ impl UnifiedExecProcessManager {
         Ok(response)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Acquire both owners before acknowledging so cancellation cannot drop a committed result"
+    )]
     async fn acknowledge_output(
         &self,
         process: &Arc<UnifiedExecProcess>,

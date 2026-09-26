@@ -35,7 +35,6 @@ use super::*;
 use crate::AsyncIo;
 use crate::WebSocketConnection;
 use crate::WebSocketConnector;
-use crate::WebSocketTlsMode;
 
 #[tokio::test]
 async fn public_connector_uses_factory_and_exposes_stream_and_sink() {
@@ -108,92 +107,6 @@ async fn public_connector_enables_tcp_nodelay_when_requested() {
 }
 
 #[tokio::test]
-async fn tungstenite_default_tls_mode_ignores_invalid_custom_ca_in_a_subprocess() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-        let target_url = format!("ws://127.0.0.1:{}/v1/responses", target_addr.port());
-        let executable = std::env::current_exe().expect("test executable should be available");
-        let output = {
-            let mut command = Command::new(executable);
-            command.args([
-                "--exact",
-                "dialer::tests::tungstenite_default_tls_mode_subprocess_probe",
-                "--nocapture",
-            ]);
-            for key in [
-                "HTTP_PROXY",
-                "http_proxy",
-                "HTTPS_PROXY",
-                "https_proxy",
-                "ALL_PROXY",
-                "all_proxy",
-                "NO_PROXY",
-                "no_proxy",
-                "SSL_CERT_FILE",
-            ] {
-                command.env_remove(key);
-            }
-            command
-                .env(
-                    "CODEX_CA_CERTIFICATE",
-                    "/codex-websocket-client-nonexistent-custom-ca.pem",
-                )
-                .env("CODEX_WEBSOCKET_DEFAULT_TLS_PROBE_URL", target_url);
-            run_probe(command).await
-        };
-
-        assert!(
-            output.status.success(),
-            "WebSocket default-TLS subprocess failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        target_task.await.expect("target task should finish");
-    })
-    .await
-    .expect("WebSocket scenario timed out");
-}
-
-#[tokio::test]
-async fn tungstenite_default_tls_mode_subprocess_probe() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let Ok(url) = std::env::var("CODEX_WEBSOCKET_DEFAULT_TLS_PROBE_URL") else {
-            return;
-        };
-        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-        assert!(
-            WebSocketConnector::new(&factory).is_err(),
-            "explicit Codex TLS should reject the invalid custom CA"
-        );
-        let connector =
-            WebSocketConnector::new_with_tls_mode(&factory, WebSocketTlsMode::TungsteniteDefault)
-                .expect("Tungstenite-default TLS should ignore custom CA configuration");
-        let request = url
-            .into_client_request()
-            .expect("websocket request should build");
-        let (mut websocket, _) = connector
-            .connect(request, WebSocketConfig::default())
-            .await
-            .expect("WebSocket should connect without constructing Codex TLS");
-        let expected = Message::Text("Tungstenite default TLS".into());
-        websocket
-            .send(expected.clone())
-            .await
-            .expect("WebSocket should send");
-        assert_eq!(
-            websocket
-                .next()
-                .await
-                .expect("WebSocket should receive a message")
-                .expect("WebSocket message should be valid"),
-            expected
-        );
-    })
-    .await
-    .expect("WebSocket scenario timed out");
-}
-
-#[tokio::test]
 async fn direct_route_connects_secure_websocket() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let (tls_config, acceptor, _) = test_tls_configs();
@@ -205,7 +118,7 @@ async fn direct_route_connects_secure_websocket() {
         let (inner, _) = connect(
             request,
             WebSocketConfig::default(),
-            Some(tls_config),
+            tls_config,
             OutboundProxyRoute::Direct,
             TcpNodelay::Enabled,
         )
@@ -222,7 +135,7 @@ async fn direct_route_connects_secure_websocket() {
 #[tokio::test]
 async fn http_proxy_tunnels_secure_websocket_before_handshake() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ false).await;
+        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ false, "localhost").await;
     })
     .await
     .expect("WebSocket scenario timed out");
@@ -231,10 +144,98 @@ async fn http_proxy_tunnels_secure_websocket_before_handshake() {
 #[tokio::test]
 async fn https_proxy_tunnels_secure_websocket_before_handshake() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true).await;
+        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true, "localhost").await;
     })
     .await
     .expect("WebSocket scenario timed out");
+}
+
+#[tokio::test]
+async fn https_proxy_addressed_by_ipv6_literal_tunnels_secure_websocket() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        // The proxy URL keeps its IPv6 brackets through parsing; TLS must verify the address.
+        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true, "[::1]").await;
+    })
+    .await
+    .expect("WebSocket scenario timed out");
+}
+
+#[tokio::test]
+async fn transport_proxy_config_errors_redact_credentials_in_a_subprocess() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let executable = std::env::current_exe().expect("test executable should be available");
+        let mut command = Command::new(executable);
+        command.args([
+            "--exact",
+            "dialer::tests::transport_proxy_config_error_subprocess_probe",
+            "--nocapture",
+        ]);
+        for key in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            command.env_remove(key);
+        }
+        // The space makes Tungstenite reject the whole value while parsing the environment.
+        command
+            .env("HTTP_PROXY", PROXY_WITH_REJECTED_CREDENTIALS)
+            .env("NO_PROXY", "unrelated.example")
+            .env("CODEX_WEBSOCKET_PROXY_ERROR_PROBE", "1");
+        let output = run_probe(command).await;
+
+        assert!(
+            output.status.success(),
+            "WebSocket proxy error subprocess failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    })
+    .await
+    .expect("WebSocket scenario timed out");
+}
+
+const PROXY_WITH_REJECTED_CREDENTIALS: &str = "http://codex-user:codex secret@proxy.example:8080";
+
+#[tokio::test]
+async fn transport_proxy_config_error_subprocess_probe() {
+    if std::env::var_os("CODEX_WEBSOCKET_PROXY_ERROR_PROBE").is_none() {
+        return;
+    }
+    let request = "ws://127.0.0.1:9/v1/responses"
+        .into_client_request()
+        .expect("websocket request should build");
+    // Both routes delegate environment proxy parsing to Tungstenite before opening a socket.
+    for route in [
+        OutboundProxyRoute::TransportDefault,
+        OutboundProxyRoute::Proxy {
+            url: PROXY_WITH_REJECTED_CREDENTIALS.to_string(),
+            no_proxy: Some("unrelated.example".to_string()),
+        },
+    ] {
+        let error = match connect(
+            request.clone(),
+            WebSocketConfig::default(),
+            test_tls_configs().0,
+            route.clone(),
+            TcpNodelay::Default,
+        )
+        .await
+        {
+            Ok(_) => panic!("{route:?} accepted an unparsable proxy"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            error,
+            invalid_proxy_config().to_string(),
+            "{route:?} must not echo proxy configuration"
+        );
+    }
 }
 
 #[tokio::test]
@@ -312,7 +313,7 @@ async fn no_proxy_subprocess_probe() {
         let (inner, _) = connect(
             request,
             WebSocketConfig::default(),
-            Some(tls_config),
+            tls_config,
             OutboundProxyRoute::Proxy {
                 url: proxy_url,
                 no_proxy: Some(no_proxy),
@@ -656,11 +657,16 @@ async fn run_probe(command: Command) -> std::process::Output {
     }
 }
 
-async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
+async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool, proxy_host: &str) {
     let (tls_config, acceptor, _) = test_tls_configs();
     let (target_addr, target_task) = start_tls_websocket_server(acceptor.clone()).await;
 
-    let proxy_listener = TcpListener::bind("127.0.0.1:0")
+    let proxy_bind_address = if proxy_host == "localhost" {
+        "127.0.0.1:0"
+    } else {
+        "[::1]:0"
+    };
+    let proxy_listener = TcpListener::bind(proxy_bind_address)
         .await
         .expect("proxy listener should bind");
     let proxy_addr = proxy_listener
@@ -710,9 +716,9 @@ async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
     let (inner, _) = connect(
         request,
         WebSocketConfig::default(),
-        Some(tls_config),
+        tls_config,
         OutboundProxyRoute::Proxy {
-            url: format!("{proxy_scheme}://localhost:{}", proxy_addr.port()),
+            url: format!("{proxy_scheme}://{proxy_host}:{}", proxy_addr.port()),
             no_proxy: None,
         },
         TcpNodelay::Enabled,
@@ -756,7 +762,7 @@ async fn start_tls_websocket_server(acceptor: TlsAcceptor) -> (SocketAddr, JoinH
 fn test_tls_configs() -> (Arc<ClientConfig>, TlsAcceptor, CertificateDer<'static>) {
     ensure_rustls_crypto_provider();
     let CertifiedKey { cert, signing_key } =
-        generate_simple_self_signed(vec!["localhost".to_string()])
+        generate_simple_self_signed(vec!["localhost".to_string(), "::1".to_string()])
             .expect("test certificate should generate");
     let certificate = cert.der().clone();
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));

@@ -222,6 +222,16 @@ fn native_stdio_preserves_early_notifications_and_rejects_failed_terminal() {
             evidence.completed_turns,
             usize::from(terminal == "completed")
         );
+        // Turn time excludes launch and the handshake; a failed turn records none.
+        assert_eq!(evidence.turn_elapsed_ms.is_some(), terminal == "completed");
+        assert!(
+            evidence
+                .turn_elapsed_ms
+                .is_none_or(|turn| turn < evidence.elapsed_ms),
+            "{:?} of {}",
+            evidence.turn_elapsed_ms,
+            evidence.elapsed_ms
+        );
         assert!(
             evidence
                 .events

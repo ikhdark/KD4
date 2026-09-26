@@ -498,11 +498,6 @@ impl LocalProcess {
                 || has_new_terminal_event
                 || tokio::time::Instant::now() >= deadline
             {
-                let _total_bytes: usize = response
-                    .chunks
-                    .iter()
-                    .map(|chunk| chunk.chunk.0.len())
-                    .sum();
                 return Ok(response);
             }
 
@@ -525,7 +520,6 @@ impl LocalProcess {
         &self,
         params: WriteParams,
     ) -> Result<WriteResponse, JSONRPCErrorError> {
-        let _input_bytes = params.chunk.0.len();
         if params.write_id.is_empty() {
             return Err(invalid_params("writeId must not be empty".to_string()));
         }
@@ -856,7 +850,6 @@ async fn stream_output(
     output_notify: Arc<Notify>,
 ) {
     while let Some(chunk) = receiver.recv().await {
-        let _chunk_len = chunk.len();
         let notification = {
             let mut processes = inner.processes.lock().await;
             let Some(entry) = processes.get_mut(&process_id) else {

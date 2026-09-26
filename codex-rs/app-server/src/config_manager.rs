@@ -291,7 +291,7 @@ impl ConfigManager {
             .keys()
             .map(|key| Ok((key, codex_config::parse_override_key(key)?)))
             .collect::<std::io::Result<Vec<_>>>()?;
-        keys.sort_by(|(left, _), (right, _)| left.cmp(right));
+        keys.sort_by_key(|(key, _)| *key);
         for (index, (key, path)) in keys.iter().enumerate() {
             for (ancestor, ancestor_path) in &keys[..index] {
                 if path.starts_with(ancestor_path) || ancestor_path.starts_with(path) {

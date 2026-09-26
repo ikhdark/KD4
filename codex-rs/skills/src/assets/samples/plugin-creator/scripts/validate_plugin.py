@@ -10,8 +10,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
-import yaml
-
 
 TODO_MARKER = "[TODO:"
 SEMVER_RE = re.compile(
@@ -422,6 +420,9 @@ def validate_skill_manifests(plugin_root: Path, errors: list[str]) -> None:
 
 
 def validate_skill_manifest(skill_root: Path, errors: list[str]) -> None:
+    # PyYAML is only needed for bundled skills; plugins without skills validate without it.
+    import yaml
+
     skill_md_path = skill_root / "SKILL.md"
     if not skill_md_path.is_file():
         errors.append(f"skill `{skill_root.name}` is missing `SKILL.md`")
@@ -480,6 +481,8 @@ def validate_skill_agent_manifest(
     agent_yaml_path: Path,
     errors: list[str],
 ) -> None:
+    import yaml
+
     try:
         payload = yaml.safe_load(agent_yaml_path.read_text(encoding="utf-8"))
     except OSError:

@@ -82,6 +82,33 @@ impl ModelContextBudget {
         self.remaining_bytes = self.remaining_bytes.saturating_sub(admitted.len());
         Some(std::borrow::Cow::Owned(admitted))
     }
+
+    /// Admit a rendered fragment, truncating only its body so its start and end
+    /// markers survive.
+    ///
+    /// Truncating rendered text can cut a marker, and a fragment missing either
+    /// marker no longer matches its registration, so a user-role fragment would
+    /// be treated as user input. When the markers leave no room for body text,
+    /// the fragment is omitted without charging the budget.
+    pub fn take_fragment<F>(&mut self, fragment: &F) -> Option<String>
+    where
+        F: ContextualUserFragment + ?Sized,
+    {
+        let (start_marker, end_marker) = fragment.markers();
+        let markers_len = start_marker.len().saturating_add(end_marker.len());
+        let body = fragment.body();
+        let body = if markers_len.saturating_add(body.len()) <= self.remaining_bytes {
+            body
+        } else {
+            let mut body_budget = Self {
+                remaining_bytes: self.remaining_bytes.checked_sub(markers_len)?,
+            };
+            std::borrow::Cow::Owned(body_budget.take(&body)?.into_owned())
+        };
+        let rendered = format!("{start_marker}{body}{end_marker}");
+        self.remaining_bytes -= rendered.len();
+        Some(rendered)
+    }
 }
 
 /// An already-rendered fragment used after aggregate budget enforcement.

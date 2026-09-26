@@ -1260,6 +1260,8 @@ fn resolve_color_str(
 }
 
 fn extract_frontmatter(contents: &str) -> Option<String> {
+    // Windows editors commonly save UTF-8 with a BOM; it must not hide the opening delimiter.
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     let mut lines = contents.lines();
     if !matches!(lines.next(), Some(line) if line.trim() == "---") {
         return None;

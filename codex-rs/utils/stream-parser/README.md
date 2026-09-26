@@ -11,66 +11,49 @@ modify the code
 ## What it provides
 
 - `StreamTextParser`: trait for incremental parsers that consume string chunks
-- `InlineHiddenTagParser<T>`: generic parser that hides inline tags and extracts their contents
-- `CitationStreamParser`: convenience wrapper for `<oai-mem-citation>...</oai-mem-citation>`
-- `strip_citations(...)`: one-shot helper for non-streamed strings
+- `ProposedPlanParser`: splits plan-mode output into visible text and `<proposed_plan>` segments
+- `AssistantTextStreamParser`: applies `ProposedPlanParser` in plan mode and passes text through
+  unchanged otherwise
+- `strip_proposed_plan_blocks(...)` / `extract_proposed_plan_text(...)`: one-shot helpers for
+  non-streamed strings
 
 ## Why this exists
 
-Some model outputs arrive as a stream and may contain hidden markup (for example
-`<oai-mem-citation>...</oai-mem-citation>`) split across chunk boundaries. Parsing each chunk
-independently is incorrect because tags can be split (`<oai-mem-` + `citation>`).
+Plan-mode model output arrives as a stream, and a `<proposed_plan>` tag line can be split across
+chunk boundaries (`<proposed` + `_plan>`). Parsing each chunk independently is incorrect.
 
-This crate keeps parser state across chunks, returns visible text safe to render
-immediately, and extracts hidden payloads separately.
+This crate keeps parser state across chunks, returns visible text safe to render immediately, and
+extracts plan segments separately.
 
-## Example: citation streaming
-
-```rust
-use codex_utils_stream_parser::CitationStreamParser;
-use codex_utils_stream_parser::StreamTextParser;
-
-let mut parser = CitationStreamParser::new();
-
-let first = parser.push_str("Hello <oai-mem-");
-assert_eq!(first.visible_text, "Hello ");
-assert!(first.extracted.is_empty());
-
-let second = parser.push_str("citation>doc A</oai-mem-citation> world");
-assert_eq!(second.visible_text, " world");
-assert_eq!(second.extracted, vec!["doc A".to_string()]);
-
-let tail = parser.finish();
-assert!(tail.visible_text.is_empty());
-assert!(tail.extracted.is_empty());
-```
-
-## Example: custom hidden tags
+## Example: plan streaming
 
 ```rust
-use codex_utils_stream_parser::InlineHiddenTagParser;
-use codex_utils_stream_parser::InlineTagSpec;
+use codex_utils_stream_parser::ProposedPlanParser;
+use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::StreamTextParser;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Tag {
-    Secret,
-}
+let mut parser = ProposedPlanParser::new();
 
-let mut parser = InlineHiddenTagParser::new(vec![InlineTagSpec {
-    tag: Tag::Secret,
-    open: "<secret>",
-    close: "</secret>",
-}]);
+let first = parser.push_str("Intro\n<proposed");
+assert_eq!(first.visible_text, "Intro\n");
 
-let out = parser.push_str("a<secret>x</secret>b");
-assert_eq!(out.visible_text, "ab");
-assert_eq!(out.extracted.len(), 1);
-assert_eq!(out.extracted[0].content, "x");
+let second = parser.push_str("_plan>\n- step\n</proposed_plan>\nOutro");
+assert_eq!(second.visible_text, "Outro");
+assert_eq!(
+    second.extracted,
+    vec![
+        ProposedPlanSegment::ProposedPlanStart,
+        ProposedPlanSegment::ProposedPlanDelta("- step\n".to_string()),
+        ProposedPlanSegment::ProposedPlanEnd,
+        ProposedPlanSegment::Normal("Outro".to_string()),
+    ]
+);
+
+assert!(parser.finish().is_empty());
 ```
 
 ## Known limitations
 
-- Tags are matched literally and case-sensitively
+- Tags are matched literally and case-sensitively, and only when alone on a line
 - No nested tag support
 - A stream can return empty objects.

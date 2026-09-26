@@ -155,8 +155,6 @@ mod model_migration;
 mod motion;
 mod multi_agents;
 mod notifications;
-#[cfg(any(not(debug_assertions), test))]
-mod npm_registry;
 pub(crate) mod onboarding;
 mod oss_selection;
 mod pager_overlay;
@@ -1278,7 +1276,7 @@ async fn run_ratatui_app(
     #[cfg(not(debug_assertions))]
     let update_action = update_action::get_update_action();
     #[cfg(not(debug_assertions))]
-    let startup_version = updates::startup_version_info(&initial_config, update_action).await;
+    let startup_version = updates::startup_version_info(&initial_config).await;
 
     #[cfg(not(debug_assertions))]
     {

@@ -89,8 +89,50 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_core_skills::SkillRenderReport;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+
+    fn available_skills(skill_root_lines: Vec<String>) -> AvailableSkills {
+        AvailableSkills {
+            skill_root_lines,
+            skill_lines: vec!["- demo: example skill".to_string()],
+            report: SkillRenderReport {
+                total_count: 1,
+                included_count: 1,
+                omitted_count: 0,
+                truncated_description_chars: 0,
+                truncated_description_count: 0,
+            },
+            warning_message: None,
+        }
+    }
+
+    /// The catalog advertises `skill:` locators, so the guidance has to name the
+    /// tool that resolves them. Saying "their stated provider" without naming one
+    /// left the model with locators and no way to load them.
+    #[test]
+    fn skill_usage_guidance_names_the_tool_that_loads_skill_locators() {
+        assert!(
+            SKILLS_HOW_TO_USE.contains("`skill:` locators with `read_file`"),
+            "skill locators must name read_file as their provider: {SKILLS_HOW_TO_USE}"
+        );
+    }
+
+    #[test]
+    fn rendered_skill_catalog_does_not_repeat_shared_usage_guidance() {
+        for skill_root_lines in [Vec::new(), vec!["- r0: C:\\workspace\\skills".to_string()]] {
+            let rendered = AvailableSkillsInstructions::from_available_skills(&available_skills(
+                skill_root_lines,
+            ))
+            .render();
+
+            assert!(rendered.starts_with("<skills_instructions>"));
+            assert!(rendered.ends_with("</skills_instructions>"));
+            assert!(!rendered.contains("How to use skills"));
+            assert!(!rendered.contains("read the selected `SKILL.md` completely"));
+        }
+    }
 
     #[tokio::test]
     async fn bounded_catalog_reports_omissions_in_model_context() {

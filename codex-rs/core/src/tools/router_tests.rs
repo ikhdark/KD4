@@ -260,6 +260,7 @@ async fn unchanged_rollout_tool_manifest_uses_a_compact_reference() {
 async fn model_visible_schema_lookup_does_not_materialize_rollout_manifest() -> anyhow::Result<()> {
     let (_, mut turn) = make_session_and_context().await;
     turn.model_info.supports_search_tool = true;
+    turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
     let hidden_tool = "hidden_manifest_counter_tool";
@@ -549,7 +550,7 @@ async fn enable_typed_router_task_with_state_home(
         .expect("typed assignment is bound");
     assert!(
         coordinator
-            .heartbeat_typed_actor_binding(&binding)
+            .heartbeat_typed_actor_binding(&binding, /*progress*/ false)
             .await
             .expect("bound fixture actor heartbeat is persisted"),
         "normal typed routing requires an active assignment bound to this session thread"
@@ -1077,6 +1078,74 @@ async fn inactive_typed_assignment_is_a_blocked_tool_call() {
         crate::FunctionCallError::RequiredOperationBlocked(message)
             if message.contains("no longer active")
     ));
+}
+
+#[tokio::test]
+async fn authorized_typed_tool_call_defers_nonproductive_recovery() {
+    let temp = tempfile::tempdir().expect("temporary repository");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let (mut session, mut turn) = make_session_and_context().await;
+    let (attempt_id, store) =
+        enable_typed_router_task(&mut session, &mut turn, &repo, &["tracked.txt"]).await;
+    let assignment_id = session
+        .services
+        .agent_control
+        .task_coordinator()
+        .binding_for_source(&turn.session_source)
+        .expect("typed task binding")
+        .assignment_id;
+    // The bound child last progressed long ago, so root wait maintenance would abandon it.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(
+                repo.join(".typed-task-home")
+                    .join("agent-task-coordination")
+                    .join("agent_tasks.sqlite"),
+            ),
+        )
+        .await
+        .expect("coordination database opens");
+    let stale = serde_json::to_string(&(chrono::Utc::now() - chrono::Duration::minutes(10)))
+        .expect("stale timestamp serializes");
+    let updated =
+        sqlx::query("UPDATE workspace_actors SET last_progress_at = ? WHERE attempt_id = ?")
+            .bind(stale)
+            .bind(attempt_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("stale progress persists");
+    assert_eq!(updated.rows_affected(), 1);
+    pool.close().await;
+
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    authorize_bound_typed_tool_call(
+        &session,
+        step_context.as_ref(),
+        TypedToolClass::ReadSearch,
+        &ToolCall {
+            tool_name: ToolName::plain("read_tool_output"),
+            call_id: "productive-read".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        },
+        ExternalMutationIntent::ProvenReadOnly,
+    )
+    .await
+    .expect("active typed assignment authorizes a read");
+
+    let no_progress_before = chrono::Utc::now()
+        - chrono::Duration::seconds(codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS);
+    assert_eq!(
+        store
+            .recover_nonproductive_assignment(assignment_id, no_progress_before)
+            .await
+            .expect("recovery evaluates"),
+        codex_agent_task_store::NonproductiveRecovery::NotEligible
+    );
 }
 
 struct PatchReplyBarrierFileSystem {
@@ -2149,7 +2218,11 @@ async fn task_authority_fixture(
                 thread_id: Some(reviewer_session.thread_id.to_string()),
             })
             .await?;
-        assert!(coordinator.heartbeat_typed_actor_binding(&binding).await?);
+        assert!(
+            coordinator
+                .heartbeat_typed_actor_binding(&binding, /*progress*/ false)
+                .await?
+        );
         session = reviewer_session;
         turn = reviewer_turn;
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {

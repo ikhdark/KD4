@@ -3,6 +3,7 @@ use app_test_support::DEFAULT_CLIENT_NAME;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
+use app_test_support::write_mock_provider_config_toml;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::InitializeCapabilities;
@@ -22,15 +23,19 @@ use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Experimental methods and fields are rejected at the capability gate without
+/// disturbing the connection, so one stable client proves every surface and
+/// then starts a thread without experimental input.
 #[tokio::test]
-async fn mock_experimental_method_requires_experimental_api_capability() -> Result<()> {
+async fn experimental_api_surfaces_require_capability() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
+
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .without_auto_env()
         .build()
         .await?;
-
     let init = mcp
         .initialize_with_capabilities(
             default_client_info(),
@@ -49,38 +54,7 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
     let request_id = mcp
         .send_mock_experimental_method_request(MockExperimentalMethodParams::default())
         .await?;
-    let error = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_experimental_capability_error(error, "mock/experimentalMethod");
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_settings_update_requires_experimental_api_capability() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-
-    let init = mcp
-        .initialize_with_capabilities(
-            default_client_info(),
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                request_attestation: false,
-                opt_out_notification_methods: None,
-                mcp_server_openai_form_elicitation: false,
-            }),
-        )
-        .await?;
-    let JSONRPCMessage::Response(_) = init else {
-        anyhow::bail!("expected initialize response, got {init:?}");
-    };
+    expect_experimental_capability_error(&mut mcp, request_id, "mock/experimentalMethod").await?;
 
     let request_id = mcp
         .send_thread_settings_update_request(ThreadSettingsUpdateParams {
@@ -88,39 +62,7 @@ async fn thread_settings_update_requires_experimental_api_capability() -> Result
             ..Default::default()
         })
         .await?;
-    let error = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_experimental_capability_error(error, "thread/settings/update");
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_start_mock_field_requires_experimental_api_capability() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    let init = mcp
-        .initialize_with_capabilities(
-            default_client_info(),
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                request_attestation: false,
-                opt_out_notification_methods: None,
-                mcp_server_openai_form_elicitation: false,
-            }),
-        )
-        .await?;
-    let JSONRPCMessage::Response(_) = init else {
-        anyhow::bail!("expected initialize response, got {init:?}");
-    };
+    expect_experimental_capability_error(&mut mcp, request_id, "thread/settings/update").await?;
 
     let request_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -128,41 +70,26 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
             ..Default::default()
         })
         .await?;
-
-    let error = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    expect_experimental_capability_error(
+        &mut mcp,
+        request_id,
+        "thread/start.mockExperimentalField",
     )
-    .await??;
-    assert_experimental_capability_error(error, "thread/start.mockExperimentalField");
-    Ok(())
-}
+    .await?;
 
-#[tokio::test]
-async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capability()
--> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    let init = mcp
-        .initialize_with_capabilities(
-            default_client_info(),
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                request_attestation: false,
-                opt_out_notification_methods: None,
-                mcp_server_openai_form_elicitation: false,
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            approval_policy: Some(AskForApproval::Granular {
+                sandbox_approval: true,
+                rules: false,
+                skill_approval: false,
+                request_permissions: true,
+                mcp_elicitations: false,
             }),
-        )
+            ..Default::default()
+        })
         .await?;
-    let JSONRPCMessage::Response(_) = init else {
-        anyhow::bail!("expected initialize response, got {init:?}");
-    };
+    expect_experimental_capability_error(&mut mcp, request_id, "askForApproval.granular").await?;
 
     let request_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -179,54 +106,6 @@ async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capa
     Ok(())
 }
 
-#[tokio::test]
-async fn thread_start_granular_approval_policy_requires_experimental_api_capability() -> Result<()>
-{
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    let init = mcp
-        .initialize_with_capabilities(
-            default_client_info(),
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                request_attestation: false,
-                opt_out_notification_methods: None,
-                mcp_server_openai_form_elicitation: false,
-            }),
-        )
-        .await?;
-    let JSONRPCMessage::Response(_) = init else {
-        anyhow::bail!("expected initialize response, got {init:?}");
-    };
-
-    let request_id = mcp
-        .send_thread_start_request(ThreadStartParams {
-            approval_policy: Some(AskForApproval::Granular {
-                sandbox_approval: true,
-                rules: false,
-                skill_approval: false,
-                request_permissions: true,
-                mcp_elicitations: false,
-            }),
-            ..Default::default()
-        })
-        .await?;
-
-    let error = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_experimental_capability_error(error, "askForApproval.granular");
-    Ok(())
-}
-
 fn default_client_info() -> ClientInfo {
     ClientInfo {
         name: DEFAULT_CLIENT_NAME.to_string(),
@@ -235,34 +114,21 @@ fn default_client_info() -> ClientInfo {
     }
 }
 
-fn assert_experimental_capability_error(error: JSONRPCError, reason: &str) {
+async fn expect_experimental_capability_error(
+    mcp: &mut TestAppServer,
+    request_id: i64,
+    reason: &str,
+) -> Result<()> {
+    let error: JSONRPCError = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
     assert_eq!(error.error.code, -32600);
     assert_eq!(
         error.error.message,
         format!("{reason} requires experimentalApi capability")
     );
     assert_eq!(error.error.data, None);
-}
-
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
+    Ok(())
 }

@@ -177,14 +177,31 @@ fn live_print_working_directory() {
 
 #[test]
 fn run_codex_times_out() {
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("suite::live_cli::timeout_test_child")
-        .arg("--nocapture")
-        .env("CODEX_LIVE_CLI_TIMEOUT_CHILD", "1")
-        .spawn()
-        .expect("spawn timeout test child");
+    let spawn_child = |sleep: bool| {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("suite::live_cli::timeout_test_child")
+            .arg("--nocapture")
+            .stdout(Stdio::null())
+            .env_remove("CODEX_LIVE_CLI_TIMEOUT_CHILD");
+        if sleep {
+            command.env("CODEX_LIVE_CLI_TIMEOUT_CHILD", "1");
+        }
+        command.spawn().expect("spawn timeout test child")
+    };
 
+    // A child that exits before the deadline must report its status, so a
+    // helper that always times out cannot pass the deadline check below.
+    let mut exiting = spawn_child(/*sleep*/ false);
+    let status =
+        wait_for_child(&mut exiting, Duration::from_secs(30)).expect("poll exiting test child");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "exiting child should report success before the deadline: {status:?}"
+    );
+
+    let mut child = spawn_child(/*sleep*/ true);
     let status =
         wait_for_child(&mut child, Duration::from_millis(25)).expect("poll timeout test child");
     assert!(

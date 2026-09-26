@@ -48,6 +48,12 @@ pub use types::RequestId;
 pub use types::SessionId;
 pub use types::SupportedProtocolVersions;
 
+/// Operation requests a V1 host runs at once; it rejects requests beyond this.
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 256;
+/// Delegate requests a V1 host leaves awaiting client responses at once;
+/// further nested calls fail inside the host without reaching the client.
+pub const MAX_PENDING_DELEGATE_REQUESTS: usize = 256;
+
 #[cfg(test)]
 #[path = "host_tests.rs"]
 mod tests;

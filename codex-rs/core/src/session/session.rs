@@ -175,6 +175,9 @@ impl ToolHistoryPersistenceQueue {
             let mut journal_bytes = 0_u64;
             let mut journal_sequence = 0_u64;
             let mut checkpoint_required = false;
+            // The durable ledger already equals the mirror and no journal
+            // append awaits sync. Starts false: the loaded journal may be unsynced.
+            let mut mirror_checkpointed = false;
             let mut cleanup_required = false;
             let mut rollout_barrier: Option<LiveThread> = None;
             let mut progress = ToolHistoryPersistenceProgress::default();
@@ -218,9 +221,12 @@ impl ToolHistoryPersistenceQueue {
                                 ToolHistoryPersistenceCommand::Mutation(mutation) => {
                                     mutation.apply(&mut mirror);
                                     mutations.push(*mutation);
+                                    mirror_checkpointed = false;
                                 }
                                 ToolHistoryPersistenceCommand::Checkpoint => {
-                                    checkpoint_required = true
+                                    // Every turn terminal checkpoints; rewriting and
+                                    // syncing an unchanged ledger would add nothing.
+                                    checkpoint_required |= !mirror_checkpointed;
                                 }
                                 ToolHistoryPersistenceCommand::ReplaceSnapshot {
                                     snapshot,
@@ -232,6 +238,7 @@ impl ToolHistoryPersistenceQueue {
                                     rollout_barrier = replacement_barrier;
                                     checkpoint_required = true;
                                     cleanup_required = true;
+                                    mirror_checkpointed = false;
                                 }
                             }
                         }
@@ -321,6 +328,7 @@ impl ToolHistoryPersistenceQueue {
                                         }
                                     }
                                 }
+                                mirror_checkpointed = !checkpoint_required;
                                 journal_records = 0;
                                 journal_bytes = 0;
                                 #[cfg(test)]
@@ -1671,6 +1679,18 @@ impl Session {
                     });
                 }
                 state.set_tool_history_state(tool_history);
+            }
+            if thread_store
+                .as_any()
+                .downcast_ref::<LocalThreadStore>()
+                .is_some()
+            {
+                // Local rollouts decide whether another thread can still read
+                // its retained artifacts.
+                crate::tools::command_output_artifact::spawn_unresumable_thread_artifact_reclaim(
+                    config.codex_home.to_path_buf(),
+                    thread_id.to_string(),
+                );
             }
             let managed_network_requirements_configured = config
                 .config_layer_stack

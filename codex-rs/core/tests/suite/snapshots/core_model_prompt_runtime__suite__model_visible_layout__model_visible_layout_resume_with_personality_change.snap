@@ -6,22 +6,34 @@ expression: "format_labeled_requests_snapshot(\"First post-resume turn where res
 Scenario: First post-resume turn where resumed config model differs from rollout and personality changes.
 
 ## Last Request Before Resume
-00:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-01:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
-02:message/developer:<PERMISSIONS_INSTRUCTIONS>
-03:message/developer:<SKILLS_INSTRUCTIONS>
-04:message/developer:<personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-06:message/user:seed resume history
+00:message/developer[4]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <configured_developer_instructions state="removed" />
+    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [04] <SKILLS_INSTRUCTIONS>
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:message/user:seed resume history
 
 ## First Request After Resume
-00:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-01:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
-02:message/developer:<PERMISSIONS_INSTRUCTIONS>
-03:message/developer:<SKILLS_INSTRUCTIONS>
-04:message/developer:<personality_spec>Use the following communication style for future messages:\nBe warm, collabora...
-05:message/user:seed resume history
-06:message/assistant:recorded before resume
-07:message/developer:<model_switch>\nThe user was previously using a different model. Continue following the session'...
-08:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-09:message/user:resume and change personality
+00:message/developer[4]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <configured_developer_instructions state="removed" />
+    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [04] <SKILLS_INSTRUCTIONS>
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:message/user:seed resume history
+05:message/assistant:recorded before resume
+06:message/developer[3]:
+    [01] <model_switch>\nThe user was previously using a different model. Use the active instructions and...
+    [02] <PERMISSIONS_INSTRUCTIONS>
+    [03] <personality_spec>Use the following communication style for future messages:\nBe warm, collabora...
+07:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+08:message/user:resume and change personality

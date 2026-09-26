@@ -29,9 +29,14 @@ defines method names and their parameter and response types.
   snake-case JSONL interface, rather than app-server's camel-case items.
 
 Regenerate app-server fixtures with `just app-server-schema-regenerate <owner>`
-and check them with `just app-server-schema-check`. Experimental methods and
-fields depend on the client's experimental capability and the selected schema
-generation mode; consult the method registry before depending on them.
+and check them with `just app-server-schema-check`. Both compare the stable
+schemas with a contract revision and exit before doing any work unless
+`CODEX_SCHEMA_COMPATIBILITY_BASELINE=<rev>` is set (the check also accepts
+`--compatibility-baseline <rev>`). Only
+`just app-server-schema-regenerate <owner> --experimental` runs without a
+baseline. Experimental methods and fields depend on the client's experimental
+capability and the selected schema generation mode; consult the method registry
+before depending on them.
 
 ## Host filesystem operations
 

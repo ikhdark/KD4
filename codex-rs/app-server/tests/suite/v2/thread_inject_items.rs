@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::to_response;
+use app_test_support::write_mock_provider_config_toml;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadInjectItemsParams;
@@ -34,7 +35,7 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
     let response_mock = responses::mount_sse_once(&server, body).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -154,7 +155,7 @@ async fn thread_inject_items_adds_raw_response_items_after_a_turn() -> Result<()
     let response_mock = responses::mount_sse_sequence(&server, vec![first_body, second_body]).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -274,29 +275,6 @@ fn response_item_json_without_id(mut item: Value) -> Value {
         object.remove("id");
     }
     responses::strip_metadata_from_json(item)
-}
-
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
 }
 
 fn response_item_text_position(items: &[Value], needle: &str) -> Option<usize> {

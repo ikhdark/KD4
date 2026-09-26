@@ -19,7 +19,7 @@ pub(crate) enum TaggedLineSegment<T> {
 }
 
 /// Stateful line parser that splits input into normal text vs tag blocks.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TaggedLineParser<T>
 where
     T: Copy + Eq,

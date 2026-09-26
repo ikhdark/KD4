@@ -1,6 +1,7 @@
 use std::env;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use codex_agent_identity::AgentIdentityKey;
 use codex_agent_identity::ChatGptEnvironment;
@@ -27,6 +28,10 @@ use crate::outbound_proxy::AuthRouteConfig;
 use super::storage::AgentIdentityAuthRecord;
 
 pub(super) const MAX_AGENT_IDENTITY_BOOTSTRAP_ATTEMPTS: usize = 3;
+// Immediate retries cannot outlast a rate limit or brief outage, and exhausting them
+// starts the shared one-hour bootstrap cooldown. Each retry waits this delay times its
+// attempt number.
+const AGENT_IDENTITY_REGISTRATION_RETRY_DELAY: Duration = Duration::from_millis(500);
 const CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL_ENV_VAR: &str = "CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL";
 const CODEX_AGENT_IDENTITY_JWKS_BASE_URL_ENV_VAR: &str = "CODEX_AGENT_IDENTITY_JWKS_BASE_URL";
 
@@ -329,12 +334,16 @@ where
                 if attempt < MAX_AGENT_IDENTITY_BOOTSTRAP_ATTEMPTS
                     && is_retryable_io_registration_error(&err) =>
             {
+                let retry_delay = AGENT_IDENTITY_REGISTRATION_RETRY_DELAY
+                    .saturating_mul(u32::try_from(attempt).unwrap_or(u32::MAX));
                 tracing::warn!(
                     attempt,
                     max_attempts = MAX_AGENT_IDENTITY_BOOTSTRAP_ATTEMPTS,
+                    ?retry_delay,
                     error = %err,
                     "agent identity registration attempt failed; retrying"
                 );
+                tokio::time::sleep(retry_delay).await;
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -397,8 +406,6 @@ impl std::fmt::Debug for ManagedChatGptAgentIdentityBinding {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
 
     use codex_agent_identity::generate_agent_key_material;
     use pretty_assertions::assert_eq;
@@ -515,12 +522,16 @@ mod tests {
     #[tokio::test]
     async fn from_record_retries_transient_registration() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let response_count = Arc::clone(&request_count);
+        let request_times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response_times = Arc::clone(&request_times);
         Mock::given(method("POST"))
             .and(path("/v1/agent/agent-runtime-1/task/register"))
             .respond_with(move |_request: &wiremock::Request| {
-                if response_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut times = response_times
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                times.push(std::time::Instant::now());
+                if times.len() == 1 {
                     ResponseTemplate::new(500)
                 } else {
                     ResponseTemplate::new(200).set_body_json(json!({
@@ -538,7 +549,17 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let times = request_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(times.len(), 2);
+        // An immediate retry would hit a rate limit or brief outage again.
+        assert!(
+            times[1].duration_since(times[0]) >= AGENT_IDENTITY_REGISTRATION_RETRY_DELAY,
+            "retry was sent {:?} after the transient failure",
+            times[1].duration_since(times[0])
+        );
         assert_eq!(auth.run_task_id(), "task-run-1");
         Ok(())
     }

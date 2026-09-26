@@ -64,11 +64,15 @@ async fn try_init_waits_for_concurrent_startup_backfill() -> anyhow::Result<()> 
             .await
     });
 
+    // Completion is observed by the next database poll; a short interval keeps
+    // the production wait bound without spending the one-second cadence.
     let initialized = try_init_with_roots_and_backfill_lease(
         home.path().to_path_buf(),
         home.path().to_path_buf(),
         "test-provider".to_string(),
         /*backfill_lease_seconds*/ 60,
+        STARTUP_BACKFILL_WAIT_TIMEOUT,
+        /*poll_interval*/ std::time::Duration::from_millis(10),
     )
     .await?;
     complete_backfill.await??;
@@ -89,11 +93,15 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
     let claimed = runtime.try_claim_backfill(/*lease_seconds*/ 60).await?;
     assert!(claimed);
 
+    // The unexpired lease keeps this backfill stuck, so any bound must expire.
+    // The production 30-second bound itself is covered with paused time below.
     let result = try_init_with_roots_and_backfill_lease(
         home.path().to_path_buf(),
         home.path().to_path_buf(),
         "test-provider".to_string(),
         /*backfill_lease_seconds*/ 60,
+        /*wait_timeout*/ std::time::Duration::from_millis(200),
+        /*poll_interval*/ std::time::Duration::from_millis(10),
     )
     .await;
     let err = match result {
@@ -117,6 +125,7 @@ async fn startup_backfill_timeout_covers_in_flight_work() {
         std::time::Duration::from_secs(31),
         wait_for_backfill_gate_with_timeout(
             home.path(),
+            STARTUP_BACKFILL_WAIT_TIMEOUT,
             std::future::pending::<anyhow::Result<()>>(),
         ),
     )
@@ -129,6 +138,57 @@ async fn startup_backfill_timeout_covers_in_flight_work() {
             .contains("timed out waiting for state db backfill"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn startup_gate_releases_its_claim_when_its_bound_stops_backfill() -> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let thread_id = ThreadId::new();
+    write_rollout_with_user_message(home.path(), thread_id, "resume me")?;
+    let runtime =
+        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+            .await?;
+
+    // An exhausted bound stops this startup's own backfill before its first rollout.
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_backfill_gate(
+            runtime.as_ref(),
+            home.path(),
+            "test-provider",
+            /*backfill_lease_seconds*/ Some(60),
+            /*wait_timeout*/ std::time::Duration::ZERO,
+            /*poll_interval*/ std::time::Duration::from_millis(10),
+        ),
+    )
+    .await
+    .expect("a stopped backfill must not leave the gate polling its own claim");
+    let err = stopped.expect_err("an exhausted bound leaves the backfill incomplete");
+    assert!(
+        err.to_string().contains("remains incomplete"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        runtime.get_backfill_state().await?.status,
+        codex_state::BackfillStatus::Pending
+    );
+
+    // The next startup claims at once instead of waiting out the 60-second lease.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_backfill_gate(
+            runtime.as_ref(),
+            home.path(),
+            "test-provider",
+            /*backfill_lease_seconds*/ Some(60),
+            STARTUP_BACKFILL_WAIT_TIMEOUT,
+            /*poll_interval*/ std::time::Duration::from_millis(10),
+        ),
+    )
+    .await
+    .expect("a released claim must not block the next startup")?;
+    assert!(runtime.get_thread(thread_id).await?.is_some());
+    Ok(())
 }
 
 #[tokio::test]

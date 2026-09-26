@@ -58,9 +58,13 @@ impl MarketplaceRequestProcessor {
             },
         )
         .await
-        .map(|outcome| MarketplaceRemoveResponse {
-            marketplace_name: outcome.marketplace_name,
-            installed_root: outcome.removed_installed_root,
+        .map(|outcome| {
+            // The marketplace edit bypasses ConfigManager; publish it to the next read.
+            self.config_manager.invalidate_load_cache();
+            MarketplaceRemoveResponse {
+                marketplace_name: outcome.marketplace_name,
+                installed_root: outcome.removed_installed_root,
+            }
         })
         .map_err(|err| match err {
             MarketplaceRemoveError::InvalidRequest(message) => invalid_request(message),
@@ -86,6 +90,10 @@ impl MarketplaceRequestProcessor {
         .await
         .map_err(|err| internal_error(format!("failed to upgrade marketplaces: {err}")))?
         .map_err(invalid_request)?;
+        if !outcome.upgraded_roots.is_empty() {
+            // Each upgraded root recorded its revision outside ConfigManager; publish it to the next read.
+            self.config_manager.invalidate_load_cache();
+        }
 
         Ok(MarketplaceUpgradeResponse {
             selected_marketplaces: outcome.selected_marketplaces,
@@ -116,10 +124,14 @@ impl MarketplaceRequestProcessor {
             },
         )
         .await
-        .map(|outcome| MarketplaceAddResponse {
-            marketplace_name: outcome.marketplace_name,
-            installed_root: outcome.installed_root,
-            already_added: outcome.already_added,
+        .map(|outcome| {
+            // The marketplace edit bypasses ConfigManager; publish it to the next read.
+            self.config_manager.invalidate_load_cache();
+            MarketplaceAddResponse {
+                marketplace_name: outcome.marketplace_name,
+                installed_root: outcome.installed_root,
+                already_added: outcome.already_added,
+            }
         })
         .map_err(|err| match err {
             MarketplaceAddError::InvalidRequest(message) => invalid_request(message),

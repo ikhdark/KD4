@@ -616,6 +616,10 @@ mod tests {
         assert!(
             matches!(err, ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id)
         );
+        assert!(
+            !store.projections.lock().await.contains_key(&thread_id),
+            "a rejected append must not load and retain the closed thread's history"
+        );
     }
 
     #[tokio::test]
@@ -682,6 +686,51 @@ mod tests {
             vec!["turn-1"]
         );
         assert!(store.projections.lock().await.contains_key(&thread_id));
+    }
+
+    #[tokio::test]
+    async fn unloaded_turn_pages_keep_a_bounded_projection_cache() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let live_thread_id = ThreadId::default();
+        store
+            .create_thread(create_thread_params(live_thread_id))
+            .await
+            .expect("create live thread");
+        let unloaded_thread_ids = (0..6)
+            .map(|index| {
+                let uuid = uuid::Uuid::from_u128(500 + index);
+                write_session_file(home.path(), &format!("2025-01-03T12-00-0{index}"), uuid)
+                    .expect("session file");
+                ThreadId::from_string(&uuid.to_string()).expect("valid thread id")
+            })
+            .collect::<Vec<_>>();
+
+        for thread_id in &unloaded_thread_ids {
+            store
+                .list_turns(crate::ListTurnsParams {
+                    thread_id: *thread_id,
+                    include_archived: false,
+                    cursor: None,
+                    page_size: 10,
+                    sort_direction: crate::SortDirection::Asc,
+                    items_view: crate::StoredTurnItemsView::Summary,
+                })
+                .await
+                .expect("list unloaded thread turns");
+        }
+
+        let projections = store.projections.lock().await;
+        assert!(
+            projections.contains_key(&live_thread_id),
+            "live projections must never be evicted"
+        );
+        let retained = unloaded_thread_ids
+            .iter()
+            .filter(|thread_id| projections.contains_key(thread_id))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(retained, unloaded_thread_ids[2..].to_vec());
     }
 
     #[tokio::test]

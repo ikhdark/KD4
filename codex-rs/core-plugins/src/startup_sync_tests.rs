@@ -57,6 +57,19 @@ fn plugin_command_output_snapshot_does_not_move_writer_cursor() {
 }
 
 #[test]
+fn command_poll_schedule_checks_early_without_skipping_fixed_interval_checks() {
+    let mut schedule = CommandPollSchedule::new();
+    let mut elapsed = Duration::ZERO;
+    let mut checks = Vec::new();
+    while elapsed < Duration::from_millis(300) {
+        elapsed += schedule.delay_after(elapsed);
+        checks.push(elapsed.as_millis());
+    }
+    // Short helper commands are seen early, and every 100ms check of fixed polling remains.
+    assert_eq!(checks, [1, 3, 7, 15, 31, 63, 100, 200, 300]);
+}
+
+#[test]
 fn zip_extraction_rejects_excessive_entries_before_writing_files() {
     let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for index in 0..=CURATED_PLUGINS_MAX_ARCHIVE_ENTRIES {

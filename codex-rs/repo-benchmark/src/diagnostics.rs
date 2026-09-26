@@ -274,6 +274,7 @@ mod tests {
             attempt_id: "failed-startup".into(),
             status: "setup_failed".into(),
             elapsed_ms: 40,
+            turn_elapsed_ms: None,
             cleanup_ms: 0,
             thread_id: None,
             completed_turns: 0,

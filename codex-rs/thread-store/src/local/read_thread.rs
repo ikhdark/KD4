@@ -30,50 +30,93 @@ pub(super) async fn read_thread(
     params: ReadThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
-    if let Some(mut metadata) = read_sqlite_metadata(store, thread_id).await {
-        resolve_sqlite_rollout_location(store, &mut metadata).await?;
-        if params.include_archived
-            || (metadata.archived_at.is_none()
-                && !rollout_path_is_archived(
-                    store.config.codex_home.as_path(),
-                    metadata.rollout_path.as_path(),
-                ))
-        {
-            let rollout_path = metadata.rollout_path.clone();
-            let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
-            reject_paginated_history(&thread, params.include_history)?;
-            let preloaded_history = if params.include_history {
-                load_history_items_for_thread(&rollout_path, thread_id).await
-            } else {
-                None
-            };
-            if params.include_history && preloaded_history.is_none() {
-                // SQLite metadata can outlive a moved/recreated rollout path. Fall through to the
-                // canonical path resolver when the single history read does not match this thread.
-            } else {
-                if !params.include_history
-                    && let Some(rollout_path) = thread.rollout_path.clone()
-                    && let Some(item) = read_thread_item_from_rollout(rollout_path).await
-                    && item.thread_id == Some(thread_id)
-                    && let Some(rollout_thread) = stored_thread_from_rollout_item(
-                        item,
-                        false,
-                        &store.config.default_model_provider_id,
-                    )
-                    && !rollout_thread.preview.is_empty()
-                {
-                    // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
-                    // object remains authoritative for every persisted metadata field.
-                    thread.preview = rollout_thread.preview;
-                }
-                if let Some(items) = preloaded_history {
-                    thread.history = Some(StoredThreadHistory { thread_id, items });
-                }
-                return Ok(thread);
+    if let Some(metadata) = visible_sqlite_metadata(store, thread_id, params.include_archived).await?
+    {
+        let rollout_path = metadata.rollout_path.clone();
+        let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
+        reject_paginated_history(&thread, params.include_history)?;
+        let preloaded_history = if params.include_history {
+            load_history_items_for_thread(&rollout_path, thread_id).await
+        } else {
+            None
+        };
+        if params.include_history && preloaded_history.is_none() {
+            // SQLite metadata can outlive a moved/recreated rollout path. Fall through to the
+            // canonical path resolver when the single history read does not match this thread.
+        } else {
+            if !params.include_history
+                && let Some(rollout_path) = thread.rollout_path.clone()
+                && let Some(item) = read_thread_item_from_rollout(rollout_path).await
+                && item.thread_id == Some(thread_id)
+                && let Some(rollout_thread) = stored_thread_from_rollout_item(
+                    item,
+                    false,
+                    &store.config.default_model_provider_id,
+                )
+                && !rollout_thread.preview.is_empty()
+            {
+                // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
+                // object remains authoritative for every persisted metadata field.
+                thread.preview = rollout_thread.preview;
             }
+            if let Some(items) = preloaded_history {
+                thread.history = Some(StoredThreadHistory { thread_id, items });
+            }
+            return Ok(thread);
         }
     }
 
+    read_thread_from_resolved_rollout(store, params).await
+}
+
+/// Returns the rollout path a summary read would report, with the same visibility and identity
+/// checks, without building the summary's name, preview, and session-metadata fields.
+pub(super) async fn read_thread_rollout_path(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    include_archived: bool,
+) -> ThreadStoreResult<Option<std::path::PathBuf>> {
+    if let Some(metadata) = visible_sqlite_metadata(store, thread_id, include_archived).await? {
+        return Ok(Some(codex_rollout::plain_rollout_path(
+            metadata.rollout_path.as_path(),
+        )));
+    }
+    read_thread_from_resolved_rollout(
+        store,
+        ReadThreadParams {
+            thread_id,
+            include_archived,
+            include_history: false,
+        },
+    )
+    .await
+    .map(|thread| thread.rollout_path)
+}
+
+/// SQLite metadata for a thread, when present and visible under `include_archived`.
+async fn visible_sqlite_metadata(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    include_archived: bool,
+) -> ThreadStoreResult<Option<ThreadMetadata>> {
+    let Some(mut metadata) = read_sqlite_metadata(store, thread_id).await else {
+        return Ok(None);
+    };
+    resolve_sqlite_rollout_location(store, &mut metadata).await?;
+    let visible = include_archived
+        || (metadata.archived_at.is_none()
+            && !rollout_path_is_archived(
+                store.config.codex_home.as_path(),
+                metadata.rollout_path.as_path(),
+            ));
+    Ok(visible.then_some(metadata))
+}
+
+async fn read_thread_from_resolved_rollout(
+    store: &LocalThreadStore,
+    params: ReadThreadParams,
+) -> ThreadStoreResult<StoredThread> {
+    let thread_id = params.thread_id;
     let path = resolve_rollout_path(
         store,
         thread_id,

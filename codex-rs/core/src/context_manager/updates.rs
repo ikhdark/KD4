@@ -235,7 +235,11 @@ pub(crate) fn build_settings_update_items(
     let developer_update_sections = [
         // Keep the model-switch compatibility note first, followed by independent setting
         // deltas that remain relevant to the new model.
-        build_model_switch_update_item(previous_turn_settings, next),
+        if previous.is_some_and(|previous| previous.model == next.model_info.slug) {
+            None
+        } else {
+            build_model_switch_update_item(previous_turn_settings, next)
+        },
         build_permissions_update_item(previous, next, exec_policy),
         build_collaboration_mode_update_item(previous, next),
         build_multi_agent_mode_update_item(previous, next),

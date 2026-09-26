@@ -78,13 +78,10 @@ async fn poll_advertises_noninteractive_session_capabilities() {
     else {
         panic!("expected function output");
     };
-    assert!(
-        output
-            .body
-            .to_text()
-            .unwrap()
-            .contains("stdin=false, interrupt=false, cancellation=false, polling=true")
-    );
+    // Direct callers see the same live-session capabilities as code mode.
+    let prompt: serde_json::Value = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+    assert_eq!(prompt["session_id"], 1000);
+    assert_eq!(prompt["session_capabilities"], value["session_capabilities"]);
     manager.process_store.lock().await.remove(1000);
     process.terminate_confirmed().await.unwrap();
 }
@@ -2522,16 +2519,18 @@ async fn network_denial_fallback_message_names_sandbox_network_proxy() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn late_network_denial_grace_observes_cancellation_after_exit() {
     let cancellation = CancellationToken::new();
     let cancellation_for_task = cancellation.clone();
+    let started_at = Instant::now();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(10)).await;
         cancellation_for_task.cancel();
     });
 
     assert!(wait_for_late_network_denial(Some(cancellation)).await);
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(10));
 }
 
 #[tokio::test]
@@ -2768,6 +2767,26 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
             .as_ref()
             .unwrap()
             .contains("do not rerun")
+    );
+    // Production finishes an exited process in the handler and again in its
+    // caller once the same nested bound has passed.
+    let response = finish_exited_process_result(
+        Some(&process),
+        Ok(response),
+        Duration::from_millis(1),
+        Some(Instant::now()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response
+            .repair_notice
+            .as_deref()
+            .unwrap()
+            .matches("do not rerun")
+            .count(),
+        1,
+        "the pending-bookkeeping notice must not repeat"
     );
     drop(receipt);
     let result = tokio::time::timeout(

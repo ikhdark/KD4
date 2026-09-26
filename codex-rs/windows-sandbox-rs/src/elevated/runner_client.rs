@@ -49,6 +49,10 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RUNNER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+// A runner normally acknowledges within tens of milliseconds, and every elevated command waits
+// here, so poll briskly at first and only fall back to the slow cadence for a slow start.
+const RUNNER_SPAWN_READY_FAST_POLL_WINDOW: Duration = Duration::from_millis(250);
+const RUNNER_SPAWN_READY_FAST_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RUNNER_SPAWN_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RUNNER_ERROR_MODE_FLAGS: u32 = 0x0001 | 0x0002;
 const WAIT_OBJECT_0: u32 = 0;
@@ -398,7 +402,13 @@ pub(crate) fn spawn_runner_transport(
         SetErrorMode(previous_error_mode);
     }
     if spawn_res == 0 {
-        return Err(RunnerLogonError { code: spawn_error }.into());
+        return Err(anyhow::Error::from(RunnerLogonError { code: spawn_error }).context(format!(
+            "launch runner {} (exists: {}) in {} (exists: {})",
+            runner_exe.display(),
+            runner_exe.is_file(),
+            cwd.display(),
+            cwd.is_dir(),
+        )));
     }
     let expected_runner_pid = pi.dwProcessId;
 
@@ -473,7 +483,8 @@ pub(crate) fn spawn_runner_transport(
 
 fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
     let handle = pipe_read.as_raw_handle() as HANDLE;
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let mut len_buf = [0u8; 4];
 
     loop {
@@ -517,10 +528,12 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
             ));
         }
 
-        std::thread::sleep(
+        let poll_interval = if started.elapsed() < RUNNER_SPAWN_READY_FAST_POLL_WINDOW {
+            RUNNER_SPAWN_READY_FAST_POLL_INTERVAL
+        } else {
             RUNNER_SPAWN_READY_POLL_INTERVAL
-                .min(deadline.saturating_duration_since(Instant::now())),
-        );
+        };
+        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 

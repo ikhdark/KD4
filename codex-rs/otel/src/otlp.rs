@@ -4,6 +4,7 @@ use codex_http_client::BlockingHttpClientBuilder;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientBuilder;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use http::HeaderMap;
 use http::Uri;
 use http::header::HeaderName;
@@ -45,7 +46,27 @@ pub(crate) fn build_header_map(
     Ok(header_map)
 }
 
-pub(crate) fn build_grpc_tls_config(
+/// TLS configuration shared by the OTLP gRPC exporters.
+///
+/// tonic builds its connector with the process-wide rustls provider when one is
+/// installed and otherwise falls back to ring, which cannot verify the ECDSA
+/// P-521 certificates the shared provider supports. Exporters are built during
+/// startup, before other TLS clients install that provider.
+pub(crate) fn grpc_tls_config(
+    endpoint: &str,
+    tls: Option<&OtelTlsConfig>,
+) -> Result<ClientTlsConfig, Box<dyn Error>> {
+    ensure_rustls_crypto_provider();
+    let tls_config = ClientTlsConfig::new()
+        .with_enabled_roots()
+        .assume_http2(true);
+    match tls {
+        Some(tls) => build_grpc_tls_config(endpoint, tls_config, tls),
+        None => Ok(tls_config),
+    }
+}
+
+fn build_grpc_tls_config(
     endpoint: &str,
     tls_config: ClientTlsConfig,
     tls: &OtelTlsConfig,

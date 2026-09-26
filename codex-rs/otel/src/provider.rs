@@ -23,7 +23,6 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_otlp::WithHttpConfig;
 use opentelemetry_otlp::WithTonicConfig;
 use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
-use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -320,15 +319,7 @@ fn build_logger(
             debug!("Using OTLP Grpc exporter: {endpoint}");
 
             let header_map = crate::otlp::build_header_map(&headers)?;
-
-            let base_tls_config = ClientTlsConfig::new()
-                .with_enabled_roots()
-                .assume_http2(true);
-
-            let tls_config = match tls.as_ref() {
-                Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)?,
-                None => base_tls_config,
-            };
+            let tls_config = crate::otlp::grpc_tls_config(&endpoint, tls.as_ref())?;
 
             let exporter = LogExporter::builder()
                 .with_tonic()
@@ -394,15 +385,7 @@ fn build_tracer_provider(
             debug!("Using OTLP Grpc exporter for traces: {endpoint}");
 
             let header_map = crate::otlp::build_header_map(&headers)?;
-
-            let base_tls_config = ClientTlsConfig::new()
-                .with_enabled_roots()
-                .assume_http2(true);
-
-            let tls_config = match tls.as_ref() {
-                Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)?,
-                None => base_tls_config,
-            };
+            let tls_config = crate::otlp::grpc_tls_config(&endpoint, tls.as_ref())?;
 
             SpanExporter::builder()
                 .with_tonic()

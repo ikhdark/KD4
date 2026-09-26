@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -148,6 +149,56 @@ fn write_http_response(stream: &mut TcpStream, status: &str) -> std::io::Result<
     stream.flush()
 }
 
+const COLLECTOR_STOP_PATH: &str = "/collector-stop";
+const COLLECTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Loopback OTLP collector that serves until the test has finished exporting,
+/// instead of listening for a fixed window.
+struct Collector {
+    addr: SocketAddr,
+    server: thread::JoinHandle<Vec<CapturedRequest>>,
+}
+
+impl Collector {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server = thread::spawn(move || {
+            let mut captured = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let result =
+                    read_http_request(&mut stream, Instant::now() + COLLECTOR_REQUEST_TIMEOUT);
+                let _ = write_http_response(&mut stream, "202 Accepted");
+                match result {
+                    Ok((path, _, _)) if path == COLLECTOR_STOP_PATH => break,
+                    Ok((path, headers, body)) => captured.push(CapturedRequest {
+                        path,
+                        content_type: headers.get("content-type").cloned(),
+                        body,
+                    }),
+                    Err(_) => {}
+                }
+            }
+            captured
+        });
+        Self { addr, server }
+    }
+
+    /// Returns every request served before the stop request. Connections are
+    /// accepted in order, so exports flushed before this call are included.
+    fn finish(self) -> Vec<CapturedRequest> {
+        let mut stop = TcpStream::connect(self.addr).expect("connect to collector");
+        stop.write_all(
+            format!("POST {COLLECTOR_STOP_PATH} HTTP/1.1\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+        )
+        .expect("send collector stop");
+        self.server.join().expect("collector join")
+    }
+}
+
 #[test]
 fn http_request_deadline_does_not_restart_after_accept() -> std::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -164,40 +215,8 @@ fn http_request_deadline_does_not_restart_after_accept() -> std::io::Result<()> 
 
 #[test]
 fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    listener.set_nonblocking(true).expect("set_nonblocking");
-
-    let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
-    let server = thread::spawn(move || {
-        let mut captured = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream, deadline);
-                    let _ = write_http_response(&mut stream, "202 Accepted");
-                    if let Ok((path, headers, body)) = result {
-                        captured.push(CapturedRequest {
-                            path,
-                            content_type: headers.get("content-type").cloned(),
-                            body,
-                        });
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(
-                        Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(_) => break,
-            }
-        }
-
-        let _ = tx.send(captured);
-    });
+    let collector = Collector::spawn();
+    let addr = collector.addr;
 
     let metrics = MetricsClient::new(MetricsConfig::otlp(
         "test",
@@ -220,8 +239,7 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     )?;
     metrics.shutdown()?;
 
-    server.join().expect("server join");
-    let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
+    let captured = collector.finish();
 
     let request = captured
         .iter()
@@ -240,17 +258,17 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     assert!(
         body.contains("codex.turns"),
         "expected metric name not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     assert!(
         body.contains("codex.active"),
         "expected gauge not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     assert!(
         body.contains("component") && body.contains("test"),
         "expected gauge tag not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
 
     Ok(())
@@ -259,40 +277,8 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
 #[test]
 fn otlp_http_exporter_sends_logs_to_collector()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    listener.set_nonblocking(true).expect("set_nonblocking");
-
-    let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
-    let server = thread::spawn(move || {
-        let mut captured = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream, deadline);
-                    let _ = write_http_response(&mut stream, "202 Accepted");
-                    if let Ok((path, headers, body)) = result {
-                        captured.push(CapturedRequest {
-                            path,
-                            content_type: headers.get("content-type").cloned(),
-                            body,
-                        });
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(
-                        Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(_) => break,
-            }
-        }
-
-        let _ = tx.send(captured);
-    });
+    let collector = Collector::spawn();
+    let addr = collector.addr;
 
     let otel = OtelProvider::from(&OtelSettings {
         environment: "test".to_string(),
@@ -326,8 +312,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
     });
     otel.shutdown();
 
-    server.join().expect("server join");
-    let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
+    let captured = collector.finish();
 
     let request = captured
         .iter()
@@ -346,7 +331,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
     assert!(
         body.contains("codex.test.log_exported"),
         "expected exported log event not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     Ok(())
 }
@@ -386,40 +371,8 @@ fn otlp_http_exporter_sends_traces_to_collector()
     let _trace_context_config_guard = TRACE_CONTEXT_CONFIG_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    listener.set_nonblocking(true).expect("set_nonblocking");
-
-    let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
-    let server = thread::spawn(move || {
-        let mut captured = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream, deadline);
-                    let _ = write_http_response(&mut stream, "202 Accepted");
-                    if let Ok((path, headers, body)) = result {
-                        captured.push(CapturedRequest {
-                            path,
-                            content_type: headers.get("content-type").cloned(),
-                            body,
-                        });
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(
-                        Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(_) => break,
-            }
-        }
-
-        let _ = tx.send(captured);
-    });
+    let collector = Collector::spawn();
+    let addr = collector.addr;
 
     let otel = OtelProvider::from(&OtelSettings {
         environment: "test".to_string(),
@@ -487,8 +440,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
         Some("example=alpha:one;keep:yes;beta:two,other=value")
     );
 
-    server.join().expect("server join");
-    let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
+    let captured = collector.finish();
 
     let request = captured
         .iter()
@@ -507,22 +459,22 @@ fn otlp_http_exporter_sends_traces_to_collector()
     assert!(
         body.contains("trace-loopback"),
         "expected span name not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     assert!(
         body.contains("codex-cli"),
         "expected service name not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     assert!(
         body.contains("test.configured_attribute") && body.contains("configured-value"),
         "expected configured span attribute not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     assert!(
         body.contains("codex.test.trace_event"),
         "expected trace event not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
 
     Ok(())
@@ -534,40 +486,8 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
     let _trace_context_config_guard = TRACE_CONTEXT_CONFIG_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    listener.set_nonblocking(true).expect("set_nonblocking");
-
-    let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
-    let server = thread::spawn(move || {
-        let mut captured = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream, deadline);
-                    let _ = write_http_response(&mut stream, "202 Accepted");
-                    if let Ok((path, headers, body)) = result {
-                        captured.push(CapturedRequest {
-                            path,
-                            content_type: headers.get("content-type").cloned(),
-                            body,
-                        });
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(
-                        Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(_) => break,
-            }
-        }
-
-        let _ = tx.send(captured);
-    });
+    let collector = Collector::spawn();
+    let addr = collector.addr;
 
     let otel = OtelProvider::from(&OtelSettings {
         environment: "test".to_string(),
@@ -603,8 +523,7 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
     });
     otel.shutdown();
 
-    server.join().expect("server join");
-    let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
+    let captured = collector.finish();
 
     let request = captured
         .iter()
@@ -623,12 +542,12 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
     assert!(
         body.contains("trace-loopback-tokio"),
         "expected span name not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     assert!(
         body.contains("codex-cli"),
         "expected service name not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
 
     Ok(())
@@ -640,40 +559,8 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
     let _trace_context_config_guard = TRACE_CONTEXT_CONFIG_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    listener.set_nonblocking(true).expect("set_nonblocking");
-
-    let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
-    let server = thread::spawn(move || {
-        let mut captured = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream, deadline);
-                    let _ = write_http_response(&mut stream, "202 Accepted");
-                    if let Ok((path, headers, body)) = result {
-                        captured.push(CapturedRequest {
-                            path,
-                            content_type: headers.get("content-type").cloned(),
-                            body,
-                        });
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(
-                        Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(_) => break,
-            }
-        }
-
-        let _ = tx.send(captured);
-    });
+    let collector = Collector::spawn();
+    let addr = collector.addr;
 
     let (runtime_result_tx, runtime_result_rx) = mpsc::channel::<std::result::Result<(), String>>();
     let runtime_thread = thread::spawn(move || {
@@ -728,8 +615,7 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
         .map_err(std::io::Error::other)?;
     runtime_thread.join().expect("runtime thread");
 
-    server.join().expect("server join");
-    let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
+    let captured = collector.finish();
 
     let request = captured
         .iter()
@@ -748,12 +634,12 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
     assert!(
         body.contains("trace-loopback-current-thread"),
         "expected span name not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
     assert!(
         body.contains("codex-cli"),
         "expected service name not found; body prefix: {}",
-        &body.chars().take(2000).collect::<String>()
+        body.chars().take(2000).collect::<String>()
     );
 
     Ok(())

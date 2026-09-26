@@ -144,6 +144,8 @@ def build_source_binaries(
         if requested_binaries
         else None
     )
+    if build_env is not None:
+        reject_rustflags_overrides(build_env)
     # Evidence belongs to this invocation only. Reuse discovers it lazily;
     # a build fills any missing observations before invoking Cargo.
     observation: dict[str, dict] = {}
@@ -500,6 +502,21 @@ def cargo_build_env(
     elif rustc_wrapper and is_sccache_wrapper(rustc_wrapper):
         set_sccache_env(env)
     return env
+
+
+def reject_rustflags_overrides(env: dict[str, str]) -> None:
+    # Cargo lets either variable, even when empty, replace every target
+    # rustflags table, which would package binaries without the 8 MiB stack and
+    # static CRT that codex-rs/.cargo/config.toml supplies. The per-target form
+    # joins those tables instead.
+    for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
+        if name in env:
+            raise RuntimeError(
+                f"{name} is set and would replace the target rustflags in "
+                "codex-rs/.cargo/config.toml (8 MiB stack, static CRT). Unset it; "
+                "add flags with CARGO_TARGET_<TRIPLE>_RUSTFLAGS, which Cargo joins "
+                "with them."
+            )
 
 
 def set_sccache_env(env: dict[str, str]) -> None:

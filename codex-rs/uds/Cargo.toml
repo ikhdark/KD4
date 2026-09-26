@@ -18,6 +18,11 @@ tokio = { workspace = true, features = ["fs", "net", "rt"] }
 async-io = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 uds_windows = { workspace = true }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

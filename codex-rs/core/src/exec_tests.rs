@@ -676,6 +676,7 @@ async fn combined_exec_cancellation_waits_inline_for_every_source() {
 async fn exec_full_buffer_capture_honors_expiration() -> Result<()> {
     let command = vec![
         "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
         "-NoLogo".to_string(),
         "-Command".to_string(),
@@ -840,7 +841,7 @@ async fn output_drain_preserves_completed_reader_and_aborts_unfinished_reader() 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn output_drain_readers_share_one_deadline_window() -> Result<()> {
     let stdout =
         tokio::spawn(async { std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await });
@@ -854,7 +855,8 @@ async fn output_drain_readers_share_one_deadline_window() -> Result<()> {
 
     assert!(stdout.text.is_empty());
     assert!(stderr.text.is_empty());
-    assert!(started_at.elapsed() < Duration::from_millis(800));
+    // Sequential per-reader windows would take 1s on the paused clock.
+    assert_eq!(started_at.elapsed(), Duration::from_millis(500));
     Ok(())
 }
 
@@ -956,6 +958,7 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
 
     let command = vec![
         "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
         "-NoLogo".to_string(),
         "-Command".to_string(),
@@ -1816,7 +1819,8 @@ async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()>
     .expect("direct exec cancellation must confirm native descendant exit");
     assert!(!output.timed_out);
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The handle is the process that writes the survival marker, so its
+    // confirmed exit already rules out a later write.
     assert!(
         !survival_marker.exists(),
         "Windows direct exec descendant survived cancellation"
@@ -1873,6 +1877,7 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
 fn long_running_command() -> Vec<String> {
     vec![
         "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
         "-NoLogo".to_string(),
         "-Command".to_string(),

@@ -16,6 +16,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
 
 const MATCH_LIMIT: usize = 50;
@@ -95,6 +96,7 @@ impl Drop for FuzzyFileSearchSession {
 }
 
 pub(crate) fn start_fuzzy_file_search_session(
+    connection_id: ConnectionId,
     session_id: String,
     roots: Vec<String>,
     outgoing: Arc<OutgoingMessageSender>,
@@ -111,6 +113,7 @@ pub(crate) fn start_fuzzy_file_search_session(
     let canceled = Arc::new(AtomicBool::new(false));
 
     let shared = Arc::new(SessionShared {
+        connection_id,
         session_id,
         latest_query: Mutex::new(String::new()),
         outgoing,
@@ -145,6 +148,7 @@ pub(crate) fn start_fuzzy_file_search_session(
 }
 
 struct SessionShared {
+    connection_id: ConnectionId,
     session_id: String,
     latest_query: Mutex<String>,
     outgoing: Arc<OutgoingMessageSender>,
@@ -257,11 +261,15 @@ async fn run_delivery_relay(shared: Arc<SessionShared>) {
         if shared.canceled.load(Ordering::Relaxed) || !shared.query_is_current(&delivery.query) {
             continue;
         }
+        let recipients = [shared.connection_id];
         tokio::select! {
             biased;
             _ = shared.delivery_cancellation.cancelled() => return,
             _ = query_changed => continue,
-            _ = shared.outgoing.send_server_notification(delivery.notification) => {}
+            _ = shared.outgoing.send_server_notification_to_connections(
+                &recipients,
+                delivery.notification,
+            ) => {}
         }
     }
 }
@@ -394,6 +402,7 @@ mod tests {
         assert!(outgoing.try_send_server_notification(completion_notification("blocker")));
 
         let shared = Arc::new(SessionShared {
+            connection_id: ConnectionId(1),
             session_id: "session".to_string(),
             latest_query: Mutex::new("query".to_string()),
             outgoing,
@@ -454,7 +463,9 @@ mod tests {
         ));
         assert!(outgoing.try_send_server_notification(completion_notification("blocker")));
         let root = tempfile::tempdir().unwrap();
+        let owner = ConnectionId(7);
         let mut session = start_fuzzy_file_search_session(
+            owner,
             "session".to_string(),
             vec![root.path().to_string_lossy().into_owned()],
             outgoing,
@@ -491,10 +502,13 @@ mod tests {
         })
         .await
         .expect("latest query delivered after capacity returns");
+        // Session results belong to the connection that started the session.
         let query = match delivered {
-            OutgoingEnvelope::Broadcast {
+            OutgoingEnvelope::ToConnection {
+                connection_id,
                 message: OutgoingMessage::AppServerNotification(notification),
-            } => match notification {
+                ..
+            } if connection_id == owner => match notification {
                 ServerNotification::FuzzyFileSearchSessionCompleted(value) => value.query,
                 ServerNotification::FuzzyFileSearchSessionUpdated(value) => value.query,
                 other => panic!("unexpected notification: {other:?}"),

@@ -8,6 +8,8 @@ use crate::mitm_hook::HookEvaluation;
 use crate::mitm_hook::MitmHooksByHost;
 use crate::mitm_hook::evaluate_mitm_hooks;
 use crate::policy::Host;
+use crate::policy::compile_allowlist_globset;
+use crate::policy::compile_denylist_globset;
 use crate::policy::is_loopback_host;
 use crate::policy::is_non_public_ip;
 use crate::policy::normalize_host;
@@ -17,7 +19,6 @@ use crate::reasons::REASON_NOT_ALLOWED;
 use crate::reasons::REASON_NOT_ALLOWED_LOCAL;
 use crate::state::NetworkProxyConstraintError;
 use crate::state::NetworkProxyConstraints;
-use crate::state::build_config_state;
 use crate::state::validate_policy_against_constraints;
 use anyhow::Context;
 use anyhow::Result;
@@ -550,18 +551,6 @@ impl NetworkProxyState {
             .await
     }
 
-    pub async fn method_allowed(&self, method: &str) -> Result<bool> {
-        Ok(self.request_policy_snapshot().await?.method_allowed(method))
-    }
-
-    pub async fn allow_upstream_proxy(&self) -> Result<bool> {
-        Ok(self.request_policy_snapshot().await?.allow_upstream_proxy())
-    }
-
-    pub async fn allow_local_binding(&self) -> Result<bool> {
-        Ok(self.request_policy_snapshot().await?.allow_local_binding())
-    }
-
     pub async fn network_mode(&self) -> Result<NetworkMode> {
         Ok(self.request_policy_snapshot().await?.network_mode())
     }
@@ -594,10 +583,6 @@ impl NetworkProxyState {
             info!("updated network mode to {mode:?}");
             return Ok(());
         }
-    }
-
-    pub async fn mitm_state(&self) -> Result<Option<Arc<MitmState>>> {
-        Ok(self.request_policy_snapshot().await?.mitm_state())
     }
 
     pub async fn add_allowed_domain(&self, host: &str) -> Result<()> {
@@ -649,23 +634,24 @@ impl NetworkProxyState {
                 .map_err(NetworkProxyConstraintError::into_anyhow)
                 .with_context(|| format!("{constraint_field} constrained by managed config"))?;
 
-            let config_to_build = candidate.clone();
-            let constraints_to_build = constraints.clone();
-            let mut new_state = run_blocking_policy_io(move || {
-                build_config_state(config_to_build, constraints_to_build)
-            })
-            .await?
-            .with_context(|| format!("failed to compile updated network {list_name}"))?;
+            // Only the domain matchers depend on the lists. Keep the compiled MITM state and hooks:
+            // rebuilding them would resolve CODEX_HOME from the environment (possibly selecting a
+            // CA other than the one children trust), re-read hook secrets, and reload platform roots.
+            let allow_set =
+                compile_allowlist_globset(&candidate.allowed_domains().unwrap_or_default())
+                    .with_context(|| format!("failed to compile updated network {list_name}"))?;
+            let deny_set = compile_denylist_globset(&candidate.denied_domains().unwrap_or_default())
+                .with_context(|| format!("failed to compile updated network {list_name}"))?;
             let mut guard = self.state.write().await;
             if guard.constraints != constraints || guard.config != previous_cfg {
                 drop(guard);
                 continue;
             }
 
-            new_state.blocked = guard.blocked.clone();
-            new_state.blocked_total = guard.blocked_total;
             log_policy_changes(&guard.config, &candidate);
-            *guard = new_state;
+            guard.config = candidate;
+            guard.allow_set = allow_set;
+            guard.deny_set = deny_set;
             info!("updated network {list_name} with {normalized_host}");
             return Ok(());
         }
@@ -1132,8 +1118,6 @@ mod tests {
     use super::*;
 
     use crate::config::NetworkProxyConfig;
-    use crate::policy::compile_allowlist_globset;
-    use crate::policy::compile_denylist_globset;
     use crate::state::NetworkProxyConstraints;
     use crate::state::build_config_state;
     use crate::state::validate_policy_against_constraints;
@@ -1444,6 +1428,60 @@ mod tests {
         assert_eq!(
             state.host_blocked("8.8.8.8", /*port*/ 80).await.unwrap(),
             HostBlockDecision::Blocked(HostBlockReason::Denied)
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_updates_keep_compiled_mitm_state_and_hooks() {
+        let home = tempfile::tempdir().unwrap();
+        let secret = home.path().join("hook-secret");
+        std::fs::write(&secret, "ghp-hook-secret").unwrap();
+        let mut config = NetworkProxyConfig {
+            enabled: true,
+            mitm: true,
+            mitm_hooks: vec![crate::mitm_hook::MitmHookConfig {
+                host: "api.github.com".to_string(),
+                matcher: crate::mitm_hook::MitmHookMatchConfig {
+                    methods: vec!["POST".to_string()],
+                    path_prefixes: vec!["/repos/openai/".to_string()],
+                    ..Default::default()
+                },
+                actions: crate::mitm_hook::MitmHookActionsConfig {
+                    inject_request_headers: vec![crate::mitm_hook::InjectedHeaderConfig {
+                        name: "authorization".to_string(),
+                        secret_file: Some(secret.display().to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            }],
+            ..NetworkProxyConfig::default()
+        };
+        config.set_allowed_domains(strings(&["api.github.com"]));
+        let initial = crate::state::build_config_state_with_codex_home(
+            config,
+            NetworkProxyConstraints::default(),
+            home.path(),
+        )
+        .unwrap();
+        let state = NetworkProxyState::with_reloader(initial, Arc::new(NoopReloader));
+        let before = state.state.read().await.clone();
+        // Hook secrets are read when hooks are compiled; approving a domain must not need them.
+        std::fs::remove_file(&secret).unwrap();
+
+        state.add_allowed_domain("8.8.8.8").await.unwrap();
+
+        {
+            let after = state.state.read().await;
+            assert!(Arc::ptr_eq(
+                before.mitm.as_ref().unwrap(),
+                after.mitm.as_ref().unwrap()
+            ));
+            assert_eq!(after.mitm_hooks, before.mitm_hooks);
+        }
+        assert_eq!(
+            state.host_blocked("8.8.8.8", /*port*/ 443).await.unwrap(),
+            HostBlockDecision::Allowed
         );
     }
 

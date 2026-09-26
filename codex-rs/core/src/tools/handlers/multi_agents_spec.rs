@@ -393,6 +393,33 @@ fn agent_status_output_schema() -> Value {
             {
                 "type": "object",
                 "properties": {
+                    "completed_with_surface": {
+                        "type": "object",
+                        "properties": {
+                            "last_agent_message": {
+                                "type": ["string", "null"]
+                            },
+                            "surfaced_result": {
+                                "type": "object",
+                                "properties": {
+                                    "adapter": {"type": "string"},
+                                    "value": {},
+                                    "canonicalMessage": {"type": "string"}
+                                },
+                                "required": ["adapter", "value"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["last_agent_message", "surfaced_result"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["completed_with_surface"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
                     "errored": {
                         "type": "string"
                     }
@@ -494,9 +521,13 @@ fn list_agents_output_schema() -> Value {
                         "last_task_message": {
                             "type": ["string", "null"],
                             "description": "Most recent user or inter-agent instruction received by the agent, when available."
+                        },
+                        "runtime_loaded": {
+                            "type": "boolean",
+                            "description": "Whether the agent's thread is currently loaded in this process."
                         }
                     },
-                    "required": ["agent_name", "agent_status", "last_task_message"],
+                    "required": ["agent_name", "agent_status", "last_task_message", "runtime_loaded"],
                     "additionalProperties": false
                 },
                 "description": "Live agents visible in the current root thread tree."
@@ -581,6 +612,18 @@ fn wait_output_schema_v2() -> Value {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Stalled live assignments that received their one durable no-progress nudge."
+            },
+            "previous_delivery": {
+                "type": "object",
+                "description": "Recovery receipt for the previous automatic-cursor wait result; if that result was not received, read artifact_id with read_tool_output.",
+                "properties": {
+                    "cursor": {"type": ["string", "null"]},
+                    "artifact_id": {"type": "string"},
+                    "thread_id": {"type": "string"},
+                    "recovery_tool": {"type": "string", "enum": ["read_tool_output"]}
+                },
+                "required": ["cursor", "artifact_id", "thread_id", "recovery_tool"],
+                "additionalProperties": false
             }
         },
         "required": ["message", "timed_out", "cursor", "typed_deltas", "truncated_count", "nudged_assignment_ids"],

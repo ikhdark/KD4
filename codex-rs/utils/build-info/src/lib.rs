@@ -1,5 +1,11 @@
 //! Shared runtime build metadata for executable surfaces.
 
+/// Version an executable reports about itself: `--version`, the TUI,
+/// `codex doctor`, and app-server build info. Release packaging embeds it
+/// through `CODEX_RELEASE_VERSION`; other builds use the Cargo package version.
+///
+/// Request headers, telemetry, and session metadata keep the Cargo package
+/// version, so a packaged build talks to model servers like a source build.
 pub const CODEX_VERSION: &str = match option_env!("CODEX_RELEASE_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),

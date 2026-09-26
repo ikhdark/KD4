@@ -114,6 +114,28 @@ pub fn upgrade_configured_git_marketplaces(
     }
 }
 
+/// Records the activation metadata the up-to-date check requires, so a Git marketplace
+/// installed by `marketplace add` is not cloned again by the next auto-upgrade.
+pub(crate) fn write_added_git_marketplace_metadata(
+    root: &Path,
+    marketplace_name: &str,
+    url: &str,
+    ref_name: Option<&str>,
+    sparse_paths: &[String],
+    revision: &str,
+) -> Result<(), String> {
+    let marketplace = ConfiguredGitMarketplace {
+        name: marketplace_name.to_string(),
+        source: MarketplaceSource::Git {
+            url: url.to_string(),
+            ref_name: ref_name.map(str::to_string),
+        },
+        sparse_paths: sparse_paths.to_vec(),
+        last_revision: Some(revision.to_string()),
+    };
+    write_installed_marketplace_metadata(root, &marketplace, revision)
+}
+
 fn load_configured_git_marketplaces(
     config_layer_stack: &ConfigLayerStack,
 ) -> ConfiguredGitMarketplaceLoadOutcome {

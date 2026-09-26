@@ -3203,6 +3203,21 @@ impl Config {
             ));
         }
         validate_multi_agent_v2_tool_namespace(multi_agent_v2.tool_namespace.as_deref())?;
+        // A non-positive budget puts every turn over the compaction threshold.
+        for (field, value) in [
+            ("model_context_window", cfg.model_context_window),
+            (
+                "model_auto_compact_token_limit",
+                cfg.model_auto_compact_token_limit,
+            ),
+        ] {
+            if value.is_some_and(|value| value <= 0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{field} must be greater than zero"),
+                ));
+            }
+        }
         let agent_max_threads = cfg.agents.as_ref().and_then(|agents| agents.max_threads);
         if agent_max_threads == Some(0) {
             return Err(std::io::Error::new(

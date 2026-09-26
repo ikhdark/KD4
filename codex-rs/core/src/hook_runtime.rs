@@ -110,7 +110,8 @@ pub(crate) async fn run_pending_session_start_hooks(
             target,
         };
         let hooks = sess.hooks();
-        let preview_runs = hooks.preview_session_start(&request);
+        let preview_runs =
+            hooks.preview_session_start(&request, Some(turn_context.sub_id.as_str()));
         if run_context_injecting_hook(
             sess,
             turn_context,
@@ -268,7 +269,7 @@ pub(crate) async fn run_post_tool_use_hooks(
         tool_response,
     };
     let hooks = sess.hooks();
-    let preview_runs = hooks.preview_planned_post_tool_use(&plan, &request.tool_use_id);
+    let preview_runs = hooks.preview_planned_post_tool_use(&plan, &request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
     let mut outcome = hooks.run_planned_post_tool_use(plan, request).await;
@@ -370,7 +371,7 @@ pub(crate) async fn run_turn_interrupt_hooks(sess: &Arc<Session>, turn_context: 
     }
 
     let hooks = sess.hooks();
-    let preview_runs = hooks.preview_interrupt();
+    let preview_runs = hooks.preview_interrupt(sess.session_id().into(), &turn_context.sub_id);
     if preview_runs.is_empty() {
         return;
     }

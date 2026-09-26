@@ -18,7 +18,6 @@ use crate::MaybeApplyPatchVerified;
 use crate::parser::Hunk;
 use crate::parser::ParseError;
 use crate::parser::parse_patch;
-use crate::unified_diff_from_chunks_internal;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::str::Utf8Error;
@@ -265,52 +264,40 @@ async fn try_verify_apply_patch_args(
     }
 
     validate_mutation_endpoints(&hunks, &effective_cwd, fs, sandbox).await?;
-    crate::preflight_hunks(&hunks, &effective_cwd, fs, sandbox).await?;
+    // Preflight has already read every delete and update source and derived
+    // each update, so the proposed changes reuse that snapshot.
+    let prepared = crate::preflight_hunks(&hunks, &effective_cwd, fs, sandbox).await?;
 
     let mut changes = HashMap::new();
-    for (hunk_index, hunk) in hunks.into_iter().enumerate() {
+    for (hunk, prepared) in hunks.into_iter().zip(prepared) {
         let path = hunk.resolve_path(&effective_cwd)?;
-        match hunk {
-            Hunk::AddFile { contents, .. } => {
-                changes.insert(path, ApplyPatchFileChange::Add { content: contents });
-            }
-            Hunk::DeleteFile { .. } => {
-                let content = fs.read_file_text(&path, sandbox).await.map_err(|source| {
-                    ApplyPatchError::IoError(IoError {
-                        context: format!("Failed to read {}", path.inferred_native_path_string()),
-                        source,
-                    })
-                })?;
-                changes.insert(path, ApplyPatchFileChange::Delete { content });
-            }
-            Hunk::UpdateFile {
-                move_path, chunks, ..
-            } => {
+        let change = match (hunk, prepared) {
+            (Hunk::AddFile { contents, .. }, _) => ApplyPatchFileChange::Add { content: contents },
+            (Hunk::DeleteFile { .. }, Some(prepared)) => ApplyPatchFileChange::Delete {
+                content: prepared.original_contents,
+            },
+            (Hunk::UpdateFile { move_path, .. }, Some(prepared)) => {
                 let ApplyPatchFileUpdate {
                     unified_diff,
-                    content: contents,
+                    content: new_content,
                     ..
-                } = unified_diff_from_chunks_internal(
-                    &path,
-                    &chunks,
-                    1,
-                    Some(hunk_index + 1),
-                    fs,
-                    sandbox,
-                )
-                .await?;
-                changes.insert(
-                    path,
-                    ApplyPatchFileChange::Update {
-                        unified_diff,
-                        move_path: move_path
-                            .map(|path| effective_cwd.join(&path.to_string_lossy()))
-                            .transpose()?,
-                        new_content: contents,
-                    },
-                );
+                } = prepared.into_file_update(/*context*/ 1);
+                ApplyPatchFileChange::Update {
+                    unified_diff,
+                    move_path: move_path
+                        .map(|path| effective_cwd.join(&path.to_string_lossy()))
+                        .transpose()?,
+                    new_content,
+                }
             }
-        }
+            (Hunk::DeleteFile { .. } | Hunk::UpdateFile { .. }, None) => {
+                return Err(ApplyPatchError::ComputeReplacements(format!(
+                    "patch preflight did not prepare {}",
+                    path.inferred_native_path_string()
+                )));
+            }
+        };
+        changes.insert(path, change);
     }
     Ok(ApplyPatchAction {
         changes,
@@ -822,7 +809,10 @@ mod tests {
         else {
             panic!("{result:?}")
         };
-        assert_eq!(mismatch.kind, crate::PatchContextMismatchKind::AmbiguousMatch);
+        assert_eq!(
+            mismatch.kind,
+            crate::PatchContextMismatchKind::AmbiguousMatch
+        );
         assert_eq!((mismatch.hunk_ordinal, mismatch.chunk_ordinal), (2, 1));
         assert!(
             mismatch

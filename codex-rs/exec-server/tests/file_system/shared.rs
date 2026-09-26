@@ -254,6 +254,48 @@ async fn file_system_read_file_stream_returns_bounded_chunks(
 #[test_case(FileSystemImplementation::Local ; "local")]
 #[test_case(FileSystemImplementation::Remote ; "remote")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_system_round_trips_payloads_above_default_websocket_frame_limit(
+    implementation: FileSystemImplementation,
+) -> Result<()> {
+    let context = create_file_system_context(implementation).await?;
+    let file_system = context.file_system;
+
+    let tmp = TempDir::new()?;
+    let file_path = PathUri::from_host_native_path(tmp.path().join("large.bin"))?;
+    // Base64 grows this past tungstenite's default 16 MiB frame limit in both directions.
+    let len: usize = 17 * 1024 * 1024;
+    let contents = (0..len)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+
+    file_system
+        .write_file(&file_path, contents.clone(), /*sandbox*/ None)
+        .await
+        .with_context(|| format!("write mode={implementation}"))?;
+    let read = file_system
+        .read_file(&file_path, /*sandbox*/ None)
+        .await
+        .with_context(|| format!("read mode={implementation}"))?;
+    // Avoid printing multi-megabyte diffs on failure.
+    assert!(
+        read == contents,
+        "read_file lost bytes mode={implementation}"
+    );
+    let bounded = file_system
+        .read_file_bounded(&file_path, len, /*sandbox*/ None)
+        .await
+        .with_context(|| format!("bounded read mode={implementation}"))?;
+    assert!(
+        bounded.as_deref() == Some(contents.as_slice()),
+        "read_file_bounded lost bytes mode={implementation}"
+    );
+
+    Ok(())
+}
+
+#[test_case(FileSystemImplementation::Local ; "local")]
+#[test_case(FileSystemImplementation::Remote ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_system_read_file_text_returns_string(
     implementation: FileSystemImplementation,
 ) -> Result<()> {
@@ -684,6 +726,44 @@ async fn file_system_sandboxed_metadata_and_read_allow_readable_root(
         .await
         .with_context(|| format!("mode={implementation}"))?;
     assert_eq!(contents, b"sandboxed hello");
+
+    Ok(())
+}
+
+#[test_case(FileSystemImplementation::Local ; "local")]
+#[test_case(FileSystemImplementation::Remote ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_system_sandboxed_bounded_reads_honor_limit_and_root(
+    implementation: FileSystemImplementation,
+) -> Result<()> {
+    let context = create_file_system_context(implementation).await?;
+    let file_system = context.file_system;
+
+    let tmp = TempDir::new()?;
+    let allowed_dir = tmp.path().join("allowed");
+    let file_path = allowed_dir.join("note.txt");
+    std::fs::create_dir_all(&allowed_dir)?;
+    std::fs::write(&file_path, "sandboxed hello")?;
+    let sandbox = read_only_sandbox(allowed_dir.clone());
+    let path = PathUri::from_host_native_path(&file_path)?;
+    let root = PathUri::from_host_native_path(&allowed_dir)?;
+
+    // Sandboxed reads cannot stream, so remote bounded reads need a native RPC.
+    let within_limit = file_system
+        .read_file_bounded(&path, /*max_bytes*/ 15, Some(&sandbox))
+        .await
+        .with_context(|| format!("mode={implementation}"))?;
+    assert_eq!(within_limit.as_deref(), Some(b"sandboxed hello".as_slice()));
+    let over_limit = file_system
+        .read_file_bounded(&path, /*max_bytes*/ 14, Some(&sandbox))
+        .await
+        .with_context(|| format!("mode={implementation}"))?;
+    assert_eq!(over_limit, None);
+    let confined = file_system
+        .read_file_bounded_confined(&path, &root, /*max_bytes*/ 15, Some(&sandbox))
+        .await
+        .with_context(|| format!("confined mode={implementation}"))?;
+    assert_eq!(confined.as_deref(), Some(b"sandboxed hello".as_slice()));
 
     Ok(())
 }

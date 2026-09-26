@@ -1047,6 +1047,9 @@ impl ThreadRequestProcessor {
                 current_cli_overrides.as_slice()
             };
 
+            // The trust edit bypasses ConfigManager, and this reload repeats the
+            // first load's cache key; without invalidation it returns pre-trust config.
+            config_manager.invalidate_load_cache();
             config = config_manager
                 .load_with_cli_overrides(
                     cli_overrides_for_reload,
@@ -2859,6 +2862,18 @@ impl ThreadRequestProcessor {
         connection_ids: &[ConnectionId],
     ) {
         if connection_ids.is_empty() {
+            if let Err(error) = super::thread_lifecycle::supervise_unsubscribed_thread(
+                self.listener_task_context(),
+                thread_id,
+                thread,
+            )
+            .await
+            {
+                warn!(
+                    "failed to supervise unsubscribed thread {thread_id}: {}",
+                    error.message
+                );
+            }
             return;
         }
         // Listener attachment is idempotent and must be retried for the current

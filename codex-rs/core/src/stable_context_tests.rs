@@ -623,7 +623,7 @@ fn malformed_registered_fragment_fails_open() {
         let projection = project_stable_context(Arc::clone(&items), StableContextTarget::Sampling);
         assert!(!projection.manifest.projection_enabled(), "{malformed}");
         assert!(projection.manifest.fail_open(), "{malformed}");
-        assert_eq!(projection.items.as_ref(), items.as_ref());
+        assert!(Arc::ptr_eq(&projection.items, &items), "{malformed}");
     }
 }
 
@@ -657,7 +657,11 @@ fn generic_preparation_target_retains_all_recognized_history() {
 
     let projection = project_stable_context(Arc::clone(&items), StableContextTarget::FailOpen);
 
-    assert_eq!(projection.items.as_ref(), items.as_ref());
+    assert!(
+        Arc::ptr_eq(&projection.items, &items),
+        "unprojected history must be shared, not deep-copied"
+    );
+    assert!(Arc::ptr_eq(&projection.fallback_items, &items));
     assert!(!projection.manifest.projection_enabled());
     assert!(projection.manifest.fail_open());
     assert!(

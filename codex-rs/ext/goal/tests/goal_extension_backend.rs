@@ -579,6 +579,11 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
         tool_names(&active),
         ["get_goal", "create_goal", "update_goal"]
     );
+    assert!(active.iter().all(|tool| {
+        tool.conversation_history_requirement(&ToolPayload::Function {
+            arguments: "{}".to_string(),
+        }) == codex_extension_api::ConversationHistoryRequirement::None
+    }));
     assert_eq!(
         tool_by_name(&active, "get_goal").exposure(),
         ToolExposure::Direct
@@ -1998,7 +2003,7 @@ async fn goal_ref(
         .thread_goals()
         .get_thread_goal(thread_id)
         .await?
-        .unwrap();
+        .expect("thread goal should exist");
     Ok(format!(
         "{}:{:x}",
         goal.goal_id,

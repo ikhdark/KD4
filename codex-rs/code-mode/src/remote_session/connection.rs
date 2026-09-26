@@ -18,6 +18,8 @@ use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
@@ -45,6 +47,11 @@ mod driver;
 mod reader;
 
 const IPC_CHANNEL_CAPACITY: usize = 128;
+// Frames the client can owe the host for work the host admits: a request and
+// its cancellation per operation the host runs at once, and a response per
+// delegate request it leaves pending. A full queue fails every session on the
+// connection, so it must not fill below that bound.
+const OUTGOING_FRAME_CAPACITY: usize = 2 * MAX_IN_FLIGHT_REQUESTS + MAX_PENDING_DELEGATE_REQUESTS;
 const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct Connection {
@@ -201,7 +208,7 @@ impl Connection {
 
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(IPC_CHANNEL_CAPACITY);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_FRAME_CAPACITY);
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let failure = Arc::new(std::sync::Mutex::new(None));

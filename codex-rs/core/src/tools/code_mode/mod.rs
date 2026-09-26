@@ -559,7 +559,12 @@ pub(super) fn handle_runtime_response(
     // Nested tool results have already crossed their owning tool boundary. Keep
     // one coherent, model-safe exec packet here instead of applying the much
     // smaller generic per-tool diagnostic budget a second time.
-    let hard_limit = codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+    let hard_limit = exec
+        .turn
+        .config
+        .tool_output_token_limit
+        .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
     let cell_id = runtime_response_cell_id(&response);
@@ -598,13 +603,6 @@ pub(super) fn handle_runtime_response(
     // Host lifecycle state stays in the canonical record. Only live handles
     // need a separate inline receipt when the script did not print them.
     let canonical_states = packet.command_states;
-    for state in &canonical_states {
-        if state["process_exited"] == false && !state["session_id"].is_null() {
-            post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
-                text: format!("Running command session_id: {}", state["session_id"]),
-            });
-        }
-    }
     let mut output = format_runtime_response(
         response,
         max_output_tokens,
@@ -615,6 +613,28 @@ pub(super) fn handle_runtime_response(
         nested_results,
         packet.first_required_terminal,
     );
+    // A zero text budget must not erase the only handle for still-owned work.
+    for state in &canonical_states {
+        if state["process_exited"] == false && !state["session_id"].is_null() {
+            output.body.push(FunctionCallOutputContentItem::InputText {
+                text: format!("Running command session_id: {}", state["session_id"]),
+            });
+        }
+        // Printing only result.output must not discard the recovery route for
+        // bytes omitted by the nested command, even if the outer packet fits.
+        if state["output_reduced"] == true
+            && let Some(artifact_id) = state["raw_output_artifact_id"].as_str()
+            && !code_mode_text_content(&output.body).contains(artifact_id)
+        {
+            output.body.push(FunctionCallOutputContentItem::InputText {
+                text: serde_json::json!({
+                    "output_truncated": true,
+                    "artifact_id": artifact_id,
+                    "recovery_tool": "read_tool_output",
+                }).to_string(),
+            });
+        }
+    }
     output.essential_inline.insert(
         "nested_commands".into(),
         JsonValue::Array(canonical_states.clone()),

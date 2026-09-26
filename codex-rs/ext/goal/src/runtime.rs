@@ -52,9 +52,15 @@ struct GoalRuntimeInner {
         codex_protocol::config_types::ModeKind,
         codex_protocol::protocol::TokenUsage,
     )>,
-    pending_steering: Mutex<Option<ResponseItem>>,
+    pending_steering: Mutex<Option<PendingGoalSteering>>,
     tools_available_for_thread: bool,
     goal_state_lock: Semaphore,
+}
+
+/// Objective-edit notice waiting for a turn of the goal it describes.
+struct PendingGoalSteering {
+    goal_id: String,
+    item: ResponseItem,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -205,15 +211,41 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn retry_goal_steering(&self) {
-        let item = self
+        let Some((goal_id, item)) = self
             .inner
             .pending_steering
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(item) = item
-            && self.inject_active_turn_steering(item).await
+            .as_ref()
+            .map(|pending| (pending.goal_id.clone(), pending.item.clone()))
+        else {
+            return;
+        };
+        // An objective-edit notice is valid only while its goal remains the active goal.
+        match self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .get_thread_goal(self.thread_id())
+            .await
         {
+            Ok(Some(goal))
+                if goal.goal_id == goal_id
+                    && goal.status == codex_state::ThreadGoalStatus::Active => {}
+            Ok(_) => {
+                *self
+                    .inner
+                    .pending_steering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                return;
+            }
+            Err(err) => {
+                tracing::debug!("deferring goal steering after goal read failed: {err}");
+                return;
+            }
+        }
+        if self.inject_active_turn_steering(item).await {
             *self
                 .inner
                 .pending_steering
@@ -333,12 +365,15 @@ impl GoalRuntimeHandle {
                         .mark_idle_goal_active(goal.goal_id.clone());
                 }
                 if objective_changed {
-                    let item = objective_updated_steering_item(&goal);
                     *self
                         .inner
                         .pending_steering
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(item);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(PendingGoalSteering {
+                            goal_id: goal.goal_id.clone(),
+                            item: objective_updated_steering_item(&goal),
+                        });
                     self.retry_goal_steering().await;
                 }
             }
@@ -554,9 +589,27 @@ impl GoalRuntimeHandle {
         {
             return Ok(());
         }
-        let item = continuation_steering_item(&goal);
+        // Deliver a pending objective-edit notice with the turn it affects instead of after that
+        // turn's first tool call. A notice for another goal is stale.
+        let pending_steering = self
+            .inner
+            .pending_steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .filter(|pending| pending.goal_id == goal.goal_id);
+        let mut items = Vec::with_capacity(2);
+        if let Some(pending) = &pending_steering {
+            items.push(pending.item.clone());
+        }
+        items.push(continuation_steering_item(&goal));
 
-        if let Err(err) = thread.try_start_turn_if_idle(vec![item]).await {
+        if let Err(err) = thread.try_start_turn_if_idle(items).await {
+            *self
+                .inner
+                .pending_steering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = pending_steering;
             let reason = err.reason();
             tracing::debug!(
                 ?reason,
@@ -787,5 +840,92 @@ impl GoalRuntimeHandle {
                 .is_none_or(|expected_goal_id| goal.goal_id == expected_goal_id)
                 .then_some(goal.status)
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_analytics::AnalyticsEventsClient;
+    use codex_extension_api::NoopExtensionEventSink;
+    use pretty_assertions::assert_eq;
+
+    fn pending_goal_id(runtime: &GoalRuntimeHandle) -> Option<String> {
+        runtime
+            .inner
+            .pending_steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|pending| pending.goal_id.clone())
+    }
+
+    #[tokio::test]
+    async fn objective_edit_notice_is_dropped_once_its_goal_is_no_longer_active()
+    -> anyhow::Result<()> {
+        let state_dbs = codex_state::StateRuntime::init(
+            tempfile::TempDir::new()?.keep(),
+            "test-provider".to_string(),
+        )
+        .await?;
+        let thread_id = ThreadId::new();
+        let original = state_dbs
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "objective A",
+                codex_state::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await?;
+        let runtime = GoalRuntimeHandle::new(
+            thread_id,
+            Arc::clone(&state_dbs),
+            GoalEventEmitter::new(Arc::new(NoopExtensionEventSink)),
+            GoalMetrics::default(),
+            Weak::new(),
+            Arc::new(GoalAccountingState::default()),
+            GoalRuntimeConfig {
+                analytics: GoalAnalytics::new(AnalyticsEventsClient::disabled()),
+                enabled: true,
+                tools_available_for_thread: true,
+            },
+        );
+        let edited = state_dbs
+            .thread_goals()
+            .update_thread_goal(
+                thread_id,
+                codex_state::GoalUpdate {
+                    objective: Some("objective B".to_string()),
+                    status: None,
+                    token_budget: None,
+                    expected_goal_id: Some(original.goal_id.clone()),
+                },
+            )
+            .await?
+            .expect("edited goal");
+        runtime
+            .apply_external_goal_set(edited.clone(), Some(PreviousGoalSnapshot::from(&original)))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        // No live turn can take the notice yet, so it waits for the edited goal's next turn.
+        runtime.retry_goal_steering().await;
+        assert_eq!(pending_goal_id(&runtime), Some(edited.goal_id.clone()));
+
+        state_dbs
+            .thread_goals()
+            .update_thread_goal(
+                thread_id,
+                codex_state::GoalUpdate {
+                    objective: None,
+                    status: Some(codex_state::ThreadGoalStatus::Complete),
+                    token_budget: None,
+                    expected_goal_id: Some(edited.goal_id),
+                },
+            )
+            .await?;
+        runtime.retry_goal_steering().await;
+        assert_eq!(pending_goal_id(&runtime), None);
+        Ok(())
     }
 }

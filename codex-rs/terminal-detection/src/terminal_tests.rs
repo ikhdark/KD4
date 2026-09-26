@@ -67,12 +67,22 @@ fn detects_windows_terminal_and_windows_compatible_markers() {
         ),
         expected(TerminalName::WezTerm, None, Some("2024.2"), None)
     );
+    // The environment Alacritty gives a Windows shell: no socket variable, and a
+    // generic TERM that must not hide the terminal's own marker.
+    let alacritty = detect_terminal_info_from_env(
+        &FakeEnvironment::default()
+            .with_var(
+                "ALACRITTY_LOG",
+                r"C:\Users\user\AppData\Local\Temp\Alacritty-4242.log",
+            )
+            .with_var("TERM", "xterm-256color")
+            .with_var("COLORTERM", "truecolor"),
+    );
     assert_eq!(
-        detect_terminal_info_from_env(
-            &FakeEnvironment::default().with_var("ALACRITTY_SOCKET", r"\\.\pipe\alacritty")
-        ),
+        alacritty,
         expected(TerminalName::Alacritty, None, None, None)
     );
+    assert_eq!(alacritty.user_agent_token(), "Alacritty");
 }
 
 #[test]

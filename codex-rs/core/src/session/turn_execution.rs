@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 use codex_config::schema::canonicalize as canonicalize_json;
 use codex_protocol::models::ResponseInputItem;
+#[cfg(test)]
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
@@ -133,14 +134,12 @@ struct SamplingToolOutcome {
     skip_disposition: Option<ToolOutputSkipDisposition>,
     plan: Option<UpdatePlanArgs>,
     source_evidence: Option<Value>,
-    unfinished_mutation_obligation: bool,
     failure_fingerprint: Option<String>,
     failure_is_terminal: bool,
     failure_diagnosis_reused: bool,
     canonical_artifact_required: bool,
     nested_in_code_mode: bool,
     wraps_nested_terminal: bool,
-    executed_cargo_test_targets: BTreeSet<String>,
     tests_executed: bool,
 }
 
@@ -158,7 +157,6 @@ impl SamplingToolOutcome {
             skip_disposition: outcome_context.skip_disposition,
             plan,
             source_evidence: sampling_source_evidence(signal),
-            unfinished_mutation_obligation: sampling_unfinished_mutation_obligation(signal),
             failure_fingerprint: sampling_failure_fingerprint(signal),
             failure_is_terminal: sampling_failure_is_terminal(signal),
             failure_diagnosis_reused: false,
@@ -168,7 +166,6 @@ impl SamplingToolOutcome {
                 .and_then(|signal| signal.get("nested_ordinal"))
                 .and_then(Value::as_u64)
                 .is_some(),
-            executed_cargo_test_targets: BTreeSet::new(),
             tests_executed: false,
         }
     }
@@ -400,7 +397,6 @@ impl DeterministicDispatchLedger {
 struct SamplingRequestSignalState {
     outcomes: Vec<SamplingToolOutcome>,
     structured_actions: BTreeMap<u64, StructuredActionIdentity>,
-    recovery_action_identities: BTreeMap<u64, RecoveryActionIdentity>,
     evidence_items: BTreeMap<u64, String>,
     successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
     successful_replay_evidence: BTreeMap<u64, SuccessfulReplayEvidence>,
@@ -408,7 +404,6 @@ struct SamplingRequestSignalState {
     validation_ordinals: BTreeSet<u64>,
     validation_proof_ordinals: BTreeSet<u64>,
     test_validation_ordinals: BTreeSet<u64>,
-    validation_mutation_revision: Option<u64>,
     final_verification_ordinals: BTreeSet<u64>,
     mutation_ordinals: BTreeSet<u64>,
     suppressed_blocked_wait: bool,
@@ -465,11 +460,6 @@ impl SamplingRequestSignalState {
 pub(crate) struct ExecutedValidationSummary {
     pub(crate) count: u32,
     pub(crate) duration_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FreshSuccessfulValidation {
-    mutation_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -650,9 +640,6 @@ impl SamplingRequestSignalCollector {
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
         }
-        if let Some(identity) = recovery_action_identity(tool_name, &canonical) {
-            state.recovery_action_identities.insert(ordinal, identity);
-        }
 
         SamplingToolCallRegistration {
             ordinal,
@@ -812,7 +799,6 @@ impl SamplingRequestSignalCollector {
             .get("output")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        outcome.executed_cargo_test_targets = executed_cargo_test_targets(output);
         outcome.tests_executed = output_proves_test_execution(output);
         let canonical = canonical_tool_action(payload);
         let structured_action =
@@ -858,9 +844,6 @@ impl SamplingRequestSignalCollector {
         state.outcomes.push(outcome);
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
-        }
-        if let Some(identity) = recovery_action_identity(tool_name, &canonical) {
-            state.recovery_action_identities.insert(ordinal, identity);
         }
         if let Some(evidence_identity) = evidence_identity {
             state.evidence_items.insert(ordinal, evidence_identity);
@@ -947,12 +930,6 @@ impl SamplingRequestSignalCollector {
         state.outcomes.push(outcome);
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
-        }
-        if let Some(identity) = canonical
-            .as_ref()
-            .and_then(|canonical| recovery_action_identity(tool_name, canonical))
-        {
-            state.recovery_action_identities.insert(ordinal, identity);
         }
     }
 
@@ -1042,7 +1019,6 @@ impl SamplingRequestSignalCollector {
         let mut outcome =
             SamplingToolOutcome::from_signal(ordinal, outcome_context, plan, signal.as_ref());
         let output = response_output_text(response).unwrap_or_default();
-        outcome.executed_cargo_test_targets = executed_cargo_test_targets(&output);
         outcome.tests_executed = output_proves_test_execution(&output);
         if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
             outcome.failure_fingerprint = response_failure_fingerprint(response);
@@ -1457,81 +1433,23 @@ impl SamplingRequestSignalCollector {
         }
     }
 
+    /// Whether the request's latest validation proof survived every later
+    /// observation. Probes the live validation, final-verification and
+    /// test-execution classification that gates successful replay.
     #[cfg(test)]
-    pub(crate) fn validation_workspace_revision_for_test(&self) -> Option<u64> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .validation_mutation_revision
-    }
-
-    pub(crate) fn record_validation_workspace_revision(
-        &self,
-        tool_name: &ToolName,
-        payload: &ToolPayload,
-        mutation_revision: u64,
-    ) {
-        if validation_invocation_status(tool_name, payload).1 {
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .validation_mutation_revision = Some(mutation_revision);
-        }
-    }
-
-    fn update_unresolved_failures(
-        &self,
-        unresolved: &mut BTreeSet<Option<RecoveryActionIdentity>>,
-        fresh_validation: bool,
-    ) {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for outcome in &state.outcomes {
-            let identity = state
-                .recovery_action_identities
-                .get(&outcome.ordinal)
-                .cloned();
-            if outcome.is_failure_evidence() {
-                unresolved.insert(identity);
-            } else if outcome.kind == SamplingToolOutcomeKind::Success
-                && identity.is_some()
-                && (!state.test_validation_ordinals.contains(&outcome.ordinal)
-                    || outcome.tests_executed)
-                && (!state.validation_ordinals.contains(&outcome.ordinal) || fresh_validation)
-            {
-                // A broader Cargo run can recover a focused failure only when
-                // it actually ran that target under the same invocation context.
-                // Unknown failures and unrelated validations remain open.
-                unresolved.retain(|failed| {
-                    failed != &identity
-                        && !failed.as_ref().zip(identity.as_ref()).is_some_and(
-                            |(failed, recovered)| {
-                                fresh_validation
-                                    && recovered.covers_cargo_failure(
-                                        failed,
-                                        &outcome.executed_cargo_test_targets,
-                                    )
-                            },
-                        )
-                });
-            }
-        }
-    }
-
-    fn fresh_successful_validation(&self) -> Option<FreshSuccessfulValidation> {
+    fn fresh_successful_validation(&self) -> bool {
         let allocated_ordinal_count = self.next_ordinal.load(Ordering::Acquire);
-        let allocated_count = usize::try_from(allocated_ordinal_count).ok()?;
+        let Ok(allocated_count) = usize::try_from(allocated_ordinal_count) else {
+            return false;
+        };
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let latest_validation_ordinal = state
-            .validation_proof_ordinals
-            .iter()
-            .next_back()
-            .copied()?;
+        let Some(latest_validation_ordinal) = state.validation_proof_ordinals.last().copied()
+        else {
+            return false;
+        };
         let outcome_ordinals = state
             .outcomes
             .iter()
@@ -1565,7 +1483,7 @@ impl SamplingRequestSignalCollector {
                     .as_ref()
                     .is_some_and(|plan| !plan.plan.is_empty() && !plan_is_unfinished(plan))
             });
-        if state.outcomes.len() != allocated_count
+        !(state.outcomes.len() != allocated_count
             || outcome_ordinals.len() != allocated_count
             || !(0..allocated_ordinal_count).all(|ordinal| outcome_ordinals.contains(&ordinal))
             || !terminal_observation_is_valid
@@ -1573,10 +1491,6 @@ impl SamplingRequestSignalCollector {
                 .outcomes
                 .iter()
                 .any(|outcome| outcome.kind != SamplingToolOutcomeKind::Success)
-            || state
-                .outcomes
-                .iter()
-                .any(|outcome| outcome.unfinished_mutation_obligation)
             || state.outcomes.iter().any(|outcome| {
                 state.test_validation_ordinals.contains(&outcome.ordinal) && !outcome.tests_executed
             })
@@ -1595,14 +1509,7 @@ impl SamplingRequestSignalCollector {
                     std::ops::Bound::Unbounded,
                 ))
                 .next()
-                .is_some()
-        {
-            return None;
-        }
-
-        Some(FreshSuccessfulValidation {
-            mutation_revision: state.validation_mutation_revision,
-        })
+                .is_some())
     }
 
     fn generation_purpose(
@@ -1770,13 +1677,6 @@ fn sampling_source_evidence(signal: Option<&Value>) -> Option<Value> {
         .cloned()
 }
 
-fn sampling_unfinished_mutation_obligation(signal: Option<&Value>) -> bool {
-    signal
-        .and_then(|value| value.get("unfinished_mutation_obligation"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn sampling_failure_fingerprint(signal: Option<&Value>) -> Option<String> {
     signal.and_then(value_failure_signature)
 }
@@ -1878,106 +1778,6 @@ fn structured_action_identity_from_canonical(
     Some(StructuredActionIdentity { identity, class })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct RecoveryActionIdentity {
-    exact: String,
-    cargo_test: Option<CargoTestRecoveryScope>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct CargoTestRecoveryScope {
-    context: String,
-    target: Option<String>,
-}
-
-impl RecoveryActionIdentity {
-    fn covers_cargo_failure(&self, failed: &Self, executed_targets: &BTreeSet<String>) -> bool {
-        let Some((recovered, failed)) = self.cargo_test.as_ref().zip(failed.cargo_test.as_ref())
-        else {
-            return false;
-        };
-        recovered.context == failed.context
-            && recovered.target.is_none()
-            && failed
-                .target
-                .as_ref()
-                .is_some_and(|target| executed_targets.contains(&target.replace('-', "_")))
-    }
-}
-
-fn cargo_test_recovery_scope(
-    tool_name: &ToolName,
-    arguments: &Value,
-) -> Option<CargoTestRecoveryScope> {
-    let (program, args) = match command_invocation(tool_name, arguments)? {
-        CommandInvocation::Argv { program, args } => (program, args),
-        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
-            // Only a literal single command can establish equivalent execution.
-            if !script
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || " _-.".contains(c))
-            {
-                return None;
-            }
-            let mut words = script.split_whitespace();
-            (
-                words.next()?.to_string(),
-                words.map(str::to_string).collect(),
-            )
-        }
-    };
-    if !matches!(program.as_str(), "cargo" | "cargo.exe") || args.first()?.as_str() != "test" {
-        return None;
-    }
-    let mut target = None;
-    let mut base_args = Vec::new();
-    let mut args = args.iter().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--test" if target.is_none() => {
-                let name = args.next()?;
-                if name.is_empty()
-                    || !name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
-                {
-                    return None;
-                }
-                target = Some(name.clone());
-            }
-            "--offline" | "--locked" | "--frozen" => base_args.push(arg.clone()),
-            "--jobs" | "-j" => {
-                base_args.push(arg.clone());
-                let jobs = args.next()?;
-                jobs.parse::<u32>().ok()?;
-                base_args.push(jobs.clone());
-            }
-            // Filters, features, package/target selection, harness options and
-            // custom Cargo configurations need stronger coverage evidence.
-            _ => return None,
-        }
-    }
-    let mut context = arguments.clone();
-    let fields = context.as_object_mut()?;
-    for field in [
-        "cmd",
-        "command",
-        "kind",
-        "program",
-        "args",
-        "script_body",
-        "force_fresh",
-        "yield_time_ms",
-        "max_output_tokens",
-    ] {
-        fields.remove(field);
-    }
-    Some(CargoTestRecoveryScope {
-        context: serialized_evidence_identity(&(tool_name, program, base_args, context))?,
-        target,
-    })
-}
-
 fn output_proves_test_execution(text: &str) -> bool {
     let parsed = serde_json::from_str::<Value>(text).ok();
     let text = parsed
@@ -2019,46 +1819,6 @@ fn output_proves_test_execution(text: &str) -> bool {
                 .windows(2)
                 .any(|pair| positive(pair[0]) && pair[1].trim_matches([';', ',']) == "passed")
         })
-    })
-}
-
-fn executed_cargo_test_targets(text: &str) -> BTreeSet<String> {
-    let parsed = serde_json::from_str::<Value>(text).ok();
-    let text = parsed
-        .as_ref()
-        .and_then(|value| value.get("output"))
-        .and_then(Value::as_str)
-        .unwrap_or(text);
-    text.lines()
-        .filter_map(|line| {
-            let running = line.trim().strip_prefix("Running ")?;
-            let (_, executable) = running.rsplit_once('(')?;
-            let executable = executable.strip_suffix(')')?.rsplit(['/', '\\']).next()?;
-            let executable = executable.strip_suffix(".exe").unwrap_or(executable);
-            let (target, hash) = executable.rsplit_once('-')?;
-            (hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit()))
-                .then(|| target.to_string())
-        })
-        .collect()
-}
-
-fn recovery_action_identity(
-    tool_name: &ToolName,
-    canonical: &CanonicalToolAction,
-) -> Option<RecoveryActionIdentity> {
-    // A forced execution is still a retry of the same action. Replay eligibility
-    // is separate from whether its successful result resolves a prior failure.
-    let exact = if canonical.kind == "function" && canonical.value.get("force_fresh").is_some() {
-        let mut arguments = canonical.value.clone();
-        arguments.as_object_mut()?.remove("force_fresh");
-        let identity_payload = serde_json::to_string(&arguments).ok()?;
-        serialized_evidence_identity(&(tool_name, identity_payload))
-    } else {
-        serialized_evidence_identity(&(tool_name, canonical.identity_payload.as_deref()?))
-    }?;
-    Some(RecoveryActionIdentity {
-        exact,
-        cargo_test: cargo_test_recovery_scope(tool_name, &canonical.value),
     })
 }
 
@@ -2339,6 +2099,7 @@ fn command_invocation(tool_name: &ToolName, arguments: &Value) -> Option<Command
     .ok()
 }
 
+#[cfg(test)]
 fn validation_invocation_status(tool_name: &ToolName, payload: &ToolPayload) -> (bool, bool, bool) {
     validation_status_from_arguments(tool_name, &canonical_tool_action(payload).value)
 }
@@ -2605,7 +2366,6 @@ pub(crate) struct TurnExecutionControl {
     turn_efficiency_guard: Option<TurnEfficiencyGuardHandle>,
     turn_efficiency_tool_calls: usize,
     turn_efficiency_child_runtime_ms: u64,
-    unresolved_failures: BTreeSet<Option<RecoveryActionIdentity>>,
     budget_progress_evidence: BTreeSet<String>,
 }
 
@@ -2643,7 +2403,6 @@ impl TurnExecutionControl {
             turn_efficiency_guard: None,
             turn_efficiency_tool_calls: 0,
             turn_efficiency_child_runtime_ms: 0,
-            unresolved_failures: BTreeSet::new(),
             budget_progress_evidence: BTreeSet::new(),
         }
     }
@@ -2798,7 +2557,6 @@ impl TurnExecutionControl {
 
     pub(crate) fn accepted_user_input(&mut self) {
         self.input_revision = self.input_revision.saturating_add(1);
-        self.unresolved_failures.clear();
         self.reset_convergence();
         let mut ledger = self
             .dispatch_ledger
@@ -3257,15 +3015,10 @@ impl TurnExecutionControl {
                 }
             }
         }
-        let fresh_validation = collector
-            .fresh_successful_validation()
-            .is_some_and(|validation| {
-                validation.mutation_revision == Some(settled.mutation_revision)
-            });
-        collector.update_unresolved_failures(&mut self.unresolved_failures, fresh_validation);
     }
 }
 
+#[cfg(test)]
 fn plan_is_unfinished(plan: &UpdatePlanArgs) -> bool {
     !plan.plan.is_empty()
         && plan
@@ -3344,7 +3097,6 @@ mod tests {
     ) {
         let registration =
             collector.register_deterministic_tool_call(&tool_name, &payload, call_id);
-        collector.record_validation_workspace_revision(&tool_name, &payload, 0);
         record_test_replay_dependencies(collector, registration.ordinal);
         collector.record_response_result(
             registration.ordinal,
@@ -3879,8 +3631,7 @@ mod tests {
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &collector, &settled_state);
 
-        assert!(collector.fresh_successful_validation().is_some());
-        assert!(control.unresolved_failures.is_empty());
+        assert!(collector.fresh_successful_validation());
         let decision = control.evaluate_convergence(&baselines, &collector, &settled_state);
         assert_eq!(
             decision.continuation,
@@ -3962,7 +3713,7 @@ mod tests {
                 },
                 "{tool}: {arguments}"
             );
-            assert!(collector.fresh_successful_validation().is_some());
+            assert!(collector.fresh_successful_validation());
             let decision = control.evaluate_convergence(&baselines, &collector, &settled_state);
             assert_eq!(
                 decision.continuation,
@@ -4053,7 +3804,7 @@ mod tests {
                     }
                     control.settle(&baselines, &collector, &settled(0));
                     assert!(
-                        collector.fresh_successful_validation().is_none(),
+                        !collector.fresh_successful_validation(),
                         "{arguments}; nested={nested}"
                     );
                     let next = control.collector(&control.baselines(0));
@@ -4100,10 +3851,7 @@ mod tests {
             );
             control.settle(&baselines, &collector, &settled_state);
             assert_eq!(collector.executed_validation_summary().count, 0);
-            assert!(
-                collector.fresh_successful_validation().is_none(),
-                "{command}"
-            );
+            assert!(!collector.fresh_successful_validation(), "{command}");
         }
     }
 
@@ -4119,11 +3867,6 @@ mod tests {
             let baselines = control.baselines(0);
             let settled_state = settled(0);
             let collector = control.collector(&baselines);
-            collector.record_validation_workspace_revision(
-                &ToolName::plain("exec_command"),
-                &validation_proof_payload(),
-                0,
-            );
             collector.record_code_mode_result(CodeModeToolResult {
                 cell_id: "validation-cell",
                 tool_name: &ToolName::plain("exec_command"),
@@ -4141,7 +3884,7 @@ mod tests {
             });
             control.settle(&baselines, &collector, &settled_state);
             assert_eq!(
-                collector.fresh_successful_validation().is_some(),
+                collector.fresh_successful_validation(),
                 outcome == ToolOutputOutcome::Success,
                 "{outcome:?}"
             );
@@ -4158,7 +3901,7 @@ mod tests {
             let collector = recorded_validation_collector(&control, &baselines, outcome);
             control.settle(&baselines, &collector, &settled_state);
 
-            assert!(collector.fresh_successful_validation().is_none());
+            assert!(!collector.fresh_successful_validation());
         }
 
         let mut control = TurnExecutionControl::new();
@@ -4172,7 +3915,7 @@ mod tests {
             "incomplete-validation",
         );
         control.settle(&baselines, &collector, &settled_state);
-        assert!(collector.fresh_successful_validation().is_none());
+        assert!(!collector.fresh_successful_validation());
     }
 
     #[test]
@@ -4204,7 +3947,7 @@ mod tests {
             let settled_state = settled(0);
             control.settle(&baselines, &collector, &settled_state);
             assert_eq!(
-                collector.fresh_successful_validation().is_some(),
+                collector.fresh_successful_validation(),
                 preserves_validation,
                 "executable: {program}"
             );
@@ -4285,7 +4028,7 @@ mod tests {
             let settled_state = settled(0);
             control.settle(&baselines, &collector, &settled_state);
 
-            assert!(collector.fresh_successful_validation().is_none());
+            assert!(!collector.fresh_successful_validation());
         }
         assert!(!final_diff_status_script_is_read_only(
             "git diff --check | Out-File result.txt; git status --short"
@@ -4301,14 +4044,13 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_validation_resolves_prior_failure_without_forcing_completion() {
+    fn a_successful_validation_after_failure_does_not_force_completion() {
         let mut control = TurnExecutionControl::new();
         settle_plan(&mut control, plan(&[StepStatus::Completed]));
         let failed_baselines = control.baselines(0);
         let failed =
             recorded_validation_collector(&control, &failed_baselines, ToolOutputOutcome::Failure);
         control.settle(&failed_baselines, &failed, &settled(0));
-        assert!(!control.unresolved_failures.is_empty());
 
         let recovery_baselines = control.baselines(0);
         let recovered = recorded_validation_collector(
@@ -4317,7 +4059,7 @@ mod tests {
             ToolOutputOutcome::Success,
         );
         control.settle(&recovery_baselines, &recovered, &settled(0));
-        assert!(control.unresolved_failures.is_empty());
+        assert!(recovered.fresh_successful_validation());
         assert_eq!(
             control
                 .evaluate_convergence(&recovery_baselines, &recovered, &settled(0))
@@ -4845,7 +4587,7 @@ mod tests {
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &collector, &settled_state);
 
-        assert!(collector.fresh_successful_validation().is_some());
+        assert!(collector.fresh_successful_validation());
         assert_eq!(
             control
                 .evaluate_convergence(&baselines, &collector, &settled_state)
@@ -4861,8 +4603,6 @@ mod tests {
             "no plan after edit",
             "empty plan",
             "new input",
-            "stale validation",
-            "missing revision",
             "complete",
         ] {
             let mut control = TurnExecutionControl::new();
@@ -4881,30 +4621,7 @@ mod tests {
             let collector =
                 recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
             let settled_state = settled(revision);
-            collector.record_validation_workspace_revision(
-                &ToolName::plain("exec_command"),
-                &validation_proof_payload(),
-                revision,
-            );
-            if scenario == "stale validation" {
-                collector.record_validation_workspace_revision(
-                    &ToolName::plain("exec_command"),
-                    &validation_proof_payload(),
-                    1,
-                );
-            }
-            if scenario == "missing revision" {
-                collector.state.lock().unwrap().validation_mutation_revision = None;
-            }
-            assert_eq!(
-                collector
-                    .fresh_successful_validation()
-                    .is_some_and(|validation| {
-                        validation.mutation_revision == Some(settled_state.mutation_revision)
-                    }),
-                !matches!(scenario, "stale validation" | "missing revision"),
-                "{scenario}",
-            );
+            assert!(collector.fresh_successful_validation(), "{scenario}");
             control.settle(&baselines, &collector, &settled_state);
             if scenario == "new input" {
                 control.input_revision += 1;
@@ -6896,7 +6613,6 @@ mod tests {
             let payload = validation_proof_payload();
             let registration =
                 collector.register_deterministic_tool_call(&tool, &payload, "failed");
-            collector.record_validation_workspace_revision(&tool, &payload, 0);
             collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
@@ -6959,10 +6675,10 @@ mod tests {
             SamplingToolOutcomeKind::Yielded,
             SamplingToolOutcomeKind::Unknown,
         ] {
-            let mut control = TurnExecutionControl::new();
-            let baseline = control.baselines(0);
-            control.settle(&baseline, &collector_with(kind), &settled(0));
-            assert!(control.unresolved_failures.is_empty(), "{kind:?}");
+            assert!(
+                !collector_with(kind).snapshot()[0].is_failure_evidence(),
+                "{kind:?}"
+            );
         }
     }
 
@@ -7112,14 +6828,9 @@ mod tests {
             "validation-after-mutation",
             ToolOutputOutcome::Success,
         );
-        collector.record_validation_workspace_revision(
-            &ToolName::plain("exec_command"),
-            &validation_proof_payload(),
-            1,
-        );
         let mutation_settled = settled(1);
         validated_after_mutation.settle(&baselines, &collector, &mutation_settled);
-        assert!(collector.fresh_successful_validation().is_some());
+        assert!(collector.fresh_successful_validation());
         assert_eq!(
             validated_after_mutation
                 .evaluate_convergence(&baselines, &collector, &mutation_settled)
@@ -7152,7 +6863,7 @@ mod tests {
         );
         let mutation_settled = settled(1);
         mutated_after_validation.settle(&baselines, &collector, &mutation_settled);
-        assert!(collector.fresh_successful_validation().is_none());
+        assert!(!collector.fresh_successful_validation());
 
         let mut observed_after_validation = TurnExecutionControl::new();
         settle_plan(
@@ -7176,7 +6887,7 @@ mod tests {
         );
         let settled_state = settled(0);
         observed_after_validation.settle(&baselines, &collector, &settled_state);
-        assert!(collector.fresh_successful_validation().is_some());
+        assert!(collector.fresh_successful_validation());
         assert_eq!(
             observed_after_validation
                 .evaluate_convergence(&baselines, &collector, &settled_state)
@@ -7186,42 +6897,7 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_validation_does_not_resolve_a_failed_target() {
-        let mut control = TurnExecutionControl::new();
-        settle_plan(&mut control, plan(&[StepStatus::Completed]));
-        let failed_baselines = control.baselines(0);
-        let failed =
-            recorded_validation_collector(&control, &failed_baselines, ToolOutputOutcome::Failure);
-        control.settle(&failed_baselines, &failed, &settled(0));
-
-        let baselines = control.baselines(0);
-        let unrelated = control.collector(&baselines);
-        record_invocation_result(
-            &unrelated,
-            ToolName::plain("exec_command"),
-            ToolPayload::Function {
-                arguments: json!({"cmd": "python -m unittest unrelated_test -q"}).to_string(),
-            },
-            "unrelated-validation",
-            ToolOutputOutcome::Success,
-        );
-        control.settle(&baselines, &unrelated, &settled(0));
-        assert!(!control.unresolved_failures.is_empty());
-
-        let recovered =
-            recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
-        control.settle(&baselines, &recovered, &settled(0));
-        assert!(control.unresolved_failures.is_empty());
-        assert_eq!(
-            control
-                .evaluate_convergence(&baselines, &recovered, &settled(0))
-                .continuation,
-            ContinuationDisposition::ModelRequired,
-        );
-    }
-
-    #[test]
-    fn validation_at_an_older_workspace_revision_cannot_finalize_or_resolve_failure() {
+    fn validation_at_an_older_workspace_revision_cannot_finalize() {
         let mut control = TurnExecutionControl::new();
         settle_plan(&mut control, plan(&[StepStatus::Completed]));
         let baselines = control.baselines(0);
@@ -7234,76 +6910,11 @@ mod tests {
         // A shell edit or concurrent mutation can advance the revision without
         // an apply_patch ordinal in this collector.
         control.settle(&baselines, &validation, &settled(1));
-        assert!(!control.unresolved_failures.is_empty());
         assert_ne!(
             control
                 .evaluate_convergence(&baselines, &validation, &settled(1))
                 .continuation,
             ContinuationDisposition::TerminalCompletionRequired,
-        );
-    }
-
-    #[test]
-    fn forced_validation_retry_resolves_its_failed_target() {
-        let mut control = TurnExecutionControl::new();
-        settle_plan(&mut control, plan(&[StepStatus::Completed]));
-        let baselines = control.baselines(0);
-        let failed =
-            recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Failure);
-        control.settle(&baselines, &failed, &settled(0));
-        let retry = control.collector(&baselines);
-        let ToolPayload::Function { arguments } = validation_proof_payload() else {
-            panic!("validation payload");
-        };
-        let mut arguments: Value = serde_json::from_str(&arguments).expect("validation arguments");
-        arguments["force_fresh"] = json!(true);
-        record_invocation_result(
-            &retry,
-            ToolName::plain("exec_command"),
-            ToolPayload::Function {
-                arguments: arguments.to_string(),
-            },
-            "forced-retry",
-            ToolOutputOutcome::Success,
-        );
-        control.settle(&baselines, &retry, &settled(0));
-        assert!(control.unresolved_failures.is_empty());
-        assert_eq!(
-            control
-                .evaluate_convergence(&baselines, &retry, &settled(0))
-                .continuation,
-            ContinuationDisposition::ModelRequired
-        );
-    }
-
-    #[test]
-    fn successful_read_retry_resolves_failure_before_later_validation() {
-        let mut control = TurnExecutionControl::new();
-        settle_plan(&mut control, plan(&[StepStatus::Completed]));
-        for outcome in [ToolOutputOutcome::Failure, ToolOutputOutcome::Success] {
-            let baselines = control.baselines(0);
-            let collector = control.collector(&baselines);
-            record_invocation_result(
-                &collector,
-                ToolName::plain("exec_command"),
-                ToolPayload::Function {
-                    arguments: json!({"cmd": "cat src/lib.rs"}).to_string(),
-                },
-                "source-read",
-                outcome,
-            );
-            control.settle(&baselines, &collector, &settled(0));
-        }
-        let baselines = control.baselines(0);
-        let validation =
-            recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
-        control.settle(&baselines, &validation, &settled(0));
-        assert!(control.unresolved_failures.is_empty());
-        assert_eq!(
-            control
-                .evaluate_convergence(&baselines, &validation, &settled(0))
-                .continuation,
-            ContinuationDisposition::ModelRequired
         );
     }
 
@@ -7339,10 +6950,7 @@ mod tests {
                 );
             }
             control.settle(&baselines, &collector, &settled(0));
-            assert!(
-                collector.fresh_successful_validation().is_some(),
-                "{commands:?}"
-            );
+            assert!(collector.fresh_successful_validation(), "{commands:?}");
             assert_eq!(
                 control
                     .evaluate_convergence(&baselines, &collector, &settled(0))
@@ -7351,136 +6959,6 @@ mod tests {
                 "{commands:?}",
             );
         }
-    }
-
-    #[test]
-    fn cargo_validation_recovery_requires_matching_context_and_executed_target() {
-        for nested in [false, true] {
-            for scenario in [
-                "covered",
-                "other target",
-                "missing output",
-                "other cwd",
-                "filtered",
-                "stale",
-                "failed",
-                "yielded",
-            ] {
-                let mut control = TurnExecutionControl::new();
-                let failed_baselines = control.baselines(0);
-                let failed = control.collector(&failed_baselines);
-                record_invocation_result(
-                    &failed,
-                    ToolName::plain("exec_command"),
-                    ToolPayload::Function {
-                        arguments: json!({"cmd": "cargo test --offline --locked --jobs 6 --test regression", "workdir": "/repo"}).to_string(),
-                    },
-                    "failed-focused-test",
-                    ToolOutputOutcome::Failure,
-                );
-                control.settle(&failed_baselines, &failed, &settled(0));
-                // A real edit advances the revision; no plan is required for
-                // this small fix, but baseline tests alone must not end a task.
-                let baselines = control.baselines(1);
-                let collector = control.collector(&baselines);
-                let mut args = vec!["test", "--offline", "--locked", "--jobs", "6"];
-                if scenario == "filtered" {
-                    args.push("some_filter");
-                }
-                let payload = ToolPayload::Function {
-                    arguments: json!({"kind": "argv", "program": "cargo", "args": args,
-                        "workdir": if scenario == "other cwd" { "/other" } else { "/repo" },
-                        "force_fresh": true, "yield_time_ms": 1000, "max_output_tokens": 3000})
-                    .to_string(),
-                };
-                let target = if scenario == "other target" {
-                    "unrelated"
-                } else {
-                    "regression"
-                };
-                let output = if scenario == "missing output" {
-                    String::new()
-                } else {
-                    format!(
-                        "     Running tests/{target}.rs (target\\debug\\deps\\{target}-0123456789abcdef.exe)\ntest result: ok. 4 passed; 0 failed\n"
-                    )
-                };
-                let outcome = match scenario {
-                    "failed" => ToolOutputOutcome::Failure,
-                    "yielded" => ToolOutputOutcome::Yielded,
-                    _ => ToolOutputOutcome::Success,
-                };
-                collector.record_validation_workspace_revision(
-                    &ToolName::plain("exec_command"),
-                    &payload,
-                    if scenario == "stale" { 0 } else { 1 },
-                );
-                if nested {
-                    collector.record_code_mode_result(CodeModeToolResult {
-                        cell_id: "recovery",
-                        tool_name: &ToolName::plain("exec_command"),
-                        payload: &payload,
-                        source_dependencies: None,
-                        outcome_context: ToolOutputOutcomeContext::new(outcome),
-                        signal: None,
-                        result: &json!({"output": output}),
-                        canonical_artifact_required: false,
-                    });
-                } else {
-                    let registration = collector.register_deterministic_tool_call(
-                        &ToolName::plain("exec_command"),
-                        &payload,
-                        "recovery",
-                    );
-                    collector.record_response_result(
-                        registration.ordinal,
-                        ToolOutputOutcomeContext::new(outcome),
-                        None,
-                        &ResponseInputItem::FunctionCallOutput {
-                            call_id: "recovery".to_string(),
-                            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                                output,
-                            ),
-                        },
-                        false,
-                    );
-                }
-                control.settle(&baselines, &collector, &settled(1));
-                let completed = scenario == "covered";
-                assert_eq!(
-                    control.unresolved_failures.is_empty(),
-                    completed,
-                    "{scenario}, nested={nested}"
-                );
-                assert_eq!(
-                    control
-                        .evaluate_convergence(&baselines, &collector, &settled(1))
-                        .continuation,
-                    ContinuationDisposition::ModelRequired,
-                    "{scenario}, nested={nested}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn status_only_plan_update_retains_unfinished_mutation_obligation() {
-        let mut control = TurnExecutionControl::new();
-        let baseline = control.baselines(0);
-        let collector = control.collector(&baseline);
-        collector.push(SamplingToolOutcome::from_signal(
-            0,
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            None,
-            Some(&json!({
-                "kind": "plan_update",
-                "plan": null,
-                "unfinished_mutation_obligation": true,
-            })),
-        ));
-
-        assert!(collector.snapshot()[0].unfinished_mutation_obligation);
-        control.settle(&baseline, &collector, &settled(0));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::rollout_path;
 use app_test_support::test_absolute_path;
 use app_test_support::to_response;
+use app_test_support::write_mock_provider_config_toml;
 use codex_app_server::in_process;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
@@ -86,7 +87,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 async fn thread_read_returns_summary_without_turns() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let preview = "Saved user message";
     let text_elements = [TextElement::new(
@@ -145,7 +146,7 @@ async fn thread_read_returns_summary_without_turns() -> Result<()> {
 async fn thread_read_can_include_turns() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let preview = "Saved user message";
     let text_elements = vec![TextElement::new(
@@ -211,7 +212,7 @@ async fn thread_read_can_include_turns() -> Result<()> {
 async fn terminal_metadata_matches_across_read_cold_resume_and_fork() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout_with_text_elements(
         codex_home.path(),
@@ -408,7 +409,7 @@ async fn paginated_stored_thread_allows_metadata_discovery_and_rejects_legacy_hi
 -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout_with_text_elements(
         codex_home.path(),
@@ -527,7 +528,7 @@ async fn paginated_stored_thread_allows_metadata_discovery_and_rejects_legacy_hi
 async fn thread_turns_list_can_page_backward_and_forward() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let conversation_id = create_fake_rollout_with_text_elements(
@@ -620,7 +621,7 @@ async fn thread_turns_list_can_page_backward_and_forward() -> Result<()> {
 async fn thread_turns_list_supports_requested_items_view() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let conversation_id = create_fake_rollout_with_text_elements(
@@ -929,7 +930,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
 async fn thread_read_can_return_archived_threads_by_id() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let preview = "Archived saved user message";
@@ -981,7 +982,7 @@ async fn thread_read_can_return_archived_threads_by_id() -> Result<()> {
 async fn thread_resume_initial_turns_page_matches_requested_turns_list_page() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let conversation_id = create_fake_rollout_with_text_elements(
@@ -1056,7 +1057,7 @@ async fn thread_resume_initial_turns_page_matches_requested_turns_list_page() ->
 async fn thread_turns_list_rejects_cursor_when_anchor_turn_is_rolled_back() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let conversation_id = create_fake_rollout_with_text_elements(
@@ -1131,7 +1132,7 @@ async fn thread_turns_list_rejects_cursor_when_anchor_turn_is_rolled_back() -> R
 async fn thread_read_returns_forked_from_id_for_forked_threads() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout_with_text_elements(
         codex_home.path(),
@@ -1185,7 +1186,7 @@ async fn thread_read_returns_forked_from_id_for_forked_threads() -> Result<()> {
 async fn thread_read_loaded_thread_returns_precomputed_path_before_materialization() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1237,7 +1238,7 @@ async fn thread_read_loaded_thread_returns_precomputed_path_before_materializati
 async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let preview = "Saved user message";
     let conversation_id = create_fake_rollout_with_text_elements(
@@ -1398,10 +1399,10 @@ async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_read_include_turns_rejects_unmaterialized_loaded_thread() -> Result<()> {
+async fn turn_history_reads_reject_unmaterialized_loaded_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1427,6 +1428,7 @@ async fn thread_read_include_turns_rejects_unmaterialized_loaded_thread() -> Res
         "fresh thread rollout should not be materialized yet"
     );
 
+    // Both history reads are read-only rejections of the same fresh thread.
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {
             thread_id: thread.id.clone(),
@@ -1456,40 +1458,7 @@ async fn thread_read_include_turns_rejects_unmaterialized_loaded_thread() -> Res
         }
     );
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_turns_list_rejects_unmaterialized_loaded_thread() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
-    let thread_path = thread.path.clone().expect("thread path");
-    assert!(
-        !thread_path.exists(),
-        "fresh thread rollout should not be materialized yet"
-    );
-
-    let read_id = mcp
+    let turns_id = mcp
         .send_thread_turns_list_request(ThreadTurnsListParams {
             thread_id: thread.id,
             cursor: None,
@@ -1498,19 +1467,19 @@ async fn thread_turns_list_rejects_unmaterialized_loaded_thread() -> Result<()> 
             items_view: None,
         })
         .await?;
-    let read_err: JSONRPCError = timeout(
+    let turns_err: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(read_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(turns_id)),
     )
     .await??;
 
     assert!(
-        read_err
+        turns_err
             .error
             .message
             .contains("thread/turns/list is unavailable before first user message"),
         "unexpected error: {}",
-        read_err.error.message
+        turns_err.error.message
     );
 
     Ok(())
@@ -1520,7 +1489,7 @@ async fn thread_turns_list_rejects_unmaterialized_loaded_thread() -> Result<()> 
 async fn thread_items_list_reconstructs_local_history_and_paginates() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let filename_ts = "2025-01-05T13-00-00";
     let conversation_id = create_fake_rollout_with_text_elements(
@@ -1657,7 +1626,7 @@ async fn thread_read_reports_system_error_idle_flag_after_failed_turn() -> Resul
     )
     .await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1954,25 +1923,3 @@ stream_max_retries = 0
 }
 
 // Helper to create a config.toml pointing at the mock model server.
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
-}

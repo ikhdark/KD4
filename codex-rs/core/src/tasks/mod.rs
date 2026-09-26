@@ -940,7 +940,6 @@ impl Session {
 
     async fn emit_post_terminal_metrics(
         &self,
-        turn_context: &TurnContext,
         turn_tool_calls: u64,
         turn_token_usage: &TokenUsage,
     ) {
@@ -990,13 +989,6 @@ impl Session {
             "codex.turn.token_usage.total_tokens",
             turn_token_usage.total_tokens,
         );
-        self.services
-            .analytics_events_client
-            .track_turn_token_usage(TurnTokenUsageFact {
-                turn_id: turn_context.sub_id.clone(),
-                thread_id: self.thread_id.to_string(),
-                token_usage: turn_token_usage.clone(),
-            });
         for (token_type, value) in [
             ("total", turn_token_usage.total_tokens),
             ("input", turn_token_usage.input_tokens),
@@ -1330,6 +1322,15 @@ impl Session {
             total_tokens: (total_token_usage.total_tokens - token_usage_at_turn_start.total_tokens)
                 .max(0),
         };
+        // The analytics turn event is emitted when `turn/completed` is observed and
+        // rejects later facts, so usage must be queued before terminal publication.
+        self.services
+            .analytics_events_client
+            .track_turn_token_usage(TurnTokenUsageFact {
+                turn_id: turn_context.sub_id.clone(),
+                thread_id: self.thread_id.to_string(),
+                token_usage: turn_token_usage.clone(),
+            });
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
         self.publish_terminal_outcome(finalization, event).await;
         if cleared_active_turn
@@ -1344,7 +1345,7 @@ impl Session {
             .command_execution
             .persist_cache_after_terminal()
             .await;
-        self.emit_post_terminal_metrics(turn_context.as_ref(), turn_tool_calls, &turn_token_usage)
+        self.emit_post_terminal_metrics(turn_tool_calls, &turn_token_usage)
             .await;
 
         if let Err(err) = self.flush_rollout().await {

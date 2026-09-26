@@ -1533,8 +1533,10 @@ impl GitWorkspaceCache {
             warn!("Git workspace cache disabled because no Tokio runtime is available");
             return Self::with_watcher(None);
         }
-        match FileWatcher::new() {
-            Ok(watcher) => Self::with_watcher(Some(Arc::new(watcher))),
+        // Sessions share one watcher, so sessions in the same repository share
+        // its backend watches instead of each watching and reconciling them.
+        match FileWatcher::shared() {
+            Ok(watcher) => Self::with_watcher(Some(watcher)),
             Err(err) => {
                 warn!("Git workspace cache disabled because file watching is unavailable: {err}");
                 Self::with_watcher(None)

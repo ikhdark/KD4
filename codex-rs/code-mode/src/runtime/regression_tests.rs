@@ -83,7 +83,7 @@ async fn pending_checks_do_not_collect_writes_and_response_heap_does_not_accumul
     assert_eq!(error_text, None);
     assert_eq!(output_loss, None);
     assert_eq!(stored_value_writes.len(), 1);
-    let payload = stored_value_writes["payload"].as_str().unwrap();
+    let payload = stored_value_writes["payload"].value.as_str().unwrap();
     assert_eq!(payload, "x".repeat(1_000_000));
     assert_eq!(payload.as_ptr() as usize, baseline.stored_payload_address, "finalization must move, not clone");
     closed(&mut rx).await;
@@ -162,7 +162,7 @@ async fn payload_limits_reject_without_queueing_large_values() {
 #[tokio::test]
 async fn full_callback_capacity_does_not_run_json_conversion() {
     let source = format!(r#"
-        const calls = Array.from({{length: {limit}}}, () => tools.sample_tool({{}}));
+        const calls = Array.from({{length: {MAX_OUTSTANDING_CALLBACKS_PER_CELL}}}, () => tools.sample_tool({{}}));
         let conversions = 0;
         const value = {{toJSON() {{ conversions++; return 'large'; }}}};
         const failures = [];
@@ -171,7 +171,7 @@ async fn full_callback_capacity_does_not_run_json_conversion() {
         }}
         text({{conversions, failures}});
         await Promise.all(calls);
-    "#, limit = MAX_OUTSTANDING_CALLBACKS_PER_CELL);
+    "#);
     let (tx, _termination, mut rx) = start(&source).await;
     let mut ids = Vec::new();
     for _ in 0..MAX_OUTSTANDING_CALLBACKS_PER_CELL {

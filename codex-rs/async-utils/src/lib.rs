@@ -60,15 +60,18 @@ mod tests {
     async fn returns_err_when_token_cancelled_first() {
         let token = CancellationToken::new();
         let token_clone = token.clone();
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
 
+        // Cancel only once the wrapped future is in flight; it never finishes on
+        // its own, so the outcome does not depend on scheduler timing.
         let cancel_handle = task::spawn(async move {
-            sleep(Duration::from_millis(10)).await;
+            polled_rx.await.expect("wrapped future should be polled");
             token_clone.cancel();
         });
 
         let result = async {
-            sleep(Duration::from_millis(100)).await;
-            7
+            let _ = polled_tx.send(());
+            std::future::pending::<i32>().await
         }
         .or_cancel(&token)
         .await;

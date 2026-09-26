@@ -7,8 +7,6 @@ use codex_git_utils::apply_git_patch;
 use codex_utils_cli::CliConfigOverrides;
 
 use crate::get_task::GetTaskResponse;
-use crate::get_task::OutputItem;
-use crate::get_task::PrOutputItem;
 use crate::get_task::get_task;
 
 /// Applies the latest diff from a Codex agent task.
@@ -39,21 +37,10 @@ pub async fn apply_diff_from_task(
     task_response: GetTaskResponse,
     cwd: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let diff_turn = match task_response.current_diff_task_turn {
-        Some(turn) => turn,
-        None => anyhow::bail!("No diff turn found"),
+    let Some(diff) = task_response.unified_diff() else {
+        anyhow::bail!("No diff found in task");
     };
-    let output_diff = diff_turn
-        .output_items
-        .into_iter()
-        .find_map(|item| match item {
-            OutputItem::Pr(PrOutputItem { output_diff }) => Some(output_diff),
-            _ => None,
-        });
-    match output_diff {
-        Some(output_diff) => apply_diff(output_diff.diff, cwd).await,
-        None => anyhow::bail!("No PR output item found"),
-    }
+    apply_diff(diff, cwd).await
 }
 
 async fn apply_diff(diff: String, cwd: Option<PathBuf>) -> anyhow::Result<()> {

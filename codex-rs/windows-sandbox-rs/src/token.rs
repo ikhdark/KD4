@@ -497,9 +497,15 @@ unsafe fn create_token_with_caps_from(
     dacl_sids.push(psid_logon);
     dacl_sids.push(psid_everyone);
     dacl_sids.extend_from_slice(psid_capabilities);
-    set_default_dacl(new_token, &dacl_sids)?;
-
-    enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
+    let configured = match set_default_dacl(new_token, &dacl_sids) {
+        Ok(()) => enable_single_privilege(new_token, "SeChangeNotifyPrivilege"),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = configured {
+        // The caller receives ownership only on success.
+        CloseHandle(new_token);
+        return Err(err);
+    }
     Ok(new_token)
 }
 

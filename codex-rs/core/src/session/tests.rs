@@ -421,6 +421,99 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
 }
 
 #[tokio::test]
+async fn tool_history_checkpoint_skips_unchanged_ledger_but_syncs_new_mutations() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let thread_id = ThreadId::new();
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        Arc::new(Semaphore::new(/*permits*/ 1)),
+        codex_home.path().to_path_buf(),
+        thread_id,
+        crate::tool_history::ToolHistoryState::default(),
+    );
+    let register = |call_id: &str| {
+        crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+            call_id: call_id.to_string(),
+        }
+    };
+
+    queue
+        .enqueue_mutation(register("first"), "test completed-tool history metadata")
+        .await
+        .expect("persistence worker remains available");
+    queue.checkpoint().await.expect("first checkpoint persists");
+    let checkpointed = queue.persisted_batch_count();
+
+    queue
+        .checkpoint()
+        .await
+        .expect("unchanged checkpoint succeeds");
+    assert_eq!(
+        queue.persisted_batch_count(),
+        checkpointed,
+        "a checkpoint with no new mutation must not rewrite the ledger",
+    );
+
+    queue
+        .enqueue_mutation(register("second"), "test completed-tool history metadata")
+        .await
+        .expect("persistence worker remains available");
+    queue.drain().await.expect("journal append succeeds");
+    let journaled = queue.persisted_batch_count();
+    assert_eq!(journaled, checkpointed + 1, "the new mutation is journaled");
+    queue
+        .checkpoint()
+        .await
+        .expect("changed checkpoint persists");
+    assert_eq!(
+        queue.persisted_batch_count(),
+        journaled + 1,
+        "a mutation after the last checkpoint must be synced into the ledger",
+    );
+
+    let (persisted, warning) =
+        crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
+            .await
+            .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_value(persisted).expect("serialize persisted history");
+    assert_eq!(
+        persisted["non_workspace_code_mode_calls"],
+        json!(["first", "second"]),
+    );
+}
+
+#[tokio::test]
+async fn consecutive_turns_reuse_the_resolved_token_budget_config() {
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("enable token budget");
+        },
+    )
+    .await;
+
+    let first = session
+        .new_default_turn_with_sub_id("first-budget-turn".to_string())
+        .await;
+    let second = session
+        .new_default_turn_with_sub_id("second-budget-turn".to_string())
+        .await;
+
+    assert!(
+        first.config.token_budget.is_some(),
+        "the enabled feature resolves a per-turn budget onto the config"
+    );
+    assert!(
+        Arc::ptr_eq(&first.config, &second.config),
+        "an unchanged turn must reuse the resolved config instead of cloning it"
+    );
+}
+
+#[tokio::test]
 async fn tool_history_registration_waits_without_blocking_or_partially_mutating() {
     let (session, _turn_context) = make_session_and_context().await;
     let codex_home = session.get_config().await.codex_home.clone();
@@ -1388,8 +1481,9 @@ async fn startup_prepared_router_handoff_is_one_shot() {
 #[tokio::test]
 async fn startup_prewarm_completing_after_handoff_is_not_awaited() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    // Held open past the handoff, so readiness cannot depend on scheduler timing.
     let handle = tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        std::future::pending::<()>().await;
         Ok(test_model_client_session())
     });
     sess.set_session_startup_prewarm(
@@ -1661,18 +1755,17 @@ async fn preview_session_start_hooks(
         ..HooksConfig::default()
     });
 
-    Ok(
-        hooks.preview_session_start(&codex_hooks::SessionStartRequest {
-            session_id: ThreadId::new(),
-            cwd: config.cwd.clone(),
-            transcript_path: None,
-            model: "gpt-5.2".to_string(),
-            permission_mode: "default".to_string(),
-            target: codex_hooks::StartHookTarget::SessionStart {
-                source: codex_hooks::SessionStartSource::Startup,
-            },
-        }),
-    )
+    let request = codex_hooks::SessionStartRequest {
+        session_id: ThreadId::new(),
+        cwd: config.cwd.clone(),
+        transcript_path: None,
+        model: "gpt-5.2".to_string(),
+        permission_mode: "default".to_string(),
+        target: codex_hooks::StartHookTarget::SessionStart {
+            source: codex_hooks::SessionStartSource::Startup,
+        },
+    };
+    Ok(hooks.preview_session_start(&request, /*turn_id*/ None))
 }
 
 fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> ToolCallRuntime {
@@ -1715,7 +1808,7 @@ fn make_connector(id: &str, name: &str) -> AppInfo {
 }
 
 #[test]
-fn assistant_message_stream_parsers_can_be_seeded_from_output_item_added_text() {
+fn assistant_message_stream_parsers_stream_seeded_text_verbatim_outside_plan_mode() {
     let mut parsers = AssistantMessageStreamParsers::new(/*plan_mode*/ false);
     let item_id = "msg-1";
 
@@ -1723,29 +1816,9 @@ fn assistant_message_stream_parsers_can_be_seeded_from_output_item_added_text() 
     let parsed = parsers.parse_delta(item_id, "1</oai-mem-citation> world");
     let tail = parsers.finish_item(item_id);
 
-    assert_eq!(seeded.visible_text, "hello ");
-    assert_eq!(seeded.citations, Vec::<String>::new());
-    assert_eq!(parsed.visible_text, " world");
-    assert_eq!(parsed.citations, vec!["doc1".to_string()]);
-    assert_eq!(tail.visible_text, "");
-    assert_eq!(tail.citations, Vec::<String>::new());
-}
-
-#[test]
-fn assistant_message_stream_parsers_seed_buffered_prefix_stays_out_of_finish_tail() {
-    let mut parsers = AssistantMessageStreamParsers::new(/*plan_mode*/ false);
-    let item_id = "msg-1";
-
-    let seeded = parsers.seed_item_text(item_id, "hello <oai-mem-");
-    let parsed = parsers.parse_delta(item_id, "citation>doc</oai-mem-citation> world");
-    let tail = parsers.finish_item(item_id);
-
-    assert_eq!(seeded.visible_text, "hello ");
-    assert_eq!(seeded.citations, Vec::<String>::new());
-    assert_eq!(parsed.visible_text, " world");
-    assert_eq!(parsed.citations, vec!["doc".to_string()]);
-    assert_eq!(tail.visible_text, "");
-    assert_eq!(tail.citations, Vec::<String>::new());
+    assert_eq!(seeded.visible_text, "hello <oai-mem-citation>doc");
+    assert_eq!(parsed.visible_text, "1</oai-mem-citation> world");
+    assert!(tail.is_empty());
 }
 
 #[test]
@@ -2438,7 +2511,7 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
             source: codex_hooks::SessionStartSource::Startup,
         },
     };
-    assert!(session.hooks().preview_session_start(&request).is_empty());
+    assert!(session.hooks().preview_session_start(&request, /*turn_id*/ None).is_empty());
 
     let config = session.get_config().await;
     let hook_list = codex_hooks::list_hooks(codex_hooks::HooksConfig {
@@ -2475,7 +2548,7 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
 
     session.reload_user_config_layer().await;
 
-    assert_eq!(session.hooks().preview_session_start(&request).len(), 1);
+    assert_eq!(session.hooks().preview_session_start(&request, /*turn_id*/ None).len(), 1);
     Ok(())
 }
 
@@ -2545,12 +2618,12 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
             source: codex_hooks::SessionStartSource::Startup,
         },
     };
-    assert!(session.hooks().preview_session_start(&request).is_empty());
+    assert!(session.hooks().preview_session_start(&request, /*turn_id*/ None).is_empty());
 
     let next_config = load_latest_config_for_session(&session).await;
     session.refresh_runtime_config(next_config).await;
 
-    assert_eq!(session.hooks().preview_session_start(&request).len(), 1);
+    assert_eq!(session.hooks().preview_session_start(&request, /*turn_id*/ None).len(), 1);
     Ok(())
 }
 
@@ -13100,14 +13173,20 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     let previous_context = Arc::new(turn_context);
     let mut previous_context_item = previous_context.to_turn_context_item();
     let world_state = build_world_state_from_turn_context(&session, &previous_context).await;
+    let (initial_items, world_state_snapshot, fragment_digests) = session
+        .build_initial_context_with_world_state_and_provenance(&previous_context, &world_state)
+        .await;
+    session
+        .record_conversation_items(&previous_context, &initial_items)
+        .await
+        .expect("the realized baseline must have its retained context in history");
+    let initial_history = session.clone_history().await.raw_items().to_vec();
     previous_context_item.context_provenance = Some(TurnContextProvenance {
         accepted_attempt: AcceptedAttemptProvenance {
             sampling_request_id: "previous-request".to_string(),
             physical_attempt_id: "previous-attempt".to_string(),
         },
-        fragment_digests: session
-            .build_context_fragment_digests(&previous_context, &world_state)
-            .await,
+        fragment_digests,
     });
     let mut turn_context = Arc::try_unwrap(previous_context)
         .unwrap_or_else(|_| panic!("previous turn context should have no remaining references"));
@@ -13117,7 +13196,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         state.set_reference_context_item(Some(previous_context_item.clone()));
         state
             .history
-            .set_world_state_baseline(world_state.snapshot());
+            .set_world_state_baseline(world_state_snapshot);
     }
     let rollout_path = attach_thread_persistence(&mut session).await;
 
@@ -13138,7 +13217,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
 
     assert_eq!(
         session.clone_history().await.raw_items().to_vec(),
-        Vec::new()
+        initial_history
     );
     assert_context_matches_with_accepted_provenance(
         session.reference_context_item().await,
@@ -14102,7 +14181,7 @@ async fn self_aborting_task_runs_interrupt_hook_before_durable_abort() -> anyhow
         ),
         ..HooksConfig::default()
     });
-    assert_eq!(hooks.preview_interrupt().len(), 1);
+    assert_eq!(hooks.preview_interrupt(session.thread_id, &turn_context.sub_id).len(), 1);
     session.services.hooks.store(Arc::new(hooks));
 
     session
@@ -14452,7 +14531,9 @@ async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
                 call_id,
                 output,
                 ..
-            } if call_id == unresolved_call_id && output.text_content() == Some("aborted")
+            } if call_id == unresolved_call_id && output.text_content() == Some(
+                "Result unavailable. Execution outcome and side effects are unknown. Do not repeat a state-changing operation solely because its result is missing."
+            )
         )
     }));
     // Expected flushes:
@@ -16959,6 +17040,11 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
         );
         let pending = sess.input_queue.get_pending_input(&sess.active_turn).await;
         let [
+            TurnInput::ResponseItem(ResponseItem::Message {
+                role: reset_role,
+                content: reset_content,
+                ..
+            }),
             TurnInput::ResponseItem(ResponseItem::Message { role, content, .. }),
             TurnInput::UserInput {
                 content: actual_input,
@@ -16971,6 +17057,10 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
                 "accepted context, exact user input and deferred mailbox must be queued: {pending:?}"
             );
         };
+        assert_eq!(reset_role, "developer");
+        assert!(matches!(reset_content.as_slice(), [ContentItem::InputText { text }]
+            if text.contains("__codex_additional_context_reset__")
+                && text.contains("previous_value_obsolete=\"true\"")));
         assert_eq!(role, "developer");
         assert_eq!(content, &vec![ContentItem::InputText {
             text: "<application_context source=\"candidate-source\" kind=\"application\">\ncandidate-context\n</application_context>".to_string(),
@@ -17812,33 +17902,47 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                 1,
                 "{case}/{route}: exactly one recovery output"
             );
+            assert_eq!(
+                outputs[0], recovered_text,
+                "{case}/{route}: recovery bytes must preserve the historical prompt prefix"
+            );
+            let notices = items
+                .iter()
+                .filter_map(|item| match item {
+                    ResponseItem::Message { role, content, .. } if role == "developer" => {
+                        Some(content)
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|part| match part {
+                    ContentItem::InputText { text }
+                        if text.starts_with("<workspace_evidence_invalidation>") =>
+                    {
+                        text.lines().find_map(|line| {
+                            serde_json::from_str::<serde_json::Value>(line).ok()
+                        })
+                    }
+                    _ => None,
+                })
+                .filter(|notice| notice["call_id"] == recovery_call_id)
+                .collect::<Vec<_>>();
             if expect_stale {
-                let notice: serde_json::Value =
-                    serde_json::from_str(&outputs[0]).expect("sampling freshness notice");
-                assert_eq!(
-                    notice,
-                    serde_json::json!({
-                        "call_id": recovery_call_id,
-                        "stale_workspace_evidence": true,
-                        "reason": "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
-                        "reason_code": "missing_observation",
-                        "valid_for_current_workspace": false,
-                        "observed_revision": null,
-                        "current_revision": null,
-                        "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
-                        "rerun": {"instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."}
-                    }),
-                    "{case}/{route}: recovered workspace bytes need a fresh observation"
-                );
+                assert_eq!(notices.len(), 1, "{case}/{route}: append one invalidation");
+                let notice = &notices[0];
+                assert_eq!(notice["stale_workspace_evidence"], true);
+                assert_eq!(notice["valid_for_current_workspace"], false);
+                assert_eq!(notice["reason_code"], "missing_observation");
+                assert_eq!(notice["observed_revision"], serde_json::Value::Null);
+                assert!(notice["if_rerun_unavailable"].as_str().unwrap().contains("unverified"));
+                assert!(notice["rerun"]["instruction"].as_str().unwrap().contains("Recovered bytes are authenticated historical evidence"));
+                assert!(notice["rerun"]["instruction"].as_str().unwrap().contains("not a request to rerun tests or builds"));
                 assert!(
-                    !outputs[0].contains(&original_text),
-                    "{case}/{route}: unobserved workspace bytes must not reach sampling"
+                    !notice.to_string().contains(&original_text),
+                    "{case}/{route}: invalidation must not promote tool bytes into developer instructions"
                 );
             } else {
-                assert_eq!(
-                    outputs[0], recovered_text,
-                    "{case}/{route}: proven repository-history recovery must remain usable"
-                );
+                assert!(notices.is_empty(), "{case}/{route}: repository history remains usable");
             }
         }
         resumed
@@ -19093,6 +19197,11 @@ async fn steer_input_validation_wait_preserves_cancellation_and_task_identity() 
         assert_eq!(metadata(&recipient), candidate_metadata);
         let pending = sess.input_queue.get_pending_input(&sess.active_turn).await;
         let [
+            TurnInput::ResponseItem(ResponseItem::Message {
+                role: reset_role,
+                content: reset_content,
+                ..
+            }),
             TurnInput::ResponseItem(ResponseItem::Message { role, content, .. }),
             TurnInput::UserInput {
                 content: actual_input,
@@ -19102,6 +19211,10 @@ async fn steer_input_validation_wait_preserves_cancellation_and_task_identity() 
         else {
             panic!("accepted context and user input must be queued exactly once: {pending:?}")
         };
+        assert_eq!(reset_role, "developer");
+        assert!(matches!(reset_content.as_slice(), [ContentItem::InputText { text }]
+            if text.contains("__codex_additional_context_reset__")
+                && text.contains("previous_value_obsolete=\"true\"")));
         assert_eq!(role, "developer");
         assert_eq!(content, &vec![ContentItem::InputText {
             text: "<application_context source=\"candidate-source\" kind=\"application\">\ncandidate-context\n</application_context>".to_string(),

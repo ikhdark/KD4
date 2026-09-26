@@ -586,8 +586,10 @@ async fn command_exec_returns_error_when_local_environment_is_disabled() -> Resu
     Ok(())
 }
 
+/// Parameter validation runs before any process starts, so one server proves
+/// every rejected combination.
 #[tokio::test]
-async fn command_exec_rejects_sandbox_policy_with_permission_profile() -> Result<()> {
+async fn command_exec_rejects_invalid_parameter_combinations() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
@@ -598,200 +600,75 @@ async fn command_exec_rejects_sandbox_policy_with_permission_profile() -> Result
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell("exit 0"),
-            process_id: None,
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-            permission_profile: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
-        })
-        .await?;
+    let base = CommandExecParams {
+        command: powershell("exit 0"),
+        process_id: None,
+        tty: false,
+        stream_stdin: false,
+        stream_stdout_stderr: false,
+        output_bytes_cap: None,
+        disable_output_cap: false,
+        disable_timeout: false,
+        timeout_ms: None,
+        cwd: None,
+        env: None,
+        size: None,
+        sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
+        permission_profile: None,
+    };
+    let cases = [
+        (
+            CommandExecParams {
+                permission_profile: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+                ..base.clone()
+            },
+            "`permissionProfile` cannot be combined with `sandboxPolicy`",
+        ),
+        (
+            CommandExecParams {
+                command: powershell("Start-Sleep -Seconds 1"),
+                process_id: Some("invalid-timeout-1".to_string()),
+                disable_timeout: true,
+                timeout_ms: Some(1_000),
+                ..base.clone()
+            },
+            "command/exec cannot set both timeoutMs and disableTimeout",
+        ),
+        (
+            CommandExecParams {
+                command: powershell("Start-Sleep -Seconds 1"),
+                process_id: Some("invalid-cap-1".to_string()),
+                output_bytes_cap: Some(1024),
+                disable_output_cap: true,
+                ..base.clone()
+            },
+            "command/exec cannot set both outputBytesCap and disableOutputCap",
+        ),
+        (
+            CommandExecParams {
+                command: powershell("Start-Sleep -Seconds 1"),
+                process_id: Some("negative-timeout-1".to_string()),
+                timeout_ms: Some(-1),
+                ..base.clone()
+            },
+            "command/exec timeoutMs must be non-negative, got -1",
+        ),
+        (
+            CommandExecParams {
+                stream_stdout_stderr: true,
+                ..base
+            },
+            "command/exec tty or streaming requires a client-supplied processId",
+        ),
+    ];
 
-    let error = mcp
-        .read_stream_until_error_message(RequestId::Integer(command_request_id))
-        .await?;
-    assert_eq!(
-        error.error.message,
-        "`permissionProfile` cannot be combined with `sandboxPolicy`"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn command_exec_rejects_disable_timeout_with_timeout_ms() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell("Start-Sleep -Seconds 1"),
-            process_id: Some("invalid-timeout-1".to_string()),
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: true,
-            timeout_ms: Some(1_000),
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-            permission_profile: None,
-        })
-        .await?;
-
-    let error = mcp
-        .read_stream_until_error_message(RequestId::Integer(command_request_id))
-        .await?;
-    assert_eq!(
-        error.error.message,
-        "command/exec cannot set both timeoutMs and disableTimeout"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn command_exec_rejects_disable_output_cap_with_output_bytes_cap() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell("Start-Sleep -Seconds 1"),
-            process_id: Some("invalid-cap-1".to_string()),
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: Some(1024),
-            disable_output_cap: true,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-            permission_profile: None,
-        })
-        .await?;
-
-    let error = mcp
-        .read_stream_until_error_message(RequestId::Integer(command_request_id))
-        .await?;
-    assert_eq!(
-        error.error.message,
-        "command/exec cannot set both outputBytesCap and disableOutputCap"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn command_exec_rejects_negative_timeout_ms() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell("Start-Sleep -Seconds 1"),
-            process_id: Some("negative-timeout-1".to_string()),
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: Some(-1),
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-            permission_profile: None,
-        })
-        .await?;
-
-    let error = mcp
-        .read_stream_until_error_message(RequestId::Integer(command_request_id))
-        .await?;
-    assert_eq!(
-        error.error.message,
-        "command/exec timeoutMs must be non-negative, got -1"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn command_exec_without_process_id_rejects_streaming() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell("exit 0"),
-            process_id: None,
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: true,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-            permission_profile: None,
-        })
-        .await?;
-
-    let error = mcp
-        .read_stream_until_error_message(RequestId::Integer(command_request_id))
-        .await?;
-    assert_eq!(
-        error.error.message,
-        "command/exec tty or streaming requires a client-supplied processId"
-    );
+    for (params, expected_message) in cases {
+        let command_request_id = mcp.send_command_exec_request(params).await?;
+        let error = mcp
+            .read_stream_until_error_message(RequestId::Integer(command_request_id))
+            .await?;
+        assert_eq!(error.error.message, expected_message);
+    }
 
     Ok(())
 }

@@ -92,13 +92,23 @@ fn event_name_label(event_name: HookEventName) -> &'static str {
     }
 }
 
+/// A handler's `once_per` scope plus its persisted hook key.
+///
+/// Run ids shift when handlers are inserted or reordered; the content-based key
+/// does not, so recorded runs stay attached to the same handler across rebuilds.
+#[derive(Debug, Clone)]
+pub(crate) struct OncePerLimit {
+    pub scope: HookRunScope,
+    pub key: String,
+}
+
 /// Admits `once_per` handlers only until they have run in the current scope.
 ///
-/// A handler without a configured scope is always admitted. Recording is
-/// separate from admission so previews can report exactly the handlers that
-/// the following run will spawn.
+/// Every event applies it to its matched handlers. A handler without a
+/// configured scope is always admitted. Previews only check admission so they
+/// can report the handlers the following run will spawn; runs claim atomically.
 pub(crate) struct ScopedRunGate<'a> {
-    once_per: &'a HashMap<String, HookRunScope>,
+    once_per: &'a HashMap<String, OncePerLimit>,
     scoped_runs: &'a Mutex<HashSet<String>>,
     session_id: String,
     turn_id: String,
@@ -106,7 +116,7 @@ pub(crate) struct ScopedRunGate<'a> {
 
 impl<'a> ScopedRunGate<'a> {
     pub(crate) fn new(
-        once_per: &'a HashMap<String, HookRunScope>,
+        once_per: &'a HashMap<String, OncePerLimit>,
         scoped_runs: &'a Mutex<HashSet<String>>,
         session_id: &str,
         turn_id: &str,
@@ -119,13 +129,26 @@ impl<'a> ScopedRunGate<'a> {
         }
     }
 
+    /// A gate with no `once_per` limits, for tests that exercise event modules directly.
+    #[cfg(test)]
+    pub(crate) fn unscoped() -> ScopedRunGate<'static> {
+        static ONCE_PER: std::sync::LazyLock<HashMap<String, OncePerLimit>> =
+            std::sync::LazyLock::new(HashMap::new);
+        static SCOPED_RUNS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+            std::sync::LazyLock::new(Mutex::default);
+        ScopedRunGate::new(&ONCE_PER, &SCOPED_RUNS, "", "")
+    }
+
     fn scope_key(&self, handler: &ConfiguredHandler) -> Option<String> {
-        let run_id = handler.run_id();
-        let scope_id = match *self.once_per.get(&run_id)? {
-            HookRunScope::Turn => self.turn_id.as_str(),
-            HookRunScope::Session => self.session_id.as_str(),
+        if self.once_per.is_empty() {
+            return None;
+        }
+        let limit = self.once_per.get(&handler.run_id())?;
+        let (scope, scope_id) = match limit.scope {
+            HookRunScope::Turn => ("turn", self.turn_id.as_str()),
+            HookRunScope::Session => ("session", self.session_id.as_str()),
         };
-        Some(format!("{run_id}|{scope_id}"))
+        Some(format!("{}|{scope}:{scope_id}", limit.key))
     }
 
     pub(crate) fn admits(&self, handler: &ConfiguredHandler) -> bool {
@@ -138,13 +161,15 @@ impl<'a> ScopedRunGate<'a> {
         })
     }
 
-    pub(crate) fn record(&self, handler: &ConfiguredHandler) {
-        if let Some(key) = self.scope_key(handler) {
+    /// Admits and records a handler under one lock, so concurrent tool calls in
+    /// the same scope cannot both run it.
+    pub(crate) fn claim(&self, handler: &ConfiguredHandler) -> bool {
+        self.scope_key(handler).is_none_or(|key| {
             self.scoped_runs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(key);
-        }
+                .insert(key)
+        })
     }
 }
 
@@ -173,7 +198,7 @@ pub(crate) struct ClaudeHooksEngine {
     warnings: Vec<String>,
     shell: CommandShell,
     output_spiller: HookOutputSpiller,
-    once_per: HashMap<String, HookRunScope>,
+    once_per: HashMap<String, OncePerLimit>,
     scoped_runs: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -213,6 +238,11 @@ impl ClaudeHooksEngine {
         }
     }
 
+    /// Shares `once_per` run history with the engine this one replaces.
+    pub(crate) fn inherit_scoped_runs(&mut self, previous: &Self) {
+        self.scoped_runs = Arc::clone(&previous.scoped_runs);
+    }
+
     fn scoped_run_gate(&self, session_id: ThreadId, turn_id: &str) -> ScopedRunGate<'_> {
         ScopedRunGate::new(
             &self.once_per,
@@ -235,8 +265,10 @@ impl ClaudeHooksEngine {
     pub(crate) fn preview_session_start(
         &self,
         request: &SessionStartRequest,
+        turn_id: Option<&str>,
     ) -> Vec<HookRunSummary> {
-        crate::events::session_start::preview(&self.handlers, request)
+        let gate = self.scoped_run_gate(request.session_id, request.scope_turn_id(turn_id));
+        crate::events::session_start::preview(&self.handlers, request, &gate)
     }
 
     pub(crate) fn preview_pre_tool_use(&self, request: &PreToolUseRequest) -> Vec<HookRunSummary> {
@@ -248,15 +280,8 @@ impl ClaudeHooksEngine {
         &self,
         request: &PermissionRequestRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::permission_request::preview(&self.handlers, request)
-    }
-
-    pub(crate) fn preview_post_tool_use(
-        &self,
-        request: &PostToolUseRequest,
-    ) -> Vec<HookRunSummary> {
-        let plan = self.plan_post_tool_use(&request.tool_name, &request.matcher_aliases);
-        self.preview_planned_post_tool_use(&plan, &request.tool_use_id)
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::permission_request::preview(&self.handlers, request, &gate)
     }
 
     pub(crate) fn plan_post_tool_use(
@@ -270,9 +295,10 @@ impl ClaudeHooksEngine {
     pub(crate) fn preview_planned_post_tool_use(
         &self,
         plan: &PostToolUsePlan,
-        tool_use_id: &str,
+        request: &PostToolUseRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::post_tool_use::preview(plan, tool_use_id)
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::post_tool_use::preview(plan, &request.tool_use_id, &gate)
     }
 
     pub(crate) async fn run_session_start(
@@ -281,8 +307,11 @@ impl ClaudeHooksEngine {
         turn_id: Option<String>,
     ) -> ContextInjectingHookOutcome {
         let session_id = request.session_id;
+        let scope_turn_id = request.scope_turn_id(turn_id.as_deref()).to_string();
+        let gate = self.scoped_run_gate(session_id, &scope_turn_id);
         let mut outcome =
-            crate::events::session_start::run(&self.handlers, &self.shell, request, turn_id).await;
+            crate::events::session_start::run(&self.handlers, &self.shell, request, turn_id, &gate)
+                .await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;
@@ -304,15 +333,8 @@ impl ClaudeHooksEngine {
         &self,
         request: PermissionRequestRequest,
     ) -> PermissionRequestOutcome {
-        crate::events::permission_request::run(&self.handlers, &self.shell, request).await
-    }
-
-    pub(crate) async fn run_post_tool_use(
-        &self,
-        request: PostToolUseRequest,
-    ) -> PostToolUseOutcome {
-        let plan = self.plan_post_tool_use(&request.tool_name, &request.matcher_aliases);
-        self.run_planned_post_tool_use(plan, request).await
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::permission_request::run(&self.handlers, &self.shell, request, &gate).await
     }
 
     pub(crate) async fn run_planned_post_tool_use(
@@ -321,7 +343,9 @@ impl ClaudeHooksEngine {
         request: PostToolUseRequest,
     ) -> PostToolUseOutcome {
         let session_id = request.session_id;
-        let mut outcome = crate::events::post_tool_use::run(plan, &self.shell, request).await;
+        let gate = self.scoped_run_gate(session_id, &request.turn_id);
+        let mut outcome =
+            crate::events::post_tool_use::run(plan, &self.shell, request, &gate).await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;
@@ -332,29 +356,34 @@ impl ClaudeHooksEngine {
     }
 
     pub(crate) fn preview_pre_compact(&self, request: &PreCompactRequest) -> Vec<HookRunSummary> {
-        crate::events::compact::preview_pre(&self.handlers, request)
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::compact::preview_pre(&self.handlers, request, &gate)
     }
 
     pub(crate) async fn run_pre_compact(&self, request: PreCompactRequest) -> StatelessHookOutcome {
-        crate::events::compact::run_pre(&self.handlers, &self.shell, request).await
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::compact::run_pre(&self.handlers, &self.shell, request, &gate).await
     }
 
     pub(crate) fn preview_post_compact(&self, request: &PostCompactRequest) -> Vec<HookRunSummary> {
-        crate::events::compact::preview_post(&self.handlers, request)
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::compact::preview_post(&self.handlers, request, &gate)
     }
 
     pub(crate) async fn run_post_compact(
         &self,
         request: PostCompactRequest,
     ) -> StatelessHookOutcome {
-        crate::events::compact::run_post(&self.handlers, &self.shell, request).await
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::compact::run_post(&self.handlers, &self.shell, request, &gate).await
     }
 
     pub(crate) fn preview_user_prompt_submit(
         &self,
         request: &UserPromptSubmitRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::user_prompt_submit::preview(&self.handlers, request)
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::user_prompt_submit::preview(&self.handlers, &gate)
     }
 
     pub(crate) async fn run_user_prompt_submit(
@@ -362,8 +391,10 @@ impl ClaudeHooksEngine {
         request: UserPromptSubmitRequest,
     ) -> ContextInjectingHookOutcome {
         let session_id = request.session_id;
+        let gate = self.scoped_run_gate(session_id, &request.turn_id);
         let mut outcome =
-            crate::events::user_prompt_submit::run(&self.handlers, &self.shell, request).await;
+            crate::events::user_prompt_submit::run(&self.handlers, &self.shell, request, &gate)
+                .await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;
@@ -371,24 +402,33 @@ impl ClaudeHooksEngine {
     }
 
     pub(crate) fn preview_stop(&self, request: &StopRequest) -> Vec<HookRunSummary> {
-        crate::events::stop::preview(&self.handlers, request)
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::stop::preview(&self.handlers, request, &gate)
     }
 
     pub(crate) async fn run_stop(&self, request: StopRequest) -> StopOutcome {
         let session_id = request.session_id;
-        let mut outcome = crate::events::stop::run(&self.handlers, &self.shell, request).await;
+        let gate = self.scoped_run_gate(session_id, &request.turn_id);
+        let mut outcome =
+            crate::events::stop::run(&self.handlers, &self.shell, request, &gate).await;
         outcome.continuation_fragments = self
             .maybe_spill_prompt_fragments(session_id, outcome.continuation_fragments)
             .await;
         outcome
     }
 
-    pub(crate) fn preview_interrupt(&self) -> Vec<HookRunSummary> {
-        crate::events::interrupt::preview(&self.handlers)
+    pub(crate) fn preview_interrupt(
+        &self,
+        session_id: ThreadId,
+        turn_id: &str,
+    ) -> Vec<HookRunSummary> {
+        let gate = self.scoped_run_gate(session_id, turn_id);
+        crate::events::interrupt::preview(&self.handlers, &gate)
     }
 
     pub(crate) async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
-        crate::events::interrupt::run(&self.handlers, &self.shell, request).await
+        let gate = self.scoped_run_gate(request.session_id, &request.turn_id);
+        crate::events::interrupt::run(&self.handlers, &self.shell, request, &gate).await
     }
 
     async fn maybe_spill_texts(&self, session_id: ThreadId, texts: Vec<String>) -> Vec<String> {

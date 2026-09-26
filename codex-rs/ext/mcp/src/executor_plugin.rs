@@ -52,8 +52,10 @@ impl SelectedExecutorPluginMcpContributor {
     /// Returns metadata for one stable selected root.
     ///
     /// Successful resolution, including a root that is not a plugin or declares no capabilities,
-    /// is cached until the thread state is dropped. Environment availability never invalidates
-    /// this cache; it only controls whether the cached metadata is projected into a model step.
+    /// is cached until the thread state is dropped. A failed MCP or connector declaration load is
+    /// projected without its failed part but not cached, so the next projection retries it.
+    /// Environment availability never invalidates this cache; it only controls whether the cached
+    /// metadata is projected into a model step.
     async fn metadata_for_root(
         &self,
         state: &SelectedExecutorPluginMcpState,
@@ -80,11 +82,13 @@ impl SelectedExecutorPluginMcpContributor {
                 return None;
             }
         };
+        let mut load_failed = false;
         let metadata = match plugin {
             Some(plugin) => {
                 let servers = load_executor_plugin_mcp_servers(&plugin)
                     .await
                     .unwrap_or_else(|err| {
+                        load_failed = true;
                         tracing::warn!(
                             selected_root = selected_root.id,
                             error = %err,
@@ -95,6 +99,7 @@ impl SelectedExecutorPluginMcpContributor {
                 let connector_ids = load_executor_plugin_connectors(&plugin)
                     .await
                     .unwrap_or_else(|err| {
+                        load_failed = true;
                         tracing::warn!(
                             selected_root = selected_root.id,
                             error = %err,
@@ -121,10 +126,12 @@ impl SelectedExecutorPluginMcpContributor {
         if let Some(cached) = cache.iter().find(|cached| cached.root == *selected_root) {
             return cached.metadata.clone();
         }
-        cache.push(CachedSelectedRoot {
-            root: selected_root.clone(),
-            metadata: metadata.clone(),
-        });
+        if !load_failed {
+            cache.push(CachedSelectedRoot {
+                root: selected_root.clone(),
+                metadata: metadata.clone(),
+            });
+        }
         metadata
     }
 }

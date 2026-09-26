@@ -1,6 +1,4 @@
-use crate::acl::add_allow_ace;
 use crate::acl::add_deny_write_ace;
-use crate::acl::allow_null_device;
 use crate::acl::ensure_allow_write_aces;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
@@ -27,7 +25,6 @@ use crate::token::LocalSid;
 use crate::token::create_readonly_token_with_cap;
 use crate::token::create_workspace_write_token_with_caps_from;
 use crate::token::get_current_token_for_restriction;
-use crate::token::get_logon_sid_bytes;
 use crate::workspace_acl::is_command_cwd_root;
 use crate::workspace_acl::protect_workspace_agents_dir;
 use crate::workspace_acl::protect_workspace_codex_dir;
@@ -267,25 +264,6 @@ fn deny_root_capabilities_for_path<'a>(
     }
 }
 
-pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) {
-    if !is_workspace_write {
-        return;
-    }
-
-    // SAFETY: The base token stays open while its SID is copied; tmp retains that valid SID through
-    // the synchronous NUL-device update, and the token is closed afterward.
-    unsafe {
-        if let Ok(base) = get_current_token_for_restriction() {
-            if let Ok(bytes) = get_logon_sid_bytes(base) {
-                let mut tmp = bytes;
-                let psid = tmp.as_mut_ptr() as *mut c_void;
-                allow_null_device(psid);
-            }
-            CloseHandle(base);
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_legacy_session_acl_rules(
     permissions: &ResolvedWindowsSandboxPermissions,
@@ -310,19 +288,14 @@ pub(crate) fn apply_legacy_session_acl_rules(
             }
             deny.insert(path.clone());
         }
-        if let Some(readonly_sid) = acl_sids.readonly_sid {
-            for p in &allow {
-                add_allow_ace(p, readonly_sid.as_ptr())
-                    .with_context(|| format!("add required read ACL for {}", p.display()))?;
-            }
-        } else {
-            for p in &allow {
-                let Some(root_sid) = matching_root_capability(p, acl_sids.write_root_sids) else {
-                    continue;
-                };
-                ensure_allow_write_aces(p, &[root_sid.sid.as_ptr()])
-                    .with_context(|| format!("add required write ACL for {}", p.display()))?;
-            }
+        // Only write-root capabilities receive allow ACEs. A read-only token has no writable roots,
+        // and a write-restricted token's reads never consult its capability SIDs.
+        for p in &allow {
+            let Some(root_sid) = matching_root_capability(p, acl_sids.write_root_sids) else {
+                continue;
+            };
+            ensure_allow_write_aces(p, &[root_sid.sid.as_ptr()])
+                .with_context(|| format!("add required write ACL for {}", p.display()))?;
         }
         for p in &deny {
             for root_sid in deny_root_capabilities_for_path(p, acl_sids.write_root_sids) {
@@ -349,12 +322,6 @@ pub(crate) fn apply_legacy_session_acl_rules(
                     root_sid.sid.as_ptr(),
                 )?;
             }
-        }
-        for root_sid in acl_sids.write_root_sids {
-            allow_null_device(root_sid.sid.as_ptr());
-        }
-        if let Some(readonly_sid) = acl_sids.readonly_sid {
-            allow_null_device(readonly_sid.as_ptr());
         }
         if !acl_sids.write_root_sids.is_empty()
             && let Some(workspace_sid) =
@@ -467,13 +434,6 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     };
     let cap_sids =
         sandbox_capability_sid_strings(uses_write_capabilities, write_root_sids, &caps.readonly);
-    let psid_to_use = LocalSid::from_string(&cap_sids[0])?;
-
-    // SAFETY: psid_to_use owns the valid converted SID until the synchronous NUL-device ACL update
-    // has returned.
-    unsafe {
-        allow_null_device(psid_to_use.as_ptr());
-    }
 
     Ok(ElevatedSpawnContext {
         sandbox_base,

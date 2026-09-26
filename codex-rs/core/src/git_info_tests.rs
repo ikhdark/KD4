@@ -197,58 +197,37 @@ async fn test_recent_commits_non_git_directory_returns_empty() {
 
 #[tokio::test]
 async fn test_recent_commits_orders_and_limits() {
-    use tokio::time::Duration;
-    use tokio::time::sleep;
-
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let repo_path = create_test_git_repo(&temp_dir).await;
 
-    // Make three distinct commits with small delays to ensure ordering by timestamp.
-    fs::write(repo_path.join("file.txt"), "one").unwrap();
-    Command::new("git")
-        .args(["add", "file.txt"])
-        .current_dir(&repo_path)
-        .output()
-        .await
-        .expect("git add");
-    Command::new("git")
-        .args(["commit", "-m", "first change"])
-        .current_dir(&repo_path)
-        .output()
-        .await
-        .expect("git commit 1");
-
-    sleep(Duration::from_millis(1100)).await;
-
-    fs::write(repo_path.join("file.txt"), "two").unwrap();
-    Command::new("git")
-        .args(["add", "file.txt"])
-        .current_dir(&repo_path)
-        .output()
-        .await
-        .expect("git add 2");
-    Command::new("git")
-        .args(["commit", "-m", "second change"])
-        .current_dir(&repo_path)
-        .output()
-        .await
-        .expect("git commit 2");
-
-    sleep(Duration::from_millis(1100)).await;
-
-    fs::write(repo_path.join("file.txt"), "three").unwrap();
-    Command::new("git")
-        .args(["add", "file.txt"])
-        .current_dir(&repo_path)
-        .output()
-        .await
-        .expect("git add 3");
-    Command::new("git")
-        .args(["commit", "-m", "third change"])
-        .current_dir(&repo_path)
-        .output()
-        .await
-        .expect("git commit 3");
+    // Pin distinct commit times instead of waiting out Git's one-second
+    // timestamp granularity between commits.
+    for (contents, subject, timestamp) in [
+        ("one", "first change", 1_700_000_100_i64),
+        ("two", "second change", 1_700_000_200),
+        ("three", "third change", 1_700_000_300),
+    ] {
+        fs::write(repo_path.join("file.txt"), contents).unwrap();
+        let add = Command::new("git")
+            .envs([("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1")])
+            .args(["add", "file.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git add");
+        assert!(add.status.success(), "git add failed: {add:?}");
+        let date = format!("{timestamp} +0000");
+        let commit = Command::new("git")
+            .envs([("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1")])
+            .args(["commit", "-m", subject])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git commit");
+        assert!(commit.status.success(), "git commit failed: {commit:?}");
+    }
 
     // Request the latest 3 commits; should be our three changes in reverse time order.
     let entries = recent_commits(&repo_path, /*limit*/ 3).await;
@@ -256,6 +235,13 @@ async fn test_recent_commits_orders_and_limits() {
     assert_eq!(entries[0].subject, "third change");
     assert_eq!(entries[1].subject, "second change");
     assert_eq!(entries[2].subject, "first change");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.timestamp)
+            .collect::<Vec<_>>(),
+        vec![1_700_000_300, 1_700_000_200, 1_700_000_100]
+    );
     // Basic sanity on SHA formatting
     for e in entries {
         assert!(e.sha.len() >= 7 && e.sha.chars().all(|c| c.is_ascii_hexdigit()));

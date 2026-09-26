@@ -13,11 +13,10 @@ image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
 codex-utils-cache = { workspace = true }
 mime_guess = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "rt", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 divan = { workspace = true }
-image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [lib]
 doctest = false

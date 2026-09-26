@@ -3,7 +3,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codex_arg0::Arg0DispatchPaths;
 use codex_builtin_extensions::BuiltinExtensionDependencies;
 use codex_builtin_extensions::GoalService;
 use codex_builtin_extensions::install_builtin_extensions;
@@ -40,6 +39,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
+use crate::codex_tool_config::ToolSessionDefaults;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
 use crate::codex_tool_runner::RunningRequest;
@@ -48,7 +48,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     initialized: bool,
-    arg0_paths: Arg0DispatchPaths,
+    session_defaults: Arc<ToolSessionDefaults>,
     thread_manager: Arc<ThreadManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
     tool_tasks: ToolTasks,
@@ -91,13 +91,18 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) async fn new(
         outgoing: OutgoingMessageSender,
-        arg0_paths: Arg0DispatchPaths,
+        session_defaults: ToolSessionDefaults,
         config: Arc<Config>,
         environment_manager: Arc<EnvironmentManager>,
         state_db: Option<StateDbHandle>,
         installation_id: String,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
+        // Tool sessions share the server's home rather than resolving it again.
+        let session_defaults = Arc::new(ToolSessionDefaults {
+            codex_home: Some(config.codex_home.to_path_buf()),
+            ..session_defaults
+        });
         let auth_manager = AuthManager::shared_from_config(
             config.as_ref(),
             /*enable_codex_api_key_env*/ false,
@@ -137,7 +142,7 @@ impl MessageProcessor {
         Self {
             outgoing,
             initialized: false,
-            arg0_paths,
+            session_defaults,
             thread_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
             tool_tasks: ToolTasks::default(),
@@ -477,7 +482,7 @@ impl MessageProcessor {
             .lock()
             .await
             .insert(id.clone(), request.clone());
-        let arg0_paths = self.arg0_paths.clone();
+        let session_defaults = Arc::clone(&self.session_defaults);
 
         // Clone outgoing and server to move into async task.
         let outgoing = self.outgoing.clone();
@@ -490,7 +495,7 @@ impl MessageProcessor {
             let prepared = tokio::select! {
                 biased;
                 _ = request.cancellation.cancelled() => Err("Codex request cancelled during startup.".to_string()),
-                result = tool_cfg.into_config(arg0_paths) => result.map_err(|e| format!("Failed to load Codex configuration from overrides: {e}")),
+                result = tool_cfg.into_config(&session_defaults) => result.map_err(|e| format!("Failed to load Codex configuration from overrides: {e}")),
             };
             let (initial_prompt, config) = match prepared {
                 Ok(prepared) => prepared,
@@ -712,7 +717,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let processor = MessageProcessor::new(
             OutgoingMessageSender::new(tx),
-            Arg0DispatchPaths::default(),
+            ToolSessionDefaults::default(),
             Arc::new(config),
             Arc::new(EnvironmentManager::default_for_tests()),
             None,
@@ -892,7 +897,7 @@ mod tests {
         let mut processor = MessageProcessor {
             outgoing: Arc::new(OutgoingMessageSender::new(tx)),
             initialized: true,
-            arg0_paths: Arg0DispatchPaths::default(),
+            session_defaults: Arc::default(),
             thread_manager: Arc::clone(&test.thread_manager),
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
             tool_tasks: ToolTasks::default(),
@@ -1020,6 +1025,102 @@ mod tests {
         .await?;
         assert_eq!(outcome["content"][0]["text"], "second complete");
         assert_ne!(outcome["isError"], true);
+        processor.shutdown().await;
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_turn_result_is_not_consumed_by_the_next_reply() -> anyhow::Result<()> {
+        use core_test_support::responses::ev_assistant_message;
+        use core_test_support::responses::ev_completed;
+        use core_test_support::responses::ev_response_created;
+        use core_test_support::responses::sse;
+        use core_test_support::responses::sse_failed;
+        use core_test_support::streaming_sse::StreamingSseChunk;
+        use core_test_support::streaming_sse::start_streaming_sse_server;
+        use core_test_support::test_codex::test_codex;
+
+        let (server, _completions) = start_streaming_sse_server(vec![
+            vec![StreamingSseChunk {
+                gate: None,
+                body: sse_failed("failed-response", "insufficient_quota", "quota exhausted"),
+            }],
+            vec![StreamingSseChunk {
+                gate: None,
+                body: sse(vec![
+                    ev_response_created("second-response"),
+                    ev_assistant_message("second-message", "second complete"),
+                    ev_completed("second-response"),
+                ]),
+            }],
+        ])
+        .await;
+        let test = test_codex().build_with_streaming_server(&server).await?;
+        let thread_id = test.session_configured.thread_id;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let mut processor = MessageProcessor {
+            outgoing: Arc::new(OutgoingMessageSender::new(tx)),
+            initialized: true,
+            session_defaults: Arc::default(),
+            thread_manager: Arc::clone(&test.thread_manager),
+            running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+            tool_tasks: ToolTasks::default(),
+        };
+        let reply = |id, prompt| {
+            serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "codex-reply", "arguments": {
+                    "threadId": thread_id.to_string(), "prompt": prompt,
+                }},
+            }))
+        };
+        async fn response_for(
+            rx: &mut tokio::sync::mpsc::Receiver<crate::outgoing_message::OutgoingMessage>,
+            id: i64,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if let Some(crate::outgoing_message::OutgoingMessage::Response(response)) =
+                        rx.recv().await
+                        && response.id == RequestId::Number(id)
+                    {
+                        break response.result;
+                    }
+                }
+            })
+            .await?)
+        }
+
+        processor.process_request(reply(201, "first prompt")?).await;
+        let failed = response_for(&mut rx, 201).await?;
+        assert_eq!(failed["isError"], true);
+        assert!(
+            failed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Quota exceeded"),
+            "the terminal turn error must be the result: {failed}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !processor
+                .running_requests_id_to_codex_uuid
+                .lock()
+                .await
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        processor
+            .process_request(reply(202, "second prompt")?)
+            .await;
+        let second = response_for(&mut rx, 202).await?;
+        assert_eq!(second["content"][0]["text"], "second complete");
+        assert_ne!(second["isError"], true);
+        assert_eq!(server.requests().await.len(), 2);
         processor.shutdown().await;
         server.shutdown().await;
         Ok(())

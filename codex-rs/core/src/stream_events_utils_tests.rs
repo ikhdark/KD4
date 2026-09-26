@@ -106,11 +106,11 @@ fn assistant_output_text_with_phase(text: &str, phase: Option<MessagePhase>) -> 
 }
 
 #[tokio::test]
-async fn handle_non_tool_response_item_strips_citations_from_assistant_message() {
+async fn handle_non_tool_response_item_keeps_literal_citation_markup_visible() {
     let (session, _) = make_session_and_context().await;
-    let item = assistant_output_text(
-        "hello<oai-mem-citation><citation_entries>\nMEMORY.md:1-2|note=[x]\n</citation_entries>\n<rollout_ids>\n019cc2ea-1dff-7902-8d40-c8f6e5d83cc4\n</rollout_ids></oai-mem-citation> world",
-    );
+    // Memory citations were removed; text that mentions their tag must not be hidden.
+    let original = "the parser handled `<oai-mem-citation>` and everything after it";
+    let item = assistant_output_text(original);
 
     let turn_item = handle_non_tool_response_item(
         &session,
@@ -131,7 +131,7 @@ async fn handle_non_tool_response_item_strips_citations_from_assistant_message()
             codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
         })
         .collect::<String>();
-    assert_eq!(text, "hello world");
+    assert_eq!(text, original);
 }
 
 struct TestTurnItemContributor;
@@ -183,9 +183,7 @@ async fn handle_non_tool_response_item_runs_turn_item_contributors_only_when_req
     builder.turn_item_contributor(Arc::new(TestTurnItemContributor));
     session.services.extensions = Arc::new(builder.build());
     let turn_store = ExtensionData::new(turn_context.sub_id.clone());
-    let item = assistant_output_text(
-        "hello<oai-mem-citation>ignored by memory parser</oai-mem-citation> world",
-    );
+    let item = assistant_output_text("hello world");
 
     let provisional_turn_item = handle_non_tool_response_item(
         &session,
@@ -782,13 +780,13 @@ async fn finalized_turn_item_defers_mailbox_for_contributed_visible_text() {
     builder.turn_item_contributor(Arc::new(RewriteAgentMessageContributor));
     session.services.extensions = Arc::new(builder.build());
     let turn_store = ExtensionData::new(turn_context.sub_id.clone());
-    let item = assistant_output_text("<oai-mem-citation>hidden only</oai-mem-citation>");
+    let item = assistant_output_text("<proposed_plan>\n- hidden only\n</proposed_plan>");
 
     let finalized = finalize_non_tool_response_item(
         &session,
         TurnItemContributorPolicy::Run(&turn_store),
         &item,
-        /*plan_mode*/ false,
+        /*plan_mode*/ true,
     )
     .await
     .expect("assistant message should parse");
@@ -826,7 +824,7 @@ async fn finalized_turn_item_keeps_mailbox_open_for_commentary_text() {
 }
 
 #[test]
-fn last_assistant_message_from_item_strips_citations_and_plan_blocks() {
+fn last_assistant_message_from_item_strips_only_plan_blocks() {
     let item = assistant_output_text(
         "before<oai-mem-citation>doc1</oai-mem-citation>\n<proposed_plan>\n- x\n</proposed_plan>\nafter",
     );
@@ -834,17 +832,7 @@ fn last_assistant_message_from_item_strips_citations_and_plan_blocks() {
     let message = last_assistant_message_from_item(&item, /*plan_mode*/ true)
         .expect("assistant text should remain after stripping");
 
-    assert_eq!(message, "before\nafter");
-}
-
-#[test]
-fn last_assistant_message_from_item_returns_none_for_citation_only_message() {
-    let item = assistant_output_text("<oai-mem-citation>doc1</oai-mem-citation>");
-
-    assert_eq!(
-        last_assistant_message_from_item(&item, /*plan_mode*/ false),
-        None
-    );
+    assert_eq!(message, "before<oai-mem-citation>doc1</oai-mem-citation>\nafter");
 }
 
 #[test]

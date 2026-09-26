@@ -3,9 +3,9 @@ use std::io::Write;
 use codex_exec_server_protocol::JSONRPCMessage;
 
 use crate::ExecServerError;
+use crate::connection::MAX_JSONRPC_MESSAGE_LEN;
 
 const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
-const MAX_NOISE_JSONRPC_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const NOISE_RECORD_PLAINTEXT_LEN: usize = 60 * 1024;
 // Retain ordinary working buffers, but release occasional multi-megabyte responses.
 const MAX_RETAINED_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -17,7 +17,7 @@ const MAX_RETAINED_BUFFER_CAPACITY: usize = 1024 * 1024;
 /// prefix lets the caller split this byte stream into bounded Noise records and
 /// lets the receiver reconstruct exact JSON-RPC message boundaries.
 pub(crate) fn frame_jsonrpc_message(message: &JSONRPCMessage) -> Result<Vec<u8>, ExecServerError> {
-    frame_jsonrpc_message_with_limit(message, MAX_NOISE_JSONRPC_MESSAGE_LEN)
+    frame_jsonrpc_message_with_limit(message, MAX_JSONRPC_MESSAGE_LEN)
 }
 
 fn frame_jsonrpc_message_with_limit(
@@ -95,7 +95,7 @@ impl JsonRpcMessageDecoder {
             let message_len =
                 u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
             // Reject the authenticated length before waiting for its payload.
-            if message_len == 0 || message_len > MAX_NOISE_JSONRPC_MESSAGE_LEN {
+            if message_len == 0 || message_len > MAX_JSONRPC_MESSAGE_LEN {
                 return Err(ExecServerError::Protocol(
                     "Noise relay JSON-RPC message has invalid length".to_string(),
                 ));
@@ -115,7 +115,7 @@ impl JsonRpcMessageDecoder {
         }
 
         // Even before a message is complete, keep reassembly memory bounded.
-        if self.buffered.len() > LENGTH_PREFIX_BYTES + MAX_NOISE_JSONRPC_MESSAGE_LEN {
+        if self.buffered.len() > LENGTH_PREFIX_BYTES + MAX_JSONRPC_MESSAGE_LEN {
             return Err(ExecServerError::Protocol(
                 "Noise relay JSON-RPC reassembly buffer exceeds maximum length".to_string(),
             ));

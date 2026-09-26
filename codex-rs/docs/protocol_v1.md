@@ -6,13 +6,15 @@ clients should use the [app-server protocol](app_server.md) instead.
 
 ## Overview
 
-A client creates a configured Codex thread with `Codex::spawn`. The returned
-`Codex` handle provides two queues:
+A client starts a configured thread with `ThreadManager::start_thread`. The
+returned `NewThread` holds the thread ID, the initial `SessionConfiguredEvent`,
+and a `CodexThread` handle that provides two queues:
 
-- the submission queue (SQ), where the client sends a `Submission` containing
-  an `Op`; and
-- the event queue (EQ), where the client receives an `Event` containing an
-  `EventMsg`.
+- the submission queue (SQ): `CodexThread::submit` sends an `Op` and returns
+  the generated submission ID (`submit_with_id` takes a caller-built
+  `Submission`); and
+- the event queue (EQ): `CodexThread::next_event` receives the next `Event`
+  containing an `EventMsg`.
 
 Each submission has an ID. Events produced by that submission carry the same
 ID so clients can associate asynchronous results with their request.
@@ -26,13 +28,14 @@ The current Rust definitions are authoritative:
 
 - [`Op` and `EventMsg`](../protocol/src/protocol.rs)
 - [`UserInput`](../protocol/src/user_input.rs)
-- [`Codex`](../core/src/session/mod.rs)
+- [`ThreadManager` and `NewThread`](../core/src/thread_manager.rs)
+- [`CodexThread`](../core/src/codex_thread.rs)
 
 ## Starting and configuring a thread
 
-`Codex::spawn` receives the initial configuration and creates the thread. It
-returns the thread ID and the queue handle. There is no separate session
-configuration operation.
+`ThreadManager::start_thread` receives the initial `Config`, creates the
+thread, and returns its ID with the `CodexThread` handle. There is no separate
+session configuration operation.
 
 Configuration that should persist for later turns can be changed with
 `Op::ThreadSettings`. A `ThreadSettings` submission updates settings without

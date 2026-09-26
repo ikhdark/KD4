@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
@@ -14,7 +15,6 @@ use tokio::sync::OnceCell;
 use crate::SkillsExtensionConfig;
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
-use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillPackageId;
 use crate::catalog::SkillProviderError;
 use crate::catalog::SkillProviderResult;
@@ -116,6 +116,10 @@ impl SkillsThreadState {
         catalog
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Continuations wait for the base catalog instead of extending an empty default"
+    )]
     pub(crate) async fn orchestrator_catalog_snapshot(
         &self,
         mcp_resources: Option<&McpResourceClient>,
@@ -129,6 +133,10 @@ impl SkillsThreadState {
         catalog_or_warning(cache.catalog.get_or_init(|| initialize).await.clone())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize continuation pages so one page is never appended twice"
+    )]
     pub(crate) async fn continue_orchestrator_catalog(
         &self,
         providers: &SkillProviders,
@@ -417,20 +425,32 @@ impl OrchestratorResourceCache {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SkillsTurnState {
-    pub(crate) catalog: SkillCatalog,
-    pub(crate) selected_entries: Vec<SkillCatalogEntry>,
-    pub(crate) warnings: Vec<String>,
-    pub(crate) main_prompts_injected: bool,
-}
-
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExecutorSkillsStepState(pub(crate) SkillCatalog);
+
+/// Warnings already shown for one turn.
+///
+/// Turn input is contributed again when a pending plan is rebuilt, for example after pre-turn
+/// compaction. That rebuild also sees the step's executor catalog through both the ready roots and
+/// [`ExecutorSkillsStepState`], so the same diagnostic can reach one contribution twice.
+#[derive(Default)]
+pub(crate) struct EmittedTurnWarnings(Mutex<HashSet<String>>);
+
+impl EmittedTurnWarnings {
+    /// Records `warning` and returns whether this is its first emission in the turn.
+    pub(crate) fn first_emission(&self, warning: &str) -> bool {
+        let mut emitted = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !emitted.contains(warning) && emitted.insert(warning.to_string())
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::SkillCatalogEntry;
 
     #[tokio::test]
     async fn estimate_includes_explicitly_continued_catalog_without_discovery() {

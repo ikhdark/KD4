@@ -25,6 +25,9 @@ pub const EXEC_EXITED_METHOD: &str = "process/exited";
 pub const EXEC_CLOSED_METHOD: &str = "process/closed";
 pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
+/// Stable, size-bounded read that honors the same sandbox context as `fs/readFile`.
+/// Older peers return method-not-found.
+pub const FS_READ_FILE_BOUNDED_METHOD: &str = "fs/readFileBounded";
 pub const FS_OPEN_METHOD: &str = "fs/open";
 pub const FS_READ_BLOCK_METHOD: &str = "fs/readBlock";
 pub const FS_CLOSE_METHOD: &str = "fs/close";
@@ -264,6 +267,26 @@ pub struct FsReadFileParams {
 #[serde(rename_all = "camelCase")]
 pub struct FsReadFileResponse {
     pub data_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadFileBoundedParams {
+    pub path: PathUri,
+    /// Largest file size the caller accepts. Larger files yield `dataBase64: null`.
+    pub max_bytes: usize,
+    /// When set, every open must stay beneath this root after resolving links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confined_root: Option<PathUri>,
+    #[serde(default)]
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadFileBoundedResponse {
+    /// `null` when the file exceeds `maxBytes` or changed while it was read.
+    pub data_base64: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +611,8 @@ mod tests {
     use super::EnvironmentInfo;
     use super::ExecExitedNotification;
     use super::ExecParams;
+    use super::FsReadFileBoundedParams;
+    use super::FsReadFileBoundedResponse;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
     use super::ProcessId;
@@ -739,6 +764,72 @@ mod tests {
             ),
             ("req-explicit-timeout", Some(1234))
         );
+    }
+
+    #[test]
+    fn bounded_read_uses_camel_case_wire_names_and_optional_fields() {
+        let path = PathUri::from_host_native_path(
+            std::env::current_dir()
+                .expect("current directory")
+                .join("file.txt"),
+        )
+        .expect("path URI");
+        let root =
+            PathUri::from_host_native_path(std::env::current_dir().expect("current directory"))
+                .expect("root URI");
+        let params = FsReadFileBoundedParams {
+            path: path.clone(),
+            max_bytes: 8,
+            confined_root: Some(root.clone()),
+            sandbox: None,
+        };
+
+        let encoded = serde_json::to_value(&params).expect("serialize bounded read");
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "path": path.to_string(),
+                "maxBytes": 8,
+                "confinedRoot": root.to_string(),
+                "sandbox": null,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<FsReadFileBoundedParams>(encoded)
+                .expect("deserialize bounded read"),
+            params
+        );
+        assert_eq!(
+            serde_json::from_value::<FsReadFileBoundedParams>(serde_json::json!({
+                "path": path.to_string(),
+                "maxBytes": 8,
+            }))
+            .expect("confined root and sandbox are optional"),
+            FsReadFileBoundedParams {
+                path,
+                max_bytes: 8,
+                confined_root: None,
+                sandbox: None,
+            }
+        );
+        for (response, wire) in [
+            (
+                FsReadFileBoundedResponse {
+                    data_base64: Some("b2s=".to_string()),
+                },
+                serde_json::json!({ "dataBase64": "b2s=" }),
+            ),
+            (
+                FsReadFileBoundedResponse { data_base64: None },
+                serde_json::json!({ "dataBase64": null }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&response).expect("serialize"), wire);
+            assert_eq!(
+                serde_json::from_value::<FsReadFileBoundedResponse>(wire).expect("deserialize"),
+                response
+            );
+        }
     }
 
     #[test]

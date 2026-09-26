@@ -42,6 +42,11 @@ pub struct NativeAttemptEvidence {
     pub attempt_id: String,
     pub status: String,
     pub elapsed_ms: u64,
+    /// Each turn from its `turn/start` request to its terminal notification, summed and
+    /// recorded only when every turn finished. `elapsed_ms` additionally includes launch,
+    /// the handshake, thread start or resume, and harness checks between turns.
+    #[serde(default)]
+    pub turn_elapsed_ms: Option<u64>,
     pub cleanup_ms: u64,
     pub thread_id: Option<String>,
     pub completed_turns: usize,
@@ -71,6 +76,7 @@ pub fn run_attempt(request: &NativeAttemptRequest) -> NativeAttemptEvidence {
         attempt_id: request.attempt_id.clone(),
         status: "setup_failed".into(),
         elapsed_ms: 0,
+        turn_elapsed_ms: None,
         cleanup_ms: 0,
         thread_id: None,
         completed_turns: 0,
@@ -166,6 +172,7 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
             .scenario
             .map(ScriptedScenario::turn_count)
             .unwrap_or(1);
+        let mut turn_elapsed = Duration::ZERO;
         for turn_index in 0..turns {
             if turn_index == 1 && request.scenario == Some(ScriptedScenario::RestartResume) {
                 process.stop()?;
@@ -194,6 +201,7 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                 .scenario
                 .map(|scenario| scenario.prompt(&request.prompt, turn_index))
                 .unwrap_or_else(|| request.prompt.clone());
+            let turn_started = Instant::now();
             let response = process.rpc(
                 "turn/start",
                 json!({
@@ -221,6 +229,7 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                 &turn_id,
                 if cancel { Some(&mut checkpoint) } else { None },
             )?;
+            turn_elapsed += turn_started.elapsed();
             evidence.tool_executions += terminal.tool_executions;
             if cancel {
                 if terminal.status != "interrupted" {
@@ -247,6 +256,7 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                 evidence.completed_turns += 1;
             }
         }
+        evidence.turn_elapsed_ms = Some(turn_elapsed.as_millis() as u64);
         evidence.status = "completed".into();
         Ok(())
     })();

@@ -976,6 +976,9 @@ struct ToolClosureEntry {
     timing_paired: bool,
     terminal: bool,
     persisted: bool,
+    /// The code-mode `wait` whose result delivered this nested call when its
+    /// owning exec projection does not attest it.
+    delivering_wait: Option<ToolExecutionId>,
 }
 
 #[derive(Debug, Default)]
@@ -1069,15 +1072,14 @@ impl ToolClosureLedger {
         entry.terminal = true;
     }
 
-    fn record_nested_projection_persisted(
-        &mut self,
-        parent_call_id: &str,
-        sampling_generation_id: &SamplingGenerationId,
-    ) {
+    fn record_nested_projection_persisted(&mut self, projection: &TurnTimingToolCallIdentity) {
         for entry in self.entries.values_mut().filter(|entry| {
             entry.identity.source == TurnTimingToolCallSource::CodeMode
-                && entry.identity.parent_call_id.as_deref() == Some(parent_call_id)
-                && &entry.identity.sampling_generation_id == sampling_generation_id
+                && (entry.delivering_wait.as_ref() == Some(&projection.execution_id)
+                    || (entry.identity.parent_call_id.as_deref()
+                        == Some(projection.call_id.as_str())
+                        && entry.identity.sampling_generation_id
+                            == projection.sampling_generation_id))
         }) {
             if entry.persisted {
                 self.duplicate_persistence_count =
@@ -1086,11 +1088,44 @@ impl ToolClosureLedger {
                 entry.persisted = true;
             }
             // Nested CodeMode results are carried inside their owning direct
-            // call's canonical projection. Once that projection is persisted,
-            // every child represented by it has a terminal model-visible
-            // outcome even if cancellation dropped the child future before its
-            // timing guard could attach an explicit outcome label.
+            // call's canonical projection, or inside the later `wait`
+            // projection that delivered them. Once that projection is
+            // persisted, every child represented by it has a terminal
+            // model-visible outcome even if cancellation dropped the child
+            // future before its timing guard could attach an explicit outcome
+            // label.
             entry.terminal = true;
+        }
+    }
+
+    /// A cell that yields keeps running, and its later nested calls reach the
+    /// model through `wait` results. Bind each child that finished before this
+    /// wait result formed and is not attested by a pending exec projection, so
+    /// the wait's durable result attests it exactly once.
+    fn bind_nested_results_to_wait(
+        &mut self,
+        wait_execution_id: &ToolExecutionId,
+        parent_call_id: &str,
+    ) {
+        let pending_exec_generations = self
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.identity.source == TurnTimingToolCallSource::Direct
+                    && entry.identity.call_id == parent_call_id
+                    && !entry.persisted
+            })
+            .map(|entry| entry.identity.sampling_generation_id.clone())
+            .collect::<Vec<_>>();
+        for entry in self.entries.values_mut().filter(|entry| {
+            entry.identity.source == TurnTimingToolCallSource::CodeMode
+                && entry.identity.parent_call_id.as_deref() == Some(parent_call_id)
+                && entry.timing_paired
+                && !entry.persisted
+                && entry.delivering_wait.is_none()
+                && !pending_exec_generations.contains(&entry.identity.sampling_generation_id)
+        }) {
+            entry.delivering_wait = Some(wait_execution_id.clone());
         }
     }
 
@@ -1105,10 +1140,7 @@ impl ToolClosureLedger {
         else {
             return;
         };
-        self.record_nested_projection_persisted(
-            &identity.call_id,
-            &identity.sampling_generation_id,
-        );
+        self.record_nested_projection_persisted(&identity);
         self.record_persisted(identity);
     }
 
@@ -2220,6 +2252,22 @@ impl TurnTimingState {
                     && entry.identity.sampling_generation_id.0 == generation
             })
             .map(|entry| entry.identity.execution_id.clone())
+    }
+
+    /// Records that a code-mode `wait` result carries progress for the cell
+    /// owned by `parent_call_id`. Call it once the wait's runtime response is
+    /// known, while the wait's generation is still current.
+    pub(crate) fn record_code_mode_wait_delivery(&self, wait_call_id: &str, parent_call_id: &str) {
+        let Some(wait_execution_id) = self.tool_result_execution_id(wait_call_id) else {
+            return;
+        };
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() {
+            return;
+        }
+        state
+            .tool_closure
+            .bind_nested_results_to_wait(&wait_execution_id, parent_call_id);
     }
 
     pub(crate) fn record_tool_result_executions_persisted(&self, executions: &[ToolExecutionId]) {

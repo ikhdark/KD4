@@ -24,6 +24,7 @@ pub(crate) struct OAuthHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
     buffered_responses: bool,
+    timeout_cap: Option<Duration>,
 }
 
 impl OAuthHttpClientAdapter {
@@ -32,11 +33,18 @@ impl OAuthHttpClientAdapter {
             http_client,
             default_headers,
             buffered_responses: false,
+            timeout_cap: None,
         }
     }
 
     pub(crate) fn with_buffered_responses(mut self) -> Self {
         self.buffered_responses = true;
+        self
+    }
+
+    /// Bounds every request, including one for which rmcp suggests no timeout.
+    pub(crate) fn with_timeout_cap(mut self, cap: Duration) -> Self {
+        self.timeout_cap = Some(cap);
         self
     }
 
@@ -73,6 +81,10 @@ impl OAuthHttpClientAdapter {
                 })
             })
             .collect::<Result<Vec<_>, OAuthHttpClientError>>()?;
+        let timeout = match self.timeout_cap {
+            Some(cap) => Some(timeout.map_or(cap, |timeout| timeout.min(cap))),
+            None => timeout,
+        };
         let timeout_ms = timeout.map(|timeout| {
             u64::try_from(timeout.as_millis())
                 .unwrap_or(u64::MAX)

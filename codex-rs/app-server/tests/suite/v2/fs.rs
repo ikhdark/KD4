@@ -421,15 +421,21 @@ async fn fs_write_file_accepts_base64_bytes() -> Result<()> {
     Ok(())
 }
 
+/// Every malformed request is rejected before the filesystem is touched, so one
+/// server proves each rejection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_write_file_rejects_invalid_base64() -> Result<()> {
+async fn fs_methods_reject_invalid_requests() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let file_path = codex_home.path().join("blob.bin");
+    let absolute_file = codex_home.path().join("absolute.txt");
+    std::fs::write(&absolute_file, "hello")?;
+    let source_dir = codex_home.path().join("source");
+    std::fs::create_dir_all(source_dir.join("nested"))?;
 
     let mut mcp = initialized_mcp(&codex_home).await?;
+
     let request_id = mcp
         .send_fs_write_file_request(FsWriteFileParams {
-            path: absolute_path(file_path),
+            path: absolute_path(codex_home.path().join("blob.bin")),
             data_base64: "%%%".to_string(),
         })
         .await?;
@@ -447,16 +453,33 @@ async fn fs_write_file_rejects_invalid_base64() -> Result<()> {
         error.error.message
     );
 
-    Ok(())
-}
+    let request_id = mcp
+        .send_fs_copy_request(FsCopyParams {
+            source_path: absolute_path(source_dir.clone()),
+            destination_path: absolute_path(codex_home.path().join("dest")),
+            recursive: false,
+        })
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        request_id,
+        "fs/copy requires recursive: true when sourcePath is a directory",
+    )
+    .await?;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_methods_reject_relative_paths() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let absolute_file = codex_home.path().join("absolute.txt");
-    std::fs::write(&absolute_file, "hello")?;
-
-    let mut mcp = initialized_mcp(&codex_home).await?;
+    let request_id = mcp
+        .send_fs_copy_request(FsCopyParams {
+            source_path: absolute_path(source_dir.clone()),
+            destination_path: absolute_path(source_dir.join("nested").join("copy")),
+            recursive: true,
+        })
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        request_id,
+        "fs/copy cannot copy a directory to itself or one of its descendants",
+    )
+    .await?;
 
     let read_id = mcp
         .send_raw_request("fs/readFile", Some(json!({ "path": "relative.txt" })))
@@ -570,60 +593,6 @@ async fn fs_methods_reject_relative_paths() -> Result<()> {
         "Invalid request: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_copy_rejects_directory_without_recursive() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let source_dir = codex_home.path().join("source");
-    std::fs::create_dir_all(&source_dir)?;
-
-    let mut mcp = initialized_mcp(&codex_home).await?;
-    let request_id = mcp
-        .send_fs_copy_request(FsCopyParams {
-            source_path: absolute_path(source_dir),
-            destination_path: absolute_path(codex_home.path().join("dest")),
-            recursive: false,
-        })
-        .await?;
-    let error = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_eq!(
-        error.error.message,
-        "fs/copy requires recursive: true when sourcePath is a directory"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_copy_rejects_copying_directory_into_descendant() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let source_dir = codex_home.path().join("source");
-    std::fs::create_dir_all(source_dir.join("nested"))?;
-
-    let mut mcp = initialized_mcp(&codex_home).await?;
-    let request_id = mcp
-        .send_fs_copy_request(FsCopyParams {
-            source_path: absolute_path(source_dir.clone()),
-            destination_path: absolute_path(source_dir.join("nested").join("copy")),
-            recursive: true,
-        })
-        .await?;
-    let error = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_eq!(
-        error.error.message,
-        "fs/copy cannot copy a directory to itself or one of its descendants"
-    );
 
     Ok(())
 }

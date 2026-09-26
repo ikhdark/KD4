@@ -5,9 +5,6 @@ use codex_http_client::OutboundProxyPolicy;
 use codex_login::ExternalAuth;
 use codex_login::ExternalAuthFuture;
 use codex_login::ExternalAuthRefreshContext;
-use codex_login::RefreshTokenError;
-use codex_protocol::auth::RefreshTokenFailedError;
-use codex_protocol::auth::RefreshTokenFailedReason;
 use pretty_assertions::assert_eq;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -40,13 +37,6 @@ impl ExternalAuth for ExternalCredentials {
                 RefreshOutcome::Rejected => Err(std::io::Error::other("refresh rejected")),
             }
         })
-    }
-
-    fn classify_error(&self, error: std::io::Error) -> RefreshTokenError {
-        RefreshTokenError::Permanent(RefreshTokenFailedError::new(
-            RefreshTokenFailedReason::Other,
-            error.to_string(),
-        ))
     }
 }
 

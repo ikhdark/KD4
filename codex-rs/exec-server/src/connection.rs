@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::debug;
 use tracing::warn;
 
@@ -32,9 +33,20 @@ use tokio::io::BufReader;
 use tokio::io::BufWriter;
 
 pub(crate) const CHANNEL_CAPACITY: usize = 128;
-// Match the existing serialized JSON-RPC message ceiling used by Noise and
-// WebSocket transports so stdio has the same per-message bound.
-const MAX_STDIO_JSONRPC_MESSAGE_LEN: usize = 64 * 1024 * 1024;
+/// Largest serialized JSON-RPC message any exec-server transport accepts.
+///
+/// Stdio and WebSocket enforce it per message and Noise enforces it before
+/// splitting a message into records, so a payload limit does not depend on
+/// which transport carries the connection.
+pub(crate) const MAX_JSONRPC_MESSAGE_LEN: usize = 64 * 1024 * 1024;
+/// Room kept for the envelope and non-payload fields such as paths and sandbox policy.
+const JSONRPC_PAYLOAD_RESERVE_LEN: usize = 1024 * 1024;
+/// Largest raw file payload whose base64 encoding fits in one JSON-RPC message.
+///
+/// An oversized message is rejected by the receiving transport, which closes the
+/// whole connection; file operations check this bound so they fail on their own.
+pub(crate) const MAX_FILE_PAYLOAD_BYTES: usize =
+    (MAX_JSONRPC_MESSAGE_LEN - JSONRPC_PAYLOAD_RESERVE_LEN) / 4 * 3;
 const STDIO_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const STDIO_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const STDIO_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(70);
@@ -42,6 +54,16 @@ const STDIO_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(70);
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Reader limits for WebSockets that carry one JSON-RPC message per frame.
+///
+/// Tungstenite writes each message as a single frame, so its default 16 MiB
+/// frame limit would reject messages that every other transport accepts.
+pub(crate) fn jsonrpc_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(Some(MAX_JSONRPC_MESSAGE_LEN))
+        .max_message_size(Some(MAX_JSONRPC_MESSAGE_LEN))
+}
 
 #[derive(Debug)]
 pub(crate) enum JsonRpcConnectionEvent {
@@ -322,7 +344,7 @@ impl JsonRpcConnection {
             reader,
             writer,
             connection_label,
-            MAX_STDIO_JSONRPC_MESSAGE_LEN,
+            MAX_JSONRPC_MESSAGE_LEN,
         )
     }
 
@@ -917,6 +939,64 @@ mod tests {
         ));
 
         drop(connection);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_connection_accepts_messages_above_default_frame_limit() -> anyhow::Result<()>
+    {
+        // One frame larger than tungstenite's 16 MiB default, still below the
+        // shared JSON-RPC ceiling enforced by stdio and Noise.
+        let large_text = "x".repeat(17 * 1024 * 1024);
+        let message = JSONRPCMessage::Request(JSONRPCRequest {
+            id: RequestId::Integer(1),
+            method: "large".to_string(),
+            params: Some(serde_json::json!({ "data": large_text })),
+            trace: None,
+        });
+        let encoded = serde_json::to_string(&message)?;
+        assert!(encoded.len() > 16 * 1024 * 1024 && encoded.len() < MAX_JSONRPC_MESSAGE_LEN);
+
+        for configured in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let websocket_url = format!("ws://{}", listener.local_addr()?);
+            let server_task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await?;
+                accept_async(stream).await.map_err(anyhow::Error::from)
+            });
+            let config = configured.then(jsonrpc_websocket_config);
+            let (client_websocket, _) = tokio_tungstenite::connect_async_with_config(
+                websocket_url,
+                config,
+                /*disable_nagle*/ false,
+            )
+            .await?;
+            let mut server_websocket = server_task.await??;
+            let mut connection = JsonRpcConnection::from_websocket(client_websocket, "test".into());
+
+            let sent = timeout(
+                Duration::from_secs(10),
+                server_websocket.send(Message::Text(encoded.clone().into())),
+            )
+            .await?;
+            let event = timeout(Duration::from_secs(10), connection.incoming_rx.recv()).await?;
+            if configured {
+                sent?;
+                assert!(
+                    matches!(&event, Some(JsonRpcConnectionEvent::Message(actual)) if actual == &message),
+                    "configured reader must accept the message"
+                );
+            } else {
+                // Proves the payload exercises the frame limit rather than passing trivially.
+                assert!(
+                    matches!(
+                        event,
+                        Some(JsonRpcConnectionEvent::Disconnected { reason: Some(_) })
+                    ),
+                    "default reader must reject the oversized frame"
+                );
+            }
+        }
         Ok(())
     }
 

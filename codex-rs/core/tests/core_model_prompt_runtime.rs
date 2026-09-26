@@ -1,12 +1,12 @@
 #![allow(clippy::expect_used)]
 
-// Bounded replacement shard for the legacy `all` integration target.
-// Model selection, prompt assembly, and turn-context runtime integration tests.
+// Bounded codex-core integration shard.
+// Model selection, prompt assembly, turn-context runtime, and tool round-trip
+// batching integration tests.
 //
 // The `suite` module is rooted at `tests/suite/` so test IDs stay
 // `suite::<module>::<test>`, and the shared bootstrap comes from the one
 // included prelude. Each shard compiles only its assigned source modules.
-pub use codex_protocol::error;
 
 #[path = "suite"]
 mod suite {
@@ -38,6 +38,8 @@ mod suite {
     mod prompt_debug_tests;
     #[path = "quota_exceeded.rs"]
     mod quota_exceeded;
+    #[path = "round_trip_batching.rs"]
+    mod round_trip_batching;
     #[path = "safety_buffering.rs"]
     mod safety_buffering;
     #[path = "web_search.rs"]

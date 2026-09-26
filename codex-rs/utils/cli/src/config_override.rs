@@ -5,10 +5,18 @@
 //! of `-c key=value` (or `--config key=value`) will be collected as a raw
 //! string. A helper method converts the raw strings into key/value pairs.
 
+use std::ffi::OsString;
+
 use clap::ArgAction;
+use clap::ArgMatches;
+use clap::Args;
+use clap::Command;
 use clap::Parser;
 use serde::de::Error as SerdeError;
 use toml::Value;
+
+/// Clap id of [`CliConfigOverrides::raw_overrides`].
+const RAW_OVERRIDES_ID: &str = "raw_overrides";
 
 /// CLI option that captures arbitrary configuration overrides specified as
 /// `-c key=value`. It intentionally keeps both halves **unparsed** so that the
@@ -42,6 +50,58 @@ impl CliConfigOverrides {
             .splice(0..0, root_overrides.raw_overrides);
     }
 
+    /// Collects `-c` values given at every command level of `args`, in
+    /// command-line order.
+    ///
+    /// The flag is global, and clap copies the values of the deepest
+    /// subcommand that received it into every ancestor, replacing values given
+    /// before that subcommand. Parsing `args` against `command` with the flag
+    /// scoped to each level recovers all of them. Returns `None` when `args`
+    /// do not parse.
+    pub fn from_every_command_level<I, T>(command: Command, args: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = Self::scope_to_each_command_level(command)
+            .try_get_matches_from(args)
+            .ok()?;
+        Some(Self::from_command_levels(&matches))
+    }
+
+    /// Declares `-c` as a non-global argument on `command` and on every
+    /// subcommand, so each level's matches keep only that level's values.
+    pub fn scope_to_each_command_level(command: Command) -> Command {
+        let mut command = if command
+            .get_arguments()
+            .any(|arg| arg.get_id() == RAW_OVERRIDES_ID)
+        {
+            command
+        } else {
+            Self::augment_args(command)
+        }
+        .mut_arg(RAW_OVERRIDES_ID, |arg| arg.global(false));
+        for subcommand in command.get_subcommands_mut() {
+            *subcommand = Self::scope_to_each_command_level(std::mem::take(subcommand));
+        }
+        command
+    }
+
+    /// Concatenates `-c` values from `matches` and its subcommand chain,
+    /// outermost level first. Expects matches from a command prepared by
+    /// [`Self::scope_to_each_command_level`].
+    pub fn from_command_levels(matches: &ArgMatches) -> Self {
+        let mut raw_overrides = Vec::new();
+        let mut level = Some(matches);
+        while let Some(matches) = level {
+            if let Ok(Some(values)) = matches.try_get_many::<String>(RAW_OVERRIDES_ID) {
+                raw_overrides.extend(values.cloned());
+            }
+            level = matches.subcommand().map(|(_, matches)| matches);
+        }
+        Self { raw_overrides }
+    }
+
     /// Parse the raw strings captured from the CLI into a list of `(path,
     /// value)` tuples where `value` is a `toml::Value`.
     pub fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String> {
@@ -50,15 +110,11 @@ impl CliConfigOverrides {
             .map(|s| {
                 // Only split on the *first* '=' so values are free to contain
                 // the character.
-                let mut parts = s.splitn(2, '=');
-                let key = match parts.next() {
-                    Some(k) => k.trim(),
-                    None => return Err("Override missing key".to_string()),
-                };
-                let value_str = parts
-                    .next()
-                    .ok_or_else(|| format!("Invalid override (missing '='): {s}"))?
-                    .trim();
+                let (key, value_str) = s
+                    .split_once('=')
+                    .ok_or_else(|| format!("Invalid override (missing '='): {s}"))?;
+                let key = key.trim();
+                let value_str = value_str.trim();
 
                 if key.is_empty() {
                     return Err(format!("Empty key in override: {s}"));
@@ -72,14 +128,10 @@ impl CliConfigOverrides {
                     Err(_) => Value::String(value_str.to_string()),
                 };
 
-                Ok((canonicalize_override_key(key), value))
+                Ok((key.to_string(), value))
             })
             .collect()
     }
-}
-
-fn canonicalize_override_key(key: &str) -> String {
-    key.to_string()
 }
 
 fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
@@ -97,6 +149,52 @@ fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::FromArgMatches;
+
+    /// Mirrors the Codex CLIs: the root and `own` (like `codex mcp`) declare
+    /// `-c`, while `inherited` (like `codex exec`) and `leaf` accept it only
+    /// through global propagation.
+    fn nested_command() -> Command {
+        CliConfigOverrides::augment_args(Command::new("codex"))
+            .subcommand(
+                CliConfigOverrides::augment_args(Command::new("own"))
+                    .subcommand(Command::new("leaf")),
+            )
+            .subcommand(Command::new("inherited"))
+    }
+
+    #[test]
+    fn collects_overrides_from_every_command_level_in_order() {
+        let root_and_child = ["codex", "-c", "a=1", "inherited", "-c", "a=2"];
+        // Plain clap parsing keeps only the deepest level's values.
+        let matches = nested_command()
+            .try_get_matches_from(root_and_child)
+            .expect("parse");
+        assert_eq!(
+            CliConfigOverrides::from_arg_matches(&matches)
+                .expect("root overrides")
+                .raw_overrides,
+            vec!["a=2"]
+        );
+
+        for (args, expected) in [
+            (root_and_child.to_vec(), vec!["a=1", "a=2"]),
+            (
+                vec!["codex", "-c", "a=1", "own", "-c", "a=2", "leaf", "-c", "a=3"],
+                vec!["a=1", "a=2", "a=3"],
+            ),
+            (vec!["codex", "own", "leaf", "--config", "a=3"], vec!["a=3"]),
+            (vec!["codex", "-c", "a=1", "own"], vec!["a=1"]),
+        ] {
+            assert_eq!(
+                CliConfigOverrides::from_every_command_level(nested_command(), args.clone())
+                    .expect("parse")
+                    .raw_overrides,
+                expected,
+                "{args:?}"
+            );
+        }
+    }
 
     #[test]
     fn parses_basic_scalar() {

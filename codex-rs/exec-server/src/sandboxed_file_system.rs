@@ -21,7 +21,6 @@ use crate::WalkOutcome;
 use crate::fs_helper::FS_PERMISSION_DENIED_ERROR_CODE;
 use crate::fs_helper::FsHelperPayload;
 use crate::fs_helper::FsHelperReadDirectoryBoundedParams;
-use crate::fs_helper::FsHelperReadFileBoundedParams;
 use crate::fs_helper::FsHelperRequest;
 use crate::fs_sandbox::FileSystemSandboxRunner;
 use crate::protocol::FsCanonicalizeParams;
@@ -29,6 +28,7 @@ use crate::protocol::FsCopyParams;
 use crate::protocol::FsCreateDirectoryParams;
 use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsReadDirectoryParams;
+use crate::protocol::FsReadFileBoundedParams;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsRemoveParams;
 use crate::protocol::FsWalkParams;
@@ -142,10 +142,11 @@ impl SandboxedFileSystem {
         let response = self
             .run_sandboxed(
                 sandbox,
-                FsHelperRequest::ReadFileBounded(FsHelperReadFileBoundedParams {
+                FsHelperRequest::ReadFileBounded(FsReadFileBoundedParams {
                     path: path.clone(),
                     max_bytes,
                     confined_root: confined_root.cloned(),
+                    sandbox: None,
                 }),
             )
             .await?

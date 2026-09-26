@@ -398,7 +398,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             );
         }
 
-        #[allow(clippy::print_stdout)]
+        let mut stdout_result = Ok(());
         if should_print_final_message_to_stdout(
             self.emit_final_message_on_shutdown
                 .then_some(self.final_message.as_deref())
@@ -407,7 +407,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             std::io::stderr().is_terminal(),
         ) && let Some(message) = self.final_message.as_deref()
         {
-            println!("{message}");
+            stdout_result = write_final_message(&mut std::io::stdout().lock(), message);
         } else if should_print_final_message_to_tty(
             self.emit_final_message_on_shutdown
                 .then_some(self.final_message.as_deref())
@@ -423,8 +423,21 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 message
             );
         }
-        output_file_result
+        output_file_result.and(stdout_result)
     }
+}
+
+/// Writes the final answer to stdout. Unlike `println!`, a closed reader
+/// (for example `codex exec ... | head`) becomes an error exit instead of a panic.
+fn write_final_message(output: &mut impl std::io::Write, message: &str) -> std::io::Result<()> {
+    writeln!(output, "{message}")
+        .and_then(|()| output.flush())
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to write final message to stdout: {error}"),
+            )
+        })
 }
 
 fn config_summary_entries(

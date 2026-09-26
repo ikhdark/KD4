@@ -12,6 +12,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use super::common;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
+use crate::engine::ScopedRunGate;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
@@ -36,13 +37,17 @@ pub struct InterruptOutcome {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct InterruptHandlerData;
 
-pub(crate) fn preview(handlers: &[ConfiguredHandler]) -> Vec<HookRunSummary> {
+pub(crate) fn preview(
+    handlers: &[ConfiguredHandler],
+    gate: &ScopedRunGate<'_>,
+) -> Vec<HookRunSummary> {
     dispatcher::select_handlers(
         handlers,
         HookEventName::Interrupt,
         /*matcher_input*/ None,
     )
     .into_iter()
+    .filter(|handler| gate.admits(handler))
     .map(|handler| dispatcher::running_summary(&handler))
     .collect()
 }
@@ -51,12 +56,14 @@ pub(crate) async fn run(
     handlers: &[ConfiguredHandler],
     shell: &CommandShell,
     request: InterruptRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> InterruptOutcome {
-    let matched = dispatcher::select_handlers(
+    let mut matched = dispatcher::select_handlers(
         handlers,
         HookEventName::Interrupt,
         /*matcher_input*/ None,
     );
+    matched.retain(|handler| gate.claim(handler));
     if matched.is_empty() {
         return InterruptOutcome::default();
     }

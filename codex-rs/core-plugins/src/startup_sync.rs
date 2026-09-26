@@ -39,6 +39,8 @@ const CURATED_PLUGINS_MAX_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
 const CURATED_PLUGINS_MAX_EXTRACTED_BYTES: u64 = 250 * 1024 * 1024;
 const CURATED_PLUGINS_MAX_ARCHIVE_ENTRIES: usize = 20_000;
 const COMMAND_MAX_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+const COMMAND_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const COMMAND_MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Keep this comfortably above a normal sync attempt so we do not race another Codex process.
 const CURATED_PLUGINS_STALE_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 // These variables can redirect Git away from the repository selected by `-C`,
@@ -817,6 +819,37 @@ impl Drop for GitChild {
     }
 }
 
+/// When `run_git_command_with_timeout` next checks the child for exit and output growth.
+///
+/// Helper commands such as `rev-parse` usually exit well inside one maximum interval, so checks
+/// back off from a short first delay. They still land on every multiple of the maximum interval,
+/// so no command is observed later than with fixed-interval polling.
+struct CommandPollSchedule {
+    backoff: Duration,
+    next_fixed_poll: Duration,
+}
+
+impl CommandPollSchedule {
+    fn new() -> Self {
+        Self {
+            backoff: COMMAND_INITIAL_POLL_INTERVAL,
+            next_fixed_poll: COMMAND_MAX_POLL_INTERVAL,
+        }
+    }
+
+    fn delay_after(&mut self, elapsed: Duration) -> Duration {
+        while self.next_fixed_poll <= elapsed {
+            self.next_fixed_poll += COMMAND_MAX_POLL_INTERVAL;
+        }
+        let delay = self.backoff.min(self.next_fixed_poll - elapsed);
+        self.backoff = self
+            .backoff
+            .saturating_mul(2)
+            .min(COMMAND_MAX_POLL_INTERVAL);
+        delay
+    }
+}
+
 pub(crate) fn run_git_command_with_timeout(
     command: &mut Command,
     context: &str,
@@ -875,6 +908,7 @@ pub(crate) fn run_git_command_with_timeout(
         .attach_and_resume(child.child.id())
         .map_err(|err| format!("failed to contain {context}: {err}"))?;
     let start = std::time::Instant::now();
+    let mut poll_schedule = CommandPollSchedule::new();
     let status = loop {
         for (stream, capture) in [("stdout", &stdout), ("stderr", &stderr)] {
             let extent = capture
@@ -908,7 +942,12 @@ pub(crate) fn run_git_command_with_timeout(
                 ))
             };
         }
-        std::thread::sleep(Duration::from_millis(100).min(timeout.saturating_sub(start.elapsed())));
+        let elapsed = start.elapsed();
+        std::thread::sleep(
+            poll_schedule
+                .delay_after(elapsed)
+                .min(timeout.saturating_sub(elapsed)),
+        );
     };
     let output = Output {
         status,

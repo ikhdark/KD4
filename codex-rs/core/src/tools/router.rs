@@ -76,6 +76,7 @@ pub struct ToolRouter {
     registry: ToolRegistry,
     planning_warnings: Vec<String>,
     exposure_identity: ToolExposureIdentity,
+    pub(crate) tool_suggest_candidates: Option<ToolSuggestCandidates>,
     schema_cache: Mutex<Option<(HashSet<ToolName>, Arc<ToolSchemaArtifact>)>>,
     manifest_cache: Mutex<ToolManifestCache>,
     deferred_tool_capability_revisions: OnceLock<Arc<HashMap<ToolName, String>>>,
@@ -139,7 +140,7 @@ pub(crate) enum ToolSuggestPresentation {
     RecommendationContext,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ToolSuggestCandidates {
     pub(crate) tools: Vec<DiscoverableTool>,
     pub(crate) presentation: ToolSuggestPresentation,
@@ -199,6 +200,7 @@ impl ToolRouter {
             registry,
             planning_warnings,
             exposure_identity,
+            tool_suggest_candidates: None,
             schema_cache: Mutex::new(None),
             manifest_cache: Mutex::new(ToolManifestCache::default()),
             deferred_tool_capability_revisions: OnceLock::new(),
@@ -790,8 +792,9 @@ async fn authorize_bound_typed_tool_call(
             ))
         })?;
     }
+    // An authorized tool call is meaningful progress, not just liveness.
     let heartbeated = coordinator
-        .heartbeat_typed_actor_binding(&binding)
+        .heartbeat_typed_actor_binding(&binding, /*progress*/ true)
         .await
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(

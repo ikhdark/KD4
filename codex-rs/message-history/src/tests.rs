@@ -37,6 +37,40 @@ async fn append_entry_creates_private_history_and_keeps_it_private_after_retenti
 }
 
 #[tokio::test]
+#[cfg(windows)]
+async fn retention_publishes_history_without_the_temporary_file_attribute() {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY;
+
+    let codex_home = TempDir::new().expect("create temp dir");
+    let mut config = HistoryConfig::new(codex_home.path(), &History::default());
+    append_entry("first prompt", "session", &config)
+        .await
+        .expect("create history");
+    let (original_id, _) = history_metadata(&config).await;
+    config.max_bytes = Some(1);
+    append_entry("second prompt", "session", &config)
+        .await
+        .expect("replace history during retention");
+
+    let (retained_id, count) = history_metadata(&config).await;
+    assert_ne!(retained_id, original_id, "retention must publish a new file");
+    assert_eq!(count, 1);
+    assert_eq!(
+        lookup(retained_id, 0, &config).map(|entry| entry.text),
+        Some("second prompt".to_string())
+    );
+    let attributes = std::fs::metadata(codex_home.path().join(HISTORY_FILENAME))
+        .expect("history metadata")
+        .file_attributes();
+    assert_eq!(
+        attributes & FILE_ATTRIBUTE_TEMPORARY,
+        0,
+        "later appends to the published history must not be marked temporary"
+    );
+}
+
+#[tokio::test]
 async fn lookup_reads_history_entries() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let history_path = temp_dir.path().join(HISTORY_FILENAME);

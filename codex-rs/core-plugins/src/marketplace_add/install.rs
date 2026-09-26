@@ -9,7 +9,7 @@ pub(super) fn clone_git_source(
     ref_name: Option<&str>,
     sparse_paths: &[String],
     destination: &Path,
-) -> Result<(), MarketplaceAddError> {
+) -> Result<String, MarketplaceAddError> {
     crate::marketplace_upgrade::git::clone_git_source(
         url,
         ref_name,
@@ -17,7 +17,6 @@ pub(super) fn clone_git_source(
         destination,
         Duration::from_secs(30),
     )
-    .map(|_| ())
     .map_err(MarketplaceAddError::Internal)
 }
 

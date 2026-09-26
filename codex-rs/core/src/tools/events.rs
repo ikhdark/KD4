@@ -708,22 +708,13 @@ async fn emit_exec_stage(
                 native_cwd.as_ref().map(AbsolutePathBuf::as_path),
             )
             .await?;
-            if matches!(
-                mutation,
-                crate::turn_diff_tracker::CommandMutation::Uncertain
-            ) {
-                let baseline = ctx
-                    .session
-                    .services
-                    .git_workspace
-                    .workspace_evidence_for_uri(ctx.turn, exec_input.cwd, exec_input.environment_id)
-                    .await;
-                ctx.session
-                    .services
-                    .command_execution
-                    .record_uncertain_command_baseline(ctx.call_id, &ctx.turn.sub_id, baseline)
-                    .await;
-            }
+            begin_uncertain_command_baseline(
+                ctx,
+                exec_input.cwd,
+                exec_input.environment_id,
+                &mutation,
+            )
+            .await;
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -807,6 +798,42 @@ async fn emit_exec_stage(
         }
     }
     Ok(())
+}
+
+/// Records the workspace identity an uncertain command's end is compared with.
+/// The snapshot must precede the process: a write that lands while it is being
+/// captured becomes part of the baseline and the command reads as unchanged.
+/// Launchers that publish Begin after spawning call this before the spawn, and
+/// Begin then keeps that earlier snapshot.
+pub(crate) async fn begin_uncertain_command_baseline(
+    ctx: ToolEventCtx<'_>,
+    cwd: &PathUri,
+    environment_id: &str,
+    mutation: &crate::turn_diff_tracker::CommandMutation,
+) {
+    if !matches!(
+        mutation,
+        crate::turn_diff_tracker::CommandMutation::Uncertain
+    ) || ctx
+        .session
+        .services
+        .command_execution
+        .has_uncertain_command_baseline(ctx.call_id)
+        .await
+    {
+        return;
+    }
+    let baseline = ctx
+        .session
+        .services
+        .git_workspace
+        .workspace_evidence_for_uri(ctx.turn, cwd, environment_id)
+        .await;
+    ctx.session
+        .services
+        .command_execution
+        .record_uncertain_command_baseline(ctx.call_id, &ctx.turn.sub_id, baseline)
+        .await;
 }
 
 pub(crate) async fn begin_exec_mutation_evidence(
@@ -2069,7 +2096,7 @@ mod tests {
             vec!["custom-mutator".to_string()],
             cwd,
             ExecCommandSource::Agent,
-            String::new(),
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
         );
         let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let capture_count_before = session

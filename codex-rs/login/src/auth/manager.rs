@@ -192,6 +192,9 @@ const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
     "Your access token could not be refreshed. Please log out and sign in again.";
 const REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+// Refresh runs under `refresh_lock`, which proactive refresh and unauthorized
+// recovery wait on, so a stalled token endpoint must not hold it indefinitely.
+const REFRESH_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const REVOKE_TOKEN_URL: &str = "https://auth.openai.com/oauth/revoke";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 pub const REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REVOKE_TOKEN_URL_OVERRIDE";
@@ -1611,6 +1614,7 @@ fn persist_tokens(
 async fn request_chatgpt_token_refresh(
     refresh_token: String,
     client: &HttpClient,
+    timeout: Duration,
 ) -> Result<RefreshResponse, RefreshTokenError> {
     let refresh_request = RefreshRequest {
         client_id: oauth_client_id(),
@@ -1623,6 +1627,7 @@ async fn request_chatgpt_token_refresh(
     let response = client
         .post(endpoint.as_str())
         .header("Content-Type", "application/json")
+        .timeout(timeout)
         .json(&refresh_request)
         .send()
         .await
@@ -1872,6 +1877,8 @@ enum ReloadOutcome {
     ReloadedNoChange,
     /// Reload was skipped (missing or mismatched account id)
     Skipped,
+    /// The auth source could not be read, so the account could not be checked
+    Failed(std::io::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1898,6 +1905,9 @@ pub struct UnauthorizedRecovery {
     step: UnauthorizedRecoveryStep,
     expected_account_id: Option<String>,
     mode: UnauthorizedRecoveryMode,
+    /// Credentials used by the latest rejected attempt: those cached when recovery
+    /// began, then those cached after the reload step for the retry that follows.
+    retried_auth: Option<RefreshAuthIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1915,6 +1925,7 @@ impl UnauthorizedRecovery {
     fn new(manager: Arc<AuthManager>) -> Self {
         let cached_auth = manager.auth_cached();
         let expected_account_id = cached_auth.as_ref().and_then(CodexAuth::get_account_id);
+        let retried_auth = cached_auth.as_ref().map(RefreshAuthIdentity::from_auth);
         let mode = if manager.has_external_auth() {
             UnauthorizedRecoveryMode::External
         } else {
@@ -1929,6 +1940,7 @@ impl UnauthorizedRecovery {
             step,
             expected_account_id,
             mode,
+            retried_auth,
         }
     }
 
@@ -2017,11 +2029,16 @@ impl UnauthorizedRecovery {
 
         match self.step {
             UnauthorizedRecoveryStep::Reload => {
-                match self
+                let outcome = self
                     .manager
                     .reload_if_account_id_matches(self.expected_account_id.as_deref())
-                    .await
-                {
+                    .await;
+                self.retried_auth = self
+                    .manager
+                    .auth_cached()
+                    .as_ref()
+                    .map(RefreshAuthIdentity::from_auth);
+                match outcome {
                     ReloadOutcome::ReloadedChanged => {
                         self.step = UnauthorizedRecoveryStep::RefreshToken;
                         return Ok(UnauthorizedRecoveryStepResult {
@@ -2041,18 +2058,17 @@ impl UnauthorizedRecovery {
                             REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
                         )));
                     }
+                    ReloadOutcome::Failed(err) => {
+                        self.step = UnauthorizedRecoveryStep::Done;
+                        return Err(RefreshTokenError::Transient(err));
+                    }
                 }
             }
-            UnauthorizedRecoveryStep::RefreshToken => {
+            UnauthorizedRecoveryStep::RefreshToken | UnauthorizedRecoveryStep::ExternalRefresh => {
                 self.step = UnauthorizedRecoveryStep::Done;
-                self.manager.refresh_token_from_authority().await?;
-                return Ok(UnauthorizedRecoveryStepResult {
-                    auth_state_changed: Some(true),
-                });
-            }
-            UnauthorizedRecoveryStep::ExternalRefresh => {
-                self.step = UnauthorizedRecoveryStep::Done;
-                self.manager.refresh_token_from_authority().await?;
+                self.manager
+                    .refresh_token_from_authority_unless_replaced(self.retried_auth.take())
+                    .await?;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
                 });
@@ -2473,7 +2489,15 @@ impl AuthManager {
     pub async fn reload(&self) -> bool {
         tracing::info!("Reloading auth");
         let revision = self.source_revision();
-        let new_auth = self.load_auth().await;
+        let new_auth = match self.load_auth().await {
+            Ok(auth) => auth,
+            Err(err) => {
+                // An unreadable store is not a logout; keep the credentials this
+                // process already holds until the store can be read again.
+                tracing::warn!(error_kind = ?err.kind(), "auth reload failed; keeping cached auth");
+                return false;
+            }
+        };
         let changed =
             !Self::auths_equal_for_refresh(self.auth_cached().as_ref(), new_auth.as_ref());
         self.set_cached_auth_if_revision(new_auth, revision).await && changed
@@ -2492,7 +2516,13 @@ impl AuthManager {
         };
 
         let revision = self.source_revision();
-        let new_auth = self.load_auth().await;
+        let new_auth = match self.load_auth().await {
+            Ok(auth) => auth,
+            Err(err) => {
+                tracing::warn!(error_kind = ?err.kind(), "auth reload failed during recovery");
+                return ReloadOutcome::Failed(err);
+            }
+        };
         let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
 
         if new_account_id.as_deref() != Some(expected_account_id) {
@@ -2562,20 +2592,22 @@ impl AuthManager {
         }
     }
 
-    async fn load_auth(&self) -> Option<CodexAuth> {
+    /// Loads auth from the active source. `Ok(None)` means no usable
+    /// credentials; `Err` means the source could not be read or hydrated.
+    async fn load_auth(&self) -> std::io::Result<Option<CodexAuth>> {
         if let Some(external_auth) = self.external_auth() {
             return match self.resolve_external_auth(&external_auth).await {
-                Ok(auth) => Some(auth),
+                Ok(auth) => Ok(Some(auth)),
                 Err(err) => {
                     tracing::error!("Failed to resolve external auth: {err}");
-                    None
+                    Ok(None)
                 }
             };
         }
 
         let allowed_login_methods = self.allowed_login_methods();
         let effective_chatgpt_workspaces = self.effective_chatgpt_workspaces();
-        load_auth(
+        let auth = match load_auth(
             &self.codex_home,
             self.enable_codex_api_key_env,
             self.auth_credentials_store_mode,
@@ -2587,16 +2619,20 @@ impl AuthManager {
             &self.auth_route_config,
         )
         .await
-        .ok()
-        .flatten()
-        .filter(|auth| {
+        {
+            Ok(auth) => auth,
+            // Workspace restrictions reject the stored credentials themselves.
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(err) => return Err(err),
+        };
+        Ok(auth.filter(|auth| {
             validate_auth_restrictions(
                 Some(&allowed_login_methods),
                 effective_chatgpt_workspaces.as_deref(),
                 auth,
             )
             .is_ok()
-        })
+        }))
     }
 
     #[expect(
@@ -2932,6 +2968,7 @@ impl AuthManager {
                     REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
                 )))
             }
+            ReloadOutcome::Failed(err) => Err(RefreshTokenError::Transient(err)),
         }
     }
 
@@ -2945,6 +2982,30 @@ impl AuthManager {
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
+        self.refresh_token_from_authority_impl().await
+    }
+
+    /// Refreshes for an unauthorized retry unless the cached credentials no longer
+    /// match those the retry used. Concurrent recoveries for one rejected token
+    /// then share the first refresh instead of each rotating the token again.
+    async fn refresh_token_from_authority_unless_replaced(
+        &self,
+        retried_auth: Option<RefreshAuthIdentity>,
+    ) -> Result<(), RefreshTokenError> {
+        let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
+            RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Other,
+                REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+            ))
+        })?;
+        if let Some(retried_auth) = retried_auth
+            && self
+                .auth_cached()
+                .is_some_and(|auth| RefreshAuthIdentity::from_auth(&auth) != retried_auth)
+        {
+            tracing::info!("Skipping token refresh because auth changed after the rejected retry.");
+            return Ok(());
+        }
         self.refresh_token_from_authority_impl().await
     }
 
@@ -3164,8 +3225,12 @@ impl AuthManager {
         token_data: TokenData,
     ) -> Result<(), RefreshTokenError> {
         let revision = self.source_revision();
-        let refresh_response =
-            request_chatgpt_token_refresh(token_data.refresh_token.clone(), auth.client()).await?;
+        let refresh_response = request_chatgpt_token_refresh(
+            token_data.refresh_token.clone(),
+            auth.client(),
+            REFRESH_TOKEN_REQUEST_TIMEOUT,
+        )
+        .await?;
         let auth = auth.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let _writer = auth

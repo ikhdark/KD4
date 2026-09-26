@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
-use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -20,7 +20,6 @@ use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_http_client::HttpClientBuilder;
 use codex_login::CodexAuth;
 use codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY;
 use codex_mcp::SandboxState;
@@ -57,7 +56,6 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
-use http::StatusCode;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageBuffer;
@@ -67,10 +65,10 @@ use serde_json::json;
 use serial_test::serial;
 use std::io::Cursor;
 use tempfile::tempdir;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
-use tokio::time::Instant;
-use tokio::time::sleep;
 use wiremock::MockServer;
 
 static OPENAI_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAD0AAAA9CAYAAAAeYmHpAAAE6klEQVR4Aeyau44UVxCGx1fZsmRLlm3Zoe0XcGQ5cUiCCIgJeS9CHgAhMkISQnIuGQgJEkBcxLW+nqnZ6uqqc+nuWRC7q/P3qetf9e+MtOwyX25O4Nep6JPyop++0qev9HrfgZ+F6r2DuB/vHOrt/UIkqdDHYvujOW6fO7h/CNEI+a5jc+pBR8uy0jVFsziYu5HtfSUk+Io34q921hLNctFSX0gwww+S8wce8K1LfCU+cYW4888aov8NxqvQILUPPReLOrm6zyLxa4i+6VZuFbJo8d1MOHZm+7VUtB/aIvhPWc/3SWg49JcwFLlHxuXKjtyloo+YNhuW3VS+WPBuUEMvCFKjEDVgFBQHXrnazpqiSxNZCkQ1kYiozsbm9Oz7l4i2Il7vGccGNWAc3XosDrZe/9P3ZnMmzHNEQw4smf8RQ87XEAMsC7Az0Au+dgXerfH4+sHvEc0SYGic8WBBUGqFH2gN7yDrazy7m2pbRTeRmU3+MjZmr1h6LJgPbGy23SI6GlYT0brQ71IY8Us4PNQCm+zepSbaD2BY9xCaAsD9IIj/IzFmKMSdHHonwdZATbTnYREf6/VZGER98N9yCWIvXQwXDoDdhZJoT8jwLnJXDB9w4Sb3e6nK5ndzlkTLnP3JBu4LKkbrYrU69gCVceV0JvpyuW1xlsUVngzhwMetn/XamtTORF9IO5YnWNiyeF9zCAfqR3fUW+vZZKLtgP+ts8BmQRBREAdRDhH3o8QuRh/YucNFz2BEjxbRN6LGzphfKmvP6v6QhqIQyZ8XNJ0W0X83MR1PEcJBNO2KC2Z1TW/v244scp9FwRViZxIOBF0Lctk7ZVSavdLvRlV1hz/ysUi9sr8CIcB3nvWBwA93ykTz18eAYxQ6N/K2DkPA1lv3iXCwmDUT7YkjIby9siXueIJj9H+pzSqJ9oIuJWTUgSSt4WO7o/9GGg0viR4VinNRUDoIj34xoCd6pxD3aK3zfdbnx5v1J3ZNNEJsE0sBG7N27ReDrJc4sFxz7dI/ZAbOmmiKvHBitQXpAdR6+F7v+/ol/tOouUV01EeMZQF2BoQDn6dP4XNr+j9GZEtEK1/L8pFw7bd3a53tsTa7WD+054jOFmPg1XBKPQgnqFfmFcy32ZRvjmiIIQTYFvyDxQ8nH8WIwwGwlyDjDznnilYyFr6njrlZwsKkBpO59A7OwgdzPEWRm+G+oeb7IfyNuzjEEVLrOVxJsxvxwF8kmCM6I2QYmJunz4u4TrADpfl7mlbRTWQ7VmrBzh3+C9f6Grc3YoGN9dg/SXFthpRsT6vobfXRs2VBlgBHXVMLHjDNbIZv1sZ9+X3hB09cXdH1JKViyG0+W9bWZDa/r2f9zAFR71sTzGpMSWz2iI4YssWjWo3REy1MDGjdwe5e0dFSiAC1JakBvu4/CUS8Eh6dqHdU0Or0ioY3W5ClSqDXAy7/6SRfgw8vt4I+tbvvNtFT2kVDhY5+IGb1rCqYaXNF08vSALsXCPmt0kQNqJT1p5eI1mkIV/BxCY1z85lOzeFbPBQHURkkPTlwTYK9gTVE25l84IbFFN+YJDHjdpn0gq6mrHht0dkcjbM4UL9283O5p77GN+SPW/QwVB4IUYg7Or+Kp7naR6qktP98LNF2UxWo9yObPIT9KYg+hK4i56no4rfnM0qeyFf6AwAAAP//trwR3wAAAAZJREFUAwBZ0sR75itw5gAAAABJRU5ErkJggg==";
@@ -482,7 +480,7 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -656,7 +654,7 @@ async fn stdio_server_uses_configured_cwd_before_runtime_fallback() -> anyhow::R
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -713,7 +711,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta() -> anyhow::Result<()>
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
 
     wait_for_mcp_server(&fixture.codex, server_name).await?;
@@ -800,7 +798,7 @@ async fn stdio_mcp_parallel_tool_calls_default_false_runs_serially() -> anyhow::
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -936,7 +934,7 @@ async fn stdio_mcp_read_only_tool_calls_run_concurrently_without_server_opt_in()
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1021,7 +1019,7 @@ async fn stdio_mcp_parallel_tool_calls_opt_in_runs_concurrently() -> anyhow::Res
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1108,7 +1106,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1262,7 +1260,7 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1345,7 +1343,7 @@ async fn stdio_image_responses_preserve_original_detail_metadata() -> anyhow::Re
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1487,7 +1485,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1527,14 +1525,9 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
         .and_then(Value::as_str)
         .expect("function_call_output output should be a JSON string");
     let wrapped_payload = split_wall_time_wrapped_output(output_text);
-    let output_json: Value = serde_json::from_str(wrapped_payload)
-        .expect("function_call_output output should be valid JSON");
     assert_eq!(
-        output_json,
-        json!([{
-            "type": "text",
-            "text": "<image content omitted because you do not support image input>"
-        }])
+        wrapped_payload,
+        "<image content omitted because you do not support image input>"
     );
     server.verify().await;
     Ok(())
@@ -1594,7 +1587,7 @@ async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1714,7 +1707,7 @@ async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Resu
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1747,9 +1740,6 @@ async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Resu
     server.verify().await;
     Ok(())
 }
-
-/// OAuth metadata path served by the Streamable HTTP MCP test server.
-const STREAMABLE_HTTP_METADATA_PATH: &str = "/.well-known/oauth-authorization-server/mcp";
 
 /// Streamable HTTP test server plus the process handle needed for cleanup.
 struct StreamableHttpTestServer {
@@ -1845,7 +1835,7 @@ async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
 
@@ -1950,7 +1940,7 @@ async fn streamable_http_configured_auth_precedes_chatgpt_auth() -> anyhow::Resu
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
 
     wait_for_mcp_server(&configured_auth_fixture.codex, "configured_auth").await?;
@@ -2194,7 +2184,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     // Phase 5: wait for MCP startup before the turn is submitted, which keeps
     // failures tied to server startup/discovery.
@@ -2276,23 +2266,31 @@ async fn start_streamable_http_test_server(
 ) -> anyhow::Result<StreamableHttpTestServer> {
     let rmcp_http_server_bin = required_streamable_http_server_bin()?;
 
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    let bind_addr = format!("127.0.0.1:{port}");
-    let server_url = format!("http://{bind_addr}/mcp");
-
+    // The server binds port 0 itself and prints the bound address once its
+    // listener accepts connections, so no port is reserved and then re-bound.
     let mut command = Command::new(&rmcp_http_server_bin);
     command
         .kill_on_drop(true)
-        .env("MCP_STREAMABLE_HTTP_BIND_ADDR", &bind_addr)
-        .env("MCP_TEST_VALUE", expected_env_value);
+        .env("MCP_STREAMABLE_HTTP_BIND_ADDR", "127.0.0.1:0")
+        .env("MCP_TEST_VALUE", expected_env_value)
+        .stdout(Stdio::piped());
     if let Some(expected_token) = expected_token {
         command.env("MCP_EXPECT_BEARER", expected_token);
     }
     let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("capture streamable HTTP server stdout")?;
+    let bind_addr = tokio::time::timeout(
+        Duration::from_secs(10),
+        BufReader::new(stdout).lines().next_line(),
+    )
+    .await
+    .context("timed out waiting for streamable HTTP server address")??
+    .context("streamable HTTP server stdout closed before emitting its address")?;
+    let server_url = format!("http://{}/mcp", bind_addr.trim());
 
-    wait_for_local_streamable_http_server(&mut child, &server_url, Duration::from_secs(5)).await?;
     Ok(StreamableHttpTestServer {
         server_url,
         process: child,
@@ -2302,65 +2300,6 @@ async fn start_streamable_http_test_server(
 fn required_streamable_http_server_bin() -> anyhow::Result<PathBuf> {
     cargo_bin("test_streamable_http_server")
         .context("resolve required test_streamable_http_server helper")
-}
-
-/// Waits for the local Streamable HTTP test server to publish OAuth metadata.
-async fn wait_for_local_streamable_http_server(
-    server_child: &mut Child,
-    server_url: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    let metadata_url = streamable_http_metadata_url(server_url);
-    let client = HttpClientBuilder::new().build_direct()?;
-    loop {
-        if let Some(status) = server_child.try_wait()? {
-            return Err(anyhow::anyhow!(
-                "streamable HTTP server exited early with status {status}"
-            ));
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-
-        if remaining.is_zero() {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for streamable HTTP server metadata at {metadata_url}: deadline reached"
-            ));
-        }
-
-        match tokio::time::timeout(remaining, client.get(&metadata_url).send()).await {
-            Ok(Ok(response)) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(Ok(response)) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for streamable HTTP server metadata at {metadata_url}: HTTP {}",
-                        response.status()
-                    ));
-                }
-            }
-            Ok(Err(error)) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for streamable HTTP server metadata at {metadata_url}: {error}"
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "timed out waiting for streamable HTTP server metadata at {metadata_url}: request timed out"
-                ));
-            }
-        }
-
-        sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())))
-            .await;
-    }
-}
-
-/// Builds the OAuth metadata URL for the test Streamable HTTP MCP endpoint.
-fn streamable_http_metadata_url(server_url: &str) -> String {
-    let base_url = server_url.strip_suffix("/mcp").unwrap_or(server_url);
-    format!("{base_url}{STREAMABLE_HTTP_METADATA_PATH}")
 }
 
 fn write_fallback_oauth_tokens(

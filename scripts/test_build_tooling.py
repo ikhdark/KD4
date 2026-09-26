@@ -730,15 +730,23 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\\scripts\\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast @forwarded_args',
             justfile,
         )
-        self.assertEqual(nextest["profile"]["default"]["test-threads"], 2)
-        local_profile = nextest["profile"]["local"]
-        self.assertEqual(local_profile["inherits"], "default")
-        self.assertEqual(local_profile["retries"], 0)
-        self.assertIs(local_profile["fail-fast"], False)
-        fast_profile = nextest["profile"]["fast"]
-        self.assertEqual(fast_profile["inherits"], "local")
-        self.assertEqual(fast_profile["retries"], 0)
-        self.assertIs(fast_profile.get("fail-fast", local_profile["fail-fast"]), False)
+        profiles = nextest["profile"]
+        self.assertEqual(profiles["default"]["test-threads"], 2)
+        self.assertEqual(profiles["local"]["inherits"], "default")
+        self.assertEqual(profiles["fast"]["inherits"], "local")
+
+        def resolved(profile_name: str, key: str):
+            # Nextest consults each profile in the `inherits` chain, then default.
+            while True:
+                profile = profiles[profile_name]
+                if key in profile or profile_name == "default":
+                    return profile.get(key)
+                profile_name = profile.get("inherits", "default")
+
+        for profile_name in ("default", "local", "fast"):
+            self.assertEqual(resolved(profile_name, "retries"), 0, profile_name)
+        for profile_name in ("local", "fast"):
+            self.assertIs(resolved(profile_name, "fail-fast"), False, profile_name)
         for recipe in (
             "core-test-fast target *args:",
             "core-test-lane target *args:",
@@ -750,15 +758,35 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             1
         ].split("\n\n", 1)[0]
         self.assertIn('$env:NEXTEST_PROFILE = "{{ profile }}"', reserved)
-        local_app_server_override = {
-            "filter": "package(codex-app-server) & kind(test)",
-            "test-group": "app_server_integration_local",
-        }
-        self.assertIn(
-            local_app_server_override,
-            local_profile["overrides"],
+        # Derived profiles inherit default's grouping; a local test-group override
+        # would shadow it for every test it matches.
+        for profile_name in ("local", "fast"):
+            self.assertFalse(
+                any(
+                    "test-group" in override
+                    for override in profiles[profile_name].get("overrides", [])
+                ),
+                profile_name,
+            )
+        group_overrides = [
+            override
+            for override in profiles["default"]["overrides"]
+            if "test-group" in override
+        ]
+        group_order = [override["test-group"] for override in group_overrides]
+        app_server_group = next(
+            override["test-group"]
+            for override in group_overrides
+            if "package(codex-app-server) & kind(test)" in override["filter"]
         )
-        self.assertIn(local_app_server_override, fast_profile["overrides"])
+        self.assertEqual(app_server_group, "process_heavy")
+        self.assertEqual(nextest["test-groups"]["login_callback_port"]["max-threads"], 1)
+        # The first matching test-group wins, so the fixed-port login tests must be
+        # claimed before the broader app-server group.
+        self.assertLess(
+            group_order.index("login_callback_port"),
+            group_order.index("process_heavy"),
+        )
         self.assertIn('$env:NEXTEST_PROFILE = "fast"; cargo nextest run', justfile)
         no_sccache_recipe = justfile.split("test-fast-nosccache *args:", 1)[1].split(
             "\n\n", 1

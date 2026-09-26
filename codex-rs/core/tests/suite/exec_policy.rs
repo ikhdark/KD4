@@ -391,40 +391,37 @@ fn authorization_identity_unified_direct_argv_shell_name_is_opaque() -> Result<(
     run_direct_argv_shell_name_is_opaque(true)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> Result<()> {
-    let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2");
-    let test = builder.build(&server).await?;
-    let call_id = "shell-empty-script-collab";
-    let args = json!({
-        "kind": "script",
-        "command": "",
-        "timeout_ms": 1_000,
-    });
-
+/// Runs one blank-script tool call in its own collaboration-mode turn and
+/// returns the output replayed to the model.
+async fn blank_script_call_output(
+    server: &wiremock::MockServer,
+    test: &core_test_support::test_codex::TestCodex,
+    tool_name: &str,
+    call_id: &str,
+    args: Value,
+) -> Result<Value> {
     mount_sse_once(
-        &server,
+        server,
         sse(vec![
-            ev_response_created("resp-empty-shell-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-empty-shell-1"),
+            ev_response_created(&format!("resp-{call_id}-1")),
+            ev_function_call(call_id, tool_name, &serde_json::to_string(&args)?),
+            ev_completed(&format!("resp-{call_id}-1")),
         ]),
     )
     .await;
     let results_mock = mount_sse_once(
-        &server,
+        server,
         sse(vec![
-            ev_assistant_message("msg-empty-shell-1", "done"),
-            ev_completed("resp-empty-shell-2"),
+            ev_assistant_message(&format!("msg-{call_id}"), "done"),
+            ev_completed(&format!("resp-{call_id}-2")),
         ]),
     )
     .await;
 
     let collaboration_mode = collaboration_mode_for_model(test.session_configured.model.clone());
     submit_user_turn(
-        &test,
-        "run an empty shell command",
+        test,
+        &format!("run blank {tool_name} script"),
         AskForApproval::OnRequest,
         PermissionProfile::Disabled,
         Some(collaboration_mode),
@@ -436,14 +433,34 @@ async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> 
     })
     .await;
 
-    let output_item = results_mock.single_request().function_call_output(call_id);
-    assert_no_matched_rules_invariant(&output_item);
+    Ok(results_mock.single_request().function_call_output(call_id))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_command_blank_scripts_with_collaboration_mode_do_not_panic() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.2");
+    let test = builder.build(&server).await?;
+
+    for (call_id, command) in [
+        ("shell-empty-script-collab", ""),
+        ("shell-whitespace-script-collab", "  \n\t  "),
+    ] {
+        let args = json!({
+            "kind": "script",
+            "command": command,
+            "timeout_ms": 1_000,
+        });
+        let output_item =
+            blank_script_call_output(&server, &test, "shell_command", call_id, args).await?;
+        assert_no_matched_rules_invariant(&output_item);
+    }
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> Result<()> {
+async fn unified_exec_blank_scripts_with_collaboration_mode_do_not_panic() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config
@@ -452,155 +469,20 @@ async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> R
             .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;
-    let call_id = "unified-exec-empty-script-collab";
-    let args = json!({
-        "kind": "script",
-        "cmd": "",
-        "yield_time_ms": 1_000,
-    });
 
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-empty-unified-1"),
-            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-empty-unified-1"),
-        ]),
-    )
-    .await;
-    let results_mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-empty-unified-1", "done"),
-            ev_completed("resp-empty-unified-2"),
-        ]),
-    )
-    .await;
-
-    let collaboration_mode = collaboration_mode_for_model(test.session_configured.model.clone());
-    submit_user_turn(
-        &test,
-        "run empty unified exec command",
-        AskForApproval::OnRequest,
-        PermissionProfile::Disabled,
-        Some(collaboration_mode),
-    )
-    .await?;
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let output_item = results_mock.single_request().function_call_output(call_id);
-    assert_no_matched_rules_invariant(&output_item);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_command_whitespace_script_with_collaboration_mode_does_not_panic() -> Result<()> {
-    let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2");
-    let test = builder.build(&server).await?;
-    let call_id = "shell-whitespace-script-collab";
-    let args = json!({
-        "kind": "script",
-        "command": "  \n\t  ",
-        "timeout_ms": 1_000,
-    });
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-whitespace-shell-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-whitespace-shell-1"),
-        ]),
-    )
-    .await;
-    let results_mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-whitespace-shell-1", "done"),
-            ev_completed("resp-whitespace-shell-2"),
-        ]),
-    )
-    .await;
-
-    let collaboration_mode = collaboration_mode_for_model(test.session_configured.model.clone());
-    submit_user_turn(
-        &test,
-        "run whitespace shell command",
-        AskForApproval::OnRequest,
-        PermissionProfile::Disabled,
-        Some(collaboration_mode),
-    )
-    .await?;
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let output_item = results_mock.single_request().function_call_output(call_id);
-    assert_no_matched_rules_invariant(&output_item);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unified_exec_whitespace_script_with_collaboration_mode_does_not_panic() -> Result<()> {
-    let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build(&server).await?;
-    let call_id = "unified-exec-whitespace-script-collab";
-    let args = json!({
-        "kind": "script",
-        "cmd": " \n \t",
-        "yield_time_ms": 1_000,
-    });
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-whitespace-unified-1"),
-            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-whitespace-unified-1"),
-        ]),
-    )
-    .await;
-    let results_mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-whitespace-unified-1", "done"),
-            ev_completed("resp-whitespace-unified-2"),
-        ]),
-    )
-    .await;
-
-    let collaboration_mode = collaboration_mode_for_model(test.session_configured.model.clone());
-    submit_user_turn(
-        &test,
-        "run whitespace unified exec command",
-        AskForApproval::OnRequest,
-        PermissionProfile::Disabled,
-        Some(collaboration_mode),
-    )
-    .await?;
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let output_item = results_mock.single_request().function_call_output(call_id);
-    assert_no_matched_rules_invariant(&output_item);
+    for (call_id, cmd) in [
+        ("unified-exec-empty-script-collab", ""),
+        ("unified-exec-whitespace-script-collab", " \n \t"),
+    ] {
+        let args = json!({
+            "kind": "script",
+            "cmd": cmd,
+            "yield_time_ms": 1_000,
+        });
+        let output_item =
+            blank_script_call_output(&server, &test, "exec_command", call_id, args).await?;
+        assert_no_matched_rules_invariant(&output_item);
+    }
 
     Ok(())
 }

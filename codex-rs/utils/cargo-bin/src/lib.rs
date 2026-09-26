@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CargoBinError {
-    #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but it does not exist")]
-    ResolvedPathDoesNotExist { key: String, path: PathBuf },
+    #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, which is not an existing file")]
+    ResolvedPathIsNotAFile { key: String, path: PathBuf },
     #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but an absolute path is required")]
     ResolvedPathIsRelative { key: String, path: PathBuf },
     #[error("could not locate binary {name:?}; tried env vars {env_keys:?}; {fallback}")]
@@ -14,6 +14,15 @@ pub enum CargoBinError {
         name: String,
         env_keys: Vec<String>,
         fallback: String,
+    },
+    #[error(
+        "binary {name:?} at {path:?} was built before its input {input:?} changed or was removed; \
+         rebuild it or run the test through the repository test runner instead of using the stale build"
+    )]
+    StaleFallback {
+        name: String,
+        path: PathBuf,
+        input: PathBuf,
     },
 }
 
@@ -43,11 +52,72 @@ pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
             ))
         }
     });
-    fallback.map_err(|error| CargoBinError::NotFound {
+    let path = fallback.map_err(|error| CargoBinError::NotFound {
         name: name.to_owned(),
         env_keys,
         fallback: error.to_string(),
+    })?;
+    // Nothing rebuilds a binary from another package before this test runs, so
+    // the file found here may predate the sources it was built from.
+    match stale_build_input(&path) {
+        Some(input) => Err(CargoBinError::StaleFallback {
+            name: name.to_owned(),
+            path,
+            input,
+        }),
+        None => Ok(path),
+    }
+}
+
+/// Returns the first input recorded in the Cargo dep-info file beside `binary`
+/// that is missing or newer than `binary`: the same comparison Cargo uses to
+/// decide that the binary needs a rebuild. A binary without dep-info is not
+/// Cargo's build output, so there is nothing to compare.
+fn stale_build_input(binary: &Path) -> Option<PathBuf> {
+    let built = std::fs::metadata(binary)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    let dep_info = std::fs::read_to_string(binary.with_extension("d")).ok()?;
+    dep_info_inputs(&dep_info).into_iter().find(|input| {
+        match std::fs::metadata(input).and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified > built,
+            // A recorded input that no longer exists also makes the build stale.
+            Err(_) => true,
+        }
     })
+}
+
+/// Parses the input list of Cargo's Makefile-style `<target>: <inputs>` rule,
+/// which escapes spaces inside a path as `\ `.
+fn dep_info_inputs(dep_info: &str) -> Vec<PathBuf> {
+    let Some((_, inputs)) = dep_info
+        .lines()
+        .next()
+        .and_then(|rule| rule.split_once(": "))
+    else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut chars = inputs.trim_end().chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&' ') => {
+                current.push(' ');
+                chars.next();
+            }
+            ' ' => {
+                if !current.is_empty() {
+                    paths.push(PathBuf::from(std::mem::take(&mut current)));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        paths.push(PathBuf::from(current));
+    }
+    paths
 }
 
 fn cargo_bin_env_keys(name: &str) -> Vec<String> {
@@ -71,11 +141,12 @@ fn resolve_bin_from_env(key: &str, value: OsString) -> Result<PathBuf, CargoBinE
             path,
         });
     }
-    if path.exists() {
+    // Match the fallback's check: a directory cannot be launched as the helper.
+    if path.is_file() {
         return Ok(path);
     }
 
-    Err(CargoBinError::ResolvedPathDoesNotExist {
+    Err(CargoBinError::ResolvedPathIsNotAFile {
         key: key.to_owned(),
         path,
     })
@@ -124,6 +195,60 @@ mod tests {
     }
 
     #[test]
+    fn dep_info_inputs_unescape_spaces_inside_paths() {
+        let inputs = dep_info_inputs(
+            "C:\\target\\debug\\helper.exe: C:\\src\\main.rs C:\\Program\\ Files\\lib.rs\r\n",
+        );
+
+        assert_eq!(
+            inputs,
+            vec![
+                PathBuf::from(r"C:\src\main.rs"),
+                PathBuf::from(r"C:\Program Files\lib.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn fallback_binary_is_stale_once_a_recorded_input_changes_or_disappears() -> std::io::Result<()>
+    {
+        fn set_modified(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
+            std::fs::File::options()
+                .write(true)
+                .open(path)?
+                .set_modified(time)
+        }
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("helper.exe");
+        let source = dir.path().join("main.rs");
+        std::fs::write(&binary, "binary")?;
+        std::fs::write(&source, "fn main() {}")?;
+        assert_eq!(
+            stale_build_input(&binary),
+            None,
+            "a binary without dep-info has no recorded inputs"
+        );
+        let escape = |path: &Path| path.display().to_string().replace(' ', "\\ ");
+        std::fs::write(
+            dir.path().join("helper.d"),
+            format!("{}: {}\n", escape(&binary), escape(&source)),
+        )?;
+        let built = std::time::SystemTime::now();
+        let minute = std::time::Duration::from_secs(60);
+        set_modified(&binary, built)?;
+
+        set_modified(&source, built - minute)?;
+        assert_eq!(stale_build_input(&binary), None);
+
+        set_modified(&source, built + minute)?;
+        assert_eq!(stale_build_input(&binary), Some(source.clone()));
+
+        std::fs::remove_file(&source)?;
+        assert_eq!(stale_build_input(&binary), Some(source));
+        Ok(())
+    }
+
+    #[test]
     fn relative_environment_path_reports_the_absolute_path_requirement() {
         let error = resolve_bin_from_env("CARGO_BIN_EXE_example", OsString::from("Cargo.toml"))
             .expect_err("relative environment path");
@@ -131,5 +256,24 @@ mod tests {
             matches!(&error, CargoBinError::ResolvedPathIsRelative { path, .. } if path == Path::new("Cargo.toml"))
         );
         assert!(error.to_string().contains("an absolute path is required"));
+    }
+
+    #[test]
+    fn environment_path_must_name_an_existing_file() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("helper.exe");
+        for rejected in [dir.path().to_path_buf(), binary.clone()] {
+            let error = resolve_bin_from_env("CARGO_BIN_EXE_example", rejected.clone().into())
+                .expect_err("a directory or missing file is not a binary");
+            assert!(
+                matches!(&error, CargoBinError::ResolvedPathIsNotAFile { path, .. } if *path == rejected)
+            );
+        }
+        std::fs::write(&binary, "binary")?;
+        assert_eq!(
+            resolve_bin_from_env("CARGO_BIN_EXE_example", binary.clone().into()).ok(),
+            Some(binary)
+        );
+        Ok(())
     }
 }

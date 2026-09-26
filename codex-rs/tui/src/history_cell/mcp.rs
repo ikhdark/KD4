@@ -365,7 +365,7 @@ fn decode_mcp_image(block: &serde_json::Value) -> Option<(u32, u32)> {
         .ok()
 }
 /// Render a summary of configured MCP servers from the current `Config`.
-pub(crate) fn empty_mcp_output() -> PlainHistoryCell {
+pub(crate) fn empty_mcp_output() -> WebHyperlinkHistoryCell {
     let lines: Vec<Line<'static>> = vec![
         "/mcp".magenta().into(),
         "".into(),
@@ -373,18 +373,14 @@ pub(crate) fn empty_mcp_output() -> PlainHistoryCell {
         "".into(),
         "  • No MCP servers configured.".italic().into(),
         Line::from(vec![
-            "    See the ".into(),
-            crate::terminal_hyperlinks::osc8_hyperlink(
-                "https://developers.openai.com/codex/mcp",
-                "MCP docs",
-            )
-            .underlined(),
+            "    See ".into(),
+            "https://developers.openai.com/codex/mcp".underlined(),
             " to configure them.".into(),
         ])
         .style(Style::default().add_modifier(Modifier::DIM)),
     ];
 
-    PlainHistoryCell::new(lines)
+    WebHyperlinkHistoryCell::new(lines)
 }
 
 #[cfg(test)]

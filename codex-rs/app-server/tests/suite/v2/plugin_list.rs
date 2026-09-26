@@ -39,6 +39,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
 use wiremock::matchers::query_param_is_missing;
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -53,22 +54,6 @@ fn write_plugins_enabled_config(codex_home: &std::path::Path) -> std::io::Result
         r#"[features]
 plugins = true
 "#,
-    )
-}
-
-fn write_plugins_enabled_config_with_base_url(
-    codex_home: &std::path::Path,
-    base_url: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"chatgpt_base_url = "{base_url}"
-
-[features]
-plugins = true
-"#,
-        ),
     )
 }
 
@@ -1549,7 +1534,7 @@ enabled = true
 async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -1619,7 +1604,7 @@ async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> 
 async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -1740,7 +1725,7 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
 async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -2008,7 +1993,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
 async fn plugin_list_uses_cached_global_remote_catalog_and_refreshes_it() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -2326,7 +2311,7 @@ async fn plugin_list_includes_api_curated_marketplace_for_api_auth_when_remote_p
 -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -2441,7 +2426,7 @@ async fn plugin_list_does_not_query_openai_curated_remote_collection_by_default(
 async fn plugin_list_vertical_kind_noops_when_remote_plugin_enabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -2499,7 +2484,7 @@ async fn plugin_list_does_not_append_global_remote_when_marketplace_kinds_are_ex
 -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -3479,7 +3464,7 @@ plugin_sharing = true
 async fn plugin_list_marks_remote_plugin_disabled_by_admin() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -4251,23 +4236,6 @@ enabled = false
 
 [plugins."calendar@openai-curated"]
 enabled = true
-"#
-        ),
-    )
-}
-
-fn write_remote_plugin_catalog_config(
-    codex_home: &std::path::Path,
-    base_url: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-chatgpt_base_url = "{base_url}"
-
-[features]
-plugins = true
 "#
         ),
     )

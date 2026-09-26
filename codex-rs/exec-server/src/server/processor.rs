@@ -135,8 +135,10 @@ async fn run_connection(
     type Completion = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
     let mut last_ordered: Option<Completion> = None;
     let mut pending_starts: HashMap<String, Completion> = HashMap::new();
-    // Mutations retain wire order. Reads and controls bypass unrelated waits,
-    // but depend on any start already admitted for their process identity.
+    // Mutations retain wire order. Reads, controls, and outbound HTTP bypass
+    // unrelated waits: a remote server may withhold response headers for as long
+    // as its work runs, and HTTP has no ordering relation to process or file state.
+    // Process-scoped requests still depend on any start admitted for their identity.
     loop {
         let event = tokio::select! {
             _ = cancelled.cancelled() => break,
@@ -186,6 +188,7 @@ async fn run_connection(
                                     | crate::protocol::EXEC_SIGNAL_METHOD
                                     | crate::protocol::EXEC_TERMINATE_METHOD
                                     | crate::protocol::ENVIRONMENT_INFO_METHOD
+                                    | crate::protocol::HTTP_REQUEST_METHOD
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
                             );
                         if initialized
@@ -212,8 +215,8 @@ async fn run_connection(
                             }
                             continue;
                         }
-                        // Reserve HTTP identity before queueing: cancellation may
-                        // arrive while this request is still behind ordered work.
+                        // Reserve HTTP identity before spawning: cancellation may
+                        // arrive before the spawned request starts running.
                         if initialized && method == crate::protocol::HTTP_REQUEST_METHOD {
                             if let Ok(params) =
                                 serde_json::from_value::<crate::protocol::HttpRequestParams>(
@@ -648,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_http_headers_do_not_block_metadata_or_request_cancellation() {
+    async fn slow_http_headers_do_not_block_other_requests_or_cancellation() {
         let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
         let (mut writer, mut lines, task) =
             spawn_test_connection(Arc::clone(&registry), "slow-http");
@@ -690,6 +693,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info, EnvironmentInfo::local());
+        // Filesystem requests keep wire order among themselves, but must not wait
+        // for a remote server that is still withholding HTTP response headers.
+        let temp = tempfile::TempDir::new().expect("temp directory");
+        send_request(
+            &mut writer,
+            5,
+            crate::protocol::FS_GET_METADATA_METHOD,
+            &crate::protocol::FsGetMetadataParams {
+                path: PathUri::from_host_native_path(temp.path()).expect("temp directory URI"),
+                sandbox: None,
+            },
+        )
+        .await;
+        let metadata: crate::protocol::FsGetMetadataResponse =
+            timeout(Duration::from_secs(1), read_response(&mut lines, 5))
+                .await
+                .expect("filesystem request must not wait for pending HTTP headers");
+        assert!(metadata.is_directory);
         send_request(
             &mut writer,
             4,

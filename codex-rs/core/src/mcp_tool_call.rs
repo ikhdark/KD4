@@ -525,12 +525,12 @@ async fn execute_approved_mcp_tool_call(
         metadata.and_then(|metadata| metadata.openai_file_input_params.as_deref()),
     )
     .await;
-    let tool_input = match &rewrite {
-        Ok(prepared) if prepared.arguments.is_some() => prepared.arguments.clone().unwrap(),
-        Ok(_) | Err(_) => arguments_value
-            .clone()
-            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
-    };
+    let tool_input = rewrite
+        .as_ref()
+        .ok()
+        .and_then(|prepared| prepared.arguments.clone())
+        .or_else(|| arguments_value.clone())
+        .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
     let execution = async {
         async {
             let rewritten_arguments = rewrite?;

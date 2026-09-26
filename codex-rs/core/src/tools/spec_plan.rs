@@ -197,14 +197,17 @@ pub(crate) fn build_tool_router(
 ) -> Result<ToolRouter, String> {
     params.exposure_identity.windows_shell_guidance = requires_windows_shell_guidance(step_context);
     let exposure_identity = params.exposure_identity.clone();
+    let tool_suggest_candidates = params.tool_suggest_candidates.clone();
     let (model_visible_specs, registry, warnings) =
         build_tool_specs_and_registry(step_context, params, tool_search_handler_cache)?;
-    Ok(ToolRouter::from_parts_with_warnings_and_identity(
+    let mut router = ToolRouter::from_parts_with_warnings_and_identity(
         registry,
         model_visible_specs,
         warnings,
         exposure_identity,
-    ))
+    );
+    router.tool_suggest_candidates = tool_suggest_candidates;
+    Ok(router)
 }
 
 #[instrument(level = "trace", skip_all)]

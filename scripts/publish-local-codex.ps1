@@ -2887,13 +2887,21 @@ function Invoke-CodexBuild {
         [switch]$DryRun
     )
 
+    # Cargo lets either variable, even when empty, replace every target rustflags
+    # table, which would publish binaries without the 8 MiB stack and static CRT
+    # that codex-rs/.cargo/config.toml supplies. The per-target form joins them.
+    foreach ($name in @("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")) {
+        if ($null -ne [System.Environment]::GetEnvironmentVariable($name, "Process")) {
+            throw "$name is set and would replace the target rustflags in codex-rs/.cargo/config.toml (8 MiB stack, static CRT). Unset it; add flags with CARGO_TARGET_<TRIPLE>_RUSTFLAGS, which Cargo joins with them."
+        }
+    }
     $cargoProfile = if ($Profile -eq "debug") { "dev" } else { $Profile }
     $cargoConfigArgs = @()
     $noSccacheCargoConfigPath = $null
     $releaseUsesUpstreamProfile = $Profile -eq "release"
     $effectiveNoSccache = [bool]$NoSccache -or $releaseUsesUpstreamProfile
     if ($releaseUsesUpstreamProfile) {
-        Write-ProofLine "releaseProfile" "upstream-compatible: thin LTO, line-table debug, strip=false, codegen-units=4"
+        Write-ProofLine "releaseProfile" "upstream-compatible: thin LTO, line-table debug, strip=symbols, codegen-units=4"
     }
     if ($effectiveNoSccache) {
         if ($DryRun) {

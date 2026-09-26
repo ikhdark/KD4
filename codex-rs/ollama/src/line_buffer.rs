@@ -14,6 +14,11 @@ impl LineBuffer {
         self.bytes.extend_from_slice(bytes);
     }
 
+    /// Bytes buffered after the last complete line.
+    pub(crate) fn pending_len(&self) -> usize {
+        self.bytes.len()
+    }
+
     pub(crate) fn take_line(&mut self) -> Option<BytesMut> {
         let Some(relative_index) = memchr(b'\n', &self.bytes[self.scanned_len..]) else {
             self.scanned_len = self.bytes.len();

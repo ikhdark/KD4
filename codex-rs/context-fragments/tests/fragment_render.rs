@@ -419,6 +419,79 @@ fn additional_context_developer_match_requires_application_kind() {
     ));
 }
 
+fn budget_with_remaining(remaining_bytes: usize) -> ModelContextBudget {
+    let mut budget = ModelContextBudget::new(100);
+    assert!(budget.try_take_bytes(budget.remaining_bytes() - remaining_bytes));
+    budget
+}
+
+#[test]
+fn fragment_budget_truncates_body_inside_markers() {
+    let fragment = TestFragment {
+        body: "abcdefghijklmnopqrstuvwxyz".to_string(),
+    };
+    let rendered = fragment.render();
+
+    // Plain text truncation cuts the markers, so the result stops matching.
+    let cut = budget_with_remaining(30).take(&rendered).expect("prefix");
+    assert!(!TestFragment::matches_text(&cut));
+
+    for (remaining, expected) in [
+        (rendered.len(), rendered.as_str()),
+        (54, "<test_context>abcdefghijklmnopqrstuvwxy</test_context>"),
+        (30, "<test_context>a</test_context>"),
+    ] {
+        let mut budget = budget_with_remaining(remaining);
+        let admitted = budget.take_fragment(&fragment).expect("fragment admitted");
+        assert_eq!(admitted, expected);
+        assert!(TestFragment::matches_text(&admitted));
+        assert_eq!(budget.remaining_bytes(), remaining - admitted.len());
+    }
+
+    let long = TestFragment {
+        body: "0123456789".repeat(10),
+    };
+    let mut budget = budget_with_remaining(80);
+    let admitted = budget.take_fragment(&long).expect("head and tail admitted");
+    assert_eq!(
+        admitted,
+        "<test_context>01234567890\n[... context truncated ...]\n90123456789</test_context>"
+    );
+    assert!(TestFragment::matches_text(&admitted));
+    assert_eq!(budget.remaining_bytes(), 0);
+}
+
+#[test]
+fn fragment_budget_omits_fragment_when_markers_leave_no_body_room() {
+    let fragment: Box<dyn ContextualUserFragment + Send> = Box::new(TestFragment {
+        body: "body".to_string(),
+    });
+    for remaining in [0, 10, "<test_context></test_context>".len()] {
+        let mut budget = budget_with_remaining(remaining);
+        assert_eq!(budget.take_fragment(fragment.as_ref()), None);
+        assert_eq!(budget.remaining_bytes(), remaining);
+    }
+}
+
+#[test]
+fn fragment_budget_matches_text_budget_for_unmarked_fragments() {
+    let fragment = RenderedContextFragment::new("user", "x".repeat(100));
+    for remaining in [100, 40, 20, 0] {
+        let mut fragment_budget = budget_with_remaining(remaining);
+        let mut text_budget = budget_with_remaining(remaining);
+        assert_eq!(
+            fragment_budget.take_fragment(&fragment),
+            text_budget
+                .take(&fragment.render())
+                .map(std::borrow::Cow::into_owned)
+        );
+        assert_eq!(
+            fragment_budget.remaining_bytes(),
+            text_budget.remaining_bytes()
+        );
+    }
+}
+
 #[test]
 fn marker_match_allows_prefix_markers_ending_with_space() {
     struct PrefixFragment;

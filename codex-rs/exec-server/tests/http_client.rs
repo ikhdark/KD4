@@ -433,7 +433,7 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
 
         // Phase 2: the next stream uses a new generated id. A late body delta
         // for the cancelled id is ignored by the client-side router.
-        let (request_id, params) = peer.read_http_request().await?;
+        let (request_id, params) = peer.read_http_request_after_cancel("http-1").await?;
         assert_eq!(
             params,
             HttpRequestParams {
@@ -587,7 +587,7 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
 
         // Phase 2: accept the next request with a new generated id. The new
         // stream must receive only fresh body bytes.
-        let (request_id, params) = peer.read_http_request().await?;
+        let (request_id, params) = peer.read_http_request_after_cancel("http-1").await?;
         assert_eq!(
             params,
             HttpRequestParams {
@@ -901,7 +901,16 @@ async fn http_response_body_stream_reports_backpressure_truncation() -> Result<(
                 error: None,
             })
             .await?;
+            // Exercise the undrained body route, not the separate bounded RPC
+            // notification backlog. Let its dispatcher route each frame.
+            tokio::task::yield_now().await;
         }
+        let cancellation = peer.read_request("http/request/cancel").await?;
+        assert_eq!(
+            cancellation.params,
+            Some(serde_json::json!({"requestId": "http-1"}))
+        );
+        peer.write_response(cancellation.id, ()).await?;
         peer.write_response(
             request_id,
             HttpRequestResponse {
@@ -1062,6 +1071,41 @@ impl JsonRpcPeer {
         let request = self.read_request(HTTP_REQUEST_METHOD).await?;
         let params = decode_request_params(&request)?;
         Ok((request.id, params))
+    }
+
+    /// Acknowledges cancellation and reads the independently scheduled replacement request.
+    async fn read_http_request_after_cancel(
+        &mut self,
+        cancelled_id: &str,
+    ) -> Result<(RequestId, HttpRequestParams)> {
+        let mut next_request = None;
+        let mut cancelled = false;
+        // Drop cleanup and the next request are independently scheduled.
+        for _ in 0..2 {
+            let message = self.read_message().await?;
+            let JSONRPCMessage::Request(request) = message else {
+                bail!("expected an HTTP request or cancellation, got {message:?}");
+            };
+            match request.method.as_str() {
+                "http/request/cancel" => {
+                    assert!(!cancelled, "duplicate cancellation");
+                    assert_eq!(
+                        request.params,
+                        Some(serde_json::json!({"requestId": cancelled_id}))
+                    );
+                    self.write_response(request.id, ()).await?;
+                    cancelled = true;
+                }
+                HTTP_REQUEST_METHOD => {
+                    assert!(next_request.is_none(), "duplicate replacement request");
+                    let params = decode_request_params(&request)?;
+                    next_request = Some((request.id, params));
+                }
+                method => bail!("unexpected HTTP lifecycle request: {method}"),
+            }
+        }
+        assert!(cancelled, "dropped body must cancel remote work");
+        next_request.context("replacement HTTP request must arrive")
     }
 
     /// Reads a JSON-RPC request and validates its method.

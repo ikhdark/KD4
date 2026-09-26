@@ -6,37 +6,59 @@ expression: "format_labeled_requests_snapshot(\"Normal turns refresh AGENTS.md a
 Scenario: Normal turns refresh AGENTS.md after a cwd change and after a same-cwd, same-length content edit.
 
 ## First Request (agents_one)
-00:message/user:<AGENTS_MD>
-01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
-03:message/developer:<PERMISSIONS_INSTRUCTIONS>
-04:message/developer:<SKILLS_INSTRUCTIONS>
-05:message/developer:<personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-06:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-07:message/user:first turn in agents_one
+00:message/developer[4]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <configured_developer_instructions state="removed" />
+    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [04] <SKILLS_INSTRUCTIONS>
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:message/user:first turn in agents_one
 
 ## Second Request (agents_two cwd)
-00:message/user:<AGENTS_MD>
-01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
-03:message/developer:<PERMISSIONS_INSTRUCTIONS>
-04:message/developer:<SKILLS_INSTRUCTIONS>
-05:message/developer:<personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-06:message/user:first turn in agents_one
-07:message/assistant:turn one complete
-08:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-09:message/user:second turn in agents_two
+00:message/developer[4]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <configured_developer_instructions state="removed" />
+    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [04] <SKILLS_INSTRUCTIONS>
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:message/user:first turn in agents_one
+05:message/assistant:turn one complete
+06:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+07:message/user:second turn in agents_two
 
 ## Third Request (agents_two edited)
-00:message/user:<AGENTS_MD>
-01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
-03:message/developer:<PERMISSIONS_INSTRUCTIONS>
-04:message/developer:<SKILLS_INSTRUCTIONS>
-05:message/developer:<personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-06:message/user:first turn in agents_one
-07:message/assistant:turn one complete
-08:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-09:message/user:second turn in agents_two
-10:message/assistant:turn two complete
-11:message/user:third turn after same-cwd AGENTS edit
+00:message/developer[4]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <configured_developer_instructions state="removed" />
+    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [04] <SKILLS_INSTRUCTIONS>
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:message/user:first turn in agents_one
+05:message/assistant:turn one complete
+06:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+07:message/user:second turn in agents_two
+08:message/assistant:turn two complete
+09:message/user:<AGENTS_MD>
+10:message/user:third turn after same-cwd AGENTS edit

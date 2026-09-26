@@ -94,6 +94,10 @@ struct RecoveryCheckpoint {
     owner_cost: RecoveryResultCost,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Recovery selectors and envelopes have infallible JSON serialization"
+)]
 fn recovery_size(value: &impl Serialize) -> TokenCountEstimate {
     TokenCountEstimate::new(&serde_json::to_string(value).expect("recovery value serializes"))
 }

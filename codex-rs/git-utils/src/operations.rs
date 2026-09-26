@@ -59,33 +59,6 @@ pub(crate) fn resolve_repository_root(path: &Path) -> Result<PathBuf, GitTooling
     Ok(PathBuf::from(root))
 }
 
-pub(crate) fn run_git_for_status<I, S>(
-    dir: &Path,
-    args: I,
-    env: Option<&[(OsString, OsString)]>,
-) -> Result<(), GitToolingError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    run_git_for_status_from(Path::new("git"), dir, args, env)?;
-    Ok(())
-}
-
-fn run_git_for_status_from<I, S>(
-    git: &Path,
-    dir: &Path,
-    args: I,
-    env: Option<&[(OsString, OsString)]>,
-) -> Result<(), GitToolingError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    run_git(git, dir, collect_git_args(args), env, false)?;
-    Ok(())
-}
-
 pub(crate) fn run_git_for_stdout<I, S>(
     dir: &Path,
     args: I,
@@ -114,7 +87,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_git(git, dir, collect_git_args(args), env, true)
+    run_git(git, dir, collect_git_args(args), env)
 }
 
 fn collect_git_args<I, S>(args: I) -> Vec<OsString>
@@ -132,7 +105,6 @@ fn run_git(
     dir: &Path,
     args: Vec<OsString>,
     env: Option<&[(OsString, OsString)]>,
-    allow_safe_directory_retry: bool,
 ) -> Result<GitRun, GitToolingError> {
     let args_vec = git_args_with_hardening(&args, None);
     let command_string = build_command_string(&args_vec);
@@ -147,8 +119,7 @@ fn run_git(
     let mut command_string = command_string;
     let mut status = output.status;
     let mut stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if allow_safe_directory_retry
-        && is_dubious_ownership_stderr(status.success(), stderr.as_bytes())
+    if is_dubious_ownership_stderr(status.success(), stderr.as_bytes())
         && let Some(repo_root) = get_git_repo_root(dir)
     {
         let retry_args = git_args_with_hardening(&args, Some(repo_root.as_path()));
@@ -228,7 +199,6 @@ struct GitRun {
 
 #[cfg(test)]
 mod tests {
-    use super::run_git_for_status_from;
     use super::run_git_for_stdout_from;
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -274,23 +244,6 @@ mod tests {
         assert!(err.to_string().contains("not a git repository"));
         let log = fs::read_to_string(log).expect("read fake git log");
         assert_eq!(log.lines().count(), 1);
-    }
-
-    #[test]
-    fn sync_git_status_does_not_retry_dubious_ownership() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir_all(repo.join(".git")).expect("create git marker");
-        let log = temp.path().join("git.log");
-        let git = write_fake_git(temp.path(), fake_git_dubious_then_success(&log));
-
-        run_git_for_status_from(&git, &repo, ["read-tree", "--reset", "HEAD"], None)
-            .expect_err("status-only mutating commands must not retry with safe.directory");
-
-        let log = fs::read_to_string(log).expect("read fake git log");
-        let entries = log.lines().collect::<Vec<_>>();
-        assert_eq!(entries.len(), 1);
-        assert!(!entries[0].contains("safe.directory="));
     }
 
     fn write_fake_git(dir: &Path, script: String) -> std::path::PathBuf {

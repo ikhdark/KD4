@@ -97,9 +97,30 @@ fn bounds_each_line_instead_of_the_aggregate_buffer() {
     assert_eq!(buffer.take_remaining(), None);
 }
 
+/// Serves `chunks` as retained stdout output to lag recovery.
 struct ReplayProcess {
     id: codex_exec_server::ProcessId,
     wake: tokio::sync::watch::Sender<u64>,
+    chunks: Vec<codex_exec_server::ProcessOutputChunk>,
+}
+
+impl ReplayProcess {
+    fn new(stdout: Vec<Vec<u8>>) -> Self {
+        let (wake, _) = tokio::sync::watch::channel(0);
+        Self {
+            id: "replay".into(),
+            wake,
+            chunks: stdout
+                .into_iter()
+                .zip(1..)
+                .map(|(chunk, seq)| codex_exec_server::ProcessOutputChunk {
+                    seq,
+                    stream: codex_exec_server::ExecOutputStream::Stdout,
+                    chunk: chunk.into(),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl codex_exec_server::ExecProcess for ReplayProcess {
@@ -118,23 +139,10 @@ impl codex_exec_server::ExecProcess for ReplayProcess {
         _: Option<usize>,
         _: Option<u64>,
     ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ReadResponse> {
-        Box::pin(async {
+        Box::pin(async move {
             Ok(codex_exec_server::ReadResponse {
-                chunks: vec![
-                    codex_exec_server::ProcessOutputChunk {
-                        seq: 1,
-                        stream: codex_exec_server::ExecOutputStream::Stdout,
-                        chunk: vec![b'x'; super::MCP_STDIO_MAX_LINE_BYTES + 1].into(),
-                    },
-                    codex_exec_server::ProcessOutputChunk {
-                        seq: 2,
-                        stream: codex_exec_server::ExecOutputStream::Stdout,
-                        chunk: b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n"
-                            .to_vec()
-                            .into(),
-                    },
-                ],
-                next_seq: 3,
+                chunks: self.chunks.clone(),
+                next_seq: self.chunks.len() as u64 + 1,
                 exited: false,
                 exit_code: None,
                 closed: false,
@@ -163,12 +171,43 @@ impl codex_exec_server::ExecProcess for ReplayProcess {
 #[tokio::test]
 async fn lag_recovery_does_not_deliver_messages_after_fatal_stdout_overflow() {
     use rmcp::transport::Transport;
-    let (wake, _) = tokio::sync::watch::channel(0);
-    let process = std::sync::Arc::new(ReplayProcess {
-        id: "replay".into(),
-        wake,
-    });
+    let process = std::sync::Arc::new(ReplayProcess::new(vec![
+        vec![b'x'; super::MCP_STDOUT_MAX_MESSAGE_BYTES + 1],
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n".to_vec(),
+    ]));
     let mut transport = super::ExecutorProcessTransport::new(process, "replay".into());
     transport.recover_lagged_events().await.unwrap();
     assert!(transport.receive().await.is_none());
+}
+
+#[tokio::test]
+async fn stdout_messages_larger_than_a_diagnostic_line_are_delivered() {
+    use rmcp::transport::Transport;
+    // A screenshot-sized tool result, delivered in the executor's 8 KiB pipe reads.
+    let text = "x".repeat(2 * super::MCP_STDERR_MAX_LINE_BYTES);
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "content": [{ "type": "text", "text": text }] },
+    }))
+    .unwrap();
+    line.push(b'\n');
+    let process = std::sync::Arc::new(ReplayProcess::new(
+        line.chunks(8_192).map(<[u8]>::to_vec).collect(),
+    ));
+    let mut transport = super::ExecutorProcessTransport::new(process, "replay".into());
+    transport.recover_lagged_events().await.unwrap();
+
+    let message = transport
+        .receive()
+        .await
+        .expect("a large well-formed message must not close the transport");
+    let message = serde_json::to_value(message).unwrap();
+    assert_eq!(message["id"], 1);
+    assert_eq!(
+        message["result"]["content"][0]["text"]
+            .as_str()
+            .map(str::len),
+        Some(text.len())
+    );
 }

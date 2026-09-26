@@ -161,6 +161,13 @@ fn native_checkout_uses_exact_destination_without_origin_registrations() {
     .unwrap();
     let snapshot = PathBuf::from("nested").join(format!("{}.snap", "long-snapshot-name".repeat(8)));
     fs::write(repo.join(&snapshot), "pinned snapshot bytes\n").unwrap();
+    // Revisions without eol attributes, like upstream prompt assets, must still
+    // build from their committed blobs under a host core.autocrlf=true.
+    fs::write(
+        repo.join("prompt.md"),
+        "embedded line one\nembedded line two\n",
+    )
+    .unwrap();
     git(&repo, &["add", "."]).unwrap();
     git(
         &repo,
@@ -206,6 +213,10 @@ fn native_checkout_uses_exact_destination_without_origin_registrations() {
     assert_eq!(
         fs::read(destination.join(&snapshot)).unwrap(),
         b"pinned snapshot bytes\n"
+    );
+    assert_eq!(
+        fs::read(destination.join("prompt.md")).unwrap(),
+        b"embedded line one\nembedded line two\n"
     );
     assert_eq!(
         git(&destination, &["rev-parse", "HEAD"]).unwrap(),

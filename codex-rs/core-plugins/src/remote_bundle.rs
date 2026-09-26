@@ -877,16 +877,26 @@ mod tests {
         // Set the HTTP test opt-in only in a child process, without mutating the
         // environment shared by concurrently running tests.
         if !allow_test_loopback_http_bundle_downloads() {
-            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
                     "remote_bundle::tests::download_install_metadata_failure_rolls_back_and_retries",
                     "--nocapture",
                 ])
                 .env(TEST_ALLOW_LOOPBACK_HTTP_REMOTE_PLUGIN_BUNDLES_ENV, "1")
-                .status()
+                .output()
                 .expect("run remote bundle HTTP scenario");
-            assert!(status.success(), "remote bundle scenario failed: {status}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "remote bundle scenario failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "remote bundle scenario must execute its assertions"
+            );
             return;
         }
 

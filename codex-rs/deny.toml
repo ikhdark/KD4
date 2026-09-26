@@ -232,7 +232,6 @@ deny = [
         "opentelemetry-http",
         "opentelemetry-otlp",
         "rmcp",
-        "sentry",
     ], reason = "first-party direct reqwest dependencies must use codex-http-client" },
 ]
 

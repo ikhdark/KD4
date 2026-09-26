@@ -106,28 +106,34 @@ fn remove_thread_name_entries_blocking(
 ) -> std::io::Result<()> {
     with_session_index_lock(codex_home, || {
         let path = session_index_path(codex_home);
-        let contents = match std::fs::read_to_string(&path) {
+        // Bytes, not text: an append torn inside a multi-byte character must be retained like
+        // any other malformed line instead of failing this and every later removal.
+        let contents = match std::fs::read(&path) {
             Ok(contents) => contents,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err),
         };
         let mut removed = false;
-        let mut remaining = String::with_capacity(contents.len());
-        for line in contents.lines() {
-            let should_remove = serde_json::from_str::<SessionIndexEntry>(line.trim())
-                .is_ok_and(|entry| entry.id == thread_id);
+        let mut remaining = Vec::with_capacity(contents.len());
+        for line in contents.split_inclusive(|byte| *byte == b'\n') {
+            let should_remove = std::str::from_utf8(line)
+                .ok()
+                .and_then(|line| serde_json::from_str::<SessionIndexEntry>(line.trim()).ok())
+                .is_some_and(|entry| entry.id == thread_id);
             if should_remove {
                 removed = true;
             } else {
-                remaining.push_str(line);
-                remaining.push('\n');
+                remaining.extend_from_slice(line);
+                if !line.ends_with(b"\n") {
+                    remaining.push(b'\n');
+                }
             }
         }
         if !removed {
             return Ok(());
         }
         let mut temp_file = tempfile::NamedTempFile::new_in(codex_home)?;
-        temp_file.write_all(remaining.as_bytes())?;
+        temp_file.write_all(&remaining)?;
         temp_file.as_file().sync_all()?;
         temp_file.persist(path).map_err(|error| error.error)?;
         Ok(())

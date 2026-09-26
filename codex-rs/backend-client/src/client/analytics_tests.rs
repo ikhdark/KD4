@@ -66,18 +66,18 @@ async fn account_analytics_uses_personal_daily_scope_and_plugin_contract() {
 async fn account_analytics_preserves_signed_credit_events() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/wham/usage/credit-usage-events"))
+        .and(path("/backend-api/wham/usage/credit-usage-events"))
         .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_json(json!({
             "data": [{"date": "2026-01-03", "product_surface": "cli", "credit_amount": -0.004}]
         })))
         .expect(/*r*/ 1)
         .mount(&server)
         .await;
+    // A `backend-api` base selects the ChatGPT path style through production inference.
     let client = Client::new(
-        server.uri(),
+        format!("{}/backend-api", server.uri()),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-    )
-    .with_path_style(PathStyle::ChatGptApi);
+    );
     let response = client
         .get_account_analytics(AnalyticsReport::Credits, "2026-01-03", "2026-01-09")
         .await

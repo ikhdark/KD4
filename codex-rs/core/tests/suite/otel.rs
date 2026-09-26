@@ -197,6 +197,15 @@ async fn responses_api_emits_api_request_event() {
     assert_eq!(request_body["service_tier"].as_str(), Some("priority"));
     assert_eq!(request_body["reasoning"]["effort"].as_str(), Some("high"));
 
+    // Token diagnostics finish asynchronously after the response consumer is released.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !logs_contain("tool_token_count=") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completed response telemetry");
+
     logs_assert(|lines: &[&str]| {
         lines
             .iter()
@@ -301,7 +310,9 @@ async fn process_sse_emits_failed_event_on_parse_error() {
             .find(|line| {
                 line.contains("codex.sse_event")
                     && line.contains("error.message")
-                    && line.contains("expected ident at line 1 column 2")
+                    && line.contains("failed to parse SSE event")
+                    && line.contains("Syntax at line 1 column 2")
+                    && !line.contains("not-json")
             })
             .map(|_| Ok(()))
             .unwrap_or(Err("missing codex.sse_event".to_string()))
@@ -565,6 +576,7 @@ async fn process_sse_emits_completed_telemetry() {
         &server,
         sse(vec![
             ev_reasoning_item_added("reasoning-1", &[]),
+            core_test_support::responses::ev_reasoning_summary_text_delta("Thinking"),
             serde_json::json!({
                 "type": "response.completed",
                 "response": {
@@ -599,6 +611,14 @@ async fn process_sse_emits_completed_telemetry() {
         .unwrap();
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !logs_contain("tool_token_count=") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completed response telemetry");
 
     logs_assert(|lines: &[&str]| {
         lines
@@ -1237,20 +1257,18 @@ async fn handle_shell_command_autoapprove_from_config_records_tool_decision() {
     ));
 }
 
-#[tokio::test]
-#[traced_test]
-async fn handle_shell_command_user_approved_records_tool_decision() {
+#[expect(clippy::unwrap_used)]
+async fn run_escalated_shell_command_with_decision(call_id: &str, decision: ReviewDecision) {
     let server = start_mock_server().await;
     let command = touch_command("codex-otel-approval-test");
     mount_sse_once(
         &server,
         sse(vec![
-            shell_command_call_requiring_approval("user_approved_call", &command),
+            shell_command_call_requiring_approval(call_id, &command),
             ev_completed("done"),
         ]),
     )
     .await;
-
     mount_sse_once(
         &server,
         sse(vec![
@@ -1272,7 +1290,7 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "approved".into(),
+                text: "run the command".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -1293,367 +1311,27 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
         .submit(Op::ExecApproval {
             id: approval.effective_approval_id(),
             turn_id: None,
-            decision: ReviewDecision::Approved,
+            decision,
         })
         .await
         .unwrap();
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "user_approved_call",
-        "approved",
-        "user",
-    ));
 }
 
 #[tokio::test]
 #[traced_test]
-async fn handle_shell_command_user_approved_for_session_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("codex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            shell_command_call_requiring_approval("user_approved_session_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    let test = test_codex()
-        .with_config(|config| {
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-    let codex = test.codex.clone();
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "persist".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    let approval_event =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::ApprovedForSession,
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "user_approved_session_call",
-        "approvedforsession",
-        "user",
-    ));
-}
-
-#[tokio::test]
-#[traced_test]
-async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("codex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            shell_command_call_requiring_approval("sandbox_retry_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    let test = test_codex()
-        .with_config(|config| {
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-    let codex = test.codex.clone();
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "retry".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    let approval_event =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::Approved,
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "sandbox_retry_call",
-        "approved",
-        "user",
-    ));
-}
-
-#[tokio::test]
-#[traced_test]
-async fn handle_shell_command_user_denies_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("codex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            shell_command_call_requiring_approval("user_denied_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-    let codex = test.codex.clone();
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "deny".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    let approval_event =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::Denied,
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "user_denied_call",
-        "denied",
-        "user",
-    ));
-}
-
-#[tokio::test]
-#[traced_test]
-async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("codex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            shell_command_call_requiring_approval("sandbox_session_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    let test = test_codex()
-        .with_config(|config| {
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-    let codex = test.codex.clone();
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "persist".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    let approval_event =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::ApprovedForSession,
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "sandbox_session_call",
-        "approvedforsession",
-        "user",
-    ));
-}
-
-#[tokio::test]
-#[traced_test]
-async fn handle_sandbox_error_user_denies_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("codex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            shell_command_call_requiring_approval("sandbox_deny_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    let test = test_codex()
-        .with_config(|config| {
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-    let codex = test.codex.clone();
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "deny".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    let approval_event =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::Denied,
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "sandbox_deny_call",
-        "denied",
-        "user",
-    ));
+async fn handle_shell_command_user_decisions_record_tool_decision() {
+    for (call_id, decision, expected_decision) in [
+        ("user_approved_call", ReviewDecision::Approved, "approved"),
+        (
+            "user_approved_session_call",
+            ReviewDecision::ApprovedForSession,
+            "approvedforsession",
+        ),
+        ("user_denied_call", ReviewDecision::Denied, "denied"),
+    ] {
+        run_escalated_shell_command_with_decision(call_id, decision).await;
+        logs_assert(tool_decision_assertion(call_id, expected_decision, "user"));
+    }
 }

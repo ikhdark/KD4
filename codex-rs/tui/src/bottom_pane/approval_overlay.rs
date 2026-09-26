@@ -12,6 +12,7 @@
 //! presents choices and routes user decisions.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::app::app_server_requests::ResolvedAppServerRequest;
@@ -158,7 +159,8 @@ impl ApprovalRequest {
 /// Modal overlay asking the user to approve or deny one or more requests.
 pub(crate) struct ApprovalOverlay {
     current_request: Option<ApprovalRequest>,
-    queue: Vec<ApprovalRequest>,
+    /// Pending requests in arrival order, so later requests cannot starve earlier ones.
+    queue: VecDeque<ApprovalRequest>,
     app_event_tx: AppEventSender,
     list: ListSelectionView,
     options: Vec<ApprovalOption>,
@@ -179,7 +181,7 @@ impl ApprovalOverlay {
     ) -> Self {
         let mut view = Self {
             current_request: None,
-            queue: Vec::new(),
+            queue: VecDeque::new(),
             app_event_tx: app_event_tx.clone(),
             list: ListSelectionView::new(Default::default(), app_event_tx, list_keymap.clone()),
             options: Vec::new(),
@@ -194,7 +196,7 @@ impl ApprovalOverlay {
     }
 
     pub fn enqueue_request(&mut self, req: ApprovalRequest) {
-        self.queue.push(req);
+        self.queue.push_back(req);
     }
 
     fn dismiss_resolved_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
@@ -464,7 +466,7 @@ impl ApprovalOverlay {
     }
 
     fn advance_queue(&mut self) {
-        if let Some(next) = self.queue.pop() {
+        if let Some(next) = self.queue.pop_front() {
             self.set_current(next);
         } else {
             self.done = true;
@@ -557,17 +559,39 @@ impl ApprovalOverlay {
             false
         }
     }
+
+    /// Whether `key_event` would decide the current request rather than navigate.
+    fn is_decision_key(&self, key_event: KeyEvent) -> bool {
+        self.list_keymap.accept.is_pressed(key_event)
+            || self.list_keymap.cancel.is_pressed(key_event)
+            || self
+                .options
+                .iter()
+                .any(|opt| opt.shortcuts.iter().any(|s| s.is_press(key_event)))
+            || matches!(key_event.code, KeyCode::Char(ch) if ch.is_ascii_digit())
+    }
 }
 
 impl BottomPaneView for ApprovalOverlay {
+    fn prefer_esc_to_handle_key_event(&self) -> bool {
+        // Receive Esc with its key kind so a repeat cannot cancel the next queued request.
+        true
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        if key_hint::plain(KeyCode::Esc).is_press(key_event)
-            && matches!(
-                self.current_request,
-                Some(ApprovalRequest::McpElicitation { .. })
-            )
-        {
-            self.cancel_current_request();
+        if key_event.kind == KeyEventKind::Release {
+            return;
+        }
+        // Esc always cancels, even when custom bindings also assign it to a decision.
+        if key_event.code == KeyCode::Esc {
+            if key_event.kind == KeyEventKind::Press {
+                self.cancel_current_request();
+            }
+            return;
+        }
+        // A decision advances the queue, so only a fresh press may decide; a held key
+        // would otherwise answer the next request before it is seen. Repeats still navigate.
+        if key_event.kind != KeyEventKind::Press && self.is_decision_key(key_event) {
             return;
         }
 

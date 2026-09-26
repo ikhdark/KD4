@@ -47,6 +47,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_absolute_path::normalize_for_native_workdir;
 use codex_utils_absolute_path::normalize_for_path_comparison;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -820,8 +821,13 @@ pub(crate) fn normalized_project_lookup_keys(path: &Path) -> Vec<String> {
     }
 }
 
+/// Lowercases a projects trust-map key and drops a Windows verbatim prefix wherever the ordinary
+/// spelling names the same location. The canonical key therefore stays in the `C:\...` form users
+/// write, and `\\?\` keys persisted by earlier builds still match.
 pub(crate) fn normalize_project_lookup_key(key: &str) -> String {
-    key.to_ascii_lowercase()
+    normalize_for_native_workdir(key)
+        .to_string_lossy()
+        .to_ascii_lowercase()
 }
 
 pub(crate) struct ProjectLookup<T> {
@@ -994,6 +1000,25 @@ mod tests {
             ("C:\\REPO".to_string(), "upper"),
         ]));
         assert_eq!(fallback.get("c:\\repo"), Some(("C:\\REPO", &"upper")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn project_keys_use_ordinary_windows_spelling_and_match_verbatim_entries() {
+        let project = tempfile::tempdir().expect("project directory");
+        let lookup_keys = normalized_project_lookup_keys(project.path());
+        // `project_trust_key` persists the first key, so it must not be a `\\?\` path.
+        assert!(
+            !lookup_keys[0].starts_with(r"\\?\"),
+            "canonical trust key must use the ordinary spelling: {lookup_keys:?}"
+        );
+
+        let persisted = format!(r"\\?\{}", project.path().display());
+        let projects = ProjectLookup::new(HashMap::from([(persisted.clone(), "trusted")]));
+        assert_eq!(
+            lookup_keys.iter().find_map(|key| projects.get(key)),
+            Some((persisted.as_str(), &"trusted"))
+        );
     }
 
     #[test]

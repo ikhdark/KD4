@@ -13,7 +13,6 @@ use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Config;
-use codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -24,8 +23,10 @@ use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::require_network;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::body_contains_text;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -43,21 +44,6 @@ use wiremock::MockServer;
 
 const AFTER_SECOND_RESUME: &str = "AFTER_SECOND_RESUME";
 const AFTER_ROLLBACK: &str = "AFTER_ROLLBACK";
-
-fn network_disabled() -> bool {
-    std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok()
-}
-
-fn body_contains_text(body: &str, text: &str) -> bool {
-    body.contains(&json_fragment(text))
-}
-
-fn json_fragment(text: &str) -> String {
-    serde_json::to_string(text)
-        .expect("serialize text to JSON")
-        .trim_matches('"')
-        .to_string()
-}
 
 fn normalize_line_endings_str(text: &str) -> String {
     if text.contains('\r') {
@@ -149,10 +135,7 @@ fn normalize_compact_prompts(requests: &mut [Value]) {
 /// Scenario: compact an initial conversation, resume it, fork one turn back, and
 /// ensure the model-visible history matches expectations at each request.
 async fn compact_resume_and_fork_preserve_model_history_view() {
-    if network_disabled() {
-        println!("Skipping test because network is disabled in this sandbox");
-        return;
-    }
+    require_network!();
 
     // 1. Arrange mocked SSE responses for the initial compact/resume/fork flow.
     let server = MockServer::start().await;
@@ -221,10 +204,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
 /// Scenario: after the forked branch is compacted, resuming again should reuse
 /// the compacted history and only append the new user message.
 async fn compact_resume_after_second_compaction_preserves_history() -> Result<()> {
-    if network_disabled() {
-        println!("Skipping test because network is disabled in this sandbox");
-        return Ok(());
-    }
+    require_network!();
 
     // 1. Arrange mocked SSE responses as a single ordered stream so assertions
     // observe the real request sequence instead of per-mock duplicate captures.
@@ -304,10 +284,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
 /// append-only history from the rollout file and keep the compaction summary
 /// visible without restoring source messages consumed by compaction.
 async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Result<()> {
-    if network_disabled() {
-        println!("Skipping test because network is disabled in this sandbox");
-        return Ok(());
-    }
+    require_network!();
 
     const EDITED_AFTER_COMPACT: &str = "EDITED_AFTER_COMPACT";
     const SECOND_REPLY: &str = "SECOND_REPLY";
@@ -394,10 +371,7 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
 /// diffs should trim those context updates so the next request includes them
 /// only once.
 async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
-    if network_disabled() {
-        println!("Skipping test because network is disabled in this sandbox");
-        return Ok(());
-    }
+    require_network!();
 
     const MODEL: &str = "gpt-5.4";
     const TURN_ONE_USER: &str = "turn 1 user";
@@ -582,7 +556,7 @@ async fn mount_initial_flow(server: &MockServer) -> Vec<ResponseMock> {
 
     let match_compact = |req: &wiremock::Request| {
         let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body_contains_text(body, SUMMARIZATION_PROMPT) || body.contains(&json_fragment(FIRST_REPLY))
+        body_contains_text(body, SUMMARIZATION_PROMPT) || body_contains_text(body, FIRST_REPLY)
     };
     let compact = mount_sse_once_match(server, match_compact, sse2).await;
 

@@ -465,6 +465,140 @@ async fn saturated_execute_is_rejected_without_side_effects_and_host_shuts_down(
 }
 
 #[tokio::test]
+async fn admitted_delegate_burst_survives_a_stalled_client_reader() {
+    use codex_code_mode_protocol::host::DelegateResponse;
+    use codex_code_mode_protocol::host::WireRuntimeResponse;
+    use codex_code_mode_protocol::host::WireToolDefinition;
+    use codex_code_mode_protocol::host::WireToolKind;
+    use codex_code_mode_protocol::host::WireToolName;
+
+    // Every call is admitted: 200 stays under the pending-delegate limit and
+    // each cell stays under its outstanding-callback limit.
+    const CELLS: usize = 2;
+    const CALLS_PER_CELL: usize = 100;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (host_reader, client_writer) = tokio::io::duplex(64 * 1024);
+        // A small output pipe stalls the host writer, as a busy client does.
+        let (host_writer, client_reader) = tokio::io::duplex(1024);
+        let mut host = tokio::spawn(run(host_reader, host_writer));
+        let mut writer = FramedWriter::new(client_writer);
+        let mut reader = FramedReader::new(client_reader);
+        writer
+            .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
+            .await
+            .expect("write hello");
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("read hello")
+            .expect("host hello");
+        let session = session_id("burst-session");
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id(1),
+                request: HostRequest::OpenSession {
+                    session_id: session.clone(),
+                },
+            })
+            .await
+            .expect("open session");
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("session ready")
+            .expect("session ready frame");
+
+        let tool = WireToolDefinition {
+            name: "echo".to_string(),
+            tool_name: WireToolName {
+                name: "echo".to_string(),
+                namespace: None,
+            },
+            description: String::new(),
+            kind: WireToolKind::Function,
+            input_schema: None,
+            output_schema: None,
+            default_timeout_ms: None,
+        };
+        for id in 0..CELLS {
+            let mut request = execute_request(&format!(
+                "await Promise.all(Array.from({{length: {CALLS_PER_CELL}}}, () => tools.echo({{}})));"
+            ));
+            request.enabled_tools = vec![tool.clone()];
+            writer
+                .write(&ClientToHost::Request {
+                    id: request_id(id as i64 + 2),
+                    request: HostRequest::Execute {
+                        session_id: session.clone(),
+                        request,
+                    },
+                })
+                .await
+                .expect("start burst cell");
+        }
+
+        // The client does not read while the cells issue their calls.
+        let stalled = tokio::time::timeout(Duration::from_secs(3), &mut host).await;
+        assert!(
+            stalled.is_err(),
+            "an admitted burst must not fail the host connection: {stalled:?}"
+        );
+
+        let mut delegated = 0;
+        let mut completed = 0;
+        let mut closed = 0;
+        while completed < CELLS || closed < CELLS {
+            match reader
+                .read::<HostToClient>()
+                .await
+                .expect("host frame")
+                .expect("host remains connected")
+            {
+                HostToClient::DelegateRequest { id, .. } => {
+                    delegated += 1;
+                    writer
+                        .write(&ClientToHost::DelegateResponse {
+                            id,
+                            result: WireResult::Ok {
+                                value: DelegateResponse::ToolResult {
+                                    result: serde_json::Value::Null,
+                                },
+                            },
+                        })
+                        .await
+                        .expect("answer delegate request");
+                }
+                HostToClient::InitialResponse {
+                    result:
+                        WireResult::Ok {
+                            value: WireRuntimeResponse::Result {
+                                error_text: None, ..
+                            },
+                        },
+                    ..
+                } => completed += 1,
+                HostToClient::CellClosed { .. } => closed += 1,
+                HostToClient::Response {
+                    result:
+                        WireResult::Ok {
+                            value: HostResponse::ExecutionStarted { .. },
+                        },
+                    ..
+                } => {}
+                other => panic!("unexpected host frame: {other:?}"),
+            }
+        }
+        assert_eq!(delegated, CELLS * CALLS_PER_CELL);
+        drop(writer);
+        drop(reader);
+        host.await.expect("host task").expect("clean EOF shutdown");
+    })
+    .await
+    .expect("admitted burst must complete");
+}
+
+#[tokio::test]
 async fn unsupported_required_capability_is_rejected() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);

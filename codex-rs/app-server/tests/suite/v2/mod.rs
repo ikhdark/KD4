@@ -41,6 +41,7 @@ mod plugin_install;
 mod plugin_list;
 mod plugin_read;
 mod plugin_share;
+mod plugin_test_support;
 mod plugin_uninstall;
 mod process_exec;
 mod projects;

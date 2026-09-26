@@ -40,9 +40,9 @@ use crate::render::available_skills_fragment;
 use crate::render::main_prompt_fragment;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::sources::SkillProviders;
+use crate::state::EmittedTurnWarnings;
 use crate::state::ExecutorSkillsStepState;
 use crate::state::SkillsThreadState;
-use crate::state::SkillsTurnState;
 use crate::tools::skill_tools;
 use crate::world_state::SKILLS_WORLD_STATE_ID;
 use crate::world_state::executor_skills_world_state_section;
@@ -328,24 +328,22 @@ where
                 catalog.extend(executor_skills.0.clone());
             }
             for warning in &catalog.warnings {
-                self.emit_warning(thread_store, &input.turn_id, warning.clone());
+                self.emit_turn_warning(thread_store, turn_store, &input.turn_id, warning.clone());
             }
 
             let selected_entries = collect_explicit_skill_mentions(&input.user_input, &catalog);
             let mut fragments: Vec<Box<dyn ContextualUserFragment + Send>> = Vec::new();
             if config.include_instructions {
-                let mut turn_catalog = catalog.clone();
-                turn_catalog.entries.retain(|entry| {
+                // Selection has already copied its entries, so the catalog can be narrowed in place.
+                catalog.entries.retain(|entry| {
                     entry.authority.kind != SkillSourceKind::Executor
                         && entry.authority.kind != SkillSourceKind::Orchestrator
                 });
-                if let Some(fragment) = available_skills_fragment(&turn_catalog) {
+                if let Some(fragment) = available_skills_fragment(&catalog) {
                     fragments.push(Box::new(fragment));
                 }
             }
 
-            let mut warnings = catalog.warnings.clone();
-            let mut main_prompts_injected = false;
             let mut injected_host_skill_prompts = InjectedHostSkillPrompts::default();
             let unavailable = SkillInstructions {
                 name: "Unavailable selected instructions".to_string(),
@@ -370,29 +368,39 @@ where
                         let Some((fragment, truncated)) =
                             main_prompt_fragment(read_result.contents.as_str(), entry, budget)
                         else {
-                            warnings.push(format!("Skill `{}` could not fit its complete recovery identity in the selected-instruction budget.", entry.name));
+                            self.emit_turn_warning(
+                                thread_store,
+                                turn_store,
+                                &input.turn_id,
+                                format!("Skill `{}` could not fit its complete recovery identity in the selected-instruction budget.", entry.name),
+                            );
                             omitted_instructions = true;
                             continue;
                         };
                         remaining_prompt_bytes -= fragment.render().len();
                         if truncated {
-                            let warning = format!(
-                                "Skill `{}` exceeded the main prompt context limit and was truncated.",
-                                entry.name
+                            self.emit_turn_warning(
+                                thread_store,
+                                turn_store,
+                                &input.turn_id,
+                                format!(
+                                    "Skill `{}` exceeded the main prompt context limit and was truncated.",
+                                    entry.name
+                                ),
                             );
-                            self.emit_warning(thread_store, &input.turn_id, warning.clone());
-                            warnings.push(warning);
                         }
                         fragments.push(Box::new(fragment));
-                        main_prompts_injected = true;
                         if entry.authority.kind == SkillSourceKind::Host {
                             injected_host_skill_prompts.insert_path(entry.main_prompt.as_str());
                         }
                     }
                     Err(message) => {
-                        let warning = format!("Failed to load skill `{}`: {message}", entry.name);
-                        self.emit_warning(thread_store, &input.turn_id, warning.clone());
-                        warnings.push(warning);
+                        self.emit_turn_warning(
+                            thread_store,
+                            turn_store,
+                            &input.turn_id,
+                            format!("Failed to load skill `{}`: {message}", entry.name),
+                        );
                         let failure = SkillInstructions {
                             name: entry.name.clone(),
                             path: entry.main_prompt.as_str().to_string(),
@@ -429,12 +437,6 @@ where
                 }
             }
 
-            turn_store.insert(SkillsTurnState {
-                catalog,
-                selected_entries,
-                warnings,
-                main_prompts_injected,
-            });
             if !injected_host_skill_prompts.is_empty() {
                 turn_store.insert(injected_host_skill_prompts);
             }
@@ -497,6 +499,21 @@ impl<C> SkillsExtension<C> {
             )
             .await
             .map_err(|err| err.model_message().to_string())
+    }
+
+    fn emit_turn_warning(
+        &self,
+        thread_store: &ExtensionData,
+        turn_store: &ExtensionData,
+        turn_id: &str,
+        message: String,
+    ) {
+        if turn_store
+            .get_or_init(EmittedTurnWarnings::default)
+            .first_emission(&message)
+        {
+            self.emit_warning(thread_store, turn_id, message);
+        }
     }
 
     fn emit_warning(&self, thread_store: &ExtensionData, turn_id: &str, message: String) {

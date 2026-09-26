@@ -329,12 +329,7 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
 
 #[tokio::test]
 async fn removed_workspace_workers_are_not_exposed_or_registered() {
-    let plan = probe(|turn| {
-        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
-        Arc::make_mut(&mut turn.config).codex_self_exe =
-            Some(turn.config.cwd.join("codex.exe").to_path_buf());
-    })
-    .await;
+    let plan = probe(|turn| set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec])).await;
     plan.assert_visible_contains(&["exec_command", "context_checkpoint"]);
     plan.assert_registered_contains(&["exec_command", "context_checkpoint"]);
     plan.assert_visible_lacks(&["semantic_context", "workspace_validation"]);
@@ -343,28 +338,6 @@ async fn removed_workspace_workers_are_not_exposed_or_registered() {
         plan.authorization_class("context_checkpoint"),
         TypedToolClass::OwnTask
     );
-    for configuration in ["executable", "runtime", "environment", "code_mode"] {
-        let plan = probe(|turn| {
-            set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
-            Arc::make_mut(&mut turn.config).codex_self_exe =
-                Some(turn.config.cwd.join("codex.exe").to_path_buf());
-            match configuration {
-                "executable" => Arc::make_mut(&mut turn.config).codex_self_exe = None,
-                "runtime" => set_feature(turn, Feature::ShellTool, false),
-                "code_mode" => {
-                    set_feature(turn, Feature::CodeMode, true);
-                    turn.model_info.supports_search_tool = true;
-                }
-                _ => turn.environments.turn_environments.clear(),
-            }
-        })
-        .await;
-        plan.assert_visible_lacks(&["semantic_context", "workspace_validation"]);
-        plan.assert_registered_lacks(&["semantic_context", "workspace_validation"]);
-        for name in ["semantic_context", "workspace_validation"] {
-            assert!(plan.tool_search_texts.iter().all(|text| !text.contains(name)));
-        }
-    }
 }
 
 #[tokio::test]
@@ -1011,11 +984,6 @@ fn recovery_contract_bundle_reduces_repeated_shapes_without_removing_call_contra
         .map(|definition| definition.description.len())
         .sum();
     let bundle = codex_code_mode::render_code_mode_tool_bundle(&definitions);
-    eprintln!(
-        "Recovery contracts: separate={} bytes, shared bundle={} bytes",
-        separate_bytes,
-        bundle.len()
-    );
     assert!(
         bundle.len() + 500 < separate_bytes,
         "bundle={}, separate={separate_bytes}",

@@ -24,7 +24,35 @@ use super::config_summary_entries;
 use super::reasoning_text;
 use super::should_print_final_message_to_stdout;
 use super::should_print_final_message_to_tty;
+use super::write_final_message;
 use crate::event_processor::EventProcessor;
+
+#[test]
+fn final_message_write_reports_closed_stdout_instead_of_panicking() {
+    struct ClosedPipe;
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut written = Vec::new();
+    write_final_message(&mut written, "final answer").expect("write final message");
+    assert_eq!(written, b"final answer\n");
+
+    let error =
+        write_final_message(&mut ClosedPipe, "final answer").expect_err("closed stdout must fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(
+        error
+            .to_string()
+            .contains("failed to write final message to stdout"),
+        "{error}"
+    );
+}
 
 #[test]
 fn suppresses_final_stdout_message_when_both_streams_are_terminals() {

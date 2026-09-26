@@ -29,14 +29,18 @@ use crate::facts::TurnProfileFact;
 use crate::facts::TurnResolvedConfigFact;
 use crate::facts::TurnTokenUsageFact;
 use crate::reducer::AnalyticsReducer;
+use crate::reducer::analytics_tool_item;
 use crate::reducer::tracked_tool_item_id;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
+use codex_app_server_protocol::ItemCompletedNotification;
+use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerResponse;
+use codex_app_server_protocol::ThreadItem;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::RouteAwareClientPool;
@@ -625,10 +629,7 @@ impl AnalyticsEventsClient {
             }
             ServerNotification::ItemCompleted(notification) => {
                 tracked_tool_item_id(&notification.item).is_some()
-                    || matches!(
-                        notification.item,
-                        codex_app_server_protocol::ThreadItem::SubAgentActivity { .. }
-                    )
+                    || matches!(notification.item, ThreadItem::SubAgentActivity { .. })
             }
             ServerNotification::TurnStarted(_)
             | ServerNotification::TurnCompleted(_)
@@ -641,7 +642,38 @@ impl AnalyticsEventsClient {
         let Some(permit) = queue.try_reserve() else {
             return;
         };
-        permit.send(AnalyticsFact::Notification(Box::new(notification.clone())));
+        let notification = match notification {
+            ServerNotification::ItemStarted(started) => {
+                let Some(item) = analytics_tool_item(&started.item) else {
+                    return;
+                };
+                ServerNotification::ItemStarted(ItemStartedNotification {
+                    item,
+                    thread_id: started.thread_id.clone(),
+                    turn_id: started.turn_id.clone(),
+                    started_at_ms: started.started_at_ms,
+                })
+            }
+            ServerNotification::ItemCompleted(completed) => {
+                let item = match &completed.item {
+                    item @ ThreadItem::SubAgentActivity { .. } => item.clone(),
+                    item => {
+                        let Some(item) = analytics_tool_item(item) else {
+                            return;
+                        };
+                        item
+                    }
+                };
+                ServerNotification::ItemCompleted(ItemCompletedNotification {
+                    item,
+                    thread_id: completed.thread_id.clone(),
+                    turn_id: completed.turn_id.clone(),
+                    completed_at_ms: completed.completed_at_ms,
+                })
+            }
+            notification => notification.clone(),
+        };
+        permit.send(AnalyticsFact::Notification(Box::new(notification)));
     }
 }
 

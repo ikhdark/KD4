@@ -43,6 +43,7 @@ use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -87,7 +88,6 @@ use uuid::Uuid;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
-use wiremock::matchers::body_string_contains;
 use wiremock::matchers::header;
 use wiremock::matchers::header_regex;
 use wiremock::matchers::method;
@@ -879,10 +879,10 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .position(|(role, text)| role == "user" && text == "hello")
         .expect("new user message");
 
-    assert!(pos_user_instructions < pos_permissions);
-    assert!(pos_permissions < pos_prior_user);
     assert!(pos_prior_user < pos_prior_assistant);
-    assert!(pos_prior_assistant < pos_environment);
+    assert!(pos_prior_assistant < pos_permissions);
+    assert!(pos_permissions < pos_user_instructions);
+    assert!(pos_user_instructions < pos_environment);
     assert!(pos_environment < pos_new_user);
 }
 
@@ -1751,9 +1751,11 @@ async fn includes_user_instructions_message_in_request() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
-    require_network!();
+#[expect(clippy::unwrap_used)]
+async fn apps_guidance_request(
+    auth: CodexAuth,
+    include_apps_instructions: bool,
+) -> ResponsesRequest {
     let server = MockServer::start().await;
     let apps_server = AppsTestServer::mount(&server)
         .await
@@ -1766,15 +1768,14 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
     )
     .await;
 
-    let mut builder = test_codex()
-        .with_auth(create_dummy_codex_auth())
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::Apps)
-                .expect("test config should allow feature update");
-            config.chatgpt_base_url = apps_base_url;
-        });
+    let mut builder = test_codex().with_auth(auth).with_config(move |config| {
+        config
+            .features
+            .enable(Feature::Apps)
+            .expect("test config should allow feature update");
+        config.chatgpt_base_url = apps_base_url;
+        config.include_apps_instructions = include_apps_instructions;
+    });
     let codex = builder
         .build(&server)
         .await
@@ -1797,133 +1798,41 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let request = resp_mock.single_request();
+    resp_mock.single_request()
+}
+
+/// Apps guidance is a developer message injected only for ChatGPT auth with
+/// `include_apps_instructions` on, even when the Apps feature is enabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apps_guidance_is_developer_only_and_gated_by_auth_and_config() {
+    require_network!();
     let apps_snippet = "Use a relevant installed app when named";
 
-    assert!(
-        message_input_text_contains(&request, "developer", apps_snippet),
-        "expected apps guidance in a developer message, got {:?}",
-        request.body_json()["input"]
-    );
-
-    assert!(
-        !message_input_text_contains(&request, "user", apps_snippet),
-        "did not expect apps guidance in user messages, got {:?}",
-        request.body_json()["input"]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled() {
-    require_network!();
-    let server = MockServer::start().await;
-    let apps_server = AppsTestServer::mount(&server)
-        .await
-        .expect("mount apps MCP mock");
-    let apps_base_url = apps_server.chatgpt_base_url.clone();
-
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::Apps)
-                .expect("test config should allow feature update");
-            config.chatgpt_base_url = apps_base_url;
-        });
-    let codex = builder
-        .build(&server)
-        .await
-        .expect("create new conversation")
-        .codex;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let apps_snippet =
-        "Apps (Connectors) can be explicitly triggered in user messages in the format";
-
-    assert!(
-        !message_input_text_contains(&request, "developer", apps_snippet)
-            && !message_input_text_contains(&request, "user", apps_snippet),
-        "did not expect apps guidance for API key auth, got {:?}",
-        request.body_json()["input"]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn omits_apps_guidance_when_configured_off() {
-    require_network!();
-    let server = MockServer::start().await;
-    let apps_server = AppsTestServer::mount(&server)
-        .await
-        .expect("mount apps MCP mock");
-    let apps_base_url = apps_server.chatgpt_base_url.clone();
-
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-
-    let mut builder = test_codex()
-        .with_auth(create_dummy_codex_auth())
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::Apps)
-                .expect("test config should allow feature update");
-            config.chatgpt_base_url = apps_base_url;
-            config.include_apps_instructions = false;
-        });
-    let codex = builder
-        .build(&server)
-        .await
-        .expect("create new conversation")
-        .codex;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    assert!(
-        !message_input_text_contains(&request, "developer", "<apps_instructions>"),
-        "did not expect apps instructions when include_apps_instructions = false, got {:?}",
-        request.body_json()["input"]
-    );
+    for (case, auth, include_apps_instructions, expected) in [
+        ("chatgpt auth", create_dummy_codex_auth(), true, true),
+        (
+            "api key auth",
+            CodexAuth::from_api_key("Test API Key"),
+            true,
+            false,
+        ),
+        ("configured off", create_dummy_codex_auth(), false, false),
+    ] {
+        let request = apps_guidance_request(auth, include_apps_instructions).await;
+        for needle in [APPS_INSTRUCTIONS_OPEN_TAG, apps_snippet] {
+            assert_eq!(
+                message_input_text_contains(&request, "developer", needle),
+                expected,
+                "{case}: developer apps guidance {needle:?}, got {:?}",
+                request.body_json()["input"]
+            );
+            assert!(
+                !message_input_text_contains(&request, "user", needle),
+                "{case}: apps guidance {needle:?} must not be a user message, got {:?}",
+                request.body_json()["input"]
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2312,10 +2221,12 @@ async fn initial_turn_preserves_configured_reasoning_effort() -> anyhow::Result<
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
+    // Effort and verbosity resolve independently while building the same request.
     let TestCodex { codex, .. } = test_codex()
         .with_model("gpt-5.4")
         .with_config(|config| {
             config.model_reasoning_effort = Some(ReasoningEffort::XHigh);
+            config.model_verbosity = Some(Verbosity::High);
         })
         .build(&server)
         .await?;
@@ -2345,6 +2256,13 @@ async fn initial_turn_preserves_configured_reasoning_effort() -> anyhow::Result<
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
         Some("xhigh")
+    );
+    assert_eq!(
+        request_body
+            .get("text")
+            .and_then(|t| t.get("verbosity"))
+            .and_then(|v| v.as_str()),
+        Some("high")
     );
 
     Ok(())
@@ -2387,6 +2305,14 @@ async fn initial_turn_uses_model_default_reasoning_effort() -> anyhow::Result<()
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
         Some("medium")
+    );
+    // The model catalog default verbosity is sent on the same default request.
+    assert_eq!(
+        request_body
+            .get("text")
+            .and_then(|t| t.get("verbosity"))
+            .and_then(|v| v.as_str()),
+        Some("low")
     );
 
     Ok(())
@@ -2772,48 +2698,6 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
-    require_network!();
-    let server = MockServer::start().await;
-
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert_eq!(
-        request_body
-            .get("text")
-            .and_then(|t| t.get("verbosity"))
-            .and_then(|v| v.as_str()),
-        Some("low")
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::Result<()> {
     require_network!();
     let server = MockServer::start().await;
@@ -2855,54 +2739,6 @@ async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::R
             .get("text")
             .and_then(|t| t.get("verbosity"))
             .is_none()
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
-    require_network!();
-    let server = MockServer::start().await;
-
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-    let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
-        .with_config(|config| {
-            config.model_verbosity = Some(Verbosity::High);
-        })
-        .build(&server)
-        .await?;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert_eq!(
-        request_body
-            .get("text")
-            .and_then(|t| t.get("verbosity"))
-            .and_then(|v| v.as_str()),
-        Some("high")
     );
 
     Ok(())
@@ -3457,24 +3293,27 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 
     const EFFECTIVE_CONTEXT_WINDOW: i64 = (272_000 * 95) / 100;
 
-    mount_sse_once_match(
+    let overflow = sse_failed(
+        "resp_context_window",
+        "context_length_exceeded",
+        "Your input exceeds the context window of this model. Please adjust your input and try again.",
+    );
+    // The first overflow permits one compaction recovery before surfacing a
+    // repeated overflow. Provide that response instead of an accidental 404.
+    let requests = mount_sse_sequence(
         &server,
-        body_string_contains("trigger context window"),
-        sse_failed(
-            "resp_context_window",
-            "context_length_exceeded",
-            "Your input exceeds the context window of this model. Please adjust your input and try again.",
-        ),
-    )
-    .await;
-
-    mount_sse_once_match(
-        &server,
-        body_string_contains("seed turn"),
-        sse(vec![
-            ev_response_created("resp_seed"),
-            ev_completed("resp_seed"),
-        ]),
+        vec![
+            sse(vec![ev_response_created("resp_seed"), ev_completed("resp_seed")]),
+            overflow.clone(),
+            sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "compaction", "encrypted_content": "overflow-recovery"},
+                }),
+                ev_completed("resp_compacted"),
+            ]),
+            overflow,
+        ],
     )
     .await;
 
@@ -3552,6 +3391,7 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    assert_eq!(requests.requests().len(), 4, "recover from overflow only once");
     Ok(())
 }
 
@@ -3664,7 +3504,8 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
             "text/event-stream",
         );
 
-    // Expect POST to /openai/responses with api-version query param
+    // Expect POST to /openai/responses with api-version query param. The
+    // bearer token proves the provider env var overrides the loaded ChatGPT auth.
     Mock::given(method("POST"))
         .and(path("/openai/responses"))
         .and(query_param("api-version", "2025-04-01-preview"))
@@ -3695,96 +3536,6 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
             "2025-04-01-preview".to_string(),
         )])),
         env_key_instructions: None,
-        wire_api: WireApi::Responses,
-        http_headers: Some(std::collections::HashMap::from([(
-            "Custom-Header".to_string(),
-            "Value".to_string(),
-        )])),
-        env_http_headers: None,
-        request_max_retries: None,
-        stream_max_retries: None,
-        stream_idle_timeout_ms: None,
-        websocket_connect_timeout_ms: None,
-        requires_openai_auth: false,
-        supports_websockets: false,
-        supports_standalone_web_search: false,
-    };
-
-    // Init session
-    let mut builder = test_codex()
-        .with_auth(create_dummy_codex_auth())
-        .with_config(move |config| {
-            config.model_provider = provider;
-        });
-    let codex = builder
-        .build(&server)
-        .await
-        .expect("create new conversation")
-        .codex;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn env_var_overrides_loaded_auth() {
-    require_network!();
-
-    // Mock server
-    let server = MockServer::start().await;
-
-    // First request – must NOT include `previous_response_id`.
-    let first = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(
-            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-            "text/event-stream",
-        );
-
-    // Expect POST to /openai/responses with api-version query param
-    Mock::given(method("POST"))
-        .and(path("/openai/responses"))
-        .and(query_param("api-version", "2025-04-01-preview"))
-        .and(header_regex("Custom-Header", "Value"))
-        .and(header(
-            "Authorization",
-            format!(
-                "Bearer {}",
-                std::env::var(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE).unwrap()
-            )
-            .as_str(),
-        ))
-        .respond_with(first)
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let provider = ModelProviderInfo {
-        name: "custom".to_string(),
-        base_url: Some(format!("{}/openai", server.uri())),
-        // Reuse the existing environment variable to avoid using unsafe code
-        env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
-        query_params: Some(std::collections::HashMap::from([(
-            "api-version".to_string(),
-            "2025-04-01-preview".to_string(),
-        )])),
-        env_key_instructions: None,
-        experimental_bearer_token: None,
-        auth: None,
-        aws: None,
         wire_api: WireApi::Responses,
         http_headers: Some(std::collections::HashMap::from([(
             "Custom-Header".to_string(),

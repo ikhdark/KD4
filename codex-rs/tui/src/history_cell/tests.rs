@@ -883,6 +883,30 @@ fn ps_output_chunk_leading_whitespace_snapshot() {
 }
 
 #[test]
+fn empty_mcp_output_links_docs_without_escape_sequences() {
+    let cell = empty_mcp_output();
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    assert!(!rendered.contains('\x1b'), "{rendered:?}");
+    let destination = "https://developers.openai.com/codex/mcp";
+    assert!(
+        cell.display_hyperlink_lines(/*width*/ 80)
+            .iter()
+            .any(|line| line.hyperlinks.iter().any(|link| link.destination == destination))
+    );
+}
+
+#[test]
+fn ps_output_chunks_show_text_without_escape_sequences() {
+    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
+        command_display: "cargo build".to_string(),
+        recent_chunks: vec!["\x1b[32mCompiling\x1b[0m foo".to_string()],
+    }]);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
+    assert!(rendered.contains("    ↳ Compiling foo"), "{rendered:?}");
+    assert!(!rendered.contains("[32m"), "{rendered:?}");
+}
+
+#[test]
 fn error_event_oversized_input_snapshot() {
     let cell = new_error_event(
         "Message exceeds the maximum length of 1048576 characters (1048577 provided).".to_string(),
@@ -1260,9 +1284,9 @@ fn standalone_windows_update_available_history_cell_snapshot() {
 }
 
 #[test]
-fn pnpm_update_available_history_cell_snapshot() {
-    let cell =
-        UpdateAvailableHistoryCell::new("9.9.9".to_string(), Some(UpdateAction::PnpmGlobalLatest));
+fn manual_update_available_history_cell_snapshot() {
+    // Package-manager installs have no automatic update action.
+    let cell = UpdateAvailableHistoryCell::new("9.9.9".to_string(), /*update_action*/ None);
     let rendered = render_lines(&cell.display_lines(/*width*/ 110)).join("\n");
 
     insta::assert_snapshot!(rendered);

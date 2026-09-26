@@ -43,6 +43,27 @@ fn editing_and_tool_calls_are_meaningful_progress() {
     assert!(!ObservationKind::Starting.is_meaningful_progress());
 }
 
+#[test]
+fn embedded_migration_checksums_match_persisted_line_endings() {
+    use sha2::Digest;
+    // SQLx hashes raw file bytes. Version 20 was first applied from CRLF bytes, and
+    // `.gitattributes` pins that checkout form; every other migration is embedded as LF.
+    for migration in TEST_MIGRATOR.migrations.iter() {
+        let lf_sql = migration.sql.as_str().replace("\r\n", "\n");
+        let persisted_sql = if migration.version == 20 {
+            lf_sql.replace('\n', "\r\n")
+        } else {
+            lf_sql
+        };
+        assert_eq!(
+            migration.checksum.as_ref(),
+            sha2::Sha384::digest(persisted_sql.as_bytes()).as_slice(),
+            "migration {} must embed the line endings recorded by persisted ledgers",
+            migration.version
+        );
+    }
+}
+
 #[tokio::test]
 async fn audit_mutation_recovery_f060_page_reports_completeness_and_rejects_zero() {
     let fixture = Fixture::new().await;
@@ -1545,6 +1566,175 @@ async fn workspace_actor_registration_waits_for_transient_writer_contention() {
         .expect("registration survives transient writer contention");
     drop(blocker);
     blocker_pool.close().await;
+}
+
+async fn wait_out_transient_writer_contention<T>(
+    blocker_pool: &sqlx::SqlitePool,
+    write: impl std::future::Future<Output = StoreResult<T>>,
+) -> T {
+    let mut blocker = blocker_pool
+        .acquire()
+        .await
+        .expect("coordination connection opens");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *blocker)
+        .await
+        .expect("writer lock is acquired");
+    tokio::pin!(write);
+    if let Ok(early) = tokio::time::timeout(std::time::Duration::from_millis(50), &mut write).await
+    {
+        panic!(
+            "the write must wait for the writer lock instead of completing early: {:?}",
+            early.err()
+        );
+    }
+    sqlx::query("ROLLBACK")
+        .execute(&mut *blocker)
+        .await
+        .expect("writer lock is released");
+    tokio::time::timeout(std::time::Duration::from_secs(1), write)
+        .await
+        .expect("the write resumes promptly after the writer lock is released")
+        .expect("the write survives transient writer contention")
+}
+
+#[tokio::test]
+async fn lease_heartbeats_and_quiescence_wait_for_transient_writer_contention() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "contended-lease-root";
+    let command = "cargo test -p contended lease";
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft(root_session_id, "src", command),
+        )
+        .await
+        .expect("worker assignment");
+    let binding = bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        root_session_id,
+    )
+    .await;
+    let call = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "contended-lease-call",
+        command,
+    )
+    .await;
+    let blocker_pool = coordination_pool(&fixture).await;
+
+    // Each operation reads before it writes; a deferred read snapshot cannot wait
+    // for the writer, so these must reserve it up front like other lease writes.
+    assert!(
+        wait_out_transient_writer_contention(
+            &blocker_pool,
+            fixture
+                .store
+                .heartbeat_typed_workspace_actor(binding, /*progress*/ false),
+        )
+        .await,
+        "the typed actor lease renews after contention"
+    );
+    assert!(
+        wait_out_transient_writer_contention(
+            &blocker_pool,
+            fixture
+                .store
+                .heartbeat_validation_call(call.call_id.clone(), Utc::now()),
+        )
+        .await,
+        "the running validation lease renews after contention"
+    );
+    let quiescence = wait_out_transient_writer_contention(
+        &blocker_pool,
+        fixture.store.check_quiescence(root_session_id.to_string()),
+    )
+    .await;
+    assert_eq!(
+        quiescence.active_assignment_ids,
+        vec![assignment.assignment_id]
+    );
+    assert_eq!(quiescence.running_validation_call_ids, vec![call.call_id]);
+    blocker_pool.close().await;
+}
+
+#[tokio::test]
+async fn upgrade_reclaims_retired_pages_and_drops_duplicate_wake_indexes() {
+    let codex_home = TempDir::new().expect("codex home tempdir");
+    let repo = TempDir::new().expect("repository tempdir");
+    let state = StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("state runtime initializes");
+    let coordination_root = state.codex_home().join("agent-task-coordination");
+    tokio::fs::create_dir_all(&coordination_root)
+        .await
+        .expect("coordination directory creates");
+    let predecessor_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(coordination_root.join("agent_tasks.sqlite"))
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("predecessor database opens");
+    task_store_migrator_through(20)
+        .run(&predecessor_pool)
+        .await
+        .expect("prior schema applies");
+    // Dropped tables leave their pages on the freelist while auto_vacuum is off.
+    sqlx::raw_sql(
+        "CREATE TABLE retired_payloads (payload BLOB NOT NULL);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
+         INSERT INTO retired_payloads SELECT zeroblob(65536) FROM n;
+         DROP TABLE retired_payloads;",
+    )
+    .execute(&predecessor_pool)
+    .await
+    .expect("retired payload pages are freed");
+    let retired_pages = sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+        .fetch_one(&predecessor_pool)
+        .await
+        .expect("predecessor freelist reads");
+    assert!(retired_pages > 0, "the predecessor retains freed pages");
+    predecessor_pool.close().await;
+
+    let store = LocalAgentTaskStore::initialize(&state)
+        .await
+        .expect("production initializer upgrades the predecessor database");
+    let fixture = Fixture {
+        _codex_home: codex_home,
+        repo,
+        state,
+        store,
+    };
+    let pool = coordination_pool(&fixture).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+            .fetch_one(&pool)
+            .await
+            .expect("upgraded freelist reads"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index'
+               AND name IN ('observations_wake_idx', 'wake_events_root_sequence_idx')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("index names read"),
+        Vec::<String>::new(),
+        "unique constraint indexes already cover (root_session_id, wake_sequence)"
+    );
+    pool.close().await;
+    fixture.store.close().await;
 }
 
 #[tokio::test]
@@ -4340,7 +4530,7 @@ async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
             comparison_now,
             fixture
                 .store
-                .heartbeat_typed_workspace_actor(binding.clone()),
+                .heartbeat_typed_workspace_actor(binding.clone(), /*progress*/ false),
         )
         .await
         .expect("typed heartbeat")
@@ -4350,7 +4540,9 @@ async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
     assert!(
         !crate::local::with_test_comparison_now(
             comparison_now,
-            fixture.store.heartbeat_typed_workspace_actor(mismatched),
+            fixture
+                .store
+                .heartbeat_typed_workspace_actor(mismatched, /*progress*/ false),
         )
         .await
         .expect("mismatched heartbeat is rejected")
@@ -4368,11 +4560,97 @@ async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
     assert!(
         !crate::local::with_test_comparison_now(
             comparison_now,
-            fixture.store.heartbeat_typed_workspace_actor(binding),
+            fixture
+                .store
+                .heartbeat_typed_workspace_actor(binding, /*progress*/ false),
         )
         .await
         .expect("sealed heartbeat is rejected")
     );
+}
+
+#[tokio::test]
+async fn progress_heartbeat_defers_nonproductive_recovery_but_liveness_does_not() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "progress-heartbeat-root";
+    let pool = coordination_pool(&fixture).await;
+    let stale = serde_json::to_string(&(Utc::now() - Duration::minutes(10)))
+        .expect("stale timestamp serializes");
+    let mut bindings = Vec::new();
+    for scope in ["src/productive", "src/idle"] {
+        let (assignment, attempt) = fixture
+            .store
+            .create_assignment(fixture.repo.path(), worker_draft(root_session_id, scope))
+            .await
+            .expect("worker assignment");
+        bindings.push(
+            bind_test_agent(
+                &fixture.store,
+                assignment.assignment_id,
+                attempt.attempt_id,
+                root_session_id,
+            )
+            .await,
+        );
+        // Both actors last progressed, and spent their one nudge, long ago.
+        sqlx::query(
+            "UPDATE workspace_actors SET last_progress_at = ?, nudge_sent_at = ?
+             WHERE attempt_id = ?",
+        )
+        .bind(&stale)
+        .bind(&stale)
+        .bind(attempt.attempt_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("stale progress persists");
+    }
+    pool.close().await;
+    let (productive, idle) = (&bindings[0], &bindings[1]);
+
+    assert!(
+        fixture
+            .store
+            .heartbeat_typed_workspace_actor(productive.clone(), /*progress*/ true)
+            .await
+            .expect("progress heartbeat")
+    );
+    assert!(
+        fixture
+            .store
+            .heartbeat_typed_workspace_actor(idle.clone(), /*progress*/ false)
+            .await
+            .expect("liveness heartbeat")
+    );
+    let productive_task = fixture
+        .store
+        .get_agent_task(productive.assignment_id, Some(0))
+        .await
+        .expect("productive task reads");
+    assert_eq!(productive_task.workspace_status.nudge_sent_at, None);
+    let idle_task = fixture
+        .store
+        .get_agent_task(idle.assignment_id, Some(0))
+        .await
+        .expect("idle task reads");
+    assert!(idle_task.workspace_status.nudge_sent_at.is_some());
+
+    let no_progress_before = Utc::now() - Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS);
+    assert_eq!(
+        fixture
+            .store
+            .recover_nonproductive_assignment(productive.assignment_id, no_progress_before)
+            .await
+            .expect("productive recovery evaluates"),
+        NonproductiveRecovery::NotEligible
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .recover_nonproductive_assignment(idle.assignment_id, no_progress_before)
+            .await
+            .expect("idle recovery evaluates"),
+        NonproductiveRecovery::Recovered { .. }
+    ));
 }
 
 #[tokio::test]

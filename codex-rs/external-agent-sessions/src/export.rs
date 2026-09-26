@@ -26,12 +26,12 @@ const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 #[cfg(test)]
 fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
     Ok(load_session_for_import_with_content_sha256(path)?
-        .map(|(session, _content_sha256, _source_modified_at)| session))
+        .map(|(session, _content_sha256)| session))
 }
 
 pub(crate) fn load_session_for_import_with_content_sha256(
     path: &Path,
-) -> io::Result<Option<(ImportedExternalAgentSession, String, Option<i64>)>> {
+) -> io::Result<Option<(ImportedExternalAgentSession, String)>> {
     let parsed = read_session_import(path)?;
     let Some(cwd) = parsed.cwd else {
         return Ok(None);
@@ -65,7 +65,6 @@ pub(crate) fn load_session_for_import_with_content_sha256(
             rollout_items,
         },
         parsed.content_sha256,
-        parsed.source_modified_at,
     )))
 }
 

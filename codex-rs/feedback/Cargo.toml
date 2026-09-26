@@ -9,8 +9,10 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-protocol = { workspace = true }
+http = { workspace = true }
 mime_guess = { workspace = true }
 sentry = { workspace = true }
 tempfile = { workspace = true }

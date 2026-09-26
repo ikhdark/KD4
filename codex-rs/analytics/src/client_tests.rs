@@ -627,6 +627,46 @@ fn ignored_notifications_are_not_enqueued() {
 }
 
 #[test]
+fn tool_item_notifications_are_queued_without_output_payloads() {
+    let (client, mut receiver) = client_with_receiver();
+    for item in crate::analytics_client_tests::tool_items_with_output_payloads() {
+        let item_id = item.id().to_string();
+        client.track_notification(&ServerNotification::ItemStarted(
+            codex_app_server_protocol::ItemStartedNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                started_at_ms: 1,
+                item: item.clone(),
+            },
+        ));
+        client.track_notification(&ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                completed_at_ms: 2,
+                item,
+            },
+        ));
+        for expected_method in ["item/started", "item/completed"] {
+            let Ok(AnalyticsFact::Notification(notification)) = receiver.try_recv() else {
+                panic!("{expected_method} for {item_id} should be queued");
+            };
+            let queued = serde_json::to_value(notification.as_ref()).expect("serialize fact");
+            assert_eq!(queued["method"], expected_method);
+            assert_eq!(queued["params"]["threadId"], "thread");
+            assert_eq!(queued["params"]["turnId"], "turn");
+            assert_eq!(queued["params"]["item"]["id"], item_id.as_str());
+            // Each source item carries about a megabyte of output payload.
+            assert!(
+                queued.to_string().len() < 2048,
+                "queued {expected_method} for {item_id} retained output payloads"
+            );
+        }
+    }
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[test]
 fn usage_deduplication_survives_queue_overflow_and_capacity_duplicates() {
     use crate::analytics_client_tests::sample_plugin_metadata;
     use crate::analytics_client_tests::test_tracking_context;

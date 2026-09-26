@@ -291,11 +291,10 @@ fn hook_output_path(output_dir: &AbsolutePathBuf, thread_id: ThreadId) -> Absolu
 /// does not let the preview grow past the hook-output limit.
 fn spilled_hook_output_preview(text: &str, path: &AbsolutePathBuf) -> String {
     let footer = format!("\n\nFull hook output saved to: {}", path.display());
-    // The formatter adds a warning and omission marker outside its text budget.
-    let formatting_tokens =
-        approx_token_count(&formatted_truncate_text(text, TruncationPolicy::Tokens(0)));
+    // A token policy keeps the formatter's warning and omission markers inside
+    // its budget, so only the footer needs to be reserved.
     let preview_policy = TruncationPolicy::Tokens(
-        HOOK_OUTPUT_TOKEN_LIMIT.saturating_sub(approx_token_count(&footer) + formatting_tokens + 1),
+        HOOK_OUTPUT_TOKEN_LIMIT.saturating_sub(approx_token_count(&footer) + 1),
     );
     format!("{}{footer}", formatted_truncate_text(text, preview_policy))
 }

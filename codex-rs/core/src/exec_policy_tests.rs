@@ -455,6 +455,43 @@ host_executable(name = "git", paths = ["{git_path_literal}"])
 }
 
 #[tokio::test]
+async fn loads_symlinked_policy_files_and_their_amendments() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let policy_dir = temp_dir.path().join(RULES_DIR_NAME);
+    let shared_dir = temp_dir.path().join("shared");
+    fs::create_dir_all(&policy_dir)?;
+    fs::create_dir_all(&shared_dir)?;
+    let target = shared_dir.join("policy.rules");
+    fs::write(
+        &target,
+        r#"prefix_rule(pattern=["rm"], decision="forbidden")
+"#,
+    )?;
+    let link = policy_dir.join(DEFAULT_POLICY_FILE);
+    let dangling = policy_dir.join("missing.rules");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, &link)?;
+        std::os::unix::fs::symlink(shared_dir.join("missing"), &dangling)?;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(&target, &link)?;
+        std::os::windows::fs::symlink_file(shared_dir.join("missing"), &dangling)?;
+    }
+    blocking_append_allow_prefix_rule(&link, &["echo".to_string()])?;
+    assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
+
+    let policy = load_exec_policy(&config_stack_for_dot_codex_folder(temp_dir.path())).await?;
+    for (command, expected) in [("rm", Decision::Forbidden), ("echo", Decision::Allow)] {
+        let evaluation = policy.check(&[command.to_string()], &|_| Decision::Prompt);
+        assert_eq!(evaluation.decision, expected, "{command}");
+        assert!(evaluation.is_match(), "{command}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn ignores_policies_outside_policy_dir() {
     let temp_dir = tempdir().expect("create temp dir");
     let config_stack = config_stack_for_dot_codex_folder(temp_dir.path());

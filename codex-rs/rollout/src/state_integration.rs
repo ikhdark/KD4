@@ -37,6 +37,11 @@ pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS: usize = 8;
+// The startup bound caps each backfill run, so its lease must outlive one bounded run.
+const _: () = assert!(
+    metadata::BACKFILL_LEASE_SECONDS as u64 > STARTUP_BACKFILL_WAIT_TIMEOUT.as_secs(),
+    "a backfill lease must outlive the startup bound that limits each run"
+);
 
 /// Initialize the state runtime for thread state persistence.
 ///
@@ -84,6 +89,8 @@ async fn try_init_with_roots(
         sqlite_home,
         default_model_provider_id,
         /*backfill_lease_seconds*/ None,
+        STARTUP_BACKFILL_WAIT_TIMEOUT,
+        STARTUP_BACKFILL_POLL_INTERVAL,
     )
     .await
 }
@@ -94,12 +101,16 @@ async fn try_init_with_roots_and_backfill_lease(
     sqlite_home: PathBuf,
     default_model_provider_id: String,
     backfill_lease_seconds: i64,
+    wait_timeout: Duration,
+    poll_interval: Duration,
 ) -> anyhow::Result<StateDbHandle> {
     try_init_with_roots_inner(
         codex_home,
         sqlite_home,
         default_model_provider_id,
         Some(backfill_lease_seconds),
+        wait_timeout,
+        poll_interval,
     )
     .await
 }
@@ -109,6 +120,8 @@ async fn try_init_with_roots_inner(
     sqlite_home: PathBuf,
     default_model_provider_id: String,
     backfill_lease_seconds: Option<i64>,
+    wait_timeout: Duration,
+    poll_interval: Duration,
 ) -> anyhow::Result<StateDbHandle> {
     let runtime =
         codex_state::StateRuntime::init(sqlite_home.clone(), default_model_provider_id.clone())
@@ -122,11 +135,14 @@ async fn try_init_with_roots_inner(
     let backfill_gate_started = Instant::now();
     let backfill_gate_result = wait_for_backfill_gate_with_timeout(
         codex_home.as_path(),
+        wait_timeout,
         wait_for_backfill_gate(
             runtime.as_ref(),
             codex_home.as_path(),
             default_model_provider_id.as_str(),
             backfill_lease_seconds,
+            wait_timeout,
+            poll_interval,
         ),
     )
     .await;
@@ -144,14 +160,15 @@ async fn try_init_with_roots_inner(
 
 async fn wait_for_backfill_gate_with_timeout(
     codex_home: &Path,
+    wait_timeout: Duration,
     wait: impl std::future::Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    match tokio::time::timeout(STARTUP_BACKFILL_WAIT_TIMEOUT, wait).await {
+    match tokio::time::timeout(wait_timeout, wait).await {
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!(
             "timed out waiting for state db backfill at {} after {:?}",
             codex_home.display(),
-            STARTUP_BACKFILL_WAIT_TIMEOUT,
+            wait_timeout,
         )),
     }
 }
@@ -161,7 +178,15 @@ async fn wait_for_backfill_gate(
     codex_home: &Path,
     default_model_provider_id: &str,
     backfill_lease_seconds: Option<i64>,
+    wait_timeout: Duration,
+    poll_interval: Duration,
 ) -> anyhow::Result<()> {
+    // Stop this startup's own backfill before the outer bound cancels it, leaving time to
+    // checkpoint and release the claim. A cancelled claim would make every later startup
+    // wait out its bound and fail until the lease expired.
+    let backfill_stop_at =
+        tokio::time::Instant::now() + wait_timeout.saturating_sub(wait_timeout / 6);
+    let backfill_lease_seconds = backfill_lease_seconds.unwrap_or(metadata::BACKFILL_LEASE_SECONDS);
     let mut reported_wait = false;
     loop {
         let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
@@ -174,17 +199,14 @@ async fn wait_for_backfill_gate(
             return Ok(());
         }
 
-        if let Some(backfill_lease_seconds) = backfill_lease_seconds {
-            metadata::backfill_sessions_with_lease(
-                runtime,
-                codex_home,
-                default_model_provider_id,
-                backfill_lease_seconds,
-            )
-            .await;
-        } else {
-            metadata::backfill_sessions(runtime, codex_home, default_model_provider_id).await;
-        }
+        metadata::backfill_sessions_until(
+            runtime,
+            codex_home,
+            default_model_provider_id,
+            backfill_lease_seconds,
+            || tokio::time::Instant::now() >= backfill_stop_at,
+        )
+        .await;
         let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
             anyhow::anyhow!(
                 "failed to read backfill state at {} after startup backfill: {err}",
@@ -204,7 +226,7 @@ async fn wait_for_backfill_gate(
             "state db backfill is {} at {}; waiting up to {:?} before retrying startup initialization",
             backfill_state.status.as_str(),
             codex_home.display(),
-            STARTUP_BACKFILL_WAIT_TIMEOUT,
+            wait_timeout,
         );
         if reported_wait {
             info!("{message}");
@@ -212,7 +234,7 @@ async fn wait_for_backfill_gate(
             emit_startup_warning(&message);
             reported_wait = true;
         }
-        tokio::time::sleep(STARTUP_BACKFILL_POLL_INTERVAL).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 

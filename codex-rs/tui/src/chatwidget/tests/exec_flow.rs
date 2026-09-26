@@ -1305,6 +1305,36 @@ async fn apply_patch_events_emit_history_cells() {
 }
 
 #[tokio::test]
+async fn file_change_approval_notification_does_not_claim_zero_files() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_notifications.notifications = Notifications::Enabled(true);
+
+    // App-server file-change approvals carry no change list; the files arrive on the item.
+    chat.handle_server_request(
+        ServerRequest::FileChangeRequestApproval {
+            request_id: AppServerRequestId::Integer(1),
+            params: FileChangeRequestApprovalParams {
+                thread_id: ThreadId::new().to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "patch-1".to_string(),
+                started_at_ms: 0,
+                reason: None,
+                grant_root: None,
+            },
+        },
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(
+        chat.pending_notification
+            .as_ref()
+            .map(Notification::display)
+            .as_deref(),
+        Some("Codex wants to edit files")
+    );
+}
+
+#[tokio::test]
 async fn apply_patch_manual_approval_adjusts_header() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

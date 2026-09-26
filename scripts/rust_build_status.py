@@ -1266,9 +1266,6 @@ def _direct_reserved_lane_command(
     elif recipe == "_core-gate-reserved" and arguments:
         profile = "fast"
         runner_arguments = ["run-gate", "--profile", profile, *arguments]
-    elif recipe == "_core-parity-reserved" and len(arguments) >= 2:
-        profile = "fast"
-        runner_arguments = ["parity", "--profile", profile, *arguments]
     if runner_arguments is not None:
         child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
         child_env["NEXTEST_PROFILE"] = profile
@@ -1492,13 +1489,10 @@ def cargo_build_context(
             "--no-default-features",
         ) or token.startswith("+"):
             options.append(token)
-    # Named core selectors also select their feature graph through the manifest.
-    named_selection = []
-    if len(command) >= 4 and Path(command[0]).stem.lower() == "just":
-        if command[1] == "_core-test-reserved":
-            named_selection = [command[1], command[3]]
-        elif command[1] in ("_core-gate-reserved", "_core-parity-reserved"):
-            named_selection = list(command[1:])
+    # Named core targets and gates deliberately share one lane: each package
+    # graph keeps its own feature-hashed artifacts there, so a different named
+    # selection is not a different build setting and must not rank that lane
+    # below a staler sibling.
     return {
         "version": 1,
         "environment": settings,
@@ -1506,7 +1500,6 @@ def cargo_build_context(
         "configs": configs,
         "packages": sorted(cargo_package_specs(command)),
         "options": options,
-        "namedSelection": named_selection,
     }
 
 

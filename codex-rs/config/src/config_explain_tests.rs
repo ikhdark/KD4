@@ -51,11 +51,15 @@ fn every_public_schema_option_has_exactly_one_explain_entry() {
 
 #[test]
 fn filters_config_reference_by_option_name() {
+    const UNRELATED_ENTRY: &str = "- model: Default model used for new turns.";
+    // The exclusion below only proves filtering if the unfiltered reference has the entry.
+    assert!(render_config_explain(None).contains(UNRELATED_ENTRY));
+
     let rendered = render_config_explain(Some("sandbox"));
 
     assert!(rendered.contains("sandbox_mode"));
     assert!(rendered.contains("sandbox_workspace_write"));
-    assert!(!rendered.contains("- model: Default model used for new turns."));
+    assert!(!rendered.contains(UNRELATED_ENTRY));
 }
 
 #[test]

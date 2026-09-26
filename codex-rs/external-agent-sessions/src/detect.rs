@@ -1,6 +1,6 @@
 use crate::ExternalAgentSessionMigration;
 use crate::ledger::load_import_ledger;
-use crate::ledger::record_current_source_refreshes;
+use crate::ledger::session_content_sha256;
 use crate::now_unix_seconds;
 use crate::summarize_session;
 use std::fs;
@@ -22,7 +22,7 @@ pub fn detect_recent_sessions(
 
     let now = now_unix_seconds();
     let ledger = load_import_ledger(codex_home)?;
-    let source_states = ledger.source_states();
+    let imported_hashes = ledger.imported_hashes_by_source();
     let mut file_candidates = Vec::new();
     for project_entry in fs::read_dir(projects_root)? {
         let Ok(project_entry) = project_entry else {
@@ -75,18 +75,14 @@ pub fn detect_recent_sessions(
         },
     );
     let mut migrations = Vec::new();
-    let mut source_refreshes = Vec::new();
     for (_modified_at, path, source_path) in file_candidates {
-        match source_states.get(source_path.as_path()).map_or(
-            Ok(None),
-            super::ledger::ImportedSourceState::current_source_refresh,
-        ) {
-            Ok(None) => {}
-            Ok(Some(refresh)) => {
-                source_refreshes.push(refresh);
-                continue;
+        // Content identity, not modification time, decides whether this version was imported.
+        if let Some(hashes) = imported_hashes.get(source_path.as_path()) {
+            match session_content_sha256(&source_path) {
+                Ok(content_sha256) if hashes.contains(content_sha256.as_str()) => continue,
+                Ok(_) => {}
+                Err(_) => continue,
             }
-            Err(_) => continue,
         }
         let Ok(Some(summary)) = summarize_session(&path) else {
             continue;
@@ -100,7 +96,6 @@ pub fn detect_recent_sessions(
             break;
         }
     }
-    record_current_source_refreshes(codex_home, source_refreshes)?;
 
     Ok(migrations)
 }
@@ -420,6 +415,34 @@ mod tests {
                 .expect("detect")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn detecting_an_imported_version_does_not_rewrite_the_ledger() {
+        let root = TempDir::new().expect("tempdir");
+        let external_agent_home = root.path().join(".external");
+        let project_root = root.path().join("repo");
+        let session_path = write_session(
+            &external_agent_home,
+            &project_root,
+            "session.jsonl",
+            &[record("user", "hello there", project_root.as_path())],
+        );
+        record_imported_session(root.path(), &session_path, ThreadId::new())
+            .expect("record import");
+        let ledger_path = root.path().join("external_agent_session_imports.json");
+        let ledger = std::fs::read(&ledger_path).expect("read ledger");
+        set_modified_at(
+            &session_path,
+            SystemTime::now() - Duration::from_secs(/*secs*/ 60),
+        );
+
+        assert!(
+            detect_recent_sessions(&external_agent_home, root.path())
+                .expect("detect")
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&ledger_path).expect("reread ledger"), ledger);
     }
 
     #[test]

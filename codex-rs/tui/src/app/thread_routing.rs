@@ -122,6 +122,37 @@ impl App {
         store.active_turn_id().map(ToOwned::to_owned)
     }
 
+    /// Interrupts the thread's cached active turn, or its startup work when no turn is cached.
+    ///
+    /// The cached turn id can trail the server. When the turn already completed there is nothing
+    /// left to interrupt; when review flows swapped the active turn, retry once with the
+    /// server-reported id. Lifecycle notifications still own the cached active turn id.
+    pub(super) async fn interrupt_thread_turn(
+        &self,
+        app_server: &mut AppServerSession,
+        thread_id: ThreadId,
+    ) -> std::result::Result<(), TypedRequestError> {
+        let Some(mut turn_id) = self.active_turn_id_for_thread(thread_id).await else {
+            return app_server.startup_interrupt(thread_id).await;
+        };
+        let mut retried_after_turn_mismatch = false;
+        loop {
+            let Err(error) = app_server.turn_interrupt(thread_id, turn_id.clone()).await else {
+                return Ok(());
+            };
+            match active_turn_interrupt_race(&error) {
+                Some(ActiveTurnInterruptRace::Finished) => return Ok(()),
+                Some(ActiveTurnInterruptRace::ExpectedTurnMismatch { actual_turn_id })
+                    if !retried_after_turn_mismatch && actual_turn_id != turn_id =>
+                {
+                    turn_id = actual_turn_id;
+                    retried_after_turn_mismatch = true;
+                }
+                _ => return Err(error),
+            }
+        }
+    }
+
     pub(super) fn thread_label(&self, thread_id: ThreadId) -> String {
         let is_primary = self.primary_thread_id == Some(thread_id);
         let fallback_label = if is_primary {
@@ -515,41 +546,9 @@ impl App {
     ) -> Result<bool> {
         match op {
             AppCommand::Interrupt { .. } => {
-                if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
-                    let mut interrupt_turn_id = turn_id;
-                    for retried_after_turn_mismatch in [false, true] {
-                        match app_server
-                            .turn_interrupt(thread_id, interrupt_turn_id.clone())
-                            .await
-                        {
-                            Ok(()) => return Ok(true),
-                            Err(error) if !retried_after_turn_mismatch => {
-                                let Some(actual_turn_id) = active_turn_interrupt_race(&error)
-                                else {
-                                    return Err(error).wrap_err("turn/interrupt failed in TUI");
-                                };
-                                if actual_turn_id == interrupt_turn_id {
-                                    return Err(error).wrap_err("turn/interrupt failed in TUI");
-                                }
-                                // Review flows can swap the active turn before the TUI processes
-                                // the corresponding notification. Retry once with the
-                                // server-reported turn id so Ctrl+C/Esc do not fatally exit on that
-                                // stale cache, but let lifecycle notifications own the cached
-                                // active turn id.
-                                interrupt_turn_id = actual_turn_id;
-                            }
-                            Err(error) => {
-                                return Err(error).wrap_err("turn/interrupt failed in TUI");
-                            }
-                        }
-                    }
-                    unreachable!("interrupt retry loop should return");
-                } else {
-                    app_server
-                        .startup_interrupt(thread_id)
-                        .await
-                        .wrap_err("turn/interrupt failed in TUI")?;
-                }
+                self.interrupt_thread_turn(app_server, thread_id)
+                    .await
+                    .wrap_err("turn/interrupt failed in TUI")?;
                 Ok(true)
             }
             AppCommand::UserTurn {
@@ -612,6 +611,7 @@ impl App {
                                         }
                                         steer_turn_id = actual_turn_id;
                                         retried_after_turn_mismatch = true;
+                                        continue;
                                     }
                                     Some(ActiveTurnSteerRace::ExpectedTurnMismatch {
                                         actual_turn_id,
@@ -622,15 +622,31 @@ impl App {
                                             let mut store = channel.store.lock().await;
                                             store.active_turn_id = Some(actual_turn_id);
                                         }
-                                        return Err(error.into());
                                     }
-                                    None => return Err(error.into()),
+                                    None => {}
                                 }
+                                // The refused input never reached the turn, which keeps running;
+                                // failing the submission would end that turn in the UI.
+                                self.chat_widget.on_steer_refused(
+                                    items,
+                                    format!(
+                                        "{:#}",
+                                        color_eyre::eyre::Report::new(error)
+                                            .wrap_err("turn/steer failed in TUI")
+                                    ),
+                                );
+                                return Ok(true);
                             }
                         }
                     }
                 }
                 if should_start_turn {
+                    let is_widget_thread = self.active_thread_id == Some(thread_id)
+                        && self.chat_widget.thread_id() == Some(thread_id);
+                    // The widget steers while it believes a turn is running. Reaching a start
+                    // means that turn already ended on the server, so the steer opens a new turn.
+                    let started_from_steer =
+                        is_widget_thread && self.chat_widget.has_pending_steer(items);
                     let config = self.chat_widget.config_ref();
                     let permissions_override = Self::turn_permissions_override_from_config(
                         config,
@@ -639,7 +655,7 @@ impl App {
                             .as_ref()
                             .map(|profile| &profile.permission_profile),
                     );
-                    let response = app_server
+                    let response = match app_server
                         .turn_start(
                             thread_id,
                             items.to_vec(),
@@ -655,10 +671,21 @@ impl App {
                             *personality,
                             final_output_json_schema.clone(),
                         )
-                        .await?;
-                    if self.active_thread_id == Some(thread_id)
-                        && self.chat_widget.thread_id() == Some(thread_id)
+                        .await
                     {
+                        Ok(response) => response,
+                        // The steered turn still reports its own end. Refusing only the input
+                        // keeps it for the next turn instead of ending that turn in the UI.
+                        Err(err) if started_from_steer => {
+                            self.chat_widget.on_steer_refused(items, format!("{err:#}"));
+                            return Ok(true);
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if is_widget_thread {
+                        if started_from_steer {
+                            self.chat_widget.on_steer_started_turn(items);
+                        }
                         self.chat_widget
                             .record_safety_buffering_turn(response.turn.id, op);
                     }
@@ -807,10 +834,12 @@ impl App {
                 Ok(true)
             }
             Err(err) => {
+                // The pending request was consumed; report the failure once instead of also
+                // falling through to the unsupported-operation path.
                 self.chat_widget.add_error_message(format!(
                     "Failed to resolve app-server request for thread {thread_id}: {err}"
                 ));
-                Ok(false)
+                Ok(true)
             }
         }
     }

@@ -14,6 +14,8 @@ use nucleo::Utf32String;
 use nucleo::pattern::CaseMatching;
 use nucleo::pattern::Normalization;
 use serde::Serialize;
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs;
 use std::num::NonZero;
 use std::path::Path;
@@ -28,6 +30,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 use nucleo::Utf32Str;
@@ -59,12 +62,11 @@ const FILE_SEARCH_WALK_LIMITS: FileSearchWalkLimits = FileSearchWalkLimits {
 /// * `path`  – Path to the matched entry (file or directory), relative to the
 ///   search directory.
 /// * `match_type` – Whether this match is a file or directory.
-/// * `indices` – Optional list of character indices that matched the query.
-///   These are only filled when the caller of [`run`] sets
-///   `options.compute_indices` to `true`. The indices vector follows the
-///   guidance from `nucleo::pattern::Pattern::indices`: they are
-///   unique and sorted in ascending order so that callers can use
-///   them directly for highlighting.
+/// * `indices` – Optional list of character indices into `path` that matched
+///   the query. These are only filled when the caller of [`run`] sets
+///   `options.compute_indices` to `true`. They are unique and sorted in
+///   ascending order so that callers can use them directly for highlighting.
+///   A matched multi-character grapheme contributes all of its characters.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FileMatch {
     pub score: u32,
@@ -426,7 +428,8 @@ fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(
 /// containing `*`) to silently suppress every file in the walk.
 ///
 /// When `respect_gitignore` is `false`, all git-related ignore processing is
-/// disabled regardless of this flag.
+/// disabled regardless of this flag. Version-control metadata directories are
+/// never walked.
 fn walker_worker(
     inner: Arc<SessionInner>,
     override_matcher: Option<ignore::overrides::Override>,
@@ -438,7 +441,24 @@ fn walker_worker(
             .send(WorkSignal::WalkComplete { complete: false });
         return;
     }
-    let Some(first_root) = inner.search_directories.first() else {
+    // Walk each distinct root once. A root nested in another root is walked as
+    // its own root and skipped by the enclosing walk, so no path is indexed twice.
+    let mut walk_roots = Vec::<&PathBuf>::new();
+    for root in &inner.search_directories {
+        if !walk_roots.contains(&root) {
+            walk_roots.push(root);
+        }
+    }
+    let nested_roots = walk_roots
+        .iter()
+        .filter(|root| {
+            walk_roots
+                .iter()
+                .any(|other| root != &other && root.starts_with(other))
+        })
+        .map(|root| (*root).clone())
+        .collect::<Vec<_>>();
+    let Some((first_root, other_roots)) = walk_roots.split_first() else {
         let _ = inner
             .work_tx
             .send(WorkSignal::WalkComplete { complete: true });
@@ -446,7 +466,7 @@ fn walker_worker(
     };
 
     let mut walk_builder = WalkBuilder::new(first_root);
-    for root in inner.search_directories.iter().skip(1) {
+    for root in other_roots {
         walk_builder.add(root);
     }
     let canonical_search_directories = inner
@@ -482,9 +502,18 @@ fn walker_worker(
                 // Yield one entry so the outer loop can stop the walker.
                 return true;
             }
+            if entry.depth() > 0 && is_vcs_metadata(entry.file_name()) {
+                return false;
+            }
             let is_directory = entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir());
+            if entry.depth() > 0
+                && is_directory
+                && nested_roots.iter().any(|root| root == entry.path())
+            {
+                return false;
+            }
             let max_entry_depth = walk_limits
                 .max_depth
                 .saturating_add(usize::from(!is_directory));
@@ -551,6 +580,8 @@ fn walker_worker(
         }
         let path = entry.path();
         let Some(full_path) = path.to_str() else {
+            // The matcher indexes UTF-8 text; this entry cannot be searched.
+            walk_complete.store(false, Ordering::Relaxed);
             continue;
         };
         if let Some((_, relative_path)) = get_file_path(path, &inner.search_directories) {
@@ -565,7 +596,7 @@ fn walker_worker(
                     match_type,
                 },
                 |_, cols| {
-                    cols[0] = Utf32String::from(relative_path);
+                    cols[0] = Utf32String::from(&*match_text(relative_path));
                 },
             );
         }
@@ -576,6 +607,66 @@ fn walker_worker(
             && !inner.cancelled.load(Ordering::Relaxed)
             && !inner.shutdown.load(Ordering::Relaxed),
     });
+}
+
+/// Maps sorted nucleo match positions to the character positions documented
+/// on [`FileMatch::indices`].
+///
+/// nucleo indexes non-ASCII haystacks by extended grapheme cluster, so each
+/// matched cluster expands to every character it contains.
+fn grapheme_indices_to_char_indices(haystack: &str, grapheme_indices: &[u32]) -> Vec<u32> {
+    let mut char_indices = Vec::with_capacity(grapheme_indices.len());
+    let mut remaining = grapheme_indices.iter().copied().peekable();
+    let mut char_start = 0u32;
+    for (grapheme_index, grapheme) in (0u32..).zip(haystack.graphemes(/*is_extended*/ true)) {
+        let Some(&next) = remaining.peek() else {
+            break;
+        };
+        let char_count = grapheme.chars().count() as u32;
+        if next == grapheme_index {
+            remaining.next();
+            char_indices.extend(char_start..char_start + char_count);
+        }
+        char_start += char_count;
+    }
+    char_indices
+}
+
+/// Text the matcher indexes for a relative path. Windows paths are indexed
+/// with `/` separators so that queries typed with either separator match; the
+/// one-for-one replacement keeps match indices valid for the native path.
+fn match_text(relative_path: &str) -> Cow<'_, str> {
+    if cfg!(windows) && relative_path.contains('\\') {
+        Cow::Owned(relative_path.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(relative_path)
+    }
+}
+
+/// Rewrites Windows path separators in a query to the `/` that [`match_text`]
+/// indexes. A backslash before a character the pattern syntax can escape
+/// (space, `!`, `^`, `'`, `$`) keeps its escape meaning.
+fn match_query(query: &str) -> Cow<'_, str> {
+    if !cfg!(windows) || !query.contains('\\') {
+        return Cow::Borrowed(query);
+    }
+    let mut normalized = String::with_capacity(query.len());
+    let mut chars = query.chars().peekable();
+    while let Some(c) = chars.next() {
+        let escapes = matches!(chars.peek(), Some(' ' | '!' | '^' | '\'' | '$'));
+        normalized.push(if c == '\\' && !escapes { '/' } else { c });
+    }
+    Cow::Owned(normalized)
+}
+
+/// Version-control metadata is never a useful result, and a `.git` directory
+/// alone can hold more entries than the walk budget, starving the worktree.
+const VCS_METADATA_NAMES: [&str; 4] = [".git", ".hg", ".jj", ".svn"];
+
+fn is_vcs_metadata(name: &OsStr) -> bool {
+    VCS_METADATA_NAMES
+        .iter()
+        .any(|metadata_name| name.eq_ignore_ascii_case(metadata_name))
 }
 
 fn reserve_walk_slot(counter: &AtomicUsize, limit: usize) -> bool {
@@ -617,10 +708,13 @@ fn matcher_worker(
                 match signal {
                     WorkSignal::QueryUpdated => {
                         let query = inner.latest_query.read_for_worker();
-                        let append = last_query.as_ref().is_some_and(|last| query.starts_with(last));
+                        let pattern_text = match_query(&query);
+                        let append = last_query
+                            .as_ref()
+                            .is_some_and(|last| pattern_text.starts_with(&*match_query(last)));
                         nucleo.pattern.reparse(
                             0,
-                            &query,
+                            &pattern_text,
                             CaseMatching::Ignore,
                             Normalization::Smart,
                             append,
@@ -678,6 +772,9 @@ fn matcher_worker(
                                 let _ = pattern.indices(haystack, indices_matcher, &mut idx_vec);
                                 idx_vec.sort_unstable();
                                 idx_vec.dedup();
+                                if !haystack.is_ascii() {
+                                    idx_vec = grapheme_indices_to_char_indices(relative_path, &idx_vec);
+                                }
                                 Some(idx_vec)
                             } else {
                                 None
@@ -1070,6 +1167,100 @@ mod tests {
                 .contains(&entry_snapshot.matches[0].path.as_path())
         );
         assert!(!entry_snapshot.walk_complete);
+    }
+
+    #[test]
+    fn vcs_metadata_does_not_consume_the_walk_budget() {
+        let root = tempfile::tempdir().unwrap();
+        // `.git` sorts before the worktree and can exceed the entry budget.
+        let objects = root.path().join(".git").join("objects");
+        fs::create_dir_all(&objects).unwrap();
+        for index in 0..8 {
+            fs::write(objects.join(format!("needle-object-{index}")), "blob").unwrap();
+        }
+        let nested_svn = root.path().join("vendor").join(".SVN");
+        fs::create_dir_all(&nested_svn).unwrap();
+        fs::write(nested_svn.join("needle-entries"), "svn").unwrap();
+        fs::write(root.path().join("src-needle.rs"), "fn main() {}").unwrap();
+
+        let snapshot = run_with_walk_limits(
+            "needle",
+            vec![root.path().to_path_buf()],
+            FileSearchWalkLimits {
+                max_depth: FILE_SEARCH_MAX_WALK_DEPTH,
+                max_directories: FILE_SEARCH_MAX_WALK_DIRECTORIES,
+                max_entries: 3,
+            },
+        );
+
+        assert_eq!(
+            snapshot
+                .matches
+                .iter()
+                .map(|file_match| file_match.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("src-needle.rs")]
+        );
+        assert!(snapshot.walk_complete);
+    }
+
+    #[test]
+    fn overlapping_roots_index_each_path_once() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(root.path().join("outer-needle.txt"), "outer").unwrap();
+        fs::write(nested.join("inner-needle.txt"), "inner").unwrap();
+
+        let results = run(
+            "needle",
+            vec![
+                root.path().to_path_buf(),
+                nested.clone(),
+                root.path().to_path_buf(),
+            ],
+            FileSearchOptions::default(),
+            /*cancel_flag*/ None,
+        )
+        .unwrap();
+
+        let mut found = results
+            .matches
+            .into_iter()
+            .map(|file_match| (file_match.root, file_match.path))
+            .collect::<Vec<_>>();
+        found.sort();
+        let mut expected = vec![
+            (root.path().to_path_buf(), PathBuf::from("outer-needle.txt")),
+            (nested, PathBuf::from("inner-needle.txt")),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(results.total_match_count, 2);
+        assert!(results.walk_complete);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unrepresentable_entry_marks_the_walk_incomplete() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("needle-text.txt"), "text").unwrap();
+        // An unpaired surrogate is a valid NTFS name but not UTF-8 text.
+        let name = std::ffi::OsString::from_wide(&[0x6e, 0x65, 0xD800]);
+        fs::write(root.path().join(name), "unsearchable").unwrap();
+
+        let results = run(
+            "needle",
+            vec![root.path().to_path_buf()],
+            FileSearchOptions::default(),
+            /*cancel_flag*/ None,
+        )
+        .unwrap();
+
+        assert_eq!(results.matches.len(), 1);
+        assert!(!results.walk_complete);
     }
 
     #[test]
@@ -1557,6 +1748,97 @@ mod tests {
             m.path == std::path::Path::new("docs").join("guides")
                 && m.match_type == MatchType::Directory
         }));
+    }
+
+    #[test]
+    fn match_indices_are_character_positions_for_multi_character_graphemes() {
+        let dir = tempfile::tempdir().unwrap();
+        // "e\u{301}" is one grapheme made of two characters.
+        let expected = [
+            ("e\u{301}-needle.txt", "needle"),
+            ("ne\u{301}edle.txt", "ne\u{301}edle"),
+        ];
+        for (name, _) in expected {
+            fs::write(dir.path().join(name), "contents").unwrap();
+        }
+
+        let results = run(
+            "needle",
+            vec![dir.path().to_path_buf()],
+            FileSearchOptions {
+                compute_indices: true,
+                ..Default::default()
+            },
+            /*cancel_flag*/ None,
+        )
+        .unwrap();
+
+        for (name, highlighted) in expected {
+            let file_match = results
+                .matches
+                .iter()
+                .find(|file_match| file_match.path == Path::new(name))
+                .unwrap();
+            let chars = name.chars().collect::<Vec<_>>();
+            let actual = file_match
+                .indices
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|index| chars[*index as usize])
+                .collect::<String>();
+            assert_eq!(actual, highlighted, "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queries_match_windows_paths_with_either_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src").join("nested")).unwrap();
+        fs::write(
+            dir.path().join("src").join("nested").join("main-file.rs"),
+            "fn main() {}",
+        )
+        .unwrap();
+        fs::write(dir.path().join("needle file.txt"), "spaced").unwrap();
+        let search = |query: &str| {
+            run(
+                query,
+                vec![dir.path().to_path_buf()],
+                FileSearchOptions {
+                    compute_indices: true,
+                    ..Default::default()
+                },
+                /*cancel_flag*/ None,
+            )
+            .unwrap()
+            .matches
+        };
+
+        let native_path = Path::new("src").join("nested").join("main-file.rs");
+        for query in ["src/nested/main", "src\\nested\\main"] {
+            let matches = search(query);
+            let file_match = matches
+                .iter()
+                .find(|file_match| file_match.path == native_path)
+                .unwrap_or_else(|| panic!("{query} must match {}", native_path.display()));
+            let chars = native_path.to_str().unwrap().chars().collect::<Vec<_>>();
+            let highlighted = file_match
+                .indices
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|index| chars[*index as usize])
+                .collect::<String>();
+            assert_eq!(highlighted, "src\\nested\\main", "{query}");
+        }
+        // A backslash before a space still escapes it instead of separating.
+        assert!(
+            search("needle\\ file")
+                .iter()
+                .any(|file_match| file_match.path == Path::new("needle file.txt"))
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -123,22 +124,6 @@ async fn expect_skills_changed_notification(
     let notification: SkillsChangedNotification = serde_json::from_value(params)?;
     assert_eq!(notification, SkillsChangedNotification {});
     Ok(())
-}
-
-fn write_plugins_enabled_config_with_base_url(
-    codex_home: &std::path::Path,
-    base_url: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"chatgpt_base_url = "{base_url}"
-
-[features]
-plugins = true
-"#,
-        ),
-    )
 }
 
 fn write_plugin_with_skill(

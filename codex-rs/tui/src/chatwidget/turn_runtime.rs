@@ -204,7 +204,7 @@ impl ChatWidget {
         }
         self.request_redraw();
 
-        let had_pending_steers = !self.input_queue.pending_steers.is_empty();
+        let had_pending_steers = self.input_queue.has_uncommitted_steers();
         self.refresh_pending_input_preview();
 
         if !from_replay && !self.has_queued_follow_up_messages() && !had_pending_steers {

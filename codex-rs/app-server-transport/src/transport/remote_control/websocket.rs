@@ -704,6 +704,7 @@ impl RemoteControlWebsocket {
             return true;
         };
 
+        let mut retry_attempt = 0;
         loop {
             if !matches!(
                 *self.desired_state_rx.borrow(),
@@ -718,7 +719,10 @@ impl RemoteControlWebsocket {
                         error = %err,
                         "waiting to resolve remote control preference until authentication is available"
                     );
-                    if !self.wait_for_preference_resolution_retry().await {
+                    if !self
+                        .wait_for_preference_resolution_retry(&mut retry_attempt)
+                        .await
+                    {
                         return false;
                     }
                     continue;
@@ -740,7 +744,10 @@ impl RemoteControlWebsocket {
                         "failed to resolve persisted remote control preference; retrying"
                     );
                     drop(current_enrollment);
-                    if !self.wait_for_preference_resolution_retry().await {
+                    if !self
+                        .wait_for_preference_resolution_retry(&mut retry_attempt)
+                        .await
+                    {
                         return false;
                     }
                     continue;
@@ -773,11 +780,19 @@ impl RemoteControlWebsocket {
         });
     }
 
-    async fn wait_for_preference_resolution_retry(&mut self) -> bool {
+    /// Auth published by this process retries at once. The capped backoff still
+    /// notices credentials written elsewhere, as the connect loop does, without
+    /// reloading auth every second for a session that never signs in.
+    async fn wait_for_preference_resolution_retry(&mut self, retry_attempt: &mut u64) -> bool {
+        let retry_delay = next_reconnect_delay(retry_attempt);
         tokio::select! {
             _ = self.shutdown_token.cancelled() => false,
             changed = self.desired_state_rx.changed() => changed.is_ok(),
-            _ = tokio::time::sleep(REMOTE_CONTROL_ACCOUNT_ID_RETRY_INTERVAL) => true,
+            changed = self.auth_change_rx.changed() => {
+                *retry_attempt = 0;
+                changed.is_ok()
+            }
+            _ = tokio::time::sleep(retry_delay) => true,
         }
     }
 

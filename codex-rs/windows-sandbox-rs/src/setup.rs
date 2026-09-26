@@ -557,10 +557,7 @@ pub(crate) fn effective_write_roots_for_permissions(
     } else {
         gather_write_roots_for_permissions(permissions, command_cwd, env_map)
     };
-    let write_roots = expand_user_profile_root(write_roots);
-    let write_roots = filter_user_profile_root(write_roots);
-    let write_roots = filter_user_profile_root_exclusions(write_roots);
-    let write_roots = filter_ssh_config_dependency_roots(write_roots);
+    let write_roots = filter_user_profile_roots(write_roots);
     filter_sensitive_write_roots(write_roots, codex_home)
 }
 
@@ -1001,10 +998,7 @@ fn build_payload_roots(
             request.codex_home,
         )
     };
-    read_roots = expand_user_profile_root(read_roots);
-    read_roots = filter_user_profile_root(read_roots);
-    read_roots = filter_user_profile_root_exclusions(read_roots);
-    read_roots = filter_ssh_config_dependency_roots(read_roots);
+    read_roots = filter_user_profile_roots(read_roots);
     let write_root_set: HashSet<&PathBuf> = write_roots.iter().collect();
     read_roots.retain(|root| !write_root_set.contains(&root));
     (read_roots, write_roots)
@@ -1034,126 +1028,87 @@ fn build_payload_deny_read_paths(explicit_deny_read_paths: Option<Vec<PathBuf>>)
     explicit_deny_read_paths.unwrap_or_default()
 }
 
-fn expand_user_profile_root(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+fn filter_user_profile_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     let Ok(user_profile) = std::env::var("USERPROFILE") else {
         return roots;
     };
-    expand_user_profile_root_for(roots, Path::new(&user_profile))
+    filter_user_profile_roots_for(roots, Path::new(&user_profile))
 }
 
-fn expand_user_profile_root_for(roots: Vec<PathBuf>, user_profile: &Path) -> Vec<PathBuf> {
-    let user_profile_key = canonical_path_key(user_profile);
-    let mut expanded = Vec::new();
-    for root in roots {
-        if canonical_path_key(&root) == user_profile_key {
-            expanded.extend(profile_read_roots(user_profile));
-        } else {
-            expanded.push(root);
-        }
-    }
-
-    expanded.sort_by_key(|root| canonical_path_key(root));
-    expanded.dedup_by(|a, b| canonical_path_key(a.as_path()) == canonical_path_key(b.as_path()));
-    expanded
-}
-
-fn filter_user_profile_root(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    let Ok(user_profile) = std::env::var("USERPROFILE") else {
-        return roots;
-    };
-    let user_profile_key = canonical_path_key(Path::new(&user_profile));
-    roots.retain(|root| canonical_path_key(root) != user_profile_key);
-    roots
-}
-
-fn filter_user_profile_root_exclusions(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    let Ok(user_profile) = std::env::var("USERPROFILE") else {
-        return roots;
-    };
-    let user_profile = Path::new(&user_profile);
-    roots.retain(|root| !is_user_profile_root_exclusion(root, user_profile));
-    roots
-}
-
-fn is_user_profile_root_exclusion(root: &Path, user_profile: &Path) -> bool {
-    let root_key = canonical_path_key(root);
+/// Replaces the profile root with its children, then drops profile children sandbox users must
+/// not receive: configured credential directories and children holding SSH configuration
+/// dependencies. Returns roots sorted and deduplicated by canonical key.
+///
+/// This runs for every elevated command, so each path is resolved to its canonical key once.
+fn filter_user_profile_roots_for(roots: Vec<PathBuf>, user_profile: &Path) -> Vec<PathBuf> {
     let profile_key = canonical_path_key(user_profile);
     let profile_prefix = format!("{}/", profile_key.trim_end_matches('/'));
-    let Some(relative_key) = root_key.strip_prefix(&profile_prefix) else {
-        return false;
-    };
-    let Some(child_name) = relative_key
-        .split('/')
-        .next()
-        .filter(|name| !name.is_empty())
-    else {
-        return false;
-    };
-
-    USERPROFILE_ROOT_EXCLUSIONS
-        .iter()
-        .any(|excluded| child_name.eq_ignore_ascii_case(excluded))
-}
-
-fn filter_ssh_config_dependency_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    let Ok(user_profile) = std::env::var("USERPROFILE") else {
-        return roots;
-    };
-    filter_ssh_config_dependency_roots_for(roots, Path::new(&user_profile))
-}
-
-fn filter_ssh_config_dependency_roots_for(
-    mut roots: Vec<PathBuf>,
-    user_profile: &Path,
-) -> Vec<PathBuf> {
-    match ssh_config_dependency_paths(user_profile) {
-        Ok(dependency_paths) => {
-            roots.retain(|root| {
-                !is_ssh_config_dependency_root(root, user_profile, &dependency_paths)
-            });
+    let mut keyed_roots = Vec::with_capacity(roots.len());
+    for root in roots {
+        let key = canonical_path_key(&root);
+        if key == profile_key {
+            keyed_roots.extend(
+                profile_read_roots(user_profile)
+                    .into_iter()
+                    .map(|child| (canonical_path_key(&child), child)),
+            );
+        } else {
+            keyed_roots.push((key, root));
         }
+    }
+    keyed_roots.sort_by(|left, right| left.0.cmp(&right.0));
+    keyed_roots.dedup_by(|left, right| left.0 == right.0);
+
+    let ssh_dependency_children = match ssh_config_dependency_paths(user_profile) {
+        Ok(dependency_paths) => Some(
+            dependency_paths
+                .iter()
+                .filter_map(|path| {
+                    profile_child_name(&canonical_path_key(path), &profile_prefix)
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>(),
+        ),
         Err(err) => {
             log_note(
                 &format!("SSH dependency discovery failed; excluding user profile roots: {err}"),
                 None,
             );
+            None
+        }
+    };
+    keyed_roots
+        .into_iter()
+        .filter(|(key, _)| {
+            if *key == profile_key {
+                return false;
+            }
+            let Some(child_name) = profile_child_name(key, &profile_prefix) else {
+                return true;
+            };
             // An incomplete dependency list cannot safely identify which profile children
             // hold SSH credentials. Keep unrelated roots, but grant no profile children.
-            let profile_key = canonical_path_key(user_profile);
-            roots.retain(|root| {
-                canonical_path_key(root) != profile_key
-                    && user_profile_child_name(root, user_profile).is_none()
-            });
-        }
-    }
-    roots
+            let Some(ssh_dependency_children) = &ssh_dependency_children else {
+                return false;
+            };
+            let configured_exclusion = USERPROFILE_ROOT_EXCLUSIONS
+                .iter()
+                .any(|excluded| child_name.eq_ignore_ascii_case(excluded));
+            let ssh_dependency = ssh_dependency_children
+                .iter()
+                .any(|dependency| child_name.eq_ignore_ascii_case(dependency));
+            !configured_exclusion && !ssh_dependency
+        })
+        .map(|(_, root)| root)
+        .collect()
 }
 
-fn is_ssh_config_dependency_root(
-    root: &Path,
-    user_profile: &Path,
-    dependency_paths: &[PathBuf],
-) -> bool {
-    let Some(child_name) = user_profile_child_name(root, user_profile) else {
-        return false;
-    };
-
-    dependency_paths.iter().any(|path| {
-        user_profile_child_name(path, user_profile)
-            .is_some_and(|dependency_child| child_name.eq_ignore_ascii_case(&dependency_child))
-    })
-}
-
-fn user_profile_child_name(path: &Path, user_profile: &Path) -> Option<String> {
-    let root_key = canonical_path_key(path);
-    let profile_key = canonical_path_key(user_profile);
-    let profile_prefix = format!("{}/", profile_key.trim_end_matches('/'));
-    let relative_key = root_key.strip_prefix(&profile_prefix)?;
-    relative_key
+/// Returns the first path component of `key` below the profile, if `key` is inside it.
+fn profile_child_name<'a>(key: &'a str, profile_prefix: &str) -> Option<&'a str> {
+    key.strip_prefix(profile_prefix)?
         .split('/')
         .next()
         .filter(|name| !name.is_empty())
-        .map(str::to_string)
 }
 
 fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> Vec<PathBuf> {
@@ -1574,12 +1529,13 @@ mod tests {
     }
 
     #[test]
-    fn is_user_profile_root_exclusion_blocks_configured_children() {
+    fn profile_filter_drops_configured_credential_children() {
         let tmp = TempDir::new().expect("tempdir");
         let user_profile = tmp.path().join("user-profile");
         let documents = user_profile.join("Documents");
         let app_data = user_profile.join("AppData");
-        let ssh_child = user_profile.join(".ssh").join("config");
+        let ssh_child = user_profile.join(".ssh").join("known_hosts");
+        // `.tsh` is only a configured exclusion, never an SSH configuration dependency.
         let tsh_child = user_profile.join(".tsh").join("keys");
         let other_root = tmp.path().join("other-root");
         fs::create_dir_all(&documents).expect("create documents");
@@ -1588,30 +1544,25 @@ mod tests {
         fs::create_dir_all(&tsh_child).expect("create tsh child");
         fs::create_dir_all(&other_root).expect("create other root");
 
-        assert!(!super::is_user_profile_root_exclusion(
-            &documents,
-            &user_profile
-        ));
-        assert!(!super::is_user_profile_root_exclusion(
-            &app_data,
-            &user_profile
-        ));
-        assert!(super::is_user_profile_root_exclusion(
-            &ssh_child,
-            &user_profile
-        ));
-        assert!(super::is_user_profile_root_exclusion(
-            &tsh_child,
-            &user_profile
-        ));
-        assert!(!super::is_user_profile_root_exclusion(
-            &other_root,
-            &user_profile
-        ));
+        let roots = super::filter_user_profile_roots_for(
+            vec![
+                documents.clone(),
+                app_data.clone(),
+                ssh_child,
+                tsh_child,
+                other_root.clone(),
+            ],
+            &user_profile,
+        );
+
+        assert_eq!(
+            roots.into_iter().collect::<HashSet<_>>(),
+            [documents, app_data, other_root].into_iter().collect()
+        );
     }
 
     #[test]
-    fn is_ssh_config_dependency_root_blocks_config_dependencies() {
+    fn profile_filter_drops_ssh_config_dependencies() {
         let tmp = TempDir::new().expect("tempdir");
         let user_profile = tmp.path().join("user-profile");
         let documents = user_profile.join("Documents");
@@ -1632,35 +1583,22 @@ mod tests {
         fs::write(key_dir.join("id_ed25519"), "").expect("write key");
         fs::write(include_dir.join("config"), "User git\n").expect("write included config");
 
-        let dependency_paths =
-            super::ssh_config_dependency_paths(&user_profile).expect("discover SSH dependencies");
+        super::ssh_config_dependency_paths(&user_profile).expect("discover SSH dependencies");
 
-        assert!(!super::is_ssh_config_dependency_root(
-            &documents,
+        let roots = super::filter_user_profile_roots_for(
+            vec![
+                documents.clone(),
+                key_dir,
+                include_dir.join("config"),
+                include_dir,
+                other_root.clone(),
+            ],
             &user_profile,
-            &dependency_paths
-        ));
-        assert!(super::is_ssh_config_dependency_root(
-            &key_dir,
-            &user_profile,
-            &dependency_paths
-        ));
-        assert!(super::is_ssh_config_dependency_root(
-            &include_dir.join("config"),
-            &user_profile,
-            &dependency_paths
-        ));
-        assert!(!super::is_ssh_config_dependency_root(
-            &other_root,
-            &user_profile,
-            &dependency_paths
-        ));
+        );
+
         assert_eq!(
-            super::filter_ssh_config_dependency_roots_for(
-                vec![documents.clone(), key_dir, include_dir, other_root.clone()],
-                &user_profile,
-            ),
-            vec![documents, other_root]
+            roots.into_iter().collect::<HashSet<_>>(),
+            [documents, other_root].into_iter().collect()
         );
     }
 
@@ -1675,7 +1613,7 @@ mod tests {
         fs::create_dir_all(&documents).expect("create documents");
         fs::create_dir_all(&other_root).expect("create other root");
         assert_eq!(
-            super::filter_ssh_config_dependency_roots_for(
+            super::filter_user_profile_roots_for(
                 vec![user_profile.clone(), documents, other_root.clone()],
                 &user_profile,
             ),
@@ -1684,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_user_profile_root_for_replaces_profile_root_with_children() {
+    fn profile_filter_replaces_profile_root_with_children() {
         let tmp = TempDir::new().expect("tempdir");
         let user_profile = tmp.path().join("user-profile");
         let documents = user_profile.join("Documents");
@@ -1694,7 +1632,7 @@ mod tests {
         fs::create_dir_all(&excluded).expect("create excluded dir");
         fs::create_dir_all(&other_root).expect("create other root");
 
-        let roots = super::expand_user_profile_root_for(
+        let roots = super::filter_user_profile_roots_for(
             vec![user_profile.clone(), other_root.clone()],
             &user_profile,
         );
@@ -1713,11 +1651,7 @@ mod tests {
         fs::create_dir_all(&codex_home).expect("create codex home");
         fs::create_dir_all(&documents).expect("create documents");
 
-        let mut roots =
-            super::expand_user_profile_root_for(vec![user_profile.clone()], &user_profile);
-        let user_profile_key = super::canonical_path_key(&user_profile);
-        roots.retain(|root| super::canonical_path_key(root) != user_profile_key);
-        roots.retain(|root| !super::is_user_profile_root_exclusion(root, &user_profile));
+        let roots = super::filter_user_profile_roots_for(vec![user_profile.clone()], &user_profile);
         let roots = super::filter_sensitive_write_roots(roots, &codex_home);
 
         assert_eq!(vec![documents], roots);

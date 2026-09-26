@@ -2342,7 +2342,6 @@ impl ToolCallRuntime {
                 .retain_generation_owner(&session, &turn, &tracker);
         }
         let evidence_tracker = Arc::clone(&tracker);
-        let validation_signals = self.sampling_request_signals.clone();
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call_with_terminal_outcome",
@@ -2602,22 +2601,6 @@ impl ToolCallRuntime {
                 });
                 turn.turn_timing_state
                     .record_tool_completion(dispatch_tool_name.as_str(), successful);
-                if successful
-                    && workspace_capable
-                    && let Some(collector) = validation_signals.as_ref()
-                {
-                    // Capture the executed payload and revision before releasing the lease,
-                    // independently of which layer persists workspace evidence.
-                    let mutation_revision =
-                        evidence_tracker.lock().await.current_mutation_revision();
-                    if let Ok(result) = &result {
-                        collector.record_validation_workspace_revision(
-                            &evidence_call.tool_name,
-                            &result.payload,
-                            mutation_revision,
-                        );
-                    }
-                }
                 let evidence_classification =
                     workspace_call_classification
                         .as_ref()
@@ -5047,8 +5030,8 @@ mod tests {
                     stale,
                     serde_json::json!({
                         "call_id": "read-before-edit",
-                        "rerun": { "instruction": "Repeat only the read-only evidence-producing call using its supported arguments to obtain or revalidate current evidence. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence." },
-                        "reason": "source dependencies were invalidated after capture; this does not establish which dependency changed; obtain or revalidate current evidence before relying on it",
+                        "rerun": { "instruction": "This notice is not a request to rerun tests or builds. Revalidate only if current evidence is essential to the task, using the cheapest scoped read or check with supported arguments; otherwise report the affected claim as unverified. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence." },
+                        "reason": "source dependencies were invalidated after capture; this does not establish which dependency changed; current workspace freshness is unverified",
                         "stale_workspace_evidence": true,
                         "reason_code": "source_dependencies_invalidated",
                         "valid_for_current_workspace": false,
@@ -5164,7 +5147,11 @@ mod tests {
                 false,
             )])
         } else {
-            std::collections::BTreeSet::new()
+            // A read-only git query observes the whole checkout.
+            std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+                &turn_context.config.cwd,
+                true,
+            )])
         };
         let result = runtime
             .clone()
@@ -5839,66 +5826,6 @@ mod tests {
                 .unwrap()
                 .contains("Sleep completed.")
         );
-    }
-
-    #[tokio::test]
-    async fn audit_reports_17_19_direct_and_nested_validation_capture_revision() {
-        for nested in [false, true] {
-            let (session, turn) = crate::session::tests::make_session_and_context().await;
-            let tool_name = codex_tools::ToolName::plain("exec_command");
-            let router = Arc::new(ToolRouter::from_parts(
-                ToolRegistry::from_tools([Arc::new(ImmediateHandler {
-                    tool_name: tool_name.clone(),
-                }) as Arc<dyn CoreToolRuntime>]),
-                Vec::new(),
-            ));
-            let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
-            let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-            tracker.lock().await.record_unknown_mutation();
-            let control = crate::session::turn_execution::TurnExecutionControl::new();
-            let collector = control.collector(&control.baselines(1));
-            let runtime = ToolCallRuntime::new(Arc::new(session), step, Arc::clone(&tracker))
-                .with_sampling_request_signals(collector.clone());
-            let call = ToolCall {
-                tool_name,
-                call_id: "validation".to_string(),
-                payload: ToolPayload::Function {
-                    arguments: r#"{"cmd":"cargo test"}"#.to_string(),
-                },
-            };
-            if nested {
-                runtime
-                    .handle_tool_call_with_source(
-                        call,
-                        ToolCallSource::CodeMode {
-                            cell_id: "cell".to_string(),
-                            parent_call_id: None,
-                            runtime_tool_call_id: "nested-validation".to_string(),
-                            nested_deadline: None,
-                            cancellation_cause: None,
-                        },
-                        CancellationToken::new(),
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                runtime
-                    .handle_tool_call(call, CancellationToken::new())
-                    .await
-                    .unwrap();
-            }
-            assert_eq!(
-                collector.validation_workspace_revision_for_test(),
-                Some(1),
-                "nested={nested}"
-            );
-            tracker.lock().await.record_unknown_mutation();
-            assert_eq!(
-                collector.validation_workspace_revision_for_test(),
-                Some(1),
-                "later mutations must not relabel validation"
-            );
-        }
     }
 
     #[tokio::test]

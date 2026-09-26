@@ -189,7 +189,7 @@ async fn wrapper_counts_include_abandonment_exactly_once() -> Result<()> {
         "",
         &[],
         &[],
-        || std::future::pending::<std::result::Result<(), &str>>(),
+        std::future::pending::<std::result::Result<(), &str>>,
         |_| true,
         |_| panic!("abandonment must not render"),
     ));

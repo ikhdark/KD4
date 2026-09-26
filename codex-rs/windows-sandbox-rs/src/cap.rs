@@ -82,6 +82,26 @@ fn persist_caps(path: &Path, caps: &CapSids) -> Result<()> {
     Ok(())
 }
 
+/// Serializes cap SID file loads that may write it across Codex and setup-helper processes.
+///
+/// Every writer holds this lock from load through rename, so a concurrent writer cannot replace
+/// the file with a copy that lacks another process's newly granted SID.
+fn lock_cap_sid_file(codex_home: &Path) -> Result<fs::File> {
+    fs::create_dir_all(codex_home)
+        .with_context(|| format!("create cap sid dir {}", codex_home.display()))?;
+    let path = cap_sid_file(codex_home).with_extension("lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open cap sid lock {}", path.display()))?;
+    lock.lock()
+        .with_context(|| format!("lock cap sid file {}", path.display()))?;
+    Ok(lock)
+}
+
 fn load_or_create_cap_sids_from_disk(codex_home: &Path) -> Result<CapSids> {
     let path = cap_sid_file(codex_home);
     if path.exists() {
@@ -119,6 +139,7 @@ fn cached_cap_sids<'a>(
 ) -> Result<&'a mut CachedCapSids> {
     let key = canonical_path_key(&cap_sid_file(codex_home));
     if !cache.contains_key(&key) {
+        let _lock = lock_cap_sid_file(codex_home)?;
         let caps = load_or_create_cap_sids_from_disk(codex_home)?;
         cache.insert(
             key.clone(),
@@ -136,9 +157,9 @@ fn cached_cap_sids<'a>(
 
 /// Loads the process-stable capability SID set once per Codex home.
 ///
-/// The file is mutated only through the helpers in this module, which update the
-/// cached value while holding the same lock. This avoids reopening and parsing
-/// the SID file for every sandboxed command without changing SID persistence.
+/// Keyed SIDs are only ever added, so cached hits stay valid. Other processes (the setup helper and
+/// concurrent Codex instances) may add keyed SIDs after this cache was loaded; keyed lookups
+/// therefore consult the file on a miss before minting a new SID.
 pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
     let mut cache = cap_sids_cache()
         .lock()
@@ -152,20 +173,7 @@ pub fn workspace_cap_sid_for_cwd(codex_home: &Path, cwd: &Path) -> Result<String
 }
 
 fn workspace_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
-    let path = cap_sid_file(codex_home);
-    let mut cache = cap_sids_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cached = cached_cap_sids(codex_home, &mut cache)?;
-    if let Some(sid) = cached.caps.workspace_by_cwd.get(&key) {
-        return Ok(sid.clone());
-    }
-    let sid = make_random_cap_sid_string();
-    let mut updated = cached.caps.clone();
-    updated.workspace_by_cwd.insert(key, sid.clone());
-    persist_caps(&path, &updated)?;
-    cached.caps = updated;
-    Ok(sid)
+    keyed_cap_sid(codex_home, key, |caps| &mut caps.workspace_by_cwd)
 }
 
 /// Returns the capability SID for an additional writable root, creating and persisting it if missing.
@@ -175,19 +183,37 @@ pub fn writable_root_cap_sid_for_path(codex_home: &Path, root: &Path) -> Result<
 }
 
 fn writable_root_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
+    keyed_cap_sid(codex_home, key, |caps| &mut caps.writable_root_by_path)
+}
+
+fn keyed_cap_sid(
+    codex_home: &Path,
+    key: String,
+    entries: fn(&mut CapSids) -> &mut HashMap<String, String>,
+) -> Result<String> {
     let path = cap_sid_file(codex_home);
     let mut cache = cap_sids_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cached = cached_cap_sids(codex_home, &mut cache)?;
-    if let Some(sid) = cached.caps.writable_root_by_path.get(&key) {
+    if let Some(sid) = entries(&mut cached.caps).get(&key) {
         return Ok(sid.clone());
     }
-    let sid = make_random_cap_sid_string();
-    let mut updated = cached.caps.clone();
-    updated.writable_root_by_path.insert(key, sid.clone());
-    persist_caps(&path, &updated)?;
-    cached.caps = updated;
+    // The elevated setup refresh persists SIDs for new write roots and grants their ACLs before
+    // this process resolves them. Minting from a stale cache would hand the command runner an
+    // ungranted SID and drop the helper's entry from the file.
+    let _lock = lock_cap_sid_file(codex_home)?;
+    let mut latest = load_or_create_cap_sids_from_disk(codex_home)?;
+    let sid = match entries(&mut latest).get(&key) {
+        Some(sid) => sid.clone(),
+        None => {
+            let sid = make_random_cap_sid_string();
+            entries(&mut latest).insert(key, sid.clone());
+            persist_caps(&path, &latest)?;
+            sid
+        }
+    };
+    cached.caps = latest;
     Ok(sid)
 }
 
@@ -284,13 +310,15 @@ mod tests {
         assert!(cached.workspace_by_cwd.is_empty());
         assert!(cached.writable_root_by_path.is_empty());
         assert_eq!(std::fs::read(&path)?, original_bytes);
-        let entries = std::fs::read_dir(home.path())?.collect::<std::io::Result<Vec<_>>>()?;
+        let mut entries = std::fs::read_dir(home.path())?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort();
         assert_eq!(
-            entries.len(),
-            1,
+            entries,
+            vec![path.clone(), path.with_extension("lock")],
             "failed writes must remove temporary files"
         );
-        assert_eq!(entries[0].path(), path);
         drop(locked);
 
         let workspace_sid = workspace_write_cap_sid_for_root(home.path(), &workspace, &workspace)?;
@@ -312,6 +340,107 @@ mod tests {
         assert_eq!(reopened.readonly, original.readonly);
         assert_eq!(reopened.workspace_by_cwd.len(), 1);
         assert_eq!(reopened.writable_root_by_path.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_sids_persisted_by_another_process_are_reused_and_preserved() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let roots = TempDir::new()?;
+        let workspace = roots.path().join("workspace");
+        let helper_root = roots.path().join("helper-root");
+        let local_root = roots.path().join("local-root");
+        for root in [&workspace, &helper_root, &local_root] {
+            std::fs::create_dir_all(root)?;
+        }
+        // Warm this process's cache before the setup helper writes the shared file.
+        let original = load_or_create_cap_sids(home.path())?;
+        let path = super::cap_sid_file(home.path());
+        let mut external: super::CapSids = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let workspace_key = super::canonical_path_key(&workspace);
+        let helper_key = super::canonical_path_key(&helper_root);
+        external
+            .workspace_by_cwd
+            .insert(workspace_key.clone(), "S-1-5-21-1-2-3-4".to_string());
+        external
+            .writable_root_by_path
+            .insert(helper_key.clone(), "S-1-5-21-5-6-7-8".to_string());
+        std::fs::write(&path, serde_json::to_vec(&external)?)?;
+
+        // The helper granted ACLs to these SIDs, so this process must hand out the same ones.
+        assert_eq!(
+            workspace_write_cap_sid_for_root(home.path(), &workspace, &workspace)?,
+            "S-1-5-21-1-2-3-4"
+        );
+        let local_sid = workspace_write_cap_sid_for_root(home.path(), &workspace, &local_root)?;
+        assert_eq!(
+            workspace_write_cap_sid_for_root(home.path(), &workspace, &helper_root)?,
+            "S-1-5-21-5-6-7-8"
+        );
+
+        // Minting a SID for a new root must not drop entries written by the other process.
+        let persisted: super::CapSids = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(
+            (persisted.workspace.as_str(), persisted.readonly.as_str()),
+            (original.workspace.as_str(), original.readonly.as_str())
+        );
+        assert_eq!(
+            persisted.workspace_by_cwd[&workspace_key],
+            "S-1-5-21-1-2-3-4"
+        );
+        assert_eq!(
+            persisted.writable_root_by_path[&helper_key],
+            "S-1-5-21-5-6-7-8"
+        );
+        assert_eq!(
+            persisted.writable_root_by_path[&super::canonical_path_key(&local_root)],
+            local_sid
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_sid_minting_waits_for_another_process_update() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let roots = TempDir::new()?;
+        let workspace = roots.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        load_or_create_cap_sids(home.path())?;
+        let path = super::cap_sid_file(home.path());
+        // Hold the lock the way a setup helper does while it loads, adds, and renames the file.
+        let other_process = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        other_process.lock()?;
+        let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
+        let resolver = {
+            let home = home.path().to_path_buf();
+            let workspace = workspace.clone();
+            std::thread::spawn(move || {
+                let sid = workspace_write_cap_sid_for_root(&home, &workspace, &workspace);
+                let _ = resolved_tx.send(());
+                sid
+            })
+        };
+        assert_eq!(
+            resolved_rx.recv_timeout(std::time::Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "minting must not race an in-progress update"
+        );
+
+        let mut external: super::CapSids = serde_json::from_slice(&std::fs::read(&path)?)?;
+        external.workspace_by_cwd.insert(
+            super::canonical_path_key(&workspace),
+            "S-1-5-21-9-8-7-6".to_string(),
+        );
+        std::fs::write(&path, serde_json::to_vec(&external)?)?;
+        drop(other_process);
+
+        assert_eq!(
+            resolver.join().expect("join SID resolver")?,
+            "S-1-5-21-9-8-7-6"
+        );
         Ok(())
     }
 

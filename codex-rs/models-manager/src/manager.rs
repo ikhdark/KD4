@@ -793,6 +793,9 @@ impl OpenAiModelsManager {
             };
 
             if self.get_etag().await.as_deref() == Some(notice.etag.as_str()) {
+                // A matching ETag confirms the current catalog exactly as a 304 does.
+                self.mark_memory_fresh(&refresh_identity, self.cache_manager.ttl())
+                    .await;
                 if let Some(write_basis) = write_basis
                     && let Err(err) = self
                         .cache_manager
@@ -900,6 +903,10 @@ impl OpenAiModelsManager {
     }
 
     /// Refresh available models according to the specified strategy.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Offline cache loads join the refresh transaction only when the gate is free"
+    )]
     async fn refresh_available_models(
         &self,
         refresh_strategy: RefreshStrategy,

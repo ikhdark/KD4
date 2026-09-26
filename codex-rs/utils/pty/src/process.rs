@@ -161,6 +161,54 @@ impl fmt::Debug for PtyHandles {
     }
 }
 
+/// PTY handles shared by a session and the waiter that may release them once
+/// the root process exits.
+pub(crate) type SharedPtyHandles = Arc<StdMutex<Option<PtyHandles>>>;
+
+/// Bounds how long a finished ConPTY reader may keep draining once its
+/// pseudoconsole has been released. Draining normally ends within
+/// milliseconds; the bound only applies when the output receiver stops reading.
+#[cfg(windows)]
+const PTY_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Releases PTY handles without blocking the async executor.
+pub(crate) fn release_pty_handles(pty_handles: &StdMutex<Option<PtyHandles>>) {
+    let handles = pty_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    #[cfg(windows)]
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        // ClosePseudoConsole can wait for output to drain. Leave the async
+        // executor free to run the reader (or complete its cancellation).
+        if let Some(handles) = handles {
+            runtime.spawn_blocking(move || drop(handles));
+        }
+        return;
+    }
+    drop(handles);
+}
+
+/// Lets a ConPTY reader deliver the final frame that the pseudoconsole flushes
+/// when it is released; releasing it always closes the reader's pipe. The
+/// reader is aborted only if its receiver stops reading.
+#[cfg(windows)]
+fn drain_released_pty_reader(reader: JoinHandle<()>) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        reader.abort();
+        return;
+    };
+    let abort = reader.abort_handle();
+    runtime.spawn(async move {
+        if tokio::time::timeout(PTY_OUTPUT_DRAIN_TIMEOUT, reader)
+            .await
+            .is_err()
+        {
+            abort.abort();
+        }
+    });
+}
+
 /// Callback used by driver-backed sessions to resize a PTY-like backend when
 /// there is no local `PtyHandles` instance to resize directly.
 type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
@@ -176,8 +224,11 @@ pub struct ProcessHandle {
     exit_status: Arc<AtomicBool>,
     exit_code: Arc<StdMutex<Option<i32>>>,
     // PtyHandles must be preserved because the process will receive Control+C if the
-    // slave is closed
-    _pty_handles: StdMutex<Option<PtyHandles>>,
+    // slave is closed. A Windows PTY waiter releases them once the root exits.
+    pty_handles: SharedPtyHandles,
+    // Whether this session was created with local PTY handles, which remain
+    // meaningful for resize and reader draining after the handles are released.
+    has_pty: bool,
     // Optional resize hook for driver-backed sessions that proxy PTY control to
     // another backend instead of owning local PTY handles.
     resizer: StdMutex<Option<ResizeFn>>,
@@ -200,9 +251,13 @@ impl ProcessHandle {
         wait_handle: JoinHandle<()>,
         exit_status: Arc<AtomicBool>,
         exit_code: Arc<StdMutex<Option<i32>>>,
-        pty_handles: Option<PtyHandles>,
+        pty_handles: SharedPtyHandles,
         resizer: Option<ResizeFn>,
     ) -> Self {
+        let has_pty = pty_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
@@ -212,7 +267,8 @@ impl ProcessHandle {
             wait_handle: StdMutex::new(Some(wait_handle)),
             exit_status,
             exit_code,
-            _pty_handles: StdMutex::new(pty_handles),
+            pty_handles,
+            has_pty,
             resizer: StdMutex::new(resizer),
         }
     }
@@ -244,7 +300,7 @@ impl ProcessHandle {
     pub fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
         {
             let handles = self
-                ._pty_handles
+                .pty_handles
                 .lock()
                 .map_err(|_| anyhow!("failed to lock PTY handles"))?;
             if let Some(handles) = handles.as_ref() {
@@ -272,6 +328,10 @@ impl ProcessHandle {
                 };
             }
         }
+        if self.has_pty {
+            // The terminal was released after exit or termination; nothing is left to resize.
+            return Ok(());
+        }
 
         let mut resizer = self
             .resizer
@@ -292,31 +352,19 @@ impl ProcessHandle {
         }
     }
 
-    /// Releases the Windows pseudoconsole after its root process exits.
+    /// Closes stdin, drops the terminator, and releases the pseudoconsole after
+    /// the root process exits.
     ///
     /// ConPTY keeps its output pipe open until the pseudoconsole handles are
-    /// closed. Releasing them here lets the reader drain buffered output and
-    /// then observe EOF without aborting the reader task.
+    /// closed. The Windows PTY waiter already releases them once it observes
+    /// the root exit; releasing them here as well is harmless and lets the
+    /// reader drain buffered output and then observe EOF without aborting it.
     pub fn release_pty_after_exit(&self) {
         self.close_stdin();
         if let Ok(mut killer_opt) = self.killer.lock() {
             killer_opt.take();
         }
-        self.release_pty_handles();
-    }
-
-    fn release_pty_handles(&self) {
-        let handles = self._pty_handles.lock().ok().and_then(|mut h| h.take());
-        #[cfg(windows)]
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            // ClosePseudoConsole can wait for output to drain. Leave the async
-            // executor free to run the reader (or complete its cancellation).
-            if let Some(handles) = handles {
-                runtime.spawn_blocking(move || drop(handles));
-            }
-            return;
-        }
-        drop(handles);
+        release_pty_handles(&self.pty_handles);
     }
 
     /// Attempts to kill the child while leaving the reader/writer tasks alive
@@ -358,7 +406,10 @@ impl ProcessHandle {
     /// This is used after the root process has already exited. In particular,
     /// pipe descendants may intentionally outlive the root while retaining an
     /// inherited output handle, so waiting for the reader tasks to observe EOF
-    /// would retain the otherwise-finished process indefinitely.
+    /// would retain the otherwise-finished process indefinitely. A Windows
+    /// pseudoconsole is different: releasing it closes the reader's pipe after
+    /// its final frame, so that reader drains to EOF (bounded) instead of
+    /// discarding output the child wrote before it exited.
     pub fn finish(&self) {
         self.close_stdin();
 
@@ -369,6 +420,13 @@ impl ProcessHandle {
         if let Ok(mut h) = self.reader_handle.lock()
             && let Some(handle) = h.take()
         {
+            #[cfg(windows)]
+            if self.has_pty {
+                drain_released_pty_reader(handle);
+            } else {
+                handle.abort();
+            }
+            #[cfg(not(windows))]
             handle.abort();
         }
         if let Ok(mut handles) = self.reader_abort_handles.lock() {
@@ -386,7 +444,7 @@ impl ProcessHandle {
             // status. Dropping its handle detaches it instead of cancelling it.
             h.take();
         }
-        self.release_pty_handles();
+        release_pty_handles(&self.pty_handles);
         if let Ok(mut resizer) = self.resizer.lock() {
             resizer.take();
         }
@@ -497,7 +555,7 @@ mod tests {
             idle_task(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(StdMutex::new(Some(0))),
-            None,
+            SharedPtyHandles::default(),
             None,
         );
 
@@ -506,6 +564,34 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
         assert!(!killed.load(Ordering::SeqCst));
         assert!(handle.writer_sender().is_closed());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn released_pty_reader_is_aborted_only_after_the_drain_bound() {
+        let (dropped_tx, mut dropped_rx) = oneshot::channel::<()>();
+        // A reader whose receiver stopped reading never reaches EOF on its own.
+        let reader = tokio::spawn(async move {
+            let _dropped_tx = dropped_tx;
+            std::future::pending::<()>().await;
+        });
+
+        drain_released_pty_reader(reader);
+
+        assert!(
+            tokio::time::timeout(
+                PTY_OUTPUT_DRAIN_TIMEOUT - Duration::from_millis(1),
+                &mut dropped_rx
+            )
+            .await
+            .is_err(),
+            "a draining reader must not be aborted before its bound"
+        );
+        let aborted = tokio::time::timeout(Duration::from_secs(60), dropped_rx).await;
+        assert!(
+            matches!(aborted, Ok(Err(_))),
+            "a reader still running at the bound must be aborted"
+        );
     }
 
     #[tokio::test]
@@ -524,7 +610,7 @@ mod tests {
             idle_task(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(StdMutex::new(None)),
-            None,
+            SharedPtyHandles::default(),
             None,
         );
 
@@ -914,7 +1000,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         wait_handle,
         exit_status,
         exit_code,
-        /*pty_handles*/ None,
+        SharedPtyHandles::default(),
         resizer,
     );
 

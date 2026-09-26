@@ -40,6 +40,36 @@ async fn bound_listener_path_is_stale_socket_path() {
 }
 
 #[tokio::test]
+async fn non_socket_paths_are_not_stale_socket_paths() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let file_path = temp_dir.path().join("regular");
+    std::fs::write(&file_path, b"keep me").expect("write regular file");
+    // Windows refuses AF_UNIX connections to regular files exactly as it refuses a dead
+    // listener, so callers rely on this check before removing a refused path.
+    assert_eq!(
+        UnixStream::connect(&file_path)
+            .await
+            .err()
+            .map(|err| err.kind()),
+        Some(std::io::ErrorKind::ConnectionRefused)
+    );
+
+    for path in [file_path.as_path(), temp_dir.path()] {
+        assert!(
+            !is_stale_socket_path(path)
+                .await
+                .expect("non-socket path check"),
+            "{} must not be treated as a socket",
+            path.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read(&file_path).expect("regular file remains"),
+        b"keep me"
+    );
+}
+
+#[tokio::test]
 async fn stream_round_trips_data_between_listener_and_client() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = temp_dir.path().join("socket");

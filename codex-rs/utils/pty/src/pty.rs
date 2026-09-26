@@ -37,6 +37,7 @@ use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
 use crate::process::PtyHandles;
 use crate::process::PtyMasterHandle;
+use crate::process::SharedPtyHandles;
 use crate::process::SpawnedProcess;
 use crate::process::TerminalSize;
 #[cfg(unix)]
@@ -276,6 +277,12 @@ async fn spawn_process_portable(
 
     let writer_handle = spawn_pty_writer(writer, writer_rx);
 
+    let pty_handles: SharedPtyHandles = Arc::new(StdMutex::new(Some(PtyHandles {
+        _slave: if cfg!(windows) { Some(slave) } else { None },
+        _master: PtyMasterHandle::Resizable(master),
+    })));
+    #[cfg(windows)]
+    let wait_pty_handles = Arc::clone(&pty_handles);
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = Arc::clone(&exit_status);
@@ -313,12 +320,12 @@ async fn spawn_process_portable(
         };
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_tx.send(code);
+        // ConPTY keeps its output pipe open until the pseudoconsole is closed,
+        // even after the root exits. Releasing it flushes the final frame and
+        // lets the reader observe EOF without every consumer doing so itself.
+        #[cfg(windows)]
+        crate::process::release_pty_handles(&wait_pty_handles);
     });
-
-    let handles = PtyHandles {
-        _slave: if cfg!(windows) { Some(slave) } else { None },
-        _master: PtyMasterHandle::Resizable(master),
-    };
 
     let handle = ProcessHandle::new(
         writer_tx,
@@ -329,7 +336,7 @@ async fn spawn_process_portable(
         wait_handle,
         exit_status,
         exit_code,
-        Some(handles),
+        pty_handles,
         /*resizer*/ None,
     );
 
@@ -480,10 +487,10 @@ async fn spawn_process_preserving_fds(
         let _ = exit_tx.send(code);
     });
 
-    let handles = PtyHandles {
+    let pty_handles: SharedPtyHandles = Arc::new(StdMutex::new(Some(PtyHandles {
         _slave: None,
         _master: PtyMasterHandle::Owned(master),
-    };
+    })));
 
     let handle = ProcessHandle::new(
         writer_tx,
@@ -494,7 +501,7 @@ async fn spawn_process_preserving_fds(
         wait_handle,
         exit_status,
         exit_code,
-        Some(handles),
+        pty_handles,
         /*resizer*/ None,
     );
 

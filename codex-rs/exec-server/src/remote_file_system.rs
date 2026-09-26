@@ -18,11 +18,13 @@ use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::client::LazyRemoteExecServerClient;
+use crate::connection::MAX_FILE_PAYLOAD_BYTES;
 use crate::protocol::FsCanonicalizeParams;
 use crate::protocol::FsCopyParams;
 use crate::protocol::FsCreateDirectoryParams;
 use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsReadDirectoryParams;
+use crate::protocol::FsReadFileBoundedParams;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsRemoveParams;
 use crate::protocol::FsWalkParams;
@@ -85,6 +87,60 @@ impl RemoteFileSystem {
         })
     }
 
+    async fn read_file_bounded_request(
+        &self,
+        path: &PathUri,
+        confined_root: Option<&PathUri>,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        trace!("remote fs read_file_bounded");
+        let client = self.client.get().await.map_err(map_remote_error)?;
+        let response = match client
+            .fs_read_file_bounded(FsReadFileBoundedParams {
+                path: path.clone(),
+                max_bytes,
+                confined_root: confined_root.cloned(),
+                sandbox: remote_sandbox_context(sandbox),
+            })
+            .await
+        {
+            Ok(response) => response,
+            // Executors without the method keep their previous behavior.
+            Err(ExecServerError::Server {
+                code: METHOD_NOT_FOUND_ERROR_CODE,
+                ..
+            }) => {
+                return match confined_root {
+                    None => {
+                        <Self as ExecutorFileSystem>::read_file_bounded_via_streams(
+                            self, path, max_bytes, sandbox,
+                        )
+                        .await
+                    }
+                    Some(_) => Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "confined bounded reads are not supported by this exec-server",
+                    )),
+                };
+            }
+            Err(error) => return Err(map_remote_error(error)),
+        };
+        response
+            .data_base64
+            .map(|data_base64| {
+                STANDARD.decode(data_base64).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "remote fs/readFileBounded returned invalid base64 dataBase64: {err}"
+                        ),
+                    )
+                })
+            })
+            .transpose()
+    }
+
     async fn read_file_stream(
         &self,
         path: &PathUri,
@@ -108,6 +164,16 @@ impl RemoteFileSystem {
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
         trace!("remote fs write_file");
+        // The receiving transport would close the shared connection instead.
+        if contents.len() > MAX_FILE_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "file is too large to write through exec-server: {} bytes exceeds the {MAX_FILE_PAYLOAD_BYTES}-byte request limit",
+                    contents.len()
+                ),
+            ));
+        }
         let client = self.client.get().await.map_err(map_remote_error)?;
         client
             .fs_write_file(FsWriteFileParams {
@@ -284,6 +350,33 @@ impl ExecutorFileSystem for RemoteFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(RemoteFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(RemoteFileSystem::read_file_bounded_request(
+            self, path, /*confined_root*/ None, max_bytes, sandbox,
+        ))
+    }
+
+    fn read_file_bounded_confined<'a>(
+        &'a self,
+        path: &'a PathUri,
+        root: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(RemoteFileSystem::read_file_bounded_request(
+            self,
+            path,
+            Some(root),
+            max_bytes,
+            sandbox,
+        ))
     }
 
     fn write_file<'a>(

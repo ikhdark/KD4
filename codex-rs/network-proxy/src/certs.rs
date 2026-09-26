@@ -937,29 +937,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn managed_ca_async_domain_updates_preserve_progress_and_policy_decisions() {
-        const CHILD_ENV: &str = "CODEX_TEST_MANAGED_CA_DOMAIN_UPDATES";
-        if std::env::var_os(CHILD_ENV).is_none() {
-            // Domain updates resolve CODEX_HOME from the process environment. Keep the
-            // real constructor and its artifacts isolated from the developer's home.
-            let home = tempdir().unwrap();
-            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("certs::tests::managed_ca_async_domain_updates_preserve_progress_and_policy_decisions")
-                .arg("--nocapture")
-                .env(CHILD_ENV, "1")
-                .env("CODEX_HOME", home.path())
-                .output()
-                .await
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "isolated domain update failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            return;
-        }
-        let home = codex_utils_home_dir::find_codex_home().unwrap();
+        // Domain updates reuse the compiled MITM state, so they never resolve CODEX_HOME or
+        // touch the CA cache; the explicit home keeps artifacts out of the developer's home.
+        let home = tempdir().unwrap();
         let config = crate::NetworkProxyConfig {
             enabled: true,
             mitm: true,
@@ -969,7 +949,7 @@ mod tests {
         let initial = crate::build_config_state_with_codex_home(
             config,
             crate::NetworkProxyConstraints::default(),
-            &home,
+            home.path(),
         )
         .unwrap();
         let reloader = Arc::new(StaticCaConfigReloader(initial.clone()));

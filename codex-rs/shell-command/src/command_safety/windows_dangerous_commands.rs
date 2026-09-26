@@ -78,13 +78,22 @@ pub(crate) fn is_dangerous_powershell_words(words: &[String]) -> bool {
     if matches!(
         command.as_str(),
         "remove-item" | "ri" | "rm" | "del" | "erase" | "rd" | "rmdir"
-    ) && args
-        .iter()
-        .any(|arg| arg.eq_ignore_ascii_case("-Force") || arg.eq_ignore_ascii_case("-Force:$true"))
+    ) && args.iter().any(|arg| is_powershell_force_parameter(arg))
     {
         return true;
     }
     is_direct_gui_launch(words)
+}
+
+/// PowerShell binds any unambiguous parameter prefix (`-Fo`, `-forc`) and treats the en dash,
+/// em dash, and horizontal bar as parameter dashes, so `-Force` cannot be matched literally.
+fn is_powershell_force_parameter(token: &str) -> bool {
+    let Some(name) = token.strip_prefix(['-', '\u{2013}', '\u{2014}', '\u{2015}']) else {
+        return false;
+    };
+    let name = name.split_once(':').map_or(name, |(name, _)| name);
+    // A bare `-F` is ambiguous with Remove-Item's `-Filter`, so PowerShell rejects it.
+    name.len() >= 2 && "force".starts_with(name.to_ascii_lowercase().as_str())
 }
 
 fn is_dangerous_powershell_script_tokens(words: &[String]) -> bool {
@@ -137,7 +146,8 @@ fn is_dangerous_cmd(command: &[String]) -> bool {
     for arg in iter.by_ref() {
         let lower = arg.to_ascii_lowercase();
         match lower.as_str() {
-            "/c" | "/r" | "-c" => break,
+            // `/k` runs the command body like `/c` and then keeps the shell open.
+            "/c" | "/r" | "/k" | "-c" => break,
             _ if lower.starts_with('/') => continue,
             // Unknown tokens before the command body => bail.
             _ => return false,
@@ -172,14 +182,14 @@ fn is_dangerous_cmd(command: &[String]) -> bool {
         }
         // Force delete: del /f, erase /f
         if (cmd.eq_ignore_ascii_case("del") || cmd.eq_ignore_ascii_case("erase"))
-            && has_force_flag_cmd(segment)
+            && has_cmd_switch(segment, 'f')
         {
             return true;
         }
         // Recursive directory removal: rd /s /q, rmdir /s /q
         if (cmd.eq_ignore_ascii_case("rd") || cmd.eq_ignore_ascii_case("rmdir"))
-            && has_recursive_flag_cmd(segment)
-            && has_quiet_flag_cmd(segment)
+            && has_cmd_switch(segment, 's')
+            && has_cmd_switch(segment, 'q')
         {
             return true;
         }
@@ -274,10 +284,7 @@ fn has_force_delete_cmdlet(tokens: &[String]) -> bool {
                 has_delete |= DELETE_CMDLETS
                     .iter()
                     .any(|cmd| atom.eq_ignore_ascii_case(cmd));
-                has_force |= atom.eq_ignore_ascii_case("-force")
-                    || atom
-                        .get(..7)
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("-force:"));
+                has_force |= is_powershell_force_parameter(atom);
                 if has_delete && has_force {
                     return true;
                 }
@@ -287,19 +294,14 @@ fn has_force_delete_cmdlet(tokens: &[String]) -> bool {
     false
 }
 
-/// Check for /f or /F flag in CMD del/erase arguments.
-fn has_force_flag_cmd(args: &[&str]) -> bool {
-    args.iter().any(|a| a.eq_ignore_ascii_case("/f"))
-}
-
-/// Check for /s or /S flag in CMD rd/rmdir arguments.
-fn has_recursive_flag_cmd(args: &[&str]) -> bool {
-    args.iter().any(|a| a.eq_ignore_ascii_case("/s"))
-}
-
-/// Check for /q or /Q flag in CMD rd/rmdir arguments.
-fn has_quiet_flag_cmd(args: &[&str]) -> bool {
-    args.iter().any(|a| a.eq_ignore_ascii_case("/q"))
+/// Check a CMD builtin's switches case-insensitively. CMD accepts switches joined in one
+/// token (`rd /s/q`, `del /f/q`) and switch values after a colon (`del /a:h`).
+fn has_cmd_switch(args: &[&str], switch: char) -> bool {
+    args.iter()
+        .filter(|arg| arg.starts_with('/'))
+        .flat_map(|arg| arg.split('/'))
+        .filter_map(|group| group.chars().next())
+        .any(|ch| ch.eq_ignore_ascii_case(&switch))
 }
 
 fn args_have_url(args: &[impl AsRef<str>]) -> bool {
@@ -844,6 +846,56 @@ mod tests {
             "file",
             "-Forceful"
         ])));
+    }
+
+    #[test]
+    fn powershell_force_parameter_prefixes_and_dash_variants_are_dangerous() {
+        // PowerShell binds each of these to Remove-Item -Force (verified against pwsh 7 and
+        // Windows PowerShell 5.1 by deleting a read-only file).
+        for force in [
+            "-Fo",
+            "-forc",
+            "-FORCE",
+            "\u{2013}Force",
+            "\u{2014}Fo",
+            "\u{2015}force",
+            "-Fo:$true",
+        ] {
+            let script = format!("Remove-Item test {force}");
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["powershell", "-Command", &script])),
+                "{script}"
+            );
+            assert!(
+                is_dangerous_powershell_words(&vec_str(&["Remove-Item", "test", force])),
+                "{force}"
+            );
+        }
+        for not_force in ["-F", "-Filter", "-Forceful", "-fx", "Force"] {
+            assert!(
+                !is_dangerous_powershell_words(&vec_str(&["Remove-Item", "test", not_force])),
+                "{not_force}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_joined_switches_and_keep_open_shell_are_dangerous() {
+        for command in [
+            vec_str(&["cmd", "/c", "rd", "/s/q", "build"]),
+            vec_str(&["cmd", "/c", "rmdir /Q/S build"]),
+            vec_str(&["cmd", "/c", "del /f/q file.txt"]),
+            vec_str(&["cmd", "/c", "del", "/A:R/F", "file.txt"]),
+            vec_str(&["cmd", "/k", "del", "/f", "file.txt"]),
+        ] {
+            assert!(is_dangerous_command_windows(&command), "{command:?}");
+        }
+        for command in [
+            vec_str(&["cmd", "/c", "rd", "/s", "build"]),
+            vec_str(&["cmd", "/c", "del", "/q", "C:/fast/file.txt"]),
+        ] {
+            assert!(!is_dangerous_command_windows(&command), "{command:?}");
+        }
     }
 
     #[test]

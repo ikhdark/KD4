@@ -248,6 +248,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "read_file",
         "list_files",
         "update_plan",
+        "context_checkpoint",
         "request_user_input",
         "request_permissions",
         "apply_patch",
@@ -543,13 +544,21 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
         .expect("initial permissions context");
     let second_permissions = message_texts(&body2, "developer")
         .into_iter()
+        .rev()
         .find(|text| text.starts_with("<permissions instructions>"))
         .expect("updated permissions context");
     assert_ne!(first_permissions, second_permissions);
+    assert_eq!(
+        message_texts(&body2, "developer")
+            .into_iter()
+            .find(|text| text.starts_with("<permissions instructions>")),
+        Some(first_permissions)
+    );
 
     let env_contexts = environment_contexts(&body2);
-    assert_eq!(env_contexts.len(), 1);
-    let env_text = env_contexts[0];
+    assert_eq!(env_contexts.len(), 2);
+    assert_eq!(env_contexts[0], environment_contexts(&body1)[0]);
+    let env_text = env_contexts[1];
     assert_env_context_fragment(env_text);
     assert!(
         env_text.contains("<permission_profile type=\"managed\">")
@@ -814,9 +823,16 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
         .expect("initial permissions context");
     let second_permissions = message_texts(&body2, "developer")
         .into_iter()
+        .rev()
         .find(|text| text.starts_with("<permissions instructions>"))
         .expect("updated permissions context");
     assert_ne!(first_permissions, second_permissions);
+    assert_eq!(
+        message_texts(&body2, "developer")
+            .into_iter()
+            .find(|text| text.starts_with("<permissions instructions>")),
+        Some(first_permissions)
+    );
     assert!(
         request2.has_message_with_input_texts("developer", |texts| {
             texts.iter().any(|text| text.contains("<model_switch>"))
@@ -824,8 +840,9 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
         "expected model switch section after model override"
     );
     let env_contexts = environment_contexts(&body2);
-    assert_eq!(env_contexts.len(), 1);
-    let env_text = env_contexts[0];
+    assert_eq!(env_contexts.len(), 2);
+    assert_eq!(env_contexts[0], environment_contexts(&body1)[0]);
+    let env_text = env_contexts[1];
     let expected_cwd = new_cwd.path().display().to_string();
     assert_env_context_location(env_text, &expected_cwd);
     assert!(env_text.contains("<current_date>"));
@@ -1061,8 +1078,9 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         "expected model switch section after model override"
     );
     let updated_env = environment_contexts(&body2);
-    assert_eq!(updated_env.len(), 1);
-    let expected_env_update_text = updated_env[0];
+    assert_eq!(updated_env.len(), 2);
+    assert_eq!(updated_env[0], initial_env[0]);
+    let expected_env_update_text = updated_env[1];
     assert_env_context_fragment(expected_env_update_text);
     assert!(
         expected_env_update_text.contains(
@@ -1143,7 +1161,13 @@ async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_r
             .any(|item| item["call_id"] == "plan-call")
     );
 
-    assert!(requests[2].inputs_of_type("reasoning").is_empty());
+    let request_3_reasoning = requests[2].inputs_of_type("reasoning");
+    assert_eq!(request_3_reasoning.len(), 2);
+    assert_eq!(request_3_reasoning[0], request_2_reasoning[0]);
+    assert_eq!(request_3_reasoning[1]["id"], "rs_reasoning_2");
+    assert_eq!(request_3_reasoning[1]["summary"][0]["text"], "summary two");
+    assert_eq!(request_3_reasoning[1]["content"][0]["text"], "plaintext two");
+    assert!(request_3_reasoning[1]["encrypted_content"].is_string());
 
     test.codex.flush_rollout().await?;
     let persisted_reasoning = persisted_reasoning_items(&rollout_path);

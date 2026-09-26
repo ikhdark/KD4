@@ -9,6 +9,7 @@ use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
 use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
@@ -159,6 +160,54 @@ fn manager_attaches_optional_service_name_tag() -> Result<()> {
     assert_eq!(
         attrs.get("service_name"),
         Some(&"my_app_server_client".to_string())
+    );
+
+    Ok(())
+}
+
+// Provider model names and spawned-agent sources must not reject or explode metadata tags.
+#[test]
+fn manager_sanitizes_model_and_bounds_session_source_tags() -> Result<()> {
+    let (metrics, exporter) = build_metrics_with_defaults(&[])?;
+    let manager = SessionTelemetry::new(
+        ThreadId::new(),
+        "gpt-oss:20b",
+        "gpt-oss:20b",
+        /*account_id*/ None,
+        /*account_email*/ None,
+        /*auth_mode*/ None,
+        "test_originator".to_string(),
+        /*log_user_prompts*/ false,
+        "tty".to_string(),
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+    )
+    .with_metrics(metrics);
+
+    manager.counter("codex.session_started", /*inc*/ 1, &[]);
+    manager.shutdown_metrics()?;
+
+    let resource_metrics = latest_metrics(&exporter);
+    let metric =
+        find_metric(&resource_metrics, "codex.session_started").expect("counter metric missing");
+    let attrs = match metric.data() {
+        AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+            let points: Vec<_> = sum.data_points().collect();
+            assert_eq!(points.len(), 1);
+            attributes_to_map(points[0].attributes())
+        }
+        _ => panic!("unexpected counter data"),
+    };
+
+    assert_eq!(attrs.get("model"), Some(&"gpt-oss_20b".to_string()));
+    assert_eq!(
+        attrs.get("session_source"),
+        Some(&"subagent_thread_spawn_d1".to_string())
     );
 
     Ok(())

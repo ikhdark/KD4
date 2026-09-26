@@ -3,8 +3,6 @@
 //! This crate owns the trace schema. Hot-path Codex code should depend on the
 //! small writer API here; semantic replay and viewer projections stay outside
 //! `codex-core`.
-//!
-//! See `README.md` for the system diagram and reducer model.
 
 mod bundle;
 mod code_cell;
@@ -54,7 +52,7 @@ pub use raw_event::RawTraceEvent;
 pub use raw_event::RawTraceEventContext;
 /// Typed payload for one raw trace event.
 pub use raw_event::RawTraceEventPayload;
-/// Replay a raw trace bundle and write/read its reduced `RolloutTrace`.
+/// Replay a raw trace bundle into its reduced `RolloutTrace`; callers own any cache file.
 pub use reducer::replay_bundle;
 /// Raw payload captured when a child agent reports completion to its parent.
 pub use thread::AgentResultTracePayload;

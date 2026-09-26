@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used)]
 
-// Bounded replacement shard for the legacy `all` integration target.
+// Bounded codex-core integration shard.
 // Thread history, compaction, resume/fork, and persisted-state integration tests.
 // `compact_resume_fork` and `window_headers` import from `compact`, so the three
 // stay in this shard together.
@@ -8,7 +8,6 @@
 // The `suite` module is rooted at `tests/suite/` so test IDs stay
 // `suite::<module>::<test>`, and the shared bootstrap comes from the one
 // included prelude. Each shard compiles only its assigned source modules.
-pub use codex_protocol::error;
 
 #[path = "suite"]
 mod suite {

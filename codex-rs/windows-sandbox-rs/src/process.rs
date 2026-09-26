@@ -14,6 +14,9 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::time::Instant;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -341,15 +344,42 @@ pub unsafe fn spawn_process_with_pipes(
     })
 }
 
+/// Bounds how long exit delivery waits for output readers once the root process has stopped.
+///
+/// Descendants preserved after a root exit may hold inherited stdout/stderr handles open
+/// indefinitely, and a preserved job can no longer be terminated, so reader EOF must not gate
+/// exit delivery.
+pub const OUTPUT_DRAIN_AFTER_ROOT_EXIT: Duration = Duration::from_secs(1);
+
+const OUTPUT_READER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Waits up to `timeout` for every reader thread to finish; returns whether all finished.
+///
+/// Readers still running at the deadline are left to finish on their own.
+pub fn wait_for_output_readers(readers: &[&JoinHandle<()>], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if readers.iter().all(|reader| reader.is_finished()) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(OUTPUT_READER_POLL_INTERVAL.min(remaining));
+    }
+}
+
 /// Reads a HANDLE until EOF and invokes `on_chunk` for each read.
-pub fn read_handle_loop<F>(handle: HANDLE, mut on_chunk: F) -> std::thread::JoinHandle<()>
+///
+/// Ownership of `handle` transfers to the reader thread, which closes it after EOF or a read error.
+pub fn read_handle_loop<F>(handle: HANDLE, mut on_chunk: F) -> JoinHandle<()>
 where
     F: FnMut(&[u8]) + Send + 'static,
 {
     // Raw Win32 handles are pointer-typed in windows-sys 0.61. Transfer the
     // address value across the thread boundary and reconstruct the opaque
-    // handle in the reader thread; the caller retains responsibility for the
-    // handle's lifetime.
+    // handle in the reader thread.
     let handle_addr = handle as usize;
     std::thread::spawn(move || {
         let handle = handle_addr as HANDLE;
@@ -379,4 +409,37 @@ where
             CloseHandle(handle);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_output_readers;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    #[test]
+    fn output_reader_wait_is_bounded_while_a_reader_stays_open() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let finished = std::thread::spawn(|| {});
+        // Models a reader whose pipe is still held open by a preserved descendant.
+        let blocked = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+
+        let started = Instant::now();
+        assert!(!wait_for_output_readers(
+            &[&finished, &blocked],
+            Duration::from_millis(50)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        drop(release_tx);
+        assert!(wait_for_output_readers(
+            &[&finished, &blocked],
+            Duration::from_secs(5)
+        ));
+        blocked.join().expect("join released reader");
+        finished.join().expect("join finished reader");
+    }
 }

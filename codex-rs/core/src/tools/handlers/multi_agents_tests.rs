@@ -1259,20 +1259,15 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(c
     let FunctionCallOutputBody::Text(receipt_text) = &output.body else {
         panic!("receipt response must include the evidence projection");
     };
-    // The normal runtime returns a JSON projection header followed by selected text.
-    let receipt_header: serde_json::Value = serde_json::from_str(
-        receipt_text
-            .lines()
-            .next()
-            .expect("receipt projection header"),
-    )
-    .expect("receipt projection JSON");
+    // A bounded receipt fits inline without a separate projection envelope.
+    let receipt_header: serde_json::Value =
+        serde_json::from_str(receipt_text).expect("receipt result JSON");
     assert_eq!(
-        receipt_header["essential"]["criterion_counts"]["with_execution_reference"],
+        receipt_header["completion_evidence"]["criterion_counts"]["with_execution_reference"],
         1
     );
     assert_eq!(
-        receipt_header["essential"]["criterion_counts"]["reported_passed_without_execution_reference"],
+        receipt_header["completion_evidence"]["criterion_counts"]["reported_passed_without_execution_reference"],
         0
     );
     before_initial_submission.release_one();
@@ -6042,6 +6037,24 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
         .await
         .expect("list_agents should succeed");
     let (content, _) = expect_text_output(output);
+    let codex_tools::ToolSpec::Function(list_spec) = ListAgentsHandlerV2.spec() else {
+        panic!("list_agents should be a function tool");
+    };
+    let schema = list_spec
+        .output_schema
+        .expect("list_agents output schema")
+        .into_value();
+    let listed: serde_json::Value =
+        serde_json::from_str(&content).expect("list_agents result should be json");
+    let schema_errors = jsonschema::validator_for(&schema)
+        .expect("compile list_agents output schema")
+        .iter_errors(&listed)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        schema_errors.is_empty(),
+        "list_agents output must match its advertised schema: {schema_errors:?}"
+    );
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
     assert_eq!(result.agents.len(), 2);

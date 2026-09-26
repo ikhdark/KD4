@@ -136,19 +136,18 @@ async fn collect_output_until_exit(
             }
             res = &mut exit_rx => {
                 let code = res.unwrap_or(-1);
-                // On Windows (ConPTY in particular), it's possible to observe the exit notification
-                // before the final bytes are drained from the PTY reader thread. Drain for a brief
-                // "quiet" window to make output assertions deterministic.
-                let (quiet_ms, max_ms) = (200, 2_000);
-                let quiet = tokio::time::Duration::from_millis(quiet_ms);
-                let max_deadline =
-                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
-                while tokio::time::Instant::now() < max_deadline {
-                    match tokio::time::timeout(quiet, output_rx.recv()).await {
+                // Final bytes can arrive after the exit notification. Pipes close with the
+                // child's handles, and ConPTY closes once its pseudoconsole is released after
+                // exit, so drain until the output closes (bounded).
+                let drain_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+                loop {
+                    match tokio::time::timeout_at(drain_deadline, output_rx.recv()).await {
                         Ok(Ok(chunk)) => collected.extend_from_slice(&chunk),
                         Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                        Err(_) => break,
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => {
+                            break;
+                        }
                     }
                 }
                 return (collected, code);
@@ -275,6 +274,89 @@ async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
     );
     assert_eq!(code, 0, "expected python to exit cleanly");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pty_output_closes_with_final_frame_after_root_exit() -> anyhow::Result<()> {
+    // ConPTY holds its output pipe open until the pseudoconsole is released, so a consumer
+    // that only awaits exit and drains output must still receive the final frame and EOF.
+    let marker = "__CODEX_PTY_EXIT_MARKER__";
+    let (program, args) = shell_command(&format!("echo {marker}"));
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let SpawnedProcess {
+        session,
+        stdout_rx,
+        exit_rx,
+        ..
+    } = spawn_pty_process(
+        &program,
+        &args,
+        Path::new("."),
+        &env_map,
+        &None,
+        TerminalSize::default(),
+    )
+    .await?;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        collect_split_output(stdout_rx),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("PTY output stayed open after the root exited"))?;
+
+    assert_eq!(exit_rx.await?, 0);
+    assert!(
+        String::from_utf8_lossy(&output).contains(marker),
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+    // The released terminal leaves nothing to resize; that is not an error.
+    session.resize(TerminalSize {
+        rows: 30,
+        cols: 100,
+    })?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finishing_an_exited_pty_keeps_output_written_before_exit() -> anyhow::Result<()> {
+    // Consumers finish a session as soon as they observe an early exit. Releasing the
+    // pseudoconsole then must not discard the output ConPTY has yet to deliver. Several
+    // attempts make a lost final frame visible despite the race it depends on.
+    let marker = "__CODEX_PTY_FINISH_MARKER__";
+    let (program, args) = shell_command(&format!("echo {marker}"));
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    for attempt in 0..5 {
+        let SpawnedProcess {
+            session,
+            stdout_rx,
+            exit_rx,
+            ..
+        } = spawn_pty_process(
+            &program,
+            &args,
+            Path::new("."),
+            &env_map,
+            &None,
+            TerminalSize::default(),
+        )
+        .await?;
+        let collector = tokio::spawn(collect_split_output(stdout_rx));
+
+        assert_eq!(exit_rx.await?, 0);
+        session.finish();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), collector)
+            .await
+            .map_err(|_| anyhow::anyhow!("finished PTY output did not close"))??;
+        assert!(
+            String::from_utf8_lossy(&output).contains(marker),
+            "attempt {attempt}: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     Ok(())
 }
 
@@ -421,10 +503,8 @@ async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipe_drains_stderr_without_stdout_activity() -> anyhow::Result<()> {
-    let Some(python) = find_python() else {
-        eprintln!("python not found; skipping pipe_drains_stderr_without_stdout_activity");
-        return Ok(());
-    };
+    let python = find_python()
+        .ok_or_else(|| anyhow::anyhow!("Python is required to verify stderr-only pipe draining"))?;
 
     let script = "import sys\nchunk = 'E' * 65536\nfor _ in range(64):\n    sys.stderr.write(chunk)\n    sys.stderr.flush()\n";
     let args = vec!["-c".to_string(), script.to_string()];

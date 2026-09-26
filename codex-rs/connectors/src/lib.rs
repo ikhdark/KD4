@@ -238,10 +238,23 @@ where
         return Ok(cached_connectors);
     }
 
-    let mut apps = list_directory_connectors(&mut fetch_page).await?;
-    if cache_context.cache_key.is_workspace_account {
-        apps.extend(list_workspace_connectors(&mut fetch_page).await?);
-    }
+    let apps = if cache_context.cache_key.is_workspace_account {
+        // The workspace page is independent of the paginated public directory.
+        // Overlap both request chains; either failure still publishes nothing.
+        let workspace_page =
+            fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string());
+        let (mut apps, workspace_page) =
+            tokio::try_join!(list_directory_connectors(&mut fetch_page), workspace_page)?;
+        apps.extend(
+            workspace_page
+                .apps
+                .into_iter()
+                .filter(|app| !is_hidden_directory_app(app)),
+        );
+        apps
+    } else {
+        list_directory_connectors(&mut fetch_page).await?
+    };
 
     let mut connectors = merge_directory_apps(apps)
         .into_iter()
@@ -335,20 +348,6 @@ where
         );
     }
     Ok(apps)
-}
-
-async fn list_workspace_connectors<F, Fut>(fetch_page: &mut F) -> anyhow::Result<Vec<DirectoryApp>>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = anyhow::Result<DirectoryListResponse>>,
-{
-    let response =
-        fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string()).await?;
-    Ok(response
-        .apps
-        .into_iter()
-        .filter(|app| !is_hidden_directory_app(app))
-        .collect())
 }
 
 fn merge_directory_apps(apps: Vec<DirectoryApp>) -> Vec<DirectoryApp> {
@@ -1074,6 +1073,58 @@ mod tests {
         assert_eq!(
             connectors[1].install_url.as_deref(),
             Some("https://chatgpt.com/apps/beta/beta%2F%E9%9B%AA%3Fquery%23fragment%25")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "test serializes access to the shared connector cache for its full duration"
+    )]
+    async fn list_all_connectors_overlaps_workspace_and_directory_requests() -> anyhow::Result<()> {
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+
+        let codex_home = TempDir::new()?;
+        let cache_context = cache_context(&codex_home, "overlap", true);
+        let workspace_started = Arc::new(tokio::sync::Notify::new());
+
+        // The directory page completes only after the workspace request is polled,
+        // so a serialized refresh cannot finish; the timeout only bounds that regression.
+        let connectors = tokio::time::timeout(
+            Duration::from_secs(1),
+            list_all_connectors_with_options(
+                cache_context,
+                /*force_refetch*/ true,
+                move |path| {
+                    let workspace_started = Arc::clone(&workspace_started);
+                    async move {
+                        if path.starts_with("/connectors/directory/list_workspace") {
+                            workspace_started.notify_one();
+                            Ok(DirectoryListResponse {
+                                apps: vec![app("workspace", "Workspace")],
+                                next_token: None,
+                            })
+                        } else {
+                            workspace_started.notified().await;
+                            Ok(DirectoryListResponse {
+                                apps: vec![app("directory", "Directory")],
+                                next_token: None,
+                            })
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("workspace request should start while the directory request is pending")?;
+
+        assert_eq!(
+            connectors
+                .into_iter()
+                .map(|connector| connector.id)
+                .collect::<Vec<_>>(),
+            vec!["directory".to_string(), "workspace".to_string()]
         );
         Ok(())
     }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use app_test_support::TestAppServer;
+use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::format_with_current_shell_display;
@@ -493,7 +494,7 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
         /*workdir*/ None,
         Some(5000),
         "call-approve",
-    )?];
+    )?, create_final_assistant_message_sse_response("command declined")?];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(
         codex_home.as_path(),

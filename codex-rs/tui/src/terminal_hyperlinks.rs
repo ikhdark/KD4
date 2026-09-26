@@ -381,6 +381,7 @@ fn terminal_destination(destination: &str) -> Option<String> {
     is_editor_file_uri.then_some(safe_destination)
 }
 
+#[cfg(test)]
 pub(crate) fn osc8_hyperlink(destination: &str, text: &str) -> String {
     let Some(safe_destination) = terminal_destination(destination) else {
         return text.to_string();
@@ -425,8 +426,18 @@ pub(crate) fn strip_osc8(text: &str) -> String {
     stripped
 }
 
+/// Prepare spans for raw scrollback writes, which bypass ratatui's control-character filtering.
+///
+/// Graphemes containing control characters other than tab are dropped so untrusted text cannot
+/// emit terminal sequences; they still advance the column so link ranges stay aligned.
 pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
-    if line.hyperlinks.is_empty() {
+    if line.hyperlinks.is_empty()
+        && !line
+            .line
+            .spans
+            .iter()
+            .any(|span| span.content.contains(is_scrollback_control))
+    {
         return line.line.spans.clone();
     }
 
@@ -464,7 +475,9 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
                 }
                 active_link_index = selected_link_index;
             }
-            push_styled_content(&mut out, grapheme, span.style);
+            if !grapheme.contains(is_scrollback_control) {
+                push_styled_content(&mut out, grapheme, span.style);
+            }
             column += width;
         }
     }
@@ -472,6 +485,10 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
         append_to_last_span(&mut out, "\x1b]8;;\x07");
     }
     out
+}
+
+fn is_scrollback_control(ch: char) -> bool {
+    ch.is_control() && ch != '\t'
 }
 
 fn push_styled_content(out: &mut Vec<Span<'static>>, content: &str, style: ratatui::style::Style) {
@@ -702,6 +719,27 @@ mod tests {
             decorate_spans(&HyperlinkLine::new(Line::from("not linked"))),
             vec![Span::from("not linked")]
         );
+    }
+
+    #[test]
+    fn decorated_spans_drop_terminal_controls_and_keep_link_columns() {
+        let destination = "https://example.com/";
+        let mut line = HyperlinkLine::from("a\x1b[2J\tb\u{9b}0m ");
+        line.push_span(Span::raw("link"), Some(destination));
+        let decorated: String = decorate_spans(&line)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            decorated,
+            format!("a[2J\tb0m {}", osc8_hyperlink(destination, "link"))
+        );
+
+        let unlinked: String = decorate_spans(&HyperlinkLine::from("x\x1b]0;title\x07y"))
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(unlinked, "x]0;titley");
     }
 
     #[test]

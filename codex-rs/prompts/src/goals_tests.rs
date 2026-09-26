@@ -13,8 +13,7 @@ fn continuation_prompt_allows_complete_and_strict_blocked_updates() {
         time_used_seconds: 56,
         created_at: 1,
         updated_at: 2,
-    })
-    .replace("\r\n", "\n");
+    });
 
     assert!(prompt.contains("finish the stack"));
     assert!(prompt.contains("<objective>\nfinish the stack\n</objective>"));
@@ -43,8 +42,7 @@ fn budget_limit_prompt_steers_model_to_wrap_up_without_pausing() {
         time_used_seconds: 56,
         created_at: 1,
         updated_at: 2,
-    })
-    .replace("\r\n", "\n");
+    });
 
     assert!(prompt.contains("finish the stack"));
     assert!(prompt.contains("<objective>\nfinish the stack\n</objective>"));
@@ -65,8 +63,7 @@ fn objective_updated_prompt_supersedes_previous_goal_context() {
         time_used_seconds: 56,
         created_at: 1,
         updated_at: 2,
-    })
-    .replace("\r\n", "\n");
+    });
 
     assert!(prompt.contains("edited by the user"));
     assert!(prompt.contains("Report edits that only served the superseded objective."));

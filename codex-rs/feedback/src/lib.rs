@@ -13,9 +13,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_http_client::BlockingHttpClient;
+use codex_http_client::BlockingHttpClientBuilder;
 use codex_login::AuthEnvTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
+use sentry::types::Dsn;
 use tracing::Event;
 use tracing::Level;
 use tracing::field::Visit;
@@ -37,7 +40,12 @@ pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
     "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
-const UPLOAD_TIMEOUT_SECS: u64 = 10;
+/// Allowance for connecting and for Sentry to acknowledge the envelope.
+const UPLOAD_BASE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Conservative sustained upload rate that extends the deadline for large envelopes.
+const UPLOAD_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
+/// Envelope headers and the event item, beyond the attachment payloads.
+const ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024;
 const FEEDBACK_TAGS_TARGET: &str = "feedback_tags";
 const MAX_FEEDBACK_TAGS: usize = 64;
 const MAX_FEEDBACK_TAG_VALUE_BYTES: usize = 1024;
@@ -203,11 +211,15 @@ impl CodexFeedback {
             .with_ansi(false)
             .with_target(false)
             // Capture everything, regardless of the caller's `RUST_LOG`, so feedback includes the
-            // full trace when the user uploads a report.
+            // full trace when the user uploads a report. OTel export-only targets stay with their
+            // exporters, as in the SQLite log sink: accepting them here would keep telemetry
+            // builders enabled without an exporter and flood the buffer with per-event records.
             .with_filter(
                 Targets::new()
                     .with_default(Level::TRACE)
-                    .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF),
+                    .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF)
+                    .with_target("codex_otel.log_only", LevelFilter::OFF)
+                    .with_target("codex_otel.trace_safe", LevelFilter::OFF),
             )
     }
 
@@ -420,35 +432,38 @@ impl FeedbackSnapshot {
         Ok(path)
     }
 
-    /// Upload feedback to Sentry with optional attachments.
+    /// Uploads feedback to Sentry and returns once Sentry has accepted it.
+    ///
+    /// Blocks the calling thread until the envelope is accepted, rejected, or the size-scaled
+    /// upload deadline expires; async callers must run it on a blocking thread. An error means
+    /// the report was not accepted.
     pub fn upload_feedback(&self, options: FeedbackUploadOptions<'_>) -> Result<()> {
-        use std::str::FromStr;
-        use std::sync::Arc;
-
-        use sentry::Client;
-        use sentry::ClientOptions;
-        use sentry::transports::DefaultTransportFactory;
-        use sentry::types::Dsn;
-
-        // Build Sentry client
-        let client = Client::from_config(ClientOptions {
-            dsn: Some(Dsn::from_str(SENTRY_DSN).map_err(|e| anyhow!("invalid DSN: {e}"))?),
-            transport: Some(Arc::new(DefaultTransportFactory {})),
-            ..Default::default()
-        });
-
-        self.upload_feedback_with_client(options, &client)
+        let dsn: Dsn = SENTRY_DSN
+            .parse()
+            .map_err(|e| anyhow!("invalid DSN: {e}"))?;
+        let client = BlockingHttpClientBuilder::new()
+            .build_with_transport_default_proxy()
+            .map_err(|err| anyhow!("failed to build feedback upload client: {err}"))?;
+        self.upload_feedback_with_client(options, &client, &dsn)
     }
 
     fn upload_feedback_with_client(
         &self,
         options: FeedbackUploadOptions<'_>,
-        client: &sentry::Client,
+        client: &BlockingHttpClient,
+        dsn: &Dsn,
     ) -> Result<()> {
+        let body = self.encode_envelope(options)?;
+        let deadline = upload_deadline(body.len());
+        send_envelope(client, dsn, body, deadline)
+    }
+
+    fn encode_envelope(&self, options: FeedbackUploadOptions<'_>) -> Result<Vec<u8>> {
         use sentry::protocol::Envelope;
         use sentry::protocol::EnvelopeItem;
         use sentry::protocol::Event;
         use sentry::protocol::Level;
+        use sentry::protocol::Value;
 
         let tags = self.upload_tags(
             options.classification,
@@ -485,22 +500,30 @@ impl FeedbackSnapshot {
                 ..Default::default()
             }]);
         }
-        envelope.add_item(EnvelopeItem::Event(event));
-
-        for attachment in self.feedback_attachments(
+        let (attachments, omitted) = self.feedback_attachments(
             options.include_logs,
             options.extra_attachments,
             options.extra_attachment_paths,
             options.logs_override,
-        ) {
+        );
+        // Skips are otherwise only logged locally, after the uploaded logs were captured.
+        if !omitted.is_empty() {
+            event
+                .extra
+                .insert("omitted_attachments".to_string(), Value::from(omitted));
+        }
+        envelope.add_item(EnvelopeItem::Event(event));
+
+        let mut body_capacity = ENVELOPE_OVERHEAD_BYTES;
+        for attachment in attachments {
+            body_capacity += attachment.buffer.len();
             envelope.add_item(EnvelopeItem::Attachment(attachment));
         }
-
-        client.send_envelope(envelope);
-        if !client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS))) {
-            return Err(anyhow!("feedback upload did not finish before the timeout"));
-        }
-        Ok(())
+        let mut body = Vec::with_capacity(body_capacity);
+        envelope
+            .to_writer(&mut body)
+            .map_err(|err| anyhow!("failed to encode feedback envelope: {err}"))?;
+        Ok(body)
     }
 
     fn upload_tags(
@@ -552,21 +575,24 @@ impl FeedbackSnapshot {
         tags
     }
 
+    /// Returns the attachments to upload and a description of each one that was skipped.
     fn feedback_attachments(
         &self,
         include_logs: bool,
         extra_attachments: &[FeedbackAttachment],
         extra_attachment_paths: &[FeedbackAttachmentPath],
         logs_override: Option<Vec<u8>>,
-    ) -> Vec<sentry::protocol::Attachment> {
+    ) -> (Vec<sentry::protocol::Attachment>, Vec<String>) {
         use sentry::protocol::Attachment;
 
         let mut attachments = Vec::new();
+        let mut omitted = Vec::new();
         let mut remaining = MAX_TOTAL_ATTACHMENT_BYTES;
 
         if include_logs {
             let logs = logs_override.as_deref().unwrap_or(&self.bytes);
-            if reserve_attachment_bytes("codex-logs.log", logs.len(), &mut remaining) {
+            if reserve_attachment_bytes("codex-logs.log", logs.len(), &mut remaining, &mut omitted)
+            {
                 attachments.push(Attachment {
                     buffer: logs_override.unwrap_or_else(|| self.bytes.clone()),
                     filename: String::from("codex-logs.log"),
@@ -584,6 +610,7 @@ impl FeedbackSnapshot {
                         &attachment.filename,
                         attachment.buffer.len(),
                         &mut remaining,
+                        &mut omitted,
                     )
                 })
                 .map(|attachment| Attachment {
@@ -599,6 +626,7 @@ impl FeedbackSnapshot {
                 FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME,
                 text.len(),
                 &mut remaining,
+                &mut omitted,
             )
         {
             attachments.push(Attachment {
@@ -610,6 +638,16 @@ impl FeedbackSnapshot {
         }
 
         for attachment_path in extra_attachment_paths {
+            let filename = attachment_path
+                .attachment_filename_override
+                .clone()
+                .unwrap_or_else(|| {
+                    attachment_path
+                        .path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "extra-log.log".to_string())
+                });
             let limit = remaining.min(MAX_ATTACHMENT_BYTES);
             let data = match fs::File::open(&attachment_path.path).and_then(|file| {
                 let mut data = Vec::new();
@@ -623,20 +661,11 @@ impl FeedbackSnapshot {
                         error = %err,
                         "failed to read log attachment; skipping"
                     );
+                    omitted.push(format!("{filename}: read failed: {err}"));
                     continue;
                 }
             };
-            let filename = attachment_path
-                .attachment_filename_override
-                .clone()
-                .unwrap_or_else(|| {
-                    attachment_path
-                        .path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "extra-log.log".to_string())
-                });
-            if !reserve_attachment_bytes(&filename, data.len(), &mut remaining) {
+            if !reserve_attachment_bytes(&filename, data.len(), &mut remaining, &mut omitted) {
                 continue;
             }
             let content_type = match Path::new(&filename)
@@ -659,21 +688,86 @@ impl FeedbackSnapshot {
             });
         }
 
-        attachments
+        (attachments, omitted)
     }
 }
 
-fn reserve_attachment_bytes(filename: &str, bytes: usize, remaining: &mut usize) -> bool {
+fn reserve_attachment_bytes(
+    filename: &str,
+    bytes: usize,
+    remaining: &mut usize,
+    omitted: &mut Vec<String>,
+) -> bool {
     if bytes > MAX_ATTACHMENT_BYTES || bytes > *remaining {
         tracing::warn!(
             filename,
             bytes,
             "feedback attachment exceeds upload byte budget; skipping"
         );
+        // Path-backed reads stop one byte past the limit, so report the limit, not a size.
+        omitted.push(if bytes > MAX_ATTACHMENT_BYTES {
+            format!("{filename}: exceeds the {MAX_ATTACHMENT_BYTES}-byte attachment limit")
+        } else {
+            format!("{filename}: exceeds the remaining {remaining}-byte upload budget")
+        });
         return false;
     }
     *remaining -= bytes;
     true
+}
+
+/// Deadline for one envelope POST, scaled so large attachments are not cut off on slow links.
+fn upload_deadline(body_bytes: usize) -> Duration {
+    UPLOAD_BASE_TIMEOUT + Duration::from_secs(body_bytes as u64 / UPLOAD_MIN_BYTES_PER_SEC)
+}
+
+/// Sends an encoded envelope and succeeds only when Sentry accepts it.
+///
+/// The request timeout bounds the whole exchange, so callers are never held past `deadline`.
+fn send_envelope(
+    client: &BlockingHttpClient,
+    dsn: &Dsn,
+    body: Vec<u8>,
+    deadline: Duration,
+) -> Result<()> {
+    let user_agent = sentry::ClientOptions::default().user_agent;
+    let auth = dsn.to_auth(Some(&user_agent)).to_string();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::HeaderName::from_static("x-sentry-auth"),
+        http::HeaderValue::from_str(&auth)
+            .map_err(|err| anyhow!("invalid feedback upload auth header: {err}"))?,
+    );
+    let response = client
+        .post(dsn.envelope_api_url())
+        .headers(headers)
+        .body(body)
+        .timeout(deadline)
+        .send()
+        .map_err(|err| {
+            if err.is_timeout() {
+                anyhow!("feedback upload did not finish within {deadline:?}")
+            } else {
+                anyhow!("feedback upload failed: {}", error_chain(&err))
+            }
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("feedback upload was rejected with HTTP {status}"));
+    }
+    Ok(())
+}
+
+/// Formats an error with its sources, which carry the connect/TLS/proxy cause.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn display_classification(classification: &str) -> String {
@@ -786,63 +880,185 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    #[test]
-    fn upload_reports_transport_flush_failure() {
-        struct TestTransport {
-            flushed: bool,
-            envelopes: Arc<std::sync::atomic::AtomicUsize>,
-        }
-        impl sentry::Transport for TestTransport {
-            fn send_envelope(&self, envelope: sentry::protocol::Envelope) {
-                let classification = envelope.items().find_map(|item| match item {
-                    sentry::protocol::EnvelopeItem::Event(event) => {
-                        event.tags.get("classification").map(String::as_str)
+    /// Accepts one envelope POST and answers with `status_line`, or never answers when it is
+    /// `None`. Returns the raw request.
+    fn serve_one_request(
+        status_line: Option<&'static str>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Sentry endpoint");
+        let address = listener.local_addr().expect("local endpoint address");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "upload sent no request");
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    _ => None,
-                });
-                assert_eq!(classification, Some("bug"));
-                self.envelopes
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(error) => panic!("accept local request: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking accepted socket");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("bound request read");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).expect("read envelope request");
+                assert!(read > 0, "request ended before complete envelope");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 64 * 1024, "unexpected request size");
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let body_len: usize = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .expect("envelope content length")
+                        .1
+                        .trim()
+                        .parse()
+                        .expect("numeric content length");
+                    if request.len() >= header_end + 4 + body_len {
+                        break;
+                    }
+                }
             }
-            fn flush(&self, _: Duration) -> bool {
-                self.flushed
+            match status_line {
+                Some(status_line) => stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("answer envelope"),
+                // Hold the connection until the client abandons it.
+                None => {
+                    let _ = stream.read(&mut chunk);
+                }
             }
-        }
-        for flushed in [false, true] {
-            let envelopes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let transport: Arc<dyn sentry::Transport> = Arc::new(TestTransport {
-                flushed,
-                envelopes: envelopes.clone(),
-            });
-            let client = sentry::Client::from_config(sentry::ClientOptions {
-                dsn: Some(SENTRY_DSN.parse().unwrap()),
-                transport: Some(Arc::new(move |_: &sentry::ClientOptions| transport.clone())),
-                ..Default::default()
-            });
-            let snapshot = CodexFeedback::new().snapshot(None);
-            let result = snapshot.upload_feedback_with_client(
-                FeedbackUploadOptions {
-                    classification: "bug",
-                    reason: None,
-                    tags: None,
-                    include_logs: false,
-                    extra_attachments: &[],
-                    extra_attachment_paths: &[],
-                    session_source: None,
-                    logs_override: None,
-                },
-                &client,
+            request
+        });
+        (address, server)
+    }
+
+    fn local_dsn(address: std::net::SocketAddr) -> Dsn {
+        format!("http://public@{address}/1")
+            .parse()
+            .expect("test DSN should parse")
+    }
+
+    #[test]
+    fn upload_succeeds_only_when_sentry_accepts_the_envelope() {
+        let missing_filename = format!("codex-feedback-missing-{}.log", ThreadId::new());
+        let missing = FeedbackAttachmentPath {
+            path: std::env::temp_dir().join(&missing_filename),
+            attachment_filename_override: None,
+        };
+        let client = BlockingHttpClientBuilder::new()
+            .build_direct()
+            .expect("build test client");
+        for (status_line, accepted) in [
+            ("200 OK", true),
+            ("413 Payload Too Large", false),
+            ("503 Service Unavailable", false),
+        ] {
+            let (address, server) = serve_one_request(Some(status_line));
+            let result = CodexFeedback::new()
+                .snapshot(/*session_id*/ None)
+                .upload_feedback_with_client(
+                    FeedbackUploadOptions {
+                        classification: "bug",
+                        reason: Some("broken"),
+                        tags: None,
+                        include_logs: false,
+                        extra_attachments: &[],
+                        extra_attachment_paths: std::slice::from_ref(&missing),
+                        session_source: None,
+                        logs_override: None,
+                    },
+                    &client,
+                    &local_dsn(address),
+                );
+            let request = String::from_utf8(server.join().expect("local endpoint completed"))
+                .expect("UTF-8 envelope request");
+            assert!(
+                request.starts_with("POST /api/1/envelope/ HTTP/1.1\r\n"),
+                "{request}"
             );
-            assert_eq!(envelopes.load(std::sync::atomic::Ordering::SeqCst), 1);
-            if flushed {
-                result.unwrap();
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-sentry-auth: sentry sentry_key=public"),
+                "{request}"
+            );
+            assert!(request.contains(r#""classification":"bug""#), "{request}");
+            assert!(
+                request.contains(&format!(
+                    r#""omitted_attachments":["{missing_filename}: read failed: "#
+                )),
+                "{request}"
+            );
+            if accepted {
+                result.expect("accepted upload");
             } else {
                 assert_eq!(
-                    result.unwrap_err().to_string(),
-                    "feedback upload did not finish before the timeout"
+                    result.expect_err("rejected upload").to_string(),
+                    format!("feedback upload was rejected with HTTP {status_line}")
                 );
             }
         }
+    }
+
+    #[test]
+    fn upload_reports_unreachable_and_stalled_endpoints_within_deadline() {
+        use std::time::Instant;
+
+        assert_eq!(upload_deadline(0), UPLOAD_BASE_TIMEOUT);
+        assert_eq!(
+            upload_deadline(MAX_TOTAL_ATTACHMENT_BYTES),
+            UPLOAD_BASE_TIMEOUT + Duration::from_secs(160)
+        );
+        let client = BlockingHttpClientBuilder::new()
+            .build_direct()
+            .expect("build test client");
+
+        let released = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve local port")
+            .local_addr()
+            .expect("reserved address");
+        let error = send_envelope(
+            &client,
+            &local_dsn(released),
+            b"{}".to_vec(),
+            Duration::from_secs(10),
+        )
+        .expect_err("nothing listens on a released port")
+        .to_string();
+        assert!(error.starts_with("feedback upload failed: "), "{error}");
+
+        let (address, server) = serve_one_request(/*status_line*/ None);
+        let deadline = Duration::from_millis(500);
+        let started = Instant::now();
+        let error = send_envelope(&client, &local_dsn(address), b"{}".to_vec(), deadline)
+            .expect_err("stalled upload must time out")
+            .to_string();
+        assert_eq!(
+            error,
+            format!("feedback upload did not finish within {deadline:?}")
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.join().expect("stalled endpoint completed");
     }
 
     #[test]
@@ -876,10 +1092,16 @@ mod tests {
             attachment_filename_override: None,
         });
         let snapshot = CodexFeedback::new().snapshot(None);
-        let attachments = snapshot.feedback_attachments(false, &[], &paths, None);
+        let (attachments, omitted) = snapshot.feedback_attachments(false, &[], &paths, None);
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].filename, "small.zip");
         assert_eq!(attachments[0].buffer, b"complete archive");
+        assert_eq!(
+            omitted,
+            [format!(
+                "large.zip: exceeds the {MAX_ATTACHMENT_BYTES}-byte attachment limit"
+            )]
+        );
 
         let extras = [
             MAX_ATTACHMENT_BYTES + 1,
@@ -895,13 +1117,22 @@ mod tests {
             buffer: vec![index as u8; size],
         })
         .collect::<Vec<_>>();
-        let attachments = snapshot.feedback_attachments(false, &extras, &paths, None);
+        let (attachments, omitted) = snapshot.feedback_attachments(false, &extras, &paths, None);
         assert_eq!(
             attachments
                 .iter()
                 .map(|item| item.filename.as_str())
                 .collect::<Vec<_>>(),
             ["1.zip", "2.zip"]
+        );
+        assert_eq!(
+            omitted,
+            [
+                format!("0.zip: exceeds the {MAX_ATTACHMENT_BYTES}-byte attachment limit"),
+                "3.zip: exceeds the remaining 0-byte upload budget".to_string(),
+                "large.zip: exceeds the remaining 0-byte upload budget".to_string(),
+                "small.zip: exceeds the remaining 0-byte upload budget".to_string(),
+            ]
         );
         assert_eq!(
             attachments
@@ -1006,102 +1237,6 @@ mod tests {
     }
 
     #[test]
-    fn configured_sentry_transport_delivers_envelope() {
-        use std::io::Read;
-        use std::net::TcpListener;
-        use std::time::Instant;
-
-        use sentry::TransportFactory;
-        use sentry::protocol::Envelope;
-        use sentry::protocol::EnvelopeItem;
-        use sentry::transports::DefaultTransportFactory;
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Sentry endpoint");
-        let address = listener.local_addr().expect("local endpoint address");
-        listener.set_nonblocking(true).expect("nonblocking accept");
-        let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "transport sent no request");
-                        std::thread::sleep(
-                            Duration::from_millis(10)
-                                .min(deadline.saturating_duration_since(Instant::now())),
-                        );
-                    }
-                    Err(error) => panic!("accept local request: {error}"),
-                }
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("blocking accepted socket");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("bound request read");
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let read = stream.read(&mut chunk).expect("read envelope request");
-                assert!(read > 0, "request ended before complete envelope");
-                request.extend_from_slice(&chunk[..read]);
-                assert!(request.len() <= 64 * 1024, "unexpected request size");
-                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let body_start = header_end + 4;
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let body_len: usize = headers
-                        .lines()
-                        .filter_map(|line| line.split_once(':'))
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                        .expect("envelope content length")
-                        .1
-                        .trim()
-                        .parse()
-                        .expect("numeric content length");
-                    if request.len() >= body_start + body_len {
-                        stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                            .expect("acknowledge envelope");
-                        return request;
-                    }
-                }
-            }
-        });
-        let options = sentry::ClientOptions {
-            dsn: Some(
-                format!("http://public@{address}/1")
-                    .parse()
-                    .expect("test DSN should parse"),
-            ),
-            ..Default::default()
-        };
-
-        let transport = DefaultTransportFactory.create_transport(&options);
-        let mut envelope = Envelope::new();
-        envelope.add_item(EnvelopeItem::Event(sentry::protocol::Event {
-            message: Some("configured-feedback-transport-marker".to_string()),
-            ..Default::default()
-        }));
-        transport.send_envelope(envelope);
-        assert!(transport.flush(Duration::from_secs(10)));
-        let request = server.join().expect("local endpoint completed");
-        let request = String::from_utf8(request).expect("UTF-8 envelope request");
-        assert!(
-            request.starts_with("POST /api/1/envelope/ HTTP/1.1\r\n"),
-            "{request}"
-        );
-        assert!(
-            request.contains("configured-feedback-transport-marker"),
-            "{request}"
-        );
-        assert!(
-            request.to_ascii_lowercase().contains("x-sentry-auth:"),
-            "{request}"
-        );
-    }
-
-    #[test]
     fn metadata_layer_records_tags_from_feedback_target() {
         let fb = CodexFeedback::new();
         let _guard = tracing_subscriber::registry()
@@ -1113,6 +1248,25 @@ mod tests {
         let snap = fb.snapshot(/*session_id*/ None);
         pretty_assertions::assert_eq!(snap.tags.get("model").map(String::as_str), Some("gpt-5"));
         pretty_assertions::assert_eq!(snap.tags.get("cached").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn logger_layer_keeps_otel_export_only_targets_disabled() {
+        let fb = CodexFeedback::new();
+        let _guard = tracing_subscriber::registry()
+            .with(fb.logger_layer())
+            .set_default();
+
+        // OTel telemetry builders are gated on these targets being enabled by an exporter.
+        assert!(!tracing::enabled!(target: "codex_otel.log_only", Level::INFO));
+        assert!(!tracing::enabled!(target: "codex_otel.trace_safe", Level::INFO));
+        tracing::info!(target: "codex_otel.log_only", "otel export event");
+        tracing::info!(target: "codex_core::client", "retained diagnostic");
+
+        let snap = fb.snapshot(/*session_id*/ None);
+        let logs = String::from_utf8_lossy(snap.as_bytes());
+        assert!(logs.contains("retained diagnostic"));
+        assert!(!logs.contains("otel export event"));
     }
 
     #[test]
@@ -1133,7 +1287,7 @@ mod tests {
                 details: vec!["HTTPS_PROXY = https://example.com:443".to_string()],
             }]));
 
-        let attachments_with_diagnostics = snapshot_with_diagnostics.feedback_attachments(
+        let (attachments_with_diagnostics, _) = snapshot_with_diagnostics.feedback_attachments(
             /*include_logs*/ true,
             &[FeedbackAttachment {
                 filename: DOCTOR_REPORT_ATTACHMENT_FILENAME.to_string(),
@@ -1174,7 +1328,7 @@ mod tests {
             OsStr::new(attachments_with_diagnostics[3].filename.as_str()),
             OsStr::new(extra_filename.as_str())
         );
-        let attachments_without_diagnostics = CodexFeedback::new()
+        let (attachments_without_diagnostics, _) = CodexFeedback::new()
             .snapshot(/*session_id*/ None)
             .with_feedback_diagnostics(FeedbackDiagnostics::default())
             .feedback_attachments(/*include_logs*/ true, &[], &[], Some(vec![1]));
@@ -1202,7 +1356,7 @@ mod tests {
         fs::write(&gzip_path, gzip_bytes).expect("gzip attachment should be written");
         fs::write(&unknown_path, unknown_bytes).expect("unknown attachment should be written");
 
-        let attachments = CodexFeedback::new()
+        let (attachments, _) = CodexFeedback::new()
             .snapshot(/*session_id*/ None)
             .feedback_attachments(
                 /*include_logs*/ false,

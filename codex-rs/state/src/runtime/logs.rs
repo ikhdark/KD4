@@ -3,6 +3,8 @@ use super::*;
 const LOG_RETENTION_DAYS: i64 = 10;
 const MAX_PENDING_RETENTION_KEYS: usize = 256;
 const RETENTION_QUERY_KEY_BATCH: usize = 200;
+// Bounded vacuum steps keep each write transaction short for concurrent log writers.
+const INCREMENTAL_VACUUM_STEP: &str = "PRAGMA incremental_vacuum(2048)";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LogRetentionScope {
@@ -389,7 +391,44 @@ impl StateRuntime {
             started.elapsed(),
             &commit_result,
         );
-        commit_result
+        commit_result?;
+        if reconcile_all {
+            self.reclaim_free_log_pages().await;
+        }
+        Ok(())
+    }
+
+    /// Return free pages to the filesystem on reconciliation passes. Incremental auto-vacuum
+    /// only shrinks the file when asked, so without this a one-time spike (a schema copy or a
+    /// retention backlog) stays on disk for the life of the database.
+    async fn reclaim_free_log_pages(&self) {
+        let started = Instant::now();
+        let result = async {
+            let mut free_pages = log_freelist_count(self.logs_pool.as_ref()).await?;
+            while free_pages > 0 {
+                sqlx::query(INCREMENTAL_VACUUM_STEP)
+                    .execute(self.logs_pool.as_ref())
+                    .await?;
+                let remaining = log_freelist_count(self.logs_pool.as_ref()).await?;
+                if remaining >= free_pages {
+                    // Databases created without incremental auto-vacuum cannot shrink this way.
+                    break;
+                }
+                free_pages = remaining;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "retention",
+            "vacuum",
+            started.elapsed(),
+            &result,
+        );
+        if let Err(err) = result {
+            warn!("failed to reclaim free log database pages: {err}");
+        }
     }
 
     /// Enforce per-partition retained-log-content caps after a successful batch insert.
@@ -624,19 +663,6 @@ WHERE id IN (
         Ok(())
     }
 
-    /// Explicit retention reconciliation for runtimes without a log inserter.
-    /// The log inserter schedules this retention work in its maintenance task.
-    pub async fn run_logs_startup_maintenance(&self) -> anyhow::Result<()> {
-        self.prune_log_retention(LogRetentionScope::for_reconciliation())
-            .await?;
-        // PASSIVE checkpoints copy whatever is immediately available and skip
-        // frames that would require waiting on active readers or writers.
-        sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-            .execute(self.logs_pool.as_ref())
-            .await?;
-        Ok(())
-    }
-
     /// Query logs with optional filters.
     pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
         query_logs(self.logs_pool.as_ref(), query).await
@@ -797,6 +823,12 @@ async fn query_logs(pool: &SqlitePool, query: &LogQuery) -> anyhow::Result<Vec<L
     Ok(rows)
 }
 
+async fn log_freelist_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+        .fetch_one(pool)
+        .await?)
+}
+
 async fn max_log_id(pool: &SqlitePool, query: &LogQuery) -> anyhow::Result<i64> {
     let mut builder = QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
     push_log_filters(&mut builder, query);
@@ -899,6 +931,7 @@ fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: 
 
 #[cfg(test)]
 mod tests {
+    use super::LogRetentionScope;
     use super::StateRuntime;
     use super::format_feedback_log_line;
     use super::test_support::unique_temp_dir;
@@ -1002,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_init_defers_log_retention_until_explicit_maintenance() {
+    async fn runtime_init_defers_log_retention_until_reconciliation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
             .await
@@ -1025,15 +1058,58 @@ mod tests {
             1
         );
         runtime
-            .run_logs_startup_maintenance()
+            .prune_log_retention(LogRetentionScope::for_reconciliation())
             .await
-            .expect("explicit maintenance");
+            .expect("reconciliation");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs")
                 .fetch_one(runtime.logs_pool.as_ref())
                 .await
-                .expect("after maintenance"),
+                .expect("after reconciliation"),
             0
+        );
+        runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_returns_pruned_log_pages_to_the_filesystem() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("runtime");
+        let expired_ts = (Utc::now() - chrono::Duration::days(11)).timestamp();
+        let entries = (0..2_000)
+            .map(|index| {
+                let mut entry = test_log(&format!("{index}-{}", "x".repeat(2_048)), "thread");
+                entry.ts = expired_ts;
+                entry
+            })
+            .collect::<Vec<_>>();
+        runtime
+            .insert_logs_deferred_retention(&entries)
+            .await
+            .expect("seed expired logs");
+        let pragma = |name: &'static str| {
+            let pool = std::sync::Arc::clone(&runtime.logs_pool);
+            async move {
+                sqlx::query_scalar::<_, i64>(name)
+                    .fetch_one(pool.as_ref())
+                    .await
+                    .expect("read pragma")
+            }
+        };
+        let pages_before = pragma("PRAGMA page_count").await;
+
+        runtime
+            .prune_log_retention(LogRetentionScope::for_reconciliation())
+            .await
+            .expect("reconciliation");
+
+        assert_eq!(pragma("PRAGMA freelist_count").await, 0);
+        let pages_after = pragma("PRAGMA page_count").await;
+        assert!(
+            pages_after < pages_before / 10,
+            "expected pruned pages to be reclaimed: {pages_before} -> {pages_after}"
         );
         runtime.close().await;
     }

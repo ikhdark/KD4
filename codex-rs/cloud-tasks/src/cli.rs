@@ -60,6 +60,8 @@ fn parse_attempts(input: &str) -> Result<usize, String> {
     }
 }
 
+pub(crate) const DEFAULT_LIST_LIMIT: i64 = 20;
+
 fn parse_limit(input: &str) -> Result<i64, String> {
     let value: i64 = input
         .parse()
@@ -85,7 +87,7 @@ pub struct ListCommand {
     pub environment: Option<String>,
 
     /// Maximum number of tasks to return (1-20).
-    #[arg(long = "limit", default_value_t = 20, value_parser = parse_limit, value_name = "N")]
+    #[arg(long = "limit", default_value_t = DEFAULT_LIST_LIMIT, value_parser = parse_limit, value_name = "N")]
     pub limit: i64,
 
     /// Pagination cursor returned by a previous call.

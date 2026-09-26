@@ -441,13 +441,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         let patch = "*** Begin Patch\n*** Add File: committed\n+first\n*** Update File: pending\n@@\n-old\n+new\n*** End Patch";
-        let failure = codex_apply_patch::apply_patch(
+        std::fs::write(dir.path().join("pending"), "old\n").unwrap();
+        // Preflight rejects stale sources before any write, so an exact partial
+        // commit comes from cancellation between hunks.
+        let committed = dir.path().join("committed");
+        let failure = codex_apply_patch::apply_patch_with_cancellation(
             patch,
             &cwd,
             &mut Vec::new(),
             &mut Vec::new(),
             LOCAL_FS.as_ref(),
             None,
+            &|| committed.exists(),
         )
         .await
         .unwrap_err();
@@ -458,7 +463,6 @@ mod tests {
             .unwrap();
         assert_eq!(receipt["committed_hunks_excluded"], 1);
         std::fs::write(dir.path().join("committed"), "later independent edit\n").unwrap();
-        std::fs::write(dir.path().join("pending"), "old\n").unwrap();
         let retry = store
             .prepare(&format!(
                 "*** Begin Patch\n*** Retry Patch: {}\n*** End Patch",

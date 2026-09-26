@@ -1156,6 +1156,13 @@ async fn collect_policy_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Exe
             })?
     {
         let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext == RULE_EXTENSION)
+        {
+            continue;
+        }
         let file_type = entry
             .file_type()
             .await
@@ -1163,13 +1170,18 @@ async fn collect_policy_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Exe
                 dir: dir.to_path_buf(),
                 source,
             })?;
-
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext == RULE_EXTENSION)
-            && file_type.is_file()
-        {
+        // Amendments are written through a symlinked policy file, so its target
+        // must be loaded too. A dangling link is equivalent to a missing file.
+        let is_file = if file_type.is_symlink() {
+            match fs::metadata(&path).await {
+                Ok(metadata) => metadata.is_file(),
+                Err(err) if err.kind() == ErrorKind::NotFound => false,
+                Err(source) => return Err(ExecPolicyError::ReadFile { path, source }),
+            }
+        } else {
+            file_type.is_file()
+        };
+        if is_file {
             policy_paths.push(path);
         }
     }

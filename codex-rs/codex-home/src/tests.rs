@@ -127,6 +127,45 @@ async fn recoverable_override_metadata_error_warns_and_falls_back_to_default() {
 }
 
 #[tokio::test]
+async fn byte_order_mark_only_override_falls_back_to_default() {
+    let home = TempDir::new().expect("temp dir");
+    fs::write(
+        home.path().join(LOCAL_AGENTS_MD_FILENAME),
+        b"\xEF\xBB\xBF \r\n",
+    )
+    .expect("write override");
+    fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
+
+    assert_eq!(
+        provider(&home).load_user_instructions().await,
+        expected(&home, DEFAULT_AGENTS_MD_FILENAME, "default", Vec::new())
+    );
+}
+
+#[tokio::test]
+async fn byte_order_marked_encodings_are_decoded() {
+    let text = "global \u{e9} doc";
+    let utf16le = [0xFF, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect::<Vec<u8>>();
+    let utf16be = [0xFE, 0xFF]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+        .collect::<Vec<u8>>();
+    let utf8 = [&b"\xEF\xBB\xBF"[..], text.as_bytes()].concat();
+    for data in [utf8, utf16le, utf16be] {
+        let home = TempDir::new().expect("temp dir");
+        fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), &data).expect("write default");
+
+        assert_eq!(
+            provider(&home).load_user_instructions().await,
+            expected(&home, DEFAULT_AGENTS_MD_FILENAME, text, Vec::new())
+        );
+    }
+}
+
+#[tokio::test]
 async fn invalid_utf8_is_lossy() {
     let home = TempDir::new().expect("temp dir");
     let path = home.path().join(DEFAULT_AGENTS_MD_FILENAME);

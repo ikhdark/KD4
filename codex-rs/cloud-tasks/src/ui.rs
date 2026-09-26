@@ -324,9 +324,8 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
     let is_error = app
         .diff_overlay
         .as_ref()
-        .and_then(|o| o.sd.wrapped_lines().first().cloned())
-        .map(|s| s.trim_start().starts_with("Task failed:"))
-        .unwrap_or(false)
+        .and_then(super::app::DiffOverlay::current_attempt)
+        .is_some_and(|attempt| attempt.status == AttemptStatus::Failed)
         && !ov_can_apply;
     let title = app
         .diff_overlay
@@ -433,16 +432,32 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .map(|o| matches!(o.current_view, crate::app::DetailView::Diff))
         .unwrap_or(false);
+    // Style only the rows that fit; wrapped content can be very large and is redrawn per frame.
+    // Selecting rows here also keeps large diffs reachable despite Paragraph's u16 scroll offset.
+    let visible = app
+        .diff_overlay
+        .as_ref()
+        .map(|o| {
+            let start = o.sd.state.scroll;
+            start..start.saturating_add(usize::from(o.sd.state.viewport_h))
+        })
+        .unwrap_or(0..0);
     let styled_lines: Vec<Line<'static>> = if is_diff_view {
-        let raw = app.diff_overlay.as_ref().map(|o| o.sd.wrapped_lines());
-        raw.unwrap_or(&[])
-            .iter()
-            .map(|l| style_diff_line(l))
-            .collect()
+        app.diff_overlay
+            .as_ref()
+            .map(|o| {
+                o.sd.wrapped_lines()
+                    .iter()
+                    .skip(visible.start)
+                    .take(visible.len())
+                    .map(|l| style_diff_line(l))
+                    .collect()
+            })
+            .unwrap_or_default()
     } else {
         app.diff_overlay
             .as_ref()
-            .map(|o| style_conversation_lines(&o.sd, o.current_attempt()))
+            .map(|o| style_conversation_lines(&o.sd, o.current_attempt(), visible.clone()))
             .unwrap_or_default()
     };
     let raw_empty = app
@@ -458,15 +473,7 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
             "Loading details…",
         );
     } else {
-        let scroll = app
-            .diff_overlay
-            .as_ref()
-            .map(|o| o.sd.state.scroll)
-            .unwrap_or(0);
-        // Paragraph's scroll offset is u16; select the rows first so large diffs
-        // can reach their final line without narrowing the logical scroll position.
-        let visible_lines: Vec<_> = styled_lines.into_iter().skip(scroll).collect();
-        let content = Paragraph::new(Text::from(visible_lines));
+        let content = Paragraph::new(Text::from(styled_lines));
         frame.render_widget(content, content_area);
     }
 }
@@ -560,9 +567,12 @@ enum ConversationSpeaker {
     Assistant,
 }
 
+/// Styles the wrapped rows in `visible`. Rows above it are scanned only for the speaker,
+/// code-fence, and bullet state they carry; rows below it cannot affect it.
 fn style_conversation_lines(
     sd: &crate::scrollable_diff::ScrollableDiff,
     attempt: Option<&AttemptView>,
+    visible: std::ops::Range<usize>,
 ) -> Vec<Line<'static>> {
     use ratatui::text::Span;
 
@@ -578,7 +588,13 @@ fn style_conversation_lines(
     let mut last_src: Option<usize> = None;
     let mut bullet_indent: Option<usize> = None;
 
-    for (display, &src_idx) in wrapped.iter().zip(indices.iter()) {
+    for (row, (display, &src_idx)) in wrapped
+        .iter()
+        .zip(indices.iter())
+        .enumerate()
+        .take(visible.end)
+    {
+        let shown = row >= visible.start;
         let raw = sd.raw_line_at(src_idx);
         let trimmed = raw.trim();
         let is_new_raw = last_src.map(|prev| prev != src_idx).unwrap_or(true);
@@ -587,10 +603,12 @@ fn style_conversation_lines(
             speaker = Some(ConversationSpeaker::User);
             in_code = false;
             bullet_indent = None;
-            styled.push(conversation_header_line(
-                ConversationSpeaker::User,
-                /*attempt*/ None,
-            ));
+            if shown {
+                styled.push(conversation_header_line(
+                    ConversationSpeaker::User,
+                    /*attempt*/ None,
+                ));
+            }
             last_src = Some(src_idx);
             continue;
         }
@@ -598,21 +616,25 @@ fn style_conversation_lines(
             speaker = Some(ConversationSpeaker::Assistant);
             in_code = false;
             bullet_indent = None;
-            styled.push(conversation_header_line(
-                ConversationSpeaker::Assistant,
-                attempt,
-            ));
+            if shown {
+                styled.push(conversation_header_line(
+                    ConversationSpeaker::Assistant,
+                    attempt,
+                ));
+            }
             last_src = Some(src_idx);
             continue;
         }
         if raw.is_empty() {
-            let mut spans: Vec<Span> = Vec::new();
-            if let Some(role) = speaker {
-                spans.push(conversation_gutter_span(role));
-            } else {
-                spans.push(Span::raw(String::new()));
+            if shown {
+                let mut spans: Vec<Span> = Vec::new();
+                if let Some(role) = speaker {
+                    spans.push(conversation_gutter_span(role));
+                } else {
+                    spans.push(Span::raw(String::new()));
+                }
+                styled.push(Line::from(spans));
             }
-            styled.push(Line::from(spans));
             last_src = Some(src_idx);
             bullet_indent = None;
             continue;
@@ -633,27 +655,25 @@ fn style_conversation_lines(
             }
         }
 
-        let mut spans: Vec<Span> = Vec::new();
-        if let Some(role) = speaker {
-            spans.push(conversation_gutter_span(role));
+        if shown {
+            let mut spans: Vec<Span> = Vec::new();
+            if let Some(role) = speaker {
+                spans.push(conversation_gutter_span(role));
+            }
+
+            spans.extend(conversation_text_spans(
+                display,
+                in_code,
+                is_new_raw,
+                bullet_indent,
+            ));
+
+            styled.push(Line::from(spans));
         }
-
-        spans.extend(conversation_text_spans(
-            display,
-            in_code,
-            is_new_raw,
-            bullet_indent,
-        ));
-
-        styled.push(Line::from(spans));
         last_src = Some(src_idx);
     }
 
-    if styled.is_empty() {
-        wrapped.iter().map(|l| Line::from(l.to_string())).collect()
-    } else {
-        styled
-    }
+    styled
 }
 
 fn conversation_header_line(
@@ -951,31 +971,11 @@ pub fn draw_env_modal(frame: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .map(|m| m.query.clone())
         .unwrap_or_default();
-    let ql = query.to_lowercase();
     let search = Paragraph::new(format!("Search: {query}")).wrap(Wrap { trim: true });
     frame.render_widget(search, rows[1]);
 
-    // Filter environments by query (case-insensitive substring over label/id/hints)
-    let envs: Vec<&crate::app::EnvironmentRow> = app
-        .environments
-        .iter()
-        .filter(|e| {
-            if ql.is_empty() {
-                return true;
-            }
-            let mut hay = String::new();
-            if let Some(l) = &e.label {
-                hay.push_str(&l.to_lowercase());
-                hay.push(' ');
-            }
-            hay.push_str(&e.id.to_lowercase());
-            if let Some(h) = &e.repo_hints {
-                hay.push(' ');
-                hay.push_str(&h.to_lowercase());
-            }
-            hay.contains(&ql)
-        })
-        .collect();
+    // Enter resolves the highlighted row through the same filter.
+    let envs = app.filtered_environments(&query);
 
     let mut items: Vec<ListItem> = Vec::new();
     items.push(ListItem::new(Line::from("All Environments (Global)")));
@@ -1146,6 +1146,64 @@ mod tests {
         assert!(!rendered.contains("Cached environment"));
         assert!(!rendered.contains("Failed to load environments"));
         assert!(app.env_error.is_none());
+    }
+
+    #[test]
+    fn conversation_window_keeps_code_fence_state_from_rows_above_it() {
+        let mut sd = crate::scrollable_diff::ScrollableDiff::new();
+        let mut lines = vec!["assistant:".to_string(), "```".to_string()];
+        lines.extend((0..100).map(|n| format!("code {n}")));
+        lines.push("```".to_string());
+        sd.set_content(lines);
+        sd.set_width(80);
+
+        let window = style_conversation_lines(&sd, /*attempt*/ None, 52..55);
+
+        assert_eq!(window.len(), 3);
+        // Row 52 (`code 50`) is inside the fence opened on row 1, above the window.
+        let code = window[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("code 50"))
+            .expect("first visible row");
+        assert_eq!(code.style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn failed_attempt_details_are_titled_failed_and_show_the_reason() {
+        let render = |status: AttemptStatus| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+            let mut app = App::new();
+            let mut overlay = crate::app::DiffOverlay::new(
+                codex_cloud_tasks_client::TaskId("task".to_string()),
+                "Broken task".to_string(),
+                None,
+            );
+            let base = overlay.base_attempt_mut();
+            base.status = status;
+            base.prompt = Some("Fix it".to_string());
+            base.text_lines = crate::conversation_lines(
+                Some("Fix it".to_string()),
+                &["Task failed: APPLY_FAILED: Patch could not be applied".to_string()],
+            );
+            overlay.set_view(crate::app::DetailView::Prompt);
+            app.diff_overlay = Some(overlay);
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("draw details");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        };
+
+        let failed = render(AttemptStatus::Failed);
+        assert!(failed.contains("[FAILED]"), "{failed}");
+        assert!(failed.contains("APPLY_FAILED: Patch could not be applied"));
+        assert!(!render(AttemptStatus::Completed).contains("[FAILED]"));
     }
 
     #[test]

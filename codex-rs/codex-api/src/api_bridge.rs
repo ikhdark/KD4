@@ -68,19 +68,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                        && let Some(error) = parsed.get("error")
-                        && error.get("code").and_then(Value::as_str)
-                            == Some(CYBER_POLICY_ERROR_CODE)
-                    {
-                        let message = error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .filter(|message| !message.trim().is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
-                        CodexErr::CyberPolicy { message }
-                    } else if body_text
+                    if body_text
                         .contains("The image data you provided does not represent a valid image")
                     {
                         CodexErr::InvalidImageRequest()
@@ -171,9 +159,6 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
-const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
-const CYBER_POLICY_FALLBACK_MESSAGE: &str =
-    "This request has been flagged for possible cybersecurity risk.";
 const CLOUDFLARE_BLOCKED_MESSAGE: &str = "Access blocked by Cloudflare";
 
 #[cfg(test)]

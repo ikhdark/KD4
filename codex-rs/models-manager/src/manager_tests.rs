@@ -704,6 +704,10 @@ async fn matching_etag_renews_ttl_without_fetching() {
 
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
     assert!(
+        manager.memory_is_fresh().await,
+        "a matching ETag confirms the in-memory catalog"
+    );
+    assert!(
         manager
             .cache_manager
             .load_fresh(&crate::client_version_to_whole())

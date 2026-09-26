@@ -13,8 +13,6 @@ pub(crate) struct VersionInfo {
     pub(crate) last_checked_at: DateTime<Utc>,
     #[serde(default)]
     pub(crate) dismissed_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) npm_ready: Option<bool>,
 }
 
 const VERSION_FILENAME: &str = "version.json";
@@ -47,18 +45,13 @@ pub(crate) async fn dismiss_version(config: &Config, version: &str) -> anyhow::R
 pub(crate) async fn cache_release(
     version_file: &Path,
     latest_version: String,
-    npm_ready: bool,
 ) -> anyhow::Result<()> {
     merge_version_info(
         version_file.to_path_buf(),
         latest_version.clone(),
         move |info| {
-            // Keep registry eligibility only for the exact release that was checked.
-            let previously_ready =
-                info.latest_version == latest_version && info.npm_ready == Some(true);
             info.latest_version = latest_version;
             info.last_checked_at = Utc::now();
-            info.npm_ready = Some(npm_ready || previously_ready);
         },
     )
     .await
@@ -82,7 +75,6 @@ async fn merge_version_info(
             latest_version: fallback_version,
             last_checked_at: DateTime::<Utc>::UNIX_EPOCH,
             dismissed_version: None,
-            npm_ready: None,
         });
         update(&mut info);
         let json_line = format!("{}\n", serde_json::to_string(&info)?);

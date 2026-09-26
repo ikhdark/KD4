@@ -217,6 +217,11 @@ mod tests {
                 .iter()
                 .all(|tool| tool.exposure() == ToolExposure::DirectModelOnly)
         );
+        assert!(tools.iter().all(|tool| {
+            tool.conversation_history_requirement(&codex_extension_api::ToolPayload::Function {
+                arguments: "{}".to_string(),
+            }) == codex_extension_api::ConversationHistoryRequirement::None
+        }));
         let api_key_extension = HistoryNotesExtension {
             auth_manager: AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test")),
         };

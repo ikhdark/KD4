@@ -37,13 +37,14 @@ impl AbsolutePathBuf {
             && (rest.is_empty() || rest.starts_with(['/', '\\']))
             && let Some(home) = home_dir()
         {
-            if rest.is_empty() {
+            let Some(separator) = rest.chars().next() else {
                 return home;
-            } else if let Some(rest) = rest.strip_prefix('/') {
-                return home.join(rest.trim_start_matches('/'));
-            } else if let Some(rest) = rest.strip_prefix('\\') {
-                return home.join(rest.trim_start_matches('\\'));
-            }
+            };
+            // Consume the whole separator run: a remaining root, such as the `\`
+            // in `~/\code` on Windows, would otherwise replace `home` in `join`.
+            let rest =
+                rest.trim_start_matches(|c: char| c == separator || std::path::is_separator(c));
+            return home.join(rest);
         }
         path.to_path_buf()
     }
@@ -746,6 +747,28 @@ mod tests {
             serde_json::from_str::<AbsolutePathBuf>(&input).expect("is valid abs path")
         };
         assert_eq!(abs_path_buf.as_path(), home.join("code").as_path());
+    }
+
+    #[test]
+    fn home_directory_mixed_separator_run_stays_under_home() {
+        let home = home_dir().expect("home directory");
+        let temp_dir = tempdir().expect("base dir");
+        let _guard = AbsolutePathBufGuard::new(temp_dir.path());
+        let deserialize = |raw: &str| {
+            let input = serde_json::to_string(raw).expect("string should serialize as JSON");
+            serde_json::from_str::<AbsolutePathBuf>(&input).expect("is valid abs path")
+        };
+        // `/` separates on every platform, so it must not root the remainder.
+        assert_eq!(
+            deserialize(r"~\/code").as_path(),
+            home.join("code").as_path()
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                deserialize(r"~/\code").as_path(),
+                home.join("code").as_path()
+            );
+        }
     }
 
     #[test]

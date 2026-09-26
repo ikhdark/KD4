@@ -25,7 +25,7 @@ The helper normalizes names to lowercase hyphen-case (spaces, underscores, and p
 - Default to the personal marketplace; repo/team placement is opt-in. Its default file is discovered implicitly: do not instruct `codex plugin marketplace add` for this path.
 - For an explicit non-default marketplace, ensure it is installed before reinstall instructions; use `codex plugin marketplace add <path-to-marketplace-root>` when missing.
 - Use `--marketplace-name` only to seed a different new marketplace when `personal` is already taken/installed. Never rename an existing file through this option; its top-level name must match.
-- Read names with `scripts/read_marketplace_name.py [marketplace.json]`. With no argument it reads the personal marketplace.
+- Read names with `scripts/read_marketplace_name.py [--marketplace-path <marketplace.json>]`. With no argument it reads the personal marketplace.
 - Preserve existing `interface.displayName`. It belongs at marketplace-root `interface`, not inside `plugins[]`.
 - Append entries unless reordering was requested; array order is Codex render order. Keep `source.path` relative to the marketplace root as `./plugins/<plugin-name>`.
 - Always write `policy.installation`, `policy.authentication`, and `category`. Defaults are `AVAILABLE` and `ON_INSTALL`; use other allowed values only when requested. Installation allows `NOT_AVAILABLE|AVAILABLE|INSTALLED_BY_DEFAULT`; authentication allows `ON_INSTALL|ON_USE`. Omit `policy.products` unless explicit product gating was requested.

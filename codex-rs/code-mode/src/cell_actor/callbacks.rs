@@ -247,14 +247,14 @@ async fn drain_tasks_bounded(
         return;
     }
 
-    let failure_reason = format!(
+    // A callback that outlives the grace is a slow peer, not a failed task.
+    // Aborting drops its future, which cancels any work it delegated. Owners
+    // treat reported failures as fatal (a host drops every session on its
+    // connection), so this bounded cleanup is not reported to them.
+    warn!(
         "code mode {description} callback cleanup exceeded {}ms; aborting remaining callbacks",
         CALLBACK_CANCELLATION_GRACE.as_millis(),
     );
-    warn!("{failure_reason}");
-    if let Some(task_failure_handler) = task_failure_handler {
-        task_failure_handler(failure_reason);
-    }
     tasks.abort_all();
     drain_tasks(tasks, description, task_failure_handler).await;
 }

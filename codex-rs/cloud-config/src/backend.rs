@@ -48,28 +48,25 @@ pub(crate) trait BundleClient: Send + Sync {
 }
 
 pub(crate) struct BackendBundleClient {
-    base_url: String,
-    http_client_factory: HttpClientFactory,
+    /// Unauthenticated template; each request applies the current auth snapshot, so
+    /// retries and unauthorized recovery reuse one transport pool.
+    client: BackendClient,
 }
 
 impl BackendBundleClient {
     pub(crate) fn new(base_url: String, http_client_factory: HttpClientFactory) -> Self {
         Self {
-            base_url,
-            http_client_factory,
+            client: BackendClient::new(base_url, http_client_factory),
         }
     }
 }
 
 impl BundleClient for BackendBundleClient {
     async fn get_bundle(&self, auth: &CodexAuth) -> Result<CloudConfigBundle, BundleRequestError> {
-        let client = BackendClient::from_auth(
-            self.base_url.clone(),
-            auth,
-            self.http_client_factory.clone(),
-        );
-
-        let response = client
+        let response = self
+            .client
+            .clone()
+            .with_auth(auth)
             .get_config_bundle()
             .await
             .inspect_err(|err| {
@@ -197,5 +194,88 @@ mod tests {
             classify_request_error(RequestError::Other(decode_error.into())),
             BundleRequestError::Permanent { status_code: None }
         );
+    }
+
+    #[tokio::test]
+    async fn requests_apply_each_auth_snapshot_over_one_connection() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncBufReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::io::BufReader;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let authorizations = Arc::new(Mutex::new(Vec::new()));
+        let server = {
+            let connections = Arc::clone(&connections);
+            let authorizations = Arc::clone(&authorizations);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let authorizations = Arc::clone(&authorizations);
+                    tokio::spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        // Serve keep-alive requests until the client closes the connection.
+                        loop {
+                            let mut authorization = None;
+                            loop {
+                                let mut line = String::new();
+                                if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                    return;
+                                }
+                                if line == "\r\n" {
+                                    break;
+                                }
+                                if let Some((name, value)) = line.split_once(':')
+                                    && name.eq_ignore_ascii_case("authorization")
+                                {
+                                    authorization = Some(value.trim().to_string());
+                                }
+                            }
+                            authorizations
+                                .lock()
+                                .expect("authorizations lock")
+                                .push(authorization);
+                            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+                            if stream
+                                .get_mut()
+                                .write_all(response.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                }
+            })
+        };
+
+        let client = BackendBundleClient::new(
+            format!("http://{address}"),
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        );
+        for key in ["sk-first", "sk-second"] {
+            assert_eq!(
+                client.get_bundle(&CodexAuth::from_api_key(key)).await,
+                Ok(CloudConfigBundle::default())
+            );
+        }
+        server.abort();
+
+        assert_eq!(
+            *authorizations.lock().expect("authorizations lock"),
+            vec![
+                Some("Bearer sk-first".to_string()),
+                Some("Bearer sk-second".to_string())
+            ]
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 }

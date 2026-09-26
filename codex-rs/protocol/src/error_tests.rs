@@ -8,6 +8,7 @@ use chrono::TimeZone;
 use chrono::Utc;
 use http::StatusCode;
 use pretty_assertions::assert_eq;
+use std::time::Duration;
 
 fn rate_limit_snapshot() -> RateLimitSnapshot {
     let primary_reset_at = Utc

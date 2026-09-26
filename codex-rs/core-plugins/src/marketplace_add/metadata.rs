@@ -33,12 +33,13 @@ pub(super) fn record_added_marketplace_entry(
     codex_home: &Path,
     marketplace_name: &str,
     install_metadata: &MarketplaceInstallMetadata,
+    last_revision: Option<&str>,
 ) -> Result<(), MarketplaceAddError> {
     let source = install_metadata.config_source();
     let timestamp = utc_timestamp_now()?;
     let update = MarketplaceConfigUpdate {
         last_updated: &timestamp,
-        last_revision: None,
+        last_revision,
         source_type: install_metadata.config_source_type(),
         source: &source,
         ref_name: install_metadata.ref_name(),
@@ -52,11 +53,13 @@ pub(super) fn record_added_marketplace_entry(
     })
 }
 
+/// Returns the root of a configured marketplace installed from this source, with the
+/// revision recorded for it so re-adding the source does not discard it.
 pub(super) fn installed_marketplace_root_for_source(
     codex_home: &Path,
     install_root: &Path,
     install_metadata: &MarketplaceInstallMetadata,
-) -> Result<Option<PathBuf>, MarketplaceAddError> {
+) -> Result<Option<(PathBuf, Option<String>)>, MarketplaceAddError> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
     let config = match fs::read_to_string(&config_path) {
         Ok(config) => config,
@@ -88,7 +91,11 @@ pub(super) fn installed_marketplace_root_for_source(
             continue;
         };
         if validate_marketplace_root(&root).is_ok() {
-            return Ok(Some(root));
+            let last_revision = marketplace
+                .get("last_revision")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string);
+            return Ok(Some((root, last_revision)));
         }
     }
 
@@ -280,7 +287,8 @@ mod tests {
             .unwrap();
             assert_eq!(
                 installed_marketplace_root_for_source(home.path(), &install_root, &metadata)
-                    .unwrap(),
+                    .unwrap()
+                    .map(|(root, _last_revision)| root),
                 expected,
                 "{extra}"
             );
@@ -359,7 +367,13 @@ mod tests {
             path: source_root.clone(),
         };
         let install_metadata = MarketplaceInstallMetadata::from_source(&source, &[]);
-        record_added_marketplace_entry(codex_home.path(), "debug", &install_metadata).unwrap();
+        record_added_marketplace_entry(
+            codex_home.path(),
+            "debug",
+            &install_metadata,
+            /*last_revision*/ None,
+        )
+        .unwrap();
 
         let root = installed_marketplace_root_for_source(
             codex_home.path(),
@@ -368,6 +382,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(root, Some(source_root));
+        assert_eq!(root, Some((source_root, None)));
     }
 }

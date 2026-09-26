@@ -1,5 +1,4 @@
 use crate::now_unix_seconds;
-use crate::records::stable_source_modified_at;
 use codex_file_system::write_atomically;
 use codex_protocol::ThreadId;
 use serde::Deserialize;
@@ -31,52 +30,13 @@ struct ImportedExternalAgentSessionRecord {
     content_sha256: String,
     imported_thread_id: ThreadId,
     imported_at: i64,
-    #[serde(default)]
-    source_modified_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedExternalAgentSessionImport {
     pub source_path: PathBuf,
     pub source_content_sha256: String,
-    pub source_modified_at: Option<i64>,
     pub imported_thread_id: ThreadId,
-}
-
-#[derive(Debug)]
-pub(super) struct ImportedSourceState<'a> {
-    latest: &'a ImportedExternalAgentSessionRecord,
-    hashes: HashSet<&'a str>,
-}
-
-impl ImportedSourceState<'_> {
-    pub(super) fn current_source_refresh(&self) -> io::Result<Option<CurrentSourceRefresh>> {
-        let (content_sha256, source_modified_at) = session_fingerprint(&self.latest.source_path)?;
-        Ok(self
-            .hashes
-            .contains(content_sha256.as_str())
-            .then(|| CurrentSourceRefresh {
-                source_path: self.latest.source_path.clone(),
-                content_sha256,
-                source_modified_at,
-                expected_latest_record: self.latest.clone(),
-            }))
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct CurrentSourceRefresh {
-    source_path: PathBuf,
-    content_sha256: String,
-    source_modified_at: Option<i64>,
-    expected_latest_record: ImportedExternalAgentSessionRecord,
-}
-
-pub fn has_current_session_been_imported(
-    codex_home: &Path,
-    source_path: &Path,
-) -> io::Result<bool> {
-    load_import_ledger(codex_home)?.contains_current_source(source_path)
 }
 
 #[cfg(test)]
@@ -85,13 +45,12 @@ pub(crate) fn record_imported_session(
     source_path: &Path,
     imported_thread_id: ThreadId,
 ) -> io::Result<()> {
-    let source_path = canonical_source_path(source_path)?;
-    let (source_content_sha256, source_modified_at) = session_fingerprint(&source_path)?;
+    let source_path = fs::canonicalize(source_path)?;
+    let source_content_sha256 = session_content_sha256(&source_path)?;
     record_completed_session_imports(
         codex_home,
         vec![CompletedExternalAgentSessionImport {
             source_content_sha256,
-            source_modified_at,
             source_path,
             imported_thread_id,
         }],
@@ -124,7 +83,6 @@ pub fn record_completed_session_imports(
                         content_sha256: import.source_content_sha256,
                         imported_thread_id: import.imported_thread_id,
                         imported_at,
-                        source_modified_at: import.source_modified_at,
                     },
                 ),
             );
@@ -141,115 +99,23 @@ pub fn record_completed_session_imports(
     })
 }
 
-pub(super) fn record_current_source_refreshes(
-    codex_home: &Path,
-    refreshes: Vec<CurrentSourceRefresh>,
-) -> io::Result<()> {
-    if refreshes.is_empty() {
-        return Ok(());
-    }
-    with_import_ledger_lock(codex_home, || {
-        let mut ledger = load_import_ledger_unlocked(codex_home)?;
-        let imported_at = now_unix_seconds();
-        let mut latest = HashMap::new();
-        let mut identities = HashMap::new();
-        for (index, record) in ledger.records.iter().enumerate() {
-            latest.insert(record.source_path.clone(), index);
-            identities.insert(
-                (record.source_path.clone(), record.content_sha256.clone()),
-                index,
-            );
-        }
-        let mut records = ledger.records.into_iter().map(Some).collect::<Vec<_>>();
-        let mut changed = false;
-        for refresh in refreshes {
-            let Some(&latest_index) = latest.get(&refresh.source_path) else {
-                continue;
-            };
-            if records[latest_index].as_ref() != Some(&refresh.expected_latest_record) {
-                continue;
-            }
-            let key = (refresh.source_path.clone(), refresh.content_sha256);
-            let Some(&index) = identities.get(&key) else {
-                continue;
-            };
-            if index == latest_index
-                && records[index]
-                    .as_ref()
-                    .is_some_and(|record| record.source_modified_at == refresh.source_modified_at)
-            {
-                continue;
-            }
-            let Some(mut record) = records[index].take() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "indexed ledger record is missing",
-                ));
-            };
-            record.imported_at = imported_at;
-            record.source_modified_at = refresh.source_modified_at;
-            latest.insert(refresh.source_path, records.len());
-            identities.insert(key, records.len());
-            records.push(Some(record));
-            changed = true;
-        }
-        if !changed {
-            return Ok(());
-        }
-        ledger.records = records.into_iter().flatten().collect();
-        save_import_ledger_unlocked(codex_home, &ledger)
-    })
-}
-
 impl ImportedExternalAgentSessionLedger {
-    pub(super) fn source_states(&self) -> HashMap<&Path, ImportedSourceState<'_>> {
-        let mut states = HashMap::new();
+    /// Returns every imported content hash, keyed by canonical source path.
+    pub(super) fn imported_hashes_by_source(&self) -> HashMap<&Path, HashSet<&str>> {
+        let mut hashes = HashMap::<_, HashSet<_>>::new();
         for record in &self.records {
-            let state = states
+            hashes
                 .entry(record.source_path.as_path())
-                .or_insert_with(|| ImportedSourceState {
-                    latest: record,
-                    hashes: HashSet::new(),
-                });
-            state.latest = record;
-            state.hashes.insert(record.content_sha256.as_str());
+                .or_default()
+                .insert(record.content_sha256.as_str());
         }
-        states
+        hashes
     }
 
     pub(super) fn contains_fingerprint(&self, source_path: &Path, content_sha256: &str) -> bool {
         self.records.iter().any(|record| {
             record.source_path == source_path && record.content_sha256 == content_sha256
         })
-    }
-
-    pub(super) fn contains_current_source(&self, source_path: &Path) -> io::Result<bool> {
-        if self.records.is_empty() {
-            return Ok(false);
-        }
-        let source_path = canonical_source_path(source_path)?;
-        if !self
-            .records
-            .iter()
-            .any(|record| record.source_path == source_path)
-        {
-            return Ok(false);
-        }
-        let (content_sha256, _source_modified_at) = session_fingerprint(&source_path)?;
-        Ok(self.records.iter().any(|record| {
-            record.source_path == source_path && record.content_sha256 == content_sha256
-        }))
-    }
-
-    #[cfg(test)]
-    pub(super) fn current_source_refresh(
-        &self,
-        source_path: &Path,
-    ) -> io::Result<Option<CurrentSourceRefresh>> {
-        let source_path = canonical_source_path(source_path)?;
-        self.source_states()
-            .get(source_path.as_path())
-            .map_or(Ok(None), ImportedSourceState::current_source_refresh)
     }
 }
 
@@ -307,13 +173,8 @@ fn import_ledger_path(codex_home: &Path) -> PathBuf {
     codex_home.join(SESSION_IMPORT_LEDGER_FILE)
 }
 
-fn canonical_source_path(path: &Path) -> io::Result<PathBuf> {
-    fs::canonicalize(path)
-}
-
-fn session_fingerprint(path: &Path) -> io::Result<(String, Option<i64>)> {
+pub(super) fn session_content_sha256(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
-    let metadata_before = file.metadata().ok();
     let mut hasher = Sha256::new();
     let mut buffer = [0; SESSION_HASH_BUFFER_SIZE];
     loop {
@@ -323,13 +184,7 @@ fn session_fingerprint(path: &Path) -> io::Result<(String, Option<i64>)> {
         }
         hasher.update(&buffer[..read]);
     }
-    let digest = hasher.finalize();
-    let metadata_after = file.metadata().ok();
-    let source_modified_at = metadata_before
-        .as_ref()
-        .zip(metadata_after.as_ref())
-        .and_then(|(before, after)| stable_source_modified_at(before, after));
-    Ok((format!("{digest:x}"), source_modified_at))
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]

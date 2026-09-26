@@ -393,6 +393,33 @@ mod tests {
     }
 
     #[test]
+    fn replay_keeps_the_complete_prefix_of_an_interrupted_log() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer =
+            TraceWriter::create(temp.path(), "trace".into(), "rollout".into(), "root".into())?;
+        for (thread_id, agent_path) in [("root", "/root"), ("child", "/root/é")] {
+            writer.append(RawTraceEventPayload::ThreadStarted {
+                thread_id: thread_id.into(),
+                agent_path: agent_path.into(),
+                metadata_payload: None,
+            })?;
+        }
+        let log = temp.path().join("trace.jsonl");
+        let bytes = std::fs::read(&log)?;
+        // A crash or a live writer can leave the final append inside a UTF-8 character.
+        let cut = bytes.iter().rposition(|byte| *byte == 0xC3).expect("é") + 1;
+        std::fs::write(&log, &bytes[..cut])?;
+
+        let replayed = replay_bundle(temp.path())?;
+        assert_eq!(replayed.threads.keys().collect::<Vec<_>>(), vec!["root"]);
+
+        // A terminated malformed record is corruption, not an unfinished append.
+        std::fs::write(&log, [&bytes[..cut], b"\n"].concat())?;
+        assert!(replay_bundle(temp.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn best_effort_payload_write_warns_and_returns_none() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let writer = TraceWriter::create(

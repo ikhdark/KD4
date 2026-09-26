@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,31 +15,31 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use serde::Deserialize;
 use serde::Serialize;
-use tracing::warn;
 
-use super::SecretListEntry;
 use super::SecretName;
 use super::SecretScope;
 use super::compute_keyring_account;
 use super::keyring_service;
 
 const SECRETS_VERSION: u8 = 1;
-const LOCAL_SECRETS_FILENAME: &str = "local.age";
+// age calibrates scrypt to ~1s (and hundreds of MiB) per operation for human passphrases.
+// The key here is 32 random bytes from the OS keyring, so the KDF adds no brute-force
+// resistance; keep the minimum practical cost. Decryption still accepts older, slower files.
+const SCRYPT_LOG_N: u8 = 10;
+// Written by the former general-purpose namespace. Its ciphertext still depends on the shared
+// keyring key, so its presence must keep blocking key bootstrap.
+const LEGACY_LOCAL_SECRETS_FILENAME: &str = "local.age";
 const CODEX_AUTH_SECRETS_FILENAME: &str = "codex_auth.age";
 const MCP_OAUTH_SECRETS_FILENAME: &str = "mcp_oauth.age";
 
 /// Selects the local encrypted file used by a `LocalSecretsBackend`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalSecretsNamespace {
-    /// General managed secrets stored in `local.age`.
-    #[default]
-    ManagedSecrets,
     /// Codex authentication credentials used by the CLI, TUI, app server, and other clients.
     CodexAuth,
     /// OAuth credentials for external MCP servers.
@@ -71,19 +69,6 @@ pub struct LocalSecretsBackend {
 }
 
 impl LocalSecretsBackend {
-    pub fn new_default(codex_home: PathBuf) -> Self {
-        let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
-        Self::new(codex_home, keyring_store)
-    }
-
-    pub fn new(codex_home: PathBuf, keyring_store: Arc<dyn KeyringStore>) -> Self {
-        Self::new_with_namespace(
-            codex_home,
-            keyring_store,
-            LocalSecretsNamespace::ManagedSecrets,
-        )
-    }
-
     pub fn new_with_namespace(
         codex_home: PathBuf,
         keyring_store: Arc<dyn KeyringStore>,
@@ -134,31 +119,12 @@ impl LocalSecretsBackend {
         Ok(removed)
     }
 
-    pub fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
-        let file = self.load_file()?;
-        let mut entries = Vec::new();
-        for canonical_key in file.secrets.keys() {
-            let Some(entry) = parse_canonical_key(canonical_key) else {
-                warn!("skipping invalid canonical secret key: {canonical_key}");
-                continue;
-            };
-            if let Some(scope) = scope_filter
-                && entry.scope != *scope
-            {
-                continue;
-            }
-            entries.push(entry);
-        }
-        Ok(entries)
-    }
-
     fn secrets_dir(&self) -> PathBuf {
         self.codex_home.join("secrets")
     }
 
     fn secrets_path(&self) -> PathBuf {
         let filename = match self.namespace {
-            LocalSecretsNamespace::ManagedSecrets => LOCAL_SECRETS_FILENAME,
             LocalSecretsNamespace::CodexAuth => CODEX_AUTH_SECRETS_FILENAME,
             LocalSecretsNamespace::McpOAuth => MCP_OAUTH_SECRETS_FILENAME,
         };
@@ -211,15 +177,13 @@ impl LocalSecretsBackend {
     }
 
     fn save_file(&self, file: &SecretsFile, passphrase: &SecretString) -> Result<()> {
-        let dir = self.secrets_dir();
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create secrets dir {}", dir.display()))?;
-
         let plaintext = serde_json::to_vec(file).context("failed to serialize secrets file")?;
         let ciphertext = encrypt_with_passphrase(&plaintext, passphrase)?;
         let path = self.secrets_path();
-        write_file_atomically(&path, &ciphertext)?;
-        Ok(())
+        // The shared writer syncs a same-directory replacement, removes it on failure, and
+        // clears the Windows temporary-file attribute before publishing it.
+        codex_file_system::write_bytes_atomically(&path, &ciphertext)
+            .with_context(|| format!("failed to write secrets file at {}", path.display()))
     }
 
     fn load_passphrase(&self) -> Result<Option<SecretString>> {
@@ -238,7 +202,7 @@ impl LocalSecretsBackend {
             Some(existing) => Ok(existing),
             None => {
                 for filename in [
-                    LOCAL_SECRETS_FILENAME,
+                    LEGACY_LOCAL_SECRETS_FILENAME,
                     CODEX_AUTH_SECRETS_FILENAME,
                     MCP_OAUTH_SECRETS_FILENAME,
                 ] {
@@ -266,69 +230,6 @@ impl LocalSecretsBackend {
     }
 }
 
-fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
-    write_file_atomically_with_replace(path, contents, |from, to| fs::rename(from, to))
-}
-
-fn write_file_atomically_with_replace<F>(path: &Path, contents: &[u8], replace: F) -> Result<()>
-where
-    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
-{
-    write_file_atomically_with_io(
-        path,
-        contents,
-        |file, contents| {
-            file.write_all(contents)?;
-            file.sync_all()
-        },
-        replace,
-    )
-}
-
-fn write_file_atomically_with_io<W, R>(
-    path: &Path,
-    contents: &[u8],
-    write_and_sync: W,
-    replace: R,
-) -> Result<()>
-where
-    W: FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
-    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
-{
-    let dir = path.parent().with_context(|| {
-        format!(
-            "failed to compute parent directory for secrets file at {}",
-            path.display()
-        )
-    })?;
-    let filename = path.file_name().with_context(|| {
-        format!(
-            "failed to compute filename for secrets file at {}",
-            path.display()
-        )
-    })?;
-    let mut tmp_file = tempfile::Builder::new()
-        .prefix(&format!(".{}.tmp-", filename.to_string_lossy()))
-        .tempfile_in(dir)
-        .with_context(|| format!("failed to create temp secrets file in {}", dir.display()))?;
-    write_and_sync(tmp_file.as_file_mut(), contents).with_context(|| {
-        format!(
-            "failed to write or sync temp secrets file at {}",
-            tmp_file.path().display()
-        )
-    })?;
-    // Close the Windows file handle before replacement, retaining cleanup ownership
-    // on every error path until the target has been atomically replaced.
-    let tmp_path = tmp_file.into_temp_path();
-    replace(&tmp_path, path).with_context(|| {
-        format!(
-            "failed to atomically replace secrets file at {} with {}",
-            path.display(),
-            tmp_path.display()
-        )
-    })
-}
-
 fn generate_passphrase() -> Result<SecretString> {
     let mut bytes = [0_u8; 32];
     let mut rng = OsRng;
@@ -350,7 +251,8 @@ fn wipe_bytes(bytes: &mut [u8]) {
 }
 
 fn encrypt_with_passphrase(plaintext: &[u8], passphrase: &SecretString) -> Result<Vec<u8>> {
-    let recipient = ScryptRecipient::new(passphrase.clone());
+    let mut recipient = ScryptRecipient::new(passphrase.clone());
+    recipient.set_work_factor(SCRYPT_LOG_N);
     encrypt(&recipient, plaintext).context("failed to encrypt secrets file")
 }
 
@@ -359,49 +261,62 @@ fn decrypt_with_passphrase(ciphertext: &[u8], passphrase: &SecretString) -> Resu
     decrypt(&identity, ciphertext).context("failed to decrypt secrets file")
 }
 
-fn parse_canonical_key(canonical_key: &str) -> Option<SecretListEntry> {
-    if let Some(name) = canonical_key.strip_prefix("global/") {
-        return Some(SecretListEntry {
-            scope: SecretScope::Global,
-            name: SecretName::new(name).ok()?,
-        });
-    }
-    let (environment_id, name) = canonical_key.strip_prefix("env/")?.rsplit_once('/')?;
-    Some(SecretListEntry {
-        scope: SecretScope::environment(environment_id).ok()?,
-        name: SecretName::new(name).ok()?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use codex_keyring_store::tests::MockKeyringStore;
     use keyring::Error as KeyringError;
     use pretty_assertions::assert_eq;
+    use std::path::Path;
+
+    fn auth_backend(home: &Path, keyring: Arc<dyn KeyringStore>) -> LocalSecretsBackend {
+        LocalSecretsBackend::new_with_namespace(
+            home.to_path_buf(),
+            keyring,
+            LocalSecretsNamespace::CodexAuth,
+        )
+    }
 
     #[test]
     fn missing_key_never_bootstraps_over_existing_ciphertext_in_any_namespace() -> Result<()> {
-        for namespace in [
-            LocalSecretsNamespace::ManagedSecrets,
-            LocalSecretsNamespace::CodexAuth,
-            LocalSecretsNamespace::McpOAuth,
+        for (existing_file, owner, writer_namespace) in [
+            (
+                LEGACY_LOCAL_SECRETS_FILENAME,
+                None,
+                LocalSecretsNamespace::CodexAuth,
+            ),
+            (
+                CODEX_AUTH_SECRETS_FILENAME,
+                Some(LocalSecretsNamespace::CodexAuth),
+                LocalSecretsNamespace::McpOAuth,
+            ),
+            (
+                MCP_OAUTH_SECRETS_FILENAME,
+                Some(LocalSecretsNamespace::McpOAuth),
+                LocalSecretsNamespace::CodexAuth,
+            ),
         ] {
             let home = tempfile::tempdir()?;
             let keyring = Arc::new(MockKeyringStore::default());
-            let existing = LocalSecretsBackend::new_with_namespace(
+            let writer = LocalSecretsBackend::new_with_namespace(
                 home.path().into(),
                 keyring.clone(),
-                namespace,
+                writer_namespace,
             );
-            fs::create_dir_all(existing.secrets_dir())?;
-            fs::write(existing.secrets_path(), b"existing ciphertext")?;
+            let existing_path = writer.secrets_dir().join(existing_file);
+            fs::create_dir_all(writer.secrets_dir())?;
+            fs::write(&existing_path, b"existing ciphertext")?;
             let name = SecretName::new("TEST")?;
-            let error = existing
+            if let Some(owner) = owner {
+                let error = LocalSecretsBackend::new_with_namespace(
+                    home.path().into(),
+                    keyring.clone(),
+                    owner,
+                )
                 .get(&SecretScope::Global, &name)
                 .expect_err("missing key must fail");
-            assert!(error.to_string().contains("keyring key is missing"));
-            let writer = LocalSecretsBackend::new(home.path().into(), keyring.clone());
+                assert!(error.to_string().contains("keyring key is missing"));
+            }
             let error = writer
                 .set(&SecretScope::Global, &name, "new value")
                 .expect_err("must preserve other namespaces' key identity");
@@ -410,7 +325,7 @@ mod tests {
                 keyring.load(keyring_service(), &compute_keyring_account(home.path()))?,
                 None
             );
-            assert_eq!(fs::read(existing.secrets_path())?, b"existing ciphertext");
+            assert_eq!(fs::read(&existing_path)?, b"existing ciphertext");
         }
         Ok(())
     }
@@ -419,7 +334,7 @@ mod tests {
     fn reads_distinguish_absence_from_io_failure_without_creating_a_key() -> Result<()> {
         let home = tempfile::tempdir()?;
         let keyring = Arc::new(MockKeyringStore::default());
-        let backend = LocalSecretsBackend::new(home.path().into(), keyring.clone());
+        let backend = auth_backend(home.path(), keyring.clone());
         let name = SecretName::new("TEST")?;
         assert_eq!(backend.get(&SecretScope::Global, &name)?, None);
         fs::create_dir_all(backend.secrets_path())?;
@@ -435,23 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_set_preserves_ciphertext_and_environment_scopes_round_trip() -> Result<()> {
+    fn unchanged_set_preserves_ciphertext_and_values_round_trip() -> Result<()> {
         let home = tempfile::tempdir()?;
-        let keyring = Arc::new(MockKeyringStore::default());
-        let backend = LocalSecretsBackend::new(home.path().into(), keyring);
-        let scope = SecretScope::environment("tenant/project/api")?;
+        let backend = auth_backend(home.path(), Arc::new(MockKeyringStore::default()));
+        let scope = SecretScope::Global;
         let name = SecretName::new("TEST")?;
         backend.set(&scope, &name, "value")?;
         let ciphertext = fs::read(backend.secrets_path())?;
         backend.set(&scope, &name, "value")?;
         assert_eq!(fs::read(backend.secrets_path())?, ciphertext);
-        assert_eq!(
-            backend.list(Some(&scope))?,
-            vec![SecretListEntry {
-                scope: scope.clone(),
-                name: name.clone()
-            }]
-        );
         assert_eq!(backend.get(&scope, &name)?, Some("value".into()));
         assert!(backend.delete(&scope, &name)?);
         assert_eq!(backend.get(&scope, &name)?, None);
@@ -462,7 +369,7 @@ mod tests {
     fn concurrent_backend_instances_preserve_both_updates_and_shared_key() -> Result<()> {
         // Exercise both a shared file transaction and cross-namespace bootstrap.
         for second_namespace in [
-            LocalSecretsNamespace::ManagedSecrets,
+            LocalSecretsNamespace::CodexAuth,
             LocalSecretsNamespace::McpOAuth,
         ] {
             let home = tempfile::tempdir()?;
@@ -470,7 +377,7 @@ mod tests {
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let mut workers = Vec::new();
             for (name, namespace) in [
-                ("FIRST", LocalSecretsNamespace::ManagedSecrets),
+                ("FIRST", LocalSecretsNamespace::CodexAuth),
                 ("SECOND", second_namespace),
             ] {
                 let backend = LocalSecretsBackend::new_with_namespace(
@@ -488,7 +395,7 @@ mod tests {
                 worker.join().expect("writer thread")?;
             }
             for (name, namespace) in [
-                ("FIRST", LocalSecretsNamespace::ManagedSecrets),
+                ("FIRST", LocalSecretsNamespace::CodexAuth),
                 ("SECOND", second_namespace),
             ] {
                 let backend = LocalSecretsBackend::new_with_namespace(
@@ -506,10 +413,45 @@ mod tests {
     }
 
     #[test]
+    fn writes_use_fixed_scrypt_cost_and_slower_files_still_decrypt() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let backend = auth_backend(home.path(), Arc::new(MockKeyringStore::default()));
+        let name = SecretName::new("TEST")?;
+        let stored_log_n = || -> Result<Option<u8>> {
+            Ok(String::from_utf8_lossy(&fs::read(backend.secrets_path())?)
+                .lines()
+                .find_map(|line| line.strip_prefix("-> scrypt "))
+                .and_then(|args| args.split_whitespace().nth(1))
+                .and_then(|log_n| log_n.parse().ok()))
+        };
+        backend.set(&SecretScope::Global, &name, "value")?;
+        assert_eq!(stored_log_n()?, Some(SCRYPT_LOG_N));
+
+        let mut slower = ScryptRecipient::new(backend.load_passphrase()?.context("passphrase")?);
+        slower.set_work_factor(SCRYPT_LOG_N + 2);
+        let plaintext = serde_json::to_vec(&SecretsFile {
+            version: SECRETS_VERSION,
+            secrets: BTreeMap::from([(
+                SecretScope::Global.canonical_key(&name),
+                "older".to_string(),
+            )]),
+        })?;
+        fs::write(backend.secrets_path(), encrypt(&slower, &plaintext)?)?;
+        assert_eq!(stored_log_n()?, Some(SCRYPT_LOG_N + 2));
+        assert_eq!(
+            backend.get(&SecretScope::Global, &name)?,
+            Some("older".into())
+        );
+        backend.set(&SecretScope::Global, &name, "newer")?;
+        assert_eq!(stored_log_n()?, Some(SCRYPT_LOG_N));
+        Ok(())
+    }
+
+    #[test]
     fn load_file_rejects_newer_schema_versions() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
-        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
+        let backend = auth_backend(codex_home.path(), keyring);
 
         let file = SecretsFile {
             version: SECRETS_VERSION + 1,
@@ -540,7 +482,7 @@ mod tests {
             KeyringError::Invalid("error".into(), "load".into()),
         );
 
-        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
+        let backend = auth_backend(codex_home.path(), keyring);
         let scope = SecretScope::Global;
         let name = SecretName::new("TEST_SECRET")?;
         let error = backend
@@ -559,7 +501,7 @@ mod tests {
     fn save_file_does_not_leave_temp_files() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
-        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring.clone());
+        let backend = auth_backend(codex_home.path(), keyring.clone());
 
         let scope = SecretScope::Global;
         let name = SecretName::new("TEST_SECRET")?;
@@ -582,108 +524,19 @@ mod tests {
             filenames,
             vec![
                 ".store.lock".to_string(),
-                LOCAL_SECRETS_FILENAME.to_string()
+                CODEX_AUTH_SECRETS_FILENAME.to_string()
             ]
         );
-        let reopened = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
-        assert_eq!(reopened.get(&scope, &name)?, Some("two".to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn replacement_failure_preserves_existing_bytes() -> Result<()> {
-        let codex_home = tempfile::tempdir().expect("tempdir");
-
-        let path = codex_home.path().join(LOCAL_SECRETS_FILENAME);
-        let original_ciphertext = b"original bytes";
-        let replacement_ciphertext = b"replacement bytes";
-        fs::write(&path, original_ciphertext)?;
-
-        let mut observed_prepared_temp = false;
-        let error = write_file_atomically_with_replace(
-            &path,
-            replacement_ciphertext,
-            |tmp_path, destination| {
-                observed_prepared_temp = true;
-                assert_eq!(destination, path);
-                assert_eq!(fs::read(tmp_path)?, replacement_ciphertext);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected replacement failure",
-                ))
-            },
-        )
-        .expect_err("replacement must fail after the temp file is prepared");
-        assert!(observed_prepared_temp);
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string() == "injected replacement failure"),
-            "unexpected error: {error:#}"
-        );
-
-        assert_eq!(fs::read(&path)?, original_ciphertext);
-        let filenames = fs::read_dir(codex_home.path())?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<std::io::Result<Vec<_>>>()?;
+        // The published store must not keep the temporary-file hint of its staging file.
+        const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
         assert_eq!(
-            filenames,
-            vec![std::ffi::OsString::from(LOCAL_SECRETS_FILENAME)]
+            std::os::windows::fs::MetadataExt::file_attributes(&fs::metadata(
+                backend.secrets_path()
+            )?) & FILE_ATTRIBUTE_TEMPORARY,
+            0
         );
-        Ok(())
-    }
-
-    #[test]
-    fn preparation_failure_preserves_store_and_removes_temporary_files() -> Result<()> {
-        let codex_home = tempfile::tempdir().expect("tempdir");
-        let path = codex_home.path().join(LOCAL_SECRETS_FILENAME);
-        let original_ciphertext = b"original bytes";
-        let replacement_ciphertext = b"replacement bytes";
-        fs::write(&path, original_ciphertext)?;
-
-        for fail_during_sync in [false, true] {
-            let mut replacement_attempted = false;
-            let error = write_file_atomically_with_io(
-                &path,
-                replacement_ciphertext,
-                |file, contents| {
-                    let written_len = if fail_during_sync {
-                        contents.len()
-                    } else {
-                        contents.len() / 2
-                    };
-                    file.write_all(&contents[..written_len])?;
-                    assert_eq!(file.metadata()?.len(), written_len as u64);
-                    Err(std::io::Error::other(if fail_during_sync {
-                        "injected sync failure"
-                    } else {
-                        "injected write failure"
-                    }))
-                },
-                |from, to| {
-                    replacement_attempted = true;
-                    fs::rename(from, to)
-                },
-            )
-            .expect_err("preparation must fail before replacement");
-            assert!(error.chain().any(|cause| {
-                cause.to_string()
-                    == if fail_during_sync {
-                        "injected sync failure"
-                    } else {
-                        "injected write failure"
-                    }
-            }));
-            assert!(!replacement_attempted);
-            assert_eq!(fs::read(&path)?, original_ciphertext);
-            let filenames = fs::read_dir(codex_home.path())?
-                .map(|entry| entry.map(|entry| entry.file_name()))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            assert_eq!(
-                filenames,
-                vec![std::ffi::OsString::from(LOCAL_SECRETS_FILENAME)]
-            );
-        }
+        let reopened = auth_backend(codex_home.path(), keyring);
+        assert_eq!(reopened.get(&scope, &name)?, Some("two".to_string()));
         Ok(())
     }
 
@@ -691,20 +544,20 @@ mod tests {
     fn stale_temp_file_does_not_corrupt_live_store() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
-        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring.clone());
+        let backend = auth_backend(codex_home.path(), keyring.clone());
         let scope = SecretScope::Global;
         let name = SecretName::new("TEST_SECRET")?;
         backend.set(&scope, &name, "one")?;
 
         let stale_path = backend
             .secrets_dir()
-            .join(format!(".{LOCAL_SECRETS_FILENAME}.tmp-stale"));
+            .join(format!(".{CODEX_AUTH_SECRETS_FILENAME}.tmp-stale"));
         let stale_contents = b"incomplete encrypted replacement";
         fs::write(&stale_path, stale_contents)?;
         assert_eq!(backend.get(&scope, &name)?, Some("one".to_string()));
 
         backend.set(&scope, &name, "two")?;
-        let reopened = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
+        let reopened = auth_backend(codex_home.path(), keyring);
         assert_eq!(reopened.get(&scope, &name)?, Some("two".to_string()));
         assert_eq!(fs::read(stale_path)?, stale_contents);
         Ok(())

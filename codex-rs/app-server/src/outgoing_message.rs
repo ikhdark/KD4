@@ -514,6 +514,10 @@ impl OutgoingMessageSender {
         self.notification_sender.as_ref().unwrap_or(&self.sender)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Register admitted work before connection teardown can purge the connection's contexts"
+    )]
     pub(crate) async fn admit_request_work(
         &self,
         context: &mut RequestContext,
@@ -610,7 +614,8 @@ impl OutgoingMessageSender {
             ActiveConnection {
                 outstanding: Arc::new(tokio::sync::Semaphore::new(64)),
                 outstanding_control: Arc::new(tokio::sync::Semaphore::new(8)),
-                outstanding_bytes: Arc::new(tokio::sync::Semaphore::new(8 * 1024 * 1024)),
+                // A maximum-size fs/writeFile request includes base64 expansion.
+                outstanding_bytes: Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)),
                 initialized,
                 delivery_failure,
             },

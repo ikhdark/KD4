@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::future::Future;
 
 use sha2::Digest;
 use sha2::Sha384;
@@ -43,6 +44,49 @@ pub(crate) fn runtime_goals_migrator() -> Migrator {
 
 pub(crate) fn runtime_bugs_migrator() -> Migrator {
     runtime_migrator(&BUGS_MIGRATOR)
+}
+
+/// SQLx takes no migration lock on SQLite, so concurrent initializers can both try to apply the
+/// same pending migration and the later one fails replaying it. Retry while the ledger shows that
+/// a writer made progress; a failure without ledger progress is returned unchanged.
+pub(crate) async fn migrate_tolerating_concurrent_initializers<F, Fut>(
+    pool: &SqlitePool,
+    mut migrate: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    loop {
+        let applied_before = applied_migration_count(pool).await.ok();
+        let Err(err) = migrate().await else {
+            return Ok(());
+        };
+        match (applied_before, applied_migration_count(pool).await.ok()) {
+            (Some(before), Some(after)) if after > before => {}
+            _ => return Err(err),
+        }
+    }
+}
+
+async fn applied_migration_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    if !migrations_table_exists(pool).await? {
+        return Ok(0);
+    }
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn migrations_table_exists(pool: &SqlitePool) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_some())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -105,13 +149,7 @@ pub(crate) async fn runtime_migrator_for_pool(
     pool: &SqlitePool,
     migrator: &Migrator,
 ) -> anyhow::Result<Migrator> {
-    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
-    )
-    .fetch_optional(pool)
-    .await?
-    .is_some();
-    let applied = if migrations_table_exists {
+    let applied = if migrations_table_exists(pool).await? {
         sqlx::query_as::<_, (i64, Vec<u8>)>(
             "SELECT version, checksum FROM _sqlx_migrations ORDER BY version",
         )
@@ -211,13 +249,7 @@ async fn repair_legacy_validation_index_migration_order_inner(
     else {
         return Ok(());
     };
-    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
-    )
-    .fetch_optional(pool)
-    .await?
-    .is_some();
-    if !migrations_table_exists {
+    if !migrations_table_exists(pool).await? {
         return Ok(());
     }
 
@@ -289,18 +321,6 @@ async fn repair_legacy_validation_index_migration_order_inner(
     Ok(())
 }
 
-pub(crate) async fn ensure_kd4_compatibility_indexes(pool: &SqlitePool) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-CREATE INDEX IF NOT EXISTS idx_threads_cwd_norm
-    ON threads(lower(replace(cwd, '\', '/')))
-        "#,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 pub(crate) async fn repair_legacy_recency_migration_version(
     pool: &SqlitePool,
     migrator: &Migrator,
@@ -312,13 +332,7 @@ pub(crate) async fn repair_legacy_recency_migration_version(
     else {
         return Ok(());
     };
-    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
-    )
-    .fetch_optional(pool)
-    .await?
-    .is_some();
-    if !migrations_table_exists {
+    if !migrations_table_exists(pool).await? {
         return Ok(());
     }
 

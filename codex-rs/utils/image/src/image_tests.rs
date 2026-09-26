@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use super::*;
+use image::ColorType;
 use image::GenericImageView;
 use image::ImageBuffer;
 use image::ImageDecoder;
@@ -199,6 +200,59 @@ fn resizing_preserves_supported_metadata() {
                 Some(TEST_RGB_ICC_PROFILE.to_vec()),
                 Some(ROTATE_90_EXIF.to_vec()),
             )
+        );
+    }
+}
+
+#[test]
+fn resizing_keeps_channel_layout_and_narrows_to_eight_bits() {
+    for (source, format, expected_color) in [
+        (
+            DynamicImage::ImageRgb8(ImageBuffer::from_pixel(2050, 2, image::Rgb([1u8, 2, 3]))),
+            ImageFormat::Png,
+            ColorType::Rgb8,
+        ),
+        (
+            DynamicImage::ImageLuma8(ImageBuffer::from_pixel(2050, 2, image::Luma([7u8]))),
+            ImageFormat::Png,
+            ColorType::L8,
+        ),
+        (
+            DynamicImage::ImageLumaA8(ImageBuffer::from_pixel(2050, 2, image::LumaA([7u8, 9]))),
+            ImageFormat::Png,
+            ColorType::La8,
+        ),
+        (
+            DynamicImage::ImageRgb16(ImageBuffer::from_pixel(2050, 2, image::Rgb([1u16, 2, 3]))),
+            ImageFormat::Png,
+            ColorType::Rgb8,
+        ),
+        (
+            DynamicImage::ImageLuma8(ImageBuffer::from_pixel(2050, 2, image::Luma([7u8]))),
+            ImageFormat::Jpeg,
+            ColorType::L8,
+        ),
+    ] {
+        let mut source_bytes = Cursor::new(Vec::new());
+        source
+            .write_to(&mut source_bytes, format)
+            .expect("encode source image");
+
+        let processed = load_for_prompt_bytes(
+            Path::new("in-memory-image"),
+            source_bytes.into_inner(),
+            PromptImageMode::ResizeToFit,
+        )
+        .expect("process image");
+
+        assert_eq!((processed.width, processed.height), (2048, 2));
+        assert_eq!(
+            image::load_from_memory(&processed.bytes)
+                .expect("decode processed image")
+                .color(),
+            expected_color,
+            "{:?} {format:?} source",
+            source.color()
         );
     }
 }

@@ -212,7 +212,7 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
     );
     assert!(
-        instructions_text.contains("Every added or modified test must assert the intended result.")
+        instructions_text.contains("Every test relied upon as evidence for the changed behavior must assert an expected observable result and fail for at least one plausible incorrect implementation of that behavior.")
     );
     assert!(!instructions_text.contains("{{ personality }}"));
 
@@ -395,6 +395,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
     let developer_texts = request.message_input_texts("developer");
     let personality_text = developer_texts
         .iter()
+        .rev()
         .find(|text| text.contains("<personality_spec>"))
         .expect("expected personality update message in developer input");
 
@@ -497,12 +498,20 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
         .filter(|text| text.contains("<personality_spec>") && text.contains(PERSONALITY_RESET_TEXT))
         .count();
     assert_eq!(
-        friendly_updates, 0,
-        "the stale friendly slot must be removed"
+        friendly_updates, 1,
+        "the historical friendly instruction must remain in the cached prefix"
     );
     assert_eq!(
         reset_updates, 1,
-        "the reset must be the canonical personality slot"
+        "the reset must be emitted exactly once"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .rev()
+            .find(|text| text.contains("<personality_spec>"))
+            .expect("active personality instruction")
+            .contains(PERSONALITY_RESET_TEXT)
     );
 
     Ok(())

@@ -37,16 +37,22 @@ const SANDBOX_MODE_READ_ONLY: &str =
     include_str!("../templates/permissions/sandbox_mode/read_only.md");
 
 static SANDBOX_MODE_DANGER_FULL_ACCESS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    Template::parse(SANDBOX_MODE_DANGER_FULL_ACCESS.trim_end())
-        .unwrap_or_else(|err| panic!("danger-full-access sandbox template must parse: {err}"))
+    Template::parse_embedded(
+        SANDBOX_MODE_DANGER_FULL_ACCESS.trim_end(),
+        "permissions/sandbox_mode/danger_full_access.md",
+    )
 });
 static SANDBOX_MODE_WORKSPACE_WRITE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    Template::parse(SANDBOX_MODE_WORKSPACE_WRITE.trim_end())
-        .unwrap_or_else(|err| panic!("workspace-write sandbox template must parse: {err}"))
+    Template::parse_embedded(
+        SANDBOX_MODE_WORKSPACE_WRITE.trim_end(),
+        "permissions/sandbox_mode/workspace_write.md",
+    )
 });
 static SANDBOX_MODE_READ_ONLY_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    Template::parse(SANDBOX_MODE_READ_ONLY.trim_end())
-        .unwrap_or_else(|err| panic!("read-only sandbox template must parse: {err}"))
+    Template::parse_embedded(
+        SANDBOX_MODE_READ_ONLY.trim_end(),
+        "permissions/sandbox_mode/read_only.md",
+    )
 });
 
 struct PermissionsPromptConfig<'a> {

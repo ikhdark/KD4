@@ -54,7 +54,6 @@ use super::list::get_threads_ascending;
 use super::list::get_threads_in_root;
 use super::list::get_threads_in_root_ascending;
 use super::list::thread_item_sort_key;
-use super::metadata;
 use super::session_index::find_thread_names_by_ids;
 use crate::config::RolloutConfigView;
 use crate::state_integration;
@@ -75,7 +74,6 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_state::StateRuntime;
-use codex_utils_absolute_path as path_utils;
 
 /// Writes canonical session rollout items to JSONL.
 ///
@@ -781,87 +779,6 @@ impl RolloutRecorder {
         db_thread_id: ThreadId,
     ) -> bool {
         !filesystem_thread_ids.contains(&db_thread_id)
-    }
-
-    /// Find the newest recorded thread path, optionally filtering to a matching cwd.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn find_latest_thread_path(
-        state_db_ctx: Option<StateDbHandle>,
-        config: &impl RolloutConfigView,
-        page_size: usize,
-        cursor: Option<&Cursor>,
-        sort_key: ThreadSortKey,
-        allowed_sources: &[SessionSource],
-        model_providers: Option<&[String]>,
-        default_provider: &str,
-        filter_cwd: Option<&Path>,
-    ) -> std::io::Result<Option<PathBuf>> {
-        let codex_home = config.codex_home();
-        let mut fallback_reason = state_db_ctx.is_none().then_some("db_unavailable");
-        if state_db_ctx.is_some() {
-            let mut db_cursor = cursor.cloned();
-            loop {
-                let Some(db_page) = state_integration::list_threads_db(
-                    state_db_ctx.as_deref(),
-                    codex_home,
-                    page_size,
-                    db_cursor.as_ref(),
-                    sort_key,
-                    SortDirection::Desc,
-                    allowed_sources,
-                    model_providers,
-                    /*cwd_filters*/ None,
-                    /*relation_filter*/ None,
-                    /*archived*/ false,
-                    /*project_id*/ None,
-                    /*search_term*/ None,
-                )
-                .await
-                else {
-                    fallback_reason = Some("db_error");
-                    break;
-                };
-                if let Some(path) =
-                    select_resume_path_from_db_page(&db_page, filter_cwd, default_provider).await
-                {
-                    return Ok(Some(path));
-                }
-                db_cursor = db_page.next_anchor.map(Into::into);
-                if db_cursor.is_none() {
-                    fallback_reason = Some("missing_row");
-                    break;
-                }
-            }
-        }
-        if let Some(reason) = fallback_reason {
-            codex_state::record_fallback(
-                "find_latest_thread_path",
-                reason,
-                /*telemetry_override*/ None,
-            );
-        }
-
-        let mut cursor = cursor.cloned();
-        loop {
-            let page = get_threads(
-                codex_home,
-                page_size,
-                cursor.as_ref(),
-                sort_key,
-                allowed_sources,
-                model_providers,
-                /*cwd_filters*/ None,
-                default_provider,
-            )
-            .await?;
-            if let Some(path) = select_resume_path(&page, filter_cwd, default_provider).await {
-                return Ok(Some(path));
-            }
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                return Ok(None);
-            }
-        }
     }
 
     /// Attempt to create a new [`RolloutRecorder`].
@@ -2444,90 +2361,6 @@ fn thread_item_from_state_metadata(
         updated_at: Some(item.updated_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
         recency_at: Some(item.recency_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
     }
-}
-
-async fn select_resume_path(
-    page: &ThreadsPage,
-    filter_cwd: Option<&Path>,
-    default_provider: &str,
-) -> Option<PathBuf> {
-    match filter_cwd {
-        Some(cwd) => {
-            for item in &page.items {
-                if resume_candidate_matches_cwd(
-                    item.path.as_path(),
-                    item.cwd.as_deref(),
-                    cwd,
-                    default_provider,
-                )
-                .await
-                {
-                    return Some(item.path.clone());
-                }
-            }
-            None
-        }
-        None => page.items.first().map(|item| item.path.clone()),
-    }
-}
-
-async fn resume_candidate_matches_cwd(
-    rollout_path: &Path,
-    cached_cwd: Option<&Path>,
-    cwd: &Path,
-    default_provider: &str,
-) -> bool {
-    let mut latest_cwd = None;
-    let mut accumulator = metadata::RolloutMetadataAccumulator::default();
-    let Ok((_, parse_errors)) = RolloutRecorder::for_each_rollout_item(rollout_path, |item| {
-        if let RolloutItem::TurnContext(context) = &item {
-            latest_cwd = Some(context.cwd.clone());
-        }
-        accumulator.push(item, rollout_path, default_provider);
-    })
-    .await
-    else {
-        return false;
-    };
-    if let Some(latest_cwd) = latest_cwd {
-        return cwd_matches(&latest_cwd, cwd);
-    }
-    if cached_cwd.is_some_and(|session_cwd| cwd_matches(session_cwd, cwd)) {
-        return true;
-    }
-    accumulator
-        .finish(rollout_path, default_provider, parse_errors)
-        .await
-        .is_ok_and(|outcome| cwd_matches(&outcome.metadata.cwd, cwd))
-}
-
-async fn select_resume_path_from_db_page(
-    page: &codex_state::ThreadsPage,
-    filter_cwd: Option<&Path>,
-    default_provider: &str,
-) -> Option<PathBuf> {
-    match filter_cwd {
-        Some(cwd) => {
-            for item in &page.items {
-                if resume_candidate_matches_cwd(
-                    item.rollout_path.as_path(),
-                    Some(item.cwd.as_path()),
-                    cwd,
-                    default_provider,
-                )
-                .await
-                {
-                    return Some(item.rollout_path.clone());
-                }
-            }
-            None
-        }
-        None => page.items.first().map(|item| item.rollout_path.clone()),
-    }
-}
-
-fn cwd_matches(session_cwd: &Path, cwd: &Path) -> bool {
-    path_utils::paths_match_after_normalization(session_cwd, cwd)
 }
 
 #[cfg(test)]

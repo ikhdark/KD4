@@ -212,7 +212,16 @@ impl Template {
             }
         }
 
-        let mut rendered = String::with_capacity(self.literal_bytes);
+        // Size the output once: literal text plus every inserted occurrence.
+        let mut rendered_bytes = self.literal_bytes;
+        for segment in &self.segments {
+            if let Segment::Placeholder(name) = segment
+                && let Some(value) = variables.get(name.as_str())
+            {
+                rendered_bytes = rendered_bytes.saturating_add(value.as_ref().len());
+            }
+        }
+        let mut rendered = String::with_capacity(rendered_bytes);
         for segment in &self.segments {
             match segment {
                 Segment::Literal(literal) => rendered.push_str(literal),
@@ -320,6 +329,17 @@ mod tests {
             rendered,
             "Hello, Codex. You are in codex-rs. Codex is repeated."
         );
+    }
+
+    #[test]
+    fn render_inserts_values_verbatim_into_exactly_sized_output() {
+        let template = Template::parse("ä {{ a }}|{{ b }}|{{ a }} }}}}").unwrap();
+        let rendered = template
+            .render([("a", "{{ b }} 🦀"), ("b", "}} {{{{")])
+            .unwrap();
+
+        assert_eq!(rendered, "ä {{ b }} 🦀|}} {{{{|{{ b }} 🦀 }}");
+        assert_eq!(rendered.capacity(), rendered.len());
     }
 
     #[test]

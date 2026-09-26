@@ -96,6 +96,27 @@ async fn exec_command_with_tty(
     workdir: Option<PathBuf>,
     tty: bool,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+    exec_command_with_tracker(
+        session,
+        turn,
+        cmd,
+        yield_time_ms,
+        workdir,
+        tty,
+        /*tracker*/ None,
+    )
+    .await
+}
+
+async fn exec_command_with_tracker(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    cmd: &str,
+    yield_time_ms: u64,
+    workdir: Option<PathBuf>,
+    tty: bool,
+    tracker: Option<crate::tools::context::SharedTurnDiffTracker>,
+) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     let manager = &session.services.unified_exec_manager;
     let reservation = manager.reserve_process_id().await;
     let process_id = reservation.process_id();
@@ -157,8 +178,9 @@ async fn exec_command_with_tty(
         validation_launch: None,
         known_delta: None,
     };
-    let context =
+    let mut context =
         UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
+    context.tracker = tracker;
     manager
         .exec_command(
             request,
@@ -972,7 +994,8 @@ async fn command_dispatch_reuses_workspace_baseline_without_ledger_recapture() -
             panic!("expected command output: {response:?}");
         };
         let text = output.body.to_text().expect("model-visible command output");
-        assert!(text.starts_with("Process exited with code 0;"), "{text}");
+        let result: serde_json::Value = serde_json::from_str(&text)?;
+        assert_eq!(result["exit_code"], 0, "{text}");
         assert!(text.contains("workspace-baseline-output"), "{text}");
         assert!(
             session
@@ -1076,27 +1099,20 @@ async fn validation_wait_delivers_exit_after_progress_and_preserves_deadline() -
             panic!("expected command output: {response:?}");
         };
         let text = output.body.to_text().expect("model-visible output");
+        let result: serde_json::Value = serde_json::from_str(&text)?;
         assert!(text.contains("VALIDATION_STARTED"), "{case}: {text}");
         if case == "deadline" {
             let terminals = session.list_background_terminals().await;
             assert_eq!(terminals.len(), 1, "{text}");
             let process_id = terminals[0].process_id.parse::<u32>()?;
             assert!(session.terminate_background_terminal(process_id).await);
-            assert!(
-                text.starts_with("Process running with session ID"),
-                "{text}"
-            );
+            assert_eq!(result["session_id"], process_id, "{text}");
+            assert!(result.get("exit_code").is_none());
             assert!(!text.contains("VALIDATION_FINISHED"), "{text}");
         } else {
             let exit_code = if passes { 0 } else { 1 };
-            assert!(
-                text.starts_with(&format!("Process exited with code {exit_code};")),
-                "{case}: {text}"
-            );
-            assert!(
-                !text.contains("Process running with session ID"),
-                "{case}: {text}"
-            );
+            assert_eq!(result["exit_code"], exit_code, "{case}: {text}");
+            assert!(result.get("session_id").is_none(), "{case}: {text}");
             assert!(
                 text.contains(if passes { "OK" } else { "FAILED (failures=1)" }),
                 "{case}: {text}"
@@ -1197,10 +1213,9 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
         "registered shell must remain alive: {opened}"
     );
     let process_id = terminals[0].process_id.parse::<u32>()?;
-    assert!(
-        opened.contains(&format!("Process running with session ID {process_id};")),
-        "{opened}"
-    );
+    let opened_result: serde_json::Value = serde_json::from_str(&opened)?;
+    assert_eq!(opened_result["session_id"], process_id, "{opened}");
+    assert!(opened_result.get("exit_code").is_none());
 
     // A unique name makes isolation independent of the host environment.
     let variable = format!("CODEX_MULTI_SESSION_{}", uuid::Uuid::new_v4().simple());
@@ -1234,18 +1249,10 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
         Some(true),
         "fresh shell failed: {short_output}"
     );
-    assert!(
-        short_output.starts_with("Process exited with code 0;"),
-        "short command must complete inline: {short_output}"
-    );
-    assert!(
-        !short_output.contains("Process running with session ID"),
-        "completed command must not return a live session: {short_output}"
-    );
-    let normalized = short_output.replace("\r\n", "\n");
-    let (_, fresh_output) = normalized
-        .split_once("\nOutput:\n")
-        .expect("real output section");
+    let short_result: serde_json::Value = serde_json::from_str(&short_output)?;
+    assert_eq!(short_result["exit_code"], 0, "{short_output}");
+    assert!(short_result.get("session_id").is_none(), "{short_output}");
+    let fresh_output = short_result["output"].as_str().expect("real output");
     assert_eq!(
         fresh_output.trim(),
         "FRESH::DONE",
@@ -1284,10 +1291,9 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    assert!(
-        preserved.contains(&format!("Process running with session ID {process_id};")),
-        "{preserved}"
-    );
+    let preserved_result: serde_json::Value = serde_json::from_str(&preserved)?;
+    assert_eq!(preserved_result["session_id"], process_id, "{preserved}");
+    assert!(preserved_result.get("exit_code").is_none());
     assert!(
         preserved.contains("PERSISTED:codex-session-state"),
         "A must preserve its own state: {preserved}"
@@ -1373,6 +1379,97 @@ async fn unified_exec_noninteractive_bursts_finish_in_one_initial_call() -> anyh
     Ok(())
 }
 
+/// Unified exec publishes Begin after its process starts. A baseline captured
+/// there can absorb the command's own write and record it as read-only.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncertain_command_workspace_baseline_precedes_launch() -> anyhow::Result<()> {
+    let fixture = tempfile::tempdir()?;
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(fixture.path())
+            .status()?
+            .success()
+    );
+    let script = "[System.IO.File]::WriteAllText('launched.txt', 'launched')";
+    let command = [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-Command",
+        script,
+    ]
+    .map(str::to_string);
+    assert!(matches!(
+        crate::turn_diff_tracker::command_mutation(&command, Some(fixture.path())),
+        crate::turn_diff_tracker::CommandMutation::Uncertain
+    ));
+    let marker = fixture.path().join("launched.txt");
+    let (session, mut turn) = test_session_and_turn().await;
+    Arc::get_mut(&mut turn)
+        .expect("turn is uniquely owned")
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)?;
+    let tracker = Arc::new(tokio::sync::Mutex::new(
+        crate::turn_diff_tracker::TurnDiffTracker::new(),
+    ));
+    let pause = session
+        .services
+        .git_workspace
+        .pause_next_workspace_evidence_capture();
+    // The command runs on the test thread like the other exec tests; only this
+    // small monitor runs on a worker, and it always releases the capture.
+    let monitor = tokio::spawn({
+        let marker = marker.clone();
+        async move {
+            let started = tokio::time::timeout(Duration::from_secs(30), pause.wait_until_started())
+                .await
+                .is_ok();
+            // A process launched ahead of its baseline writes while this capture is held.
+            let written_during_baseline = started
+                && tokio::time::timeout(Duration::from_secs(5), async {
+                    while !marker.exists() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .is_ok();
+            pause.release();
+            (started, written_during_baseline)
+        }
+    });
+    let result = exec_command_with_tracker(
+        &session,
+        &turn,
+        script,
+        /*yield_time_ms*/ 30_000,
+        Some(fixture.path().to_path_buf()),
+        /*tty*/ false,
+        Some(Arc::clone(&tracker)),
+    )
+    .await;
+    let (started, written_during_baseline) = monitor.await?;
+    let result = result?;
+
+    assert!(
+        started,
+        "the uncertain command captured no workspace baseline"
+    );
+    assert!(
+        !written_during_baseline,
+        "the command ran before its workspace baseline was captured"
+    );
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(std::fs::read_to_string(&marker)?, "launched");
+    assert_eq!(
+        tracker.lock().await.current_mutation_revision(),
+        1,
+        "the command's write must be attributed to it"
+    );
+    Ok(())
+}
+
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_timeouts() -> anyhow::Result<()> {
@@ -1444,26 +1541,69 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
     let (session, turn) = test_session_and_turn().await;
     let elicitation = session.services.elicitations.register();
+    let fixture = tempfile::tempdir()?;
+    let pid_path = fixture.path().join("command.pid");
+    let pid_path_for_release = pid_path.clone();
 
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    // Lift the pause only after the command process has exited. The command
+    // outlasts the 250ms yield, so an unpaused yield would answer first no
+    // matter how quickly PowerShell starts.
+    let release = tokio::spawn(async move {
+        let pid = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_path_for_release)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("command should start while the yield is paused");
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if !raw.is_null() {
+            let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+            let waited = tokio::task::spawn_blocking(move || unsafe {
+                WaitForSingleObject(process.as_raw_handle(), 30_000)
+            })
+            .await
+            .expect("join command exit wait");
+            assert_eq!(waited, WAIT_OBJECT_0, "command should exit while paused");
+        }
+        let released_at = Instant::now();
         drop(elicitation);
+        released_at
     });
 
-    let started = tokio::time::Instant::now();
+    let command = format!(
+        "[System.IO.File]::WriteAllText('{}', [string]$PID); Start-Sleep -Seconds 1; Write-Output unified-exec-done",
+        pid_path.to_string_lossy().replace('\'', "''")
+    );
     let response = exec_command(
         &session,
         &turn,
-        "Start-Sleep -Seconds 1; Write-Output unified-exec-done",
+        &command,
         /*yield_time_ms*/ 250,
         /*workdir*/ None,
     )
     .await?;
+    let responded_at = Instant::now();
+    let released_at = release.await?;
 
     assert!(
-        started.elapsed() >= Duration::from_secs(2),
+        responded_at >= released_at,
         "pause should block the unified exec yield timeout"
     );
     assert!(

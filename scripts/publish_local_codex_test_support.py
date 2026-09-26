@@ -47,7 +47,8 @@ def clean_env() -> dict[str, str]:
     # CODEX_LOCAL_PUBLISH_DIR over the test's temp USERPROFILE, which makes
     # assertions machine-state-dependent unless they are stripped.
     env = os.environ.copy()
-    for name in PUBLISH_ENV_VARS:
+    # Publish builds refuse these, so an ambient value must not decide a test.
+    for name in (*PUBLISH_ENV_VARS, "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     return env
 

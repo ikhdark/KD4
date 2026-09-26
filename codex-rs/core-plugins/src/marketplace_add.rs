@@ -1,6 +1,7 @@
 use crate::installed_marketplaces::marketplace_install_root;
 use crate::marketplace_policy::validate_marketplace_name_for_add;
 use crate::marketplace_policy::validate_marketplace_source_for_add;
+use crate::marketplace_upgrade::write_added_git_marketplace_metadata;
 use codex_config::ConfigRequirements;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::fs;
@@ -89,7 +90,7 @@ fn add_marketplace_sync_with_cloner<F>(
     clone_source: F,
 ) -> Result<MarketplaceAddOutcome, MarketplaceAddError>
 where
-    F: Fn(&str, Option<&str>, &[String], &Path) -> Result<(), MarketplaceAddError>,
+    F: Fn(&str, Option<&str>, &[String], &Path) -> Result<String, MarketplaceAddError>,
 {
     let MarketplaceAddRequest {
         source,
@@ -115,13 +116,18 @@ where
     })?;
 
     let install_metadata = MarketplaceInstallMetadata::from_source(&source, &sparse_paths);
-    if let Some(existing_root) =
+    if let Some((existing_root, last_revision)) =
         installed_marketplace_root_for_source(codex_home, &install_root, &install_metadata)?
     {
         let marketplace_name = validate_marketplace_source_root(&existing_root)?;
         validate_marketplace_name_for_add(managed_marketplace_name, &marketplace_name)
             .map_err(MarketplaceAddError::InvalidRequest)?;
-        record_added_marketplace_entry(codex_home, &marketplace_name, &install_metadata)?;
+        record_added_marketplace_entry(
+            codex_home,
+            &marketplace_name,
+            &install_metadata,
+            last_revision.as_deref(),
+        )?;
         return Ok(MarketplaceAddOutcome {
             marketplace_name,
             source_display: source.display(),
@@ -143,7 +149,12 @@ where
                 "marketplace '{marketplace_name}' is already added from a different source; remove it before adding this source"
             )));
         }
-        record_added_marketplace_entry(codex_home, &marketplace_name, &install_metadata)?;
+        record_added_marketplace_entry(
+            codex_home,
+            &marketplace_name,
+            &install_metadata,
+            /*last_revision*/ None,
+        )?;
         return Ok(MarketplaceAddOutcome {
             marketplace_name,
             source_display: source.display(),
@@ -174,11 +185,22 @@ where
         })?;
     let staged_root = staged_dir.path().to_path_buf();
 
-    stage_marketplace_source(&source, &sparse_paths, &staged_root, clone_source)?;
+    let revision = stage_marketplace_source(&source, &sparse_paths, &staged_root, clone_source)?;
 
     let marketplace_name = validate_marketplace_source_root(&staged_root)?;
     validate_marketplace_name_for_add(managed_marketplace_name, &marketplace_name)
         .map_err(MarketplaceAddError::InvalidRequest)?;
+    if let MarketplaceSource::Git { url, ref_name } = &source {
+        write_added_git_marketplace_metadata(
+            &staged_root,
+            &marketplace_name,
+            url,
+            ref_name.as_deref(),
+            &sparse_paths,
+            &revision,
+        )
+        .map_err(MarketplaceAddError::Internal)?;
+    }
 
     let destination = install_root.join(safe_marketplace_dir_name(&marketplace_name)?);
     ensure_marketplace_destination_is_inside_install_root(&install_root, &destination)?;
@@ -193,9 +215,12 @@ where
             destination.display()
         ))
     })?;
-    if let Err(err) =
-        record_added_marketplace_entry(codex_home, &marketplace_name, &install_metadata)
-    {
+    if let Err(err) = record_added_marketplace_entry(
+        codex_home,
+        &marketplace_name,
+        &install_metadata,
+        Some(&revision),
+    ) {
         if let Err(rollback_err) = fs::rename(&destination, &staged_root) {
             return Err(MarketplaceAddError::Internal(format!(
                 "{err}; additionally failed to roll back installed marketplace at {}: {rollback_err}",
@@ -240,20 +265,23 @@ mod tests {
 
     #[test]
     fn add_marketplace_sync_installs_marketplace_and_updates_config() -> Result<()> {
+        const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
         let codex_home = TempDir::new()?;
         let source_root = TempDir::new()?;
         write_marketplace_source(source_root.path(), "remote copy")?;
+        let request = MarketplaceAddRequest {
+            source: "https://github.com/owner/repo.git".to_string(),
+            ref_name: None,
+            sparse_paths: Vec::new(),
+        };
 
         let result = add_marketplace_sync_with_cloner(
             codex_home.path(),
             &ConfigRequirements::default(),
-            MarketplaceAddRequest {
-                source: "https://github.com/owner/repo.git".to_string(),
-                ref_name: None,
-                sparse_paths: Vec::new(),
-            },
+            request.clone(),
             |_url, _ref_name, _sparse_paths, destination| {
                 copy_dir_all(source_root.path(), destination)
+                    .map(|()| REVISION.to_string())
                     .map_err(|err| MarketplaceAddError::Internal(err.to_string()))
             },
         )?;
@@ -273,6 +301,37 @@ mod tests {
         assert!(config.contains("[marketplaces.debug]"));
         assert!(config.contains("source_type = \"git\""));
         assert!(config.contains("source = \"https://github.com/owner/repo.git\""));
+        // Auto-upgrade treats the root as current only when both the recorded revision and
+        // the activation metadata match; otherwise the next startup clones it again.
+        assert!(config.contains(&format!("last_revision = \"{REVISION}\"")));
+        let activation_metadata: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+            result
+                .installed_root
+                .as_path()
+                .join(".codex-marketplace-install.json"),
+        )?)?;
+        assert_eq!(
+            activation_metadata,
+            serde_json::json!({
+                "source_type": "git",
+                "source": "https://github.com/owner/repo.git",
+                "ref_name": null,
+                "sparse_paths": [],
+                "revision": REVISION,
+            })
+        );
+
+        let readded = add_marketplace_sync_with_cloner(
+            codex_home.path(),
+            &ConfigRequirements::default(),
+            request,
+            |_url, _ref_name, _sparse_paths, _destination| {
+                panic!("an already added marketplace must not be cloned again")
+            },
+        )?;
+        assert!(readded.already_added);
+        let config = fs::read_to_string(codex_home.path().join(codex_config::CONFIG_TOML_FILE))?;
+        assert!(config.contains(&format!("last_revision = \"{REVISION}\"")));
         Ok(())
     }
 
@@ -301,7 +360,7 @@ url = "https://github.com/example/allowed.git"
             },
             |_url, _ref_name, _sparse_paths, _destination| {
                 cloner_called.set(true);
-                Ok(())
+                Ok(String::new())
             },
         )
         .expect_err("blocked marketplace should fail");

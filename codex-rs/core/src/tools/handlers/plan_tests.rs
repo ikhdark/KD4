@@ -73,7 +73,6 @@ fn plan_output_signals_governor_state() {
     assert_eq!(signal["effect"], "no_op");
     assert_eq!(signal["no_progress"], true);
     assert!(signal["plan"].is_null());
-    assert_eq!(signal["unfinished_mutation_obligation"], false);
 }
 
 #[test]

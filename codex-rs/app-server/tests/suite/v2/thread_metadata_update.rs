@@ -135,7 +135,7 @@ async fn thread_metadata_update_patches_git_branch_and_returns_updated_thread() 
 }
 
 #[tokio::test]
-async fn thread_metadata_update_rejects_empty_git_info_patch() -> Result<()> {
+async fn thread_metadata_update_rejects_empty_patch_and_ephemeral_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -146,95 +146,54 @@ async fn thread_metadata_update_rejects_empty_git_info_patch() -> Result<()> {
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
-
-    let update_id = mcp
-        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
-            project_id: None,
-            thread_id: thread.id,
-            git_info: Some(ThreadMetadataGitInfoUpdateParams {
-                sha: None,
-                branch: None,
-                origin_url: None,
-            }),
-        })
-        .await?;
-    let update_err: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(update_id)),
-    )
-    .await??;
-
-    assert_eq!(
-        update_err.error.message,
-        "gitInfo must include at least one field"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_metadata_update_rejects_ephemeral_thread() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            ephemeral: Some(true),
-            ..Default::default()
-        })
-        .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
-
-    let update_id = mcp
-        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
-            project_id: None,
-            thread_id: thread.id.clone(),
-            git_info: Some(ThreadMetadataGitInfoUpdateParams {
-                sha: None,
-                branch: Some(Some("feature/ephemeral".to_string())),
-                origin_url: None,
-            }),
-        })
-        .await?;
-    let update_err: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(update_id)),
-    )
-    .await??;
-
-    assert_eq!(update_err.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        update_err.error.message,
-        format!(
-            "ephemeral thread does not support metadata updates: {}",
-            thread.id
+    for ephemeral in [false, true] {
+        let start_id = mcp
+            .send_thread_start_request_with_auto_env(ThreadStartParams {
+                model: Some("mock-model".to_string()),
+                ephemeral: ephemeral.then_some(true),
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
         )
-    );
+        .await??;
+        let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+        // A persistent thread still requires a non-empty patch; an ephemeral
+        // thread rejects even a valid one.
+        let (branch, expected_message) = if ephemeral {
+            (
+                Some(Some("feature/ephemeral".to_string())),
+                format!(
+                    "ephemeral thread does not support metadata updates: {}",
+                    thread.id
+                ),
+            )
+        } else {
+            (None, "gitInfo must include at least one field".to_string())
+        };
+        let update_id = mcp
+            .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+                project_id: None,
+                thread_id: thread.id.clone(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: None,
+                    branch,
+                    origin_url: None,
+                }),
+            })
+            .await?;
+        let update_err: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(update_id)),
+        )
+        .await??;
+
+        assert_eq!(update_err.error.code, INVALID_REQUEST_ERROR_CODE);
+        assert_eq!(update_err.error.message, expected_message);
+    }
 
     Ok(())
 }

@@ -660,16 +660,17 @@ async fn inventory_delivery_survives_history_projection_and_compaction_without_r
     let delivered = dispatched.code_mode_result();
     let projection: Value =
         serde_json::from_str(output.body.to_text().unwrap().lines().next().unwrap()).unwrap();
+    // The prompt projection renders essential fields at the top level.
     assert_eq!(
-        projection["essential"]["delivery"]["rendered_path"],
+        projection["delivery"]["rendered_path"],
         delivered["rendered_path"]
     );
-    assert_eq!(projection["essential"]["delivery"]["count"], 2);
+    assert_eq!(projection["delivery"]["count"], 2);
     assert_eq!(
-        projection["essential"]["delivery"]["scope_id"],
+        projection["delivery"]["scope_id"],
         initial["summary"]["scope_id"]
     );
-    assert_eq!(projection["essential"]["delivery"]["complete"], false);
+    assert_eq!(projection["delivery"]["complete"], false);
     let artifact_id = delivered["rendered_artifact_id"].as_str().unwrap();
     let items = Arc::from([ResponseItem::FunctionCallOutput {
         id: None,

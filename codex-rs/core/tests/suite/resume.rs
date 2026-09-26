@@ -306,13 +306,11 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    assert!(
-        resumed_mock
-            .single_request()
-            .inputs_of_type("reasoning")
-            .is_empty(),
-        "the next resumed request must project out reasoning from completed instruction groups"
-    );
+    let reasoning = resumed_mock.single_request().inputs_of_type("reasoning");
+    assert_eq!(reasoning.len(), 1);
+    assert!(reasoning[0].get("id").is_none());
+    assert_eq!(reasoning[0]["summary"][0]["text"], "Summarized step");
+    assert_eq!(reasoning[0]["content"][0]["text"], "raw detail");
 
     Ok(())
 }

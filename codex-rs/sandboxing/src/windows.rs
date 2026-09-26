@@ -139,22 +139,11 @@ pub fn resolve_windows_restricted_token_filesystem_overrides(
     // The backend derives capability SIDs and write ACLs from this permission
     // profile directly. The compatibility projection can add a writable cwd,
     // so its root set must not constrain profiles that keep the cwd read-only.
-
-    for writable_root in &split_writable_roots {
-        for read_only_subpath in &writable_root.read_only_subpaths {
-            if split_writable_roots.iter().any(|candidate| {
-                candidate.root.as_path() != writable_root.root.as_path()
-                    && candidate
-                        .root
-                        .as_path()
-                        .starts_with(read_only_subpath.as_path())
-            }) {
-                return Err(
-                    "windows unelevated restricted-token sandbox cannot reopen writable descendants under read-only carveouts directly; refusing to run unsandboxed"
-                        .to_string(),
-                );
-            }
-        }
+    if has_reopened_writable_descendant(&split_writable_roots) {
+        return Err(
+            "windows unelevated restricted-token sandbox cannot reopen writable descendants under read-only carveouts directly; refusing to run unsandboxed"
+                .to_string(),
+        );
     }
 
     let mut additional_deny_write_paths = BTreeSet::new();

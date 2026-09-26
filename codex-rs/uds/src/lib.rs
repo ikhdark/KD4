@@ -16,10 +16,11 @@ pub async fn prepare_private_socket_directory(socket_dir: impl AsRef<Path>) -> I
     platform::prepare_private_socket_directory(socket_dir.as_ref()).await
 }
 
-/// Returns whether a possible Unix socket rendezvous path exists.
+/// Returns whether `socket_path` is an AF_UNIX socket rendezvous file.
 ///
-/// Despite the historical name, this does not establish that the listener is dead
-/// or that the path is safe to remove. Callers must check liveness and ownership.
+/// Regular files, directories, links and other reparse points return `false`,
+/// as does a missing path. Despite the historical name, this does not establish
+/// that the listener is dead; callers must check liveness before removing it.
 pub async fn is_stale_socket_path(socket_path: impl AsRef<Path>) -> IoResult<bool> {
     platform::is_stale_socket_path(socket_path.as_ref()).await
 }
@@ -86,6 +87,8 @@ mod platform {
     use std::io::Result as IoResult;
     use std::net::Shutdown;
     use std::ops::Deref;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::os::windows::io::AsRawSocket;
     use std::os::windows::io::AsSocket;
     use std::os::windows::io::BorrowedSocket;
@@ -102,6 +105,13 @@ mod platform {
     use tokio::task;
     use tokio_util::compat::Compat;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_AF_UNIX;
 
     pub(super) struct Stream(Compat<Async<WindowsUnixStream>>);
 
@@ -137,7 +147,39 @@ mod platform {
     }
 
     pub(super) async fn is_stale_socket_path(socket_path: &Path) -> IoResult<bool> {
-        tokio::fs::try_exists(socket_path).await
+        let socket_path = socket_path.to_path_buf();
+        spawn_blocking_io(move || match reparse_tag(&socket_path) {
+            Ok(tag) => Ok(tag == Some(IO_REPARSE_TAG_AF_UNIX)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        })
+        .await
+    }
+
+    /// Reads the reparse tag of `path` itself, without following the reparse point.
+    fn reparse_tag(path: &Path) -> IoResult<Option<u32>> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut info = FILE_ATTRIBUTE_TAG_INFO {
+            FileAttributes: 0,
+            ReparseTag: 0,
+        };
+        // SAFETY: `file` owns a live handle for the duration of the call, and `info` is
+        // writable storage whose size matches the FileAttributeTagInfo class.
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileAttributeTagInfo,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0).then_some(info.ReparseTag))
     }
 
     async fn spawn_blocking_io<T>(

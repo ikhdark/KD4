@@ -8,12 +8,15 @@ use bytes::Bytes;
 use codex_api::ApiError;
 use codex_api::AuthError;
 use codex_api::AuthProvider;
-use codex_api::CompactClient;
 use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
 use codex_api::ResponsesOptions;
+use codex_api::SearchClient;
+use codex_api::SearchInput;
+use codex_api::SearchRequest;
+use codex_api::SearchResponse;
 use codex_client::HttpTransport;
 use codex_client::Request;
 use codex_client::RequestBody;
@@ -125,7 +128,7 @@ impl HttpTransport for FailsOnceExecuteTransport {
         Ok(Response {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
-            body: Bytes::from_static(br#"{"output":[]}"#),
+            body: Bytes::from_static(br#"{"output":"search result"}"#),
         })
     }
 
@@ -418,18 +421,30 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 #[tokio::test]
 async fn non_streaming_retries_reuse_one_prepared_body() -> Result<()> {
     let transport = FailsOnceExecuteTransport::default();
-    let client = CompactClient::new(transport.clone(), provider("openai"), Arc::new(NoAuth));
+    let client = SearchClient::new(transport.clone(), provider("openai"), Arc::new(NoAuth));
 
-    let output = client
-        .compact(
-            serde_json::json!({"model": "gpt-test", "input": ["hello"]}),
+    let response = client
+        .search(
+            &SearchRequest {
+                id: "search-session".to_string(),
+                model: "gpt-test".to_string(),
+                reasoning: None,
+                input: Some(SearchInput::Text("hello".to_string())),
+                commands: None,
+                settings: None,
+                max_output_tokens: None,
+            },
             HeaderMap::new(),
-            Duration::from_secs(1),
-            None,
         )
         .await?;
 
-    assert!(output.is_empty());
+    assert_eq!(
+        response,
+        SearchResponse {
+            encrypted_output: None,
+            output: "search result".to_string(),
+        }
+    );
     let requests = transport.requests();
     assert_eq!(requests.len(), 2);
     let first = request_body_bytes(&requests[0]);

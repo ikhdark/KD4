@@ -150,14 +150,19 @@ impl ScrollableDiff {
                 }
                 let w = UnicodeWidthChar::width(ch).unwrap_or(0);
                 if line_cols.saturating_add(w) > max_cols {
-                    if let Some(split) = last_soft_idx {
+                    // A break with only whitespace before it (at a leading diff marker or
+                    // after indentation) would emit a blank row; hard-break instead.
+                    if let Some(split) = last_soft_idx.take()
+                        && !line[..split].trim_end().is_empty()
+                    {
                         let (prefix, rest) = line.split_at(split);
                         out.push(prefix.trim_end().to_string());
                         out_idx.push(raw_idx);
                         line = rest.trim_start().to_string();
-                        last_soft_idx = None;
-                        // retry add current ch now that line may be shorter
-                    } else if !line.is_empty() {
+                        line_cols = UnicodeWidthStr::width(line.as_str());
+                    }
+                    // The rendered rows are clipped, not rewrapped, so never let `ch` overflow.
+                    if line_cols.saturating_add(w) > max_cols && !line.is_empty() {
                         out.push(std::mem::take(&mut line));
                         out_idx.push(raw_idx);
                     }
@@ -187,6 +192,38 @@ impl ScrollableDiff {
 #[cfg(test)]
 mod tests {
     use super::ScrollableDiff;
+    use pretty_assertions::assert_eq;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn wrapping_keeps_every_row_filled_and_within_the_width() {
+        let mut diff = ScrollableDiff::new();
+        diff.set_content(vec![
+            // Removal marker followed by an unbroken run.
+            "-abcdefghijkl".to_string(),
+            // Context-line indentation followed by an unbroken run.
+            "    abcdefghijkl".to_string(),
+            // A soft break that frees too little room for a wide character.
+            "a.bcdefg中".to_string(),
+        ]);
+        diff.set_width(8);
+
+        assert_eq!(
+            diff.wrapped_lines(),
+            &[
+                "-abcdefg", "hijkl", "    abcd", "efghijkl", "a", ".bcdefg", "中"
+            ]
+        );
+        assert_eq!(diff.wrapped_src_indices(), &[0, 0, 1, 1, 2, 2, 2]);
+        for row in diff.wrapped_lines() {
+            assert!(
+                !row.trim().is_empty(),
+                "blank row in {:?}",
+                diff.wrapped_lines()
+            );
+            assert!(row.width() <= 8, "{row:?} overflows the width");
+        }
+    }
 
     #[test]
     fn zero_width_preserves_large_content_and_source_indices() {

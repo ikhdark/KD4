@@ -363,9 +363,15 @@ async fn discover_streamable_http_oauth_with_headers_and_http_client(
     default_headers: HeaderMap,
     http_client: Arc<dyn HttpClient>,
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
+    // Discovery probes several well-known URLs in turn, and rmcp suggests 30s
+    // for each. Apply the direct discovery client's per-probe bound so a server
+    // that accepts connections but never answers cannot stall callers for minutes.
     let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
         url,
-        Arc::new(OAuthHttpClientAdapter::new(http_client, default_headers)),
+        Arc::new(
+            OAuthHttpClientAdapter::new(http_client, default_headers)
+                .with_timeout_cap(DISCOVERY_TIMEOUT),
+        ),
     )
     .await?;
     discover_streamable_http_oauth_with_manager(&authorization_manager).await
@@ -477,6 +483,61 @@ mod tests {
         assert!(
             error.to_string().contains("exceeds 1048576 bytes"),
             "{error}"
+        );
+    }
+
+    #[derive(Default)]
+    struct TimeoutRecordingHttpClient {
+        timeouts_ms: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+
+    impl TimeoutRecordingHttpClient {
+        fn record(&self, params: &HttpRequestParams) -> ExecServerError {
+            self.timeouts_ms.lock().unwrap().push(params.timeout_ms);
+            ExecServerError::HttpRequest("offline".to_string())
+        }
+    }
+
+    impl HttpClient for TimeoutRecordingHttpClient {
+        fn http_request(
+            &self,
+            params: HttpRequestParams,
+        ) -> BoxFuture<'_, Result<HttpRequestResponse, ExecServerError>> {
+            let error = self.record(&params);
+            async move { Err(error) }.boxed()
+        }
+
+        fn http_request_stream(
+            &self,
+            params: HttpRequestParams,
+        ) -> BoxFuture<'_, Result<(HttpRequestResponse, HttpResponseBodyStream), ExecServerError>>
+        {
+            let error = self.record(&params);
+            async move { Err(error) }.boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_client_discovery_bounds_each_probe_like_the_direct_client() {
+        // rmcp suggests 30s per probe; a server that accepts connections but
+        // never answers would otherwise stall session startup for minutes.
+        let client = Arc::new(TimeoutRecordingHttpClient::default());
+        let _ = discover_streamable_http_oauth_with_http_client(
+            "http://127.0.0.1:1/mcp",
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+            client.clone(),
+        )
+        .await;
+
+        let cap_ms = u64::try_from(DISCOVERY_TIMEOUT.as_millis()).unwrap();
+        let timeouts_ms = client.timeouts_ms.lock().unwrap().clone();
+        assert!(!timeouts_ms.is_empty(), "discovery sent no request");
+        assert!(
+            timeouts_ms
+                .iter()
+                .all(|timeout| timeout.is_some_and(|timeout| timeout <= cap_ms)),
+            "{timeouts_ms:?}"
         );
     }
 

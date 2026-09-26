@@ -8,6 +8,7 @@ use app_test_support::start_analytics_events_server;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml;
+use app_test_support::write_mock_provider_config_toml;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportHistoriesReadResponse;
@@ -701,7 +702,7 @@ async fn external_agent_config_import_sends_completion_notification_after_pendin
 async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("follow-up answer").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
     let project_root = codex_home.path().join("repo");
     let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
@@ -960,7 +961,7 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
 async fn external_agent_config_import_does_not_initialize_required_mcp() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("unused").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
     let mut config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     config.push_str(
         r#"
@@ -1059,7 +1060,7 @@ async fn external_agent_config_import_accepts_detected_session_payload_after_res
 {
     let server = create_mock_responses_server_repeating_assistant("unused").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
     let project_root = codex_home.path().join("repo");
     let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
@@ -1154,7 +1155,7 @@ async fn external_agent_config_import_accepts_detected_session_payload_after_res
 async fn external_agent_config_import_skips_already_imported_session_versions() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("unused").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
     let project_root = codex_home.path().join("repo");
     let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
@@ -1426,28 +1427,6 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
     assert!(second.contains("follow up"));
     assert!(second.contains("LOCAL_SUMMARY"));
     Ok(())
-}
-
-fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
 }
 
 fn write_analytics_config(codex_home: &std::path::Path, base_url: &str) -> std::io::Result<()> {

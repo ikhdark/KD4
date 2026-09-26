@@ -104,6 +104,38 @@ struct CancellationDelegate {
 
 struct OversizedResultDelegate;
 
+/// Holds every notification until its cancellation token fires.
+struct StalledNotificationDelegate {
+    events_tx: mpsc::UnboundedSender<&'static str>,
+}
+
+impl CodeModeSessionDelegate for StalledNotificationDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        _cancellation_token: NestedCancellation,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async { Err("no nested tools".to_string()) })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            let _ = self.events_tx.send("notification started");
+            cancellation_token.cancelled().await;
+            let _ = self.events_tx.send("notification cancelled");
+            Err("notification cancelled".to_string())
+        })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
 impl CodeModeSessionDelegate for OversizedResultDelegate {
     fn invoke_tool<'a>(
         &'a self,
@@ -124,6 +156,13 @@ impl CodeModeSessionDelegate for OversizedResultDelegate {
     }
 
     fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+async fn next_stalled_event(events_rx: &mut mpsc::UnboundedReceiver<&'static str>) -> &'static str {
+    tokio::time::timeout(Duration::from_secs(10), events_rx.recv())
+        .await
+        .expect("delegate event timeout")
+        .expect("delegate event stream")
 }
 
 impl CancellationDelegate {
@@ -362,6 +401,69 @@ text([absent.value, explicitNull.value, object.value].join(","));
         );
         session.shutdown().await.expect("shutdown session");
     }
+}
+
+#[tokio::test]
+async fn stalled_notification_at_session_shutdown_keeps_other_sessions_on_the_host() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let survivor = provider
+        .create_session(Arc::new(RecordingDelegate::default()))
+        .await
+        .expect("create surviving session");
+    assert_eq!(
+        execute(&survivor, execute_request(r#"store("key", "preserved");"#)).await,
+        RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: cell_id("1"),
+            content_items: Vec::new(),
+            error_text: None,
+        }
+    );
+
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let stalled = provider
+        .create_session(Arc::new(StalledNotificationDelegate { events_tx }))
+        .await
+        .expect("create stalled session");
+    let mut request = execute_request("notify('never acknowledged'); await new Promise(() => {});");
+    request.yield_time_ms = Some(1);
+    assert!(matches!(
+        execute(&stalled, request).await,
+        RuntimeResponse::Yielded { .. }
+    ));
+    assert_eq!(
+        next_stalled_event(&mut events_rx).await,
+        "notification started"
+    );
+
+    // Shutdown cancels the cell while its notification is still unanswered.
+    // Bounded callback cleanup must not take down the shared host.
+    tokio::time::timeout(Duration::from_secs(10), stalled.shutdown())
+        .await
+        .expect("stalled session shutdown timeout")
+        .expect("stalled session shutdown");
+    assert_eq!(
+        next_stalled_event(&mut events_rx).await,
+        "notification cancelled"
+    );
+
+    assert_eq!(
+        execute(&survivor, execute_request(r#"text(load("key"));"#)).await,
+        RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: cell_id("2"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "preserved".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    survivor
+        .shutdown()
+        .await
+        .expect("shutdown surviving session");
 }
 
 #[tokio::test]
@@ -925,11 +1027,82 @@ async fn oversized_initial_response_is_bounded_without_closing_the_shared_host()
             }),
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "Code mode output was truncated because the cell buffered more than 64 MiB."
+                text: "Code mode output was truncated because the cell's buffered output exceeded its 63 MiB encoded limit."
                     .to_string(),
             }],
             error_text: None,
         }
+    );
+
+    assert_eq!(
+        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: cell_id("2"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "still alive".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    session.shutdown().await.expect("shutdown remote session");
+}
+
+#[tokio::test]
+async fn escape_heavy_output_reports_truthful_loss_within_one_frame() {
+    // Six 2 MiB control-character texts: 12 MiB raw, but 72 MiB once JSON
+    // escapes each byte as `\u0001`, more than one IPC frame can carry.
+    const ITEM_BYTES: usize = 2 * 1024 * 1024;
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let session = provider
+        .create_session(Arc::new(RecordingDelegate::default()))
+        .await
+        .expect("create remote session");
+    let response = execute(
+        &session,
+        ExecuteRequest {
+            yield_time_ms: Some(60_000),
+            ..execute_request(&format!(
+                r#"for (let i = 0; i < 6; i++) text("\u0001".repeat({ITEM_BYTES}));"#
+            ))
+        },
+    )
+    .await;
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        output_loss,
+        ..
+    } = response
+    else {
+        panic!("escape-heavy cell must complete");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(
+        output_loss,
+        Some(OutputLoss {
+            discarded_items: 1,
+            discarded_bytes_lower_bound: ITEM_BYTES as u64,
+        })
+    );
+    let texts = content_items
+        .iter()
+        .map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text } => text.as_str(),
+            other => panic!("unexpected content item {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts.len(), 6);
+    assert!(
+        texts[..5]
+            .iter()
+            .all(|text| text.len() == ITEM_BYTES && text.bytes().all(|byte| byte == 1))
+    );
+    assert_eq!(
+        texts[5],
+        "Code mode output was truncated because the cell's buffered output exceeded its 63 MiB encoded limit."
     );
 
     assert_eq!(

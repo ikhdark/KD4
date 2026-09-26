@@ -624,10 +624,13 @@ async fn handle_request_user_input(
         cancel_token,
     )
     .await;
-    let _ = codex
-        .submit(Op::UserInputAnswer { id, response })
-        .or_cancel(cancel_token)
-        .await;
+    // The interrupted answer is terminal delivery, not work to cancel with its owner.
+    // Bound admission so a stalled child cannot hold delegate shutdown indefinitely.
+    let _ = timeout(
+        Duration::from_millis(500),
+        codex.submit(Op::UserInputAnswer { id, response }),
+    )
+    .await;
 }
 
 fn protocol_elicitation_id(id: &codex_protocol::mcp::RequestId) -> rmcp::model::RequestId {

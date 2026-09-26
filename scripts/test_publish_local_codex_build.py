@@ -551,6 +551,50 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn('rustc-wrapper = ""', result.stdout)
             self.assert_no_publish_temps(install_dir)
 
+    def test_environment_rustflags_cannot_replace_checked_in_target_flags(
+        self,
+    ) -> None:
+        # Cargo lets RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, even when empty,
+        # replace the target rustflags that give published binaries their 8 MiB
+        # stack and static CRT; the per-target variable joins them instead.
+        self.init_repo_fixture()
+        for name, value, blocked in (
+            ("RUSTFLAGS", "-C target-cpu=native", True),
+            ("RUSTFLAGS", "", True),
+            ("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-cpu=native", True),
+            (
+                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+                "-C target-cpu=native",
+                False,
+            ),
+        ):
+            with (
+                self.subTest(name=name, value=value),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                temp_path = Path(temp_dir)
+                install_dir = temp_path / "install"
+                install_dir.mkdir()
+                fake_bin = temp_path / "bin"
+                fake_bin.mkdir()
+                calls = temp_path / "cargo-calls.txt"
+                self.write_fake_cargo(fake_bin, f'echo invoked>>"{calls}"')
+                env = clean_env()
+                env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+                env[name] = value
+
+                result = self.run_script("-InstallDir", str(install_dir), env=env)
+
+                output = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+                if blocked:
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertFalse(calls.exists(), output)
+                    self.assertIn(f"{name} is set", result.stderr)
+                    self.assertFalse((install_dir / "codex.exe").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertEqual(calls.read_text().splitlines(), ["invoked"])
+
     def test_missing_sccache_clears_stale_inherited_wrapper(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:

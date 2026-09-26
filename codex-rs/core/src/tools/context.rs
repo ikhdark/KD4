@@ -818,6 +818,12 @@ impl ApplyPatchToolOutput {
 }
 
 impl ToolOutput for ApplyPatchToolOutput {
+    fn code_mode_failure_is_error(&self) -> bool {
+        // Patch failures are structured results so JavaScript can inspect the
+        // applied delta and repair a retained patch without losing its receipt.
+        false
+    }
+
     fn log_preview(&self) -> String {
         telemetry_preview(&self.text)
     }
@@ -1724,6 +1730,11 @@ impl ExecCommandToolOutput {
         }
         if let Some(id) = self.process_id {
             fields.insert("session_id".into(), id.into());
+            // write_stdin's contract tells callers to inspect these before
+            // sending input, interrupting, or polling a live session.
+            if let Some(capabilities) = self.session_capabilities {
+                fields.insert("session_capabilities".into(), serde_json::json!(capabilities));
+            }
         }
         if projected.reduced
             && let Some(id) = self
@@ -1744,6 +1755,9 @@ impl ExecCommandToolOutput {
             text.push_str(&format!("\n{notice}"));
         }
         fields.insert("output".into(), text.into());
+        if let Some(validation) = self.declared_validation_metadata() {
+            fields.insert("validation".into(), validation);
+        }
         JsonValue::Object(fields).to_string()
     }
 

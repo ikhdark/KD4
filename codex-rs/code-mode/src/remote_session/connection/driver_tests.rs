@@ -50,7 +50,7 @@ impl DriverHarness {
     fn start() -> Self {
         let (command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 16);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 16);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(super::super::OUTGOING_FRAME_CAPACITY);
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let (driver, execute_claim_tx) = ConnectionDriver::new(
@@ -645,6 +645,55 @@ async fn shutdown_closes_cell_without_waiting_for_delegate_cleanup() {
         Err(mpsc::error::TryRecvError::Empty)
     ));
     assert!(harness.alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn admitted_delegate_responses_survive_a_stalled_host_reader() {
+    // The host admits this many pending delegate requests across its cells.
+    const CELLS: usize = 2;
+    const CALLS_PER_CELL: usize = 100;
+
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
+    for cell in 1..=CELLS {
+        let _started = harness
+            .start_cell(session.clone(), cell as i64 + 1, &cell.to_string())
+            .await;
+    }
+    for index in 0..CELLS * CALLS_PER_CELL {
+        let request = DriverEvent::HostMessage(HostToClient::DelegateRequest {
+            id: DelegateRequestId::new(index as i64 + 1),
+            session_id: session.id.clone(),
+            request: DelegateRequest::Notify {
+                call_id: format!("call-{index}"),
+                cell_id: CellId::new((index % CELLS + 1).to_string()).into(),
+                text: "burst".to_string(),
+            },
+        });
+        // A failed driver closes its event stream; the assertion below reports it.
+        if harness.event_tx.send(request).await.is_err() {
+            break;
+        }
+    }
+
+    // Nothing drains the outgoing queue while every response completes.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.alive.load(Ordering::Acquire)
+            && harness.outgoing_rx.len() < CELLS * CALLS_PER_CELL
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delegate responses timeout");
+    assert!(
+        harness.alive.load(Ordering::Acquire),
+        "an admitted burst must not fail the host connection"
+    );
+    assert_eq!(harness.outgoing_rx.len(), CELLS * CALLS_PER_CELL);
 }
 
 #[tokio::test]

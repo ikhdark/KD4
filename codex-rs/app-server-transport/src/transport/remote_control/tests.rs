@@ -219,6 +219,94 @@ async fn plain_start_resolves_persisted_remote_control_preference() {
 }
 
 #[tokio::test]
+async fn plain_start_resolves_persisted_preference_when_auth_changes() {
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let remote_control_target = normalize_remote_control_url(TEST_REMOTE_CONTROL_URL)
+        .expect("remote control target should normalize");
+    state_db
+        .upsert_remote_control_enrollment(&RemoteControlEnrollmentRecord {
+            websocket_url: remote_control_target.websocket_url,
+            account_id: "account_id".to_string(),
+            app_server_client_name: None,
+            server_id: "server-id".to_string(),
+            environment_id: "environment-id".to_string(),
+            server_name: "server-name".to_string(),
+            remote_control_enabled: Some(true),
+        })
+        .await
+        .expect("enrollment should persist");
+    let auth_manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let (transport_event_tx, _transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (status_tx, _status_rx) = watch::channel(RemoteControlStatusChangedNotification {
+        status: RemoteControlConnectionStatus::Disabled,
+        server_name: test_server_name(),
+        installation_id: TEST_INSTALLATION_ID.to_string(),
+        environment_id: None,
+    });
+    let desired_state_tx = Arc::new(watch::channel(RemoteControlDesiredState::Unknown).0);
+    let mut websocket = RemoteControlWebsocket::new(
+        RemoteControlWebsocketConfig {
+            remote_control_url: TEST_REMOTE_CONTROL_URL.to_string(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            remote_control_target: None,
+            server_name: test_server_name(),
+            http_clients: remote_control_http_clients(codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            )),
+        },
+        Some(state_db),
+        auth_manager.clone(),
+        RemoteControlChannels {
+            transport_event_tx,
+            status_publisher: RemoteControlStatusPublisher::new(status_tx),
+            current_enrollment: Arc::new(RemoteControlEnrollmentState::new(
+                /*enrollment*/ None,
+            )),
+            pairing_persistence_key: watch::channel(None).0,
+            desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
+        },
+        CancellationToken::new(),
+        desired_state_tx.clone(),
+    );
+
+    let resolve = websocket.resolve_unknown_desired_state(/*app_server_client_name*/ None);
+    tokio::pin!(resolve);
+    timeout(Duration::from_millis(50), &mut resolve)
+        .await
+        .expect_err("logged-out preference resolution should wait");
+    save_auth(
+        codex_home.path(),
+        &remote_control_auth_dot_json(Some("account_id")),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("auth should save");
+    auth_manager.reload().await;
+
+    assert!(
+        timeout(Duration::from_millis(100), &mut resolve)
+            .await
+            .expect("auth change should wake preference resolution before its retry delay")
+    );
+    assert_eq!(
+        *desired_state_tx.borrow(),
+        RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true)
+        }
+    );
+}
+
+#[tokio::test]
 async fn explicit_disabled_start_ignores_persisted_enable() {
     let codex_home = TempDir::new().expect("temp dir should create");
     let state_db = remote_control_state_runtime(&codex_home).await;

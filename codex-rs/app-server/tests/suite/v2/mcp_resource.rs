@@ -270,8 +270,13 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
     let list_output = requests[1]
         .function_call_output_text(SKILLS_LIST_CALL_ID)
         .ok_or_else(|| anyhow::anyhow!("skills.list output should be sent to the model"))?;
+    let list_output: serde_json::Value = serde_json::from_str(&list_output)?;
+    let next_cursor = list_output["next_cursor"]
+        .as_str()
+        .filter(|cursor| !cursor.is_empty())
+        .expect("incomplete discovery must retain a continuation cursor");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&list_output)?,
+        list_output,
         json!({
             "skills": [{
                 "authority": {
@@ -282,9 +287,12 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
                 "description": SKILL_DESCRIPTION,
                 "main_resource": SKILL_MAIN_PROMPT_URI,
             }],
-            "warnings": ["Orchestrator skill discovery stopped after 2 resource pages: failed to list orchestrator skill resources: resources/list failed for `codex_apps`: Mcp error: -32603: simulated later-page failure"],
+            "warnings": [
+                "Orchestrator skill discovery is unavailable; continue listing to retry.",
+                "Orchestrator skill discovery is incomplete. Follow skills.list next_cursor to continue discovery."
+            ],
             "warnings_omitted": 0,
-            "next_cursor": null,
+            "next_cursor": next_cursor,
         })
     );
 
@@ -307,7 +315,7 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
     assert_eq!(read_output, repeated_read_output);
     assert_eq!(
         ResourceAppsMcpCallCounts {
-            list_resources: 3,
+            list_resources: 4,
             main_prompt_reads: 1,
             reference_reads: 1,
         },
@@ -348,7 +356,7 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
     assert_eq!(requests.len(), 5);
     assert_eq!(
         ResourceAppsMcpCallCounts {
-            list_resources: 6,
+            list_resources: 7,
             main_prompt_reads: 2,
             reference_reads: 1,
         },

@@ -63,6 +63,10 @@ struct TerminationControl {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Holding one output owner proves a cancelled append commits no partial copy"
+)]
 async fn output_chunk_updates_are_cancellation_atomic() {
     let pending = Arc::new(Mutex::new(HeadTailBuffer::default()));
     let completion = Arc::new(Mutex::new(HeadTailBuffer::default()));

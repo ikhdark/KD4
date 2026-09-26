@@ -1,40 +1,11 @@
 use codex_core::config::Config;
 use codex_login::AuthManager;
-use serde::Deserialize;
 
 use crate::chatgpt_client::chatgpt_get_request;
 use crate::chatgpt_client::chatgpt_http_clients;
 
-#[derive(Debug, Deserialize)]
-pub struct GetTaskResponse {
-    pub current_diff_task_turn: Option<AssistantTurn>,
-}
-
-// Only relevant fields for our extraction
-#[derive(Debug, Deserialize)]
-pub struct AssistantTurn {
-    pub output_items: Vec<OutputItem>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub enum OutputItem {
-    #[serde(rename = "pr")]
-    Pr(PrOutputItem),
-
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PrOutputItem {
-    pub output_diff: OutputDiff,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct OutputDiff {
-    pub diff: String,
-}
+/// Task details as modeled for `codex cloud`, so `codex apply` finds the same diff.
+pub use codex_backend_client::CodeTaskDetailsResponse as GetTaskResponse;
 
 pub(crate) async fn get_task(config: &Config, task_id: String) -> anyhow::Result<GetTaskResponse> {
     anyhow::ensure!(

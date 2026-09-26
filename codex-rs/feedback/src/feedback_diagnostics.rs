@@ -235,6 +235,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn collect_from_pairs_ignores_non_utf8_entries_without_inspecting_values() {
         use std::os::windows::ffi::OsStringExt;

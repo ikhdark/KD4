@@ -566,8 +566,16 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 delivery_failure.clone(),
             ),
         );
+        let outbound_shutdown = delivery_failure.clone();
         let mut outbound_handle = tokio::spawn(async move {
-            while let Some(envelope) = outgoing_rx.recv().await {
+            loop {
+                let envelope = tokio::select! {
+                    _ = outbound_shutdown.cancelled() => break,
+                    envelope = outgoing_rx.recv() => match envelope {
+                        Some(envelope) => envelope,
+                        None => break,
+                    },
+                };
                 route_outgoing_envelope(&mut outbound_connections, envelope).await;
             }
         });

@@ -69,9 +69,20 @@ async fn canceled_mcp_refresh_returns_an_error_for_a_mismatched_environment() {
 async fn canceled_mcp_refresh_allows_environment_only_updates_without_restarting_a_manager() {
     let (session, turn, _) = crate::session::tests::make_session_and_context_with_rx().await;
     let current = session.services.latest_mcp_runtime();
+    let projection = session
+        .services
+        .mcp_manager
+        .runtime_config_for_step(
+            &turn.config,
+            &session.services.mcp_thread_init,
+            &session.services.thread_extension_data,
+            &turn.originator,
+            &[],
+        )
+        .await;
     let stale = Arc::new(McpRuntimeSnapshot::new_with_manager_lifecycle(
         10,
-        Arc::new(current.config().clone()),
+        Arc::new(projection.config),
         current.plugins_available(),
         current.manager_arc(),
         current.manager_lifecycle_arc(),

@@ -85,10 +85,7 @@ pub(crate) async fn run(
         HookEventName::PreToolUse,
         &matcher_inputs,
     );
-    matched.retain(|handler| gate.admits(handler));
-    for handler in &matched {
-        gate.record(handler);
-    }
+    matched.retain(|handler| gate.claim(handler));
     if matched.is_empty() {
         return PreToolUseOutcome {
             hook_events: Vec::new(),
@@ -744,23 +741,10 @@ mod tests {
         );
     }
 
-    fn unscoped_gate<'a>(
-        once_per: &'a std::collections::HashMap<String, codex_config::HookRunScope>,
-        scoped_runs: &'a std::sync::Mutex<std::collections::HashSet<String>>,
-    ) -> ScopedRunGate<'a> {
-        ScopedRunGate::new(once_per, scoped_runs, "session-1", "turn-1")
-    }
-
     #[test]
     fn preview_and_completed_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-123");
-        let once_per = std::collections::HashMap::new();
-        let scoped_runs = std::sync::Mutex::new(std::collections::HashSet::new());
-        let runs = preview(
-            &[handler()],
-            &request,
-            &unscoped_gate(&once_per, &scoped_runs),
-        );
+        let runs = preview(&[handler()], &request, &ScopedRunGate::unscoped());
 
         assert_eq!(runs.len(), 1);
         assert_eq!(
@@ -784,13 +768,7 @@ mod tests {
     #[test]
     fn serialization_failure_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-123");
-        let once_per = std::collections::HashMap::new();
-        let scoped_runs = std::sync::Mutex::new(std::collections::HashSet::new());
-        let runs = preview(
-            &[handler()],
-            &request,
-            &unscoped_gate(&once_per, &scoped_runs),
-        );
+        let runs = preview(&[handler()], &request, &ScopedRunGate::unscoped());
 
         let completed = common::serialization_failure_hook_events_for_tool_use(
             vec![handler()],

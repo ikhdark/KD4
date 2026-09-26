@@ -151,10 +151,11 @@ fn push_absolute_path(
 fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobScanPlan {
     // Start scanning at the deepest literal directory prefix before the first
     // glob metacharacter. For example, `C:\repo\**\*.env` only scans `C:\repo`
-    // instead of the current directory or drive root.
+    // instead of the current directory or drive root. `{` starts a globset
+    // alternation, so `C:\repo\{a,b}\*` must scan `C:\repo` as well.
     let first_glob = pattern
         .char_indices()
-        .find(|(_, ch)| matches!(ch, '*' | '?' | '['))
+        .find(|(_, ch)| matches!(ch, '*' | '?' | '[' | '{'))
         .map(|(index, _)| index)
         .unwrap_or(pattern.len());
     let literal_prefix = &pattern[..first_glob];
@@ -360,6 +361,34 @@ mod tests {
         let expected = [root_env, nested_env].into_iter().collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn brace_alternation_scans_from_the_literal_parent() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let secret = tmp.path().join("secrets").join("id.pem");
+        let key = tmp.path().join("keys").join("signing.pem");
+        let unrelated = tmp.path().join("public").join("cert.pem");
+        for path in [&secret, &key, &unrelated] {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+            std::fs::write(path, "pem").expect("write pem");
+        }
+        // The matcher expands `{a,b}`, so no literal `{secrets,keys}` directory exists to scan.
+        let pattern = format!("{}/{{secrets,keys}}/*.pem", tmp.path().display());
+        assert_eq!(
+            glob_scan_plan(&pattern, /*configured_max_depth*/ None).root,
+            tmp.path().to_path_buf()
+        );
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(pattern)]);
+
+        let actual: HashSet<PathBuf> = resolve_windows_deny_read_paths(&policy, &cwd)
+            .expect("resolve")
+            .into_iter()
+            .map(AbsolutePathBuf::into_path_buf)
+            .collect();
+
+        assert_eq!(actual, [secret, key].into_iter().collect());
     }
 
     #[test]

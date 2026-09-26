@@ -5,6 +5,10 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
 
+/// Longest self-imposed wait between attempts. Server `Retry-After` advice is
+/// a minimum wait and is not capped.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// Maximum number of retries after the initial request.
@@ -53,21 +57,9 @@ impl RetryOn {
     }
 }
 
-/// Computes exponential backoff for a one-based retry number.
-///
-/// A retry number of zero is accepted for compatibility and returns `base`
-/// without jitter. Retry number one is the first retry.
-pub fn backoff(base: Duration, retry_number: u64) -> Duration {
-    if retry_number == 0 {
-        return base;
-    }
-    let raw = exponential_backoff_millis(base, retry_number);
-    let jitter: f64 = rand::rng().random_range(0.9..1.1);
-    Duration::from_millis((raw as f64 * jitter) as u64)
-}
-
-/// Computes exponential backoff while retaining jitter at the `maximum`.
-/// Saturated delays are spread over 90-100% of the ceiling.
+/// Computes exponential backoff for a one-based retry number while retaining
+/// jitter at the `maximum`. Saturated delays are spread over 90-100% of the
+/// ceiling. A retry number of zero returns `base` without jitter.
 pub fn capped_backoff(base: Duration, retry_number: u64, maximum: Duration) -> Duration {
     if retry_number == 0 {
         return base.min(maximum);
@@ -91,8 +83,9 @@ fn exponential_backoff_millis(base: Duration, retry_number: u64) -> u64 {
 /// The operation receives a zero-based attempt index. If all allowed attempts
 /// fail, the final underlying error is returned unchanged.
 /// Use only for operations whose replay is safe. Otherwise use
-/// [`run_with_retry_non_idempotent`]. Delays grow exponentially without a cap;
-/// callers that need an elapsed-time budget must apply an outer deadline.
+/// [`run_with_retry_non_idempotent`]. Backoff grows exponentially up to
+/// 30 seconds per retry; callers that need an elapsed-time budget must apply
+/// an outer deadline.
 pub async fn run_with_retry<T, F, Fut>(
     policy: RetryPolicy,
     mut make_req: impl FnMut() -> Request,
@@ -116,7 +109,12 @@ where
                 if let Some(advice) = err.retry_after() {
                     tokio::time::sleep_until(advice.deadline()).await;
                 } else {
-                    sleep(backoff(policy.base_delay, retry_number)).await;
+                    sleep(capped_backoff(
+                        policy.base_delay,
+                        retry_number,
+                        MAX_RETRY_DELAY,
+                    ))
+                    .await;
                 }
                 attempt = retry_number;
             }
@@ -149,7 +147,12 @@ where
                 ) =>
             {
                 let retry_number = attempt + 1;
-                sleep(backoff(policy.base_delay, retry_number)).await;
+                sleep(capped_backoff(
+                    policy.base_delay,
+                    retry_number,
+                    MAX_RETRY_DELAY,
+                ))
+                .await;
                 attempt = retry_number;
             }
             Err(err) => return Err(err),

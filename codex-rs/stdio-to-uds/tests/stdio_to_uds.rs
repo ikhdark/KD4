@@ -1,4 +1,3 @@
-use std::io::ErrorKind;
 use std::io::Read;
 use std::process::Command;
 use std::process::ExitStatus;
@@ -28,16 +27,9 @@ async fn pipes_stdin_and_stdout_through_socket() -> anyhow::Result<()> {
     let request = b"request";
     let request_path = dir.path().join("request.txt");
     std::fs::write(&request_path, request).context("failed to write child stdin fixture")?;
-    let listener = match UnixListener::bind(&socket_path).await {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            eprintln!("skipping test: failed to bind unix socket: {err}");
-            return Ok(());
-        }
-        Err(err) => {
-            return Err(err).context("failed to bind test unix socket");
-        }
-    };
+    let listener = UnixListener::bind(&socket_path)
+        .await
+        .context("failed to bind test unix socket")?;
 
     let (event_tx, event_rx) = mpsc::channel();
     let server_task = tokio::spawn(async move {
@@ -154,6 +146,77 @@ async fn pipes_stdin_and_stdout_through_socket() -> anyhow::Result<()> {
 
     let received = server_task.await.context("server task panicked")??;
     assert_eq!(received, request);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exits_after_peer_closes_while_stdin_stays_open() -> anyhow::Result<()> {
+    // Proxy clients keep stdin open while waiting for output, so the bridge must
+    // end the session when the peer closes instead of waiting for stdin EOF.
+    let dir = tempfile::TempDir::new().context("failed to create temp dir")?;
+    let socket_path = dir.path().join("socket");
+    let listener = UnixListener::bind(&socket_path)
+        .await
+        .context("failed to bind test unix socket")?;
+
+    let server_task = tokio::spawn(async move {
+        let mut listener = listener;
+        let mut connection = listener
+            .accept()
+            .await
+            .context("failed to accept test connection")?;
+        connection
+            .write_all(b"response")
+            .await
+            .context("failed to write response to client")?;
+        // Dropping the connection closes the peer while the client's stdin stays open.
+        anyhow::Ok(())
+    });
+
+    let child_task = tokio::task::spawn_blocking(move || -> anyhow::Result<(ExitStatus, Vec<u8>)> {
+        let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codex-stdio-to-uds")?)
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn codex-stdio-to-uds")?;
+        let stdin = child.stdin.take().context("missing child stdin")?;
+        let mut child_stdout = child.stdout.take().context("missing child stdout")?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut stdout = Vec::new();
+            let result = child_stdout.read_to_end(&mut stdout).map(|_| stdout);
+            let _ = stdout_tx.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().context("failed to poll child status")? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("codex-stdio-to-uds kept running after the peer closed");
+            }
+            thread::sleep(
+                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        };
+        drop(stdin);
+        let stdout = stdout_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("timed out waiting for child stdout")?
+            .context("failed to read child stdout")?;
+        Ok((status, stdout))
+    });
+
+    let (status, stdout) = child_task.await.context("child task panicked")??;
+    server_task.await.context("server task panicked")??;
+    assert!(status.success(), "codex-stdio-to-uds exited with {status}");
+    assert_eq!(stdout, b"response");
 
     Ok(())
 }

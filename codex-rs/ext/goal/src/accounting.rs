@@ -108,12 +108,17 @@ impl GoalAccountingState {
         turn.account_tokens && turn.active_goal_id.is_some()
     }
 
-    pub(crate) fn record_token_usage(&self, turn_id: &str, total_usage: &TokenUsage) {
+    pub(crate) fn record_token_usage(
+        &self,
+        turn_id: &str,
+        total_usage: &TokenUsage,
+        last_usage: &TokenUsage,
+    ) {
         let mut inner = self.inner();
         if inner.current_turn_id.as_deref() == Some(turn_id)
             && let Some(turn) = inner.turns.get_mut(turn_id)
         {
-            turn.current_token_usage = total_usage.clone();
+            turn.record_token_usage(total_usage, last_usage);
         }
     }
 
@@ -354,19 +359,22 @@ impl Default for GoalAccountingState {
     }
 }
 
-fn token_delta_since_last_accounting(last: &TokenUsage, current: &TokenUsage) -> i64 {
-    let delta = TokenUsage {
-        input_tokens: current.input_tokens.saturating_sub(last.input_tokens),
+fn usage_difference(current: &TokenUsage, previous: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
         cached_input_tokens: current
             .cached_input_tokens
-            .saturating_sub(last.cached_input_tokens),
-        output_tokens: current.output_tokens.saturating_sub(last.output_tokens),
+            .saturating_sub(previous.cached_input_tokens),
+        output_tokens: current.output_tokens.saturating_sub(previous.output_tokens),
         reasoning_output_tokens: current
             .reasoning_output_tokens
-            .saturating_sub(last.reasoning_output_tokens),
-        total_tokens: current.total_tokens.saturating_sub(last.total_tokens),
-    };
-    goal_token_delta_for_usage(&delta)
+            .saturating_sub(previous.reasoning_output_tokens),
+        total_tokens: current.total_tokens.saturating_sub(previous.total_tokens),
+    }
+}
+
+fn token_delta_since_last_accounting(last: &TokenUsage, current: &TokenUsage) -> i64 {
+    goal_token_delta_for_usage(&usage_difference(current, last))
 }
 
 pub(crate) fn goal_token_delta_for_usage(usage: &TokenUsage) -> i64 {
@@ -404,6 +412,22 @@ impl GoalTurnAccounting {
 
     fn reset_baseline_to_current(&mut self) {
         self.last_accounted_token_usage = self.current_token_usage.clone();
+    }
+
+    fn record_token_usage(&mut self, total_usage: &TokenUsage, last_usage: &TokenUsage) {
+        // Hosts can rebase cumulative usage between reports, e.g. after a context-window
+        // overflow. Move the baseline to the rebased origin so unflushed usage and this report
+        // are both charged instead of being hidden by a negative cumulative delta.
+        let origin = usage_difference(total_usage, last_usage);
+        let observed = &self.current_token_usage;
+        if origin.input_tokens < observed.input_tokens
+            || origin.cached_input_tokens < observed.cached_input_tokens
+            || origin.output_tokens < observed.output_tokens
+        {
+            let unaccounted = usage_difference(observed, &self.last_accounted_token_usage);
+            self.last_accounted_token_usage = usage_difference(&origin, &unaccounted);
+        }
+        self.current_token_usage = total_usage.clone();
     }
 
     fn token_delta_since_last_accounting(&self) -> i64 {

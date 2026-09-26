@@ -10,7 +10,6 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::HookEventsToml;
 use codex_config::HookHandlerConfig;
-use codex_config::HookRunScope;
 use codex_config::HookStateToml;
 use codex_config::HooksFile;
 use codex_config::ManagedHooksRequirementsToml;
@@ -38,7 +37,7 @@ pub(crate) struct DiscoveryResult {
     pub hook_entries: Vec<HookListEntry>,
     pub warnings: Vec<String>,
     /// Handler run ids whose user hook state limits how often they run.
-    pub once_per: HashMap<String, HookRunScope>,
+    pub once_per: HashMap<String, super::OncePerLimit>,
 }
 
 struct HookHandlerSource<'a> {
@@ -176,7 +175,10 @@ pub(crate) fn discover_handlers(
             let scope = hook_states.get(&entry.key)?.once_per?;
             Some((
                 super::hook_run_id(entry.event_name, entry.display_order, &entry.source_path),
-                scope,
+                super::OncePerLimit {
+                    scope,
+                    key: entry.key.clone(),
+                },
             ))
         })
         .collect();

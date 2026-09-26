@@ -839,8 +839,13 @@ impl Session {
             &model_info,
         );
         let mut per_turn_config = per_turn_config;
-        let resolved_token_budget = super::token_budget::resolve_for_model(&per_turn_config, &model_info);
-        Arc::make_mut(&mut per_turn_config).token_budget = resolved_token_budget;
+        let resolved_token_budget =
+            super::token_budget::resolve_for_model(&per_turn_config, &model_info);
+        // The config is usually shared with the cross-turn cache; an
+        // unconditional write would clone it and defeat that reuse.
+        if per_turn_config.token_budget != resolved_token_budget {
+            Arc::make_mut(&mut per_turn_config).token_budget = resolved_token_budget;
+        }
         if per_turn_config.service_tier != resolved_service_tier {
             Arc::make_mut(&mut per_turn_config).service_tier = resolved_service_tier;
         }
@@ -1093,6 +1098,10 @@ impl Session {
         if per_turn_config.service_tier != resolved_service_tier {
             Arc::make_mut(&mut per_turn_config).service_tier = resolved_service_tier;
         }
+        // Resolve before consulting the cache so the cached allocation already
+        // carries this model's budget and make_turn_context has nothing to rewrite.
+        let resolved_token_budget =
+            super::token_budget::resolve_for_model(&per_turn_config, &model_info);
         let per_turn_config = {
             let mut cached = self
                 .turn_config_cache
@@ -1100,11 +1109,16 @@ impl Session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match cached.as_ref() {
                 Some(previous)
-                    if same_turn_config_projection(previous.as_ref(), per_turn_config.as_ref()) =>
+                    if same_turn_config_projection(previous.as_ref(), per_turn_config.as_ref())
+                        && previous.token_budget == resolved_token_budget =>
                 {
                     Arc::clone(previous)
                 }
                 _ => {
+                    let mut per_turn_config = per_turn_config;
+                    if per_turn_config.token_budget != resolved_token_budget {
+                        Arc::make_mut(&mut per_turn_config).token_budget = resolved_token_budget;
+                    }
                     *cached = Some(Arc::clone(&per_turn_config));
                     per_turn_config
                 }

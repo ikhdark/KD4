@@ -298,11 +298,14 @@ async fn plugin_share_save_forwards_access_policy() -> Result<()> {
     Ok(())
 }
 
+/// Invalid share settings are rejected before the backend is contacted, so
+/// one server proves each rule.
 #[tokio::test]
-async fn plugin_share_save_rejects_listed_discoverability() -> Result<()> {
+async fn plugin_share_rejects_invalid_share_settings() -> Result<()> {
     let codex_home = TempDir::new()?;
     let plugin_root = TempDir::new()?;
-    let plugin_path = write_test_plugin(plugin_root.path(), "demo-plugin")?;
+    let plugin_path =
+        AbsolutePathBuf::try_from(write_test_plugin(plugin_root.path(), "demo-plugin")?)?;
     let server = MockServer::start().await;
     write_remote_plugin_config(codex_home.path(), &format!("{}/backend-api", server.uri()))?;
     write_chatgpt_auth(
@@ -320,32 +323,76 @@ async fn plugin_share_save_rejects_listed_discoverability() -> Result<()> {
         .build()
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let request_id = mcp
-        .send_raw_request(
+
+    let workspace_targets_message = "shareTargets cannot include workspace principals; use discoverability UNLISTED for workspace link access";
+    let workspace_target = json!([
+        {
+            "principalType": "workspace",
+            "principalId": "account-123",
+            "role": "reader",
+        },
+    ]);
+    let cases = [
+        (
             "plugin/share/save",
-            Some(json!({
-                "pluginPath": AbsolutePathBuf::try_from(plugin_path)?,
+            json!({
+                "pluginPath": plugin_path,
                 "discoverability": "LISTED",
-            })),
+            }),
+            "discoverability LISTED is not supported for plugin/share/save; use UNLISTED or PRIVATE",
+        ),
+        (
+            "plugin/share/save",
+            json!({
+                "pluginPath": plugin_path,
+                "discoverability": "UNLISTED",
+                "shareTargets": workspace_target,
+            }),
+            workspace_targets_message,
+        ),
+        (
+            "plugin/share/updateTargets",
+            json!({
+                "remotePluginId": "plugins_123",
+                "discoverability": "UNLISTED",
+                "shareTargets": workspace_target,
+            }),
+            workspace_targets_message,
+        ),
+        (
+            "plugin/share/save",
+            json!({
+                "pluginPath": plugin_path,
+                "remotePluginId": "plugins_123",
+                "discoverability": "PRIVATE",
+                "shareTargets": [
+                    {
+                        "principalType": "user",
+                        "principalId": "user-1",
+                        "role": "reader",
+                    },
+                ],
+            }),
+            "discoverability and shareTargets are only supported when creating a plugin share; use plugin/share/updateTargets to update share settings",
+        ),
+    ];
+
+    for (method, params, expected_message) in cases {
+        let request_id = mcp.send_raw_request(method, Some(params)).await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
         )
-        .await?;
+        .await??;
 
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(
-        error.error.message,
-        "discoverability LISTED is not supported for plugin/share/save; use UNLISTED or PRIVATE"
-    );
+        assert_eq!(error.error.code, -32600, "{method}");
+        assert_eq!(error.error.message, expected_message, "{method}");
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn plugin_share_save_rejects_when_plugin_sharing_disabled() -> Result<()> {
+async fn plugin_share_mutations_reject_when_plugin_sharing_disabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let plugin_root = TempDir::new()?;
     let plugin_path = write_test_plugin(plugin_root.path(), "demo-plugin")?;
@@ -378,165 +425,42 @@ plugin_sharing = false
         .build()
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let request_id = mcp
-        .send_raw_request(
+
+    for (method, params) in [
+        (
             "plugin/share/save",
-            Some(json!({
+            json!({
                 "pluginPath": AbsolutePathBuf::try_from(plugin_path)?,
-            })),
+            }),
+        ),
+        (
+            "plugin/share/updateTargets",
+            json!({
+                "remotePluginId": "plugins_123",
+                "discoverability": "UNLISTED",
+                "shareTargets": [],
+            }),
+        ),
+    ] {
+        let request_id = mcp.send_raw_request(method, Some(params)).await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
         )
-        .await?;
+        .await??;
 
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(error.error.message, "plugin sharing is disabled");
+        assert_eq!(error.error.code, -32600, "{method}");
+        assert_eq!(
+            error.error.message, "plugin sharing is disabled",
+            "{method}"
+        );
+    }
     assert!(
         server
             .received_requests()
             .await
             .expect("wiremock should record requests")
             .is_empty()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn plugin_share_rejects_workspace_targets_from_client() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let plugin_root = TempDir::new()?;
-    let plugin_path = write_test_plugin(plugin_root.path(), "demo-plugin")?;
-    let server = MockServer::start().await;
-    write_remote_plugin_config(codex_home.path(), &format!("{}/backend-api", server.uri()))?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .chatgpt_user_id("user-123")
-            .chatgpt_account_id("account-123"),
-        AuthCredentialsStoreMode::File,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let request_id = mcp
-        .send_raw_request(
-            "plugin/share/save",
-            Some(json!({
-                "pluginPath": AbsolutePathBuf::try_from(plugin_path)?,
-                "discoverability": "UNLISTED",
-                "shareTargets": [
-                    {
-                        "principalType": "workspace",
-                        "principalId": "account-123",
-                        "role": "reader",
-                    },
-                ],
-            })),
-        )
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(
-        error.error.message,
-        "shareTargets cannot include workspace principals; use discoverability UNLISTED for workspace link access"
-    );
-
-    let request_id = mcp
-        .send_raw_request(
-            "plugin/share/updateTargets",
-            Some(json!({
-                "remotePluginId": "plugins_123",
-                "discoverability": "UNLISTED",
-                "shareTargets": [
-                    {
-                        "principalType": "workspace",
-                        "principalId": "account-123",
-                        "role": "reader",
-                    },
-                ],
-            })),
-        )
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(
-        error.error.message,
-        "shareTargets cannot include workspace principals; use discoverability UNLISTED for workspace link access"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn plugin_share_save_rejects_access_policy_for_existing_plugin() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let plugin_root = TempDir::new()?;
-    let plugin_path = write_test_plugin(plugin_root.path(), "demo-plugin")?;
-    let server = MockServer::start().await;
-    write_remote_plugin_config(codex_home.path(), &format!("{}/backend-api", server.uri()))?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .chatgpt_user_id("user-123")
-            .chatgpt_account_id("account-123"),
-        AuthCredentialsStoreMode::File,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let request_id = mcp
-        .send_raw_request(
-            "plugin/share/save",
-            Some(json!({
-                "pluginPath": AbsolutePathBuf::try_from(plugin_path)?,
-                "remotePluginId": "plugins_123",
-                "discoverability": "PRIVATE",
-                "shareTargets": [
-                    {
-                        "principalType": "user",
-                        "principalId": "user-1",
-                        "role": "reader",
-                    },
-                ],
-            })),
-        )
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(
-        error.error.message,
-        "discoverability and shareTargets are only supported when creating a plugin share; use plugin/share/updateTargets to update share settings"
     );
     Ok(())
 }
@@ -1113,60 +1037,6 @@ async fn plugin_share_update_targets_updates_share_targets() -> Result<()> {
             discoverability: codex_app_server_protocol::PluginShareDiscoverability::Unlisted,
         }
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn plugin_share_update_targets_rejects_when_plugin_sharing_disabled() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let server = MockServer::start().await;
-    std::fs::write(
-        codex_home.path().join("config.toml"),
-        format!(
-            r#"
-chatgpt_base_url = "{}/backend-api"
-
-[features]
-plugins = true
-plugin_sharing = false
-"#,
-            server.uri()
-        ),
-    )?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .chatgpt_user_id("user-123")
-            .chatgpt_account_id("account-123"),
-        AuthCredentialsStoreMode::File,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let request_id = mcp
-        .send_raw_request(
-            "plugin/share/updateTargets",
-            Some(json!({
-                "remotePluginId": "plugins_123",
-                "discoverability": "UNLISTED",
-                "shareTargets": [],
-            })),
-        )
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(error.error.message, "plugin sharing is disabled");
     Ok(())
 }
 

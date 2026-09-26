@@ -36,6 +36,7 @@ const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 pub const AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID: &str = "openai.gpt-6-astra";
@@ -161,6 +162,20 @@ pub struct ModelProviderAwsAuthInfo {
 
 impl ModelProviderInfo {
     pub fn validate(&self) -> std::result::Result<(), String> {
+        // A zero budget expires before the first poll: every stream would fail and be retried
+        // as a fresh model request, and every WebSocket connect would fall back to HTTPS.
+        for (field, value) in [
+            ("stream_idle_timeout_ms", self.stream_idle_timeout_ms),
+            (
+                "websocket_connect_timeout_ms",
+                self.websocket_connect_timeout_ms,
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(format!("provider {field} must be greater than zero"));
+            }
+        }
+
         if self.aws.is_some() {
             if self.supports_websockets {
                 // TODO(celia-oai): Support AWS SigV4 signing for WebSocket
@@ -267,32 +282,34 @@ impl ModelProviderInfo {
         Ok(headers)
     }
 
-    pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
-        let default_base_url = if matches!(
-            auth_mode,
-            Some(
-                AuthMode::Chatgpt
-                    | AuthMode::ChatgptAuthTokens
-                    | AuthMode::Headers
-                    | AuthMode::AgentIdentity
-                    | AuthMode::PersonalAccessToken
-            )
-        ) {
-            CHATGPT_CODEX_BASE_URL
-        } else {
-            "https://api.openai.com/v1"
-        };
-        let base_url = self
-            .base_url
-            .clone()
-            .unwrap_or_else(|| default_base_url.to_string());
+    /// Base URL that requests use under `auth_mode`: the configured URL, else
+    /// the ChatGPT Codex backend for account-backed auth or the public API.
+    pub fn effective_base_url(&self, auth_mode: Option<AuthMode>) -> &str {
+        self.base_url.as_deref().unwrap_or(
+            if matches!(
+                auth_mode,
+                Some(
+                    AuthMode::Chatgpt
+                        | AuthMode::ChatgptAuthTokens
+                        | AuthMode::Headers
+                        | AuthMode::AgentIdentity
+                        | AuthMode::PersonalAccessToken
+                )
+            ) {
+                CHATGPT_CODEX_BASE_URL
+            } else {
+                OPENAI_API_BASE_URL
+            },
+        )
+    }
 
+    pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
         let headers = self.build_header_map()?;
         let retry = self.request_retry_config();
 
         Ok(ApiProvider {
             name: self.name.clone(),
-            base_url,
+            base_url: self.effective_base_url(auth_mode).to_string(),
             query_params: self.query_params.clone(),
             headers,
             retry,

@@ -360,13 +360,17 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
-                let is_user_turn = matches!(&op, AppCommand::UserTurn { .. });
+                // A refused turn start or compaction leaves the widget waiting for a turn that
+                // will not begin. Other refused ops change no turn state, and none of them may end
+                // the session.
+                let ends_pending_turn =
+                    matches!(&op, AppCommand::UserTurn { .. } | AppCommand::Compact);
                 self.chat_widget.prepare_local_op_submission(&op);
                 if let Err(err) = self.submit_active_thread_op(app_server, op).await {
-                    if is_user_turn {
+                    if ends_pending_turn {
                         self.chat_widget.on_error(format!("{err:#}"));
                     } else {
-                        return Err(err);
+                        self.chat_widget.add_error_message(format!("{err:#}"));
                     }
                 }
             }
@@ -466,7 +470,9 @@ impl App {
                     .await?;
             }
             AppEvent::SubmitThreadOp { thread_id, op } => {
-                self.submit_thread_op(app_server, thread_id, op).await?;
+                if let Err(err) = self.submit_thread_op(app_server, thread_id, op).await {
+                    self.chat_widget.add_error_message(format!("{err:#}"));
+                }
             }
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)

@@ -92,6 +92,28 @@ fn token_budget_handles_dense_ends_and_large_sparse_middle() {
 }
 
 #[test]
+fn token_budget_retains_nearly_the_full_budget() {
+    // Uniform text sized without the marker overshoots by only a few tokens, and
+    // ends sparser than the dense middle fit on the first attempt far below the
+    // budget. Neither case may discard a large fraction of the requested budget.
+    let uniform = "alpha beta, gamma delta.\n".repeat(40_000);
+    let sparse_ends = format!(
+        "{}{}{}",
+        "abcd ".repeat(10_000),
+        "!".repeat(500_000),
+        "abcd ".repeat(10_000)
+    );
+    for input in [uniform, sparse_ends] {
+        for budget in [1_000, 10_000] {
+            let (output, _) = truncate_middle_with_token_budget(&input, budget);
+            let used = approx_token_count(&output);
+            assert!(used <= budget, "budget={budget} used={used}");
+            assert!(used * 100 >= budget * 97, "budget={budget} used={used}");
+        }
+    }
+}
+
+#[test]
 fn split_string_works() {
     assert_eq!(
         split_string(

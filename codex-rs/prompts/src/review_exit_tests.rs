@@ -10,10 +10,10 @@ fn render_review_exit_success_replaces_results_placeholder() {
 }
 
 #[test]
-fn normalize_review_template_line_endings_rewrites_crlf() {
+fn render_review_exit_interrupted_uses_lf_template() {
     assert_eq!(
-        normalize_review_template_line_endings("<user_action>\r\n  <results>\r\n  None.\r\n"),
-        "<user_action>\n  <results>\n  None.\n"
+        render_review_exit_interrupted(),
+        "<user_action>\n  <context>User initiated a review task, but was interrupted. If user asks about this, tell them to re-initiate a review with `/review` and wait for it to complete.</context>\n  <action>review</action>\n  <results>\n  None.\n  </results>\n</user_action>\n\n"
     );
 }
 

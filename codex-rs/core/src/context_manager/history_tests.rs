@@ -42,8 +42,6 @@ use image::Luma;
 use image::Rgba;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
@@ -178,16 +176,14 @@ fn tool_search_acknowledgement_preserves_full_schema_bytes() {
         omitted_result_count: Some(2),
         internal_chat_message_metadata_passthrough: None,
     };
-    let compact = compact_acknowledged_tool_search_outputs(
-        vec![original.clone(), agent_message("acknowledged")].into(),
-    );
+    let prepared = create_history_with_items(vec![original.clone(), agent_message("acknowledged")])
+        .prepare_for_prompt(&default_input_modalities());
     let expected = serde_json::to_value(&original).unwrap();
-    assert_eq!(serde_json::to_value(&compact[0]).unwrap(), expected);
-    assert_eq!(compact[1], agent_message("acknowledged"));
-    assert_eq!(
-        serde_json::to_value(original).unwrap()["tools"][0]["description"],
-        "discard"
-    );
+    for projection in prepared.shared_prompt_projections() {
+        assert_eq!(serde_json::to_value(&projection[0]).unwrap(), expected);
+        assert_eq!(projection[1], agent_message("acknowledged"));
+    }
+    assert_eq!(expected["tools"][0]["description"], "discard");
 }
 
 #[test]
@@ -232,7 +228,7 @@ fn prepared_prompt_index_walks_deep_unmaterialized_chains() {
 }
 
 #[test]
-fn prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append() {
+fn prompt_projections_share_primary_storage_during_runtime_append() {
     let search = ResponseItem::ToolSearchOutput {
         id: None,
         call_id: Some("server-search".to_string()),
@@ -248,7 +244,7 @@ fn prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append()
     let first = history
         .clone()
         .prepare_for_prompt(&default_input_modalities());
-    let original = first.compacted_tool_search_outputs(compact_acknowledged_tool_search_outputs);
+    let original = first.shared_prompt_projections();
     assert_eq!(original[0].as_ref(), std::slice::from_ref(&search));
 
     let mut expected = vec![search];
@@ -259,10 +255,12 @@ fn prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append()
         let prepared = history
             .clone()
             .prepare_for_prompt(&default_input_modalities());
-        let projections = prepared.compacted_tool_search_outputs(|_| {
-            panic!("safe append must advance the existing compaction cache")
-        });
+        let projections = prepared.shared_prompt_projections();
+        // The request input is the flattened copy retry bookkeeping holds;
+        // a parallel mirror would deep-copy the whole history again.
+        let primary = prepared.shared_items();
         for projection in projections {
+            assert!(Arc::ptr_eq(&projection, &primary));
             assert_eq!(projection.as_ref(), expected.as_slice());
         }
     }
@@ -1263,7 +1261,7 @@ fn total_token_usage_does_not_restore_evicted_reasoning() {
     let current_reasoning = reasoning_with_encrypted_content(/*len*/ 1_000);
     let mut history = create_history_with_items(vec![
         user_input_text_msg("first instruction"),
-        earlier_reasoning.clone(),
+        earlier_reasoning,
         assistant_msg("first response"),
         user_input_text_msg("second instruction"),
         current_reasoning,
@@ -1399,7 +1397,7 @@ fn total_token_usage_refreshes_from_server_after_next_model_response() {
     let boundary = user_input_text_msg("new instruction");
     let earlier_reasoning = reasoning_with_encrypted_content(/*len*/ 2_000);
     let mut history = create_history_with_items(vec![
-        earlier_reasoning.clone(),
+        earlier_reasoning,
         assistant_msg("old response"),
         boundary,
     ]);
@@ -2754,8 +2752,7 @@ fn projection_budget_drops_are_ordered_to_match_the_prompt_representations() {
 fn unchanged_tool_projection_preserves_prepared_sidecars() {
     let prepared = create_history_with_items(vec![agent_message("hello")])
         .prepare_for_prompt(&default_input_modalities());
-    let _ = prepared.compacted_tool_search_outputs(std::convert::identity);
-    let compacted_cache = Arc::clone(&prepared.compacted_tool_search_outputs);
+    let projections = prepared.shared_prompt_projections();
     let provenance = prepared.prompt_provenance.clone();
     let projection = ToolHistoryProjection {
         items: prepared.shared_items(),
@@ -2772,41 +2769,31 @@ fn unchanged_tool_projection_preserves_prepared_sidecars() {
 
     let projected = apply_tool_history_projection(prepared, projection, fallback_projection);
 
-    assert!(Arc::ptr_eq(
-        &projected.compacted_tool_search_outputs,
-        &compacted_cache
-    ));
+    for (projected, original) in projected
+        .shared_prompt_projections()
+        .iter()
+        .zip(&projections)
+    {
+        assert!(Arc::ptr_eq(projected, original));
+    }
     assert!(
         projected
             .prompt_provenance
             .shares_contributions_with(&provenance)
     );
-    assert!(
-        projected
-            .compacted_tool_search_outputs_are_materialized()
-            .is_some()
-    );
 }
 
 #[test]
-fn tool_search_compaction_uses_projection_identity_without_content_scans() {
+fn prompt_projections_reuse_shared_storage_without_copies() {
     let mut prepared = create_history_with_items(vec![agent_message("same content")])
         .prepare_for_prompt(&default_input_modalities());
-    prepared.fallback_items =
-        PreparedPromptItems::from_shared(Arc::clone(&prepared.shared_items()));
+    let primary = prepared.shared_items();
+    prepared.fallback_items = PreparedPromptItems::from_shared(Arc::clone(&primary));
     prepared.unreplaced_fallback_items = prepared.fallback_items.clone();
-    let build_count = AtomicUsize::new(0);
 
-    let compacted = prepared.compacted_tool_search_outputs(|items| {
-        build_count.fetch_add(1, Ordering::Relaxed);
-        Arc::from(items.as_ref().to_vec())
-    });
-
-    assert_eq!(build_count.load(Ordering::Relaxed), 2);
-    assert!(Arc::ptr_eq(&compacted[0], &compacted[2]));
-    assert!(Arc::ptr_eq(&compacted[1], &compacted[3]));
-    assert_eq!(compacted[0], compacted[1]);
-    assert!(!Arc::ptr_eq(&compacted[0], &compacted[1]));
+    for projection in prepared.shared_prompt_projections() {
+        assert!(Arc::ptr_eq(&projection, &primary));
+    }
 }
 
 #[test]

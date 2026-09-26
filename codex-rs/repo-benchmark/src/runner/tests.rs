@@ -893,6 +893,7 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
                     "type":"task_complete", "turn_id":format!("turn-{session}"),
                     "timing": {
                         "schemaVersion":25, "profileValid":true, "classificationComplete":true,
+                        "inclusiveDurationNs":1000,
                         "counters": {
                             "saturationCount":0, "executedValidationCount":1,
                             "executedValidationDurationNs":count * 100 + session,

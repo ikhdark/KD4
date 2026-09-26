@@ -84,7 +84,9 @@ fn parse_result(item: &Value) -> CommandResult {
         .expect("shell output payload");
     match serde_json::from_str::<Value>(output_str) {
         Ok(parsed) => {
-            let exit_code = parsed["metadata"]["exit_code"].as_i64();
+            let exit_code = parsed["exit_code"]
+                .as_i64()
+                .or_else(|| parsed["metadata"]["exit_code"].as_i64());
             let stdout = parsed["output"].as_str().unwrap_or_default().to_string();
             CommandResult { exit_code, stdout }
         }

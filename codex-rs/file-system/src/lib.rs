@@ -318,6 +318,18 @@ pub trait ExecutorFileSystem: Send + Sync {
         max_bytes: usize,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        self.read_file_bounded_via_streams(path, max_bytes, sandbox)
+    }
+
+    /// Performs the default bounded read using two [`Self::read_file_stream`] passes.
+    ///
+    /// Overrides can use this when a backend lacks a native bounded read.
+    fn read_file_bounded_via_streams<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
             let Some(first) =
                 collect_bounded_read(self.read_file_stream(path, sandbox).await?, max_bytes)

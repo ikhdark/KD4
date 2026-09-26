@@ -23,7 +23,8 @@ const MAX_QUEUED_REQUESTS_PER_KEY: usize = 64;
 // protocol limit so turn validation, rather than overload handling, owns the
 // boundary response.
 const MAX_TOTAL_QUEUED_BYTES: usize = 32 * 1024 * 1024;
-const MAX_QUEUED_BYTES_PER_KEY: usize = 5 * 1024 * 1024;
+// Admit a 10 MiB fs/writeFile payload after base64 encoding and its JSON envelope.
+const MAX_QUEUED_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_SHARED_READS: usize = 16;
 /// Reserved slots per key for out-of-band control requests such as `turn/interrupt`.
 ///
@@ -51,6 +52,7 @@ pub(crate) enum RequestSerializationQueueKey {
         process_handle: String,
     },
     FuzzyFileSearchSession {
+        connection_id: ConnectionId,
         session_id: String,
     },
     FsWatch {
@@ -117,7 +119,10 @@ impl RequestSerializationQueueKey {
                 RequestSerializationAccess::Exclusive,
             ),
             ClientRequestSerializationScope::FuzzyFileSearchSession { session_id } => (
-                Self::FuzzyFileSearchSession { session_id },
+                Self::FuzzyFileSearchSession {
+                    connection_id,
+                    session_id,
+                },
                 RequestSerializationAccess::Exclusive,
             ),
             ClientRequestSerializationScope::FsWatch { watch_id } => (

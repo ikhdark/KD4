@@ -1314,6 +1314,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
         step: UnauthorizedRecoveryStep::Reload,
         expected_account_id: None,
         mode: UnauthorizedRecoveryMode::Managed,
+        retried_auth: None,
     };
     assert_eq!(managed.mode_name(), "managed");
     assert_eq!(managed.step_name(), "reload");
@@ -1323,6 +1324,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
         step: UnauthorizedRecoveryStep::ExternalRefresh,
         expected_account_id: None,
         mode: UnauthorizedRecoveryMode::External,
+        retried_auth: None,
     };
     assert_eq!(external.mode_name(), "external");
     assert_eq!(external.step_name(), "external_refresh");
@@ -2983,6 +2985,124 @@ async fn proactive_refresh_is_deduplicated_and_empty_responses_do_not_advance_st
 }
 
 #[tokio::test]
+#[serial(codex_auth_env)]
+async fn concurrent_unauthorized_recoveries_share_one_token_refresh() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account-123".into()),
+        },
+        home.path(),
+    )?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let mut original = storage.load()?.unwrap();
+    original.tokens.as_mut().unwrap().account_id = Some("account-123".into());
+    storage.save(&original)?;
+    let server = MockServer::start().await;
+    let _endpoint_guard = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        &format!("{}/oauth/token", server.uri()),
+    );
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"access_token":"rotated-access", "refresh_token":"rotated-refresh"}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let manager = Arc::new(
+        AuthManager::new(
+            home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+            None,
+            None,
+            AuthKeyringBackendKind::Direct,
+            crate::test_support::transport_default_auth_route_config(),
+        )
+        .await,
+    );
+    // Two in-flight requests were rejected with the same token and both retried
+    // it after reloading unchanged credentials.
+    let mut first = manager.unauthorized_recovery();
+    let mut second = manager.unauthorized_recovery();
+    for recovery in [&mut first, &mut second] {
+        assert_eq!(
+            recovery.next().await?.auth_state_changed(),
+            Some(false),
+            "reload should find the rejected credentials unchanged"
+        );
+    }
+
+    for recovery in [&mut first, &mut second] {
+        assert_eq!(recovery.step_name(), "refresh_token");
+        assert_eq!(recovery.next().await?.auth_state_changed(), Some(true));
+    }
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let tokens = manager.auth_cached().unwrap().get_token_data()?;
+    assert_eq!(tokens.access_token, "rotated-access");
+    assert_eq!(tokens.refresh_token, "rotated-refresh");
+    assert_eq!(
+        storage.load()?.unwrap().tokens.unwrap().refresh_token,
+        "rotated-refresh"
+    );
+    Ok(())
+}
+
+struct CountingRefreshExternalAuth {
+    current: std::sync::RwLock<CodexAuth>,
+    refreshes: AtomicUsize,
+}
+
+impl ExternalAuth for CountingRefreshExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.current.read().unwrap().clone()) })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async {
+            let refresh = self.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+            let auth = CodexAuth::from_api_key(&format!("refreshed-{refresh}"));
+            *self.current.write().unwrap() = auth.clone();
+            Ok(auth)
+        })
+    }
+}
+
+#[tokio::test]
+async fn concurrent_external_recoveries_share_one_provider_refresh() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("initial"));
+    let provider = Arc::new(CountingRefreshExternalAuth {
+        current: std::sync::RwLock::new(CodexAuth::from_api_key("rejected")),
+        refreshes: AtomicUsize::new(0),
+    });
+    manager
+        .set_external_auth(provider.clone())
+        .await
+        .expect("external auth should install");
+    // Two in-flight requests were rejected with the same external credentials.
+    let mut first = manager.unauthorized_recovery();
+    let mut second = manager.unauthorized_recovery();
+
+    for recovery in [&mut first, &mut second] {
+        assert_eq!(recovery.step_name(), "external_refresh");
+        let result = recovery.next().await.expect("recovery should succeed");
+        assert_eq!(result.auth_state_changed(), Some(true));
+    }
+
+    assert_eq!(provider.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        manager.auth().await.and_then(|auth| auth.api_key().map(str::to_string)),
+        Some("refreshed-1".to_string())
+    );
+}
+
+#[tokio::test]
 async fn failed_external_recovery_is_consumed() {
     let script = ProviderAuthScript::new(&["provider-token"]).unwrap();
     let manager = AuthManager::external_bearer_only(script.auth_config());
@@ -3316,4 +3436,160 @@ async fn revocation_uses_resolved_personal_and_bedrock_modes() -> anyhow::Result
     .await?;
     assert!(server.received_requests().await.unwrap().is_empty());
     Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn unreadable_auth_store_is_not_published_as_logout() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account-123".into()),
+        },
+        home.path(),
+    )?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let mut original = storage.load()?.unwrap();
+    original.tokens.as_mut().unwrap().account_id = Some("account-123".into());
+    storage.save(&original)?;
+    let server = MockServer::start().await;
+    let _endpoint_guard = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        &format!("{}/oauth/token", server.uri()),
+    );
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let manager = Arc::new(
+        AuthManager::new(
+            home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+            None,
+            None,
+            AuthKeyringBackendKind::Direct,
+            crate::test_support::transport_default_auth_route_config(),
+        )
+        .await,
+    );
+    std::fs::write(get_auth_file(home.path()), "not json")?;
+
+    assert!(!manager.reload().await);
+    let cached = || {
+        manager
+            .auth_cached()
+            .and_then(|auth| auth.get_current_auth_json())
+    };
+    assert_eq!(cached(), Some(original.clone()));
+    // An unreadable store cannot confirm the account, which is neither an
+    // account switch nor a permanent refresh failure.
+    let mut recovery = manager.unauthorized_recovery();
+    let error = recovery
+        .next()
+        .await
+        .expect_err("recovery cannot proceed without reading the store");
+    assert_eq!(error.failed_reason(), None);
+    assert!(!recovery.has_next());
+    let error = manager
+        .refresh_token()
+        .await
+        .expect_err("refresh cannot proceed without reading the store");
+    assert_eq!(error.failed_reason(), None);
+    assert_eq!(cached(), Some(original));
+
+    // A readable store without credentials is still a logout.
+    std::fs::remove_file(get_auth_file(home.path()))?;
+    assert!(manager.reload().await);
+    assert!(manager.auth_cached().is_none());
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn reload_publishes_workspace_policy_rejection_as_logout() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/user-auth-credential/whoami"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(personal_access_token_whoami(WORKSPACE_ID_ALLOWED)),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    let _authapi_guard = EnvVarGuard::set("CODEX_AUTHAPI_BASE_URL", &server.uri());
+    let home = tempdir()?;
+    super::login_with_access_token(
+        home.path(),
+        "at-policy-reload",
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::Direct,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .await?;
+    let manager = AuthManager::new(
+        home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
+        None,
+        AuthKeyringBackendKind::Direct,
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    assert!(manager.auth_cached().is_some());
+
+    manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_DISALLOWED.to_string()]));
+    assert!(manager.reload().await);
+    assert!(manager.auth_cached().is_none());
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn stalled_token_refresh_request_times_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let _endpoint_guard = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        &format!("{}/oauth/token", server.uri()),
+    );
+    let client = create_client().expect("default client should build");
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        request_chatgpt_token_refresh(
+            "refresh-token".to_string(),
+            &client,
+            std::time::Duration::from_millis(50),
+        ),
+    )
+    .await
+    .expect("a stalled refresh must not outlive its request timeout")
+    .err()
+    .expect("a stalled refresh must fail");
+
+    let RefreshTokenError::Transient(error) = error else {
+        panic!("a timed-out refresh must be transient: {error}");
+    };
+    assert!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<codex_http_client::HttpError>())
+            .is_some_and(codex_http_client::HttpError::is_timeout)
+    );
 }

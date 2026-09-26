@@ -491,7 +491,9 @@ impl InputQueue {
             {
                 break;
             }
-            let (mail, bytes) = mailbox.pending_mails.pop_front().expect("front exists");
+            let Some((mail, bytes)) = mailbox.pending_mails.pop_front() else {
+                break;
+            };
             mailbox.bytes -= bytes;
             input.bytes += bytes;
             input.items.push(TurnInput::InterAgentCommunication(mail));
@@ -564,7 +566,9 @@ impl InputQueue {
             {
                 break;
             }
-            let (mail, bytes) = mailbox.pending_mails.pop_front().expect("front exists");
+            let Some((mail, bytes)) = mailbox.pending_mails.pop_front() else {
+                break;
+            };
             mailbox.bytes -= bytes;
             output.bytes += bytes;
             output.items.push(TurnInput::InterAgentCommunication(mail));
@@ -901,9 +905,9 @@ mod tests {
             vec![TurnInput::InterAgentCommunication(queued)]
         );
         assert!(!queue.has_pending_mailbox_items().await);
-        let recovered = queue.startup_recovery_items.lock().await;
+        let recovered_bytes = queue.startup_recovery_items.lock().await.bytes;
         assert_eq!(
-            recovered.bytes,
+            recovered_bytes,
             turn_input_size_bytes(&user("recovered user"))
         );
         assert_eq!(

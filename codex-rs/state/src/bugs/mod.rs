@@ -3,6 +3,7 @@
 //! Raw report text is bound directly into SQLite and is never logged here.
 
 use crate::BUGS_DB_FILENAME;
+use crate::migrations::migrate_tolerating_concurrent_initializers;
 use crate::migrations::runtime_bugs_migrator;
 use anyhow::Context;
 use sqlx::ConnectOptions;
@@ -95,10 +96,15 @@ impl BugStore {
             .max_connections(4)
             .connect_with(options)
             .await?;
-        runtime_bugs_migrator()
-            .run(&pool)
-            .await
-            .context("migrate bug database")?;
+        let pool_ref = &pool;
+        migrate_tolerating_concurrent_initializers(pool_ref, move || async move {
+            runtime_bugs_migrator()
+                .run(pool_ref)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .context("migrate bug database")?;
         Ok(Self { pool })
     }
 

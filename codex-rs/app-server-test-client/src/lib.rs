@@ -1587,7 +1587,6 @@ struct CodexClient {
     pending_notifications: VecDeque<JSONRPCNotification>,
     command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
-    command_approval_item_ids: Vec<String>,
     command_execution_statuses: Vec<CommandExecutionStatus>,
     command_execution_outputs: Vec<String>,
     command_output_stream: String,
@@ -1662,31 +1661,11 @@ impl CodexClient {
             .take()
             .context("codex app-server stdout unavailable")?;
 
-        Ok(Self {
-            transport: ClientTransport::Stdio {
-                child: std::sync::Arc::new(std::sync::Mutex::new(codex_app_server)),
-                stdin: Some(stdin),
-                stdout: BufReader::new(stdout),
-            },
-            operation_deadline: None,
-            wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
-            pending_notifications: VecDeque::new(),
-            command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
-            command_approval_count: 0,
-            command_approval_item_ids: Vec::new(),
-            command_execution_statuses: Vec::new(),
-            command_execution_outputs: Vec::new(),
-            command_output_stream: String::new(),
-            helper_command: None,
-            helper_item_id: None,
-            helper_duration: None,
-            command_item_started: false,
-            helper_done_seen: false,
-            turn_completed_before_helper_done: false,
-            unexpected_items_before_helper_done: Vec::new(),
-            last_turn_status: None,
-            last_turn_error_message: None,
-        })
+        Ok(Self::from_transport(ClientTransport::Stdio {
+            child: std::sync::Arc::new(std::sync::Mutex::new(codex_app_server)),
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+        }))
     }
 
     fn connect_websocket(url: &str) -> Result<Self> {
@@ -1696,17 +1675,20 @@ impl CodexClient {
                 "failed to connect to websocket app-server at `{url}`; if no server is running, start one with `codex-app-server-test-client serve --listen {url}`"
             )
         })?;
-        Ok(Self {
-            transport: ClientTransport::WebSocket {
-                url: url.to_string(),
-                socket: Box::new(socket),
-            },
+        Ok(Self::from_transport(ClientTransport::WebSocket {
+            url: url.to_string(),
+            socket: Box::new(socket),
+        }))
+    }
+
+    fn from_transport(transport: ClientTransport) -> Self {
+        Self {
+            transport,
             operation_deadline: None,
             wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
-            command_approval_item_ids: Vec::new(),
             command_execution_statuses: Vec::new(),
             command_execution_outputs: Vec::new(),
             command_output_stream: String::new(),
@@ -1719,7 +1701,7 @@ impl CodexClient {
             unexpected_items_before_helper_done: Vec::new(),
             last_turn_status: None,
             last_turn_error_message: None,
-        })
+        }
     }
 
     /// Bounds a smoke polling operation, including its synchronous child RPC/turn IO.
@@ -2334,7 +2316,6 @@ impl CodexClient {
             approval_id.as_deref().unwrap_or("<none>")
         );
         self.command_approval_count += 1;
-        self.command_approval_item_ids.push(item_id.clone());
         if let Some(environment_id) = environment_id.as_deref() {
             println!("< environment: {environment_id}");
         }
@@ -2890,31 +2871,11 @@ mod tests {
             let mut ready = String::new();
             stdout.read_line(&mut ready).expect("server startup");
             assert_eq!(ready.trim(), "ready");
-            let client = CodexClient {
-                transport: ClientTransport::Stdio {
-                    child: std::sync::Arc::new(std::sync::Mutex::new(child)),
-                    stdin,
-                    stdout,
-                },
-                operation_deadline: None,
-                wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
-                pending_notifications: VecDeque::new(),
-                command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
-                command_approval_count: 0,
-                command_approval_item_ids: Vec::new(),
-                command_execution_statuses: Vec::new(),
-                command_execution_outputs: Vec::new(),
-                command_output_stream: String::new(),
-                helper_command: None,
-                helper_item_id: None,
-                helper_duration: None,
-                command_item_started: false,
-                helper_done_seen: false,
-                turn_completed_before_helper_done: false,
-                unexpected_items_before_helper_done: Vec::new(),
-                last_turn_status: None,
-                last_turn_error_message: None,
-            };
+            let client = CodexClient::from_transport(ClientTransport::Stdio {
+                child: std::sync::Arc::new(std::sync::Mutex::new(child)),
+                stdin,
+                stdout,
+            });
             let started = Instant::now();
             drop(client);
             let elapsed = started.elapsed();
@@ -3175,31 +3136,11 @@ mod tests {
         let mut ready = String::new();
         stdout.read_line(&mut ready).expect("peer ready");
         assert_eq!(ready.trim(), "ready");
-        CodexClient {
-            transport: ClientTransport::Stdio {
-                child: std::sync::Arc::new(std::sync::Mutex::new(child)),
-                stdin,
-                stdout,
-            },
-            operation_deadline: None,
-            wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
-            pending_notifications: VecDeque::new(),
-            command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
-            command_approval_count: 0,
-            command_approval_item_ids: Vec::new(),
-            command_execution_statuses: Vec::new(),
-            command_execution_outputs: Vec::new(),
-            command_output_stream: String::new(),
-            helper_command: None,
-            helper_item_id: None,
-            helper_duration: None,
-            command_item_started: false,
-            helper_done_seen: false,
-            turn_completed_before_helper_done: false,
-            unexpected_items_before_helper_done: Vec::new(),
-            last_turn_status: None,
-            last_turn_error_message: None,
-        }
+        CodexClient::from_transport(ClientTransport::Stdio {
+            child: std::sync::Arc::new(std::sync::Mutex::new(child)),
+            stdin,
+            stdout,
+        })
     }
 
     #[test]

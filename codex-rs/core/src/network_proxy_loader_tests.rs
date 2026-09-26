@@ -468,9 +468,15 @@ async fn malformed_custom_rules_preserve_managed_denied_domain() {
     )
     .expect("layer stack should be valid");
 
+    let error = build_config_state_from_layers(&layers, temp_dir.path())
+        .await
+        .err()
+        .expect("malformed custom rules must prevent a partial policy from activating");
+    assert!(error.to_string().contains("failed to parse rules file"));
+    fs::write(policy_dir.join("broken.rules"), "").expect("repair malformed policy");
     let state = build_config_state_from_layers(&layers, temp_dir.path())
         .await
-        .expect("proxy state should tolerate malformed custom rules");
+        .expect("repaired custom rules should preserve managed policy");
 
     assert_eq!(
         state.config.denied_domains(),

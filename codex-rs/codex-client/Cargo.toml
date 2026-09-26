@@ -6,11 +6,9 @@ version.workspace = true
 
 [dependencies]
 codex-http-client = { workspace = true }
-eventsource-stream = { workspace = true }
-futures = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
@@ -20,4 +18,4 @@ doctest = false
 test = false
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

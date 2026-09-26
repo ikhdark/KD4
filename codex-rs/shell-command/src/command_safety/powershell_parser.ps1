@@ -412,6 +412,15 @@ function Convert-DirectCommandElement {
     param($element)
 
     if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        # PowerShell 7 expands an unquoted leading `~` (for example `~` or `~/src`) to the home
+        # directory before starting a native command, so the source text is not the argv the
+        # process receives. Quoted `'~'` stays literal and remains eligible.
+        if (
+            $element.StringConstantType -eq [System.Management.Automation.Language.StringConstantType]::BareWord -and
+            $element.Value.StartsWith('~')
+        ) {
+            return $null
+        }
         return @($element.Value)
     }
 

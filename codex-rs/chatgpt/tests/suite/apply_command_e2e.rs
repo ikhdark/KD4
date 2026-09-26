@@ -142,6 +142,37 @@ fn test_apply_command_creates_fibonacci_file() {
 }
 
 #[tokio::test]
+async fn test_apply_command_accepts_diff_carried_as_output_diff_item() {
+    let temp_repo = create_temp_git_repo()
+        .await
+        .expect("Failed to create temp git repo");
+    let repo_path = temp_repo.path();
+
+    // The fixture's diff carried directly by the diff turn rather than inside
+    // a `pr` item, a task shape `codex cloud apply` also accepts.
+    let fixture_path = find_resource!("tests/task_turn_fixture.json").expect("fixture path");
+    let fixture: serde_json::Value = serde_json::from_str(
+        &tokio::fs::read_to_string(fixture_path)
+            .await
+            .expect("read fixture"),
+    )
+    .expect("fixture JSON");
+    let output_diff = fixture["current_diff_task_turn"]["output_items"][0]["output_diff"].clone();
+    let task_response: GetTaskResponse = serde_json::from_value(serde_json::json!({
+        "current_diff_task_turn": {"output_items": [output_diff]}
+    }))
+    .expect("task response");
+
+    apply_diff_from_task(task_response, Some(repo_path.to_path_buf()))
+        .await
+        .expect("apply a diff carried as an output_diff item");
+
+    let contents = std::fs::read_to_string(repo_path.join("scripts/fibonacci.js"))
+        .expect("Failed to read fibonacci.js");
+    assert!(contents.contains("module.exports = fibonacci;"));
+}
+
+#[tokio::test]
 async fn test_apply_command_with_merge_conflicts() {
     let temp_repo = create_temp_git_repo()
         .await

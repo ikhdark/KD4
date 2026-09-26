@@ -1,9 +1,6 @@
 #![cfg(any(not(debug_assertions), test))]
 
 use crate::legacy_core::config::Config;
-use crate::npm_registry;
-use crate::npm_registry::NpmPackageInfo;
-use crate::update_action::UpdateAction;
 use crate::updates_cache::VersionInfo;
 use crate::updates_cache::read_version_info_async;
 use crate::updates_cache::version_filepath;
@@ -11,6 +8,7 @@ use chrono::Duration;
 use chrono::Utc;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::RouteAwareClientPool;
+use codex_install_context::LATEST_RELEASE_API_URL;
 use codex_install_context::is_newer_version;
 use codex_install_context::is_source_build_version;
 use codex_install_context::version_from_release_tag;
@@ -22,19 +20,13 @@ use crate::version::CODEX_CLI_VERSION;
 
 pub(crate) use crate::updates_cache::dismiss_version;
 
-pub(crate) async fn startup_version_info(
-    config: &Config,
-    action: Option<UpdateAction>,
-) -> Option<VersionInfo> {
+pub(crate) async fn startup_version_info(config: &Config) -> Option<VersionInfo> {
     if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
     let version_file = version_filepath(config);
-    let info = read_version_info_async(&version_file)
-        .await
-        .ok()
-        .filter(|info| !requires_npm_readiness(action) || info.npm_ready == Some(true));
+    let info = read_version_info_async(&version_file).await.ok();
 
     if match &info {
         None => true,
@@ -45,7 +37,7 @@ pub(crate) async fn startup_version_info(
         // value (if any) for this run; the next run shows the banner if needed.
         let http_clients = create_client_pool(config.http_client_factory(), ClientRouteClass::Api);
         tokio::spawn(async move {
-            check_for_update(&version_file, action, &http_clients)
+            check_for_update(&version_file, &http_clients)
                 .await
                 .inspect_err(|e| tracing::error!("Failed to update version: {e}"))
         });
@@ -54,19 +46,6 @@ pub(crate) async fn startup_version_info(
     info.filter(|info| is_newer_version(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false))
 }
 
-fn requires_npm_readiness(action: Option<UpdateAction>) -> bool {
-    matches!(
-        action,
-        Some(
-            UpdateAction::NpmGlobalLatest
-                | UpdateAction::BunGlobalLatest
-                | UpdateAction::PnpmGlobalLatest
-        )
-    )
-}
-
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
-
 #[derive(Deserialize, Debug, Clone)]
 struct ReleaseInfo {
     tag_name: String,
@@ -74,41 +53,10 @@ struct ReleaseInfo {
 
 async fn check_for_update(
     version_file: &Path,
-    action: Option<UpdateAction>,
     http_clients: &RouteAwareClientPool,
 ) -> anyhow::Result<()> {
-    let latest_version = match action {
-        Some(UpdateAction::NpmGlobalLatest)
-        | Some(UpdateAction::BunGlobalLatest)
-        | Some(UpdateAction::PnpmGlobalLatest) => {
-            let latest_version = fetch_latest_github_release_version(http_clients).await?;
-            let package_info = http_clients
-                .get(npm_registry::PACKAGE_URL)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<NpmPackageInfo>()
-                .await?;
-            npm_registry::ensure_version_ready(&package_info, &latest_version)?;
-            latest_version
-        }
-        Some(UpdateAction::StandaloneWindows) | None => {
-            fetch_latest_github_release_version(http_clients).await?
-        }
-    };
-
-    crate::updates_cache::cache_release(
-        version_file,
-        latest_version,
-        requires_npm_readiness(action),
-    )
-    .await
-}
-
-async fn fetch_latest_github_release_version(
-    http_clients: &RouteAwareClientPool,
-) -> anyhow::Result<String> {
-    fetch_github_release_version(http_clients, LATEST_RELEASE_URL).await
+    let latest_version = fetch_github_release_version(http_clients, LATEST_RELEASE_API_URL).await?;
+    crate::updates_cache::cache_release(version_file, latest_version).await
 }
 
 async fn fetch_github_release_version(
@@ -154,7 +102,6 @@ mod tests {
             latest_version: "9999.0.0".into(),
             last_checked_at: Utc::now(),
             dismissed_version: Some("9999.0.0".into()),
-            npm_ready: None,
         };
         assert_eq!(super::get_upgrade_version_for_popup(Some(&info)), None);
         info.dismissed_version = Some("9998.0.0".into());
@@ -166,13 +113,13 @@ mod tests {
     }
 
     async fn get_upgrade_version(config: &Config) -> Option<String> {
-        startup_version_info(config, None)
+        startup_version_info(config)
             .await
             .map(|info| info.latest_version)
     }
 
     async fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
-        let info = startup_version_info(config, None).await;
+        let info = startup_version_info(config).await;
         super::get_upgrade_version_for_popup(info.as_ref()).map(str::to_owned)
     }
 

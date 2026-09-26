@@ -1043,6 +1043,12 @@ impl AgentControl {
         {
             Ok(reloaded_thread) => {
                 residency_slot.commit(reloaded_thread.thread_id);
+                self.watch_loaded_typed_actor(
+                    self.state
+                        .agent_metadata_for_thread(thread_id)
+                        .and_then(|metadata| metadata.agent_path),
+                    &reloaded_thread,
+                );
                 state
                     .notify_thread_created(reloaded_thread.thread_id, &reloaded_thread.thread)
                     .await;
@@ -1294,7 +1300,11 @@ impl AgentControl {
         if options.typed_task_binding.is_some()
             && let Some(agent_path) = agent_metadata.agent_path.clone()
         {
-            self.start_typed_actor_heartbeat_watcher(agent_path, new_thread.thread_id);
+            self.start_typed_actor_heartbeat_watcher(
+                agent_path,
+                new_thread.thread_id,
+                &new_thread.thread,
+            );
         }
 
         if let Some(binding) = options.agent_job_binding.as_ref() {
@@ -1997,14 +2007,7 @@ impl AgentControl {
             residency_slot.commit(resumed_thread.thread_id);
         }
         pending_cleanup.disarm();
-        if let Some(agent_path) = agent_metadata.agent_path.clone()
-            && self
-                .task_coordinator()
-                .binding_for_agent_path(&agent_path)
-                .is_some()
-        {
-            self.start_typed_actor_heartbeat_watcher(agent_path, resumed_thread.thread_id);
-        }
+        self.watch_loaded_typed_actor(agent_metadata.agent_path.clone(), &resumed_thread);
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
         state

@@ -148,7 +148,8 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
     submit_text_turn(&test, "second").await?;
 
     let permissions = permissions_texts(&req2.single_request());
-    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions.len(), 2);
+    assert!(permissions[0].contains("model A approvals"));
     assert!(
         permissions
             .last()
@@ -254,8 +255,10 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     let permissions_2 = permissions_texts(&req2.single_request());
 
     assert_eq!(permissions_1.len(), 1);
-    assert_eq!(permissions_2.len(), 1);
-    assert_ne!(permissions_1, permissions_2);
+    assert_eq!(permissions_2.len(), 2);
+    assert_eq!(permissions_2[0], permissions_1[0]);
+    assert_ne!(permissions_2[1], permissions_1[0]);
+    assert!(permissions_2[1].contains("never"));
 
     Ok(())
 }
@@ -478,9 +481,10 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions = permissions_texts(&req3.single_request());
-    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions.len(), 2);
+    assert!(permissions[1].contains("never"));
     let unique = permissions.into_iter().collect::<HashSet<String>>();
-    assert_eq!(unique.len(), 1);
+    assert_eq!(unique.len(), 2);
 
     Ok(())
 }
@@ -562,7 +566,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions_base = permissions_texts(&req2.single_request());
-    assert_eq!(permissions_base.len(), 1);
+    assert_eq!(permissions_base.len(), 2);
 
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -587,7 +591,8 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions_resume = permissions_texts(&req3.single_request());
-    assert_eq!(permissions_resume.len(), 1);
+    assert_eq!(permissions_resume.len(), 3);
+    assert_eq!(&permissions_resume[..2], permissions_base.as_slice());
     assert_ne!(permissions_resume, permissions_base);
 
     let mut fork_config = initial.config.clone();
@@ -621,7 +626,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions_fork = permissions_texts(&req4.single_request());
-    assert_eq!(permissions_fork.len(), 1);
+    assert_eq!(permissions_fork.len(), 3);
     assert_eq!(permissions_fork, permissions_resume);
     assert_ne!(permissions_fork, permissions_base);
 

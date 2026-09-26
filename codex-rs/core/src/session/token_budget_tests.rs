@@ -67,10 +67,11 @@ async fn reminders_are_opt_in_and_once_per_window() {
             .count(),
         1
     );
-    let mut state = session.state.lock().await;
-    let (number, ids) = state.next_auto_compact_window();
-    state.restore_auto_compact_window(number, ids);
-    drop(state);
+    {
+        let mut state = session.state.lock().await;
+        let (number, ids) = state.next_auto_compact_window();
+        state.restore_auto_compact_window(number, ids);
+    }
     maybe_record(&session, &turn, Some(5), true).await.unwrap();
     assert!(history_text(session.clone_history().await.raw_items()).contains("remaining 5"));
 }

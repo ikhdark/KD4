@@ -2306,7 +2306,7 @@ fn successful_byte_selector_result(
 /// Largest prefix of `range` whose own response fits, measured on the bytes
 /// that would actually be returned.
 ///
-/// Sizing against a synthetic buffer cannot work: NUL renders as ` `, so a
+/// Sizing against a synthetic buffer cannot work: NUL renders as `\u0000`, so a
 /// zero-filled probe overstates the cost about sixfold and advertises chunks a
 /// fraction of the size that fits, while representative letters would
 /// understate escape-heavy content and advertise chunks that do not. Only the
@@ -6112,6 +6112,162 @@ async fn enforce_retention_after_upsert(
         reject_stale_delta(&failure_token);
         tracing::warn!(%error, "artifact retention worker failed");
     }
+}
+
+/// A thread directory stays addressable only while its thread can be resumed:
+/// `read_tool_output` resolves the caller's own directory, and only a rollout
+/// can bring that caller back. Without one, the directory's protection markers
+/// pin it forever and grow the shared root past its index capacity, so every
+/// later artifact write pays a full-root scan. The grace period keeps live
+/// threads whose rollout is not materialized, in any process, out of reach.
+const UNRESUMABLE_THREAD_ARTIFACT_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+const UNRESUMABLE_THREAD_ARTIFACT_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Starts a background reclaim at most once per sweep interval per home.
+pub(crate) fn spawn_unresumable_thread_artifact_reclaim(
+    codex_home: PathBuf,
+    active_thread_id: String,
+) {
+    static LAST_SWEEPS: StdMutex<BTreeMap<PathBuf, std::time::Instant>> =
+        StdMutex::new(BTreeMap::new());
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    {
+        let mut last_sweeps = LAST_SWEEPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_sweeps
+            .get(&codex_home)
+            .is_some_and(|started| started.elapsed() < UNRESUMABLE_THREAD_ARTIFACT_SWEEP_INTERVAL)
+        {
+            return;
+        }
+        last_sweeps.insert(codex_home.clone(), std::time::Instant::now());
+    }
+    runtime.spawn(async move {
+        let lookup_home = codex_home.clone();
+        let reclaimed = reclaim_unresumable_thread_artifacts(
+            &codex_home,
+            &active_thread_id,
+            SystemTime::now(),
+            |thread_id| {
+                let codex_home = lookup_home.clone();
+                async move { thread_rollout_exists(&codex_home, &thread_id).await }
+            },
+        )
+        .await;
+        match reclaimed {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "reclaimed artifacts of unresumable threads"),
+            Err(error) => tracing::warn!(%error, "unresumable thread artifact reclaim failed"),
+        }
+    });
+}
+
+/// Rollout files are authoritative here. A stale state-db row would only add an
+/// error log per thread before the same filesystem lookup.
+async fn thread_rollout_exists(codex_home: &Path, thread_id: &str) -> std::io::Result<bool> {
+    Ok(
+        crate::find_thread_path_by_id_str(codex_home, thread_id, /*state_db_ctx*/ None)
+            .await?
+            .is_some()
+            || crate::find_archived_thread_path_by_id_str(
+                codex_home, thread_id, /*state_db_ctx*/ None,
+            )
+            .await?
+            .is_some(),
+    )
+}
+
+async fn reclaim_unresumable_thread_artifacts<F, Fut>(
+    codex_home: &Path,
+    active_thread_id: &str,
+    now: SystemTime,
+    thread_is_resumable: F,
+) -> std::io::Result<usize>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<bool>>,
+{
+    let root = codex_home.join("tool-output");
+    let scan_root = root.clone();
+    let active_thread_id = active_thread_id.to_string();
+    let idle = run_blocking_artifact_io(move || {
+        idle_thread_artifact_directories(&scan_root, &active_thread_id, now)
+    })
+    .await?;
+    let mut unresumable = Vec::new();
+    for thread_id in idle {
+        // Only a proven absence releases a directory; a failed lookup keeps it.
+        if matches!(thread_is_resumable(thread_id.clone()).await, Ok(false)) {
+            unresumable.push(thread_id);
+        }
+    }
+    if unresumable.is_empty() {
+        return Ok(0);
+    }
+    let Some(permit) = retention_sweep_permit(&root).await else {
+        return Ok(0);
+    };
+    run_blocking_artifact_io(move || {
+        let _permit = permit;
+        let mut removed = 0;
+        for thread_id in unresumable {
+            match std::fs::remove_dir_all(root.join(&thread_id)) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    thread_id = %thread_id,
+                    "failed to reclaim artifacts of an unresumable thread"
+                ),
+            }
+        }
+        // The in-memory index still counts the removed records.
+        let mut registry = lock_retention_registry();
+        transition_current_root_to_dirty(&mut registry, &normalized_tool_output_root(&root));
+        Ok(removed)
+    })
+    .await
+}
+
+fn idle_thread_artifact_directories(
+    root: &Path,
+    active_thread_id: &str,
+    now: SystemTime,
+) -> std::io::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut idle = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Ok(thread_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        // Shared stores under the root, such as known-delta blobs, are not thread-owned.
+        if thread_id == active_thread_id
+            || codex_protocol::ThreadId::from_string(&thread_id).is_err()
+        {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_dir() || metadata_is_reparse_point(&metadata) {
+            continue;
+        }
+        if now
+            .duration_since(metadata.modified()?)
+            .is_ok_and(|idle_for| idle_for >= UNRESUMABLE_THREAD_ARTIFACT_GRACE)
+        {
+            idle.push(thread_id);
+        }
+    }
+    Ok(idle)
 }
 
 fn publish_observed_path_blocking(token: &RetentionIndexToken, path: &Path) {

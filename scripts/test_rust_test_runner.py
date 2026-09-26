@@ -452,6 +452,62 @@ class WallClockRunnerTest(RunnerTestCase):
             executor.commands(["cargo", "nextest", "run"])[0][-2:], filters
         )
 
+    def test_exact_selection_narrows_helpers_without_discovery(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
+        manifest = Manifest.from_data(data)
+        for filters, built in (
+            (["-E", "test(=mod::tests::alpha)"], []),
+            (
+                ["-E", "test(=mod::tests::alpha) | test(=other::beta)"],
+                ["codex", "codex-command-runner"],
+            ),
+            (
+                [
+                    "-E",
+                    "test(=mod::tests::alpha)",
+                    "--filterset=test(=mod::tests::gamma)",
+                    "--run-ignored",
+                    "all",
+                ],
+                [],
+            ),
+        ):
+            with self.subTest(filters=filters):
+                runner, executor = self.runner(
+                    manifest=manifest,
+                    executor=FakeExecutor(
+                        artifacts={
+                            name: self.helper_executable(name)
+                            for name in ("codex", "codex-command-runner")
+                        }
+                    ),
+                )
+                runner.run_target("core_lib", filters)
+                self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+                self.assertEqual(
+                    [
+                        command[index + 1]
+                        for command in executor.commands(["cargo", "build"])
+                        for index, arg in enumerate(command)
+                        if arg == "--bin"
+                    ],
+                    built,
+                )
+                (run,) = executor.commands(["cargo", "nextest", "run"])
+                self.assertEqual(run[-len(filters) :], filters)
+        # Name filters, other expressions, and libtest arguments still need
+        # nextest to resolve the selection.
+        for filters in (
+            ["alpha"],
+            ["-E", "test(=mod::tests::alpha) & test(alpha)"],
+            ["-E", "test(=mod::tests::alpha)", "--", "--exact"],
+        ):
+            with self.subTest(filters=filters):
+                runner, executor = self.runner(manifest=manifest)
+                runner.run_target("core_lib", filters)
+                self.assertEqual(len(executor.commands(["cargo", "nextest", "list"])), 1)
+
     def test_mixed_unknown_selection_keeps_fallback_helpers(self):
         data = copy.deepcopy(MANIFEST_DATA)
         data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
@@ -1382,7 +1438,12 @@ class RunTargetTest(RunnerTestCase):
                 for i, arg in enumerate(build["args"])
                 if arg == "-p"
             ],
-            ["codex-cli", "codex-code-mode-host", "codex-rmcp-client"],
+            [
+                "codex-cli",
+                "codex-code-mode-host",
+                "codex-rmcp-client",
+                "codex-windows-sandbox",
+            ],
         )
         self.assertEqual(run["args"][run["args"].index("-E") + 1], expression)
         self.assertEqual(run["args"][run["args"].index("--test") + 1], "all")
@@ -1433,7 +1494,7 @@ class RunTargetTest(RunnerTestCase):
         builds = executor.commands(["cargo", "build"])
         self.assertEqual(len(builds), 1)
         self.assertEqual(plan["builds"], builds)
-        self.assertEqual(builds[0][builds[0].index("-p") + 1], "codex-rmcp-client")
+        self.assertIn("codex-rmcp-client", builds[0])
         self.assertEqual(
             {
                 builds[0][index + 1]
@@ -1448,6 +1509,39 @@ class RunTargetTest(RunnerTestCase):
                 executor.last_env()[f"CARGO_BIN_EXE_{name}"],
                 str(executor.artifacts[name].resolve()),
             )
+
+    def test_helper_feature_scope_is_independent_of_the_selection(self) -> None:
+        # Cargo unifies features across every `-p` package, so a scope that
+        # followed the selection would compile one variant per helper set.
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["helpers"]["retired"] = {"package": "codex-retired", "bin": "retired"}
+        manifest = Manifest.from_data(data)
+
+        def build_scope(platform: str, target: str) -> tuple[list[str], list[str]]:
+            runner, executor = self.runner(
+                executor=self.build_executor(), platform=platform, manifest=manifest
+            )
+            runner.run_target(target, [])
+            (build,) = executor.commands(["cargo", "build"])
+            return (
+                [build[i + 1] for i, arg in enumerate(build) if arg == "-p"],
+                [build[i + 1] for i, arg in enumerate(build) if arg == "--bin"],
+            )
+
+        # A helper package absent from the workspace or off this platform
+        # cannot join the scope; the selected binaries stay exact.
+        scope = [
+            "codex-cli",
+            "codex-code-mode-host",
+            "codex-rmcp-client",
+            "codex-windows-sandbox",
+        ]
+        self.assertEqual(build_scope("windows", "core_shard"), (scope, ["codex"]))
+        self.assertEqual(
+            build_scope("windows", "core_all"),
+            (scope, ["codex", "codex-code-mode-host", "test_stdio_server"]),
+        )
+        self.assertEqual(build_scope("linux", "core_shard"), (scope[:-1], ["codex"]))
 
     def test_grouped_helper_build_rejects_a_missing_second_artifact(self) -> None:
         data = copy.deepcopy(MANIFEST_DATA)
@@ -1699,6 +1793,28 @@ class RunGateTest(RunnerTestCase):
                 self.assertEqual(raised.exception.outcome, outcome)
                 self.assertEqual(len(commands), 1)
                 self.assertIn("--lib", commands[0])
+
+    def test_stop_after_a_failed_group_still_reports_that_failure(self) -> None:
+        # Gate runs capture their output, so a stop must not discard the
+        # failure an earlier group already recorded.
+        for outcome in ("cancelled", "timed_out", "cleanup_failed"):
+            with self.subTest(outcome=outcome):
+                executor = self.gate_executor(self.matching_listings())
+                executor.failing_runs = {"--lib"}
+                runner, _ = self.runner(executor=executor)
+                original = runner._checked
+
+                def stop_second_run(args, **kwargs):
+                    if args[:3] == ["cargo", "nextest", "run"] and "all" in args:
+                        raise RunnerError("requested stop", outcome=outcome)
+                    return original(args, **kwargs)
+
+                with mock.patch.object(runner, "_checked", side_effect=stop_second_run):
+                    with self.assertRaises(RunnerError) as raised:
+                        runner.run_gates(["demo-gate"], quiet=True)
+                self.assertEqual(raised.exception.outcome, outcome)
+                self.assertIn("requested stop", str(raised.exception))
+                self.assertIn("failed --lib", str(raised.exception))
 
     def test_repository_core_gates_build_only_their_required_helpers(self) -> None:
         manifest = Manifest.load(
@@ -2096,6 +2212,92 @@ class RunGateTest(RunnerTestCase):
             )
         self.assertFalse(Path(envs["all"]["CARGO_BIN_EXE_codex-command-runner"]).exists())
 
+    def test_compatible_steps_of_one_package_share_an_invocation(self) -> None:
+        # Integration steps of one package with one helper set need only one
+        # nextest invocation; a library step or another helper set stays apart.
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "shards": {
+                "steps": [
+                    {"target": "core_shard", "tests": ["suite::a::one"]},
+                    {
+                        "target": "core_lib",
+                        "tests": ["mod::tests::alpha"],
+                        "helpers": ["codex"],
+                    },
+                    {
+                        "target": "core_shard_two",
+                        "tests": ["suite::b::two", "suite::b::three"],
+                    },
+                    {"target": "core_all", "tests": ["suite::c::four"]},
+                ]
+            }
+        }
+        results = {
+            "codex-core::core_shard": ["suite::a::one"],
+            "codex-core::core_shard_two": ["suite::b::two", "suite::b::three"],
+            "codex-core": ["mod::tests::alpha"],
+            "codex-core::all": ["suite::c::four"],
+        }
+        executor = self.gate_executor({})
+        original = executor._stdout
+
+        def stdout(args: list[str]) -> str:
+            if args[:3] != ["cargo", "nextest", "run"]:
+                return original(args)
+            binaries = ["codex-core" for arg in args if arg == "--lib"] + [
+                f"codex-core::{args[index + 1]}"
+                for index, arg in enumerate(args)
+                if arg == "--test"
+            ]
+            return "\n".join(
+                f"PASS [ 0.001s] {binary} {test}"
+                for binary in binaries
+                for test in results[binary]
+            )
+
+        executor._stdout = stdout
+        runner, _ = self.runner(manifest=Manifest.from_data(data), executor=executor)
+        self.assertEqual(
+            runner.run_gates(["shards"], quiet=True),
+            {"shards": sorted(test for tests in results.values() for test in tests)},
+        )
+        runs = executor.commands(["cargo", "nextest", "run"])
+        self.assertEqual(len(runs), 3)
+        # A failure in one binary must not cancel another step's tests.
+        self.assertEqual([run.count("--no-fail-fast") for run in runs], [1, 1, 1])
+        shards = runs[0]
+        self.assertEqual(shards.count("-p"), 1)
+        self.assertEqual(
+            [shards[index + 1] for index, arg in enumerate(shards) if arg == "--test"],
+            ["core_shard", "core_shard_two"],
+        )
+        self.assertNotIn("--lib", shards)
+        self.assertEqual(
+            shards[shards.index("-E") + 1],
+            "(binary_id(=codex-core::core_shard) & (test(=suite::a::one))) | "
+            "(binary_id(=codex-core::core_shard_two) & "
+            "(test(=suite::b::two) | test(=suite::b::three)))",
+        )
+        self.assertIn("--lib", runs[1])
+        self.assertEqual(runs[1][runs[1].index("-E") + 1], "test(=mod::tests::alpha)")
+        self.assertEqual(runs[2][runs[2].index("--test") + 1], "all")
+        self.assertEqual(
+            [step["run"] for step in runner.plan("shards")["steps"]],
+            [shards, shards, runs[1], runs[2]],
+        )
+        # The batch still proves each ID in the binary of the step declaring it.
+        results["codex-core::core_shard"].append("suite::b::two")
+        results["codex-core::core_shard_two"].remove("suite::b::two")
+        executor.calls.clear()
+        runner.no_fail_fast = True
+        with self.assertRaisesRegex(RunnerError, "passed exactly once") as raised:
+            runner.run_gates(["shards"], quiet=True)
+        self.assertEqual(raised.exception.outcome, "not_executed")
+        self.assertIn("unexpected=True", str(raised.exception))
+        runs = executor.commands(["cargo", "nextest", "run"])
+        self.assertEqual([run.count("--no-fail-fast") for run in runs], [1, 1, 1])
+
     def test_pure_gate_needs_no_helper_artifacts(self) -> None:
         data = copy.deepcopy(MANIFEST_DATA)
         data["gates"] = {
@@ -2113,6 +2315,37 @@ class RunGateTest(RunnerTestCase):
             runner.run_gates(["pure"], quiet=True), {"pure": ["tests::alpha"]}
         )
         self.assertEqual(executor.commands(["cargo", "build"]), [])
+
+    def test_leaked_pass_counts_but_leak_failure_does_not(self) -> None:
+        # Nextest reports a test that passed but leaked handles as LEAK instead
+        # of PASS; LEAK-FAIL is a failure and must not satisfy the gate.
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "pure": {
+                "steps": [
+                    {"target": "core_lib", "tests": ["tests::alpha"], "helpers": []}
+                ]
+            }
+        }
+        for status, passes in (("LEAK", True), ("LEAK-FAIL", False)):
+            with self.subTest(status=status):
+                executor = FakeExecutor(default_listing={"tests::alpha": False})
+                render = executor._stdout
+                executor._stdout = lambda args, render=render, status=status: render(
+                    args
+                ).replace("PASS", status)
+                runner, _ = self.runner(
+                    manifest=Manifest.from_data(data), executor=executor
+                )
+                if passes:
+                    self.assertEqual(
+                        runner.run_gates(["pure"], quiet=True),
+                        {"pure": ["tests::alpha"]},
+                    )
+                    continue
+                with self.assertRaises(RunnerError) as raised:
+                    runner.run_gates(["pure"], quiet=True)
+                self.assertEqual(raised.exception.outcome, "not_executed")
 
     def test_schema_gate_runs_declared_tests_without_building_helpers(self) -> None:
         manifest = Manifest.load(
@@ -2255,179 +2488,25 @@ class RunGateTest(RunnerTestCase):
         self.assertEqual(executor.commands(["cargo", "build"]), [])
 
 
-class ParityTest(RunnerTestCase):
-    def parity_executor(
-        self,
-        listings: dict[str, dict[str, bool]],
-        *,
-        failing_runs: set[str] | None = None,
-    ) -> FakeExecutor:
-        artifacts = {
-            name: self.helper_executable(name)
-            for name in ("codex", "codex-code-mode-host", "test_stdio_server")
-        }
-        return FakeExecutor(
-            artifacts=artifacts,
-            listings=listings,
-            failing_runs=failing_runs,
-        )
-
-    def test_identical_inventories_pass_and_run_both_sides(self) -> None:
-        listings = {
-            "all": {"suite::a::one": False, "suite::b::two": True},
-            "core_shard": {"suite::a::one": False, "suite::b::two": True},
-        }
-        executor = self.parity_executor(listings)
-        runner, _ = self.runner(executor=executor)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codex_rs_root = Path(temp_dir) / "codex-rs"
-            snapshots = codex_rs_root / "core" / "tests" / "suite" / "snapshots"
-            snapshots.mkdir(parents=True)
-            approved = {
-                snapshots
-                / "all__suite__a__one.snap": "---\nsource: old.rs\nexpression: report\n---\nTOTAL: 5\n",
-                snapshots
-                / "core_shard__suite__a__one.snap": "---\nsource: new.rs\nexpression: report\n---\nTOTAL: 5\n",
-            }
-            for path, content in approved.items():
-                path.write_text(content, encoding="utf-8")
-            with mock.patch.object(rust_test_runner, "CODEX_RS_ROOT", codex_rs_root):
-                runner.parity("core_all", ["core_shard"])
-            for path, content in approved.items():
-                self.assertEqual(path.read_text(encoding="utf-8"), content)
-        list_commands = executor.commands(["cargo", "nextest", "list"])
-        self.assertEqual(len(list_commands), 2)
-        for command in list_commands:
-            self.assertIn("--ignore-default-filter", command)
-            self.assertEqual(command[command.index("--run-ignored") + 1], "all")
-
-        run_commands = executor.commands(["cargo", "nextest", "run"])
-        self.assertEqual(len(run_commands), 2)
-        for command in run_commands:
-            self.assertIn("--no-fail-fast", command)
-            self.assertEqual(command[command.index("--retries") + 1], "0")
-            self.assertEqual(command[command.index("--run-ignored") + 1], "default")
-        run_calls = [
-            call
-            for call in executor.calls
-            if call["args"][:3] == ["cargo", "nextest", "run"]
-        ]
-        self.assertEqual(run_calls[0]["env"]["INSTA_UPDATE"], "no")
-        self.assertEqual(run_calls[1]["env"]["INSTA_UPDATE"], "no")
-
-    def test_snapshot_content_change_fails_after_behavior_runs(self) -> None:
-        listings = {
-            "all": {"suite::a::one": False},
-            "core_shard": {"suite::a::one": False},
-        }
-        executor = self.parity_executor(listings)
-        runner, _ = self.runner(executor=executor)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codex_rs_root = Path(temp_dir) / "codex-rs"
-            snapshots = codex_rs_root / "core" / "tests" / "suite" / "snapshots"
-            snapshots.mkdir(parents=True)
-            (snapshots / "all__suite__a__one.snap").write_text("legacy")
-            (snapshots / "core_shard__suite__a__one.snap").write_text("replacement")
-            with (
-                mock.patch.object(rust_test_runner, "CODEX_RS_ROOT", codex_rs_root),
-                self.assertRaisesRegex(RunnerError, "content_changes"),
-            ):
-                runner.parity("core_all", ["core_shard"])
-        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
-
-    def test_behavior_failures_are_reported_after_every_target_runs(self) -> None:
-        listings = {
-            "all": {"suite::a::one": False, "suite::b::two": False},
-            "core_shard": {"suite::a::one": False},
-            "core_shard_two": {"suite::b::two": False},
-        }
-        executor = self.parity_executor(
-            listings,
-            failing_runs={"all", "core_shard_two"},
-        )
-        runner, _ = self.runner(executor=executor)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codex_rs_root = Path(temp_dir) / "codex-rs"
-            with (
-                mock.patch.object(rust_test_runner, "CODEX_RS_ROOT", codex_rs_root),
-                self.assertRaisesRegex(
-                    RunnerError, "(?s)every target.*core_all:.*core_shard_two:"
-                ),
-            ):
-                runner.parity(
-                    "core_all",
-                    ["core_shard", "core_shard_two"],
-                )
-        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 3)
-
-    def test_missing_or_duplicate_snapshot_counterpart_fails(self) -> None:
-        listings = {
-            "all": {"suite::a::one": False, "suite::b::two": False},
-            "core_shard": {"suite::a::one": False},
-            "core_shard_two": {"suite::b::two": False},
-        }
-        runner, _ = self.runner(executor=self.parity_executor(listings))
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codex_rs_root = Path(temp_dir) / "codex-rs"
-            snapshots = codex_rs_root / "core" / "tests" / "suite" / "snapshots"
-            snapshots.mkdir(parents=True)
-            (snapshots / "all__suite__a__one.snap").write_text("same")
-            (snapshots / "all__suite__b__two.snap").write_text("same")
-            (snapshots / "core_shard__suite__a__one.snap").write_text("same")
-            (snapshots / "core_shard_two__suite__a__one.snap").write_text("same")
-            with (
-                mock.patch.object(rust_test_runner, "CODEX_RS_ROOT", codex_rs_root),
-                self.assertRaisesRegex(
-                    RunnerError,
-                    "missing=\\['suite__b__two\\.snap'\\].*duplicates=\\['suite__a__one\\.snap'\\]",
-                ),
-            ):
-                runner.parity("core_all", ["core_shard", "core_shard_two"])
-
-    def test_missing_test_fails_parity(self) -> None:
-        listings = {
-            "all": {"suite::a::one": False, "suite::b::two": False},
-            "core_shard": {"suite::a::one": False},
-        }
-        runner, executor = self.runner(executor=self.parity_executor(listings))
-        with self.assertRaisesRegex(RunnerError, r"missing=\['suite::b::two'\]"):
-            runner.parity("core_all", ["core_shard"])
-        self.assertEqual(executor.commands(["cargo", "nextest", "run"]), [])
-
-    def test_ignored_state_change_fails_parity(self) -> None:
-        listings = {
-            "all": {"suite::a::one": True},
-            "core_shard": {"suite::a::one": False},
-        }
-        runner, _ = self.runner(executor=self.parity_executor(listings))
-        with self.assertRaisesRegex(RunnerError, "ignored_state_changes"):
-            runner.parity("core_all", ["core_shard"])
-
-    def test_legacy_target_cannot_also_be_a_replacement(self) -> None:
-        runner, _ = self.runner(executor=self.parity_executor({}))
-        with self.assertRaisesRegex(RunnerError, "cannot also be a replacement"):
-            runner.parity("core_all", ["core_all"])
-
-    def test_unconfirmed_cleanup_is_a_classified_failure_outside_checked_runs(
+class CleanupClassificationTest(RunnerTestCase):
+    def test_unconfirmed_cleanup_is_classified_and_quarantines_the_lane(
         self,
     ) -> None:
-        # Parity behavior runs and metadata discovery call the executor
-        # directly; an unconfirmed process tree must still be reported as
-        # cleanup_failed (and quarantine the lane) rather than escape.
-        listings = {"all": {"suite::a::one": False}, "core_shard": {"suite::a::one": False}}
-        executor = self.parity_executor(listings)
-
-        def execute(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            if args[:3] == ["cargo", "nextest", "run"]:
-                raise rust_test_runner.CleanupFailed("owned job still active")
-            return executor(args, **kwargs)
-
-        runner, _ = self.runner(executor=executor)
-        runner.executor = execute
+        # An unconfirmed process tree must be reported as cleanup_failed (and
+        # quarantine the lane) rather than escape, including from metadata
+        # discovery, which calls the executor directly.
+        runner, _ = self.runner()
+        runner.executor = mock.Mock(
+            side_effect=rust_test_runner.CleanupFailed("owned job still active")
+        )
         with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(RunnerError) as parity_failure:
-                runner.parity("core_all", ["core_shard"])
-        self.assertEqual(parity_failure.exception.outcome, "cleanup_failed")
+            with self.assertRaises(RunnerError) as run_failure:
+                runner._checked(
+                    ["cargo", "nextest", "run"],
+                    env={},
+                    capture=rust_test_runner.CAPTURE_NONE,
+                )
+        self.assertEqual(run_failure.exception.outcome, "cleanup_failed")
         self.assertTrue((self.target_dir / ".lane-cleanup-unconfirmed").is_file())
 
         with self.assertRaises(RunnerError) as metadata_failure:
@@ -2472,20 +2551,20 @@ class RepositoryManifestTest(unittest.TestCase):
                 "core_transport_telemetry",
                 "core_agents_review",
                 "core_model_prompt_runtime",
-                "core_windows",
             }.issubset(self.manifest.targets)
         )
 
-    def test_every_declared_test_target_has_a_source_file(self) -> None:
+    def test_core_integration_binaries_are_exactly_the_declared_targets(self) -> None:
+        # Every top-level `core/tests/*.rs` file is its own Cargo test binary.
+        # A declared target without a source fails selection; an undeclared
+        # source links a binary that no named target or gate can run.
         tests_dir = REPO_ROOT / "codex-rs" / "core" / "tests"
-        for target in self.manifest.targets.values():
-            if target.package != "codex-core" or target.selector_kind != "test":
-                continue
-            with self.subTest(target=target.name):
-                self.assertTrue(
-                    (tests_dir / f"{target.selector_value}.rs").is_file(),
-                    f"{target.selector_value}.rs is declared but missing",
-                )
+        declared = {
+            target.selector_value
+            for target in self.manifest.targets.values()
+            if target.package == "codex-core" and target.selector_kind == "test"
+        }
+        self.assertEqual({path.stem for path in tests_dir.glob("*.rs")}, declared)
 
     def test_every_gate_step_names_a_declared_target(self) -> None:
         for gate in self.manifest.gates.values():
@@ -2517,6 +2596,7 @@ class RepositoryManifestTest(unittest.TestCase):
                 "approvals",
                 "exec_policy",
                 "extension_sandbox",
+                "hooks_windows",
                 "permissions_messages",
                 "request_permissions",
                 "safety_check_downgrade",
@@ -2524,6 +2604,7 @@ class RepositoryManifestTest(unittest.TestCase):
                 "shell_snapshot",
                 "unified_exec",
                 "unified_exec_process_events",
+                "windows_sandbox",
             ],
             "core_thread_state": [
                 "compact",
@@ -2546,6 +2627,7 @@ class RepositoryManifestTest(unittest.TestCase):
                 "external_auth",
                 "otel",
                 "responses_api_proxy_headers",
+                "responses_headers",
                 "responses_lite",
                 "websocket_fallback",
             ],
@@ -2575,23 +2657,22 @@ class RepositoryManifestTest(unittest.TestCase):
                 "prompt_caching",
                 "prompt_debug_tests",
                 "quota_exceeded",
+                "round_trip_batching",
                 "safety_buffering",
                 "web_search",
             ],
-            "core_windows": ["hooks_windows", "windows_sandbox"],
         }
+        # `test_codex()` sessions resolve codex-code-mode-host; only modules
+        # that launch the CLI need the full `codex` build.
         expected_helpers = {
-            target: ["codex", "codex-code-mode-host"] for target in expected_modules
+            target: ["codex-code-mode-host"] for target in expected_modules
         }
+        expected_helpers["core_cli_workspace"].insert(0, "codex")
         expected_helpers["core_code_mode_mcp"] += [
             "test_stdio_server",
             "test_streamable_http_server",
         ]
         expected_helpers["core_exec_permissions"] += [
-            "codex-windows-sandbox-setup",
-            "codex-command-runner",
-        ]
-        expected_helpers["core_windows"] += [
             "codex-windows-sandbox-setup",
             "codex-command-runner",
         ]
@@ -2611,6 +2692,28 @@ class RepositoryManifestTest(unittest.TestCase):
                     list(self.manifest.targets[target_name].helpers),
                     expected_helpers[target_name],
                 )
+                target = self.manifest.targets[target_name]
+                launches_cli = {
+                    module: 'cargo_bin("codex")'
+                    in (tests_dir / "suite" / f"{module}.rs").read_text(
+                        encoding="utf-8"
+                    )
+                    for module in modules
+                }
+                self.assertEqual("codex" in target.helpers, any(launches_cli.values()))
+                # A filtered run narrows helpers by test prefix, so only the
+                # modules that launch the CLI may still build it.
+                for module, launches in launches_cli.items():
+                    test_id = f"suite::{module}::test"
+                    helpers = next(
+                        (
+                            names
+                            for prefix, names in target.helpers_by_test_prefix.items()
+                            if test_id.startswith(prefix)
+                        ),
+                        target.helpers,
+                    )
+                    self.assertEqual("codex" in helpers, launches, module)
 
 
 class RunEnvironmentTest(RunnerTestCase):
@@ -2768,6 +2871,46 @@ class RunEnvironmentTest(RunnerTestCase):
             Path(executor.last_env()["CARGO_BIN_EXE_codex-code-mode-host"]).exists()
         )
 
+    def test_windows_resources_mirror_only_the_declared_helpers(self) -> None:
+        # Sandbox code finds these helpers in `codex-resources` beside the test
+        # binary before PATH. A copy staged by an earlier run must neither
+        # satisfy an undeclared helper nor outlive a rebuild, and PATH must not
+        # expose the other binaries left in the lane.
+        fresh = self.helper_executable("codex-command-runner")
+        fresh.write_bytes(b"fresh")
+        stale_sibling = str(fresh.resolve().parent)
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            name: {
+                "steps": [
+                    {"target": "core_lib", "tests": ["tests::alpha"], "helpers": helpers}
+                ]
+            }
+            for name, helpers in (
+                ("sandbox", ["codex-command-runner"]),
+                ("pure", []),
+            )
+        }
+        executor = FakeExecutor(
+            artifacts={"codex-command-runner": fresh},
+            default_listing={"tests::alpha": False},
+        )
+        runner, _ = self.runner(manifest=Manifest.from_data(data), executor=executor)
+        resources = runner.target_dir / "debug" / "deps" / "codex-resources"
+        resources.mkdir(parents=True)
+        staged = resources / "codex-command-runner.exe"
+        staged.write_bytes(b"stale copy")
+
+        runner.run_gates(["sandbox"], quiet=True)
+        self.assertEqual(staged.read_bytes(), b"fresh")
+        path = executor.last_env()["PATH"].split(os.pathsep)
+        self.assertEqual(path[0], str(resources))
+        self.assertNotIn(stale_sibling, path)
+
+        runner.run_gates(["pure"], quiet=True)
+        self.assertFalse(staged.exists())
+        self.assertNotIn(str(resources), executor.last_env()["PATH"].split(os.pathsep))
+
 
 class CommandLineTest(unittest.TestCase):
     @staticmethod
@@ -2821,13 +2964,12 @@ class JustfileContractTest(unittest.TestCase):
 
     # Just and PowerShell placeholders standing in for real runtime values.
     PLACEHOLDERS: ClassVar[dict[str, str]] = {
-        "{{ target }}": "core_windows",
+        "{{ target }}": "core_exec_permissions",
         "{{ gate }}": "config-schema-protocol",
-        "{{ name }}": "core_windows",
-        "{{ legacy }}": "core_windows",
+        "{{ name }}": "core_exec_permissions",
         "{{ package }}": "codex-tui",
         "$target_dir": "target",
-        "@forwarded_args": "core_windows",
+        "@forwarded_args": "core_exec_permissions",
     }
 
     @staticmethod
@@ -2905,8 +3047,6 @@ class JustfileContractTest(unittest.TestCase):
                 elif parsed.command == "run-gate":
                     for name in parsed.names:
                         self.assertIn(name, manifest.gates)
-                elif parsed.command == "parity":
-                    self.assertIn(parsed.legacy_target, manifest.targets)
 
 
 if __name__ == "__main__":

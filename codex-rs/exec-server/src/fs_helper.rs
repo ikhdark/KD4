@@ -16,6 +16,7 @@ use crate::protocol::FS_COPY_METHOD;
 use crate::protocol::FS_CREATE_DIRECTORY_METHOD;
 use crate::protocol::FS_GET_METADATA_METHOD;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
+use crate::protocol::FS_READ_FILE_BOUNDED_METHOD;
 use crate::protocol::FS_READ_FILE_METHOD;
 use crate::protocol::FS_REMOVE_METHOD;
 use crate::protocol::FS_WALK_METHOD;
@@ -31,6 +32,8 @@ use crate::protocol::FsGetMetadataResponse;
 use crate::protocol::FsReadDirectoryEntry;
 use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadDirectoryResponse;
+use crate::protocol::FsReadFileBoundedParams;
+use crate::protocol::FsReadFileBoundedResponse;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsReadFileResponse;
 use crate::protocol::FsRemoveParams;
@@ -44,24 +47,8 @@ use crate::rpc::invalid_request;
 use crate::rpc::not_found;
 
 pub const CODEX_FS_HELPER_ARG1: &str = "--codex-run-as-fs-helper";
-const FS_READ_FILE_BOUNDED_OPERATION: &str = "fs/readFileBounded";
 const FS_READ_DIRECTORY_BOUNDED_OPERATION: &str = "fs/readDirectoryBounded";
 pub(crate) const FS_PERMISSION_DENIED_ERROR_CODE: i64 = -32003;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FsHelperReadFileBoundedParams {
-    pub(crate) path: PathUri,
-    pub(crate) max_bytes: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) confined_root: Option<PathUri>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FsHelperReadFileBoundedResponse {
-    pub(crate) data_base64: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,7 +71,7 @@ pub(crate) enum FsHelperRequest {
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileParams),
     #[serde(rename = "fs/readFileBounded")]
-    ReadFileBounded(FsHelperReadFileBoundedParams),
+    ReadFileBounded(FsReadFileBoundedParams),
     #[serde(rename = "fs/writeFile")]
     WriteFile(FsWriteFileParams),
     #[serde(rename = "fs/createDirectory")]
@@ -118,7 +105,7 @@ pub(crate) enum FsHelperPayload {
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileResponse),
     #[serde(rename = "fs/readFileBounded")]
-    ReadFileBounded(FsHelperReadFileBoundedResponse),
+    ReadFileBounded(FsReadFileBoundedResponse),
     #[serde(rename = "fs/writeFile")]
     WriteFile(FsWriteFileResponse),
     #[serde(rename = "fs/createDirectory")]
@@ -143,7 +130,7 @@ impl FsHelperPayload {
     fn operation(&self) -> &'static str {
         match self {
             Self::ReadFile(_) => FS_READ_FILE_METHOD,
-            Self::ReadFileBounded(_) => FS_READ_FILE_BOUNDED_OPERATION,
+            Self::ReadFileBounded(_) => FS_READ_FILE_BOUNDED_METHOD,
             Self::WriteFile(_) => FS_WRITE_FILE_METHOD,
             Self::CreateDirectory(_) => FS_CREATE_DIRECTORY_METHOD,
             Self::GetMetadata(_) => FS_GET_METADATA_METHOD,
@@ -165,11 +152,11 @@ impl FsHelperPayload {
 
     pub(crate) fn expect_read_file_bounded(
         self,
-    ) -> Result<FsHelperReadFileBoundedResponse, JSONRPCErrorError> {
+    ) -> Result<FsReadFileBoundedResponse, JSONRPCErrorError> {
         match self {
             Self::ReadFileBounded(response) => Ok(response),
             other => Err(unexpected_response(
-                FS_READ_FILE_BOUNDED_OPERATION,
+                FS_READ_FILE_BOUNDED_METHOD,
                 other.operation(),
             )),
         }
@@ -297,7 +284,7 @@ pub(crate) async fn run_direct_request(
             }
             .map_err(map_fs_error)?;
             Ok(FsHelperPayload::ReadFileBounded(
-                FsHelperReadFileBoundedResponse {
+                FsReadFileBoundedResponse {
                     data_base64: data.map(|data| STANDARD.encode(data)),
                 },
             ))

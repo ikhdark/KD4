@@ -53,7 +53,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::executor_process_transport::ExecutorProcessTransport;
-use crate::executor_process_transport::MCP_STDIO_MAX_LINE_BYTES;
+use crate::executor_process_transport::MCP_STDERR_MAX_LINE_BYTES;
 use crate::program_resolver;
 use crate::utils::create_env_for_mcp_server;
 use crate::utils::create_env_overlay_for_remote_mcp_server;
@@ -74,11 +74,11 @@ async fn read_stderr_line(
         let newline = memchr::memchr(b'\n', bytes);
         let len = newline.unwrap_or(bytes.len());
         if !oversized {
-            if len > MCP_STDIO_MAX_LINE_BYTES - line.len() {
+            if len > MCP_STDERR_MAX_LINE_BYTES - line.len() {
                 line.clear();
                 oversized = true;
                 warn!(
-                    "MCP server stderr line exceeded the {MCP_STDIO_MAX_LINE_BYTES}-byte limit; discarding diagnostic"
+                    "MCP server stderr line exceeded the {MCP_STDERR_MAX_LINE_BYTES}-byte limit; discarding diagnostic"
                 );
             } else {
                 line.extend_from_slice(&bytes[..len]);
@@ -644,7 +644,7 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(1024);
         let writing = tokio::spawn(async move {
             writer
-                .write_all(&vec![b'x'; MCP_STDIO_MAX_LINE_BYTES + 1])
+                .write_all(&vec![b'x'; MCP_STDERR_MAX_LINE_BYTES + 1])
                 .await
                 .unwrap();
             writer.write_all(b"\ninvalid \xff\nnext\r\n").await.unwrap();

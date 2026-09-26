@@ -1117,6 +1117,7 @@ LIMIT 1
     async fn heartbeat_typed_workspace_actor_impl(
         &self,
         binding: AgentTaskBinding,
+        progress: bool,
     ) -> StoreResult<bool> {
         if binding
             .thread_id
@@ -1125,7 +1126,9 @@ LIMIT 1
         {
             return Ok(false);
         }
-        let mut transaction = self.pool.begin().await?;
+        // Reserve the writer before reading. Upgrading a deferred read snapshot to
+        // renew the lease fails with SQLITE_BUSY at once instead of honoring busy_timeout.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let workspace_id = sqlx::query_scalar::<_, String>(
             "SELECT workspace_id FROM assignment_repositories WHERE assignment_id = ?",
         )
@@ -1136,7 +1139,8 @@ LIMIT 1
             return Ok(false);
         };
         let updated =
-            heartbeat_typed_workspace_actor_tx(&mut transaction, &workspace_id, &binding).await?;
+            heartbeat_typed_workspace_actor_tx(&mut transaction, &workspace_id, &binding, progress)
+                .await?;
         transaction.commit().await?;
         Ok(updated)
     }
@@ -1419,7 +1423,8 @@ LIMIT 1
         call_id: String,
         _lease_expires_at: chrono::DateTime<Utc>,
     ) -> StoreResult<bool> {
-        let mut transaction = self.pool.begin().await?;
+        // Reserve the writer before reading; see heartbeat_typed_workspace_actor_impl.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let body = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM validation_calls
              WHERE call_id = ? AND status = ?",
@@ -1447,8 +1452,13 @@ LIMIT 1
         if let Some(binding) = binding {
             let workspace_id =
                 assignment_workspace_id_tx(&mut transaction, binding.assignment_id).await?;
-            if !heartbeat_typed_workspace_actor_tx(&mut transaction, &workspace_id, &binding)
-                .await?
+            if !heartbeat_typed_workspace_actor_tx(
+                &mut transaction,
+                &workspace_id,
+                &binding,
+                /*progress*/ false,
+            )
+            .await?
             {
                 transaction.commit().await?;
                 return Ok(false);
@@ -3764,11 +3774,17 @@ impl LocalAgentTaskStore {
         })
     }
 
+    /// Renew the bound actor's lease. With `progress`, also record meaningful progress,
+    /// which is what defers nonproductive recovery; a lease alone only proves liveness.
     pub fn heartbeat_typed_workspace_actor(
         &self,
         binding: AgentTaskBinding,
+        progress: bool,
     ) -> TaskStoreFuture<'_, bool> {
-        Box::pin(async move { self.heartbeat_typed_workspace_actor_impl(binding).await })
+        Box::pin(async move {
+            self.heartbeat_typed_workspace_actor_impl(binding, progress)
+                .await
+        })
     }
 
     pub fn append_observation(
@@ -5553,6 +5569,7 @@ pub(crate) async fn heartbeat_typed_workspace_actor_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workspace_id: &str,
     binding: &AgentTaskBinding,
+    progress: bool,
 ) -> StoreResult<bool> {
     let Some(thread_id) = binding
         .thread_id
@@ -5571,9 +5588,14 @@ pub(crate) async fn heartbeat_typed_workspace_actor_tx(
 
     let now = Utc::now();
     let lease_expires_at = now + chrono::Duration::seconds(crate::DEFAULT_WORKSPACE_LEASE_SECONDS);
+    // Liveness alone renews the lease. Progress also restarts the nonproductive-recovery
+    // clock and its one-nudge budget, like a meaningful observation, without a wake event.
+    let progress_at = progress.then(|| encode(&now)).transpose()?;
     let updated = sqlx::query(
         "UPDATE workspace_actors
-         SET state = 'active', lease_expires_at = ?
+         SET state = 'active', lease_expires_at = ?,
+             last_progress_at = COALESCE(?, last_progress_at),
+             nudge_sent_at = CASE WHEN ? IS NULL THEN nudge_sent_at ELSE NULL END
          WHERE workspace_id = ?
            AND actor_id = ?
            AND root_session_id = ?
@@ -5607,6 +5629,8 @@ pub(crate) async fn heartbeat_typed_workspace_actor_tx(
            )",
     )
     .bind(encode(&lease_expires_at)?)
+    .bind(&progress_at)
+    .bind(&progress_at)
     .bind(workspace_id)
     .bind(format!("attempt:{}", binding.attempt_id))
     .bind(&binding.root_session_id)

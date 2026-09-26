@@ -320,9 +320,10 @@ impl AgentTaskCoordinator {
     pub(crate) async fn heartbeat_typed_actor_binding(
         &self,
         binding: &AgentTaskBinding,
+        progress: bool,
     ) -> StoreResult<bool> {
         self.required_store()?
-            .heartbeat_typed_workspace_actor(binding.clone())
+            .heartbeat_typed_workspace_actor(binding.clone(), progress)
             .await
     }
 

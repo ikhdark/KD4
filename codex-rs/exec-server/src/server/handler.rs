@@ -33,6 +33,8 @@ use crate::protocol::FsReadBlockParams;
 use crate::protocol::FsReadBlockResponse;
 use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadDirectoryResponse;
+use crate::protocol::FsReadFileBoundedParams;
+use crate::protocol::FsReadFileBoundedResponse;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsReadFileResponse;
 use crate::protocol::FsRemoveParams;
@@ -269,6 +271,14 @@ impl ExecServerHandler {
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
         self.require_initialized_for("filesystem")?;
         self.file_system.read_file(params).await
+    }
+
+    pub(crate) async fn fs_read_file_bounded(
+        &self,
+        params: FsReadFileBoundedParams,
+    ) -> Result<FsReadFileBoundedResponse, JSONRPCErrorError> {
+        self.require_initialized_for("filesystem")?;
+        self.file_system.read_file_bounded(params).await
     }
 
     pub(crate) async fn fs_open(

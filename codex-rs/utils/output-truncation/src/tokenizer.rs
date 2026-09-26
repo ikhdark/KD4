@@ -6,6 +6,11 @@ pub fn model_token_count(text: &str) -> usize {
 
 /// Keep the head and failure tail, counting the complete rendered packet.
 pub fn truncate_model_text(text: &str, limit: usize) -> String {
+    // Every ordinary token encodes at least one byte, so text this short fits
+    // without encoding it or loading the vocabulary.
+    if text.len() <= limit {
+        return text.to_string();
+    }
     let bpe = tiktoken_rs::o200k_base_singleton();
     let tokens = bpe.encode_ordinary(text);
     if tokens.len() <= limit {

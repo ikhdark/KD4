@@ -2,7 +2,12 @@ AGENTS.md text eol=lf
 # Keep diffs textual against revisions with a literal NUL in a test comment.
 codex-rs/core/src/tools/command_output_artifact_tests.rs diff
 *.sh text eol=lf
+# include_str!, include_dir!, and sqlx::migrate! embed raw file bytes, so prompts, tool
+# grammars, bundled skills, and migration checksums must not depend on checkout settings.
+codex-rs/** text=auto eol=lf
 codex-rs/**/*.sql text eol=lf
+# Persisted agent-task ledgers recorded version 20 from CRLF bytes; keep its checksum reproducible.
+codex-rs/agent-task-store/migrations/0020_automatic_wake_delivery.sql text eol=crlf
 codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs text eol=lf linguist-generated
 codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.rs text eol=lf linguist-generated
 codex-rs/app-server-protocol/schema/** linguist-generated

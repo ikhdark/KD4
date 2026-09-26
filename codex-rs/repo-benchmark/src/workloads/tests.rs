@@ -340,7 +340,9 @@ fn python_refactor_checks_real_helper_use_and_preserved_results() {
     fs::write(workspace.join("test_repo_benchmark_refactor.py"), "import unittest\nfrom scripts.readme_toc import generate_toc_lines, format_toc_entry\nclass Regression(unittest.TestCase):\n    def test_heading(self):\n        self.assertEqual(generate_toc_lines(['## Hello']), ['- [Hello](#hello)'])\n    def test_indent(self):\n        self.assertEqual(generate_toc_lines(['### Child']), ['  - [Child](#child)'])\n    def test_escaping(self):\n        self.assertEqual(format_toc_entry(2, 'A[B]', 'a'), '- [A\\\\[B\\\\]](#a)')\n").unwrap();
     let tests = workspace.join("test_repo_benchmark_refactor.py");
     let existing = fs::read_to_string(&tests).unwrap();
-    fs::write(tests, format!("{existing}\n    def test_repeated_headings(self):\n        self.assertEqual(generate_toc_lines(['## A','## A']), ['- [A](#a)','- [A](#a-1)'])\n    def test_fenced_code(self):\n        self.assertEqual(generate_toc_lines(['```','## Hidden','```','## Visible']), ['- [Visible](#visible)'])\n")).unwrap();
+    // A docstring makes verbose unittest print its first line before the outcome;
+    // the oracle must still count that test when it passes and when a mutation fails it.
+    fs::write(tests, format!("{existing}\n    def test_repeated_headings(self):\n        \"\"\"Repeated headings get distinct anchors.\"\"\"\n        self.assertEqual(generate_toc_lines(['## A','## A']), ['- [A](#a)','- [A](#a-1)'])\n    def test_fenced_code(self):\n        self.assertEqual(generate_toc_lines(['```','## Hidden','```','## Visible']), ['- [Visible](#visible)'])\n")).unwrap();
     let result = verify_fixture(&fixture).unwrap();
     assert_eq!(result.status, VerificationStatus::Passed, "{result:?}");
     let wrong = updated.replace(

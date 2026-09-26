@@ -2,6 +2,7 @@ use super::*;
 use notify::event::AccessKind;
 use notify::event::AccessMode;
 use notify::event::CreateKind;
+use notify::event::Flag;
 use notify::event::ModifyKind;
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
@@ -577,7 +578,7 @@ async fn recursive_registration_downgrades_to_non_recursive_after_drop() {
 }
 
 #[tokio::test]
-async fn failed_nonempty_mode_downgrade_is_reconciled() {
+async fn mode_change_replaces_the_backend_watch_without_unwatching() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path().join("watched-dir");
     std::fs::create_dir(&root).expect("create root");
@@ -585,7 +586,8 @@ async fn failed_nonempty_mode_downgrade_is_reconciled() {
     let watcher = Arc::new(FileWatcher::new().expect("watcher"));
     let (subscriber, _rx) = watcher.add_subscriber();
     let _non_recursive = subscriber.register_path(root.clone(), /*recursive*/ false);
-    let recursive = subscriber.register_path(root.clone(), /*recursive*/ true);
+    // Stopping the watch before starting its replacement would drop changes
+    // that the path's other registrations rely on.
     watcher
         .inner
         .as_ref()
@@ -594,34 +596,25 @@ async fn failed_nonempty_mode_downgrade_is_reconciled() {
         .expect("inner lock")
         .fail_next_unwatch = true;
 
-    drop(recursive);
+    let _recursive = subscriber.register_path(root.clone(), /*recursive*/ true);
 
-    timeout(Duration::from_secs(1), async {
-        loop {
-            let reconciled = {
-                let inner = watcher.inner.as_ref().expect("watcher inner");
-                let inner = inner.lock().expect("inner lock");
-                inner.watched_paths.get(&root) == Some(&RecursiveMode::NonRecursive)
-                    && !inner.degraded_paths.contains(&root)
-            };
-            if reconciled {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("failed nonempty downgrade should be reconciled");
+    let inner = watcher.inner.as_ref().expect("watcher inner");
+    let inner = inner.lock().expect("inner lock");
+    assert_eq!(
+        inner.watched_paths.get(&root),
+        Some(&RecursiveMode::Recursive)
+    );
+    assert!(inner.fail_next_unwatch, "a mode change must not unwatch");
 }
 
 #[tokio::test]
-async fn failed_mode_restore_is_reconciled() {
+async fn failed_mode_change_keeps_the_previous_watch_until_reconciled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path().join("watched-dir");
     std::fs::create_dir(&root).expect("create root");
 
     let watcher = Arc::new(FileWatcher::new().expect("watcher"));
-    let (subscriber, _rx) = watcher.add_subscriber();
+    let (subscriber, mut rx) = watcher.add_subscriber();
     let _non_recursive = subscriber.register_path(root.clone(), /*recursive*/ false);
     let recursive = subscriber.register_path(root.clone(), /*recursive*/ true);
     watcher
@@ -634,6 +627,25 @@ async fn failed_mode_restore_is_reconciled() {
 
     drop(recursive);
 
+    // A failed replacement leaves the previous watch covering the remaining
+    // registration while the downgrade is retried.
+    {
+        let inner = watcher.inner.as_ref().expect("watcher inner");
+        let inner = inner.lock().expect("inner lock");
+        assert_eq!(
+            inner.watched_paths.get(&root),
+            Some(&RecursiveMode::Recursive)
+        );
+        assert!(inner.degraded_paths.contains(&root));
+    }
+    // The owner consumes the degradation rescan before reconciliation runs.
+    assert_eq!(
+        rx.recv().await,
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
     timeout(Duration::from_secs(1), async {
         loop {
             let reconciled = {
@@ -649,7 +661,17 @@ async fn failed_mode_restore_is_reconciled() {
         }
     })
     .await
-    .expect("missing backend watch after a failed restore should be reconciled");
+    .expect("failed mode change should be reconciled");
+    // Changes during the degraded period may not have been reported.
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("re-established watch should request a rescan"),
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
 }
 
 #[tokio::test]
@@ -689,6 +711,242 @@ async fn failed_old_watch_release_after_move_is_reconciled() {
     })
     .await
     .expect("failed release of a fallback watch should be reconciled");
+}
+
+async fn recv_event_for(rx: &mut Receiver, expected: &Path) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("watcher remains open");
+            if event.paths.iter().any(|path| path == expected) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("watched path event timeout");
+}
+
+async fn wait_for_watch_counts(
+    watcher: &FileWatcher,
+    path: &Path,
+    expected: Option<(usize, usize)>,
+) {
+    timeout(Duration::from_secs(10), async {
+        while watcher.watch_counts_for_test(path) != expected {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watch should move");
+}
+
+#[tokio::test]
+async fn live_file_watch_reports_lock_file_replacement() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let head = temp_dir.path().join("HEAD");
+    std::fs::write(&head, "ref: refs/heads/main\n").expect("write HEAD");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(head.clone(), /*recursive*/ false);
+
+    // Git replaces refs by renaming a lock file over the target.
+    let lock = temp_dir.path().join("HEAD.lock");
+    std::fs::write(&lock, "ref: refs/heads/other\n").expect("write HEAD.lock");
+    std::fs::rename(&lock, &head).expect("replace HEAD");
+
+    recv_event_for(&mut rx, &head).await;
+}
+
+#[tokio::test]
+async fn deleted_watched_directory_is_followed_through_recreation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(root.clone(), /*recursive*/ true);
+
+    // The backend must report the deletion itself, or the watch dies silently.
+    std::fs::remove_dir(&root).expect("remove root");
+    recv_event_for(&mut rx, &root).await;
+    wait_for_watch_counts(&watcher, temp_dir.path(), Some((1, 0))).await;
+
+    recreate_dir(&root).await;
+    recv_event_for(&mut rx, &root).await;
+    wait_for_watch_counts(&watcher, &root, Some((0, 1))).await;
+
+    let child = root.join("after.txt");
+    std::fs::write(&child, "recreated").expect("write child");
+    recv_event_for(&mut rx, &child).await;
+}
+
+/// Recreates a removed directory. The backend's open handle keeps a removed
+/// directory delete-pending until the backend reports the removal and drops
+/// its watch.
+async fn recreate_dir(path: &Path) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match std::fs::create_dir(path) {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => panic!("recreate {}: {err}", path.display()),
+            }
+        }
+    })
+    .await
+    .expect("recreate directory timeout");
+}
+
+#[tokio::test]
+async fn watch_root_recreated_before_reconciliation_is_rearmed() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(root.clone(), /*recursive*/ true);
+
+    // Stall reconciliation so the removal report is handled only after the
+    // root exists again, as when a tool replaces a directory quickly.
+    let state = Arc::clone(&watcher.state);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = state.write().expect("watch state lock");
+        locked_tx.send(()).expect("signal held lock");
+        let _ = release_rx.recv_timeout(Duration::from_secs(20));
+    });
+    locked_rx.recv().expect("lock held");
+    std::fs::remove_dir(&root).expect("remove root");
+    recreate_dir(&root).await;
+    release_tx.send(()).expect("release reconciliation");
+    holder.join().expect("lock holder");
+
+    // Resolution finds the root where it was; the dropped backend watch must
+    // still be re-armed before the root change is delivered.
+    recv_event_for(&mut rx, &root).await;
+    let child = root.join("after.txt");
+    std::fs::write(&child, "recreated").expect("write child");
+    recv_event_for(&mut rx, &child).await;
+}
+
+#[tokio::test]
+async fn backend_error_rearms_the_watch_it_names() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(root.clone(), /*recursive*/ true);
+    // A backend that cannot re-arm a read stops that watch and reports an
+    // error naming its root.
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .watcher
+        .unwatch(&root)
+        .expect("stop backend watch");
+    let (raw_tx, raw_rx) = mpsc::channel(1);
+    watcher.spawn_event_loop_for_test(raw_rx);
+
+    raw_tx
+        .send(Err(
+            notify::Error::generic("rearm failed").add_path(root.clone())
+        ))
+        .await
+        .expect("send backend error");
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("backend error rescan timeout"),
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
+    let child = root.join("after-error.txt");
+    std::fs::write(&child, "rearmed").expect("write child");
+    recv_event_for(&mut rx, &child).await;
+}
+
+#[tokio::test]
+async fn rescan_moves_a_stable_watch_whose_root_disappeared() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(root.clone(), /*recursive*/ true);
+    std::fs::remove_dir(&root).expect("remove root");
+
+    // The removal report was among the events a queue overflow discarded.
+    let (_raw_tx, raw_rx) = mpsc::channel(1);
+    let raw_overflow = Arc::new(AtomicBool::new(true));
+    let raw_overflow_notify = Arc::new(Notify::new());
+    raw_overflow_notify.notify_one();
+    watcher.spawn_event_loop(
+        &Handle::current(),
+        raw_rx,
+        raw_overflow,
+        raw_overflow_notify,
+    );
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("overflow rescan timeout"),
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
+    // The rescan is requested only after the watch followed the removal.
+    assert_eq!(watcher.watch_counts_for_test(&root), None);
+    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), Some((1, 0)));
+}
+
+#[tokio::test]
+async fn queued_raw_events_are_reconciled_in_one_pass() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let requested = temp_dir.path().join("requested");
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    // A fallback watch resolves the filesystem once per pass that reports a
+    // child of its ancestor.
+    let _registration = subscriber.register_path(requested.clone(), /*recursive*/ false);
+    std::fs::write(&requested, "created").expect("create requested");
+    let (raw_tx, raw_rx) = mpsc::channel(RAW_EVENT_BUFFER_CAPACITY);
+    for name in ["sibling-a", "sibling-b", "sibling-c", "requested"] {
+        raw_tx
+            .send(Ok(notify_event(
+                EventKind::Create(CreateKind::File),
+                vec![temp_dir.path().join(name)],
+            )))
+            .await
+            .expect("queue raw event");
+    }
+
+    watcher.spawn_event_loop_for_test(raw_rx);
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("batched event timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![requested],
+            rescan_required: false,
+        })
+    );
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -805,6 +1063,49 @@ async fn stable_descendant_events_skip_actual_path_resolution() {
             paths: vec![skills.join("rust").join("SKILL.md")],
             rescan_required: false,
         }
+    );
+}
+
+#[tokio::test]
+async fn unrelated_events_skip_fallback_watch_resolution() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let source = temp_dir.path().join("source");
+    let changed = source.join("nested").join("main.rs");
+    std::fs::create_dir_all(source.join("nested")).expect("create source tree");
+    let watcher = Arc::new(FileWatcher::noop());
+    let (source_subscriber, source_rx) = watcher.add_subscriber();
+    let (metadata_subscriber, _metadata_rx) = watcher.add_subscriber();
+    let _source = source_subscriber.register_path(source, /*recursive*/ true);
+    let _missing = metadata_subscriber.register_path(
+        temp_dir.path().join("missing").join("FETCH_HEAD"),
+        /*recursive*/ false,
+    );
+
+    watcher.send_paths_for_test(vec![changed.clone()]).await;
+
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        0
+    );
+    let mut source_rx = ThrottledWatchReceiver::new(source_rx, TEST_THROTTLE_INTERVAL);
+    assert_eq!(
+        timeout(Duration::from_secs(1), source_rx.recv())
+            .await
+            .expect("source change timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![changed],
+            rescan_required: false,
+        })
+    );
+
+    // The fallback's ancestor watch can report a sibling that becomes a
+    // missing component or symlink target, so that still re-resolves.
+    watcher
+        .send_paths_for_test(vec![temp_dir.path().join("sibling")])
+        .await;
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        1
     );
 }
 
@@ -1151,6 +1452,91 @@ async fn oversized_raw_event_requires_a_rescan_without_entering_the_queue() {
             paths: Vec::new(),
             rescan_required: true,
         })
+    );
+}
+
+#[tokio::test]
+async fn backend_rescan_event_requires_a_rescan_without_entering_the_queue() {
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(path("/tmp/skills"), /*recursive*/ true);
+    let (raw_tx, mut raw_rx) = mpsc::channel(1);
+    let raw_overflow = Arc::new(AtomicBool::new(false));
+    let raw_overflow_notify = Arc::new(Notify::new());
+
+    // Windows reports discarded ReadDirectoryChangesW details this way, without paths.
+    enqueue_raw_event(
+        &raw_tx,
+        &raw_overflow,
+        &raw_overflow_notify,
+        Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+    );
+
+    assert!(raw_overflow.load(Ordering::Acquire));
+    assert!(matches!(
+        raw_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    watcher.spawn_event_loop(
+        &Handle::current(),
+        raw_rx,
+        Arc::clone(&raw_overflow),
+        Arc::clone(&raw_overflow_notify),
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("backend rescan timeout"),
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn shared_watcher_is_reused_per_runtime_until_released() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let first = FileWatcher::shared().expect("shared watcher");
+    let second = FileWatcher::shared().expect("shared watcher");
+    assert!(Arc::ptr_eq(&first, &second));
+
+    // Overlapping registrations from independent users share one backend watch.
+    let (first_subscriber, _first_rx) = first.add_subscriber();
+    let (second_subscriber, _second_rx) = second.add_subscriber();
+    let first_registration =
+        first_subscriber.register_path(temp_dir.path().to_path_buf(), /*recursive*/ true);
+    let second_registration =
+        second_subscriber.register_path(temp_dir.path().to_path_buf(), /*recursive*/ true);
+    assert_eq!(first.watch_counts_for_test(temp_dir.path()), Some((0, 2)));
+
+    // Another runtime runs its own event loop, so it must not reuse this watcher.
+    let first_ptr = Arc::as_ptr(&first) as usize;
+    let other_runtime_ptr = std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                Arc::as_ptr(&FileWatcher::shared().expect("shared watcher")) as usize
+            })
+    })
+    .join()
+    .expect("other runtime");
+    assert_ne!(other_runtime_ptr, first_ptr);
+
+    let released = Arc::downgrade(&first);
+    drop((
+        first_registration,
+        second_registration,
+        first_subscriber,
+        second_subscriber,
+        first,
+        second,
+    ));
+    assert!(
+        released.upgrade().is_none(),
+        "the registry must not keep an unused watcher alive"
     );
 }
 

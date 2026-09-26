@@ -151,7 +151,9 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
     .into_iter()
     .find_map(|prefix| body.strip_prefix(prefix));
     let agent_target = target.is_some_and(|target| {
-        let mut words = target.split_whitespace();
+        let mut words = target
+            .split_whitespace()
+            .map(|word| word.trim_end_matches([',', ':', '!']));
         let noun = words.find(|word| {
             !matches!(
                 *word,

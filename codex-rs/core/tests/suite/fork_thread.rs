@@ -193,7 +193,7 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
             defer_loading: false,
         })]);
 
-    let error = match test
+    let forked = test
         .thread_manager
         .fork_thread_from_history(
             ForkSnapshot::Interrupted,
@@ -208,16 +208,25 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
             /*supports_openai_form_elicitation*/ false,
         )
         .await
-    {
-        Ok(_) => panic!("invalid restored dynamic tools should reject fork"),
-        Err(error) => error,
+        .expect("invalid restored capabilities must not make history inaccessible");
+    let warning = wait_for_event(&forked.thread, |event| matches!(event, EventMsg::Warning(_))).await;
+    let EventMsg::Warning(warning) = warning else {
+        unreachable!();
     };
     assert!(
-        error.to_string().contains(
+        warning.message.contains(
             "dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: invalid tool name"
         ),
-        "unexpected fork error: {error}"
+        "unexpected quarantine warning: {warning:?}"
     );
+    forked.thread.ensure_rollout_materialized().await;
+    forked.thread.flush_rollout().await.expect("flush fork");
+    let items = read_rollout_items_with_session_meta(&forked.thread.rollout_path().expect("fork rollout"));
+    let tools = items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta) => Some(meta.meta.dynamic_tools.clone().unwrap_or_default()),
+        _ => None,
+    }).expect("fork session metadata");
+    assert!(tools.is_empty(), "invalid capability must be quarantined: {tools:?}");
 }
 
 #[test]
@@ -334,10 +343,11 @@ fn fork_thread_from_history_does_not_require_source_rollout_path() {
 
         let requests = request_log.requests();
         assert_eq!(requests.len(), 2);
-        assert!(
-            requests[1].inputs_of_type("reasoning").is_empty(),
-            "the next forked request must project out reasoning from completed instruction groups"
-        );
+        let reasoning = requests[1].inputs_of_type("reasoning");
+        assert_eq!(reasoning.len(), 1);
+        assert!(reasoning[0].get("id").is_none());
+        assert_eq!(reasoning[0]["summary"][0]["text"], "fork summary");
+        assert_eq!(reasoning[0]["content"][0]["text"], "fork detail");
     });
 }
 

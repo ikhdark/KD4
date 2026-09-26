@@ -1630,7 +1630,7 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
         cases.push((
             "powershell",
             "Get-ChildItem src -Filter AGENTS.md; Get-Content src/work.rs",
-            BTreeSet::from([src_tree.clone(), work.clone()]),
+            BTreeSet::from([src_tree, work.clone()]),
         ));
         cases.push((
             "powershell",
@@ -1653,7 +1653,7 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
         cases.push((
             "powershell",
             "git diff --stat; Get-Content src/work.rs",
-            BTreeSet::from([checkout.clone(), work.clone()]),
+            BTreeSet::from([checkout, work]),
         ));
     }
     for (shell, command, expected) in cases {
@@ -4862,7 +4862,7 @@ fn untracked_exposure_preserves_fresh_failures_and_late_artifact_registration() 
         "{}\nwrite failed: permission denied",
         "diagnostic ".repeat(160)
     );
-    let mut failure = text_output("failure", detail.clone());
+    let mut failure = text_output("failure", detail);
     if let ResponseItem::FunctionCallOutput { output, .. } = &mut failure {
         output.success = Some(false);
     }

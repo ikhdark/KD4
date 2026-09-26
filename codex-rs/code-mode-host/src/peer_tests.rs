@@ -12,6 +12,7 @@ use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use pretty_assertions::assert_eq;
@@ -22,7 +23,6 @@ use tokio::sync::oneshot::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
 use super::HostPeer;
-use super::MAX_PENDING_DELEGATE_CALLS;
 
 #[tokio::test]
 async fn revoked_callback_after_cell_closure_does_not_recreate_route() {
@@ -73,7 +73,7 @@ async fn revoked_callback_after_cell_closure_does_not_recreate_route() {
         assert!(peer.pending.lock().expect("pending delegates").is_empty());
         assert_eq!(
             peer.delegate_permits.available_permits(),
-            MAX_PENDING_DELEGATE_CALLS
+            MAX_PENDING_DELEGATE_REQUESTS
         );
         assert_eq!(permits.available_permits(), 1);
         assert!(matches!(
@@ -302,7 +302,7 @@ async fn cancelled_queued_calls_release_payloads_and_capacity_before_forwarding(
             assert_eq!(len, 0);
             assert_eq!(
                 peer.delegate_permits.available_permits(),
-                MAX_PENDING_DELEGATE_CALLS
+                MAX_PENDING_DELEGATE_REQUESTS
             );
         }
         peer.close_cell(key.0, cell);
@@ -393,7 +393,7 @@ async fn pending_delegate_limit_rejects_call_without_disconnecting() {
     let (outgoing_tx, _outgoing_rx) = mpsc::channel(/*max_capacity*/ 1);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
     let permits = Arc::clone(&peer.delegate_permits)
-        .acquire_many_owned(MAX_PENDING_DELEGATE_CALLS as u32)
+        .acquire_many_owned(MAX_PENDING_DELEGATE_REQUESTS as u32)
         .await
         .expect("delegate permits");
 
@@ -436,14 +436,14 @@ fn dropped_delegate_call_releases_capacity_without_a_runtime() {
     ));
     assert_eq!(
         peer.delegate_permits.available_permits(),
-        MAX_PENDING_DELEGATE_CALLS - 1
+        MAX_PENDING_DELEGATE_REQUESTS - 1
     );
 
     drop(call);
 
     assert_eq!(
         peer.delegate_permits.available_permits(),
-        MAX_PENDING_DELEGATE_CALLS
+        MAX_PENDING_DELEGATE_REQUESTS
     );
     assert!(matches!(
         outgoing_rx.try_recv(),
@@ -478,7 +478,7 @@ async fn exhausted_delegate_ids_reject_calls_without_side_effects() {
         );
         assert_eq!(
             peer.delegate_permits.available_permits(),
-            MAX_PENDING_DELEGATE_CALLS
+            MAX_PENDING_DELEGATE_REQUESTS
         );
         assert!(peer.pending.lock().expect("pending delegates").is_empty());
         assert!(peer.cell_routes.lock().expect("cell routes").is_empty());
@@ -524,7 +524,7 @@ async fn cancellation_before_cell_dispatch_releases_delegate_call() {
     );
     assert_eq!(
         peer.delegate_permits.available_permits(),
-        MAX_PENDING_DELEGATE_CALLS
+        MAX_PENDING_DELEGATE_REQUESTS
     );
     assert!(matches!(
         outgoing_rx.try_recv(),
@@ -589,7 +589,7 @@ async fn cancellation_before_cell_dispatch_releases_delegate_call() {
     assert_eq!(live_call.await, Ok(()));
     assert_eq!(
         peer.delegate_permits.available_permits(),
-        MAX_PENDING_DELEGATE_CALLS
+        MAX_PENDING_DELEGATE_REQUESTS
     );
     assert!(matches!(
         outgoing_rx.try_recv(),
@@ -643,7 +643,7 @@ async fn dropped_dispatched_delegate_call_sends_cancellation_immediately() {
         .expect("immediate cancellation frame");
     assert_eq!(
         peer.delegate_permits.available_permits(),
-        MAX_PENDING_DELEGATE_CALLS
+        MAX_PENDING_DELEGATE_REQUESTS
     );
     let mut bytes = Vec::new();
     let mut writer = FramedWriter::new(&mut bytes);

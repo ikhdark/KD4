@@ -9,7 +9,6 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 use std::fs::File;
-use std::fs::Metadata;
 use std::io;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -33,7 +32,6 @@ pub(super) struct ParsedSessionImport {
     pub ai_title: Option<String>,
     pub messages: Vec<ConversationMessage>,
     pub content_sha256: String,
-    pub source_modified_at: Option<i64>,
 }
 
 pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
@@ -115,9 +113,7 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
 }
 
 pub(super) fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport> {
-    let file = File::open(path)?;
-    let metadata_before = file.metadata().ok();
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(File::open(path)?);
     let mut cwd = None;
     let mut custom_title = None;
     let mut ai_title = None;
@@ -153,33 +149,13 @@ pub(super) fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport
             messages.push(message);
         }
     }
-    let metadata_after = reader.get_ref().metadata().ok();
     Ok(ParsedSessionImport {
         cwd,
         custom_title,
         ai_title,
         messages,
         content_sha256: format!("{:x}", hasher.finalize()),
-        source_modified_at: metadata_before
-            .as_ref()
-            .zip(metadata_after.as_ref())
-            .and_then(|(before, after)| stable_source_modified_at(before, after)),
     })
-}
-
-pub(super) fn stable_source_modified_at(before: &Metadata, after: &Metadata) -> Option<i64> {
-    if before.len() != after.len() {
-        return None;
-    }
-    let before_modified = before.modified().ok()?;
-    let after_modified = after.modified().ok()?;
-    if before_modified != after_modified {
-        return None;
-    }
-    before_modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
 }
 
 fn custom_title_from_record(record: &JsonValue) -> Option<&str> {

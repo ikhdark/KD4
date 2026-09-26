@@ -63,6 +63,37 @@ async fn removing_thread_names_preserves_other_entries_and_cleans_replacement() 
     );
 }
 
+#[tokio::test]
+async fn removing_thread_names_retains_a_record_torn_inside_a_character() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let removed = ThreadId::new();
+    let retained = ThreadId::new();
+    let entry_line = |id, thread_name: &str| {
+        serde_json::to_string(&SessionIndexEntry {
+            id,
+            thread_name: thread_name.to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+    };
+    // A crash mid-append can cut a record inside a multi-byte character; the next append
+    // terminates that fragment in place.
+    let torn_record = entry_line(retained, "réponse")?;
+    let cut = torn_record.find('é').expect("multi-byte character") + 1;
+    let retained_line = entry_line(retained, "retained name")?;
+    let mut expected = torn_record.as_bytes()[..cut].to_vec();
+    expected.push(b'\n');
+    expected.extend_from_slice(format!("{retained_line}\n").as_bytes());
+    let path = session_index_path(home.path());
+    let mut contents = format!("{}\n", entry_line(removed, "old name")?).into_bytes();
+    contents.extend_from_slice(&expected);
+    std::fs::write(&path, contents)?;
+
+    remove_thread_name_entries(home.path(), removed).await?;
+
+    assert_eq!(std::fs::read(&path)?, expected);
+    Ok(())
+}
+
 const LOCK_HOLDER_CHILD_TEST: &str = "session_index::tests::session_index_lock_holder_child";
 const LOCK_HOLDER_CODEX_HOME_ENV: &str = "CODEX_SESSION_INDEX_LOCK_HOLDER_CODEX_HOME";
 const LOCK_HOLDER_READY_PATH_ENV: &str = "CODEX_SESSION_INDEX_LOCK_HOLDER_READY_PATH";

@@ -253,8 +253,8 @@ feature effects are not isolated.
 
 | Mode | Scripted execution ceiling | Real-model work and ceiling |
 |---|---:|---|
-| Fast | 30 minutes | Rust task Ã— two variants; 50 minutes |
-| Full | 30 minutes | Rust, TypeScript, Python TOC and consumer-discovery tasks Ã— two variants; 200 minutes |
+| Fast | 30 minutes | Rust task × two variants; 50 minutes |
+| Full | 30 minutes | Rust, TypeScript, Python TOC and consumer-discovery tasks × two variants; 200 minutes |
 
 Each real-model attempt has a twenty-minute ceiling. Execution is sequential: scripted work,
 cleanup, then real-model work. Variants and independent attempts run one at a time. These are
@@ -379,10 +379,15 @@ and unsupported reference categories marked unavailable. No recording proxy is u
 analysis and workspace verification occur outside measured execution.
 
 Reports lead with completion and failures, distinguishing changes outside the permitted task scope
-from incorrect behavior. Report schema 3 compares named metrics independently: elapsed time, tool
-and turn counts, first-output and first-action timing, request volume, complete live token usage,
-discovery work, and outside-execution durations. Missing or partial evidence excludes the attempt
-for that metric rather than supplying zero. Statistics retain matched pairs, run clusters,
+from incorrect behavior. Report schema 3 compares named metrics independently: elapsed and turn-only
+time, tool and turn counts, first-output and first-action timing, request volume, complete live
+token usage, discovery work, and outside-execution durations. `elapsed_ms` spans app-server launch
+through the last turn, including initialize, the harness `config/read` check, thread start or
+resume, and scripted harness checks between turns. `turn_elapsed_ms` sums each turn from its
+`turn/start` request to its terminal notification and is recorded only when every turn finished.
+First-output and first-tool times count from attempt start, before launch. Missing or partial
+evidence excludes the attempt for that metric rather than supplying zero. Statistics retain matched
+pairs, run clusters,
 distributions, sample identities, and 10,000-resample bootstrap intervals when supported. Markdown
 suppresses tail comparisons below 20 observations in either arm; JSON retains the interpolated
 sample quantiles. Behavior counts remain descriptive without significance tests. One live attempt
@@ -526,7 +531,7 @@ a small extension to its owning handler; it does not justify a second scheduler.
 Likewise, change locking only for demonstrated shared-resource conflicts or
 unnecessary exclusion, never by serializing entire categories of writes or builds.
 
-## Audit AJâ€“AY: verified changes and measurement limits
+## Audit AJ–AY: verified changes and measurement limits
 
 The behavior vector uses the existing `investigation-evidence-v1` envelope.
 Its snapshot hashes the captured rollout byte identities, independently of file

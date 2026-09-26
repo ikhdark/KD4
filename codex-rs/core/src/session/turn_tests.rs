@@ -355,112 +355,35 @@ async fn turn_context_waits_for_a_contended_picker_snapshot() {
     );
 }
 
-#[test]
-fn projected_prompt_compaction_reuses_equal_and_incrementally_appended_projections() {
-    fn message(text: &str) -> ResponseItem {
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: text.to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        }
-    }
-
-    fn tool_search_output() -> ResponseItem {
-        ResponseItem::ToolSearchOutput {
-            id: None,
-            call_id: None,
-            status: "completed".to_string(),
-            execution: "server".to_string(),
-            tools: vec![serde_json::json!({
-                "type": "function",
-                "name": "search_repository",
-                "description": "large acknowledged schema",
-                "parameters": {"type": "object"}
-            })],
-            omitted_result_count: None,
-            internal_chat_message_metadata_passthrough: None,
-        }
-    }
-
-    fn prepare(items: Vec<ResponseItem>) -> PreparedPromptInput {
-        let mut history = ContextManager::new();
-        history.record_items(
-            items.iter(),
-            codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
-        );
-        history.prepare_for_sampling_prompt(&[], StableContextTarget::Sampling)
-    }
-
-    fn assert_matches_independent_compaction(
-        prepared: &PreparedPromptInput,
-        compacted: &CompactedProjectedPromptInputs,
-    ) {
-        assert_eq!(
-            compacted.input,
-            compact_acknowledged_tool_search_outputs(prepared.shared_items())
-        );
-        assert_eq!(
-            compacted.stable_context_fallback_input,
-            compact_acknowledged_tool_search_outputs(prepared.shared_fallback_items())
-        );
-        assert_eq!(
-            compacted.tool_history_fallback_input,
-            compact_acknowledged_tool_search_outputs(prepared.shared_unreplaced_items())
-        );
-        assert_eq!(
-            compacted.stable_context_tool_history_fallback_input,
-            compact_acknowledged_tool_search_outputs(prepared.shared_unreplaced_fallback_items())
-        );
-    }
-
-    let equal_prepared = prepare(vec![tool_search_output(), message("continue")]);
-    let equal = compact_projected_prompt_inputs(&equal_prepared);
-    assert_eq!(equal.pass_count, 1);
-    assert!(Arc::ptr_eq(
-        &equal.input,
-        &equal.stable_context_fallback_input
-    ));
-    assert!(Arc::ptr_eq(
-        &equal.input,
-        &equal.tool_history_fallback_input
-    ));
-    assert!(Arc::ptr_eq(
-        &equal.input,
-        &equal.stable_context_tool_history_fallback_input
-    ));
-    let ResponseItem::ToolSearchOutput { tools, .. } = &equal.input[0] else {
-        panic!("expected historical tool-search output");
-    };
-    assert_eq!(
-        tools,
-        &[serde_json::json!({
+#[tokio::test]
+async fn projected_prompt_shares_prepared_projection_storage_across_appends() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await
+        .unwrap();
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        Vec::new(),
+    );
+    let tool_search_output = ResponseItem::ToolSearchOutput {
+        id: None,
+        call_id: None,
+        status: "completed".to_string(),
+        execution: "server".to_string(),
+        tools: vec![serde_json::json!({
             "type": "function",
-            "name": "search_repository"
-        })]
-    );
-    let equal_reused = compact_projected_prompt_inputs(&equal_prepared);
-    assert!(
-        Arc::ptr_eq(&equal.input, &equal_reused.input),
-        "later generations must reuse the compacted projection",
-    );
-    assert_matches_independent_compaction(&equal_prepared, &equal);
-
-    let mut advancing_history = ContextManager::new();
-    let initial_items = [message("before"), tool_search_output()];
-    advancing_history.record_items(initial_items.iter(), TruncationPolicy::Tokens(10_000));
-    let before_append = advancing_history
-        .clone()
-        .prepare_for_sampling_prompt(&[], StableContextTarget::Sampling);
-    let before_append_compacted = compact_projected_prompt_inputs(&before_append);
-    let ResponseItem::ToolSearchOutput { tools, .. } = &before_append_compacted.input[1] else {
-        panic!("expected final tool-search output");
+            "name": "search_repository",
+            "description": "large acknowledged schema",
+            "parameters": {"type": "object"}
+        })],
+        omitted_result_count: None,
+        internal_chat_message_metadata_passthrough: None,
     };
-    assert_eq!(tools[0]["description"], "large acknowledged schema");
-
     let reasoning = ResponseItem::Reasoning {
         id: None,
         summary: Vec::new(),
@@ -468,32 +391,45 @@ fn projected_prompt_compaction_reuses_equal_and_incrementally_appended_projectio
         encrypted_content: None,
         internal_chat_message_metadata_passthrough: None,
     };
-    advancing_history.record_items([&reasoning], TruncationPolicy::Tokens(10_000));
-    let after_append = advancing_history
-        .clone()
-        .prepare_for_sampling_prompt(&[], StableContextTarget::Sampling);
-    assert_eq!(
-        after_append.compacted_tool_search_outputs_are_materialized(),
-        Some([false; 4]),
-        "a safe append must advance the cached model projections without flattening them",
-    );
+    let mut history = ContextManager::new();
+    history.record_items([&tool_search_output], TruncationPolicy::Tokens(10_000));
+    for append in [None, Some(&reasoning)] {
+        if let Some(item) = append {
+            history.record_items([item], TruncationPolicy::Tokens(10_000));
+        }
+        let prepared = history
+            .clone()
+            .prepare_for_sampling_prompt(&[], StableContextTarget::Sampling);
+        let prompt = build_projected_prompt(
+            &session,
+            &prepared,
+            &router,
+            step_context.as_ref(),
+            session.get_base_instructions().await,
+        );
 
-    let after_append_compacted = compact_projected_prompt_inputs(&after_append);
-    assert_eq!(after_append_compacted.pass_count, 1);
-    let ResponseItem::ToolSearchOutput { tools, .. } = &after_append_compacted.input[1] else {
-        panic!("expected historical tool-search output");
-    };
-    assert_eq!(
-        tools,
-        &[serde_json::json!({
-            "type": "function",
-            "name": "search_repository"
-        })]
-    );
-    assert_eq!(&after_append_compacted.input[2], &reasoning);
-    assert_matches_independent_compaction(&after_append, &after_append_compacted);
+        // Retry bookkeeping holds `shared_items`; the request must send that
+        // copy rather than flattening the whole history a second time.
+        assert!(Arc::ptr_eq(&prompt.input, &prepared.shared_items()));
+        assert!(Arc::ptr_eq(
+            &prompt.stable_context_fallback_input,
+            &prepared.shared_fallback_items()
+        ));
+        assert!(Arc::ptr_eq(
+            &prompt.tool_history_fallback_input,
+            &prepared.shared_unreplaced_items()
+        ));
+        assert!(Arc::ptr_eq(
+            &prompt.stable_context_tool_history_fallback_input,
+            &prepared.shared_unreplaced_fallback_items()
+        ));
+        assert_eq!(
+            prompt.input[0], tool_search_output,
+            "acknowledged search schemas keep their cached-prefix bytes"
+        );
+        assert_eq!(prompt.input.len(), 1 + usize::from(append.is_some()));
+    }
 }
-
 #[test]
 fn arc_identity_short_circuits_equivalence_check() {
     let comparison_count = AtomicUsize::new(0);
@@ -3190,12 +3126,12 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
     let max_bytes = codex_utils_string::approx_bytes_for_tokens(
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
-    let items = build_bounded_skill_context_items([
-        (
+    let items = build_bounded_skill_context_items(&[
+        RenderedContextFragment::new(
             "user",
             format!("legacy-skill-budget-first:{}", "x".repeat(max_bytes)),
         ),
-        ("user", "legacy-skill-budget-second".to_string()),
+        RenderedContextFragment::new("user", "legacy-skill-budget-second".to_string()),
     ]);
     let texts = response_input_texts(&items);
 
@@ -3210,6 +3146,45 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
             .iter()
             .all(|text| !text.contains("legacy-skill-budget-second"))
     );
+}
+
+#[test]
+fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
+    let max_bytes = codex_utils_string::approx_bytes_for_tokens(
+        codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
+    );
+    let skill = |name: &str, contents: String| codex_core_skills::injection::SkillInjection {
+        name: name.to_string(),
+        path: format!("/skills/{name}/SKILL.md"),
+        contents,
+        scope: codex_protocol::protocol::SkillScope::User,
+    };
+    // Leave the second skill room for its markers but not its whole body.
+    let first_overhead = skill("first", String::new()).render().len();
+    let first = skill("first", "x".repeat(max_bytes - first_overhead - 20));
+    let second = skill("second", "second skill instructions".to_string());
+
+    let items = build_bounded_skill_context_items([&first, &second]);
+
+    assert_eq!(items.len(), 2);
+    assert!(
+        response_input_texts(&items)
+            .iter()
+            .map(|text| text.len())
+            .sum::<usize>()
+            <= max_bytes
+    );
+    for item in &items {
+        let ResponseItem::Message { role, content, .. } = item else {
+            panic!("expected skill message, got {item:?}");
+        };
+        assert_eq!(role, "user");
+        // Unrecognized user-role text would surface as user input and a turn boundary.
+        assert!(
+            crate::event_mapping::is_contextual_user_message_content(content),
+            "{content:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6971,14 +6946,21 @@ fn projected_prompt_pressure_adds_pending_body_growth_to_server_usage() {
 
 #[test]
 fn assistant_stream_parsers_reuse_state_across_interleaved_deltas() {
-    let mut parsers = AssistantMessageStreamParsers::new(false);
-    let first = parsers.seed_item_text("one", "hello <oai-mem-citation>doc");
-    assert_eq!(first.visible_text, "hello ");
-    assert!(first.citations.is_empty());
+    let mut parsers = AssistantMessageStreamParsers::new(/*plan_mode*/ true);
+    let first = parsers.seed_item_text("one", "hello\n<proposed");
+    assert_eq!(first.visible_text, "hello\n");
     assert_eq!(parsers.parse_delta("two", "other").visible_text, "other");
-    let next = parsers.parse_delta("one", "1</oai-mem-citation> world");
+    let next = parsers.parse_delta("one", "_plan>\n- step\n</proposed_plan>\n world");
     assert_eq!(next.visible_text, " world");
-    assert_eq!(next.citations, vec!["doc1"]);
+    assert_eq!(
+        next.plan_segments,
+        vec![
+            ProposedPlanSegment::ProposedPlanStart,
+            ProposedPlanSegment::ProposedPlanDelta("- step\n".to_string()),
+            ProposedPlanSegment::ProposedPlanEnd,
+            ProposedPlanSegment::Normal(" world".to_string()),
+        ]
+    );
     assert_eq!(parsers.parsers_by_item.len(), 2);
     assert!(parsers.finish_item("one").is_empty());
     assert!(!parsers.parsers_by_item.contains_key("one"));

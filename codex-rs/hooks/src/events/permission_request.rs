@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use super::common;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
+use crate::engine::ScopedRunGate;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
@@ -67,6 +68,7 @@ struct PermissionRequestHandlerData {
 pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
     request: &PermissionRequestRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> Vec<HookRunSummary> {
     let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
     dispatcher::select_handlers_for_matcher_inputs(
@@ -75,6 +77,7 @@ pub(crate) fn preview(
         &matcher_inputs,
     )
     .into_iter()
+    .filter(|handler| gate.admits(handler))
     .map(|handler| {
         common::hook_run_for_tool_use(
             dispatcher::running_summary(&handler),
@@ -88,13 +91,15 @@ pub(crate) async fn run(
     handlers: &[ConfiguredHandler],
     shell: &CommandShell,
     request: PermissionRequestRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> PermissionRequestOutcome {
     let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
-    let matched = dispatcher::select_handlers_for_matcher_inputs(
+    let mut matched = dispatcher::select_handlers_for_matcher_inputs(
         handlers,
         HookEventName::PermissionRequest,
         &matcher_inputs,
     );
+    matched.retain(|handler| gate.claim(handler));
     if matched.is_empty() {
         return PermissionRequestOutcome {
             hook_events: Vec::new(),

@@ -168,6 +168,25 @@ class WarmLaneReservationTest(unittest.TestCase):
             context,
             rust_build_status.cargo_build_context(self.repo, args + ["--release"], {}),
         )
+        # Named core targets and gates share one lane by design; which one ran
+        # last is not a build setting and must not rank that lane as changed.
+        named = [
+            ["just", "_core-test-reserved", "fast", "core_lib", "-E", "test(=a)"],
+            ["just", "_core-test-reserved", "local", "core_windows"],
+            ["just", "_core-gate-reserved", "core-retry-output", "windows-process"],
+        ]
+        self.assertEqual(
+            len(
+                {
+                    json.dumps(
+                        rust_build_status.cargo_build_context(self.repo, command, {}),
+                        sort_keys=True,
+                    )
+                    for command in named
+                }
+            ),
+            1,
+        )
         config = self.repo / "codex-rs" / ".cargo" / "config.toml"
         config.parent.mkdir(parents=True)
         config.write_text('[build]\nrustflags = ["changed"]\n')
@@ -1247,11 +1266,6 @@ class BuildToolingStorageTest(unittest.TestCase):
             (
                 ["_core-gate-reserved", "first", "second"],
                 ["run-gate", "--profile", "fast", "first", "second"],
-                "fast",
-            ),
-            (
-                ["_core-parity-reserved", "legacy", "first", "second"],
-                ["parity", "--profile", "fast", "legacy", "first", "second"],
                 "fast",
             ),
         )

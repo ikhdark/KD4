@@ -6,7 +6,6 @@ use codex_extension_api::ExtensionData;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;
-use codex_utils_stream_parser::strip_citations;
 use tokio_util::sync::CancellationToken;
 
 use crate::parse_turn_item;
@@ -73,12 +72,11 @@ pub fn image_generation_artifact_path(
         .join(format!("{}.png", sanitize(call_id)))
 }
 
-fn strip_hidden_assistant_markup(text: &str, plan_mode: bool) -> String {
-    let (without_citations, _) = strip_citations(text);
+fn strip_hidden_assistant_markup(text: String, plan_mode: bool) -> String {
     if plan_mode {
-        strip_proposed_plan_blocks(&without_citations)
+        strip_proposed_plan_blocks(&text)
     } else {
-        without_citations
+        text
     }
 }
 
@@ -739,7 +737,7 @@ pub(crate) async fn finalize_turn_item(
                 codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
             })
             .collect::<String>();
-        let stripped = strip_hidden_assistant_markup(&combined, plan_mode);
+        let stripped = strip_hidden_assistant_markup(combined, plan_mode);
         agent_message.content =
             vec![codex_protocol::items::AgentMessageContent::Text { text: stripped }];
     }
@@ -753,7 +751,7 @@ pub(crate) fn last_assistant_message_from_item(
         if combined.is_empty() {
             return None;
         }
-        let stripped = strip_hidden_assistant_markup(&combined, plan_mode);
+        let stripped = strip_hidden_assistant_markup(combined, plan_mode);
         if stripped.trim().is_empty() {
             return None;
         }

@@ -74,7 +74,7 @@ async fn dismissal_waits_for_refresh_transaction_and_preserves_new_metadata() {
         .await
         .unwrap();
     let path = version_filepath(&config);
-    cache_release(&path, "998.0.0".into(), false).await.unwrap();
+    cache_release(&path, "998.0.0".into()).await.unwrap();
     let (read_tx, read_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let refresh = tokio::spawn(merge_version_info(
@@ -108,19 +108,31 @@ async fn dismissal_waits_for_refresh_transaction_and_preserves_new_metadata() {
         "2026-09-13T01:02:03+00:00"
     );
     // The reverse writer ordering must preserve dismissal too.
-    cache_release(&path, "1000.0.0".into(), true).await.unwrap();
+    cache_release(&path, "1000.0.0".into()).await.unwrap();
     let info = read_version_info(&path).unwrap();
     assert_eq!(info.latest_version, "1000.0.0");
     assert_eq!(info.dismissed_version.as_deref(), Some("999.0.0"));
-    assert_eq!(info.npm_ready, Some(true));
-    cache_release(&path, "1000.0.0".into(), false)
-        .await
-        .unwrap();
-    assert_eq!(read_version_info(&path).unwrap().npm_ready, Some(true));
-    cache_release(&path, "1001.0.0".into(), false)
-        .await
-        .unwrap();
-    assert_eq!(read_version_info(&path).unwrap().npm_ready, Some(false));
+}
+
+#[tokio::test]
+async fn release_refresh_reads_and_rewrites_legacy_registry_cache() {
+    let home = tempdir().unwrap();
+    let path = home.path().join("version.json");
+    tokio::fs::write(
+        &path,
+        r#"{"latest_version":"999.0.0","last_checked_at":"2026-01-02T03:04:05Z","dismissed_version":"998.0.0","npm_ready":true}"#,
+    )
+    .await
+    .unwrap();
+
+    cache_release(&path, "1000.0.0".into()).await.unwrap();
+
+    // A cache that failed to parse would be replaced and lose its dismissal.
+    let persisted: serde_json::Value =
+        serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+    assert_eq!(persisted["latest_version"], "1000.0.0");
+    assert_eq!(persisted["dismissed_version"], "998.0.0");
+    assert!(persisted.get("npm_ready").is_none());
 }
 
 #[tokio::test]

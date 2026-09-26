@@ -312,7 +312,7 @@ impl ChatWidget {
         }
         self.status_state.pending_status_indicator_restore = match item.phase {
             // Models that don't support preambles only output AgentMessageItems on turn completion.
-            Some(MessagePhase::FinalAnswer) | None => !self.input_queue.pending_steers.is_empty(),
+            Some(MessagePhase::FinalAnswer) | None => self.input_queue.has_uncommitted_steers(),
             Some(MessagePhase::Commentary) => true,
         };
         self.maybe_restore_status_indicator_after_stream_idle();

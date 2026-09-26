@@ -205,7 +205,9 @@ pub(crate) async fn quiescence(
     pool: &SqlitePool,
     root_session_id: &str,
 ) -> StoreResult<QuiescenceStatus> {
-    let mut transaction = pool.begin().await?;
+    // Orphan release writes after this read, and a deferred read snapshot cannot
+    // wait out a concurrent writer; reserve the writer first.
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let workspace_ids = sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT assignment_repositories.workspace_id
          FROM assignments

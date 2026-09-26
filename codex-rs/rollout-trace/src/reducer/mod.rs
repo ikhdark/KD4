@@ -67,39 +67,27 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
         pending_agent_interaction_edges: Vec::new(),
     };
 
-    let event_log_path = bundle_dir.join(RAW_EVENT_LOG_FILE_NAME);
+    // Both passes use one snapshot, so a log that is still growing cannot give them
+    // different event sets.
+    let events = read_raw_events(&bundle_dir.join(RAW_EVENT_LOG_FILE_NAME))?;
     // Cell lifecycle persistence is queued off the dispatch path. Establish
     // immutable runtime identities before replay so a nested tool can precede
     // its cell-start record on disk. The normal pass still validates ownership
     // and lifecycle, and backfills links when each cell materializes.
-    let identities = File::open(&event_log_path)?;
-    for line in BufReader::new(identities).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: RawTraceEvent = serde_json::from_str(&line)?;
+    for event in &events {
         if let RawTraceEventPayload::CodeCellStarted {
             runtime_cell_id,
             model_visible_call_id,
             ..
-        } = event.payload
-            && let Some(thread_id) = event.thread_id
+        } = &event.payload
+            && let Some(thread_id) = &event.thread_id
         {
             let cell_id =
-                reducer.reduced_code_cell_id_for_model_visible_call(&model_visible_call_id);
-            reducer.record_runtime_code_cell_id(&thread_id, &runtime_cell_id, &cell_id)?;
+                reducer.reduced_code_cell_id_for_model_visible_call(model_visible_call_id);
+            reducer.record_runtime_code_cell_id(thread_id, runtime_cell_id, &cell_id)?;
         }
     }
-    let event_log = File::open(&event_log_path)
-        .with_context(|| format!("open trace event log {}", event_log_path.display()))?;
-    for (line_index, line) in BufReader::new(event_log).lines().enumerate() {
-        let line = line.with_context(|| format!("read trace event line {}", line_index + 1))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: RawTraceEvent = serde_json::from_str(&line)
-            .with_context(|| format!("parse trace event line {}", line_index + 1))?;
+    for event in events {
         reducer.apply_event(event)?;
     }
     // Spawn edges prefer the child task message as their target, but a child can
@@ -108,6 +96,47 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
     reducer.resolve_pending_spawn_edge_fallbacks()?;
 
     Ok(reducer.rollout)
+}
+
+/// Reads every complete raw event from a trace log.
+///
+/// The writer appends one newline-terminated record at a time. A final record
+/// that ends before its JSON value and newline is an append that a crash
+/// interrupted or that a live writer has not finished; it carries no reducible
+/// evidence, so replay keeps the complete prefix. Any other malformed record,
+/// including a terminated one, is corruption and fails replay.
+fn read_raw_events(event_log_path: &Path) -> Result<Vec<RawTraceEvent>> {
+    let event_log = File::open(event_log_path)
+        .with_context(|| format!("open trace event log {}", event_log_path.display()))?;
+    let mut reader = BufReader::new(event_log);
+    let mut events = Vec::new();
+    let mut line = Vec::new();
+    for line_number in 1.. {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("read trace event line {line_number}"))?;
+        if read == 0 {
+            break;
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice(&line) {
+            Ok(event) => events.push(event),
+            Err(err) if err.is_eof() && line.last() != Some(&b'\n') => {
+                tracing::warn!(
+                    "ignoring incomplete final trace event line {line_number} in {}",
+                    event_log_path.display()
+                );
+                break;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("parse trace event line {line_number}"));
+            }
+        }
+    }
+    Ok(events)
 }
 
 struct TraceReducer {

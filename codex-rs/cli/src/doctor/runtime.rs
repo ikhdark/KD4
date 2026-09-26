@@ -98,10 +98,23 @@ fn local_publish_target_path_from_inputs(
     Some(publish_dir.join("codex.exe"))
 }
 
+/// Hashes the local publish target once for every check that reports or verifies it; the
+/// payload is large enough that each read costs a noticeable fraction of a second.
+pub(super) async fn target_sha256(target_path: &Path) -> Result<String, String> {
+    let target_path = target_path.to_path_buf();
+    tokio::task::spawn_blocking(move || file_sha256(&target_path))
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|result| result)
+}
+
 /// Reports the local payload managed by the configured local publish path.
 /// This is intentionally passive: it does not build, publish, restart, or
 /// repair the desktop routing.
-pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
+pub(super) async fn local_publish_check(
+    target_path: PathBuf,
+    target_sha256: Result<String, String>,
+) -> DoctorCheck {
     let current_exe = env::current_exe().ok();
     let current_is_target = current_exe
         .as_deref()
@@ -123,14 +136,7 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
     ];
     push_path_detail(&mut details, "current executable", current_exe.as_deref());
 
-    match tokio::task::spawn_blocking({
-        let target_path = target_path.clone();
-        move || file_sha256(&target_path)
-    })
-    .await
-    .map_err(|err| err.to_string())
-    .and_then(|result| result)
-    {
+    match target_sha256 {
         Ok(hash) => details.push(format!("target sha256: {hash}")),
         Err(err) => details.push(format!("target sha256: <unavailable: {err}>")),
     }
@@ -254,6 +260,7 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
 /// from the selected local target, without starting or stopping Desktop.
 pub(super) async fn desktop_runtime_chain_check(
     target_path: PathBuf,
+    target_sha256: Result<String, String>,
     expected_codex_home: Option<PathBuf>,
     show_details: bool,
 ) -> DoctorCheck {
@@ -337,6 +344,7 @@ pub(super) async fn desktop_runtime_chain_check(
             &receipt,
             &processes,
             &target_path,
+            target_sha256.as_deref().map_err(String::as_str),
             std::process::id(),
             &expected_codex_home,
         )
@@ -574,6 +582,7 @@ fn validate_desktop_runtime_receipt(
     receipt: &DesktopRuntimeReceipt,
     processes: &[DesktopProcessEvidence],
     target_path: &Path,
+    target_sha256: Result<&str, &str>,
     current_pid: u32,
     expected_codex_home: &Path,
 ) -> Result<(), String> {
@@ -612,7 +621,7 @@ fn validate_desktop_runtime_receipt(
         return Err("receipt CODEX_HOME does not match the intended fork home".to_string());
     }
     let target_sha256 =
-        file_sha256(target_path).map_err(|err| format!("could not hash selected binary: {err}"))?;
+        target_sha256.map_err(|err| format!("could not hash selected binary: {err}"))?;
     if receipt.executable_sha256 != target_sha256 {
         return Err("receipt executable hash does not match the selected binary".to_string());
     }
@@ -780,6 +789,10 @@ mod tests {
         }
     }
 
+    fn target_hash(path: &Path) -> String {
+        file_sha256(path).expect("hash test binary")
+    }
+
     #[tokio::test]
     async fn bundled_search_must_execute_successfully() {
         let temp = tempfile::tempdir().unwrap();
@@ -805,7 +818,14 @@ mod tests {
             .collect();
         let processes = prioritize_desktop_processes(processes, &target);
         assert_eq!(
-            validate_desktop_runtime_receipt(&receipt, &processes, &target, 99, &home),
+            validate_desktop_runtime_receipt(
+                &receipt,
+                &processes,
+                &target,
+                Ok(&target_hash(&target)),
+                99,
+                &home
+            ),
             Ok(())
         );
         let mut details = Vec::new();
@@ -884,10 +904,21 @@ mod tests {
     #[tokio::test]
     async fn missing_local_publish_target_warns() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let check = local_publish_check(temp.path().join("missing-codex")).await;
+        let target = temp.path().join("missing-codex");
+        let hash = target_sha256(&target).await;
+        assert!(hash.is_err(), "a missing target cannot be hashed");
+        let check = local_publish_check(target, hash).await;
 
         assert_eq!(check.status, CheckStatus::Warning);
         assert_eq!(check.summary, "local publish target is missing");
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|detail| detail.starts_with("target sha256: <unavailable: ")),
+            "{:?}",
+            check.details
+        );
     }
 
     #[cfg(windows)]
@@ -976,8 +1007,15 @@ mod tests {
         let home = temp.path().join("LOCAL-KD");
         let receipt = matching_receipt(target.clone(), home.clone(), 42);
 
-        let err = validate_desktop_runtime_receipt(&receipt, &[], &target, 10, &home)
-            .expect_err("an absent receipt PID must not prove a Desktop restart");
+        let err = validate_desktop_runtime_receipt(
+            &receipt,
+            &[],
+            &target,
+            Ok(&target_hash(&target)),
+            10,
+            &home,
+        )
+        .expect_err("an absent receipt PID must not prove a Desktop restart");
 
         assert!(err.contains("not live"), "unexpected error: {err}");
     }
@@ -995,8 +1033,15 @@ mod tests {
         let mut receipt = matching_receipt(target.clone(), home.clone(), 42);
         receipt.client_name = "codex_vscode".to_string();
 
-        let err = validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
-            .expect_err("a non-Desktop receipt must not prove a Desktop restart");
+        let err = validate_desktop_runtime_receipt(
+            &receipt,
+            &processes,
+            &target,
+            Ok(&target_hash(&target)),
+            10,
+            &home,
+        )
+        .expect_err("a non-Desktop receipt must not prove a Desktop restart");
 
         assert!(err.contains("not Codex Desktop"), "unexpected error: {err}");
     }
@@ -1015,15 +1060,27 @@ mod tests {
         }];
 
         let wrong_binary_receipt = matching_receipt(wrong_binary, home.clone(), 42);
-        let binary_err =
-            validate_desktop_runtime_receipt(&wrong_binary_receipt, &processes, &target, 10, &home)
-                .expect_err("a wrong receipt executable must fail");
+        let binary_err = validate_desktop_runtime_receipt(
+            &wrong_binary_receipt,
+            &processes,
+            &target,
+            Ok(&wrong_binary_receipt.executable_sha256),
+            10,
+            &home,
+        )
+        .expect_err("a wrong receipt executable must fail");
         assert!(binary_err.contains("executable"));
 
         let wrong_home_receipt = matching_receipt(target.clone(), wrong_home, 42);
-        let home_err =
-            validate_desktop_runtime_receipt(&wrong_home_receipt, &processes, &target, 10, &home)
-                .expect_err("a wrong receipt CODEX_HOME must fail");
+        let home_err = validate_desktop_runtime_receipt(
+            &wrong_home_receipt,
+            &processes,
+            &target,
+            Ok(&target_hash(&target)),
+            10,
+            &home,
+        )
+        .expect_err("a wrong receipt CODEX_HOME must fail");
         assert!(home_err.contains("CODEX_HOME"));
     }
 
@@ -1039,8 +1096,15 @@ mod tests {
         }];
         let receipt = matching_receipt(target.clone(), home.clone(), 42);
 
-        validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
-            .expect("matching live receipt should prove the selected fork runtime");
+        validate_desktop_runtime_receipt(
+            &receipt,
+            &processes,
+            &target,
+            Ok(&target_hash(&target)),
+            10,
+            &home,
+        )
+        .expect("matching live receipt should prove the selected fork runtime");
     }
 
     #[test]
@@ -1056,13 +1120,27 @@ mod tests {
         let mut receipt = matching_receipt(target.clone(), home.clone(), 42);
         receipt.build_commit = "receipt-producer-build".to_string();
         receipt.build_built = "receipt-producer-time".to_string();
+        let hash = target_hash(&target);
 
-        validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
+        validate_desktop_runtime_receipt(&receipt, &processes, &target, Ok(&hash), 10, &home)
             .expect("producer metadata may differ from the doctor when the file hash matches");
 
+        // The shared hash is authoritative; validation does not reread the payload.
+        let err = validate_desktop_runtime_receipt(
+            &receipt,
+            &processes,
+            &target,
+            Err("access denied"),
+            10,
+            &home,
+        )
+        .expect_err("an unhashable payload must not validate");
+        assert_eq!(err, "could not hash selected binary: access denied");
+
         receipt.executable_sha256 = "0".repeat(64);
-        let err = validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
-            .expect_err("a receipt for different bytes must not validate");
+        let err =
+            validate_desktop_runtime_receipt(&receipt, &processes, &target, Ok(&hash), 10, &home)
+                .expect_err("a receipt for different bytes must not validate");
         assert!(err.contains("hash"), "unexpected error: {err}");
     }
 }

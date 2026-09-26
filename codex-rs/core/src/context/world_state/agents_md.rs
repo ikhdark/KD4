@@ -114,9 +114,10 @@ impl WorldStateSection for AgentsMdState {
             text: expected_body.to_string(),
         };
         let rendered = instructions.render();
-        let (header, body) = rendered
-            .split_once("<INSTRUCTIONS>\n")
-            .expect("instruction framing");
+        // Unframed renders cannot be matched against retained text; resend them.
+        let Some((header, body)) = rendered.split_once("<INSTRUCTIONS>\n") else {
+            return false;
+        };
         let header = header.trim_end();
         text.starts_with(&format!("{header}\n\n"))
             && text

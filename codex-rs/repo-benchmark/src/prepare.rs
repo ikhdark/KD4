@@ -371,6 +371,12 @@ fn checkout(source: &SourceIdentity) -> Result<()> {
                     "--no-tags",
                     "--config",
                     "core.longpaths=true",
+                    // Built bytes must be the recorded tree's blobs, not the
+                    // host's line-ending conversion (include_str! embeds them).
+                    "--config",
+                    "core.autocrlf=false",
+                    "--config",
+                    "core.eol=lf",
                     "--",
                 ])
                 .arg(provenance::git_path(&source.origin))

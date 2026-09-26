@@ -789,6 +789,42 @@ async fn manual_interrupt_restores_pending_steers_to_composer() {
 }
 
 #[tokio::test]
+async fn steer_that_started_a_new_turn_is_not_restored_when_the_old_turn_is_interrupted() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+
+    chat.bottom_pane.set_composer_text(
+        "sent after the turn ended".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert!(chat.has_pending_steer(&items));
+
+    // The server had already ended turn-1, so the app started a new turn with this input.
+    chat.on_steer_started_turn(&items);
+    handle_turn_interrupted(&mut chat, "turn-1");
+
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+    assert_no_submit_op(&mut op_rx);
+
+    handle_turn_started(&mut chat, "turn-2");
+    complete_user_message(&mut chat, "user-2", "sent after the turn ended");
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .filter(|cell| lines_to_single_string(cell).contains("sent after the turn ended"))
+        .count();
+    assert_eq!(rendered, 1);
+    assert!(chat.input_queue.promoted_steers.is_empty());
+}
+
+#[tokio::test]
 async fn esc_interrupt_sends_all_pending_steers_immediately_and_keeps_existing_draft() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());

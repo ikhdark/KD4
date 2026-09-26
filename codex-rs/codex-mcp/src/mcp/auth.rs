@@ -272,19 +272,32 @@ async fn compute_auth_status(
             let http_client = runtime_context
                 .resolve_http_client(server_name, config)
                 .map_err(anyhow::Error::msg)?;
-            determine_streamable_http_auth_status_with_http_client(
-                codex_home,
-                server_name,
-                url,
-                bearer_token_env_var.as_deref(),
-                http_headers.clone(),
-                env_http_headers.clone(),
-                store_mode,
-                keyring_backend_kind,
-                http_client,
+            // Session startup waits for this discovery, which belongs to starting
+            // this server, so it may not outlast the server's own startup budget.
+            let startup_timeout = config
+                .startup_timeout_sec
+                .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
+            tokio::time::timeout(
+                startup_timeout,
+                determine_streamable_http_auth_status_with_http_client(
+                    codex_home,
+                    server_name,
+                    url,
+                    bearer_token_env_var.as_deref(),
+                    http_headers.clone(),
+                    env_http_headers.clone(),
+                    store_mode,
+                    keyring_backend_kind,
+                    http_client,
+                )
+                .boxed(),
             )
-            .boxed()
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "OAuth discovery did not finish within the {startup_timeout:?} startup timeout"
+                )
+            })?
         }
     }
 }
@@ -299,6 +312,85 @@ mod tests {
     use super::ResolvedMcpOAuthScopes;
     use super::resolve_oauth_scopes;
     use super::should_retry_without_scopes;
+
+    #[tokio::test]
+    async fn auth_status_discovery_is_bounded_by_the_server_startup_timeout() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
+        use codex_config::McpServerConfig;
+        use codex_config::McpServerTransportConfig;
+        use codex_config::types::AuthKeyringBackendKind;
+        use codex_config::types::OAuthCredentialsStoreMode;
+        use codex_exec_server::EnvironmentManager;
+        use codex_rmcp_client::McpAuthState;
+
+        use crate::runtime::McpRuntimeContext;
+        use crate::server::EffectiveMcpServer;
+
+        // Accept every connection but never answer, like a stalled HTTP server.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("address"));
+        let accept_loop = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let codex_home = tempfile::tempdir().expect("codex home");
+        let server = EffectiveMcpServer::configured(McpServerConfig {
+            auth: Default::default(),
+            transport: McpServerTransportConfig::StreamableHttp {
+                url,
+                bearer_token_env_var: None,
+                http_headers: None,
+                env_http_headers: None,
+            },
+            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+            enabled: true,
+            required: false,
+            supports_parallel_tool_calls: false,
+            disabled_reason: None,
+            startup_timeout_sec: Some(Duration::from_millis(500)),
+            tool_timeout_sec: None,
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth: None,
+            oauth_resource: None,
+            tools: HashMap::new(),
+        });
+        let servers = HashMap::from([("stalled".to_string(), server)]);
+        let runtime_context = McpRuntimeContext::new(
+            Arc::new(EnvironmentManager::without_environments()),
+            codex_home.path().to_path_buf(),
+        );
+
+        let started = std::time::Instant::now();
+        let statuses = super::compute_auth_statuses(
+            &servers,
+            codex_home.path(),
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            /*auth*/ None,
+            &runtime_context,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        accept_loop.abort();
+
+        assert_eq!(statuses["stalled"].auth_state, McpAuthState::Unsupported);
+        // One unanswered probe alone takes the 5s per-request discovery bound.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "discovery held startup for {elapsed:?}"
+        );
+    }
 
     #[test]
     fn resolve_oauth_scopes_prefers_explicit() {

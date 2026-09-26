@@ -45,7 +45,16 @@ use tracing::info;
 use tracing::warn;
 
 static PROCESS_COUNTER: AtomicUsize = AtomicUsize::new(1);
-pub(super) const MCP_STDIO_MAX_LINE_BYTES: usize = 1024 * 1024;
+/// Longest stderr diagnostic line retained for logging; longer lines are dropped.
+pub(super) const MCP_STDERR_MAX_LINE_BYTES: usize = 1024 * 1024;
+/// Longest stdout JSON-RPC message accepted before the transport closes.
+///
+/// Tool results routinely carry multi-megabyte base64 payloads such as
+/// screenshots, and local stdio accepts them without a limit. This bound only
+/// stops an unterminated stream from growing forever, so it matches the
+/// exec-server's own 64 MiB JSON-RPC message limit rather than the diagnostic
+/// line limit.
+const MCP_STDOUT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct LineBuffer {
@@ -340,11 +349,11 @@ impl ExecutorProcessTransport {
             ExecOutputStream::Stdout | ExecOutputStream::Pty => {
                 if self
                     .stdout
-                    .extend_from_slice(&bytes, MCP_STDIO_MAX_LINE_BYTES)
+                    .extend_from_slice(&bytes, MCP_STDOUT_MAX_MESSAGE_BYTES)
                     .is_err()
                 {
                     warn!(
-                        "Remote MCP server stdout line exceeded the {MCP_STDIO_MAX_LINE_BYTES}-byte limit ({}); closing transport",
+                        "Remote MCP server stdout message exceeded the {MCP_STDOUT_MAX_MESSAGE_BYTES}-byte limit ({}); closing transport",
                         self.program_name
                     );
                     self.stdout.clear();
@@ -388,11 +397,11 @@ impl ExecutorProcessTransport {
         // produce one log record per byte chunk.
         if self
             .stderr
-            .extend_from_slice(bytes, MCP_STDIO_MAX_LINE_BYTES)
+            .extend_from_slice(bytes, MCP_STDERR_MAX_LINE_BYTES)
             .is_err()
         {
             warn!(
-                "MCP server stderr line exceeded the {MCP_STDIO_MAX_LINE_BYTES}-byte limit ({}); discarding buffered diagnostics",
+                "MCP server stderr line exceeded the {MCP_STDERR_MAX_LINE_BYTES}-byte limit ({}); discarding buffered diagnostics",
                 self.program_name
             );
             self.stderr.clear();

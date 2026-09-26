@@ -4,6 +4,7 @@ use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
+use app_test_support::write_mock_provider_config_toml;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
@@ -53,7 +54,7 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -181,7 +182,7 @@ async fn thread_start_rejects_hidden_dynamic_tools_without_namespace() -> Result
     let server = MockServer::start().await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -223,7 +224,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
     let server = MockServer::start().await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
     let project = TempDir::new()?;
     let config_path = codex_home.path().join("config.toml");
     let original_config = std::fs::read_to_string(&config_path)?;
@@ -377,7 +378,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -613,7 +614,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
     let server = create_mock_responses_server_sequence_unchecked(response_sequence).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -959,27 +960,4 @@ async fn wait_for_dynamic_tool_completed(
             return Ok(completed);
         }
     }
-}
-
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
 }

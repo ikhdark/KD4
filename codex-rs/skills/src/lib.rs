@@ -13,6 +13,7 @@ const SYSTEM_SKILLS_DIR_NAME: &str = ".system";
 const SKILLS_DIR_NAME: &str = "skills";
 const SYSTEM_SKILLS_MARKER_FILENAME: &str = ".codex-system-skills.marker";
 const SYSTEM_SKILLS_MARKER_SALT: &str = "v1";
+const SYSTEM_SKILLS_STAGING_PREFIX: &str = ".system-staging-";
 
 /// Returns the on-disk cache location for embedded system skills from an absolute CODEX_HOME.
 pub fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
@@ -64,8 +65,9 @@ fn install_system_skills_with(
         return Ok(());
     }
 
+    remove_abandoned_staging_dirs(&skills_root_dir);
     let staging = tempfile::Builder::new()
-        .prefix(".system-staging-")
+        .prefix(SYSTEM_SKILLS_STAGING_PREFIX)
         .tempdir_in(skills_root_dir.as_path())
         .map_err(|source| SystemSkillsError::io("create system skills staging dir", source))?;
     let staged_system = AbsolutePathBuf::from_absolute_path(staging.path())
@@ -95,6 +97,25 @@ fn install_system_skills_with(
             .map_err(|source| SystemSkillsError::io("remove system skills backup", source))?;
     }
     Ok(())
+}
+
+/// Staging directories are removed by `TempDir`'s destructor, which does not run when an
+/// installer process is killed. Every installer holds the shared lock, so any staging directory
+/// seen here belongs to an abandoned install. Cleanup is best-effort and never blocks publishing.
+fn remove_abandoned_staging_dirs(skills_root_dir: &AbsolutePathBuf) {
+    let Ok(entries) = fs::read_dir(skills_root_dir.as_path()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SYSTEM_SKILLS_STAGING_PREFIX)
+            && entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn lock_system_skills(codex_home: &AbsolutePathBuf) -> Result<fs::File, SystemSkillsError> {
@@ -308,6 +329,39 @@ mod tests {
         assert!(!backup.as_path().exists());
         uninstall_system_skills(&home).expect("uninstall");
         assert!(!dest.as_path().exists());
+    }
+
+    #[test]
+    fn reinstall_reclaims_staging_dirs_abandoned_by_interrupted_installs() {
+        use super::*;
+        let home = tempfile::tempdir().expect("home");
+        let home = AbsolutePathBuf::from_absolute_path(home.path()).expect("absolute home");
+        let skills_root = home.join(SKILLS_DIR_NAME);
+        let abandoned = skills_root.join(format!("{SYSTEM_SKILLS_STAGING_PREFIX}interrupted"));
+        fs::create_dir_all(abandoned.join("skill-creator").as_path()).expect("abandoned staging");
+        fs::write(
+            abandoned.join("skill-creator/SKILL.md").as_path(),
+            "partial",
+        )
+        .expect("partial staged file");
+        let user_skill = skills_root.join("user-skill");
+        fs::create_dir_all(user_skill.as_path()).expect("user skill");
+
+        install_system_skills(&home).expect("install");
+
+        assert!(!abandoned.as_path().exists());
+        assert!(user_skill.as_path().is_dir());
+        let staging_dirs = fs::read_dir(skills_root.as_path())
+            .expect("skills root")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(SYSTEM_SKILLS_STAGING_PREFIX)
+            })
+            .count();
+        assert_eq!(staging_dirs, 0);
     }
 
     #[test]

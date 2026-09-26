@@ -50,6 +50,37 @@ async fn concurrent_workspace_settings_requests_share_cached_false() {
 }
 
 #[tokio::test]
+async fn concurrent_waiters_share_a_failed_refresh_but_later_calls_retry() {
+    let (_home, mut config, auth) = workspace_config().await;
+    let server = MockServer::start().await;
+    config.chatgpt_base_url = server.uri();
+    // One slow failure for three queued callers, then one retry by a later call.
+    Mock::given(method("GET"))
+        .and(path("/accounts/account-a/settings"))
+        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(200)))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let cache = WorkspaceSettingsCache::default();
+    let (first, second, third) = tokio::join!(
+        codex_plugins_enabled_for_workspace(&config, Some(&auth), Some(&cache)),
+        codex_plugins_enabled_for_workspace(&config, Some(&auth), Some(&cache)),
+        codex_plugins_enabled_for_workspace(&config, Some(&auth), Some(&cache)),
+    );
+    let errors = [first, second, third].map(|result| result.expect_err("HTTP 503").to_string());
+    assert_eq!(
+        errors,
+        ["Request failed with status 503 Service Unavailable: "; 3].map(str::to_string)
+    );
+    assert!(
+        codex_plugins_enabled_for_workspace(&config, Some(&auth), Some(&cache))
+            .await
+            .is_err()
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn workspace_settings_identity_misses_do_not_leak_or_evict_cached_false() {
     let (_home, mut config, auth) = workspace_config().await;
     let server = MockServer::start().await;

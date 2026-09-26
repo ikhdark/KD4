@@ -286,7 +286,8 @@ impl PathUri {
     /// Path text is interpreted using the POSIX or Windows convention inferred
     /// from the base URI. An absolute path replaces the base URI's path, while a
     /// relative path is appended lexically. Windows root-relative paths retain
-    /// the base drive or UNC share, while drive-relative paths are rejected.
+    /// the base drive or UNC share, while drive-relative paths and UNC prefixes
+    /// without a share are rejected.
     /// Empty and `.` segments are ignored, while `..` removes one segment
     /// without escaping the POSIX root, Windows drive, or UNC share. Literal
     /// `%`, `?`, and `#` characters are percent-encoded as filename text. Paths
@@ -314,8 +315,11 @@ impl PathUri {
             return Ok(absolute);
         }
         let path_bytes = path.as_bytes();
+        // A UNC prefix without a share, such as `\\server`, is not relative to the base either.
         if convention == PathConvention::Windows
-            && matches!(path_bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+            && (matches!(path_bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+                || matches!(path_bytes, [first, second, ..]
+                    if is_windows_separator_byte(*first) && is_windows_separator_byte(*second)))
         {
             return Err(PathUriParseError::InvalidFileUriPath {
                 path: path.to_string(),
@@ -420,7 +424,16 @@ impl PathUri {
             ));
         }
 
-        let path = self.0.to_file_path().map_err(|()| {
+        // Lexical parents and joins stop at `file:///C:`, the drive root. `Url::to_file_path`
+        // renders that URI as the drive-relative path `C:` (and debug-asserts that its result is
+        // absolute), so give the root its separator.
+        let path = match self.0.path().as_bytes() {
+            [b'/', drive, b':'] if self.0.host_str().is_none() && drive.is_ascii_alphabetic() => {
+                Ok(PathBuf::from(format!("{}:\\", char::from(*drive))))
+            }
+            _ => self.0.to_file_path(),
+        }
+        .map_err(|()| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 PathUriParseError::InvalidFileUriPath {

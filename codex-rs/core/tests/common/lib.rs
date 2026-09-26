@@ -1,11 +1,8 @@
 #![allow(clippy::expect_used)]
 
-use anyhow::Context as _;
-use anyhow::ensure;
-use codex_arg0::Arg0PathEntryGuard;
+use codex_test_binary_support::Arg0PathEntryGuard;
 use codex_utils_cargo_bin::CargoBinError;
 use ctor::ctor;
-use std::sync::OnceLock;
 use tempfile::TempDir;
 
 use codex_config::CloudConfigBundleLoader;
@@ -39,18 +36,18 @@ pub mod test_codex;
 pub mod test_codex_exec;
 pub mod tracing;
 
-static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
-
 #[ctor(unsafe)]
 fn enable_deterministic_unified_exec_process_ids_for_tests() {
     codex_core::test_support::set_thread_manager_test_mode(/*enabled*/ true);
     codex_core::test_support::set_deterministic_process_ids(/*enabled*/ true);
 }
 
+// The one arg0 dispatch for every test binary linking this crate: exec-server
+// local runtimes re-execute the test binary as their helper, and ordinary test
+// processes get apply_patch aliases outside the developer's Codex home.
 #[ctor(unsafe)]
-fn configure_arg0_dispatch_for_test_binaries() {
-    let _ = TEST_ARG0_PATH_ENTRY.get_or_init(codex_arg0::arg0_dispatch);
-}
+static TEST_BINARY_DISPATCH: Option<Arg0PathEntryGuard> =
+    codex_test_binary_support::configure_test_binary_dispatch("codex-core-tests");
 
 #[ctor(unsafe)]
 fn configure_insta_workspace_root_for_snapshot_tests() {
@@ -69,6 +66,16 @@ fn configure_insta_workspace_root_for_snapshot_tests() {
         unsafe {
             std::env::set_var("INSTA_WORKSPACE_ROOT", workspace_root);
         }
+    }
+}
+
+#[ctor(unsafe)]
+fn isolate_state_db_from_developer_environment() {
+    // A developer shell may point the state DB at a live Codex home. Test configs
+    // must derive it from their temporary CODEX_HOME; children may still set it.
+    // Safety: this ctor runs at process startup before test threads begin.
+    unsafe {
+        std::env::remove_var("CODEX_SQLITE_HOME");
     }
 }
 
@@ -168,42 +175,6 @@ pub fn normalized_directory_write_permissions(
         )),
         ..RequestPermissionProfile::default()
     })
-}
-
-/// Fetch a DotSlash resource and return the resolved executable/file path.
-pub fn fetch_dotslash_file(
-    dotslash_file: &std::path::Path,
-    dotslash_cache: Option<&std::path::Path>,
-) -> anyhow::Result<PathBuf> {
-    let mut command = std::process::Command::new("dotslash");
-    command.arg("--").arg("fetch").arg(dotslash_file);
-    if let Some(dotslash_cache) = dotslash_cache {
-        command.env("DOTSLASH_CACHE", dotslash_cache);
-    }
-    let output = command.output().with_context(|| {
-        format!(
-            "failed to run dotslash to fetch resource {}",
-            dotslash_file.display()
-        )
-    })?;
-    ensure!(
-        output.status.success(),
-        "dotslash fetch failed for {}: {}",
-        dotslash_file.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let fetched_path = String::from_utf8(output.stdout)
-        .context("dotslash fetch output was not utf8")?
-        .trim()
-        .to_string();
-    ensure!(!fetched_path.is_empty(), "dotslash fetch output was empty");
-    let fetched_path = PathBuf::from(fetched_path);
-    ensure!(
-        fetched_path.is_file(),
-        "dotslash returned non-file path: {}",
-        fetched_path.display()
-    );
-    Ok(fetched_path)
 }
 
 /// Returns a default `Config` whose on-disk state is confined to the provided
@@ -399,10 +370,6 @@ where
     .await
 }
 
-pub fn sandbox_env_var() -> &'static str {
-    codex_core::spawn::CODEX_SANDBOX_ENV_VAR
-}
-
 pub fn sandbox_network_env_var() -> &'static str {
     codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
 }
@@ -433,7 +400,7 @@ pub fn format_with_current_shell_display_non_login(command: &str) -> String {
 /// the caller propagates it; a required helper must never turn into a silent
 /// pass. The owning test target declares the helper in
 /// `codex-rs/.config/kd4-rust-tests.toml`, which builds it before the run.
-pub fn required_helper_bin(name: &str) -> Result<String, CargoBinError> {
+fn required_helper_bin(name: &str) -> Result<String, CargoBinError> {
     codex_utils_cargo_bin::cargo_bin(name).map(|path| path.to_string_lossy().to_string())
 }
 

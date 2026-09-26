@@ -39,7 +39,6 @@ use crate::context::is_startup_contextual_user_fragment;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
-use crate::context_manager::compact_acknowledged_tool_search_outputs;
 use crate::feedback_tags;
 use crate::hook_runtime::emit_hook_stop_reason;
 use crate::hook_runtime::inspect_pending_input;
@@ -194,7 +193,6 @@ use codex_utils_stream_parser::AssistantTextChunk;
 use codex_utils_stream_parser::AssistantTextStreamParser;
 use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::extract_proposed_plan_text;
-use codex_utils_stream_parser::strip_citations;
 use futures::future::BoxFuture;
 use futures::future::Either;
 use futures::prelude::*;
@@ -2067,16 +2065,12 @@ async fn build_pure_pending_turn_plan(
         plan_mcp_dependencies(sess, turn_context, &mentioned_skills),
         plan_skill_injections(&mentioned_skills, Some(skills_outcome))
     );
-    let rendered_skill_items = skill_plan
+    let skill_connector_items = skill_plan
         .injections
         .items
         .iter()
-        .map(|skill| (skill.role(), skill.render()))
-        .collect::<Vec<_>>();
-    let skill_connector_items = rendered_skill_items
-        .iter()
-        .map(|(role, text)| {
-            ContextualUserFragment::into(RenderedContextFragment::new(role, text.clone()))
+        .map(|skill| {
+            ContextualUserFragment::into(RenderedContextFragment::new(skill.role(), skill.render()))
         })
         .collect::<Vec<_>>();
     let skill_connector_ids = collect_explicit_app_ids_from_skill_items(
@@ -2084,7 +2078,6 @@ async fn build_pure_pending_turn_plan(
         &available_connectors,
         &skill_name_counts_lower,
     );
-    let skill_items = build_bounded_skill_context_items(rendered_skill_items);
     let plugin_items = build_plugin_injections(
         &mentioned_plugins,
         mcp_tools,
@@ -2115,17 +2108,12 @@ async fn build_pure_pending_turn_plan(
     let injected_host_skill_prompts = turn_context
         .extension_data
         .get::<InjectedHostSkillPrompts>();
-    let mut injection_items = match injected_host_skill_prompts {
-        Some(injected_host_skill_prompts) => build_bounded_skill_context_items(
-            skill_plan
-                .injections
-                .items
-                .iter()
-                .filter(|skill| !injected_host_skill_prompts.contains_path(&skill.path))
-                .map(|skill| (skill.role(), skill.render())),
-        ),
-        None => skill_items,
-    };
+    let mut injection_items =
+        build_bounded_skill_context_items(skill_plan.injections.items.iter().filter(|skill| {
+            injected_host_skill_prompts
+                .as_ref()
+                .is_none_or(|prompts| !prompts.contains_path(&skill.path))
+        }));
     let base_instructions = Arc::clone(&turn_context.base_instructions);
     // The task-model guidance fragment is opt-in: every request re-sends it
     // and its provenance labels leak into final answers. Base instructions
@@ -2643,15 +2631,18 @@ fn projected_prompt_tokens_from_estimates(
     locally_estimated_prompt.max(server_usage_with_pending_body)
 }
 
-fn build_bounded_skill_context_items(
-    rendered_skill_items: impl IntoIterator<Item = (&'static str, String)>,
-) -> Vec<ResponseItem> {
+fn build_bounded_skill_context_items<'a, F>(
+    skill_fragments: impl IntoIterator<Item = &'a F>,
+) -> Vec<ResponseItem>
+where
+    F: ContextualUserFragment + 'a,
+{
     let mut budget = ModelContextBudget::default();
-    rendered_skill_items
+    skill_fragments
         .into_iter()
-        .filter_map(|(role, text)| {
-            budget.take(&text).map(|text| {
-                ContextualUserFragment::into(RenderedContextFragment::new(role, text.into_owned()))
+        .filter_map(|fragment| {
+            budget.take_fragment(fragment).map(|text| {
+                ContextualUserFragment::into(RenderedContextFragment::new(fragment.role(), text))
             })
         })
         .collect()
@@ -2734,9 +2725,8 @@ async fn build_extension_turn_input_items(
     while let Some(contributed_fragments) = pending.next().await {
         let contributed_fragments = contributed_fragments?;
         items.extend(contributed_fragments.into_iter().filter_map(|fragment| {
-            let role = fragment.role();
-            budget.take(&fragment.render()).map(|text| {
-                ContextualUserFragment::into(RenderedContextFragment::new(role, text.into_owned()))
+            budget.take_fragment(fragment.as_ref()).map(|text| {
+                ContextualUserFragment::into(RenderedContextFragment::new(fragment.role(), text))
             })
         }));
     }
@@ -3216,54 +3206,6 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
     connector_ids
 }
 
-#[derive(Debug)]
-struct CompactedProjectedPromptInputs {
-    input: Arc<[ResponseItem]>,
-    stable_context_fallback_input: Arc<[ResponseItem]>,
-    tool_history_fallback_input: Arc<[ResponseItem]>,
-    stable_context_tool_history_fallback_input: Arc<[ResponseItem]>,
-    #[cfg(test)]
-    pass_count: usize,
-}
-
-fn compact_projected_prompt_inputs(
-    prepared: &PreparedPromptInput,
-) -> CompactedProjectedPromptInputs {
-    let [
-        input,
-        stable_context_fallback_input,
-        tool_history_fallback_input,
-        stable_context_tool_history_fallback_input,
-    ] = prepared.compacted_tool_search_outputs(compact_acknowledged_tool_search_outputs);
-    #[cfg(test)]
-    let pass_count = {
-        let compacted = [
-            &input,
-            &stable_context_fallback_input,
-            &tool_history_fallback_input,
-            &stable_context_tool_history_fallback_input,
-        ];
-        compacted
-            .iter()
-            .enumerate()
-            .filter(|(index, candidate)| {
-                !compacted[..*index]
-                    .iter()
-                    .any(|prior| Arc::ptr_eq(prior, candidate))
-            })
-            .count()
-    };
-
-    CompactedProjectedPromptInputs {
-        input,
-        stable_context_fallback_input,
-        tool_history_fallback_input,
-        stable_context_tool_history_fallback_input,
-        #[cfg(test)]
-        pass_count,
-    }
-}
-
 #[instrument(level = "trace", skip_all)]
 pub(crate) fn build_prompt(
     input: impl Into<Arc<[ResponseItem]>>,
@@ -3271,7 +3213,7 @@ pub(crate) fn build_prompt(
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
-    let input = compact_acknowledged_tool_search_outputs(input.into());
+    let input = input.into();
     Prompt {
         input: Arc::clone(&input),
         stable_context_fallback_input: Arc::clone(&input),
@@ -3684,14 +3626,12 @@ fn build_projected_prompt_from_scaffold(
     resolved_scaffold: &ResolvedRequestScaffold,
 ) -> Prompt {
     let scaffold = resolved_scaffold.scaffold.as_ref();
-    let CompactedProjectedPromptInputs {
+    let [
         input,
-        stable_context_fallback_input: fallback_input,
+        fallback_input,
         tool_history_fallback_input,
         stable_context_tool_history_fallback_input,
-        #[cfg(test)]
-            pass_count: _,
-    } = compact_projected_prompt_inputs(prepared);
+    ] = prepared.shared_prompt_projections();
     let digests = PromptDigests {
         history: prepared.fingerprint(),
         ..scaffold.digests
@@ -4080,8 +4020,48 @@ async fn finalized_router_matches_current_exposure(
     step_context: &StepContext,
     router: &ToolRouter,
 ) -> bool {
-    router.exposure_identity().dynamic_identity()
-        == current_dynamic_tool_exposure_identity(sess, step_context).await
+    if router.exposure_identity().dynamic_identity()
+        != current_dynamic_tool_exposure_identity(sess, step_context).await
+    {
+        return false;
+    }
+    let turn_context = step_context.turn.as_ref();
+    if !tool_suggest_enabled(turn_context) {
+        return router.tool_suggest_candidates.is_none();
+    }
+    let loaded_plugins = sess
+        .services
+        .plugins_manager
+        .plugins_for_config(&turn_context.config.plugins_config_input())
+        .await;
+    // Advisory catalog fetches can finish without changing the turn config.
+    router.tool_suggest_candidates
+        == cached_tool_suggest_candidates(sess, turn_context, &loaded_plugins).await
+}
+
+async fn cached_tool_suggest_candidates(
+    sess: &Session,
+    turn_context: &TurnContext,
+    loaded_plugins: &PluginLoadOutcome,
+) -> Option<ToolSuggestCandidates> {
+    if !tool_suggest_enabled(turn_context) {
+        return None;
+    }
+    let auth = sess.services.auth_manager.auth().await;
+    let plugins_config = turn_context.config.plugins_config_input();
+    sess.services
+        .plugins_manager
+        .cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+            plugins_config: &plugins_config,
+            loaded_plugins,
+            auth: auth.as_ref(),
+            disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
+            app_server_client_name: turn_context.app_server_client_name.as_deref(),
+        })
+        .map(|tools| ToolSuggestCandidates {
+            tools,
+            presentation: ToolSuggestPresentation::RecommendationContext,
+        })
 }
 
 async fn current_dynamic_tool_exposure_identity(
@@ -4296,31 +4276,8 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
-    let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
-    let auth = if tool_suggest_is_enabled {
-        sess.services.auth_manager.auth().await
-    } else {
-        None
-    };
-    let endpoint_recommended_plugin_candidates = if tool_suggest_is_enabled {
-        let plugins_config = turn_context.config.plugins_config_input();
-        sess.services
-            .plugins_manager
-            .cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
-                plugins_config: &plugins_config,
-                loaded_plugins: &loaded_plugins,
-                auth: auth.as_ref(),
-                disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
-                app_server_client_name: turn_context.app_server_client_name.as_deref(),
-            })
-    } else {
-        None
-    };
     let tool_suggest_candidates =
-        endpoint_recommended_plugin_candidates.map(|tools| ToolSuggestCandidates {
-            tools,
-            presentation: ToolSuggestPresentation::RecommendationContext,
-        });
+        cached_tool_suggest_candidates(sess, turn_context, &loaded_plugins).await;
     let mcp_tool_exposure = build_mcp_tool_exposure(
         all_mcp_tools,
         connectors.as_deref(),
@@ -4967,7 +4924,6 @@ async fn maybe_complete_plan_item_from_message(
             }
         }
         if let Some(plan_text) = extract_proposed_plan_text(&text) {
-            let (plan_text, _) = strip_citations(&plan_text);
             if !state.plan_item_state.started {
                 state.plan_item_state.start(sess, turn_context).await;
             }

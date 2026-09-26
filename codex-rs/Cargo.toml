@@ -298,7 +298,6 @@ flate2 = "1.1.8"
 futures = { version = "0.3", default-features = false }
 fs2 = "0.4.3"
 gethostname = "1.1.0"
-gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
 glob = "0.3"
 globset = "0.4"
 hmac = "0.12.1"
@@ -330,7 +329,8 @@ maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
 multimap = "0.10.0"
-notify = "8.2.0"
+# 9.0 reports discarded Windows change details and deleted watched directories.
+notify = "9.0.0-rc.5"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
 objc2-foundation = { version = "0.3.2", default-features = false }
 # OAuth HTTP goes through codex-exec-server's HttpClient; the default
@@ -387,12 +387,9 @@ rustls-pki-types = "1.14.0"
 schannel = "0.1"
 schemars = { version = "0.8.22", features = ["indexmap2"] }
 semver = "1.0"
-# 0.47 is the first release whose transport uses reqwest 0.13 (shared with
-# codex-http-client) instead of a second reqwest 0.12 stack.
-sentry = { version = "0.47.0", default-features = false, features = [
-    "reqwest",
-    "rustls",
-] }
+# Only the envelope types are used; codex-feedback sends envelopes through
+# codex-http-client so uploads honor Codex CA/proxy policy and report failures.
+sentry = { version = "0.47.0", default-features = false }
 serde = { version = "1", features = ["rc"] }
 serde_ignored = "0.1.14"
 serde_json = "1"

@@ -596,6 +596,35 @@ pub(super) async fn ensure_conversation_listener_for_instance(
     Ok(EnsureConversationListenerResult::Attached)
 }
 
+/// Starts the listener that owns idle unload for a created thread with no
+/// connection to subscribe. Subscription normally starts it, so a creator that
+/// disconnects before attaching would otherwise leave the loaded thread
+/// unsupervised until the server exits.
+pub(super) async fn supervise_unsubscribed_thread(
+    listener_task_context: ListenerTaskContext,
+    conversation_id: ThreadId,
+    conversation: Arc<CodexThread>,
+) -> Result<(), JSONRPCErrorError> {
+    if listener_task_context
+        .pending_thread_unloads
+        .contains(&conversation_id)
+        .await
+    {
+        return Ok(());
+    }
+    let thread_state = listener_task_context
+        .thread_state_manager
+        .thread_state(conversation_id)
+        .await;
+    ensure_listener_task_running(
+        listener_task_context,
+        conversation_id,
+        conversation,
+        thread_state,
+    )
+    .await
+}
+
 pub(super) fn log_listener_attach_result(
     result: Result<EnsureConversationListenerResult, JSONRPCErrorError>,
     thread_id: ThreadId,
@@ -2365,6 +2394,105 @@ mod tests {
         assert!(error.contains("injected watcher initialization failure"));
         assert!(!skills_watcher.is_initialized());
         assert_eq!(skills_watcher.initialization_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unsubscribed_created_thread_gets_idle_unload_supervision() {
+        let mut fixture = LateShutdownFixture::new().await;
+        let config = fixture.thread.config().await;
+        let context = ListenerTaskContext {
+            thread_manager: Arc::clone(&fixture.thread_manager),
+            thread_state_manager: fixture.thread_state_manager.clone(),
+            outgoing: Arc::clone(&fixture.outgoing),
+            pending_thread_unloads: Arc::clone(&fixture.pending_thread_unloads),
+            thread_watch_manager: fixture.thread_watch_manager.clone(),
+            thread_list_state_permit: Arc::new(Semaphore::new(1)),
+            fallback_model_provider: config.model_provider_id.clone(),
+            codex_home: config.codex_home.to_path_buf(),
+            skills_watcher: SkillsWatcher::new(
+                fixture.thread_manager.skills_service(),
+                Arc::clone(&fixture.outgoing),
+            ),
+        };
+        assert!(
+            !fixture
+                .original_thread_state
+                .lock()
+                .await
+                .listener_matches(&fixture.thread)
+        );
+
+        supervise_unsubscribed_thread(
+            context.clone(),
+            fixture.thread_id,
+            Arc::clone(&fixture.thread),
+        )
+        .await
+        .expect("unsubscribed thread supervision should start");
+
+        assert!(
+            fixture
+                .original_thread_state
+                .lock()
+                .await
+                .listener_matches(&fixture.thread),
+            "the listener that owns idle unload must run without a subscriber"
+        );
+        assert!(
+            !fixture
+                .thread_state_manager
+                .has_subscribers(fixture.thread_id)
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture
+                .pending_thread_unloads
+                .state
+                .lock()
+                .await
+                .eligible
+                .contains_key(&fixture.thread_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the idle unsubscribed thread must become eligible for unload");
+
+        // A thread whose unload already began is not supervised again.
+        fixture.thread_state_manager.clear_all_listeners().await;
+        assert!(
+            fixture
+                .pending_thread_unloads
+                .begin(fixture.thread_id)
+                .await
+        );
+        supervise_unsubscribed_thread(context, fixture.thread_id, Arc::clone(&fixture.thread))
+            .await
+            .expect("closing thread supervision is a no-op");
+        assert!(
+            !fixture
+                .original_thread_state
+                .lock()
+                .await
+                .listener_matches(&fixture.thread)
+        );
+        fixture
+            .pending_thread_unloads
+            .finish(&fixture.thread_id)
+            .await;
+
+        fixture
+            .release_shutdown
+            .take()
+            .expect("terminal task release")
+            .send(())
+            .expect("release terminal task");
+        fixture
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("normal thread cleanup");
     }
 
     #[tokio::test]

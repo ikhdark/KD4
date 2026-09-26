@@ -525,7 +525,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     if let Some(context) = traceparent_context_from_env() {
         set_parent_from_context(&exec_span, context);
     }
-    run_exec_session(ExecRunArgs {
+    let turn_failed = run_exec_session(ExecRunArgs {
         arg0_paths,
         cli_overrides: run_cli_overrides,
         loader_overrides: run_loader_overrides,
@@ -546,7 +546,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         stderr_with_ansi,
     })
     .instrument(exec_span)
-    .await
+    .await?;
+    if turn_failed {
+        // The failure was already reported. `exit` skips destructors, so flush the
+        // failed run's spans and metrics first.
+        drop(otel);
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[allow(clippy::print_stderr)]
@@ -589,7 +596,9 @@ async fn load_bootstrap_config_or_exit(
     }
 }
 
-async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+/// Returns whether the turn failed after its failure was reported, so the caller
+/// can exit nonzero once session state and telemetry are released.
+async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     let ExecRunArgs {
         arg0_paths,
         cli_overrides,
@@ -637,9 +646,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 ));
             }
         };
-        ensure_oss_provider_ready(provider_id, &config)
-            .await
-            .map_err(|e| anyhow::anyhow!("OSS setup failed: {e}"))?;
+        ensure_oss_provider_ready(provider_id, &config).await?;
     }
 
     let default_cwd = config.cwd.to_path_buf();
@@ -1011,11 +1018,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     if let Some(message) = event_stream_error {
         anyhow::bail!(message);
     }
-    if error_seen {
-        std::process::exit(1);
-    }
 
-    Ok(())
+    Ok(error_seen)
 }
 
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {

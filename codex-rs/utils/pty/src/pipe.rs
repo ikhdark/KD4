@@ -27,6 +27,7 @@ use crate::configure_windows_command_args;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
+use crate::process::SharedPtyHandles;
 use crate::process::SpawnedProcess;
 use crate::process::exit_code_from_status;
 use crate::process::publish_exit_status;
@@ -381,7 +382,7 @@ async fn finish_pipe_process_setup(
         wait_handle,
         exit_status,
         exit_code,
-        /*pty_handles*/ None,
+        SharedPtyHandles::default(),
         /*resizer*/ None,
     );
 

@@ -536,6 +536,10 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({"authority": {"kind": "orchestrator"}}).to_string(),
     };
+    assert!(tools.iter().all(|tool| {
+        tool.conversation_history_requirement(&payload)
+            == codex_extension_api::ConversationHistoryRequirement::None
+    }));
     let output = list_tool
         .handle(ToolCall {
             turn_id: "turn-1".to_string(),
@@ -1582,6 +1586,88 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
         args["cursor"] = response["next_cursor"].clone();
     }
     assert_eq!(recovered, original_contents);
+    Ok(())
+}
+
+#[tokio::test]
+async fn omitted_selected_instructions_warn_the_user() -> TestResult {
+    // The resource appears in both the path and the recovery route, so even an empty
+    // partial fragment exceeds the whole selected-instruction budget.
+    let resource = format!("skill://orchestrator/{}/SKILL.md", "x".repeat(20_000));
+    let provider = ReadContentsProvider {
+        catalog: SkillCatalog {
+            continuation: None,
+            entries: vec![test_entry(
+                SkillSourceKind::Orchestrator,
+                "codex_apps",
+                "orchestrator/huge",
+                &resource,
+            )],
+            warnings: Vec::new(),
+        },
+        contents: "y".repeat(12_000),
+        returned_resource: None,
+        read_calls: Default::default(),
+    };
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut builder =
+        ExtensionRegistryBuilder::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    install_with_providers(
+        &mut builder,
+        SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+        skills_extension_config,
+    );
+    let registry = builder.build();
+    let session = ExtensionData::new("session");
+    let thread = ExtensionData::new("thread");
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            session_store: &session,
+            thread_store: &thread,
+        })
+        .await;
+
+    let input = TurnInputContext {
+        turn_id: "turn".to_string(),
+        user_input: vec![UserInput::Mention {
+            name: "huge".to_string(),
+            path: resource,
+        }],
+        environments: Vec::new(),
+        ready_selected_capability_roots: Vec::new(),
+    };
+    // A rebuilt pending plan contributes the same turn again; its warning is shown once.
+    let turn = ExtensionData::new("turn");
+    for _ in 0..2 {
+        let fragments = registry.turn_input_contributors()[0]
+            .contribute(&input, &session, &thread, &turn)
+            .await;
+        assert_eq!(fragments.len(), 1);
+        assert!(
+            fragments[0]
+                .render()
+                .contains("<name>Unavailable selected instructions</name>")
+        );
+    }
+    let warnings = event_rx
+        .try_iter()
+        .filter_map(|event| match event.msg {
+            EventMsg::Warning(warning) => Some(warning.message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings,
+        vec![
+            "Skill `huge` could not fit its complete recovery identity in the selected-instruction budget."
+                .to_string()
+        ]
+    );
     Ok(())
 }
 

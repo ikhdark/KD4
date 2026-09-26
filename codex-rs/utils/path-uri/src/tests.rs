@@ -515,6 +515,27 @@ fn ancestors_include_self_and_stop_at_native_path_roots() {
 }
 
 #[test]
+fn lexical_drive_roots_convert_to_the_native_drive_root() {
+    let child = PathUri::parse("file:///C:/Users").expect("valid drive URI");
+    let root = AbsolutePathBuf::from_absolute_path_checked(r"C:\").expect("absolute drive root");
+
+    for uri in [
+        child.parent().expect("drive child has a parent"),
+        child.join("..").expect("parent join stays on the drive"),
+        child
+            .join(r"\")
+            .expect("root-relative join keeps the drive"),
+        PathUri::parse("file:///C:/").expect("canonical drive root"),
+    ] {
+        assert_eq!(
+            uri.to_abs_path().expect("drive root converts"),
+            root,
+            "converting {uri}"
+        );
+    }
+}
+
+#[test]
 fn join_normalizes_relative_uri_segments() {
     for (base, relative, expected) in [
         (
@@ -708,6 +729,21 @@ fn join_rejects_windows_drive_relative_path() {
             path: r"D:tmp".to_string(),
         })
     );
+}
+
+#[test]
+fn join_rejects_windows_unc_prefix_without_share() {
+    let base = PathUri::parse("file:///C:/base").expect("valid base URI");
+
+    for path in [r"\\server", r"\\server\", "//server", r"\\"] {
+        assert_eq!(
+            base.join(path),
+            Err(PathUriParseError::InvalidFileUriPath {
+                path: path.to_string(),
+            }),
+            "joining {path}"
+        );
+    }
 }
 
 #[test]

@@ -117,6 +117,57 @@ async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn record_torn_inside_a_character_is_skipped_in_both_representations() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(911);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "before the crash")?;
+    // A killed writer can stop inside a multi-byte character of its final record.
+    let torn = serde_json::to_vec(&RolloutLine {
+        timestamp: "2025-01-03T12:00:02Z".to_string(),
+        item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "réponse".to_string(),
+            ..Default::default()
+        })),
+    })?;
+    let cut = torn.iter().position(|byte| *byte == 0xC3).expect("é") + 1;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)?
+        .write_all(&torn[..cut])?;
+    // The next append terminates the fragment in place and continues the history.
+    append_rollout_item_to_path(
+        &rollout_path,
+        &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "after the crash".to_string(),
+            ..Default::default()
+        })),
+    )
+    .await?;
+
+    for compressed in [false, true] {
+        if compressed {
+            compress_now(&rollout_path)?;
+        }
+        let (items, loaded_thread_id, parse_errors) =
+            RolloutRecorder::load_rollout_items(&rollout_path).await?;
+        assert_eq!(loaded_thread_id, Some(thread_id));
+        assert_eq!(parse_errors, 1);
+        let messages = items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::UserMessage(event)) => Some(event.message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["before the crash", "after the crash"]);
+    }
+    Ok(())
+}
+
 #[test]
 fn rollout_file_from_path_normalizes_compressed_file_names() -> anyhow::Result<()> {
     let home = TempDir::new()?;

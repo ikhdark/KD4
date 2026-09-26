@@ -14,7 +14,6 @@ use std::path::PathBuf;
 pub use detect::detect_recent_sessions;
 use export::load_session_for_import_with_content_sha256;
 pub use ledger::CompletedExternalAgentSessionImport;
-pub use ledger::has_current_session_been_imported;
 pub use ledger::record_completed_session_imports;
 pub use records::SessionSummary;
 pub use records::summarize_session;
@@ -40,7 +39,6 @@ pub struct ImportedExternalAgentSession {
 pub struct PendingSessionImport {
     pub source_path: PathBuf,
     pub source_content_sha256: String,
-    pub source_modified_at: Option<i64>,
     pub session: ImportedExternalAgentSession,
 }
 
@@ -60,7 +58,7 @@ pub fn prepare_validated_session_import(
 
 fn load_importable_session(path: &Path) -> io::Result<Option<PendingSessionImport>> {
     let source_path = std::fs::canonicalize(path)?;
-    let Some((imported_session, source_content_sha256, source_modified_at)) =
+    let Some((imported_session, source_content_sha256)) =
         load_session_for_import_with_content_sha256(&source_path)?
     else {
         return Ok(None);
@@ -71,7 +69,6 @@ fn load_importable_session(path: &Path) -> io::Result<Option<PendingSessionImpor
         .then_some(PendingSessionImport {
             source_path,
             source_content_sha256,
-            source_modified_at,
             session: imported_session,
         }))
 }

@@ -2464,6 +2464,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_requests_progress_while_required_delivery_is_full() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            // The first delta fills the one-slot queue and the second is retained
+            // behind it; the best-effort delta arrives while that event is retained.
+            for notification in [
+                agent_message_delta_notification("first"),
+                agent_message_delta_notification("second"),
+                command_execution_output_delta_notification("dropped"),
+            ] {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(GetAccountResponse {
+                        account: None,
+                        requires_openai_auth: false,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(turn_completed_notification())
+                            .expect("notification should serialize"),
+                    )
+                    .expect("notification should convert to JSON-RPC"),
+                ),
+            )
+            .await;
+            let _ = done_rx.await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            channel_capacity: 1,
+            ..test_remote_connect_args(websocket_url)
+        })
+        .await
+        .expect("remote client should connect");
+
+        let response: GetAccountResponse = timeout(
+            Duration::from_secs(2),
+            client.request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(1),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            }),
+        )
+        .await
+        .expect("RPC completes before event consumption")
+        .expect("account read");
+        assert_eq!(response.account, None);
+
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            events.push(
+                timeout(Duration::from_secs(2), client.next_event())
+                    .await
+                    .expect("event should arrive before timeout")
+                    .expect("event stream should stay open"),
+            );
+        }
+        assert!(matches!(
+            &events[0],
+            AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(notification))
+                if notification.delta == "first"
+        ));
+        assert!(matches!(
+            &events[1],
+            AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(notification))
+                if notification.delta == "second"
+        ));
+        assert!(matches!(&events[2], AppServerEvent::Lagged { skipped: 1 }));
+        assert!(matches!(
+            &events[3],
+            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(_))
+        ));
+
+        done_tx
+            .send(())
+            .expect("server completion signal should send");
+        client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
+    }
+
+    #[tokio::test]
     async fn remote_server_request_resolution_roundtrip_works() {
         let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;

@@ -2078,8 +2078,12 @@ async fn prepare_model_projection(
     // establish that anything was omitted. Projecting a fitting result solely
     // for these hints needlessly reads its artifact and, in code mode, merges
     // recovered excerpts alongside the complete native result printed by JS.
-    let needs_canonical_artifact =
-        result.result.requires_canonical_artifact() || projection_truncated;
+    let needs_canonical_artifact = result.result.requires_canonical_artifact()
+        || projection_truncated
+        || metadata
+            .essential_inline
+            .get(crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY)
+            == Some(&Value::Bool(true));
     let retain_for_history = track_for_admission
         && invocation
             .step_context
@@ -3667,7 +3671,6 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
         "output_reduced",
         "original_token_count",
         "original_token_count_is_approximate",
-        "session_capabilities",
         "success",
         "raw_output_artifact_bytes",
         "raw_output_artifact_id",

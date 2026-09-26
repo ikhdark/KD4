@@ -77,7 +77,6 @@ impl ChatWidget {
                     cwd.as_path(),
                     &env_map,
                     &permissions,
-                    Some(config.codex_home.as_path()),
                 ) {
                     Ok(_) => None,
                     Err(_) => Some((Vec::new(), 0, true)),

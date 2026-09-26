@@ -544,6 +544,17 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
 }
 
 async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
+    // Identity comes from the first session metadata line, so avoid parsing the rest of the
+    // rollout. Legacy rollouts without metadata, and unreadable heads, use the full scan below.
+    if let Ok(meta) = codex_rollout::read_session_meta_line(path).await
+        && let Some(builder) = codex_rollout::builder_from_items(
+            &[codex_protocol::protocol::RolloutItem::SessionMeta(meta)],
+            path,
+        )
+    {
+        return RolloutThreadId::Id(builder.id.to_string());
+    }
+
     let mut saw_item = false;
     let mut first_meta = Vec::new();
     let result = RolloutRecorder::for_each_rollout_item(path, |item| {
@@ -763,6 +774,13 @@ mod tests {
         let path =
             original.with_file_name(format!("rollout-2025-01-02T10-00-00-{filename_id}.jsonl"));
         std::fs::copy(original, &path).unwrap();
+        assert!(
+            matches!(thread_id_from_rollout(&path).await, RolloutThreadId::Id(id) if id == metadata_id)
+        );
+        // Identity is read from the metadata head; a full scan would fail on this tail.
+        let mut contents = std::fs::read(&path).unwrap();
+        contents.extend_from_slice(b"\xff\xfe not utf-8\n");
+        std::fs::write(&path, contents).unwrap();
         assert!(
             matches!(thread_id_from_rollout(&path).await, RolloutThreadId::Id(id) if id == metadata_id)
         );

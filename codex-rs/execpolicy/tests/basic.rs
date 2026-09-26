@@ -1098,38 +1098,62 @@ prefix_rule(pattern = ["git"], decision = "prompt")
 }
 
 #[test]
-fn host_executable_resolution_does_not_override_exact_match() -> Result<()> {
+fn exact_path_allow_does_not_shadow_stricter_basename_rule() -> Result<()> {
     let git_path = host_absolute_path(&["usr", "bin", "git"]);
     let git_path_literal = starlark_string(&git_path);
     let policy_src = format!(
         r#"
 prefix_rule(pattern = ["{git_path_literal}"], decision = "allow")
-prefix_rule(pattern = ["git"], decision = "prompt")
+prefix_rule(pattern = ["git", "push"], decision = "forbidden")
 host_executable(name = "git", paths = ["{git_path_literal}"])
 "#
     );
     let mut parser = PolicyParser::new();
     parser.parse("test.rules", &policy_src)?;
     let policy = parser.build();
+    let options = MatchOptions {
+        resolve_host_executables: true,
+    };
 
-    let evaluation = policy.check_with_options(
-        &[git_path.clone(), "status".to_string()],
-        &allow_all,
-        &MatchOptions {
-            resolve_host_executables: true,
-        },
-    );
     assert_eq!(
-        evaluation,
+        policy.check_with_options(&tokens(&[&git_path, "push"]), &allow_all, &options),
+        Evaluation {
+            decision: Decision::Forbidden,
+            matched_rules: vec![
+                RuleMatch::PrefixRuleMatch {
+                    matched_prefix: vec![git_path.clone()],
+                    decision: Decision::Allow,
+                    resolved_program: None,
+                    justification: None,
+                },
+                RuleMatch::PrefixRuleMatch {
+                    matched_prefix: tokens(&["git", "push"]),
+                    decision: Decision::Forbidden,
+                    resolved_program: Some(absolute_path(&git_path)),
+                    justification: None,
+                },
+            ],
+        }
+    );
+    // The exact rule still applies where no stricter basename rule matches.
+    assert_eq!(
+        policy.check_with_options(&tokens(&[&git_path, "status"]), &prompt_all, &options),
         Evaluation {
             decision: Decision::Allow,
             matched_rules: vec![RuleMatch::PrefixRuleMatch {
-                matched_prefix: vec![git_path],
+                matched_prefix: vec![git_path.clone()],
                 decision: Decision::Allow,
                 resolved_program: None,
                 justification: None,
             }],
         }
+    );
+    // Without resolution, only the literal spelling is considered.
+    assert_eq!(
+        policy
+            .check(&tokens(&[&git_path, "push"]), &prompt_all)
+            .decision,
+        Decision::Allow
     );
     Ok(())
 }
@@ -1244,6 +1268,58 @@ fn suffixed_windows_rules_resolve_without_authorizing_other_suffixes() -> Result
             .check_with_options(&tokens(&[&exe, "status"]), &prompt_all, &options)
             .decision,
         Decision::Forbidden
+    );
+    // An allow rule for one bare spelling cannot shadow the extensionless rule.
+    policy.add_prefix_rule(&tokens(&["git.exe"]), Decision::Allow)?;
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&["git.exe", "status"]), &prompt_all, &options)
+            .decision,
+        Decision::Forbidden
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn bare_windows_spellings_are_not_gated_by_host_executable_paths() -> Result<()> {
+    let trusted = host_absolute_path(&["trusted", "git.exe"]);
+    let mut parser = PolicyParser::new();
+    parser.parse(
+        "test.rules",
+        &format!(
+            r#"
+prefix_rule(pattern = ["git", "push"], decision = "forbidden")
+host_executable(name = "git", paths = ["{}"])
+"#,
+            starlark_string(&trusted)
+        ),
+    )?;
+    let policy = parser.build();
+    let options = MatchOptions {
+        resolve_host_executables: true,
+    };
+    for program in ["git", "GIT", "git.exe", "Git.EXE"] {
+        assert_eq!(
+            policy.check_with_options(&tokens(&[program, "push"]), &allow_all, &options),
+            Evaluation {
+                decision: Decision::Forbidden,
+                matched_rules: vec![RuleMatch::PrefixRuleMatch {
+                    matched_prefix: tokens(&["git", "push"]),
+                    decision: Decision::Forbidden,
+                    resolved_program: None,
+                    justification: None,
+                }],
+            },
+            "{program}"
+        );
+    }
+    let untrusted = host_absolute_path(&["untrusted", "git.exe"]);
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&untrusted, "push"]), &allow_all, &options)
+            .decision,
+        Decision::Allow
     );
     Ok(())
 }

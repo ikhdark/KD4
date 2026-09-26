@@ -18,6 +18,11 @@ cargo run -p codex-mcp-server
 An MCP client must perform the normal MCP initialization handshake before it
 lists or calls tools.
 
+Configuration flags given to the server, such as
+`codex -c model_reasoning_effort=high mcp-server`, and `--strict-config` apply to
+every thread the `codex` tool starts. A tool call's own arguments and `config`
+entries take precedence over the server flags.
+
 ## Tools
 
 The server publishes exactly two Codex tools through `tools/list`:

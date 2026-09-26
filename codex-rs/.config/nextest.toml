@@ -1,11 +1,12 @@
 experimental = ["setup-scripts"]
 
 [profile.default]
-# Retry once so one transient failure does not fail full-CI outright.
-# Fanout keeps the full-CI shards moving without treating every >30s test as
-# stuck. Keep this aligned with the broader timeout budget we give sharded CI.
+# Flag a test as slow after 30s and terminate it after 60s. Tests that
+# legitimately need longer get a narrowly scoped override below.
 slow-timeout = { period = "30s", terminate-after = 2 }
-retries = 1
+# Report a flaky or hanging test on its first attempt. A retry would turn a
+# flake into a pass and double the time until a deterministic hang fails.
+retries = 0
 # Avoid saturating developer machines when Nextest is invoked directly.
 # NEXTEST_TEST_THREADS or --test-threads can opt into a different limit.
 test-threads = 2
@@ -20,15 +21,13 @@ command = ["python", "scripts/nextest_windows_stack.py"]
 platform = { host = 'cfg(windows)' }
 setup = 'windows-test-stack'
 
-[profile.default.junit]
-path = "junit.xml"
-
+# Nextest resolves settings, per-test overrides, and setup scripts through the
+# whole `inherits` chain (fast -> local -> default), so derived profiles only
+# declare what they change.
 [profile.local]
 inherits = "default"
 # Finish the selected tests so local fixes can address failures in batches.
 fail-fast = false
-# Report failures without masking flakes with retries.
-retries = 0
 # Report counts and failures; gate commands capture PASS lines to verify selection.
 status-level = "fail"
 final-status-level = "fail"
@@ -36,85 +35,76 @@ failure-output = "final"
 
 [profile.fast]
 inherits = "local"
-retries = 0
 
-[test-groups.app_server_protocol_codegen]
+# The ChatGPT login server binds fixed callback ports 1455/1457, and a new
+# server sends `/cancel` to whichever process already holds them.
+# `#[serial(login_port)]` only serializes tests inside one process, and nextest
+# runs every test in its own process.
+[test-groups.login_callback_port]
 max-threads = 1
 
-[test-groups.app_server_integration]
-max-threads = 1
-
-# Higher concurrency causes integration test timeouts under resource contention
-# on common developer machines.
-[test-groups.app_server_integration_local]
-max-threads = 1
-
-[test-groups.core_apply_patch_cli_integration]
-max-threads = 1
+# Each test launches its own subprocesses. The two-thread default never reaches
+# this cap; it bounds their combined load when NEXTEST_TEST_THREADS is raised.
+[test-groups.process_heavy]
+max-threads = 2
 
 [test-groups.windows_sandbox_legacy_sessions]
 max-threads = 1
-
-[test-groups.windows_process_heavy]
-max-threads = 2
 
 [test-groups.windows_core]
 max-threads = 4
 
 [[profile.default.overrides]]
-# Do not add new tests here
-filter = 'test(rmcp_client) | test(humanlike_typing_1000_chars_appears_live_no_placeholder)'
-slow-timeout = { period = "2m", terminate-after = 4 }
+# These tests start the real login server on its fixed callback ports. Keep
+# this before the process_heavy override: the first matching test-group wins.
+filter = '''
+(package(codex-app-server) & binary(all) & (
+    test(=suite::v2::account::login_account_chatgpt_start_can_be_cancelled)
+  | test(=suite::v2::account::active_chatgpt_login_does_not_block_app_server_shutdown)
+  | test(=suite::v2::account::login_account_chatgpt_uses_debug_oauth_overrides)
+  | test(=suite::v2::account::login_account_chatgpt_redirects_to_hosted_success_page)
+  | test(=suite::v2::account::set_auth_token_cancels_active_chatgpt_login)
+  | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_query_param)
+  | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_allowlist_query_param)
+))
+| (package(codex-app-server) & kind(lib)
+    & test(=request_processors::account_processor::tests::cancelled_login_start_closes_callback_before_registry_ownership))
+| (package(codex-login) & binary(all)
+    & test(=suite::login_server_e2e::falls_back_to_registered_fallback_port_when_default_port_is_in_use))
+'''
+test-group = 'login_callback_port'
 
 [[profile.default.overrides]]
-filter = 'package(codex-app-server-protocol) & (test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated) | test(generate_ts_with_experimental_api_retains_experimental_entries) | test(generated_ts_optional_nullable_fields_only_in_params) | test(generate_json_filters_experimental_fields_and_methods))'
-test-group = 'app_server_protocol_codegen'
+# These Windows tests spawn the codex CLI or a JSON-RPC stdio client per case
+# and have been the dominant source of 30s timeouts. core's suite::resume runs
+# in process, so only codex-exec's resume suite belongs here.
+platform = 'cfg(windows)'
+filter = '(package(codex-exec) & (test(suite::resume::) | test(suite::auth_env::))) | (package(codex-core) & test(suite::cli_stream::)) | test(connect_stdio_command_initializes_json_rpc_client_on_windows)'
+test-group = 'process_heavy'
+slow-timeout = { period = "1m", terminate-after = 2 }
 
 [[profile.default.overrides]]
-# These integration tests spawn a fresh app-server subprocess per case.
-# Keep the library unit tests parallel.
-filter = 'package(codex-app-server) & kind(test)'
-test-group = 'app_server_integration'
-
-[[profile.local.overrides]]
-# Serialize app-server subprocess tests locally to avoid resource contention.
-filter = 'package(codex-app-server) & kind(test)'
-test-group = 'app_server_integration_local'
-
-[[profile.fast.overrides]]
-# Nextest resolves per-test overrides from the selected profile and `default`,
-# not from intermediate profiles. Mirror the bounded local concurrency here so
-# fast validation uses the same local group.
-filter = 'package(codex-app-server) & kind(test)'
-test-group = 'app_server_integration_local'
-
-[[profile.default.overrides]]
-# These tests exercise full Codex turns and apply_patch execution, and they are
-# sensitive to Windows runner process-startup stalls when many cases launch at once.
-filter = 'package(codex-core) & kind(test) & test(apply_patch_cli)'
-test-group = 'core_apply_patch_cli_integration'
+# App-server integration tests spawn a fresh app-server subprocess per case, and
+# core apply_patch_cli tests run full Codex turns that launch apply_patch. Both
+# use isolated homes and ephemeral ports. The library unit tests stay ungrouped.
+filter = '(package(codex-app-server) & kind(test)) | (package(codex-core) & kind(test) & test(suite::apply_patch_cli::))'
+test-group = 'process_heavy'
 
 [[profile.default.overrides]]
 # These tests create restricted-token Windows child processes and private desktops.
 # Serialize only the unified-exec process tests to avoid exhausting Windows
-# session/global desktop resources. The delete-child probe is cached and unsafe
-# kernels fail closed before process startup, so the default timeout is sufficient.
+# session/global desktop resources; their in-process LEGACY_PROCESS_TEST_LOCK
+# cannot serialize separate nextest processes. The delete-child probe is cached
+# and unsafe kernels fail closed before process startup, so the default timeout
+# is sufficient.
 platform = 'cfg(windows)'
 filter = 'package(codex-windows-sandbox) & test(unified_exec::tests::legacy_)'
 test-group = 'windows_sandbox_legacy_sessions'
 
 [[profile.default.overrides]]
-# These Windows-heavy tests spawn subprocesses, session files, or JSON-RPC
-# clients and have been the dominant source of 30s full-CI timeouts.
-platform = 'cfg(windows)'
-filter = 'test(suite::resume::) | test(suite::cli_stream::) | test(suite::auth_env::) | test(connect_stdio_command_initializes_json_rpc_client_on_windows)'
-test-group = 'windows_process_heavy'
-slow-timeout = { period = "1m", terminate-after = 2 }
-
-[[profile.default.overrides]]
 # Core's Windows library tests include real PowerShell parsing and child-process
 # execution. Bound the whole package so those internal deadlines remain meaningful
-# instead of measuring scheduler starvation on developer machines.
+# instead of measuring scheduler starvation when NEXTEST_TEST_THREADS is raised.
 platform = 'cfg(windows)'
 filter = 'package(codex-core)'
 test-group = 'windows_core'

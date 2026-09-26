@@ -662,6 +662,8 @@ mod tests {
             "python x; git status",
             "& python x",
             "$x = 'x'; python $x",
+            "python ~",
+            "git -C ~/src status",
         ] {
             let command = vec![
                 pwsh.as_path().to_string_lossy().into_owned(),
@@ -675,6 +677,18 @@ mod tests {
                 "unexpected direct candidate for {script:?}"
             );
         }
+        let quoted_tilde = vec![
+            pwsh.as_path().to_string_lossy().into_owned(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "python '~'".to_string(),
+        ];
+        assert_eq!(
+            parse_noprofile_powershell_command_into_direct_argv(&quoted_tilde)
+                .map(|candidate| candidate.argv),
+            Some(vec!["python".to_string(), "~".to_string()]),
+            "quoted tilde is passed literally and stays eligible"
+        );
     }
 
     #[test]

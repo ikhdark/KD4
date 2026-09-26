@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::future::Future;
-use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -31,25 +30,15 @@ pub struct Arg0DispatchPaths {
 pub struct Arg0PathEntryGuard {
     _temp_dir: TempDir,
     _lock_file: File,
-    paths: Arg0DispatchPaths,
 }
 
-impl Arg0PathEntryGuard {
-    fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self {
-        Self {
-            _temp_dir: temp_dir,
-            _lock_file: lock_file,
-            paths,
-        }
-    }
-
-    pub fn paths(&self) -> &Arg0DispatchPaths {
-        &self.paths
-    }
-}
-
-pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
-    // Determine if we were invoked via the special alias.
+/// Runs the helper selected by this executable's name or its hidden argv[1]
+/// flag; a helper never returns. Returns only when this process is not a
+/// helper invocation.
+///
+/// Helpers run with the environment they inherit, before `.env` values or
+/// PATH aliases are applied.
+pub fn arg0_dispatch_helper() {
     let mut args = std::env::args_os();
     let argv0 = args.next().unwrap_or_default();
     let exe_name = Path::new(&argv0)
@@ -69,18 +58,12 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
         codex_windows_sandbox::run_windows_sandbox_wrapper_main();
     }
     if argv1 == CODEX_CORE_APPLY_PATCH_ARG1 {
-        let mut stdin = std::io::stdin();
-        let patch_arg = match apply_patch_arg_from_args_or_stdin(args, &mut stdin) {
-            Ok(patch_arg) => patch_arg,
-            Err(err) => {
-                print_apply_patch_input_error(&err);
-                std::process::exit(apply_patch_input_error_exit_code(&err));
-            }
-        };
-
-        let exit_code = codex_apply_patch::run_apply_patch(&patch_arg);
-        std::process::exit(exit_code);
+        std::process::exit(codex_apply_patch::run_main_with_args(args));
     }
+}
+
+pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
+    arg0_dispatch_helper();
 
     // This modifies the environment, which is not thread-safe, so do this
     // before creating any threads/the Tokio runtime.
@@ -99,64 +82,6 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
         }
     }
     path_entry_guard
-}
-
-#[derive(Debug)]
-enum ApplyPatchInputError {
-    EmptyStdin,
-    NonUtf8Argument,
-    ReadStdin(std::io::Error),
-    TooManyArguments,
-}
-
-fn apply_patch_arg_from_args_or_stdin(
-    mut args: impl Iterator<Item = OsString>,
-    stdin: &mut impl Read,
-) -> Result<String, ApplyPatchInputError> {
-    let Some(arg) = args.next() else {
-        let mut buf = String::new();
-        stdin
-            .read_to_string(&mut buf)
-            .map_err(ApplyPatchInputError::ReadStdin)?;
-        if buf.is_empty() {
-            return Err(ApplyPatchInputError::EmptyStdin);
-        }
-        return Ok(buf);
-    };
-
-    let patch_arg = arg
-        .into_string()
-        .map_err(|_| ApplyPatchInputError::NonUtf8Argument)?;
-
-    if args.next().is_some() {
-        return Err(ApplyPatchInputError::TooManyArguments);
-    }
-
-    Ok(patch_arg)
-}
-
-fn print_apply_patch_input_error(err: &ApplyPatchInputError) {
-    match err {
-        ApplyPatchInputError::EmptyStdin => {
-            eprintln!("Usage: apply_patch 'PATCH'\n       echo 'PATCH' | apply_patch");
-        }
-        ApplyPatchInputError::NonUtf8Argument => {
-            eprintln!("Error: {CODEX_CORE_APPLY_PATCH_ARG1} requires a UTF-8 PATCH argument.");
-        }
-        ApplyPatchInputError::ReadStdin(err) => {
-            eprintln!("Error: Failed to read PATCH from stdin.\n{err}");
-        }
-        ApplyPatchInputError::TooManyArguments => {
-            eprintln!("Error: {CODEX_CORE_APPLY_PATCH_ARG1} accepts exactly one PATCH argument.");
-        }
-    }
-}
-
-fn apply_patch_input_error_exit_code(err: &ApplyPatchInputError) -> i32 {
-    match err {
-        ApplyPatchInputError::EmptyStdin | ApplyPatchInputError::TooManyArguments => 2,
-        ApplyPatchInputError::NonUtf8Argument | ApplyPatchInputError::ReadStdin(_) => 1,
-    }
 }
 
 fn prepare_path_env_var_with_aliases(
@@ -185,7 +110,7 @@ fn prepare_path_env_var_with_aliases(
 /// 3.  Construct a Tokio multi-thread runtime.
 /// 4.  Execute the provided async `main_fn` inside that runtime, forwarding any
 ///     error. Note that `main_fn` receives [`Arg0DispatchPaths`], which
-///     contains the helper executable paths needed to construct
+///     contains the current executable path needed to construct
 ///     [`codex_core::config::Config`].
 ///
 /// This function should be used to wrap any `main()` function in binary crates
@@ -276,8 +201,8 @@ where
     }
 }
 
-/// Creates a temporary directory with an `apply_patch.bat` helper.
-///   with the hidden `--codex-run-as-apply-patch` flag.
+/// Creates a temporary directory with `apply_patch.bat` helpers that re-invoke
+/// this executable with the hidden `--codex-run-as-apply-patch` flag.
 ///
 /// Returns the temporary directory guard and the PATH value that prepends the
 /// temporary directory so `apply_patch` can be on the PATH without requiring the
@@ -320,10 +245,10 @@ fn prepare_path_entry_for_codex_aliases(
 
     let lock_file = lock_session_dir(path)?;
 
+    let exe = std::env::current_exe()?;
+    let exe = exe.display();
     for filename in &[APPLY_PATCH_ARG0, MISSPELLED_APPLY_PATCH_ARG0] {
-        let exe = std::env::current_exe()?;
         let batch_script = path.join(format!("{filename}.bat"));
-        let exe = exe.display();
         std::fs::write(
             &batch_script,
             format!(
@@ -336,12 +261,11 @@ fn prepare_path_entry_for_codex_aliases(
 
     let updated_path_env_var = path_env_with_entry(path, existing_path)?;
 
-    let paths = Arg0DispatchPaths {
-        codex_self_exe: std::env::current_exe().ok(),
-    };
-
     Ok((
-        Arg0PathEntryGuard::new(temp_dir, lock_file, paths),
+        Arg0PathEntryGuard {
+            _temp_dir: temp_dir,
+            _lock_file: lock_file,
+        },
         updated_path_env_var,
     ))
 }
@@ -440,7 +364,6 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ApplyPatchInputError;
     use super::LOCK_FILENAME;
     use super::janitor_cleanup;
     use codex_install_context::CodexPackageLayout;
@@ -448,7 +371,6 @@ mod tests {
     use codex_install_context::InstallMethod;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
-    use std::ffi::OsString;
     use std::fs;
     use std::fs::File;
     use std::path::Path;
@@ -471,11 +393,6 @@ mod tests {
             .create(true)
             .truncate(false)
             .open(lock_path)
-    }
-
-    fn invalid_unicode_os_string() -> OsString {
-        use std::os::windows::ffi::OsStringExt;
-        OsString::from_wide(&[0xD800])
     }
 
     fn package_path_test_fixture() -> anyhow::Result<PackagePathTestFixture> {
@@ -507,86 +424,6 @@ mod tests {
             install_context,
             path_dir,
         })
-    }
-
-    #[test]
-    fn hidden_apply_patch_arg_uses_single_utf8_argument() {
-        let mut stdin = "ignored".as_bytes();
-
-        let patch = super::apply_patch_arg_from_args_or_stdin(
-            [OsString::from("*** Begin Patch\n*** End Patch")].into_iter(),
-            &mut stdin,
-        )
-        .expect("single UTF-8 patch argument should be accepted");
-
-        assert_eq!(patch, "*** Begin Patch\n*** End Patch");
-    }
-
-    #[test]
-    fn hidden_apply_patch_arg_reads_stdin_when_argument_missing() {
-        let mut stdin = "*** Begin Patch\n*** Add File: file.txt\n+hello\n*** End Patch".as_bytes();
-
-        let patch = super::apply_patch_arg_from_args_or_stdin([].into_iter(), &mut stdin)
-            .expect("stdin patch should be accepted when no argument is passed");
-
-        assert_eq!(
-            patch,
-            "*** Begin Patch\n*** Add File: file.txt\n+hello\n*** End Patch"
-        );
-    }
-
-    #[test]
-    fn hidden_apply_patch_arg_rejects_empty_stdin() {
-        let mut stdin = "".as_bytes();
-
-        let err = super::apply_patch_arg_from_args_or_stdin([].into_iter(), &mut stdin)
-            .expect_err("empty stdin should be rejected");
-
-        assert!(matches!(err, ApplyPatchInputError::EmptyStdin));
-        assert_eq!(super::apply_patch_input_error_exit_code(&err), 2);
-    }
-
-    #[test]
-    fn hidden_apply_patch_arg_rejects_invalid_utf8_stdin() {
-        let mut stdin = std::io::Cursor::new(vec![0xff]);
-
-        let err = super::apply_patch_arg_from_args_or_stdin([].into_iter(), &mut stdin)
-            .expect_err("invalid UTF-8 stdin should be rejected");
-
-        assert!(matches!(
-            &err,
-            ApplyPatchInputError::ReadStdin(source)
-                if source.kind() == std::io::ErrorKind::InvalidData
-        ));
-        assert_eq!(super::apply_patch_input_error_exit_code(&err), 1);
-    }
-
-    #[test]
-    fn hidden_apply_patch_arg_rejects_non_utf8_argument() {
-        let mut stdin = "ignored".as_bytes();
-
-        let err = super::apply_patch_arg_from_args_or_stdin(
-            [invalid_unicode_os_string()].into_iter(),
-            &mut stdin,
-        )
-        .expect_err("non-UTF-8 patch argument should be rejected");
-
-        assert!(matches!(err, ApplyPatchInputError::NonUtf8Argument));
-        assert_eq!(super::apply_patch_input_error_exit_code(&err), 1);
-    }
-
-    #[test]
-    fn hidden_apply_patch_arg_rejects_extra_arguments() {
-        let mut stdin = "ignored".as_bytes();
-
-        let err = super::apply_patch_arg_from_args_or_stdin(
-            [OsString::from("patch"), OsString::from("extra")].into_iter(),
-            &mut stdin,
-        )
-        .expect_err("extra patch arguments should be rejected");
-
-        assert!(matches!(err, ApplyPatchInputError::TooManyArguments));
-        assert_eq!(super::apply_patch_input_error_exit_code(&err), 2);
     }
 
     #[test]

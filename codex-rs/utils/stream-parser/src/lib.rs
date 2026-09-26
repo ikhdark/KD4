@@ -1,17 +1,10 @@
 mod assistant_text;
-mod citation;
-mod inline_hidden_tag;
 mod proposed_plan;
 mod stream_text;
 mod tagged_line_parser;
 
 pub use assistant_text::AssistantTextChunk;
 pub use assistant_text::AssistantTextStreamParser;
-pub use citation::CitationStreamParser;
-pub use citation::strip_citations;
-pub use inline_hidden_tag::ExtractedInlineTag;
-pub use inline_hidden_tag::InlineHiddenTagParser;
-pub use inline_hidden_tag::InlineTagSpec;
 pub use proposed_plan::ProposedPlanParser;
 pub use proposed_plan::ProposedPlanSegment;
 pub use proposed_plan::extract_proposed_plan_text;

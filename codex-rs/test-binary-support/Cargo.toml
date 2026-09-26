@@ -14,4 +14,3 @@ workspace = true
 
 [dependencies]
 codex-arg0 = { workspace = true }
-tempfile = { workspace = true }

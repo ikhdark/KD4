@@ -100,7 +100,6 @@ pub(crate) enum ExecServerTransportParams {
         provider: Arc<dyn NoiseRendezvousConnectProvider>,
         identity: NoiseChannelIdentity,
     },
-    #[allow(dead_code)]
     StdioCommand {
         command: StdioExecServerCommand,
         initialize_timeout: Duration,

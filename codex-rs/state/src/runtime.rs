@@ -15,7 +15,7 @@ use crate::SortKey;
 use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
-use crate::migrations::ensure_kd4_compatibility_indexes;
+use crate::migrations::migrate_tolerating_concurrent_initializers;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::migrations::repair_legacy_validation_index_migration_order;
 use crate::migrations::runtime_goals_migrator;
@@ -420,20 +420,18 @@ async fn open_sqlite(
     let pool = pool_result
         .map_err(|source| recovery::RuntimeDbInitError::new(spec.label, "open", path, source))?;
     let started = Instant::now();
-    let migrate_result = async {
+    let pool_ref = &pool;
+    let migrate_result = migrate_tolerating_concurrent_initializers(pool_ref, move || async move {
         if matches!(spec.kind, DbKind::State) {
-            repair_legacy_validation_index_migration_order(&pool, migrator).await?;
+            repair_legacy_validation_index_migration_order(pool_ref, migrator).await?;
         }
-        let migrator = runtime_migrator_for_pool(&pool, migrator).await?;
+        let migrator = runtime_migrator_for_pool(pool_ref, migrator).await?;
         if matches!(spec.kind, DbKind::State) {
-            repair_legacy_recency_migration_version(&pool, &migrator).await?;
+            repair_legacy_recency_migration_version(pool_ref, &migrator).await?;
         }
-        migrator.run(&pool).await.map_err(anyhow::Error::from)?;
-        if matches!(spec.kind, DbKind::State) {
-            ensure_kd4_compatibility_indexes(&pool).await?;
-        }
+        migrator.run(pool_ref).await.map_err(anyhow::Error::from)?;
         Ok::<(), anyhow::Error>(())
-    }
+    })
     .await;
     crate::telemetry::record_init_result(
         telemetry_override,
@@ -689,6 +687,43 @@ mod tests {
         tolerant_pool.close().await;
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_initializers_both_migrate_a_fresh_database() {
+        let migrator = runtime_state_migrator();
+        for _ in 0..3 {
+            let codex_home = unique_temp_dir();
+            tokio::fs::create_dir_all(&codex_home)
+                .await
+                .expect("create codex home");
+            let state_path = state_db_path(codex_home.as_path());
+            let (first, second) = tokio::join!(
+                open_state_sqlite(
+                    state_path.as_path(),
+                    &migrator,
+                    /*telemetry_override*/ None
+                ),
+                open_state_sqlite(
+                    state_path.as_path(),
+                    &migrator,
+                    /*telemetry_override*/ None
+                ),
+            );
+            let first = first.expect("first initializer should migrate");
+            let second = second.expect("concurrent initializer should accept the shared migration");
+            let applied = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+                .fetch_one(&second)
+                .await
+                .expect("count applied migrations");
+            assert_eq!(
+                usize::try_from(applied).expect("non-negative count"),
+                STATE_MIGRATOR.migrations.len()
+            );
+            first.close().await;
+            second.close().await;
+            let _ = tokio::fs::remove_dir_all(codex_home).await;
+        }
     }
 
     #[tokio::test]

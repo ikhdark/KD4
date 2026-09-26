@@ -53,8 +53,11 @@ fn derive_for_struct(
             let mut registrations = Vec::new();
             for field in &named.named {
                 let annotation = experimental_annotation(&field.attrs)?;
+                let Some(ident) = field.ident.as_ref() else {
+                    continue;
+                };
                 if let Some(Experimental::Reason(reason)) = annotation {
-                    let expr = experimental_presence_expr(field, /*tuple_struct*/ false);
+                    let expr = presence_expr_for_access(quote!(self.#ident), &field.ty);
                     checks.push(quote! {
                         if #expr {
                             return Some(#reason);
@@ -81,9 +84,6 @@ fn derive_for_struct(
                         });
                     }
                 } else if matches!(annotation, Some(Experimental::Nested)) {
-                    let Some(ident) = field.ident.as_ref() else {
-                        continue;
-                    };
                     checks.push(quote! {
                         if let Some(reason) =
                             crate::experimental_api::ExperimentalApi::experimental_reason(&self.#ident)
@@ -339,17 +339,6 @@ fn snake_to_camel(s: &str) -> String {
         }
     }
     out
-}
-
-fn experimental_presence_expr(
-    field: &Field,
-    tuple_struct: bool,
-) -> Option<proc_macro2::TokenStream> {
-    if tuple_struct {
-        return None;
-    }
-    let ident = field.ident.as_ref()?;
-    Some(presence_expr_for_access(quote!(self.#ident), &field.ty))
 }
 
 fn index_presence_expr(index: usize, ty: &Type) -> proc_macro2::TokenStream {

@@ -5,6 +5,7 @@ use codex_exec_server::EnvironmentManager;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionDataInit;
+use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
@@ -147,6 +148,52 @@ async fn selected_plugin_package_is_contributed_without_servers_or_connectors() 
     Ok(())
 }
 
+#[tokio::test]
+async fn failed_declaration_load_is_retried_by_the_next_projection() -> TestResult {
+    let codex_home = tempfile::tempdir()?;
+    let plugin_root = tempfile::tempdir()?;
+    std::fs::create_dir_all(plugin_root.path().join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.path().join(".codex-plugin/plugin.json"),
+        r#"{"name":"late-config","mcpServers":"./config/mcp.json"}"#,
+    )?;
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+    let thread = SelectedPluginThread::new(plugin_root.path())?;
+
+    let unreadable = thread.contribute(&config).await;
+    assert_eq!(server_names(&unreadable), Vec::<String>::new());
+    assert!(
+        unreadable.iter().any(|contribution| matches!(
+            contribution,
+            McpServerContribution::SelectedPluginPackage { .. }
+        )),
+        "the package stays visible while its MCP declarations are unreadable"
+    );
+
+    std::fs::create_dir_all(plugin_root.path().join("config"))?;
+    std::fs::write(
+        plugin_root.path().join("config/mcp.json"),
+        r#"{"mcpServers":{"late":{"command":"late-command"}}}"#,
+    )?;
+    let recovered = thread.contribute(&config).await;
+    assert_eq!(server_names(&recovered), vec!["late".to_string()]);
+    Ok(())
+}
+
+fn server_names(contributions: &[McpServerContribution]) -> Vec<String> {
+    contributions
+        .iter()
+        .filter_map(|contribution| match contribution {
+            McpServerContribution::SelectedPlugin { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn selected_plugin_contributions(
     config: &Config,
     plugin_root: &std::path::Path,
@@ -180,30 +227,51 @@ async fn raw_selected_plugin_contributions(
     config: &Config,
     plugin_root: &std::path::Path,
 ) -> Result<Vec<McpServerContribution>, Box<dyn std::error::Error>> {
-    let mut builder = ExtensionRegistryBuilder::new();
-    codex_mcp_extension::install_executor_plugins(
-        &mut builder,
-        Arc::new(EnvironmentManager::default_for_tests()),
-    );
-    let registry = builder.build();
-    let mut thread_init = ExtensionDataInit::new();
-    thread_init.insert(vec![SelectedCapabilityRoot {
-        id: "selected-root".to_string(),
-        location: CapabilityRootLocation::Environment {
-            environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
-            path: PathUri::from_host_native_path(plugin_root)?,
-        },
-    }]);
-    let thread_store = ExtensionData::new_with_init("test-thread", thread_init.clone());
-    let available_environment_ids = vec![LOCAL_ENVIRONMENT_ID.to_string()];
-
-    Ok(registry.mcp_server_contributors()[0]
-        .contribute(McpServerContributionContext::for_step(
-            config,
-            &thread_init,
-            &thread_store,
-            "test_originator",
-            &available_environment_ids,
-        ))
+    Ok(SelectedPluginThread::new(plugin_root)?
+        .contribute(config)
         .await)
+}
+
+/// One thread that selected `plugin_root`, so repeated projections share its extension state.
+struct SelectedPluginThread {
+    registry: ExtensionRegistry<Config>,
+    thread_init: ExtensionDataInit,
+    thread_store: ExtensionData,
+}
+
+impl SelectedPluginThread {
+    fn new(plugin_root: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut builder = ExtensionRegistryBuilder::new();
+        codex_mcp_extension::install_executor_plugins(
+            &mut builder,
+            Arc::new(EnvironmentManager::default_for_tests()),
+        );
+        let mut thread_init = ExtensionDataInit::new();
+        thread_init.insert(vec![SelectedCapabilityRoot {
+            id: "selected-root".to_string(),
+            location: CapabilityRootLocation::Environment {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                path: PathUri::from_host_native_path(plugin_root)?,
+            },
+        }]);
+        let thread_store = ExtensionData::new_with_init("test-thread", thread_init.clone());
+        Ok(Self {
+            registry: builder.build(),
+            thread_init,
+            thread_store,
+        })
+    }
+
+    async fn contribute(&self, config: &Config) -> Vec<McpServerContribution> {
+        let available_environment_ids = vec![LOCAL_ENVIRONMENT_ID.to_string()];
+        self.registry.mcp_server_contributors()[0]
+            .contribute(McpServerContributionContext::for_step(
+                config,
+                &self.thread_init,
+                &self.thread_store,
+                "test_originator",
+                &available_environment_ids,
+            ))
+            .await
+    }
 }

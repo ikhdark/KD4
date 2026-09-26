@@ -1233,6 +1233,18 @@ impl ChatWidget {
                 );
                 self.on_user_message_display(display);
             }
+        } else if let Some(index) = self
+            .input_queue
+            .promoted_steers
+            .iter()
+            .position(|promoted| promoted.compare_key == compare_key)
+            && let Some(promoted) = self.input_queue.promoted_steers.remove(index)
+        {
+            self.refresh_pending_input_preview();
+            self.on_user_message_display(user_message_display_for_history(
+                promoted.user_message,
+                &promoted.history_record,
+            ));
         } else if !self.review.is_review_mode
             && self.last_rendered_user_message_display.as_ref() != Some(&display)
         {

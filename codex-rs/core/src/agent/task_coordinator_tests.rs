@@ -645,19 +645,24 @@ async fn missing_typed_receipt_preserves_recorded_validation_without_claiming_ac
         })
         .await
         .unwrap();
-    coordinator
-        .store()
-        .unwrap()
-        .record_validation_call(codex_agent_task_store::ValidationCall {
-            call_id: "actual-validation".to_string(),
-            attempt_id: attempt.attempt_id,
-            command_summary: "cargo test -p codex-core".to_string(),
-            evidence: codex_agent_task_store::ValidationEvidence::default(),
-            status: codex_agent_task_store::ValidationCallStatus::Failed,
-            recorded_at: Utc::now(),
-        })
-        .await
-        .unwrap();
+    for status in [
+        codex_agent_task_store::ValidationCallStatus::Running,
+        codex_agent_task_store::ValidationCallStatus::Failed,
+    ] {
+        coordinator
+            .store()
+            .unwrap()
+            .record_validation_call(codex_agent_task_store::ValidationCall {
+                call_id: "actual-validation".to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "cargo test -p codex-core".to_string(),
+                evidence: codex_agent_task_store::ValidationEvidence::default(),
+                status,
+                recorded_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
     let receipt = coordinator
         .seal_missing_receipt_for_attempt(
             &path,

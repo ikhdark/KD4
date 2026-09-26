@@ -51,6 +51,53 @@ fn final_wait_failure_does_not_join_output_reader() {
 }
 
 #[test]
+fn root_exit_is_delivered_while_a_descendant_keeps_output_open() -> anyhow::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+
+    let mut root = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "exit 3"])
+        .spawn()?;
+    root.wait()?;
+    // finalize_exit takes ownership of the exited root's process handle.
+    let process_handle = Arc::new(Mutex::new(Some(sendable_handle(
+        root.into_raw_handle().cast(),
+    ))));
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    // Models an output reader whose pipe a preserved descendant still holds open.
+    let output_join = std::thread::spawn(move || {
+        let _ = release_rx.recv();
+    });
+    let (exit_tx, mut exit_rx) = oneshot::channel();
+    let finalizer = std::thread::spawn(move || {
+        finalize_exit(
+            exit_tx,
+            process_handle,
+            /*thread_handle*/ 0,
+            output_join,
+            /*logs_base_dir*/ None,
+            vec!["test-command".to_string()],
+            /*termination_requested*/ false,
+        );
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exit_code = loop {
+        match exit_rx.try_recv() {
+            Ok(code) => break Some(code),
+            Err(oneshot::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break None,
+        }
+    };
+    drop(release_tx);
+    finalizer.join().expect("join exit finalizer");
+
+    assert_eq!(exit_code, Some(3));
+    Ok(())
+}
+
+#[test]
 fn native_write_request_length_preserves_the_dword_boundary() {
     assert_eq!(super::native_write_request_len(0), 0);
     assert_eq!(super::native_write_request_len(23), 23);

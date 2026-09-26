@@ -361,9 +361,11 @@ where
                 return;
             }
 
-            runtime
-                .accounting_state()
-                .record_token_usage(turn_store.level_id(), &token_usage.total_token_usage);
+            runtime.accounting_state().record_token_usage(
+                turn_store.level_id(),
+                &token_usage.total_token_usage,
+                &token_usage.last_token_usage,
+            );
         })
     }
 }
@@ -422,7 +424,7 @@ where
                 goal_id: progress.goal_id,
                 delivered: false,
             };
-            let item = budget_limit_steering_item(&goal);
+            let item = budget_limit_steering_item(&goal, &report.goal_id);
             report.delivered = runtime.inject_active_turn_steering(item).await;
         })
     }

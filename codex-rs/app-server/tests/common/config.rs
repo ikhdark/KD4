@@ -79,21 +79,48 @@ model_provider = "{model_provider_id}"
     )
 }
 
+/// Writes the minimal config that routes Codex to a mock Responses server.
+pub fn write_mock_provider_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
+    write_mock_provider_config(codex_home, server_uri, /*extra_settings*/ "")
+}
+
 pub fn write_mock_responses_config_toml_with_chatgpt_base_url(
     codex_home: &Path,
     server_uri: &str,
     chatgpt_base_url: &str,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
+    write_mock_provider_config(
+        codex_home,
+        server_uri,
+        &format!("chatgpt_base_url = \"{chatgpt_base_url}\"\n"),
+    )
+}
+
+/// Writes the minimal mock-provider config backed by an in-memory thread
+/// store. The provider is unreachable because these tests never sample.
+pub fn write_in_memory_thread_store_config_toml(
+    codex_home: &Path,
+    store_id: &str,
+) -> std::io::Result<()> {
+    write_mock_provider_config(
+        codex_home,
+        "http://127.0.0.1:1",
+        &format!("experimental_thread_store = {{ type = \"in_memory\", id = \"{store_id}\" }}\n"),
+    )
+}
+
+fn write_mock_provider_config(
+    codex_home: &Path,
+    server_uri: &str,
+    extra_settings: &str,
+) -> std::io::Result<()> {
     std::fs::write(
-        config_toml,
+        codex_home.join("config.toml"),
         format!(
-            r#"
-model = "mock-model"
+            r#"model = "mock-model"
 approval_policy = "never"
 sandbox_mode = "read-only"
-chatgpt_base_url = "{chatgpt_base_url}"
-
+{extra_settings}
 model_provider = "mock_provider"
 
 [model_providers.mock_provider]

@@ -9,6 +9,7 @@ use crate::error_code::invalid_request;
 use crate::fuzzy_file_search::FuzzyFileSearchSession;
 use crate::fuzzy_file_search::run_fuzzy_file_search;
 use crate::fuzzy_file_search::start_fuzzy_file_search_session;
+use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_app_server_protocol::FuzzyFileSearchParams;
 use codex_app_server_protocol::FuzzyFileSearchResponse;
@@ -25,7 +26,8 @@ use tokio::sync::Mutex;
 pub(crate) struct SearchRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     pending_fuzzy_searches: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
-    fuzzy_search_sessions: Arc<Mutex<HashMap<String, FuzzyFileSearchSession>>>,
+    // Sessions are owned by the connection that started them, like fs watches.
+    fuzzy_search_sessions: Arc<Mutex<HashMap<(ConnectionId, String), FuzzyFileSearchSession>>>,
 }
 
 struct PendingFuzzySearch {
@@ -103,6 +105,7 @@ impl SearchRequestProcessor {
 
     pub(crate) async fn fuzzy_file_search_session_start_response(
         &self,
+        connection_id: ConnectionId,
         params: FuzzyFileSearchSessionStartParams,
     ) -> Result<FuzzyFileSearchSessionStartResponse, JSONRPCErrorError> {
         let FuzzyFileSearchSessionStartParams { session_id, roots } = params;
@@ -110,26 +113,31 @@ impl SearchRequestProcessor {
             return Err(invalid_request("sessionId must not be empty"));
         }
 
-        let session =
-            start_fuzzy_file_search_session(session_id.clone(), roots, self.outgoing.clone())
-                .map_err(|err| {
-                    internal_error(format!("failed to start fuzzy file search session: {err}"))
-                })?;
+        let session = start_fuzzy_file_search_session(
+            connection_id,
+            session_id.clone(),
+            roots,
+            self.outgoing.clone(),
+        )
+        .map_err(|err| {
+            internal_error(format!("failed to start fuzzy file search session: {err}"))
+        })?;
         self.fuzzy_search_sessions
             .lock()
             .await
-            .insert(session_id, session);
+            .insert((connection_id, session_id), session);
         Ok(FuzzyFileSearchSessionStartResponse {})
     }
 
     pub(crate) async fn fuzzy_file_search_session_update_response(
         &self,
+        connection_id: ConnectionId,
         params: FuzzyFileSearchSessionUpdateParams,
     ) -> Result<FuzzyFileSearchSessionUpdateResponse, JSONRPCErrorError> {
         let FuzzyFileSearchSessionUpdateParams { session_id, query } = params;
         let found = {
             let sessions = self.fuzzy_search_sessions.lock().await;
-            if let Some(session) = sessions.get(&session_id) {
+            if let Some(session) = sessions.get(&(connection_id, session_id.clone())) {
                 session.update_query(query);
                 true
             } else {
@@ -147,12 +155,25 @@ impl SearchRequestProcessor {
 
     pub(crate) async fn fuzzy_file_search_session_stop(
         &self,
+        connection_id: ConnectionId,
         params: FuzzyFileSearchSessionStopParams,
     ) -> Result<FuzzyFileSearchSessionStopResponse, JSONRPCErrorError> {
         let FuzzyFileSearchSessionStopParams { session_id } = params;
-        self.fuzzy_search_sessions.lock().await.remove(&session_id);
+        self.fuzzy_search_sessions
+            .lock()
+            .await
+            .remove(&(connection_id, session_id));
 
         Ok(FuzzyFileSearchSessionStopResponse {})
+    }
+
+    /// Stops every session the closed connection left running; each session
+    /// otherwise keeps its search workers and file index for the server lifetime.
+    pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+        self.fuzzy_search_sessions
+            .lock()
+            .await
+            .retain(|(owner, _), _| *owner != connection_id);
     }
 }
 
@@ -161,6 +182,61 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::task::Poll;
+
+    #[tokio::test]
+    async fn fuzzy_search_sessions_are_owned_and_closed_by_their_connection() {
+        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let processor = SearchRequestProcessor::new(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        )));
+        let directory = tempfile::TempDir::new().expect("search directory");
+        let roots = vec![directory.path().to_string_lossy().into_owned()];
+        let first = ConnectionId(1);
+        let second = ConnectionId(2);
+        let update = || FuzzyFileSearchSessionUpdateParams {
+            session_id: "shared".to_string(),
+            query: "needle".to_string(),
+        };
+        for connection_id in [first, second] {
+            processor
+                .fuzzy_file_search_session_start_response(
+                    connection_id,
+                    FuzzyFileSearchSessionStartParams {
+                        session_id: "shared".to_string(),
+                        roots: roots.clone(),
+                    },
+                )
+                .await
+                .expect("session starts");
+        }
+
+        processor
+            .fuzzy_file_search_session_stop(
+                first,
+                FuzzyFileSearchSessionStopParams {
+                    session_id: "shared".to_string(),
+                },
+            )
+            .await
+            .expect("session stops");
+        processor
+            .fuzzy_file_search_session_update_response(second, update())
+            .await
+            .expect("another connection's same-named session stays live");
+        processor
+            .fuzzy_file_search_session_update_response(first, update())
+            .await
+            .expect_err("the stopped session is gone");
+
+        processor.connection_closed(second).await;
+        let error = processor
+            .fuzzy_file_search_session_update_response(second, update())
+            .await
+            .expect_err("closing the connection stops its sessions");
+        assert_eq!(error.message, "fuzzy file search session not found: shared");
+        assert!(processor.fuzzy_search_sessions.lock().await.is_empty());
+    }
 
     #[test]
     fn canceled_fuzzy_search_removes_only_its_own_registration() {

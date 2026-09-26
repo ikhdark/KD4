@@ -123,6 +123,7 @@ pub fn write(prepared: &Prepared, result: &RunResult) -> Result<()> {
             "Intervals require at least five independent paired clusters. Default three-cluster scripted runs remain descriptive. Quantiles use linear interpolation at (n-1)*q; p95 with few samples is a descriptive tail estimate, not a stable population percentile.".into(),
             "Discovery counts are recognized operations, not distinct files or instruction-compliance verdicts. First-action turn medians require one fully covered rollout session. Complete request-token usage is read once per attempt; cumulative session snapshots are never summed.".into(),
             "Execution durations are ceilings. Preparation, builds, resets, independent verification, cleanup and analysis are recorded outside execution budgets.".into(),
+            "elapsed_ms spans app-server launch through the last turn, including initialize, the harness config/read check, thread start or resume, and scripted harness checks between turns. turn_elapsed_ms sums each turn from its turn/start request to its terminal notification. first_output_ms and first_tool_ms count from attempt start, before launch.".into(),
         ],
     };
     report
@@ -306,6 +307,9 @@ fn attempt_metrics(attempt: &Attempt) -> BTreeMap<String, f64> {
     }
     if let Some(native) = &attempt.native {
         metrics.insert("elapsed_ms".into(), native.elapsed_ms as f64);
+        if let Some(turn_elapsed) = native.turn_elapsed_ms {
+            metrics.insert("turn_elapsed_ms".into(), turn_elapsed as f64);
+        }
         metrics.insert("tool_executions".into(), native.tool_executions as f64);
         metrics.insert("completed_turns".into(), native.completed_turns as f64);
     }
@@ -1270,7 +1274,7 @@ mod tests {
         sample.native = Some(
             serde_json::from_value(json!({
                 "schemaVersion": 1, "attemptId": "activity", "status": "completed",
-                "elapsedMs": 100, "cleanupMs": 0, "threadId": "root", "completedTurns": 1,
+                "elapsedMs": 100, "turnElapsedMs": 60, "cleanupMs": 0, "threadId": "root", "completedTurns": 1,
                 "toolExecutions": 3, "failure": null, "effectiveConfig": null,
                 "events": [], "stdoutPaths": [], "stderrPaths": [], "rolloutPaths": [],
                 "providerRequestsPath": null, "adaptations": [], "evidencePath": "native.json"
@@ -1317,6 +1321,8 @@ mod tests {
             "first"
         );
         let metrics = attempt_metrics(&sample);
+        assert_eq!(metrics["elapsed_ms"], 100.0);
+        assert_eq!(metrics["turn_elapsed_ms"], 60.0);
         assert_eq!(metrics["observed_tool_items"], 7.0);
         assert_eq!(metrics["completed_tool_items"], 6.0);
         assert_eq!(metrics["observed_tool_items_commandExecution"], 4.0);

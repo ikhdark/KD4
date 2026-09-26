@@ -65,6 +65,25 @@ fn atomically_replaces_existing_contents_with_bytes() {
 }
 
 #[test]
+fn failed_replacement_preserves_destination_and_removes_staging_file() {
+    let temp = tempfile::tempdir().unwrap();
+    // A file cannot replace a non-empty directory, so publication fails after staging.
+    let target = temp.path().join("state.bin");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("kept"), b"kept").unwrap();
+
+    codex_file_system::write_bytes_atomically(&target, b"new")
+        .expect_err("a file must not replace a directory");
+
+    assert_eq!(std::fs::read(target.join("kept")).unwrap(), b"kept");
+    let names = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec![std::ffi::OsString::from("state.bin")]);
+}
+
+#[test]
 fn missing_target_can_be_created_after_resolution() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("new.toml");

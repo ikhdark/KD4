@@ -25,6 +25,46 @@ fn restored_input_mode(mode: u32, original: VirtualTerminalInput) -> u32 {
 
 static ORIGINAL_VT_INPUT: std::sync::Mutex<Vec<InputModeSnapshot>> =
     std::sync::Mutex::new(Vec::new());
+static ORIGINAL_MOUSE_INPUT: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+pub(super) fn set_mouse_capture(enabled: bool) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT,
+        SetConsoleMode,
+    };
+
+    let mut original = ORIGINAL_MOUSE_INPUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !enabled && original.is_none() {
+        return Ok(());
+    }
+    // Serialize console read/modify/write with VT input restoration as well.
+    let _input_modes = ORIGINAL_VT_INPUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((handle, mode)) = current_input_mode()? else {
+        return Ok(());
+    };
+    let mask = ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE | ENABLE_WINDOW_INPUT;
+    let mouse_mode = if enabled {
+        ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT
+    } else {
+        original.unwrap_or(mode & mask)
+    };
+    // Restore only mouse-related bits; raw mode and VT input have separate owners.
+    let requested_mode = (mode & !mask) | mouse_mode;
+    // SAFETY: current_input_mode checked this borrowed console handle.
+    if requested_mode != mode && unsafe { SetConsoleMode(handle, requested_mode) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if enabled {
+        original.get_or_insert(mode & mask);
+    } else {
+        *original = None;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 pub(super) fn lock_input_modes_for_test() -> impl Drop {

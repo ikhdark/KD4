@@ -542,7 +542,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The stdin pipe buffers this line until the child reads it.
     let write_response = session.process.write(b"hello\n".to_vec()).await?;
     assert_eq!(write_response.status, WriteStatus::Accepted);
     let StartedExecProcess { process, .. } = session;

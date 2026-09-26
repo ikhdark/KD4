@@ -485,6 +485,35 @@ function Get-Command($Name) {
                 f'Set-ProcessEnvironmentVariable -Name "{variable}"', publisher
             )
 
+    def test_packaged_entrypoints_report_the_embedded_release_version(self) -> None:
+        # Packaging embeds --release-version through CODEX_RELEASE_VERSION and
+        # rejects an entrypoint whose `--version` differs. Clap's bare `version`
+        # embeds the crate's own Cargo version instead, so each packaged
+        # entrypoint and the doctor's self-report read build-info's version.
+        rust_root = REPO_ROOT / "codex-rs"
+        build_info = (rust_root / "utils" / "build-info" / "src" / "lib.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('option_env!("CODEX_RELEASE_VERSION")', build_info)
+        for entrypoint in (
+            rust_root / "cli" / "src" / "main.rs",
+            rust_root / "app-server" / "src" / "main.rs",
+        ):
+            self.assertRegex(
+                entrypoint.read_text(encoding="utf-8"),
+                r"\bversion\s*=\s*codex_utils_build_info::CODEX_VERSION\b",
+                entrypoint,
+            )
+        doctor = (rust_root / "cli" / "src" / "doctor.rs").read_text(encoding="utf-8")
+        self.assertRegex(doctor, r"codex_version:\s*codex_utils_build_info::CODEX_VERSION")
+        self.assertNotRegex(doctor, r'codex_version:\s*env!\("CARGO_PKG_VERSION"\)')
+        updates = (rust_root / "cli" / "src" / "doctor" / "updates.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            updates, r"current_version\s*=\s*codex_utils_build_info::CODEX_VERSION"
+        )
+
     def test_confirmed_dead_rust_inputs_do_not_return(self) -> None:
         rust_root = REPO_ROOT / "codex-rs"
         rmcp = load_toml(rust_root / "rmcp-client" / "Cargo.toml")
@@ -2742,8 +2771,6 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             "_core-test-reserved profile target *args:",
             "core-gate +gates:",
             "_core-gate-reserved +gates:",
-            "core-test-parity legacy *args:",
-            "_core-parity-reserved legacy *args:",
             "core-test-list:",
             "core-test-manifest-check:",
         ):
@@ -2757,7 +2784,6 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             ("core-test-fast target *args:", "just _core-test-reserved fast"),
             ("core-test-lane target *args:", "just _core-test-reserved fast"),
             ("core-gate +gates:", "just _core-gate-reserved"),
-            ("core-test-parity legacy *args:", "just _core-parity-reserved"),
         ):
             body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
             self.assertIn('rust_build_status.py" run-lane --lane', body, recipe)
@@ -2770,7 +2796,6 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             "core-test target *args:",
             "core-test-fast target *args:",
             "core-gate +gates:",
-            "core-test-parity legacy *args:",
         ):
             body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
             self.assertIn('--lane "{{ core_test_lane }}"', body, recipe)
@@ -2784,7 +2809,6 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         for reserved in (
             "_core-test-reserved profile target *args:",
             "_core-gate-reserved +gates:",
-            "_core-parity-reserved legacy *args:",
         ):
             body = justfile.split(f"\n{reserved}\n", 1)[1].split("\n\n", 1)[0]
             self.assertIn("$target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR", body)
@@ -2810,7 +2834,7 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             self.assertRegex(justfile, rf"just core-gate [^\n]*\b{gate}\b")
             self.assertIn(gate, manifest["gates"])
 
-        thread_status = justfile.split("_app-server-thread-status-tests:", 1)[1].split(
+        thread_status = justfile.split("\napp-server-thread-status-check:\n", 1)[1].split(
             "\n\n", 1
         )[0]
         self.assertIn("just core-gate app-server-thread-status", thread_status)
@@ -2829,9 +2853,8 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         # own profile or target name as one, so pin it per recipe signature.
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         signature = re.compile(
-            r"^(core-test|core-test-fast|core-test-lane|core-test-parity"
-            r"|core-gate|_core-test-reserved|_core-gate-reserved"
-            r"|_core-parity-reserved)"
+            r"^(core-test|core-test-fast|core-test-lane"
+            r"|core-gate|_core-test-reserved|_core-gate-reserved)"
             r"((?: [^:\n]*)?):[ \t]*$"
         )
         skip = re.compile(r"\$args \| Select-Object -Skip (\d+)")
@@ -2860,12 +2883,10 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
                 "core-test": 2,
                 "core-test-fast": 2,
                 "core-test-lane": 2,
-                "core-test-parity": 2,
                 # A `+`/`*` variadic occupies no slot of its own.
                 "core-gate": 1,
                 "_core-test-reserved": 3,
                 "_core-gate-reserved": 1,
-                "_core-parity-reserved": 2,
             },
         )
 

@@ -614,6 +614,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_markdown_cannot_write_terminal_sequences_to_scrollback() {
+        let destination = "https://example.com/a";
+        let lines = crate::markdown_render::render_markdown_lines_with_width_and_cwd(
+            &format!("Run\x1b]52;c;cHduZWQ=\x07 now\x1b[2J see {destination}"),
+            /*width*/ None,
+            /*cwd*/ None,
+        );
+        let mut actual = Vec::new();
+
+        write_history_line(
+            &mut actual,
+            &lines[0],
+            /*wrap_width*/ 80,
+            /*reachable_rows_below*/ 0,
+        )
+        .expect("write history line");
+
+        let output = String::from_utf8(actual).expect("UTF-8 terminal output");
+        assert!(!output.contains("\x1b]52"), "{output:?}");
+        assert!(!output.contains("\x1b[2J"), "{output:?}");
+        assert!(output.contains(&format!(
+            "Run]52;c;cHduZWQ= now[2J see {}",
+            crate::terminal_hyperlinks::osc8_hyperlink(destination, destination)
+        )));
+    }
+
+    #[test]
     fn vt100_blockquote_line_emits_green_fg() {
         // Set up a small off-screen terminal
         let width: u16 = 40;

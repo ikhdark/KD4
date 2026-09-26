@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -8,7 +9,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_utils_cache::BlockingLruCache;
 use codex_utils_cache::sha1_digest;
-use image::ColorType;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageDecoder;
@@ -57,7 +57,15 @@ impl EncodedImage {
 
 /// Wraps image bytes in a data URL without decoding or validating them.
 pub fn data_url_from_bytes(mime: &str, bytes: &[u8]) -> String {
-    let mut url = format!("data:{mime};base64,");
+    const BASE64_MARKER: &str = ";base64,";
+    let prefix_len = DATA_URL_PREFIX.len() + mime.len() + BASE64_MARKER.len();
+    // Reserve the full payload up front; multi-megabyte images otherwise
+    // regrow and copy the string repeatedly while encoding.
+    let payload_len = base64::encoded_len(bytes.len(), /*padding*/ true).unwrap_or(0);
+    let mut url = String::with_capacity(prefix_len.saturating_add(payload_len));
+    url.push_str(DATA_URL_PREFIX);
+    url.push_str(mime);
+    url.push_str(BASE64_MARKER);
     BASE64_STANDARD.encode_string(bytes, &mut url);
     url
 }
@@ -364,87 +372,59 @@ fn encode_image(
     preferred_format: ImageFormat,
     metadata: ImageMetadata,
 ) -> Result<(Vec<u8>, ImageFormat), ImageProcessingError> {
-    let target_format = match preferred_format {
-        ImageFormat::Jpeg => ImageFormat::Jpeg,
-        ImageFormat::WebP => ImageFormat::WebP,
+    let format = match preferred_format {
+        ImageFormat::Jpeg | ImageFormat::WebP => preferred_format,
         _ => ImageFormat::Png,
     };
-
+    let image = eight_bit_image(image);
     let mut buffer = Vec::new();
-    let ImageMetadata { icc_profile, exif } = metadata;
-
-    match target_format {
-        ImageFormat::Png => {
-            let rgba = image.to_rgba8();
-            let mut encoder = PngEncoder::new(&mut buffer);
-            apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
-            encoder
-                .write_image(
-                    rgba.as_raw(),
-                    image.width(),
-                    image.height(),
-                    ColorType::Rgba8.into(),
-                )
-                .map_err(|source| ImageProcessingError::Encode {
-                    format: target_format,
-                    source,
-                })?;
-        }
-        ImageFormat::Jpeg => {
-            let mut encoder = JpegEncoder::new_with_quality(&mut buffer, 85);
-            apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
-            encoder
-                .encode_image(image)
-                .map_err(|source| ImageProcessingError::Encode {
-                    format: target_format,
-                    source,
-                })?;
-        }
+    let encoded = match format {
+        ImageFormat::Jpeg => write_with_metadata(
+            JpegEncoder::new_with_quality(&mut buffer, 85),
+            &image,
+            metadata,
+        ),
         ImageFormat::WebP => {
-            let rgba = image.to_rgba8();
-            let mut encoder = WebPEncoder::new_lossless(&mut buffer);
-            apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
-            encoder
-                .write_image(
-                    rgba.as_raw(),
-                    image.width(),
-                    image.height(),
-                    ColorType::Rgba8.into(),
-                )
-                .map_err(|source| ImageProcessingError::Encode {
-                    format: target_format,
-                    source,
-                })?;
+            write_with_metadata(WebPEncoder::new_lossless(&mut buffer), &image, metadata)
         }
-        _ => unreachable!("unsupported target_format should have been handled earlier"),
-    }
+        _ => write_with_metadata(PngEncoder::new(&mut buffer), &image, metadata),
+    };
+    encoded.map_err(|source| ImageProcessingError::Encode { format, source })?;
 
-    Ok((buffer, target_format))
+    Ok((buffer, format))
 }
 
-fn apply_image_metadata(
-    encoder: &mut impl ImageEncoder,
-    icc_profile: Option<Vec<u8>>,
-    exif: Option<Vec<u8>>,
-    format: ImageFormat,
-) -> Result<(), ImageProcessingError> {
+/// Narrows wider samples to 8 bits but keeps the decoded channel layout, so
+/// opaque or grayscale images are not expanded to RGBA before encoding.
+fn eight_bit_image(image: &DynamicImage) -> Cow<'_, DynamicImage> {
+    let color = image.color();
+    if color.bytes_per_pixel() == color.channel_count() {
+        return Cow::Borrowed(image);
+    }
+    Cow::Owned(match (color.has_color(), color.has_alpha()) {
+        (false, false) => image.to_luma8().into(),
+        (false, true) => image.to_luma_alpha8().into(),
+        (true, false) => image.to_rgb8().into(),
+        (true, true) => image.to_rgba8().into(),
+    })
+}
+
+fn write_with_metadata(
+    mut encoder: impl ImageEncoder,
+    image: &DynamicImage,
+    ImageMetadata { icc_profile, exif }: ImageMetadata,
+) -> image::ImageResult<()> {
     if let Some(icc_profile) = icc_profile {
         encoder
             .set_icc_profile(icc_profile)
-            .map_err(|source| ImageProcessingError::Encode {
-                format,
-                source: image::ImageError::Unsupported(source),
-            })?;
+            .map_err(image::ImageError::Unsupported)?;
     }
     if let Some(exif) = exif {
         encoder
             .set_exif_metadata(exif)
-            .map_err(|source| ImageProcessingError::Encode {
-                format,
-                source: image::ImageError::Unsupported(source),
-            })?;
+            .map_err(image::ImageError::Unsupported)?;
     }
-    Ok(())
+    image.write_with_encoder(encoder)
 }
 
 fn format_to_mime(format: ImageFormat) -> &'static str {

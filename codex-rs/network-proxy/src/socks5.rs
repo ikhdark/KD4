@@ -129,15 +129,13 @@ async fn run_socks5_with_listener(
         }
     }
 
-    let tcp_connector = TargetCheckedTcpConnector::new(state.clone());
     let policy_tcp_connector = service_fn({
         let policy_decider = policy_decider.clone();
         let environment_id = environment_id.clone();
         move |req: TcpRequest| {
-            let tcp_connector = tcp_connector.clone();
             let policy_decider = policy_decider.clone();
             let environment_id = environment_id.clone();
-            async move { handle_socks5_tcp(req, tcp_connector, policy_decider, environment_id).await }
+            async move { handle_socks5_tcp(req, policy_decider, environment_id).await }
         }
     });
 
@@ -180,7 +178,6 @@ async fn run_socks5_with_listener(
 
 async fn handle_socks5_tcp(
     mut req: TcpRequest,
-    _tcp_connector: TargetCheckedTcpConnector,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
 ) -> Result<EstablishedClientConnection<Socks5TcpConnection, TcpRequest>, BoxError> {
@@ -907,7 +904,6 @@ mod tests {
 
         let result = handle_socks5_tcp(
             request,
-            TargetCheckedTcpConnector::new(state),
             /*policy_decider*/ None,
             /*environment_id*/ None,
         )
@@ -942,7 +938,6 @@ mod tests {
             request.extensions_mut().insert(state.clone());
             let connection = handle_socks5_tcp(
                 request,
-                TargetCheckedTcpConnector::new(state),
                 /*policy_decider*/ None,
                 /*environment_id*/ None,
             )
@@ -978,7 +973,6 @@ mod tests {
         let (result, events) = capture_events(|| async {
             handle_socks5_tcp(
                 request,
-                TargetCheckedTcpConnector::new(state.clone()),
                 /*policy_decider*/ None,
                 /*environment_id*/ None,
             )
@@ -1022,7 +1016,6 @@ mod tests {
 
         let result = handle_socks5_tcp(
             request,
-            TargetCheckedTcpConnector::new(state),
             /*policy_decider*/ None,
             /*environment_id*/ None,
         )
@@ -1048,7 +1041,6 @@ mod tests {
         let (result, events) = capture_events(|| async {
             handle_socks5_tcp(
                 request,
-                TargetCheckedTcpConnector::new(state),
                 /*policy_decider*/ None,
                 /*environment_id*/ None,
             )
@@ -1099,7 +1091,6 @@ mod tests {
 
         let result = handle_socks5_tcp(
             request,
-            TargetCheckedTcpConnector::new(state),
             /*policy_decider*/ None,
             /*environment_id*/ None,
         )
@@ -1124,7 +1115,6 @@ mod tests {
 
         let err = handle_socks5_tcp(
             request,
-            TargetCheckedTcpConnector::new(state),
             /*policy_decider*/ None,
             /*environment_id*/ None,
         )
@@ -1162,7 +1152,6 @@ mod tests {
 
         let result = handle_socks5_tcp(
             request,
-            TargetCheckedTcpConnector::new(state),
             /*policy_decider*/ None,
             /*environment_id*/ None,
         )
@@ -1197,7 +1186,6 @@ mod tests {
 
         let err = handle_socks5_tcp(
             request,
-            TargetCheckedTcpConnector::new(state),
             /*policy_decider*/ None,
             /*environment_id*/ None,
         )

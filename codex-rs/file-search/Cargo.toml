@@ -24,6 +24,7 @@ ignore = { workspace = true }
 nucleo = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

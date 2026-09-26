@@ -703,7 +703,7 @@ mod tests {
                     assert_eq!(user_paths[0].as_path(), config_path.as_path());
                     assert_eq!(std::fs::read(&config_path)?, CONFIG.as_bytes());
                     let state_db = codex_state::StateRuntime::init(
-                        PathBuf::from(std::env::var_os("CODEX_SQLITE_HOME").expect("child sqlite home")),
+                        home.clone(),
                         "openai".to_string(),
                     )
                     .await.expect("open completed archive state database");
@@ -775,7 +775,6 @@ mod tests {
                 .env(MODE, mode)
                 .env(PROJECT, &project)
                 .env("CODEX_HOME", selected_home)
-                .env("CODEX_SQLITE_HOME", fixture.path().join("sqlite"))
                 .current_dir(&project)
                 .output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -788,9 +787,7 @@ mod tests {
                 );
                 assert_eq!(
                     stderr.trim_end(),
-                    format!(
-                        "WARNING: proceeding, even though we could not create PATH aliases: {home_error}\nError finding codex home: {home_error}"
-                    ),
+                    format!("Error finding codex home: {home_error}"),
                     "{mode}"
                 );
                 assert!(!stdout.contains(PASSED));

@@ -87,7 +87,9 @@ use codex_utils_oss::get_default_model_for_oss_provider;
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    // A bare `version` would embed this crate's Cargo version and, being
+    // applied last, override the flattened TUI's release-aware version.
+    version = codex_utils_build_info::CODEX_VERSION,
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform-specific name like
@@ -751,23 +753,11 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     let cmd_str = action.command_str();
     println!("Updating Codex via `{cmd_str}`...");
 
-    let status = {
-        {
-            if action == UpdateAction::StandaloneWindows {
-                let (cmd, args) = action.command_args();
-                // Run the standalone PowerShell installer with PowerShell
-                // itself. Routing this through `cmd.exe /C` would parse
-                // PowerShell metacharacters like `|` before PowerShell sees
-                // the installer command.
-                std::process::Command::new(cmd).args(args).status()?
-            } else {
-                // On Windows, run via cmd.exe so .CMD/.BAT are correctly resolved (PATHEXT semantics).
-                std::process::Command::new("cmd")
-                    .args(["/C", &cmd_str])
-                    .status()?
-            }
-        }
-    };
+    // Run the standalone PowerShell installer with PowerShell itself. Routing
+    // this through `cmd.exe /C` would parse PowerShell metacharacters like `|`
+    // before PowerShell sees the installer command.
+    let (cmd, args) = action.command_args();
+    let status = std::process::Command::new(cmd).args(args).status()?;
     if !status.success() {
         anyhow::bail!("`{cmd_str}` failed with status {status}");
     }
@@ -787,7 +777,8 @@ fn run_update_command() -> anyhow::Result<()> {
     {
         let Some(action) = codex_tui::get_update_action() else {
             anyhow::bail!(
-                "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
+                "This Codex installation cannot update itself. Install the latest release from {}",
+                codex_install_context::LATEST_RELEASE_URL
             );
         };
         run_update_action(action)
@@ -934,6 +925,26 @@ fn validate_root_shared_options(shared: &SharedCliOptions) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Parses the command line, keeping `-c` values given before and after a
+/// subcommand.
+///
+/// Plain clap parsing gives the root, and every subcommand struct that reads
+/// `-c`, only the values of the deepest level that received it. The root list
+/// is replaced with every level's values in order; subcommand structs still
+/// hold the deepest level's values, which already end that list, so appending
+/// them again does not change the effective configuration.
+fn parse_multitool_cli(args: impl IntoIterator<Item = std::ffi::OsString>) -> MultitoolCli {
+    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    let mut cli = MultitoolCli::parse_from(&args);
+    if cli.subcommand.is_some()
+        && let Some(config_overrides) =
+            CliConfigOverrides::from_every_command_level(MultitoolCli::command(), args)
+    {
+        cli.config_overrides = config_overrides;
+    }
+    cli
+}
+
 fn main() -> anyhow::Result<()> {
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
@@ -952,7 +963,7 @@ async fn cli_main(
         remote,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse();
+    } = parse_multitool_cli(std::env::args_os());
     validate_root_shared_options(&interactive.shared)?;
 
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
@@ -1348,6 +1359,9 @@ async fn cli_main(
             run_apply_command(apply_cli, /*cwd*/ None).await?;
         }
         Some(Subcommand::ResponsesApiProxy(args)) => {
+            // The standalone proxy binary applies these mitigations before main;
+            // this subcommand serves the same API key, so apply them before reading it.
+            codex_process_hardening::pre_main_hardening();
             tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
                 .await??;
         }
@@ -2478,6 +2492,33 @@ mod tests {
                 .expect("sandbox supports config profile")
                 .as_deref(),
             Some("work")
+        );
+    }
+
+    #[test]
+    fn config_overrides_before_and_after_subcommands_are_all_applied() {
+        let parse = |args: &[&str]| parse_multitool_cli(args.iter().map(std::ffi::OsString::from));
+
+        let cli = parse(&["codex", "-c", "model=root", "exec", "-c", "effort=high", "task"]);
+        assert_eq!(
+            cli.config_overrides.raw_overrides,
+            vec!["model=root", "effort=high"]
+        );
+
+        let cli = parse(&["codex", "-c", "a=1", "-c", "b=1", "mcp", "-c", "a=2", "list"]);
+        let Some(Subcommand::Mcp(mut mcp_cli)) = cli.subcommand else {
+            panic!("expected mcp subcommand");
+        };
+        prepend_config_flags(&mut mcp_cli.config_overrides, cli.config_overrides);
+        let effective: std::collections::HashMap<_, _> = mcp_cli
+            .config_overrides
+            .parse_overrides()
+            .expect("parse overrides")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            (effective.get("a"), effective.get("b")),
+            (Some(&toml::Value::Integer(2)), Some(&toml::Value::Integer(1)))
         );
     }
 

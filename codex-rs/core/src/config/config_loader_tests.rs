@@ -433,6 +433,30 @@ async fn strict_config_rejects_unknown_cli_override_key_with_relative_path_overr
 }
 
 #[tokio::test]
+async fn non_positive_context_budgets_are_rejected() {
+    for field in ["model_context_window", "model_auto_compact_token_limit"] {
+        for (value, valid) in [(-1, false), (0, false), (1, true)] {
+            let tmp = tempdir().expect("tempdir");
+            let result = ConfigBuilder::default()
+                .codex_home(tmp.path().to_path_buf())
+                .fallback_cwd(Some(tmp.path().to_path_buf()))
+                .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+                .cli_overrides(vec![(field.to_string(), TomlValue::Integer(value))])
+                .build()
+                .await;
+
+            match result {
+                Ok(_) => assert!(valid, "{field} = {value} must be rejected"),
+                Err(err) => {
+                    assert!(!valid, "{field} = {value} must be accepted: {err}");
+                    assert_eq!(err.to_string(), format!("{field} must be greater than zero"));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn strict_config_rejects_unknown_feature_cli_override_key() {
     let tmp = tempdir().expect("tempdir");
 
@@ -2562,11 +2586,13 @@ foo = "child"
 "#,
     )
     .expect("parse child config");
-    let expected_project_layer = ConfigLayerEntry::new(
+    let expected_project_layer = ConfigLayerEntry::new_with_raw_toml(
         ConfigLayerSource::Project {
             dot_codex_folder: AbsolutePathBuf::from_absolute_path(&nested_dot_codex)?,
         },
         child_config,
+        "foo = \"child\"\n".to_string(),
+        AbsolutePathBuf::from_absolute_path(&nested_dot_codex)?,
     );
     assert_eq!(vec![&expected_project_layer], project_layers);
     assert_eq!(
@@ -2636,9 +2662,10 @@ profile = "ignored"
         "expected untrusted project layer to be disabled"
     );
     assert_eq!(
-        project_layers_untrusted[0].config.get("foo"),
-        Some(&TomlValue::String("child".to_string()))
+        project_layers_untrusted[0].config,
+        TomlValue::Table(toml::map::Map::new())
     );
+    assert_eq!(project_layers_untrusted[0].raw_toml(), None);
     assert!(
         project_layers_untrusted[0].config.get("profile").is_none(),
         "expected unsupported project config keys to be ignored even when the layer is disabled"
@@ -2682,9 +2709,10 @@ profile = "ignored"
         "expected unknown-trust project layer to be disabled"
     );
     assert_eq!(
-        project_layers_unknown[0].config.get("foo"),
-        Some(&TomlValue::String("child".to_string()))
+        project_layers_unknown[0].config,
+        TomlValue::Table(toml::map::Map::new())
     );
+    assert_eq!(project_layers_unknown[0].raw_toml(), None);
     assert!(
         project_layers_unknown[0].config.get("profile").is_none(),
         "expected unsupported project config keys to be ignored even when the layer is disabled"

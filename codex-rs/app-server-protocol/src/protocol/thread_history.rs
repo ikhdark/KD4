@@ -639,6 +639,9 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_web_search_begin(&mut self, payload: &WebSearchBeginEvent) {
+        if self.current_turn_has_item(&payload.call_id) {
+            return;
+        }
         let item = ThreadItem::WebSearch(WebSearchItem {
             id: payload.call_id.clone(),
             query: String::new(),
@@ -838,6 +841,9 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_image_generation_begin(&mut self, payload: &ImageGenerationBeginEvent) {
+        if self.current_turn_has_item(&payload.call_id) {
+            return;
+        }
         let item = ThreadItem::ImageGeneration(ImageGenerationItem {
             id: payload.call_id.clone(),
             status: String::new(),
@@ -1516,6 +1522,14 @@ impl ThreadHistoryBuilder {
     fn upsert_item_in_current_turn(&mut self, item: ThreadItem) {
         let index = self.ensure_turn().upsert_item(item);
         self.record_changed_item(self.turns.len(), index);
+    }
+
+    /// Legacy begin events carry only a call id. Extension tools emit their canonical
+    /// started item first, so replacing it would erase that item's state.
+    fn current_turn_has_item(&self, item_id: &str) -> bool {
+        self.current_turn
+            .as_ref()
+            .is_some_and(|turn| turn.item_indexes.contains_key(item_id))
     }
 
     fn is_tracking_changes(&self) -> bool {
@@ -2282,6 +2296,74 @@ mod tests {
                 result: "cG5n".to_string(),
                 saved_path: Some(saved_path),
             })]
+        );
+    }
+
+    #[test]
+    fn legacy_begin_fanout_preserves_started_extension_items() {
+        let thread_id = ThreadId::new();
+        let started_image = ImageGenerationItem {
+            id: "image-1".to_string(),
+            status: "in_progress".to_string(),
+            revised_prompt: None,
+            result: String::new(),
+            saved_path: None,
+        };
+        let started_search = WebSearchItem {
+            id: "search-1".to_string(),
+            query: String::new(),
+            action: None,
+        };
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        for (item, legacy_begin) in [
+            (
+                CoreExtensionItem::ImageGeneration(started_image.clone()),
+                EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                    call_id: "image-1".to_string(),
+                }),
+            ),
+            (
+                CoreExtensionItem::WebSearch(started_search.clone()),
+                EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                    call_id: "search-1".to_string(),
+                }),
+            ),
+        ] {
+            builder.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id,
+                turn_id: "turn-1".to_string(),
+                item: CoreTurnItem::Extension(item),
+                started_at_ms: 1,
+            }));
+            // Extensions emit their legacy compatibility event after the canonical item.
+            let changes = builder.handle_event_with_changes(&legacy_begin);
+            assert!(changes.changed_items.is_empty());
+        }
+        // Hosted image generation has only the legacy begin, which must still create its item.
+        builder.handle_event(&EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+            call_id: "hosted-image".to_string(),
+        }));
+
+        assert_eq!(
+            builder.in_progress_turn_snapshot().map(|turn| turn.items),
+            Some(vec![
+                ThreadItem::ImageGeneration(started_image),
+                ThreadItem::WebSearch(started_search),
+                ThreadItem::ImageGeneration(ImageGenerationItem {
+                    id: "hosted-image".to_string(),
+                    status: String::new(),
+                    revised_prompt: None,
+                    result: String::new(),
+                    saved_path: None,
+                }),
+            ])
         );
     }
 

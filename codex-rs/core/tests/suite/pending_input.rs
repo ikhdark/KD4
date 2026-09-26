@@ -388,6 +388,7 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
     let test = test_codex()
         .with_model("gpt-5.4")
         .with_config(|config| {
+            config.multi_agent_v2.tool_namespace = Some(MULTI_AGENT_V2_NAMESPACE.to_string());
             config
                 .features
                 .enable(Feature::Collab)

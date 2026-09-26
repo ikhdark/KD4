@@ -77,7 +77,6 @@ impl Handler {
             })
             .transpose()?;
         let mut typed_tasks = Vec::new();
-        let mut typed_tasks_truncated = false;
         if let (Some(store), Some(root_session_id)) =
             (coordinator.store(), coordinator.root_session_id())
         {
@@ -89,7 +88,6 @@ impl Handler {
                         "list_agents: durable typed-task state is unavailable: {error}"
                     ))
                 })?;
-            typed_tasks_truncated = false;
             for binding in bindings {
                 if resolved_prefix
                     .as_ref()
@@ -127,7 +125,6 @@ impl Handler {
         Ok(boxed_tool_output(ListAgentsResult {
             agents,
             typed_tasks,
-            typed_tasks_truncated,
         }))
     }
 }
@@ -148,7 +145,6 @@ struct ListAgentsArgs {
 pub(crate) struct ListAgentsResult {
     agents: Vec<ListedAgent>,
     typed_tasks: Vec<JsonValue>,
-    typed_tasks_truncated: bool,
 }
 
 fn agent_path_matches_prefix(agent_path: &str, prefix: &AgentPath) -> bool {

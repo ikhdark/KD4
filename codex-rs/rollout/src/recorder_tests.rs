@@ -2243,63 +2243,6 @@ async fn list_threads_search_repairs_stale_state_db_hits_before_returning() -> s
 }
 
 #[tokio::test]
-async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let stale_cwd = home.path().join("stale");
-    let latest_cwd = home.path().join("latest");
-    fs::create_dir_all(&stale_cwd)?;
-    fs::create_dir_all(&latest_cwd)?;
-
-    let path = write_session_file(home.path(), "2025-01-03T13-00-00", Uuid::from_u128(9012))?;
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-    let turn_context = RolloutLine {
-        timestamp: "2025-01-03T13:00:01Z".to_string(),
-        item: RolloutItem::TurnContext(TurnContextItem {
-            turn_id: Some("turn-1".to_string()),
-            cwd: serde_json::from_value(serde_json::json!(&latest_cwd))
-                .expect("absolute latest cwd"),
-            workspace_roots: None,
-            current_date: None,
-            timezone: None,
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::new_read_only_policy(),
-            permission_profile: None,
-            network: None,
-            file_system_sandbox_policy: None,
-            model: "test-model".to_string(),
-            comp_hash: None,
-            personality: None,
-            collaboration_mode: None,
-            multi_agent_version: None,
-            multi_agent_mode: None,
-            effort: None,
-            context_provenance: None,
-        }),
-    };
-    writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;
-
-    assert!(
-        resume_candidate_matches_cwd(
-            path.as_path(),
-            Some(stale_cwd.as_path()),
-            latest_cwd.as_path(),
-            "test-provider",
-        )
-        .await
-    );
-    assert!(
-        !resume_candidate_matches_cwd(
-            path.as_path(),
-            Some(stale_cwd.as_path()),
-            stale_cwd.as_path(),
-            "test-provider",
-        )
-        .await
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn list_threads_filters_and_projects_latest_persisted_cwd() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let latest_cwd = home.path().join("latest-list-cwd");
@@ -2351,57 +2294,6 @@ async fn list_threads_filters_and_projects_latest_persisted_cwd() -> std::io::Re
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].path, path);
     assert_eq!(page.items[0].cwd.as_deref(), Some(latest_cwd.as_path()));
-    Ok(())
-}
-
-#[tokio::test]
-async fn find_latest_thread_path_filters_on_latest_turn_context_cwd() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let latest_cwd = home.path().join("latest");
-    fs::create_dir_all(&latest_cwd)?;
-
-    let path = write_session_file(home.path(), "2025-01-03T13-00-00", Uuid::from_u128(9013))?;
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-    let turn_context = RolloutLine {
-        timestamp: "2025-01-03T13:00:01Z".to_string(),
-        item: RolloutItem::TurnContext(TurnContextItem {
-            turn_id: Some("turn-1".to_string()),
-            cwd: serde_json::from_value(serde_json::json!(&latest_cwd))
-                .expect("absolute latest cwd"),
-            workspace_roots: None,
-            current_date: None,
-            timezone: None,
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::new_read_only_policy(),
-            permission_profile: None,
-            network: None,
-            file_system_sandbox_policy: None,
-            model: "test-model".to_string(),
-            comp_hash: None,
-            personality: None,
-            collaboration_mode: None,
-            multi_agent_version: None,
-            multi_agent_mode: None,
-            effort: None,
-            context_provenance: None,
-        }),
-    };
-    writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;
-
-    let found = RolloutRecorder::find_latest_thread_path(
-        /*state_db_ctx*/ None,
-        &test_config(home.path()),
-        /*page_size*/ 10,
-        /*cursor*/ None,
-        ThreadSortKey::CreatedAt,
-        &[SessionSource::Cli],
-        /*model_providers*/ None,
-        "test-provider",
-        Some(latest_cwd.as_path()),
-    )
-    .await?;
-
-    assert_eq!(found, Some(path));
     Ok(())
 }
 

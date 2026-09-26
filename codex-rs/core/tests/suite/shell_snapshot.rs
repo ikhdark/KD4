@@ -20,34 +20,8 @@ use core_test_support::wait_for_event_match_with_timeout;
 use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use std::path::Path;
-use std::path::PathBuf;
 use tokio::fs;
 use tokio::time::Duration;
-use tokio::time::Instant;
-use tokio::time::sleep;
-
-async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
-    let snapshot_dir = codex_home.join("shell_snapshots");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(mut entries) = fs::read_dir(&snapshot_dir).await {
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) == Some("ps1") {
-                    return Ok(path);
-                }
-            }
-        }
-
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for PowerShell snapshot");
-        }
-
-        sleep(Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())))
-            .await;
-    }
-}
 
 async fn run_tool_turn_on_harness(
     harness: &TestCodexHarness,
@@ -147,7 +121,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     });
     let harness = TestCodexHarness::with_builder(builder).await?;
     let codex_home = harness.test().home.path().to_path_buf();
-    run_tool_turn_on_harness(
+    let warmup = run_tool_turn_on_harness(
         &harness,
         "warm up PowerShell snapshot",
         "powershell-snapshot-warmup",
@@ -158,34 +132,17 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
         }),
     )
     .await?;
-    let snapshot_path = wait_for_snapshot(&codex_home).await?;
-    let snapshot_content = fs::read_to_string(&snapshot_path).await?;
-
-    assert!(snapshot_path.starts_with(&codex_home));
-    for section in ["# Snapshot file", "# Functions", "# aliases", "# exports"] {
-        assert!(
-            snapshot_content.lines().any(|line| line == section),
-            "snapshot should contain exact section header {section:?}; snapshot={snapshot_content:?}"
-        );
-    }
-    assert!(
-        snapshot_content
-            .lines()
-            .any(|line| line == "# Codex PowerShell snapshot format: 1")
-    );
-
-    fs::write(
-        &snapshot_path,
-        "# Snapshot file\n# Codex PowerShell snapshot format: 1\n# Functions\nfunction Invoke-CodexSnapshotE2E { Microsoft.PowerShell.Utility\\Write-Output 'snapshot-windows' }\n# aliases\n# exports\n",
-    )
-    .await?;
+    assert_eq!(normalize_newlines(&warmup.stdout).trim(), "warmup");
+    assert_eq!(warmup.exit_code, 0);
+    // PowerShell snapshots deliberately remain disabled: replaying function
+    // source loses captured variables and module state. Exercise normal execution.
     let end = run_tool_turn_on_harness(
         &harness,
         "verify PowerShell snapshot replay",
         "powershell-snapshot-replay",
         json!({
             "kind": "script",
-            "cmd": "Invoke-CodexSnapshotE2E",
+            "cmd": "$value = 'snapshot-windows'; $closure = { Microsoft.PowerShell.Utility\\Write-Output $value }.GetNewClosure(); & $closure",
             "yield_time_ms": 1_000,
         }),
     )
@@ -193,6 +150,13 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
 
     assert_eq!(normalize_newlines(&end.stdout).trim(), "snapshot-windows");
     assert_eq!(end.exit_code, 0);
+    let snapshot_dir = codex_home.join("shell_snapshots");
+    if snapshot_dir.exists() {
+        let mut entries = fs::read_dir(snapshot_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            assert_ne!(entry.path().extension().and_then(|ext| ext.to_str()), Some("ps1"));
+        }
+    }
 
     Ok(())
 }

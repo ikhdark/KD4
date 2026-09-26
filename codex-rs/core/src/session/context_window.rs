@@ -1,5 +1,6 @@
 use super::session::Session;
 use super::turn_context::TurnContext;
+use crate::config::TokenBudgetConfig;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 
 #[derive(Debug)]
@@ -106,7 +107,7 @@ async fn context_window_token_status_for_pressure(
             .config
             .token_budget
             .as_ref()
-            .map_or(0, |config| config.fallback_buffer_tokens())
+            .map_or(0, TokenBudgetConfig::fallback_buffer_tokens)
     } else {
         0
     };

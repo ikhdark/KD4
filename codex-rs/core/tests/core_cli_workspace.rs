@@ -1,12 +1,13 @@
 #![allow(clippy::expect_used)]
 
-// Bounded replacement shard for the legacy `all` integration target.
-// CLI, workspace-context, and shell-invocation integration tests.
+// Bounded codex-core integration shard.
+// CLI, workspace-context, and shell-invocation integration tests. `cli_stream`
+// and `live_cli` spawn the `codex` CLI; the other modules drive in-process
+// sessions.
 //
 // The `suite` module is rooted at `tests/suite/` so test IDs stay
 // `suite::<module>::<test>`, and the shared bootstrap comes from the one
 // included prelude. Each shard compiles only its assigned source modules.
-pub use codex_protocol::error;
 
 #[path = "suite"]
 mod suite {

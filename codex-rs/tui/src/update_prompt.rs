@@ -33,7 +33,7 @@ use ratatui::widgets::WidgetRef;
 #[cfg(not(debug_assertions))]
 use tokio_stream::StreamExt;
 
-const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
+const RELEASE_NOTES_URL: &str = codex_install_context::LATEST_RELEASE_URL;
 
 #[cfg(not(debug_assertions))]
 pub(crate) enum UpdatePromptOutcome {
@@ -261,7 +261,7 @@ mod tests {
         UpdatePromptScreen::new(
             FrameRequester::test_dummy(),
             "9.9.9".into(),
-            UpdateAction::NpmGlobalLatest,
+            UpdateAction::StandaloneWindows,
         )
     }
 
@@ -274,8 +274,8 @@ mod tests {
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render update prompt");
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("https://github.com/openai/codex/releases/latest"));
-        assert!(rendered.contains("npm install -g @openai/codex"));
+        assert!(rendered.contains("https://github.com/ikhdark/KD4/releases/latest"));
+        assert!(rendered.contains("Update now (runs `powershell"));
         insta::assert_snapshot!("update_prompt_modal", terminal.backend());
     }
 

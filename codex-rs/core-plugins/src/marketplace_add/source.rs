@@ -91,9 +91,9 @@ pub(super) fn stage_marketplace_source<F>(
     sparse_paths: &[String],
     staged_root: &Path,
     clone_source: F,
-) -> Result<(), MarketplaceAddError>
+) -> Result<String, MarketplaceAddError>
 where
-    F: Fn(&str, Option<&str>, &[String], &Path) -> Result<(), MarketplaceAddError>,
+    F: Fn(&str, Option<&str>, &[String], &Path) -> Result<String, MarketplaceAddError>,
 {
     if !sparse_paths.is_empty() && !matches!(source, MarketplaceSource::Git { .. }) {
         return Err(MarketplaceAddError::InvalidRequest(
@@ -444,7 +444,7 @@ mod tests {
             &MarketplaceSource::Local { path },
             &["plugins/foo".to_string()],
             Path::new("/tmp"),
-            |_url, _ref_name, _sparse_paths, _staged_root| Ok(()),
+            |_url, _ref_name, _sparse_paths, _staged_root| Ok(String::new()),
         )
         .unwrap_err();
 

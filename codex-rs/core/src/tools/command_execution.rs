@@ -584,6 +584,15 @@ impl CommandExecutionLedger {
             );
     }
 
+    pub(crate) async fn has_uncertain_command_baseline(&self, call_id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .repository
+            .uncertain_command_baselines
+            .contains_key(call_id)
+    }
+
     pub(crate) async fn take_uncertain_command_baseline(
         &self,
         call_id: &str,

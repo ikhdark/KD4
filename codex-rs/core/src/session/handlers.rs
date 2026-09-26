@@ -151,10 +151,11 @@ struct TurnStartAdmission(Option<tokio::sync::oneshot::Sender<CodexResult<()>>>)
 
 impl TurnStartAdmission {
     fn send(mut self, result: CodexResult<()>) -> Result<(), CodexResult<()>> {
-        self.0
-            .take()
-            .expect("admission sender is owned")
-            .send(result)
+        // Only `send` and `Drop` take the sender, so it is present here.
+        match self.0.take() {
+            Some(sender) => sender.send(result),
+            None => Err(result),
+        }
     }
 }
 

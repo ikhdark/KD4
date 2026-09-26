@@ -90,6 +90,13 @@ fn upsert_marketplace(
     let Some(marketplaces_item) = root.get_mut("marketplaces") else {
         return;
     };
+    let entry = marketplace_entry(update);
+    // An inline table holds the other configured marketplaces; replacing it
+    // with an empty table would delete them.
+    if let Some(marketplaces) = marketplaces_item.as_inline_table_mut() {
+        marketplaces.insert(marketplace_name, entry.into_inline_table().into());
+        return;
+    }
     if !marketplaces_item.is_table() {
         *marketplaces_item = TomlItem::Table(new_implicit_table());
     }
@@ -97,6 +104,10 @@ fn upsert_marketplace(
     let Some(marketplaces) = marketplaces_item.as_table_mut() else {
         return;
     };
+    marketplaces.insert(marketplace_name, TomlItem::Table(entry));
+}
+
+fn marketplace_entry(update: &MarketplaceConfigUpdate<'_>) -> TomlTable {
     let mut entry = TomlTable::new();
     entry.set_implicit(false);
     entry["last_updated"] = value(update.last_updated.to_string());
@@ -113,7 +124,7 @@ fn upsert_marketplace(
             update.sparse_paths.iter().map(String::as_str).collect(),
         ));
     }
-    marketplaces.insert(marketplace_name, TomlItem::Table(entry));
+    entry
 }
 
 fn remove_marketplace(
@@ -249,6 +260,46 @@ mod tests {
             fs::read(&config_path).expect("read preserved config"),
             before
         );
+    }
+
+    #[test]
+    fn record_user_marketplace_preserves_inline_table_siblings() {
+        let codex_home = TempDir::new().unwrap();
+        fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            "marketplaces = { other = { source_type = \"local\", source = \"/tmp/marketplace\" } }\n",
+        )
+        .unwrap();
+        let update = MarketplaceConfigUpdate {
+            last_updated: "2026-04-13T00:00:00Z",
+            last_revision: None,
+            source_type: "git",
+            source: "https://github.com/owner/repo.git",
+            ref_name: Some("main"),
+            sparse_paths: &["plugins".to_string()],
+        };
+
+        record_user_marketplace(codex_home.path(), "debug", &update).unwrap();
+
+        let config: toml::Value =
+            toml::from_str(&fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).unwrap())
+                .unwrap();
+        let expected: toml::Value = toml::from_str(
+            r#"
+[marketplaces.other]
+source_type = "local"
+source = "/tmp/marketplace"
+
+[marketplaces.debug]
+last_updated = "2026-04-13T00:00:00Z"
+source_type = "git"
+source = "https://github.com/owner/repo.git"
+ref = "main"
+sparse_paths = ["plugins"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config, expected);
     }
 
     #[test]

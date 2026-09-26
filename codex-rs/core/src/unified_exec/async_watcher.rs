@@ -76,7 +76,7 @@ impl Drop for OutputDrainedGuard {
 }
 
 /// Spawn a background task that continuously reads from the PTY, appends to the
-/// shared transcript, and emits ExecCommandOutputDelta events on UTFâ€‘8
+/// shared transcript, and emits ExecCommandOutputDelta events on UTF-8
 /// boundaries.
 // Preserve the shared unified-exec error shape at this process boundary.
 #[allow(clippy::result_large_err)]

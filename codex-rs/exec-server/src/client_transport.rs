@@ -29,6 +29,7 @@ use crate::client_api::RemoteExecServerConnectArgs;
 use crate::client_api::StdioExecServerCommand;
 use crate::client_api::StdioExecServerConnectArgs;
 use crate::connection::JsonRpcConnection;
+use crate::connection::jsonrpc_websocket_config;
 use crate::noise_channel::NoiseChannelIdentity;
 use crate::noise_relay::NoiseHarnessConnectionArgs;
 use crate::noise_relay::noise_harness_connection_from_websocket;
@@ -198,7 +199,7 @@ impl ExecServerClient {
             let connector = websocket_connector_with_custom_ca(&websocket_url).await?;
             connect_async_tls_with_config(
                 websocket_url.as_str(),
-                /*config*/ None,
+                Some(jsonrpc_websocket_config()),
                 /*disable_nagle*/ false,
                 connector,
             )

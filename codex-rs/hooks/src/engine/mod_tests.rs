@@ -39,9 +39,16 @@ fn cwd() -> AbsolutePathBuf {
 }
 
 fn scoped_engine(scope: codex_config::HookRunScope) -> ClaudeHooksEngine {
+    scoped_engine_for(HookEventName::PreToolUse, scope)
+}
+
+fn scoped_engine_for(
+    event_name: HookEventName,
+    scope: codex_config::HookRunScope,
+) -> ClaudeHooksEngine {
     let handler = ConfiguredHandler {
-        event_name: HookEventName::PreToolUse,
-        matcher: Some(crate::events::common::HookMatcher::new("^Bash$").expect("valid matcher")),
+        event_name,
+        matcher: None,
         command: "exit 0".to_string(),
         timeout_sec: 10,
         status_message: None,
@@ -51,7 +58,13 @@ fn scoped_engine(scope: codex_config::HookRunScope) -> ClaudeHooksEngine {
         env: HashMap::new(),
     };
     ClaudeHooksEngine {
-        once_per: HashMap::from([(handler.run_id(), scope)]),
+        once_per: HashMap::from([(
+            handler.run_id(),
+            super::OncePerLimit {
+                scope,
+                key: "scoped-test-hook".to_string(),
+            },
+        )]),
         scoped_runs: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         handlers: vec![handler],
         warnings: Vec::new(),
@@ -80,46 +93,220 @@ fn scoped_request(session_id: ThreadId, turn_id: &str, tool_use_id: &str) -> Pre
     }
 }
 
+/// Previews and runs one dispatch of `event_name`, returning how many handlers
+/// the preview reported and how many the run spawned.
+async fn preview_and_run(
+    engine: &ClaudeHooksEngine,
+    event_name: HookEventName,
+    session_id: ThreadId,
+    turn_id: &str,
+) -> (usize, usize) {
+    let cwd = cwd();
+    let model = "gpt-test".to_string();
+    let permission_mode = "default".to_string();
+    match event_name {
+        HookEventName::PreToolUse => {
+            let request = scoped_request(session_id, turn_id, "tool");
+            (
+                engine.preview_pre_tool_use(&request).len(),
+                engine.run_pre_tool_use(request).await.hook_events.len(),
+            )
+        }
+        HookEventName::PermissionRequest => {
+            let request = crate::PermissionRequestRequest {
+                session_id,
+                turn_id: turn_id.to_string(),
+                subagent: None,
+                cwd: cwd.as_path().to_path_buf(),
+                transcript_path: None,
+                model,
+                permission_mode,
+                tool_name: "Bash".to_string(),
+                matcher_aliases: Vec::new(),
+                run_id_suffix: "tool".to_string(),
+                tool_input: serde_json::json!({}),
+            };
+            (
+                engine.preview_permission_request(&request).len(),
+                engine
+                    .run_permission_request(request)
+                    .await
+                    .hook_events
+                    .len(),
+            )
+        }
+        HookEventName::PostToolUse => {
+            let request = crate::PostToolUseRequest {
+                session_id,
+                turn_id: turn_id.to_string(),
+                subagent: None,
+                cwd,
+                transcript_path: None,
+                model,
+                permission_mode,
+                tool_name: "Bash".to_string(),
+                matcher_aliases: Vec::new(),
+                tool_use_id: "tool".to_string(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            };
+            let plan = engine.plan_post_tool_use(&request.tool_name, &request.matcher_aliases);
+            (
+                engine.preview_planned_post_tool_use(&plan, &request).len(),
+                engine
+                    .run_planned_post_tool_use(plan, request)
+                    .await
+                    .hook_events
+                    .len(),
+            )
+        }
+        HookEventName::PreCompact => {
+            let request = crate::PreCompactRequest {
+                session_id,
+                turn_id: turn_id.to_string(),
+                subagent: None,
+                cwd,
+                transcript_path: None,
+                model,
+                trigger: "manual".to_string(),
+            };
+            (
+                engine.preview_pre_compact(&request).len(),
+                engine.run_pre_compact(request).await.hook_events.len(),
+            )
+        }
+        HookEventName::PostCompact => {
+            let request = crate::PostCompactRequest {
+                session_id,
+                turn_id: turn_id.to_string(),
+                subagent: None,
+                cwd,
+                transcript_path: None,
+                model,
+                trigger: "manual".to_string(),
+                compaction_summary: None,
+            };
+            (
+                engine.preview_post_compact(&request).len(),
+                engine.run_post_compact(request).await.hook_events.len(),
+            )
+        }
+        HookEventName::SessionStart | HookEventName::SubagentStart => {
+            let target = if event_name == HookEventName::SessionStart {
+                crate::StartHookTarget::SessionStart {
+                    source: crate::SessionStartSource::Startup,
+                }
+            } else {
+                crate::StartHookTarget::SubagentStart {
+                    turn_id: turn_id.to_string(),
+                    agent_id: "agent".to_string(),
+                    agent_type: "worker".to_string(),
+                }
+            };
+            let request = crate::SessionStartRequest {
+                session_id,
+                cwd,
+                transcript_path: None,
+                model,
+                permission_mode,
+                target,
+            };
+            (
+                engine.preview_session_start(&request, Some(turn_id)).len(),
+                engine
+                    .run_session_start(request, Some(turn_id.to_string()))
+                    .await
+                    .hook_events
+                    .len(),
+            )
+        }
+        HookEventName::UserPromptSubmit => {
+            let request = crate::UserPromptSubmitRequest {
+                session_id,
+                turn_id: turn_id.to_string(),
+                subagent: None,
+                cwd,
+                transcript_path: None,
+                model,
+                permission_mode,
+                prompt: "hello".to_string(),
+            };
+            (
+                engine.preview_user_prompt_submit(&request).len(),
+                engine
+                    .run_user_prompt_submit(request)
+                    .await
+                    .hook_events
+                    .len(),
+            )
+        }
+        HookEventName::Stop | HookEventName::SubagentStop => {
+            let target = if event_name == HookEventName::Stop {
+                crate::StopHookTarget::Stop
+            } else {
+                crate::StopHookTarget::SubagentStop {
+                    agent_id: "agent".to_string(),
+                    agent_type: "worker".to_string(),
+                    agent_transcript_path: None,
+                }
+            };
+            let request = crate::StopRequest {
+                session_id,
+                turn_id: turn_id.to_string(),
+                cwd,
+                transcript_path: None,
+                model,
+                permission_mode,
+                stop_hook_active: false,
+                last_assistant_message: None,
+                target,
+            };
+            (
+                engine.preview_stop(&request).len(),
+                engine.run_stop(request).await.hook_events.len(),
+            )
+        }
+        HookEventName::Interrupt => {
+            let request = crate::InterruptRequest {
+                session_id,
+                turn_id: turn_id.to_string(),
+                cwd,
+                transcript_path: None,
+                model,
+                permission_mode,
+            };
+            (
+                engine.preview_interrupt(session_id, turn_id).len(),
+                engine.run_interrupt(request).await.hook_events.len(),
+            )
+        }
+    }
+}
+
 #[tokio::test]
-async fn once_per_turn_handler_runs_once_per_turn_and_previews_agree() {
-    let engine = scoped_engine(codex_config::HookRunScope::Turn);
-    let session_id = ThreadId::new();
+async fn once_per_turn_limits_every_event_and_previews_agree() {
+    for event_name in HookEventName::all() {
+        let engine = scoped_engine_for(event_name, codex_config::HookRunScope::Turn);
+        let session_id = ThreadId::new();
 
-    assert_eq!(
-        engine
-            .preview_pre_tool_use(&scoped_request(session_id, "turn-1", "tool-1"))
-            .len(),
-        1
-    );
-    let first = engine
-        .run_pre_tool_use(scoped_request(session_id, "turn-1", "tool-1"))
-        .await;
-    assert_eq!(first.hook_events.len(), 1);
-    assert_eq!(first.hook_events[0].run.status, HookRunStatus::Completed);
-
-    // A second matched dispatch in the same turn is skipped without spawning.
-    assert!(
-        engine
-            .preview_pre_tool_use(&scoped_request(session_id, "turn-1", "tool-2"))
-            .is_empty()
-    );
-    let second = engine
-        .run_pre_tool_use(scoped_request(session_id, "turn-1", "tool-2"))
-        .await;
-    assert!(second.hook_events.is_empty());
-    assert!(!second.should_block);
-
-    // A new turn admits the handler again.
-    assert_eq!(
-        engine
-            .preview_pre_tool_use(&scoped_request(session_id, "turn-2", "tool-3"))
-            .len(),
-        1
-    );
-    let third = engine
-        .run_pre_tool_use(scoped_request(session_id, "turn-2", "tool-3"))
-        .await;
-    assert_eq!(third.hook_events.len(), 1);
+        assert_eq!(
+            preview_and_run(&engine, event_name, session_id, "turn-1").await,
+            (1, 1),
+            "first {event_name:?} dispatch in a turn"
+        );
+        // A later matched dispatch in the same turn is skipped without spawning.
+        assert_eq!(
+            preview_and_run(&engine, event_name, session_id, "turn-1").await,
+            (0, 0),
+            "repeated {event_name:?} dispatch in a turn"
+        );
+        // A new turn admits the handler again.
+        assert_eq!(
+            preview_and_run(&engine, event_name, session_id, "turn-2").await,
+            (1, 1),
+            "{event_name:?} dispatch in a new turn"
+        );
+    }
 }
 
 #[tokio::test]
@@ -140,6 +327,84 @@ async fn once_per_session_handler_skips_later_turns_in_the_same_session() {
         .run_pre_tool_use(scoped_request(ThreadId::new(), "turn-1", "tool-3"))
         .await;
     assert_eq!(other_session.hook_events.len(), 1);
+}
+
+#[tokio::test]
+async fn once_per_session_history_survives_rebuild_after_insertion() {
+    let temp = tempdir().expect("create temp dir");
+    let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).expect("absolute temp dir");
+    let config_path = root.join("config.toml");
+    let hooks_config = |commands: &[&str], state: serde_json::Value| {
+        let groups = commands
+            .iter()
+            .map(|command| {
+                serde_json::json!({
+                    "matcher": "^Bash$",
+                    "hooks": [{"type": "command", "command": command}],
+                })
+            })
+            .collect::<Vec<_>>();
+        let config = serde_json::from_value(serde_json::json!({
+            "hooks": {"state": state, "PreToolUse": groups},
+        }))
+        .expect("config TOML should deserialize");
+        crate::HooksConfig {
+            feature_enabled: true,
+            bypass_hook_trust: true,
+            config_layer_stack: Some(
+                ConfigLayerStack::new(
+                    vec![ConfigLayerEntry::new(
+                        ConfigLayerSource::User {
+                            file: config_path.clone(),
+                            profile: None,
+                        },
+                        config,
+                    )],
+                    ConfigRequirements::default(),
+                    ConfigRequirementsToml::default(),
+                )
+                .expect("config layer stack"),
+            ),
+            ..Default::default()
+        }
+    };
+    let request = |session_id, turn_id: &str| PreToolUseRequest {
+        cwd: root.clone(),
+        ..scoped_request(session_id, turn_id, "tool")
+    };
+    let key = crate::list_hooks(hooks_config(&["echo scoped"], serde_json::json!({}))).hooks[0]
+        .key
+        .clone();
+    let state = serde_json::json!({ (key): {"once_per": "session"} });
+    let session_id = ThreadId::new();
+
+    let before = crate::Hooks::new(hooks_config(&["echo scoped"], state.clone()));
+    let first = before.run_pre_tool_use(request(session_id, "turn-1")).await;
+    assert_eq!(first.hook_events.len(), 1);
+
+    // Inserting a hook shifts the scoped handler's run id; its persisted key and
+    // the session's run history must still suppress it.
+    let after = crate::Hooks::new(hooks_config(&["echo inserted", "echo scoped"], state))
+        .with_run_history_from(&before);
+    let display_orders = |outcome: crate::PreToolUseOutcome| {
+        outcome
+            .hook_events
+            .iter()
+            .map(|event| event.run.display_order)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        display_orders(after.run_pre_tool_use(request(session_id, "turn-2")).await),
+        vec![0]
+    );
+    assert_eq!(
+        display_orders(
+            after
+                .run_pre_tool_use(request(ThreadId::new(), "turn-1"))
+                .await
+        ),
+        vec![0, 1]
+    );
 }
 
 fn managed_hooks_for_current_platform(

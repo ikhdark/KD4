@@ -1280,14 +1280,17 @@ fn take_prompt_fragment_with_identity(
             slot,
             identify(text),
         )]);
-        let tokens = items.iter_mut().fold(0usize, |total, item| {
+        items.iter_mut().fold(0usize, |total, item| {
             item.set_turn_id_if_missing(turn_id);
-            total.saturating_add(
+            let token_bytes = codex_utils_string::approx_bytes_for_tokens(
                 usize::try_from(crate::context_manager::estimate_item_token_count(item).max(1))
                     .unwrap_or(usize::MAX),
-            )
-        });
-        codex_utils_string::approx_bytes_for_tokens(tokens)
+            );
+            let serialized_bytes = serde_json::to_vec(item)
+                .map(|bytes| bytes.len())
+                .unwrap_or(usize::MAX);
+            total.saturating_add(token_bytes.max(serialized_bytes))
+        })
     };
     let text = budget.clone().take(&rendered)?;
     let charge = message_bytes(&text);
@@ -2403,6 +2406,7 @@ impl Session {
                 .latest_mcp_runtime()
                 .manager()
                 .invalidate_resource_caches();
+            let hooks = hooks.with_run_history_from(&self.services.hooks.load());
             self.services.hooks.store(Arc::new(hooks));
             let new_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
@@ -6011,7 +6015,10 @@ impl Session {
         }
         let coordinator = self.services.agent_control.task_coordinator();
         if let Some(binding) = coordinator.binding_for_source(&turn_context.session_source) {
-            match coordinator.heartbeat_typed_actor_binding(&binding).await {
+            match coordinator
+                .heartbeat_typed_actor_binding(&binding, /*progress*/ true)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => warn!(
                     attempt_id = %binding.attempt_id,

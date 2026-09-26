@@ -119,7 +119,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     let commit = host.commit_completion(
         HashMap::from([(
             "candidate".to_string(),
-            Arc::new(JsonValue::String("lost".to_string())),
+            StoredValue::new("candidate", JsonValue::String("lost".to_string())),
         )]),
         completion.clone(),
         /*pending_initial_yield_items*/ None,
@@ -180,10 +180,14 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
     let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
     runtime.inner.stored_values.lock().await.insert(
         "stable".to_string(),
-        Arc::new(JsonValue::String("preserved".to_string())),
+        StoredValue::new("stable", JsonValue::String("preserved".to_string())),
     );
     let writes = (0..crate::runtime::MAX_SESSION_STORED_VALUES)
-        .map(|index| (format!("new-{index}"), Arc::new(JsonValue::Bool(true))))
+        .map(|index| {
+            let key = format!("new-{index}");
+            let stored = StoredValue::new(&key, JsonValue::Bool(true));
+            (key, stored)
+        })
         .collect();
     let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let host = RuntimeCellHost {
@@ -211,7 +215,9 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
     let stored_values = runtime.inner.stored_values.lock().await;
     assert_eq!(stored_values.len(), 1);
     assert_eq!(
-        stored_values.get("stable").map(Arc::as_ref),
+        stored_values
+            .get("stable")
+            .map(|stored| stored.value.as_ref()),
         Some(&JsonValue::String("preserved".to_string()))
     );
 }
@@ -258,6 +264,46 @@ async fn terminal_result_remains_observable_after_active_cell_removal() {
         .await;
     assert_eq!(observed, Ok(completed.clone()));
     assert_eq!(runtime.terminate(&cell_id).await, Ok(completed));
+}
+
+#[test]
+fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
+    let completed = |bytes: usize| CellEvent::Completed {
+        content_items: vec![OutputItem::Text {
+            text: "x".repeat(bytes),
+        }],
+        error_text: None,
+        output_loss: None,
+    };
+    let half = TERMINAL_CELL_CACHE_MAX_BYTES / 2;
+    let mut cache = TerminalCellCache::default();
+    cache.insert(CellId::new("1"), completed(half));
+    cache.insert(CellId::new("2"), completed(half));
+    assert!(
+        cache.get(&CellId::new("1")).is_some(),
+        "the exact budget fits"
+    );
+    cache.insert(CellId::new("3"), completed(1));
+    assert_eq!(
+        cache.get(&CellId::new("1")),
+        None,
+        "the oldest event is evicted"
+    );
+    assert_eq!(cache.get(&CellId::new("2")), Some(completed(half)));
+
+    let oversized = completed(TERMINAL_CELL_CACHE_MAX_BYTES + 1);
+    cache.insert(CellId::new("4"), oversized.clone());
+    assert_eq!(cache.get(&CellId::new("4")), Some(oversized));
+    assert_eq!(cache.order.len(), 1);
+    assert_eq!(cache.retained_bytes, TERMINAL_CELL_CACHE_MAX_BYTES + 1);
+
+    for index in 0..TERMINAL_CELL_CACHE_CAPACITY + 10 {
+        cache.insert(CellId::new(format!("small-{index}")), completed(0));
+    }
+    assert_eq!(cache.order.len(), TERMINAL_CELL_CACHE_CAPACITY);
+    assert_eq!(cache.events.len(), TERMINAL_CELL_CACHE_CAPACITY);
+    assert_eq!(cache.get(&CellId::new("4")), None);
+    assert_eq!(cache.retained_bytes, 0);
 }
 
 #[tokio::test]

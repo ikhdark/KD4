@@ -1080,6 +1080,24 @@ mod tests {
         assert!(projected.essential_inline.to_string().len() < 1024);
         let retained = serde_json::to_value(&result).unwrap();
         assert_eq!(retained["previous_delivery"], receipt);
+        let codex_tools::ToolSpec::Function(spec) =
+            super::create_wait_agent_tool_v2(super::WaitAgentTimeoutOptions::default())
+        else {
+            panic!("wait_agent should be a function tool");
+        };
+        let schema = spec
+            .output_schema
+            .expect("wait_agent output schema")
+            .into_value();
+        let schema_errors = jsonschema::validator_for(&schema)
+            .expect("compile wait_agent output schema")
+            .iter_errors(&retained)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            schema_errors.is_empty(),
+            "wait_agent output must match its advertised schema: {schema_errors:?}"
+        );
     }
     use super::*;
 

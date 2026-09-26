@@ -232,15 +232,18 @@ impl CloudConfigBundleLoader {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let future = state
-                .future
-                .get_or_insert_with(|| {
-                    self.retry_factory
-                        .as_ref()
-                        .expect("only retryable loaders clear failed attempts")(
-                    )
-                })
-                .clone();
+            // Only retryable loaders clear a failed attempt, so an empty slot has a factory.
+            let future = match (&state.future, &self.retry_factory) {
+                (Some(future), _) => future.clone(),
+                (None, Some(retry_factory)) => state.future.insert(retry_factory()).clone(),
+                (None, None) => {
+                    return Err(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Internal,
+                        /*status_code*/ None,
+                        "cloud config bundle loader has no pending load attempt",
+                    ));
+                }
+            };
             (state.generation, future)
         };
         let result = future.await;

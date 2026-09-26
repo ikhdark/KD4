@@ -462,7 +462,10 @@ fn restore_common(
         KeyboardRestore::ResetAfterExit => keyboard_modes::reset_keyboard_reporting_after_exit(),
     }
 
-    if let Err(err) = execute!(stdout(), DisableBracketedPaste, crossterm::event::DisableMouseCapture) {
+    if let Err(err) = execute!(stdout(), DisableBracketedPaste) {
+        first_error.get_or_insert(err);
+    }
+    if let Err(err) = windows_console::set_mouse_capture(false) {
         first_error.get_or_insert(err);
     }
     let _ = execute!(stdout(), DisableFocusChange);
@@ -847,11 +850,7 @@ impl Tui {
     }
 
     pub(crate) fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
-        if enabled {
-            execute!(self.terminal.backend_mut(), crossterm::event::EnableMouseCapture)
-        } else {
-            execute!(self.terminal.backend_mut(), crossterm::event::DisableMouseCapture)
-        }
+        windows_console::set_mouse_capture(enabled)
     }
 
     /// Leave alternate screen and restore the previously saved inline viewport, if any.

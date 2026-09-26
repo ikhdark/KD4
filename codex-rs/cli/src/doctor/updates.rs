@@ -26,7 +26,7 @@ use super::npm_global_root_check;
 use super::run_command;
 
 const VERSION_FILE_NAME: &str = "version.json";
-const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const GITHUB_LATEST_RELEASE_URL: &str = codex_install_context::LATEST_RELEASE_API_URL;
 
 /// Builds the update-health row for the current installation.
 ///
@@ -37,7 +37,7 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     let current_exe = std::env::current_exe().ok();
     let install_context = doctor_install_context(current_exe.as_deref());
     let npm_result = doctor_managed_by_npm(current_exe.as_deref()).then(npm_global_root_check);
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = codex_utils_build_info::CODEX_VERSION;
     let latest =
         (!is_source_build_version(current_version)).then(|| fetch_latest_version(&install_context));
     updates_check_from_inputs(

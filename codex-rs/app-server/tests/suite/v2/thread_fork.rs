@@ -6,6 +6,8 @@ use app_test_support::create_fake_rollout_with_token_usage;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_mock_provider_config_toml;
+use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -139,7 +141,7 @@ async fn update_thread_model(mcp: &mut TestAppServer, thread_id: &str, model: &s
 async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let preview = "Saved user message";
     let conversation_id = create_fake_rollout(
@@ -310,7 +312,7 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
 async fn thread_fork_at_last_turn_id_keeps_only_terminal_prefix() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -426,7 +428,7 @@ async fn thread_fork_at_last_turn_id_keeps_only_terminal_prefix() -> Result<()> 
 async fn thread_fork_reduces_settings_at_head_and_selected_turn_boundary() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -481,7 +483,7 @@ async fn thread_fork_reduces_settings_at_head_and_selected_turn_boundary() -> Re
 async fn thread_fork_inherits_explicit_source_name_from_session_index() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -529,7 +531,7 @@ async fn thread_fork_inherits_explicit_source_name_from_session_index() -> Resul
 async fn thread_fork_can_load_source_by_path() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let preview = "Saved user message";
     let conversation_id = create_fake_rollout(
@@ -584,7 +586,7 @@ async fn thread_fork_can_load_source_by_path() -> Result<()> {
 async fn thread_fork_emits_restored_token_usage_before_next_turn() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout_with_token_usage(
         codex_home.path(),
@@ -642,7 +644,7 @@ async fn thread_fork_emits_restored_token_usage_before_next_turn() -> Result<()>
 async fn thread_fork_can_exclude_turns_and_skip_restored_token_usage() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout_with_token_usage(
         codex_home.path(),
@@ -695,7 +697,7 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    write_mock_responses_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
     let conversation_id = create_fake_rollout(
@@ -755,7 +757,7 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
 async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -811,7 +813,7 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
 async fn thread_fork_with_empty_path_uses_thread_id() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -874,7 +876,7 @@ async fn thread_fork_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
     let codex_home = TempDir::new()?;
     let model_server = create_mock_responses_server_repeating_assistant("Done").await;
     let chatgpt_base_url = format!("{}/backend-api", server.uri());
-    create_config_toml_with_chatgpt_base_url(
+    write_mock_responses_config_toml_with_chatgpt_base_url(
         codex_home.path(),
         &model_server.uri(),
         &chatgpt_base_url,
@@ -952,7 +954,7 @@ async fn thread_fork_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
 async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let preview = "Saved user message";
     let conversation_id = create_fake_rollout(
@@ -1110,7 +1112,7 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
 async fn pathless_ephemeral_thread_rejects_codex_home_path_after_reload() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
 
     let parent_thread_id = create_fake_rollout(
         codex_home.path(),
@@ -1229,53 +1231,3 @@ async fn pathless_ephemeral_thread_rejects_codex_home_path_after_reload() -> Res
 }
 
 // Helper to create a config.toml pointing at the mock model server.
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
-}
-
-fn create_config_toml_with_chatgpt_base_url(
-    codex_home: &Path,
-    server_uri: &str,
-    chatgpt_base_url: &str,
-) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-chatgpt_base_url = "{chatgpt_base_url}"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
-}

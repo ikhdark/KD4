@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use codex_app_server_protocol::ThreadHistoryBuilder;
@@ -26,7 +28,6 @@ use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
-use crate::ReadThreadParams;
 use crate::StoredThreadItem;
 use crate::StoredTurn;
 use crate::StoredTurnError;
@@ -38,10 +39,15 @@ use crate::TurnPage;
 
 pub(super) type SharedLocalThreadProjection = Arc<LocalThreadProjectionEntry>;
 
+/// Projections of threads without a live writer are cached only so consecutive pages avoid
+/// reloading history; each holds the thread's materialized history twice.
+const MAX_UNLOADED_PROJECTIONS: usize = 4;
+
 pub(super) struct LocalThreadProjectionEntry {
     state: Mutex<LocalThreadProjection>,
     operation_gate: Arc<Semaphore>,
     source_version: Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>,
+    last_unloaded_read: StdMutex<Option<Instant>>,
 }
 
 struct ProjectedItem {
@@ -486,7 +492,22 @@ impl LocalThreadProjectionEntry {
             state: Mutex::new(LocalThreadProjection::default()),
             operation_gate: Arc::new(Semaphore::new(1)),
             source_version: Mutex::new(None),
+            last_unloaded_read: StdMutex::new(None),
         }
+    }
+
+    fn last_unloaded_read(&self) -> Option<Instant> {
+        *self
+            .last_unloaded_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn mark_unloaded_read(&self) {
+        *self
+            .last_unloaded_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
     }
 
     pub(super) async fn acquire_operation(&self) -> ThreadStoreResult<OwnedSemaphorePermit> {
@@ -553,9 +574,14 @@ pub(super) async fn initialize_from_store(
     let projection = projection_entry(store, thread_id).await;
     let _operation = projection.acquire_operation().await?;
     if !store.live_recorders.lock().await.contains_key(&thread_id) {
-        // Unloaded rollouts may be appended or rolled back by another process.
-        // Compare the durable source before reusing its pagination projection.
-        let source_version = if let Some(path) = rollout_path {
+        // Unloaded rollouts may be appended, rolled back, or compressed by another process.
+        // Compare the durable source (the physical plain or compressed file) before reusing its
+        // pagination projection.
+        let source_path = match rollout_path {
+            Some(path) => codex_rollout::existing_rollout_path(&path).await,
+            None => None,
+        };
+        let source_version = if let Some(path) = source_path {
             tokio::fs::metadata(&path)
                 .await
                 .ok()
@@ -577,9 +603,32 @@ pub(super) async fn initialize_from_store(
             projection.initialize(history.items.as_slice()).await?;
             *projection.source_version.lock().await = source_version;
         }
+        projection.mark_unloaded_read();
+        evict_least_recent_unloaded_projections(store).await;
     }
     initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;
     Ok(projection)
+}
+
+async fn evict_least_recent_unloaded_projections(store: &LocalThreadStore) {
+    let mut projections = store.projections.lock().await;
+    // Liveness must not change while entries are dropped: a writer appending to a dropped entry
+    // would leave its replacement without those items. Skip this pass rather than wait here.
+    let Ok(live_recorders) = store.live_recorders.try_lock() else {
+        return;
+    };
+    let mut unloaded = projections
+        .iter()
+        .filter(|(thread_id, _)| !live_recorders.contains_key(thread_id))
+        .map(|(thread_id, projection)| (projection.last_unloaded_read(), *thread_id))
+        .collect::<Vec<_>>();
+    if unloaded.len() <= MAX_UNLOADED_PROJECTIONS {
+        return;
+    }
+    unloaded.sort_unstable_by_key(|(last_read, _)| std::cmp::Reverse(*last_read));
+    for (_, thread_id) in unloaded.into_iter().skip(MAX_UNLOADED_PROJECTIONS) {
+        projections.remove(&thread_id);
+    }
 }
 
 async fn initialize_entry_from_store(
@@ -604,6 +653,11 @@ pub(super) async fn initialized_entry_for_append(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<(SharedLocalThreadProjection, OwnedSemaphorePermit)> {
+    // Appends require a live writer. Reject a closed thread before creating an entry that would
+    // load its whole history only for the writer lookup to fail.
+    if !store.live_recorders.lock().await.contains_key(&thread_id) {
+        return Err(ThreadStoreError::ThreadNotFound { thread_id });
+    }
     let projection = projection_entry(store, thread_id).await;
     let operation = projection.acquire_operation().await?;
     initialize_entry_from_store(
@@ -680,16 +734,8 @@ async fn validate_thread_visibility(
     thread_id: ThreadId,
     include_archived: bool,
 ) -> ThreadStoreResult<Option<PathBuf>> {
-    super::read_thread::read_thread(
-        store,
-        ReadThreadParams {
-            thread_id,
-            include_archived,
-            include_history: false,
-        },
-    )
-    .await
-    .map(|thread| thread.rollout_path)
+    // Every page runs this check, so it resolves only the rollout path rather than a summary.
+    super::read_thread::read_thread_rollout_path(store, thread_id, include_archived).await
 }
 
 async fn projection_entry(
@@ -832,6 +878,54 @@ fn serialize_item_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local::test_support::test_config;
+    use crate::local::test_support::write_session_file;
+
+    #[tokio::test]
+    async fn unloaded_compressed_rollout_keeps_a_reusable_source_version() {
+        let home = tempfile::TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = uuid::Uuid::from_u128(700);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let plain =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let compressed = plain.with_extension("jsonl.zst");
+        let bytes = std::fs::read(&plain).expect("plain rollout");
+        std::fs::write(
+            &compressed,
+            zstd::encode_all(bytes.as_slice(), /*level*/ 0).expect("compress rollout"),
+        )
+        .expect("compressed rollout");
+        std::fs::remove_file(&plain).expect("remove plain rollout");
+        let params = ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::Summary,
+        };
+
+        list_turns(&store, params.clone())
+            .await
+            .expect("list compressed rollout turns");
+        let projection = existing_entry(&store, thread_id)
+            .await
+            .expect("cached unloaded projection");
+        // Without a version, every later page would reload and decompress the whole rollout.
+        assert_eq!(
+            projection
+                .source_version
+                .lock()
+                .await
+                .as_ref()
+                .map(|(path, _, _)| path.clone()),
+            Some(compressed)
+        );
+        list_turns(&store, params)
+            .await
+            .expect("second page reuses the projection");
+    }
 
     #[test]
     fn oversized_item_pages_allocate_only_available_items() {

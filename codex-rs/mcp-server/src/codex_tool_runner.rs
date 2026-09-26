@@ -265,6 +265,7 @@ pub async fn run_codex_tool_session(
         thread,
         outgoing,
         id,
+        request.turn_id,
         running_requests_id_to_codex_uuid,
     )
     .await;
@@ -338,16 +339,22 @@ pub async fn run_codex_tool_session_reply(
         thread,
         outgoing,
         request_id,
+        request.turn_id,
         running_requests_id_to_codex_uuid,
     )
     .await;
 }
 
+/// Streams events until this request's turn reaches its terminal event. Error
+/// events do not end the turn; core reports terminal errors on `TurnComplete`.
+/// Leaving that terminal event queued would let a later reply on this thread
+/// consume it as its own result.
 async fn run_codex_tool_session_inner(
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
+    turn_id: String,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
 ) {
     let request_id_str = request_id.to_string();
@@ -399,18 +406,8 @@ async fn run_codex_tool_session_inner(
                         .await;
                         continue;
                     }
-                    EventMsg::PlanDelta(_) => {
+                    EventMsg::PlanDelta(_) | EventMsg::Error(_) => {
                         continue;
-                    }
-                    EventMsg::Error(err_event) => {
-                        // Always respond in tools/call's expected shape, and include conversationId so the client can resume.
-                        let result = create_call_tool_result_with_thread_id(
-                            thread_id,
-                            err_event.message,
-                            Some(true),
-                        );
-                        outgoing.send_response(request_id.clone(), result).await;
-                        break;
                     }
                     EventMsg::Warning(_)
                     | EventMsg::ModelVerification(_)
@@ -428,6 +425,11 @@ async fn run_codex_tool_session_inner(
                         .await;
                         continue;
                     }
+                    EventMsg::TurnAborted(aborted)
+                        if aborted
+                            .turn_id
+                            .as_ref()
+                            .is_some_and(|aborted_turn_id| *aborted_turn_id != turn_id) => {}
                     EventMsg::TurnAborted(_) => {
                         elicitation_cancellation.cancel();
                         let result = create_call_tool_result_with_thread_id(
@@ -464,17 +466,29 @@ async fn run_codex_tool_session_inner(
                         continue;
                     }
                     EventMsg::TurnComplete(TurnCompleteEvent {
+                        turn_id: completed_turn_id,
+                        ..
+                    }) if completed_turn_id != turn_id => {}
+                    EventMsg::TurnComplete(TurnCompleteEvent {
                         last_agent_message,
                         surfaced_result,
+                        error,
                         ..
                     }) => {
-                        let text = last_agent_message.unwrap_or_default();
-                        let result = create_call_tool_result_with_thread_id_and_surfaced_result(
-                            thread_id,
-                            text,
-                            /*is_error*/ None,
-                            surfaced_result,
-                        );
+                        // Always respond in tools/call's expected shape, and include the thread id so the client can resume.
+                        let result = match error {
+                            Some(error) => create_call_tool_result_with_thread_id(
+                                thread_id,
+                                error.message,
+                                Some(true),
+                            ),
+                            None => create_call_tool_result_with_thread_id_and_surfaced_result(
+                                thread_id,
+                                last_agent_message.unwrap_or_default(),
+                                /*is_error*/ None,
+                                surfaced_result,
+                            ),
+                        };
                         outgoing.send_response(request_id.clone(), result).await;
                         // unregister the id so we don't keep it in the map
                         running_requests_id_to_codex_uuid

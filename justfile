@@ -319,8 +319,9 @@ core-test-lane target *args:
 _core-test-reserved profile target *args:
     $forwarded_args = @($args | Select-Object -Skip 3); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "{{ profile }}"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir run-target "{{ target }}" @forwarded_args
 
-# Run gates together, sharing helper builds and overlapping tests.
-# Every declared step must select and complete exactly its declared test IDs.
+# Run gates together, sharing helper builds, overlapping tests, and one nextest
+# invocation per package and helper set. Every declared step must select and
+# complete exactly its declared test IDs in its own test binary.
 [windows]
 core-gate +gates:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ core_test_lane }}" -- just _core-gate-reserved @forwarded_args
@@ -343,16 +344,6 @@ core-test-plan name:
 [no-cd]
 core-test-manifest-check:
     @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" check-manifest
-
-# Compare a legacy integration target against the union of its replacements, then
-# run both once. Used only for the authorized `all` -> shard migration gate.
-[windows]
-core-test-parity legacy *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ core_test_lane }}" -- just _core-parity-reserved "{{ legacy }}" @forwarded_args
-
-[windows]
-_core-parity-reserved legacy *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir parity "{{ legacy }}" @forwarded_args
 
 # Isolated non-incremental experiment; this also changes the target directory.
 [windows]
@@ -640,25 +631,16 @@ codex-cli-wrapper-check:
     node --check "{{ justfile_directory() }}/codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js"
 
 app-server-command-exec-check:
-    just _app-server-command-exec-tests
-    cargo check -p codex-app-server
-
-_app-server-command-exec-tests:
     just core-gate app-server-command-exec
+    cargo check -p codex-app-server
 
 app-server-process-exec-check:
-    just _app-server-process-exec-tests
-    cargo check -p codex-app-server
-
-_app-server-process-exec-tests:
     just core-gate app-server-process-exec
+    cargo check -p codex-app-server
 
 app-server-thread-status-check:
-    just _app-server-thread-status-tests
-    cargo check -p codex-app-server
-
-_app-server-thread-status-tests:
     just core-gate app-server-thread-status
+    cargo check -p codex-app-server
 
 app-server-schema-protocol-check:
     just core-gate app-server-schema-fixtures

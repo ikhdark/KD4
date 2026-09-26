@@ -92,6 +92,13 @@ impl Hooks {
         self.engine.warnings()
     }
 
+    /// Keeps the `once_per` run history of the hook set this one replaces, so a
+    /// config refresh does not re-admit handlers that already ran in their scope.
+    pub fn with_run_history_from(mut self, previous: &Hooks) -> Self {
+        self.engine.inherit_scoped_runs(&previous.engine);
+        self
+    }
+
     fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook] {
         match hook_event {
             HookEvent::AfterAgent { .. } => &self.after_agent,
@@ -113,11 +120,13 @@ impl Hooks {
         outcomes
     }
 
+    /// Previews the handlers `run_session_start` would spawn with the same `turn_id`.
     pub fn preview_session_start(
         &self,
         request: &SessionStartRequest,
+        turn_id: Option<&str>,
     ) -> Vec<codex_protocol::protocol::HookRunSummary> {
-        self.engine.preview_session_start(request)
+        self.engine.preview_session_start(request, turn_id)
     }
 
     pub fn preview_pre_tool_use(
@@ -134,13 +143,6 @@ impl Hooks {
         self.engine.preview_permission_request(request)
     }
 
-    pub fn preview_post_tool_use(
-        &self,
-        request: &PostToolUseRequest,
-    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
-        self.engine.preview_post_tool_use(request)
-    }
-
     pub fn plan_post_tool_use(
         &self,
         tool_name: &str,
@@ -152,9 +154,9 @@ impl Hooks {
     pub fn preview_planned_post_tool_use(
         &self,
         plan: &crate::PostToolUsePlan,
-        tool_use_id: &str,
+        request: &PostToolUseRequest,
     ) -> Vec<codex_protocol::protocol::HookRunSummary> {
-        self.engine.preview_planned_post_tool_use(plan, tool_use_id)
+        self.engine.preview_planned_post_tool_use(plan, request)
     }
 
     pub async fn run_session_start(
@@ -174,10 +176,6 @@ impl Hooks {
         request: PermissionRequestRequest,
     ) -> PermissionRequestOutcome {
         self.engine.run_permission_request(request).await
-    }
-
-    pub async fn run_post_tool_use(&self, request: PostToolUseRequest) -> PostToolUseOutcome {
-        self.engine.run_post_tool_use(request).await
     }
 
     pub async fn run_planned_post_tool_use(
@@ -239,8 +237,12 @@ impl Hooks {
         self.engine.run_stop(request).await
     }
 
-    pub fn preview_interrupt(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
-        self.engine.preview_interrupt()
+    pub fn preview_interrupt(
+        &self,
+        session_id: codex_protocol::ThreadId,
+        turn_id: &str,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_interrupt(session_id, turn_id)
     }
 
     pub async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {

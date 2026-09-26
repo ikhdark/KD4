@@ -35,7 +35,9 @@ use tracing::warn;
 
 const BACKFILL_BATCH_SIZE: usize = 200;
 const EXTRACTION_CACHE_CAPACITY: usize = 256;
-const BACKFILL_LEASE_SECONDS: i64 = 900;
+/// A claim must outlive one bounded startup run so live workers never overlap, yet expire
+/// soon after a worker is killed so later startups can resume instead of timing out behind it.
+pub(crate) const BACKFILL_LEASE_SECONDS: i64 = 60;
 
 pub(crate) fn builder_from_session_meta(
     session_meta: &SessionMetaLine,
@@ -323,6 +325,7 @@ impl RolloutMetadataAccumulator {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn backfill_sessions(
     runtime: &codex_state::StateRuntime,
     codex_home: &Path,
@@ -337,11 +340,34 @@ pub(crate) async fn backfill_sessions(
     .await;
 }
 
+#[cfg(test)]
 pub(crate) async fn backfill_sessions_with_lease(
     runtime: &codex_state::StateRuntime,
     codex_home: &Path,
     default_provider: &str,
     backfill_lease_seconds: i64,
+) {
+    backfill_sessions_until(
+        runtime,
+        codex_home,
+        default_provider,
+        backfill_lease_seconds,
+        || false,
+    )
+    .await;
+}
+
+/// Backfill rollout metadata into SQLite under the shared worker lease.
+///
+/// `should_stop` is checked between rollouts. A stopped run checkpoints its contiguous
+/// progress and releases its claim, so a caller with a deadline never abandons a held lease
+/// that would block every later worker until it expires.
+pub(crate) async fn backfill_sessions_until(
+    runtime: &codex_state::StateRuntime,
+    codex_home: &Path,
+    default_provider: &str,
+    backfill_lease_seconds: i64,
+    mut should_stop: impl FnMut() -> bool,
 ) {
     let metric_client = codex_otel::global();
     let timer = metric_client
@@ -444,11 +470,15 @@ pub(crate) async fn backfill_sessions_with_lease(
     };
     let mut contiguous_watermark = backfill_state.last_watermark.clone();
     let mut checkpointed_watermark = backfill_state.last_watermark.clone();
-    for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
+    let mut stopped = false;
+    'batches: for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
+            if should_stop() {
+                stopped = true;
+                break 'batches;
+            }
             stats.scanned = stats.scanned.saturating_add(1);
-            let succeeded = match extract_metadata_from_rollout(&rollout.path, default_provider)
-                .await
+            let settled = match extract_metadata_from_rollout(&rollout.path, default_provider).await
             {
                 Ok(outcome) => {
                     if outcome.parse_errors > 0
@@ -501,10 +531,14 @@ pub(crate) async fn backfill_sessions_with_lease(
                         "failed to extract rollout {}: {err}",
                         rollout.path.display()
                     );
-                    false
+                    // Opening already retries transient failures, so an empty, torn, or
+                    // unknown-format file fails identically on every pass; retrying it would
+                    // hold the backfill, and with it every startup gate, pending forever.
+                    stats.failed = stats.failed.saturating_add(1);
+                    true
                 }
             };
-            if succeeded {
+            if settled {
                 if !unresolved_failures {
                     contiguous_watermark = Some(rollout.watermark.clone());
                 }
@@ -528,7 +562,25 @@ pub(crate) async fn backfill_sessions_with_lease(
             }
         }
     }
-    if unresolved_failures {
+    // A stopped run skipped its batch checkpoint; save the contiguous progress so the next
+    // claim resumes after it instead of rescanning the batch.
+    if stopped
+        && contiguous_watermark != checkpointed_watermark
+        && let Some(watermark) = contiguous_watermark.as_deref()
+        && let Err(err) = runtime.checkpoint_backfill(watermark).await
+    {
+        warn!(
+            "failed to checkpoint stopped backfill at {}: {err}",
+            codex_home.display()
+        );
+    }
+    if unresolved_failures || stopped {
+        if stopped {
+            info!(
+                "state db backfill paused at {}; a later worker resumes from its checkpoint",
+                codex_home.display()
+            );
+        }
         if let Err(err) = runtime.mark_backfill_pending().await {
             warn!(
                 "failed to release incomplete backfill at {}: {err}",

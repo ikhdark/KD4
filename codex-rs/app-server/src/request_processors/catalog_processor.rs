@@ -680,6 +680,8 @@ impl CatalogRequestProcessor {
             .apply()
             .await
             .map(|()| {
+                // This edit bypasses ConfigManager, so publish it to the next read.
+                self.config_manager.invalidate_load_cache();
                 self.thread_manager.plugins_manager().clear_cache();
                 self.thread_manager.skills_service().clear_cache();
                 SkillsConfigWriteResponse {

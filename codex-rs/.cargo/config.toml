@@ -17,6 +17,9 @@ RUST_TEST_THREADS = { value = "2", force = false }
 # Shared by x64 and ARM64. KD4 tooling links both with lld-link when installed
 # (scripts/rust_tool_env.py), and lld-link rejects link.exe-only arguments such
 # as upstream's ARM64 /arm64hazardfree warning suppressor, so add none here.
+# Setting RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, even to an empty value, replaces
+# these tables outright and silently drops the 8 MiB stack and static CRT. Add
+# flags with CARGO_TARGET_<TRIPLE>_RUSTFLAGS instead; Cargo joins it with them.
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static"]
 

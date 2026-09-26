@@ -8,29 +8,31 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-base64 = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
 codex-backend-client = { workspace = true }
 codex-config = { workspace = true }
 codex-core = { workspace = true }
-codex-file-system = { workspace = true }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
-hmac = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 codex-agent-identity = { workspace = true }
 pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "test-util",
+    "time",
+] }
 
 [lib]
 doctest = false

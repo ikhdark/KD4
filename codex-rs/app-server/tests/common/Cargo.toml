@@ -37,12 +37,6 @@ tokio = { workspace = true, features = [
     "test-util",
     "time",
 ] }
-tokio-util = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 core_test_support = { workspace = true }
-shlex = { workspace = true }
-
-[dev-dependencies]
-pretty_assertions = { workspace = true }

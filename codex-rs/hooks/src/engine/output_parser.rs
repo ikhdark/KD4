@@ -63,12 +63,6 @@ pub(crate) struct StopOutput {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PreCompactOutput {
-    pub universal: UniversalOutput,
-    pub invalid_reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct StatelessHookOutput {
     pub universal: UniversalOutput,
     pub invalid_reason: Option<String>,
@@ -291,10 +285,10 @@ pub(crate) fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
     })
 }
 
-pub(crate) fn parse_pre_compact(stdout: &str) -> Option<PreCompactOutput> {
+pub(crate) fn parse_pre_compact(stdout: &str) -> Option<StatelessHookOutput> {
     let wire: PreCompactCommandOutputWire = parse_json(stdout)?;
     let universal = UniversalOutput::from(wire.universal);
-    Some(PreCompactOutput {
+    Some(StatelessHookOutput {
         universal,
         invalid_reason: None,
     })

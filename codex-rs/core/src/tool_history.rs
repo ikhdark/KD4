@@ -1287,11 +1287,41 @@ impl ToolHistoryState {
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: &GitWorkspaceCache,
     ) -> ToolHistoryProjection {
-        // Admission/receipt replacement is reserved for explicit compaction.
-        // Sampling starts with exactly the recorded bytes and appends notices.
+        // Explicit checkpoints retire only their selected, recoverable results.
+        // All other sampling evidence retains its original representation.
+        let retired = items
+            .iter()
+            .filter_map(phase_checkpoint_ids)
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let mut checkpointed = ProjectedResponseItems::Shared(Arc::clone(&items));
+        for (index, item) in items.iter().enumerate() {
+            let Some((call_id, output)) = canonical_textual_output_identity(item) else {
+                continue;
+            };
+            if !retired.contains(call_id) || non_text_output_token_cost(item) != 0 {
+                continue;
+            }
+            let Some(candidate) = self.candidates.get(call_id) else {
+                continue;
+            };
+            if !candidate.successful
+                || candidate.consumed_by_generation.is_none()
+                || sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256
+            {
+                continue;
+            }
+            let Some((pin, _)) = candidate.artifact_pin() else {
+                continue;
+            };
+            if let Some((_, body)) = textual_output_body_mut(&mut checkpointed.make_owned()[index]) {
+                replace_model_visible_output_text(body, pin);
+            }
+        }
+        let checkpointed = checkpointed.into_shared();
         let mut projection = ToolHistoryProjection {
-            items: Arc::clone(&items),
-            unreplaced_items: Arc::clone(&items),
+            items: Arc::clone(&checkpointed),
+            unreplaced_items: checkpointed,
             ..Default::default()
         };
         let shared = Arc::ptr_eq(&projection.items, &projection.unreplaced_items);
@@ -5028,7 +5058,7 @@ fn dependency_search_command(
         .or_else(|| arguments.get("cmd"))
         .or_else(|| arguments.get("script_body"))?
         .as_str()?;
-    let default_shell = std::cell::LazyCell::new(crate::shell::default_user_shell);
+    let default_shell = default_user_shell_for_dependencies();
     let shell_type =
         if arguments.get("kind").and_then(serde_json::Value::as_str) == Some("powershell_script") {
             crate::shell::ShellType::PowerShell
@@ -5037,7 +5067,7 @@ fn dependency_search_command(
                 .get("shell")
                 .and_then(serde_json::Value::as_str)
                 .and_then(shell_type_from_name)
-                .unwrap_or_else(|| default_shell.shell_type)
+                .unwrap_or(default_shell.shell_type)
         };
     let command = match shell_type {
         crate::shell::ShellType::PowerShell => {
@@ -5045,13 +5075,12 @@ fn dependency_search_command(
             // different syntax and separate long-lived AST parser processes.
             let executable = match arguments.get("shell").and_then(serde_json::Value::as_str) {
                 Some(shell) => shell.to_string(),
+                // The default user shell is the PowerShell lookup itself, so a
+                // non-PowerShell default means no PowerShell host is installed.
                 None if default_shell.shell_type == crate::shell::ShellType::PowerShell => {
                     default_shell.shell_path.to_string_lossy().into_owned()
                 }
-                None => crate::shell::get_shell(crate::shell::ShellType::PowerShell, None)?
-                    .shell_path
-                    .to_string_lossy()
-                    .into_owned(),
+                None => return None,
             };
             vec![executable, "-Command".to_string(), script.to_string()]
         }
@@ -5069,6 +5098,15 @@ fn dependency_search_command(
         }
     };
     Some((command, Some(shell_type)))
+}
+
+/// Dependency classification runs several times per tool call; resolve the
+/// host once instead of repeating the PATH x PATHEXT search each time, as the
+/// session does for its own user shell.
+fn default_user_shell_for_dependencies() -> &'static crate::shell::Shell {
+    static DEFAULT_USER_SHELL: std::sync::OnceLock<crate::shell::Shell> =
+        std::sync::OnceLock::new();
+    DEFAULT_USER_SHELL.get_or_init(crate::shell::default_user_shell)
 }
 
 fn shell_type_from_name(value: &str) -> Option<crate::shell::ShellType> {
@@ -5141,26 +5179,9 @@ fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDe
             skipped_pattern = true;
             continue;
         }
-        scopes.push(arg);
+        scopes.push(arg.clone());
     }
-    if scopes.is_empty() {
-        return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
-    }
-    scopes
-        .into_iter()
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            }
-        })
-        .map(|path| {
-            let recursive = path.is_dir() || path.extension().is_none();
-            SourceDependencyV1::new(&path, recursive)
-        })
-        .collect()
+    dependencies_for_search_scopes(scopes, cwd)
 }
 
 fn dependencies_for_search_scopes(scopes: Vec<String>, cwd: &Path) -> BTreeSet<SourceDependencyV1> {

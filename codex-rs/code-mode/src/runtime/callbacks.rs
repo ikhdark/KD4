@@ -8,6 +8,7 @@ use super::MAX_SESSION_STORED_VALUE_BYTES;
 use super::MAX_SESSION_STORED_VALUES;
 use super::RuntimeEvent;
 use super::RuntimeState;
+use super::StoredValue;
 use super::stored_value_entry_bytes;
 use super::stored_value_limit_message;
 use super::timers;
@@ -268,7 +269,7 @@ pub(super) fn store_callback(
         }
         let key_bytes = stored_value_entry_bytes(&key, &serde_json::Value::Null).saturating_sub(4);
         MAX_SESSION_STORED_VALUE_BYTES.checked_sub(state.total_stored_value_bytes)
-            .and_then(|available| available.checked_add(state.stored_value_bytes.get(&key).copied().unwrap_or(0)))
+            .and_then(|available| available.checked_add(state.stored_values.get(&key).map_or(0, |stored| stored.bytes)))
             .and_then(|available| available.checked_sub(key_bytes))
     });
     let Some(max_bytes) = admission else {
@@ -299,22 +300,20 @@ pub(super) fn store_callback(
             return Some(error.clone());
         }
 
-        let bytes = stored_value_entry_bytes(&key, &serialized);
-        let previous_bytes = state.stored_value_bytes.get(&key).copied();
+        let stored = StoredValue::new(&key, serialized);
+        let previous_bytes = state.stored_values.get(&key).map(|previous| previous.bytes);
         let total_bytes = state
             .total_stored_value_bytes
             .checked_sub(previous_bytes.unwrap_or(0))
-            .and_then(|total| total.checked_add(bytes));
+            .and_then(|total| total.checked_add(stored.bytes));
         if state.stored_values.len() + usize::from(previous_bytes.is_none())
             <= MAX_SESSION_STORED_VALUES
             && let Some(total_bytes) =
                 total_bytes.filter(|total| *total <= MAX_SESSION_STORED_VALUE_BYTES)
         {
             state.total_stored_value_bytes = total_bytes;
-            state.stored_value_bytes.insert(key.clone(), bytes);
-            let serialized = Arc::new(serialized);
-            state.stored_values.insert(key.clone(), Arc::clone(&serialized));
-            state.stored_value_writes.insert(key, serialized);
+            state.stored_values.insert(key.clone(), stored.clone());
+            state.stored_value_writes.insert(key, stored);
             return None;
         }
 
@@ -352,7 +351,7 @@ pub(super) fn load_callback(
     let value = scope
         .get_slot::<RuntimeState>()
         .and_then(|state| state.stored_values.get(&key))
-        .cloned();
+        .map(|stored| Arc::clone(&stored.value));
     let Some(value) = value else {
         retval.set(v8::undefined(scope).into());
         return;

@@ -17,8 +17,6 @@ pub use load_outcome::prompt_safe_plugin_description;
 pub use namespace::DISCOVERABLE_PLUGIN_MANIFEST_PATHS;
 pub use namespace::find_plugin_manifest_path;
 pub use namespace::plugin_namespace_for_root_uri;
-pub use namespace::plugin_namespace_for_skill_path;
-pub use namespace::plugin_namespace_for_skill_uri;
 pub use plugin_id::PluginId;
 pub use plugin_id::PluginIdError;
 pub use plugin_id::validate_plugin_segment;

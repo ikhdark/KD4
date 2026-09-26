@@ -27,16 +27,10 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
 
 mod windows_impl {
     use super::ElevatedSandboxProfileCaptureRequest;
-    use crate::acl::allow_null_device;
-    use crate::cap::load_or_create_cap_sids;
-    use crate::cap::workspace_write_cap_sid_for_root;
-    use crate::env::ensure_non_interactive_pager;
-    use crate::env::inherit_path_env;
-    use crate::env::normalize_null_device_env;
     use crate::identity::refresh_logon_sandbox_creds;
-    use crate::identity::require_logon_sandbox_creds_with_additional_read_roots;
     use crate::ipc_framed::EmptyPayload;
     use crate::ipc_framed::FramedMessage;
+    use crate::ipc_framed::IPC_PROTOCOL_VERSION;
     use crate::ipc_framed::Message;
     use crate::ipc_framed::OutputStream;
     use crate::ipc_framed::SpawnRequest;
@@ -44,20 +38,15 @@ mod windows_impl {
     use crate::ipc_framed::read_frame;
     use crate::ipc_framed::write_frame;
     use crate::logging::log_failure;
-    use crate::logging::log_start;
     use crate::logging::log_success;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use crate::runner_client::retry_runner_spawn_once;
     use crate::runner_client::spawn_runner_transport;
-    use crate::sandbox_utils::ensure_codex_home_exists;
-    use crate::sandbox_utils::inject_git_safe_directory;
-    use crate::setup::effective_write_roots_for_permissions;
-    use crate::spawn_prep::sandbox_capability_sid_strings;
-    use crate::token::LocalSid;
+    use crate::spawn_prep::ElevatedSpawnContext;
+    use crate::spawn_prep::prepare_elevated_spawn_context_for_permissions;
     use anyhow::Result;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use std::fs::File;
-    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -84,7 +73,7 @@ mod windows_impl {
                     let _ = write_frame(
                         &mut pipe_write,
                         &FramedMessage {
-                            version: 1,
+                            version: IPC_PROTOCOL_VERSION,
                             message: Message::Terminate {
                                 payload: EmptyPayload::default(),
                             },
@@ -140,21 +129,18 @@ mod windows_impl {
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
             .collect::<Vec<_>>();
-        normalize_null_device_env(&mut env_map);
-        ensure_non_interactive_pager(&mut env_map);
-        inherit_path_env(&mut env_map);
-        inject_git_safe_directory(&mut env_map, cwd);
-        // Use a temp-based log dir that the sandbox user can write.
-        let sandbox_base = codex_home.join(".sandbox");
-        ensure_codex_home_exists(&sandbox_base)?;
-
-        let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
-        log_start(&command, logs_base_dir);
-        let sandbox_creds = require_logon_sandbox_creds_with_additional_read_roots(
-            &permissions,
-            cwd,
-            &env_map,
+        // Captures and sessions must derive the same setup request and capability SIDs.
+        let ElevatedSpawnContext {
+            sandbox_base,
+            logs_base_dir,
+            sandbox_creds,
+            cap_sids,
+        } = prepare_elevated_spawn_context_for_permissions(
+            permissions.clone(),
             codex_home,
+            cwd,
+            &mut env_map,
+            &command,
             read_roots_override,
             &additional_read_roots,
             read_roots_include_platform_defaults,
@@ -164,36 +150,7 @@ mod windows_impl {
             proxy_enforced,
             crate::WindowsSandboxProxySettingsMode::Reconcile,
         )?;
-        // Build capability SID for ACL grants.
-        let caps = load_or_create_cap_sids(codex_home)?;
-        let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, &env_map);
-        let write_root_sids = if uses_write_capabilities {
-            let write_roots = effective_write_roots_for_permissions(
-                &permissions,
-                cwd,
-                &env_map,
-                codex_home,
-                write_roots_override,
-            );
-            write_roots
-                .iter()
-                .map(|root| workspace_write_cap_sid_for_root(codex_home, cwd, root))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        let cap_sids = sandbox_capability_sid_strings(
-            uses_write_capabilities,
-            write_root_sids,
-            &caps.readonly,
-        );
-        let sid_for_null = LocalSid::from_string(&cap_sids[0])?;
-
-        // SAFETY: sid_for_null retains a valid converted SID for the complete synchronous NUL-
-        // device ACL update.
-        unsafe {
-            allow_null_device(sid_for_null.as_ptr());
-        }
+        let logs_base_dir = logs_base_dir.as_deref();
 
         (|| -> Result<CaptureResult> {
             let spawn_request = SpawnRequest {
@@ -307,6 +264,28 @@ mod windows_impl {
                 timed_out,
             })
         })()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::spawn_cancel_writer;
+        use crate::ipc_framed::Message;
+        use crate::ipc_framed::read_frame;
+        use std::io::Seek;
+
+        #[test]
+        fn cancellation_sends_a_terminate_frame_the_runner_accepts() -> anyhow::Result<()> {
+            let mut pipe = tempfile::tempfile()?;
+            let cancellation = crate::WindowsSandboxCancellationToken::new(|| true);
+            let (writer, _done) =
+                spawn_cancel_writer(&pipe, Some(cancellation))?.expect("cancel writer");
+            writer.join().expect("join cancel writer");
+
+            pipe.rewind()?;
+            let frame = read_frame(&mut pipe)?.expect("runner must receive a terminate frame");
+            assert!(matches!(frame.message, Message::Terminate { .. }));
+            Ok(())
+        }
     }
 }
 

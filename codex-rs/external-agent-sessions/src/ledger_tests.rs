@@ -1,25 +1,11 @@
 use super::CompletedExternalAgentSessionImport;
-use super::ImportedExternalAgentSessionLedger;
 use super::record_completed_session_imports;
-use super::record_current_source_refreshes;
 use codex_protocol::ThreadId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::sync::Arc;
 use std::sync::Barrier;
 use tempfile::TempDir;
-
-#[test]
-fn empty_ledger_does_not_read_source() {
-    let root = TempDir::new().expect("tempdir");
-    let missing_source = root.path().join("missing-session.jsonl");
-
-    assert!(
-        !ImportedExternalAgentSessionLedger::default()
-            .contains_current_source(&missing_source)
-            .expect("empty ledger cannot contain sources")
-    );
-}
 
 #[test]
 fn completed_imports_do_not_read_source_files() {
@@ -37,7 +23,6 @@ fn completed_imports_do_not_read_source_files() {
         vec![CompletedExternalAgentSessionImport {
             source_path: source_path.clone(),
             source_content_sha256: format!("{:x}", Sha256::digest(contents)),
-            source_modified_at: None,
             imported_thread_id,
         }],
     )
@@ -47,11 +32,10 @@ fn completed_imports_do_not_read_source_files() {
     assert_eq!(ledger.records.len(), 1);
     assert_eq!(ledger.records[0].source_path, source_path);
     assert_eq!(ledger.records[0].imported_thread_id, imported_thread_id);
-    assert_eq!(ledger.records[0].source_modified_at, None);
 }
 
 #[test]
-fn completed_import_refreshes_existing_record_metadata() {
+fn completed_import_replaces_existing_record_for_the_same_version() {
     let root = TempDir::new().expect("tempdir");
     let codex_home = root.path().join("codex-home");
     let source_path = root.path().join("session.jsonl");
@@ -62,33 +46,49 @@ fn completed_import_refreshes_existing_record_metadata() {
     let first_thread_id = ThreadId::new();
     let second_thread_id = ThreadId::new();
 
-    record_completed_session_imports(
-        &codex_home,
-        vec![CompletedExternalAgentSessionImport {
-            source_path: source_path.clone(),
-            source_content_sha256: content_sha256.clone(),
-            source_modified_at: Some(1),
-            imported_thread_id: first_thread_id,
-        }],
-    )
-    .expect("record first import");
-    record_completed_session_imports(
-        &codex_home,
-        vec![CompletedExternalAgentSessionImport {
-            source_path: source_path.clone(),
-            source_content_sha256: content_sha256.clone(),
-            source_modified_at: Some(2),
-            imported_thread_id: second_thread_id,
-        }],
-    )
-    .expect("record replacement import");
+    for imported_thread_id in [first_thread_id, second_thread_id] {
+        record_completed_session_imports(
+            &codex_home,
+            vec![CompletedExternalAgentSessionImport {
+                source_path: source_path.clone(),
+                source_content_sha256: content_sha256.clone(),
+                imported_thread_id,
+            }],
+        )
+        .expect("record import");
+    }
 
     let ledger = super::load_import_ledger(&codex_home).expect("ledger");
     assert_eq!(ledger.records.len(), 1);
     assert_eq!(ledger.records[0].source_path, source_path);
     assert_eq!(ledger.records[0].imported_thread_id, second_thread_id);
-    assert_eq!(ledger.records[0].source_modified_at, Some(2));
     assert_eq!(ledger.records[0].content_sha256, content_sha256);
+}
+
+#[test]
+fn ledgers_with_retired_fields_still_load() {
+    let root = TempDir::new().expect("tempdir");
+    let codex_home = root.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    let source_path = root.path().join("session.jsonl");
+    let imported_thread_id = ThreadId::new();
+    std::fs::write(
+        super::import_ledger_path(&codex_home),
+        serde_json::json!({
+            "records": [{
+                "source_path": source_path,
+                "content_sha256": "abc",
+                "imported_thread_id": imported_thread_id,
+                "imported_at": 1,
+                "source_modified_at": 2,
+            }],
+        })
+        .to_string(),
+    )
+    .expect("write ledger");
+
+    let ledger = super::load_import_ledger(&codex_home).expect("ledger");
+    assert!(ledger.contains_fingerprint(&source_path, "abc"));
 }
 
 #[test]
@@ -109,7 +109,6 @@ fn concurrent_completed_imports_preserve_every_ledger_update() {
         let completed_import = CompletedExternalAgentSessionImport {
             source_path,
             source_content_sha256: format!("{:x}", Sha256::digest(contents)),
-            source_modified_at: Some(index as i64),
             imported_thread_id: ThreadId::new(),
         };
         expected.push(completed_import.clone());
@@ -137,80 +136,6 @@ fn concurrent_completed_imports_preserve_every_ledger_update() {
             .expect("every identity survives");
         assert_eq!(actual.content_sha256, expected.source_content_sha256);
         assert_eq!(actual.imported_thread_id, expected.imported_thread_id);
-        assert_eq!(actual.source_modified_at, expected.source_modified_at);
         assert!((before..=after).contains(&actual.imported_at));
     }
-}
-
-#[test]
-fn stale_source_refresh_does_not_reorder_a_newer_completed_import() {
-    let root = TempDir::new().expect("tempdir");
-    let codex_home = root.path().join("codex-home");
-    let source_path = root.path().join("session.jsonl");
-    std::fs::write(&source_path, b"version-a").expect("source");
-    let source_path = std::fs::canonicalize(source_path).expect("canonical source");
-
-    let version_a_hash = format!("{:x}", Sha256::digest(b"version-a"));
-    let version_b_hash = format!("{:x}", Sha256::digest(b"version-b"));
-    let version_c_hash = format!("{:x}", Sha256::digest(b"version-c"));
-    record_completed_session_imports(
-        &codex_home,
-        vec![CompletedExternalAgentSessionImport {
-            source_path: source_path.clone(),
-            source_content_sha256: version_a_hash,
-            source_modified_at: Some(1),
-            imported_thread_id: ThreadId::new(),
-        }],
-    )
-    .expect("record version a");
-    record_completed_session_imports(
-        &codex_home,
-        vec![CompletedExternalAgentSessionImport {
-            source_path: source_path.clone(),
-            source_content_sha256: version_b_hash,
-            source_modified_at: Some(2),
-            imported_thread_id: ThreadId::new(),
-        }],
-    )
-    .expect("record version b");
-
-    let stale_snapshot = super::load_import_ledger(&codex_home).expect("snapshot");
-    let stale_refresh = stale_snapshot
-        .current_source_refresh(&source_path)
-        .expect("refresh")
-        .expect("version a was imported");
-
-    std::fs::write(&source_path, b"version-c").expect("replace source");
-    record_completed_session_imports(
-        &codex_home,
-        vec![CompletedExternalAgentSessionImport {
-            source_path,
-            source_content_sha256: version_c_hash.clone(),
-            source_modified_at: Some(3),
-            imported_thread_id: ThreadId::new(),
-        }],
-    )
-    .expect("record version c");
-    let before = super::load_import_ledger(&codex_home).expect("before refresh");
-    let ledger_path = super::import_ledger_path(&codex_home);
-    let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-    std::fs::File::options()
-        .write(true)
-        .open(&ledger_path)
-        .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(sentinel))
-        .unwrap();
-    record_current_source_refreshes(&codex_home, vec![stale_refresh])
-        .expect("record stale refresh");
-
-    let ledger = super::load_import_ledger(&codex_home).expect("ledger");
-    assert_eq!(ledger, before);
-    assert_eq!(
-        std::fs::metadata(ledger_path).unwrap().modified().unwrap(),
-        sentinel
-    );
-    assert_eq!(
-        ledger.records.last().map(|record| &record.content_sha256),
-        Some(&version_c_hash)
-    );
 }

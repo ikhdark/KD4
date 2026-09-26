@@ -23,6 +23,16 @@ pub const PLUGINS_CACHE_DIR: &str = "plugins/cache";
 pub const PLUGINS_DATA_DIR: &str = "plugins/data";
 const REMOTE_PLUGIN_INSTALL_METADATA_FILE: &str = ".codex-remote-plugin-install.json";
 const REMOTE_PLUGIN_INSTALL_METADATA_SCHEMA_VERSION: u8 = 1;
+// Transactions stage beside the plugin root so activation stays a same-volume rename. The
+// leading dot keeps them out of the plugin-name namespace, which never admits `.`.
+const INSTALL_TRANSACTION_PREFIX: &str = ".plugin-install-";
+const UNINSTALL_TRANSACTION_PREFIX: &str = ".plugin-uninstall-";
+
+/// Whether an entry beside plugin cache roots is reserved store state (a live transaction, or
+/// one preserved after a failed rollback) rather than a plugin cache root.
+pub(crate) fn is_reserved_plugin_cache_entry(file_name: &str) -> bool {
+    file_name.starts_with('.')
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RemotePluginInstallMetadata {
@@ -705,7 +715,7 @@ fn replace_plugin_root_atomically(
         .map_err(|err| PluginStoreError::io("failed to create plugin cache directory", err))?;
 
     let staged_dir = tempfile::Builder::new()
-        .prefix("plugin-install-")
+        .prefix(INSTALL_TRANSACTION_PREFIX)
         .tempdir_in(parent)
         .map_err(|err| {
             PluginStoreError::io("failed to create temporary plugin cache directory", err)
@@ -788,7 +798,7 @@ fn stage_plugin_uninstall(path: &Path) -> Result<PendingPluginUninstall, PluginS
         ))
     })?;
     let transaction_dir = tempfile::Builder::new()
-        .prefix("plugin-uninstall-")
+        .prefix(UNINSTALL_TRANSACTION_PREFIX)
         .tempdir_in(parent)
         .map_err(|err| {
             PluginStoreError::io("failed to create plugin uninstall staging directory", err)

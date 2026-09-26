@@ -37,12 +37,32 @@ fn write_plugin_skill(
     name: &str,
     description: &str,
 ) -> PathBuf {
+    write_versioned_plugin_skill(
+        codex_home,
+        marketplace,
+        plugin_name,
+        "local",
+        dir,
+        name,
+        description,
+    )
+}
+
+fn write_versioned_plugin_skill(
+    codex_home: &TempDir,
+    marketplace: &str,
+    plugin_name: &str,
+    version: &str,
+    dir: &str,
+    name: &str,
+    description: &str,
+) -> PathBuf {
     let plugin_root = codex_home
         .path()
         .join("plugins/cache")
         .join(marketplace)
         .join(plugin_name)
-        .join("local");
+        .join(version);
     let skill_dir = plugin_root.join("skills").join(dir);
     fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
     fs::create_dir_all(&skill_dir).unwrap();
@@ -789,6 +809,84 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
             .skills
             .iter()
             .any(|skill| skill.name == "late-skill")
+    );
+}
+
+async fn cwd_snapshot_plugin_skill(
+    skills_service: &SkillsService,
+    cwd: &TempDir,
+    config_layer_stack: &ConfigLayerStack,
+    skill_path: &Path,
+) -> SkillMetadata {
+    let input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        vec![plugin_skill_root_for_skill_path(
+            skill_path,
+            "sample@test",
+            "sample",
+        )],
+        config_layer_stack.clone(),
+        /*bundled_skills_enabled*/ false,
+    );
+    skills_service
+        .snapshot_for_cwd(
+            &input,
+            /*force_reload*/ false,
+            Some(Arc::clone(&LOCAL_FS)),
+        )
+        .await
+        .outcome()
+        .skills
+        .iter()
+        .find(|skill| skill.name == "sample:sample-search")
+        .cloned()
+        .expect("plugin skill should load")
+}
+
+#[tokio::test]
+async fn skills_for_cwd_cache_follows_reinstalled_plugin_skill_roots() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let write_version = |version: &str, description: &str| {
+        write_versioned_plugin_skill(
+            &codex_home,
+            "test",
+            "sample",
+            version,
+            "sample-search",
+            "sample-search",
+            description,
+        )
+    };
+
+    let installed_path = write_version("1.0.0", "before update");
+    let installed =
+        cwd_snapshot_plugin_skill(&skills_service, &cwd, &config_layer_stack, &installed_path)
+            .await;
+    assert_eq!(installed.description, "before update");
+
+    // A plugin reinstall publishes a new versioned root and removes the replaced one.
+    let replaced_version_root = installed_path
+        .ancestors()
+        .nth(3)
+        .expect("plugin version root");
+    fs::remove_dir_all(replaced_version_root).expect("remove replaced plugin version");
+    let upgraded_path = write_version("2.0.0", "after update");
+    let upgraded =
+        cwd_snapshot_plugin_skill(&skills_service, &cwd, &config_layer_stack, &upgraded_path)
+            .await;
+
+    assert_eq!(upgraded.description, "after update");
+    assert_eq!(
+        upgraded.path_to_skills_md,
+        dunce::canonicalize(&upgraded_path)
+            .expect("canonical skill path")
+            .abs()
     );
 }
 

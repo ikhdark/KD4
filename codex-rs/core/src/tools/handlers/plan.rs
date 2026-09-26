@@ -139,7 +139,6 @@ impl ToolOutput for PlanToolOutput {
             "plan": self.governor_plan,
             "effect": self.effect.as_str(),
             "no_progress": self.effect == PlanUpdateEffect::NoOp,
-            "unfinished_mutation_obligation": false,
         }))
     }
 

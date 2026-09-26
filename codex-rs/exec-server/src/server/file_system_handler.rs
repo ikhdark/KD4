@@ -9,6 +9,7 @@ use crate::CreateDirectoryOptions;
 use crate::ExecServerRuntimePaths;
 use crate::ExecutorFileSystem;
 use crate::RemoveOptions;
+use crate::connection::MAX_FILE_PAYLOAD_BYTES;
 use crate::file_read::FileReadHandleManager;
 use crate::local_file_system::LocalFileSystem;
 use crate::protocol::FS_WRITE_FILE_METHOD;
@@ -29,6 +30,8 @@ use crate::protocol::FsReadBlockResponse;
 use crate::protocol::FsReadDirectoryEntry;
 use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadDirectoryResponse;
+use crate::protocol::FsReadFileBoundedParams;
+use crate::protocol::FsReadFileBoundedResponse;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsReadFileResponse;
 use crate::protocol::FsRemoveParams;
@@ -113,8 +116,47 @@ impl FileSystemHandler {
             .read_file(&params.path, params.sandbox.as_ref())
             .await
             .map_err(map_fs_error)?;
+        if bytes.len() > MAX_FILE_PAYLOAD_BYTES {
+            return Err(invalid_request(format!(
+                "file is too large to read through exec-server: {} bytes exceeds the {MAX_FILE_PAYLOAD_BYTES}-byte response limit",
+                bytes.len()
+            )));
+        }
         Ok(FsReadFileResponse {
             data_base64: STANDARD.encode(bytes),
+        })
+    }
+
+    pub(crate) async fn read_file_bounded(
+        &self,
+        params: FsReadFileBoundedParams,
+    ) -> Result<FsReadFileBoundedResponse, JSONRPCErrorError> {
+        // Never read beyond what one response can carry. A larger caller limit
+        // cannot be honored remotely, so a miss is reported instead of looking
+        // like an ordinary "too large or changed" result for that limit.
+        let exceeds_response_limit = params.max_bytes > MAX_FILE_PAYLOAD_BYTES;
+        let max_bytes = params.max_bytes.min(MAX_FILE_PAYLOAD_BYTES);
+        let sandbox = params.sandbox.as_ref();
+        let data = match params.confined_root.as_ref() {
+            Some(root) => {
+                self.file_system
+                    .read_file_bounded_confined(&params.path, root, max_bytes, sandbox)
+                    .await
+            }
+            None => {
+                self.file_system
+                    .read_file_bounded(&params.path, max_bytes, sandbox)
+                    .await
+            }
+        }
+        .map_err(map_fs_error)?;
+        if data.is_none() && exceeds_response_limit {
+            return Err(invalid_request(format!(
+                "file exceeds the {MAX_FILE_PAYLOAD_BYTES}-byte exec-server response limit or changed while being read"
+            )));
+        }
+        Ok(FsReadFileBoundedResponse {
+            data_base64: data.map(|data| STANDARD.encode(data)),
         })
     }
 
@@ -276,6 +318,79 @@ mod tests {
     use crate::FileSystemSandboxContext;
     use crate::protocol::FsReadFileParams;
     use crate::protocol::FsWriteFileParams;
+
+    async fn bounded_read(
+        handler: &FileSystemHandler,
+        path: &std::path::Path,
+        max_bytes: usize,
+        confined_root: Option<&std::path::Path>,
+    ) -> Result<Option<String>, JSONRPCErrorError> {
+        let uri = |path: &std::path::Path| PathUri::from_host_native_path(path).expect("path URI");
+        handler
+            .read_file_bounded(FsReadFileBoundedParams {
+                path: uri(path),
+                max_bytes,
+                confined_root: confined_root.map(uri),
+                sandbox: None,
+            })
+            .await
+            .map(|response| response.data_base64)
+    }
+
+    #[tokio::test]
+    async fn bounded_reads_honor_limits_confinement_and_response_budget() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let runtime_paths =
+            ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
+                .expect("runtime paths");
+        let handler = FileSystemHandler::new(runtime_paths);
+        let root = temp_dir.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        let inside = root.join("inside.txt");
+        std::fs::write(&inside, b"inside").expect("write inside");
+        let outside = temp_dir.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").expect("write outside");
+
+        assert_eq!(
+            bounded_read(&handler, &inside, 6, None).await,
+            Ok(Some(STANDARD.encode("inside")))
+        );
+        assert_eq!(bounded_read(&handler, &inside, 5, None).await, Ok(None));
+        assert_eq!(
+            bounded_read(&handler, &inside, 6, Some(&root)).await,
+            Ok(Some(STANDARD.encode("inside")))
+        );
+        let escape = bounded_read(&handler, &outside, 7, Some(&root))
+            .await
+            .expect_err("confined read must not escape its root");
+        assert!(
+            escape.message.contains("outside the confined root"),
+            "{escape:?}"
+        );
+
+        // Sparse file: bounded reads reject it from metadata without reading data.
+        let huge = temp_dir.path().join("huge.bin");
+        std::fs::File::create(&huge)
+            .and_then(|file| file.set_len(MAX_FILE_PAYLOAD_BYTES as u64 + 1))
+            .expect("create sparse file");
+        assert_eq!(
+            bounded_read(&handler, &huge, MAX_FILE_PAYLOAD_BYTES, None).await,
+            Ok(None),
+            "a caller limit within one response keeps the ordinary miss"
+        );
+        let error = bounded_read(&handler, &huge, usize::MAX, None)
+            .await
+            .expect_err("a limit beyond one response cannot be honored");
+        assert!(error.message.contains("response limit"), "{error:?}");
+        let error = handler
+            .read_file(FsReadFileParams {
+                path: PathUri::from_host_native_path(&huge).expect("path URI"),
+                sandbox: None,
+            })
+            .await
+            .expect_err("fs/readFile must not produce an untransportable response");
+        assert!(error.message.contains("response limit"), "{error:?}");
+    }
 
     #[tokio::test]
     async fn no_platform_sandbox_policies_do_not_require_configured_sandbox_helper() {

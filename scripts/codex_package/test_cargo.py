@@ -96,6 +96,35 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                     ],
                 )
 
+    def test_environment_rustflags_cannot_replace_checked_in_target_flags(self):
+        # Cargo lets RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, even when empty,
+        # replace the target rustflags that give packaged binaries their 8 MiB
+        # stack and static CRT; the per-target variable joins them instead.
+        for name, value, blocked in (
+            ("RUSTFLAGS", "-C target-cpu=native", True),
+            ("RUSTFLAGS", "", True),
+            ("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-cpu=native", True),
+            (
+                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+                "-C target-cpu=native",
+                False,
+            ),
+        ):
+            with (
+                self.subTest(name=name, value=value),
+                self.package_fixture() as fixture,
+            ):
+                spec, variant, kwargs, run, _, _ = fixture
+                os.environ[name] = value
+                if blocked:
+                    with self.assertRaisesRegex(RuntimeError, f"{name} is set"):
+                        build_source_binaries(spec, variant, **kwargs)
+                    run.assert_not_called()
+                else:
+                    outputs = build_source_binaries(spec, variant, **kwargs)
+                    self.assertTrue(outputs.entrypoint_bin.is_file())
+                    self.assertEqual(run.call_count, 1)
+
     def test_public_reuse_observes_inputs_once_and_build_observes_before_and_after(
         self,
     ):

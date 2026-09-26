@@ -431,8 +431,6 @@ fn build_rustls_client_config_from_pem_data(
         });
     };
 
-    ensure_rustls_crypto_provider();
-
     // Start from the platform roots so websocket callers keep the same baseline trust behavior
     // they would get from tungstenite's default rustls connector, then layer in the Codex custom
     // CA bundle on top when configured.

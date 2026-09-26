@@ -2362,7 +2362,7 @@ async fn turn_start_exec_approval_decline_v2() -> Result<()> {
         /*workdir*/ None,
         Some(5000),
         "call-decline",
-    )?];
+    )?, create_final_assistant_message_sse_response("command declined")?];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(
         codex_home.as_path(),
@@ -2509,6 +2509,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             Some(5000),
             "call-first",
         )?,
+        create_final_assistant_message_sse_response("first command declined")?,
         create_shell_command_sse_response(
             vec!["echo".to_string(), "second".to_string(), "turn".to_string()],
             /*workdir*/ None,
@@ -4054,7 +4055,10 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
 +new line
 *** End Patch
 "#;
-    let responses = vec![create_apply_patch_sse_response(patch, "patch-call")?];
+    let responses = vec![
+        create_apply_patch_sse_response(patch, "patch-call")?,
+        create_final_assistant_message_sse_response("patch declined")?,
+    ];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml_with_sandbox(
         &codex_home,

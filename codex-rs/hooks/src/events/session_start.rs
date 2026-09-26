@@ -13,6 +13,7 @@ use super::common;
 use super::common::ContextInjectingHookOutcome;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
+use crate::engine::ScopedRunGate;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
@@ -47,6 +48,17 @@ pub struct SessionStartRequest {
     pub model: String,
     pub permission_mode: String,
     pub target: StartHookTarget,
+}
+
+impl SessionStartRequest {
+    /// Returns the turn that scopes `once_per` limits: a subagent start carries
+    /// its own turn, while a session start uses the dispatching turn.
+    pub(crate) fn scope_turn_id<'a>(&'a self, turn_id: Option<&'a str>) -> &'a str {
+        match &self.target {
+            StartHookTarget::SessionStart { .. } => turn_id.unwrap_or_default(),
+            StartHookTarget::SubagentStart { turn_id, .. } => turn_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +99,7 @@ struct SessionStartHandlerData {
 pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
     request: &SessionStartRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> Vec<HookRunSummary> {
     dispatcher::select_handlers(
         handlers,
@@ -94,6 +107,7 @@ pub(crate) fn preview(
         Some(request.target.matcher_input()),
     )
     .into_iter()
+    .filter(|handler| gate.admits(handler))
     .map(|handler| dispatcher::running_summary(&handler))
     .collect()
 }
@@ -103,12 +117,14 @@ pub(crate) async fn run(
     shell: &CommandShell,
     request: SessionStartRequest,
     turn_id: Option<String>,
+    gate: &ScopedRunGate<'_>,
 ) -> ContextInjectingHookOutcome {
-    let matched = dispatcher::select_handlers(
+    let mut matched = dispatcher::select_handlers(
         handlers,
         request.target.event_name(),
         Some(request.target.matcher_input()),
     );
+    matched.retain(|handler| gate.claim(handler));
     if matched.is_empty() {
         return ContextInjectingHookOutcome::default();
     }

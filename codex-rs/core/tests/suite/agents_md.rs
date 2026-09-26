@@ -59,7 +59,7 @@ async fn agents_instructions(mut builder: TestCodexBuilder) -> Result<String> {
     )
     .await;
 
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     test.submit_turn("hello").await?;
 
     let request = resp_mock.single_request();
@@ -140,12 +140,12 @@ fn assert_instruction_replacement_once(
 ) {
     let initial = expected_provider_only_instruction_fragment(initial_contents);
     let replacement = expected_provider_only_replacement_fragment(replacement_contents);
-    assert_eq!(instruction_fragments(&requests[0]), vec![initial]);
+    assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
     assert_eq!(
         instruction_fragments(&requests[1]),
-        vec![replacement.clone()]
+        vec![initial.clone(), replacement.clone()]
     );
-    assert_eq!(instruction_fragments(&requests[2]), vec![replacement]);
+    assert_eq!(instruction_fragments(&requests[2]), vec![initial, replacement]);
 }
 
 fn assert_single_fresh_instruction_fragment_contains(
@@ -538,7 +538,7 @@ async fn selected_environment_sources_match_model_visible_instructions() -> Resu
             .await?;
             Ok::<(), anyhow::Error>(())
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     let project_agents = test.config.cwd.join("AGENTS.md");
     let global_agents = global_agents.abs();
 
@@ -602,7 +602,7 @@ async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
             .await?;
             Ok(())
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     assert_eq!(provider.load_count(), 1);
 
     let no_environment_thread = test
@@ -688,7 +688,7 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
             .await?;
             Ok(())
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     let project_source = test.config.cwd.join(GLOBAL_AGENTS_FILENAME);
     let creation_sources = vec![
         PathUri::from_abs_path(&global_source),
@@ -740,7 +740,7 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     assert_eq!(fragments, vec![expected_fragment.clone()]);
     assert_eq!(
         instruction_fragments(&requests[1]),
-        vec![replacement_fragment]
+        vec![expected_fragment, replacement_fragment]
     );
     let rendered = fragments
         .into_iter()
@@ -867,8 +867,7 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
         .resume(&server, Arc::clone(&home), rollout_path)
         .await?;
 
-    // Stable-context reconstruction removes the obsolete fragment and its
-    // internal tombstone before sampling.
+    // Resume retains the historical prefix and appends one explicit revocation.
     assert_eq!(
         resumed.codex.instruction_sources().await,
         Vec::<PathUri>::new(),
@@ -881,9 +880,15 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
     let initial = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
-    assert_eq!(instruction_fragments(&requests[0]), vec![initial]);
-    assert_eq!(instruction_fragments(&requests[1]), Vec::<String>::new());
-    assert_eq!(instruction_fragments(&requests[2]), Vec::<String>::new());
+    let removal = expected_provider_only_instruction_fragment(
+        "The previously provided AGENTS.md instructions no longer apply.",
+    );
+    assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
+    assert_eq!(
+        instruction_fragments(&requests[1]),
+        vec![initial.clone(), removal.clone()]
+    );
+    assert_eq!(instruction_fragments(&requests[2]), vec![initial, removal]);
 
     Ok(())
 }

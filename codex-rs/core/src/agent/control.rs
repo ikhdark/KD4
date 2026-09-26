@@ -229,23 +229,31 @@ impl AgentControl {
         self.state.has_live_agents()
     }
 
+    /// Heartbeats a bound typed agent for as long as this loaded runtime lives. A finished turn
+    /// idles instead of exiting, so follow-up and correction turns stay covered; a resumed or
+    /// reloaded runtime gets its own watcher.
     pub(crate) fn start_typed_actor_heartbeat_watcher(
         &self,
         agent_path: AgentPath,
         thread_id: ThreadId,
+        thread: &Arc<crate::CodexThread>,
     ) {
         let control = self.clone();
+        let runtime = Arc::downgrade(thread);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(TYPED_ACTOR_HEARTBEAT_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if !matches!(
-                    control.get_status(thread_id).await,
-                    AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
-                ) {
-                    break;
-                }
+                let status = match runtime.upgrade() {
+                    Some(thread) if thread.is_running() => thread.agent_status().await,
+                    _ => break,
+                };
+                let progress = match typed_actor_heartbeat(&status) {
+                    TypedActorHeartbeat::Renew { progress } => progress,
+                    TypedActorHeartbeat::Idle => continue,
+                    TypedActorHeartbeat::Stop => break,
+                };
                 let Some(binding) = control
                     .task_coordinator()
                     .binding_for_agent_path(&agent_path)
@@ -259,7 +267,7 @@ impl AgentControl {
                 }
                 match control
                     .task_coordinator()
-                    .heartbeat_typed_actor_binding(&binding)
+                    .heartbeat_typed_actor_binding(&binding, progress)
                     .await
                 {
                     Ok(true) => {}
@@ -279,6 +287,26 @@ impl AgentControl {
         });
     }
 
+    /// Watches a bound agent runtime this control just resumed or reloaded. Reattachment to a
+    /// runtime that was already running keeps that runtime's existing watcher.
+    fn watch_loaded_typed_actor(
+        &self,
+        agent_path: Option<AgentPath>,
+        loaded: &crate::thread_manager::NewThread,
+    ) {
+        if loaded.was_already_running {
+            return;
+        }
+        if let Some(agent_path) = agent_path
+            && self
+                .task_coordinator()
+                .binding_for_agent_path(&agent_path)
+                .is_some()
+        {
+            self.start_typed_actor_heartbeat_watcher(agent_path, loaded.thread_id, &loaded.thread);
+        }
+    }
+
     pub(crate) async fn reconcile_live_typed_actor_heartbeats(
         &self,
     ) -> codex_agent_task_store::StoreResult<()> {
@@ -290,17 +318,17 @@ impl AgentControl {
             let Some(binding) = self.task_coordinator().binding_for_agent_path(&agent_path) else {
                 continue;
             };
-            if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str())
-                || !matches!(
-                    self.get_status(thread_id).await,
-                    AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
-                )
-            {
+            if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str()) {
                 continue;
             }
+            let TypedActorHeartbeat::Renew { progress } =
+                typed_actor_heartbeat(&self.get_status(thread_id).await)
+            else {
+                continue;
+            };
             match self
                 .task_coordinator()
-                .heartbeat_typed_actor_binding(&binding)
+                .heartbeat_typed_actor_binding(&binding, progress)
                 .await
             {
                 Ok(true) => {}
@@ -1069,6 +1097,29 @@ impl AgentControl {
         }
 
         Ok(descendants)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TypedActorHeartbeat {
+    Renew { progress: bool },
+    Idle,
+    Stop,
+}
+
+/// A running turn is working even inside one long model call or command, so it defers
+/// nonproductive recovery; pending and interrupted agents only stay live. A finished turn must not
+/// renew a settled actor, but a follow-up turn may still start on the same runtime.
+fn typed_actor_heartbeat(status: &AgentStatus) -> TypedActorHeartbeat {
+    match status {
+        AgentStatus::Running => TypedActorHeartbeat::Renew { progress: true },
+        AgentStatus::PendingInit | AgentStatus::Interrupted => {
+            TypedActorHeartbeat::Renew { progress: false }
+        }
+        AgentStatus::Completed(_)
+        | AgentStatus::CompletedWithSurface { .. }
+        | AgentStatus::Errored(_) => TypedActorHeartbeat::Idle,
+        AgentStatus::Shutdown | AgentStatus::NotFound => TypedActorHeartbeat::Stop,
     }
 }
 

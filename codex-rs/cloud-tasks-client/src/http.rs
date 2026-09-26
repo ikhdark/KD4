@@ -83,12 +83,11 @@ impl CloudBackend for HttpClient {
         Box::pin(async move { self.tasks_api().diff(id).await })
     }
 
-    fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>> {
-        Box::pin(async move { self.tasks_api().messages(id).await })
-    }
-
-    fn get_task_text(&self, id: TaskId) -> CloudBackendFuture<'_, TaskText> {
-        Box::pin(async move { self.tasks_api().task_text(id).await })
+    fn get_task_text_and_diff(
+        &self,
+        id: TaskId,
+    ) -> CloudBackendFuture<'_, (TaskText, Option<String>)> {
+        Box::pin(async move { self.tasks_api().task_text_and_diff(id).await })
     }
 
     fn list_sibling_attempts(
@@ -146,14 +145,12 @@ mod api {
     use std::collections::HashMap;
 
     pub(crate) struct Tasks<'a> {
-        base_url: &'a str,
         backend: &'a backend::Client,
     }
 
     impl<'a> Tasks<'a> {
         pub(crate) fn new(client: &'a HttpClient) -> Self {
             Self {
-                base_url: &client.base_url,
                 backend: &client.backend,
             }
         }
@@ -273,61 +270,18 @@ mod api {
             Ok(None)
         }
 
-        pub(crate) async fn messages(&self, id: TaskId) -> Result<Vec<String>> {
-            let (details, body, ct) = self
-                .details_with_body(&id.0)
-                .await
-                .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
-
-            let mut msgs = details.assistant_text_messages();
-            if msgs.is_empty() {
-                msgs.extend(extract_assistant_messages_from_body(&body));
-            }
-            if !msgs.is_empty() {
-                return Ok(msgs);
-            }
-            if let Some(err) = details.assistant_error_message() {
-                return Ok(vec![format!("Task failed: {err}")]);
-            }
-
-            let url = match details_path(self.base_url, &id.0) {
-                Some(url) => url,
-                None => format!("{}/api/codex/tasks/{}", self.base_url, id.0),
-            };
-            Err(CloudTaskError::Http(format!(
-                "No assistant text messages in response. GET {url}; content-type={ct}; body_bytes={}; body_excerpt={}",
-                body.len(),
-                excerpt(&body, 2000)
-            )))
-        }
-
-        pub(crate) async fn task_text(&self, id: TaskId) -> Result<TaskText> {
+        pub(crate) async fn task_text_and_diff(
+            &self,
+            id: TaskId,
+        ) -> Result<(TaskText, Option<String>)> {
             let (details, body, _ct) = self
                 .details_with_body(&id.0)
                 .await
                 .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
-            let prompt = details.user_text_prompt();
-            let mut messages = details.assistant_text_messages();
-            if messages.is_empty() {
-                messages.extend(extract_assistant_messages_from_body(&body));
-            }
-            let assistant_turn = details.current_assistant_turn.as_ref();
-            let turn_id = assistant_turn.and_then(|turn| turn.id.clone());
-            let sibling_turn_ids = assistant_turn
-                .map(|turn| turn.sibling_turn_ids.clone())
-                .unwrap_or_default();
-            let attempt_placement = assistant_turn.and_then(|turn| turn.attempt_placement);
-            let attempt_status = attempt_status_from_str(
-                assistant_turn.and_then(|turn| turn.turn_status.as_deref()),
-            );
-            Ok(TaskText {
-                prompt,
-                messages,
-                turn_id,
-                sibling_turn_ids,
-                attempt_placement,
-                attempt_status,
-            })
+            Ok((
+                task_text_from_details(&details, &body),
+                details.unified_diff(),
+            ))
         }
 
         pub(crate) async fn create(
@@ -586,13 +540,33 @@ mod api {
         }
     }
 
-    fn details_path(base_url: &str, id: &str) -> Option<String> {
-        if base_url.contains("/backend-api") {
-            Some(format!("{base_url}/wham/tasks/{id}"))
-        } else if base_url.contains("/api/codex") {
-            Some(format!("{base_url}/tasks/{id}"))
-        } else {
-            None
+    fn task_text_from_details(details: &backend::CodeTaskDetailsResponse, body: &str) -> TaskText {
+        let prompt = details.user_text_prompt();
+        let mut messages = details.assistant_text_messages();
+        if messages.is_empty() {
+            messages.extend(extract_assistant_messages_from_body(body));
+        }
+        // A failed turn usually has no assistant text; keep its reason visible to readers.
+        if messages.is_empty()
+            && let Some(error) = details.assistant_error_message()
+        {
+            messages.push(format!("Task failed: {error}"));
+        }
+        let assistant_turn = details.current_assistant_turn.as_ref();
+        let turn_id = assistant_turn.and_then(|turn| turn.id.clone());
+        let sibling_turn_ids = assistant_turn
+            .map(|turn| turn.sibling_turn_ids.clone())
+            .unwrap_or_default();
+        let attempt_placement = assistant_turn.and_then(|turn| turn.attempt_placement);
+        let attempt_status =
+            attempt_status_from_str(assistant_turn.and_then(|turn| turn.turn_status.as_deref()));
+        TaskText {
+            prompt,
+            messages,
+            turn_id,
+            sibling_turn_ids,
+            attempt_placement,
+            attempt_status,
         }
     }
 
@@ -1122,6 +1096,69 @@ mod api {
         }
 
         #[tokio::test]
+        async fn task_text_and_diff_share_one_task_read() {
+            // The fixture server answers exactly one request, so a second task read fails.
+            let (client, server) = client_with_json_responses(vec![(
+                "/api/codex/tasks/task",
+                serde_json::json!({
+                    "current_user_turn": {
+                        "input_items": [{"type": "message", "role": "user", "content": ["Fix it"]}]
+                    },
+                    "current_assistant_turn": {
+                        "id": "turn-1",
+                        "turn_status": "completed",
+                        "sibling_turn_ids": ["turn-2"],
+                        "output_items": [{"type": "message", "content": ["Done"]}]
+                    },
+                    "current_diff_task_turn": {
+                        "output_items": [{"type": "output_diff", "diff": "diff --git a/f b/f\n"}]
+                    }
+                }),
+            )])
+            .await;
+            let (text, diff) = client
+                .get_task_text_and_diff(TaskId("task".to_string()))
+                .await
+                .expect("text and diff from one task read");
+            server.await.expect("HTTP server");
+            assert_eq!(diff.as_deref(), Some("diff --git a/f b/f\n"));
+            assert_eq!(text.prompt.as_deref(), Some("Fix it"));
+            assert_eq!(text.messages, vec!["Done".to_string()]);
+            assert_eq!(text.turn_id.as_deref(), Some("turn-1"));
+            assert_eq!(text.sibling_turn_ids, vec!["turn-2".to_string()]);
+            assert_eq!(text.attempt_status, AttemptStatus::Completed);
+        }
+
+        #[tokio::test]
+        async fn failed_task_text_reports_the_failure_reason() {
+            let (client, server) = client_with_json_responses(vec![(
+                "/api/codex/tasks/task",
+                serde_json::json!({
+                    "current_user_turn": {
+                        "input_items": [{"type": "message", "role": "user", "content": ["Fix it"]}]
+                    },
+                    "current_assistant_turn": {
+                        "id": "turn-1",
+                        "turn_status": "failed",
+                        "error": {"code": "APPLY_FAILED", "message": "Patch could not be applied"}
+                    }
+                }),
+            )])
+            .await;
+            let (text, diff) = client
+                .get_task_text_and_diff(TaskId("task".to_string()))
+                .await
+                .expect("failed task details");
+            server.await.expect("HTTP server");
+            assert_eq!(diff, None);
+            assert_eq!(text.attempt_status, AttemptStatus::Failed);
+            assert_eq!(
+                text.messages,
+                vec!["Task failed: APPLY_FAILED: Patch could not be applied".to_string()]
+            );
+        }
+
+        #[tokio::test]
         async fn list_rejects_unrepresentable_limit_before_sending_request() {
             let client = HttpClient::new(
                 "http://127.0.0.1:1",
@@ -1234,6 +1271,8 @@ mod api {
 
             let directory = tempfile::tempdir().expect("temporary repository");
             let cwd = directory.path();
+            // Keep apply diagnostics beside the repository so a failure can show them.
+            crate::set_error_log_dir(cwd);
             git(cwd, &["init", "--quiet"]);
             git(cwd, &["config", "user.email", "test@example.com"]);
             git(cwd, &["config", "user.name", "Cloud task test"]);
@@ -1290,7 +1329,7 @@ mod api {
                     outcome.status,
                     ApplyStatus::Success,
                     "preflight={preflight}, outcome={outcome:?}, log={:?}",
-                    std::fs::read_to_string(cwd.join("error.log"))
+                    std::fs::read_to_string(cwd.join(crate::logging::ERROR_LOG_FILE_NAME))
                 );
                 assert_eq!(outcome.applied, !preflight);
                 assert!(outcome.skipped_paths.is_empty());

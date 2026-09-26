@@ -233,11 +233,15 @@ fn enforce_history_limit(
     let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
     std::io::copy(&mut reader, &mut replacement)?;
     replacement.as_file().sync_all()?;
+    // Clear the Windows temporary attribute, which would otherwise defer write-back
+    // of every later append to the published file; retain cleanup on rename failure.
+    let (replacement, replacement_path) = replacement.keep().map_err(|error| error.error)?;
+    let replacement_path = tempfile::TempPath::try_from_path(replacement_path)?;
     // Keep both generations locked across publication. Waiting users of the old
     // generation must reopen; users of the new one wait for publication to finish.
-    replacement.as_file().lock()?;
+    replacement.lock()?;
     // Preserve open readers of the old generation on Windows as well as Unix.
-    std::fs::rename(replacement.path(), path)?;
+    std::fs::rename(&replacement_path, path)?;
     Ok(())
 }
 

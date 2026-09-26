@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 
 use axum::Router;
 use codex_exec_server::Environment;
@@ -131,19 +130,19 @@ struct FailFirstInitializeHttpClient {
     initialize_attempts: Arc<AtomicUsize>,
 }
 
+/// Lets the first initialize through and stalls every reinitialize forever, so
+/// only the caller's operation timeout can end a recovering call.
 #[derive(Clone)]
-struct DelayReinitializeHttpClient {
+struct StallReinitializeHttpClient {
     inner: Arc<dyn HttpClient>,
     initialize_attempts: Arc<AtomicUsize>,
-    reinitialize_delay: Duration,
 }
 
-impl DelayReinitializeHttpClient {
-    fn new(inner: Arc<dyn HttpClient>, reinitialize_delay: Duration) -> Self {
+impl StallReinitializeHttpClient {
+    fn new(inner: Arc<dyn HttpClient>) -> Self {
         Self {
             inner,
             initialize_attempts: Arc::new(AtomicUsize::new(0)),
-            reinitialize_delay,
         }
     }
 
@@ -152,7 +151,7 @@ impl DelayReinitializeHttpClient {
     }
 }
 
-impl HttpClient for DelayReinitializeHttpClient {
+impl HttpClient for StallReinitializeHttpClient {
     fn http_request(
         &self,
         params: HttpRequestParams,
@@ -166,12 +165,11 @@ impl HttpClient for DelayReinitializeHttpClient {
     ) -> BoxFuture<'_, Result<(HttpRequestResponse, HttpResponseBodyStream), ExecServerError>> {
         let inner = Arc::clone(&self.inner);
         let initialize_attempts = Arc::clone(&self.initialize_attempts);
-        let reinitialize_delay = self.reinitialize_delay;
 
         async move {
             if is_initialize_post(&params) && initialize_attempts.fetch_add(1, Ordering::SeqCst) > 0
             {
-                tokio::time::sleep(reinitialize_delay).await;
+                std::future::pending::<()>().await;
             }
 
             inner.http_request_stream(params).await
@@ -562,10 +560,8 @@ async fn streamable_http_404_session_expiry_recovers_and_retries_once() -> anyho
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn streamable_http_operation_timeout_covers_session_reinitialization() -> anyhow::Result<()> {
     let (_server, base_url) = spawn_streamable_http_server().await?;
-    let http_client = DelayReinitializeHttpClient::new(
-        Environment::default_for_tests().get_http_client(),
-        Duration::from_secs(2),
-    );
+    let http_client =
+        StallReinitializeHttpClient::new(Environment::default_for_tests().get_http_client());
     let client = create_client_with_http_client(&base_url, Arc::new(http_client.clone())).await?;
 
     arm_session_post_failure(
@@ -576,27 +572,27 @@ async fn streamable_http_operation_timeout_covers_session_reinitialization() -> 
     )
     .await?;
 
-    let started_at = Instant::now();
-    let error = client
-        .call_tool(
+    // Reinitialization never completes, so returning at all proves the
+    // operation timeout covers it; the outer bound only turns a hang into a
+    // failure.
+    let error = timeout(
+        Duration::from_secs(30),
+        client.call_tool(
             "echo".to_string(),
             Some(serde_json::json!({ "message": "recovery-timeout" })),
             /*meta*/ None,
             Some(Duration::from_millis(100)),
-        )
-        .await
-        .expect_err("session reinitialization must stay within the operation timeout");
+        ),
+    )
+    .await
+    .expect("operation timeout must cover a stalled session reinitialization")
+    .expect_err("session reinitialization must stay within the operation timeout");
 
     assert!(
         error.to_string().contains("timed out awaiting tools/call"),
         "unexpected timeout error: {error:#}"
     );
     assert_eq!(http_client.initialize_attempts(), 2);
-    assert!(
-        started_at.elapsed() < Duration::from_secs(1),
-        "operation exceeded its single timeout budget: {:?}",
-        started_at.elapsed()
-    );
 
     Ok(())
 }

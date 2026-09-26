@@ -32,17 +32,8 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 #[derive(Clone)]
 pub struct WebSocketConnector {
     http_client_factory: HttpClientFactory,
-    tls_config: Option<Arc<ClientConfig>>,
+    tls_config: Arc<ClientConfig>,
     tcp_nodelay: TcpNodelay,
-}
-
-/// Selects whether WebSocket TLS follows Codex custom-CA policy or Tungstenite defaults.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WebSocketTlsMode {
-    /// Build an explicit TLS configuration from native roots and configured Codex custom CAs.
-    ExplicitCodexTls,
-    /// Let Tungstenite build its default TLS configuration when the target requires TLS.
-    TungsteniteDefault,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,29 +44,15 @@ pub(crate) enum TcpNodelay {
 
 impl WebSocketConnector {
     /// Creates a connector using native roots and any configured Codex custom CA bundle.
+    ///
+    /// The same TLS configuration secures both HTTPS proxy tunnels and `wss` targets, so every
+    /// route honors the Codex custom-CA policy.
     pub fn new(
         http_client_factory: &HttpClientFactory,
     ) -> Result<Self, BuildCustomCaTransportError> {
-        Self::new_with_tls_mode(http_client_factory, WebSocketTlsMode::ExplicitCodexTls)
-    }
-
-    /// Creates a connector with explicit Codex TLS or the transport's existing TLS defaults.
-    ///
-    /// HTTPS proxy connections still build Codex TLS configuration when they establish their
-    /// proxy tunnel; default-mode target connections otherwise remain entirely with Tungstenite.
-    pub fn new_with_tls_mode(
-        http_client_factory: &HttpClientFactory,
-        tls_mode: WebSocketTlsMode,
-    ) -> Result<Self, BuildCustomCaTransportError> {
-        let tls_config = match tls_mode {
-            WebSocketTlsMode::ExplicitCodexTls => {
-                Some(build_rustls_client_config_with_custom_ca()?)
-            }
-            WebSocketTlsMode::TungsteniteDefault => None,
-        };
         Ok(Self {
             http_client_factory: http_client_factory.clone(),
-            tls_config,
+            tls_config: build_rustls_client_config_with_custom_ca()?,
             tcp_nodelay: TcpNodelay::Default,
         })
     }
@@ -101,7 +78,7 @@ impl WebSocketConnector {
         let (inner, response) = dialer::connect(
             request,
             config,
-            self.tls_config.clone(),
+            Arc::clone(&self.tls_config),
             proxy_route,
             self.tcp_nodelay,
         )

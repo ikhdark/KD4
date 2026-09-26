@@ -1,6 +1,6 @@
 ---
 source: core/tests/suite/compact.rs
-assertion_line: 4543
+assertion_line: 4533
 expression: "format_labeled_requests_snapshot(\"Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded.\",\n&[(\"Local Compaction Request\", &requests[2]),\n(\"Local Post-Compaction History Layout\", &requests[3]),])"
 ---
 Scenario: Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded.
@@ -19,14 +19,17 @@ Scenario: Pre-turn auto-compaction with a context override emits the context dif
 10:message/user:<SUMMARIZATION_PROMPT>
 
 ## Local Post-Compaction History Layout
-00:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or app...
-01:message/developer:You are `/root`, the primary agent in a team of agents collabora...
-02:message/developer:<PERMISSIONS_INSTRUCTIONS>
-03:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
-04:message/developer:<NO_TEXT>
-05:message/developer:<personality_spec>Use the following communication style for futu...
-06:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-07:message/user:<COMPACTION_SUMMARY>\nPRE_TURN_SUMMARY
-08:message/user[2]:
+00:message/developer[4]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <configured_developer_instructions state="removed" />
+    [03] <personality_spec>Use the following communication style for futu...
+    [04] <skills_usage_instructions>\n## How to use skills\n- Use the sma...
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collabora...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or app...
+03:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+04:message/user:<COMPACTION_SUMMARY>\nPRE_TURN_SUMMARY
+05:message/user[2]:
     [01] <input_image:detail,image_url>
     [02] USER_THREE

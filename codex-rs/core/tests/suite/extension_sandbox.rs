@@ -321,12 +321,12 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
         output["output"],
         json!([
             {
-                "type": "input_text",
-                "text": "",
-            },
-            {
                 "type": "input_image",
                 "image_url": TINY_PNG_DATA_URL,
+            },
+            {
+                "type": "input_text",
+                "text": "The image was generated successfully. Local saving is not configured; the returned image remains available through conversation-image selection.",
             }
         ])
     );

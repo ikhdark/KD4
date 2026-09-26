@@ -27,9 +27,8 @@ pub const MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS: i64 = MULTI_AGENT_MIN_WAIT_TIMEOU
 
 mod feature_configs;
 pub use feature_configs::CodeModeConfigToml;
-pub use feature_configs::CurrentTimeReminderConfigToml;
 pub use feature_configs::ContextManagementConfigToml;
-pub use feature_configs::TokenBudgetConfigToml;
+pub use feature_configs::CurrentTimeReminderConfigToml;
 pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
 pub use feature_configs::MultiAgentV2ConfigToml;
@@ -38,6 +37,7 @@ pub use feature_configs::NetworkProxyDomainPermissionToml;
 pub use feature_configs::NetworkProxyModeToml;
 pub use feature_configs::NetworkProxyUnixSocketPermissionToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
+pub use feature_configs::TokenBudgetConfigToml;
 
 /// High-level lifecycle stage for a feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,8 +527,8 @@ pub fn user_settable_feature_for_key(key: &str) -> Option<Feature> {
 
 /// Resolves a feature key accepted by managed feature requirements.
 ///
-/// Requirements retain a bounded compatibility alias that is deliberately not
-/// accepted by current user-facing feature configuration.
+/// Requirements accept exactly the user-settable canonical keys; internal-only
+/// features cannot be pinned.
 pub fn feature_requirement_for_key(key: &str) -> Option<Feature> {
     user_settable_feature_for_key(key)
 }
@@ -615,7 +615,11 @@ impl FeaturesToml {
 
     pub fn entries(&self) -> BTreeMap<String, bool> {
         let mut entries = self.entries.clone();
-        if let Some(enabled) = self.context_management.as_ref().and_then(FeatureToml::enabled) {
+        if let Some(enabled) = self
+            .context_management
+            .as_ref()
+            .and_then(FeatureToml::enabled)
+        {
             entries.insert(Feature::ContextManagement.key().to_string(), enabled);
         }
         if let Some(enabled) = self.token_budget.as_ref().and_then(FeatureToml::enabled) {
@@ -696,8 +700,12 @@ fn materialize_resolved_feature_enabled<T: FeatureConfig>(
 impl From<BTreeMap<String, bool>> for FeaturesToml {
     fn from(mut entries: BTreeMap<String, bool>) -> Self {
         Self {
-            context_management: entries.remove(Feature::ContextManagement.key()).map(FeatureToml::Enabled),
-            token_budget: entries.remove(Feature::TokenBudget.key()).map(FeatureToml::Enabled),
+            context_management: entries
+                .remove(Feature::ContextManagement.key())
+                .map(FeatureToml::Enabled),
+            token_budget: entries
+                .remove(Feature::TokenBudget.key())
+                .map(FeatureToml::Enabled),
             code_mode: entries
                 .remove(Feature::CodeMode.key())
                 .map(FeatureToml::Enabled),
@@ -1216,27 +1224,29 @@ pub fn unstable_features_warning_event(
         return None;
     }
 
+    // Resolve each configured value with its feature's own toggle field (for example
+    // `context_management.experimental_mode`), exactly as feature resolution does.
+    let configured_entries = effective_features
+        .and_then(|table| {
+            toml::Value::Table(table.clone())
+                .try_into::<FeaturesToml>()
+                .ok()
+        })
+        .map(|features_toml| features_toml.entries())
+        .unwrap_or_default();
     let mut under_development_feature_keys = BTreeSet::new();
-    if let Some(table) = effective_features {
-        for (key, value) in table {
-            let is_enabled = value.as_bool() == Some(true)
-                || value
-                    .as_table()
-                    .and_then(|table| table.get("enabled"))
-                    .and_then(toml::Value::as_bool)
-                    == Some(true);
-            if !is_enabled {
-                continue;
-            }
-            let Some(feature) = feature_for_key(key) else {
-                continue;
-            };
-            if !features.enabled(feature) {
-                continue;
-            }
-            if matches!(feature.stage(), Stage::UnderDevelopment) {
-                under_development_feature_keys.insert(feature.key());
-            }
+    for (key, enabled) in configured_entries {
+        if !enabled {
+            continue;
+        }
+        let Some(feature) = feature_for_key(&key) else {
+            continue;
+        };
+        if !features.enabled(feature) {
+            continue;
+        }
+        if matches!(feature.stage(), Stage::UnderDevelopment) {
+            under_development_feature_keys.insert(feature.key());
         }
     }
 

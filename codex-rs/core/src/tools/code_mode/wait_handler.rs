@@ -1,3 +1,4 @@
+use futures::FutureExt;
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -209,6 +210,19 @@ impl CodeModeWaitHandler {
                 if keep_dispatch_open {
                     dispatch_lease.keep_open();
                 }
+                if matches!(&wait_response, codex_code_mode::WaitOutcome::LiveCell(_))
+                    && let Some(parent_call_id) = exec
+                        .session
+                        .services
+                        .code_mode_service
+                        .cell_parent_call_id(&cell_id)
+                {
+                    // Nested calls the cell finished after its exec result reach
+                    // the model through this wait's result.
+                    exec.turn
+                        .turn_timing_state
+                        .record_code_mode_wait_delivery(&call_id, &parent_call_id);
+                }
                 let mut terminal_parent_call_id = None;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
                     && !matches!(
@@ -365,20 +379,30 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<codex_code_mode::WaitOutcome, String>>,
 {
+    let cancelled = || OwnerHeldCodeModeWaitError {
+        message: cancellation_message.to_string(),
+        drained_observations: 0,
+    };
+    let steered = |activity| OwnerHeldCodeModeWait {
+        exit: OwnerHeldCodeModeExit::InputActivity(activity),
+        drained_observations: 0,
+    };
+    if cancellation_token.is_cancelled() {
+        return Err(cancelled());
+    }
+    // The runtime retains a decision only while no observer holds it; one
+    // delivered to an observer that is then dropped is lost. Answer input that
+    // is already waiting before starting an observation.
+    if let Some(activity) =
+        next_input_activity(&mut activity_rx, &mut pending_activity).now_or_never()
+    {
+        return Ok(steered(activity));
+    }
     tokio::select! {
         biased;
-        _ = cancellation_token.cancelled() => {
-            Err(OwnerHeldCodeModeWaitError {
-                message: cancellation_message.to_string(),
-                drained_observations: 0,
-            })
-        }
-        activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
-            Ok(OwnerHeldCodeModeWait {
-                exit: OwnerHeldCodeModeExit::InputActivity(activity),
-                drained_observations: 0,
-            })
-        }
+        _ = cancellation_token.cancelled() => Err(cancelled()),
+        // A decision delivered in the same wakeup as new input wins; the input
+        // stays queued for the next sampling request.
         result = wait_once() => {
             result
                 .map(|response| OwnerHeldCodeModeWait {
@@ -389,6 +413,9 @@ where
                     message,
                     drained_observations: 0,
                 })
+        }
+        activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
+            Ok(steered(activity))
         }
         _ = tokio::time::sleep(OWNER_HELD_WAIT_TIMEOUT) => {
             // Silence is not failure: the runtime has not reported completion,
@@ -653,6 +680,100 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn wait_result_attests_nested_calls_the_cell_finished() {
+        use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
+        use crate::turn_timing::ToolCallTimingLineage;
+        use codex_protocol::protocol::ToolExecutionId;
+        use codex_protocol::protocol::TurnTimingToolCallSource;
+
+        let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+        session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        ));
+        let session = Arc::new(session);
+        let timing = Arc::clone(&turn.turn_timing_state);
+        let turn = Arc::new(turn);
+        let service = &session.services.code_mode_service;
+        let started = service
+            .execute(codex_code_mode::ExecuteRequest {
+                tool_call_id: "outer-exec".to_string(),
+                enabled_tools: Vec::new(),
+                source: "await yield_control();".to_string(),
+                yield_time_ms: None,
+                max_output_tokens: None,
+                default_tool_timeout_ms: None,
+            })
+            .await
+            .unwrap();
+        let cell = started.cell_id.clone();
+        service.record_cell_parent_call_id(&cell, "outer-exec");
+        service.mark_cell_ready_for_dispatch(&cell);
+        assert!(matches!(
+            started.initial_response().await.unwrap(),
+            codex_code_mode::RuntimeResponse::ExplicitYield { .. }
+        ));
+        // The yielded cell finished a nested call after its exec result, so
+        // only this wait's result carries it to the model.
+        let wait_execution = ToolExecutionId("wait-execution".to_string());
+        timing.record_accepted_tool_call(
+            "wait-call",
+            &wait_execution,
+            TurnTimingToolCallSource::Direct,
+            None,
+        );
+        let nested_execution = ToolExecutionId("nested-execution".to_string());
+        timing.record_accepted_tool_call(
+            "exec-1-tool-1",
+            &nested_execution,
+            TurnTimingToolCallSource::CodeMode,
+            Some("outer-exec"),
+        );
+        timing.record_tool_dispatch_timing(
+            "exec-1-tool-1",
+            "write_stdin",
+            TurnTimingToolCallSource::CodeMode,
+            ToolCallTimingLineage {
+                parent_call_id: Some("outer-exec"),
+                ..ToolCallTimingLineage::default()
+            },
+            ToolDispatchTimingSnapshot {
+                execution_id: nested_execution,
+                outcome: Some("success"),
+                ..ToolDispatchTimingSnapshot::default()
+            },
+        );
+
+        CodeModeWaitHandler
+            .handle_call(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(turn),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "wait-call".to_string(),
+                tool_name: ToolName::plain(WAIT_TOOL_NAME),
+                source: crate::tools::router::ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({ "cell_id": cell.as_str() }).to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        timing.record_tool_result_persisted("wait-call");
+
+        let closure = timing.tool_closure_snapshot();
+        assert_eq!(closure.persisted_count, 2);
+        assert!(
+            closure
+                .unresolved_calls
+                .iter()
+                .all(|call| call.call_id != "exec-1-tool-1")
+        );
+        service.shutdown().await.unwrap();
+    }
+
     #[test]
     fn terminal_signal_is_private_to_final_typed_cell_states() {
         let cell_id = codex_code_mode::CellId::new("cell-terminal".to_string());
@@ -805,6 +926,97 @@ mod tests {
         ));
         assert_eq!(result.drained_observations, 0);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn decision_delivered_with_new_input_is_not_dropped() {
+        let cell_id = codex_code_mode::CellId::new("cell-1".to_string());
+        let (activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+        let held = tokio::spawn(async move {
+            hold_until_state_change(
+                move || async move {
+                    let _ = started_tx.send(());
+                    decision_rx
+                        .await
+                        .map_err(|_| "decision dropped".to_string())
+                },
+                &tokio_util::sync::CancellationToken::new(),
+                activity_rx,
+                None,
+                "wait cancelled",
+            )
+            .await
+        });
+
+        started_rx.await.expect("observer started");
+        // The cell yields in the same wakeup as the user steers.
+        decision_tx
+            .send(codex_code_mode::WaitOutcome::LiveCell(
+                codex_code_mode::RuntimeResponse::ExplicitYield {
+                    cell_id: cell_id.clone(),
+                    content_items: vec![
+                        codex_code_mode::FunctionCallOutputContentItem::InputText {
+                            text: "yielded output".to_string(),
+                        },
+                    ],
+                },
+            ))
+            .expect("observer is waiting");
+        activity_tx.send_replace(InputQueueActivity::Steer);
+
+        let held = held
+            .await
+            .expect("held wait task")
+            .expect("a decision is non-terminal");
+        assert!(matches!(
+            held.exit,
+            OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::LiveCell(
+                codex_code_mode::RuntimeResponse::ExplicitYield { content_items, .. }
+            )) if matches!(
+                content_items.as_slice(),
+                [codex_code_mode::FunctionCallOutputContentItem::InputText { text }]
+                    if text == "yielded output"
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiting_input_returns_before_an_observation_starts() {
+        for queued_before_subscription in [true, false] {
+            let (activity_tx, activity_rx) =
+                tokio::sync::watch::channel(InputQueueActivity::Mailbox);
+            let pending_activity = if queued_before_subscription {
+                Some(InputQueueActivity::Steer)
+            } else {
+                activity_tx.send_replace(InputQueueActivity::Steer);
+                None
+            };
+            let observed = Arc::new(AtomicBool::new(false));
+            let observed_by_wait = Arc::clone(&observed);
+            let held = hold_until_state_change(
+                move || async move {
+                    observed_by_wait.store(true, Ordering::Release);
+                    std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>().await
+                },
+                &tokio_util::sync::CancellationToken::new(),
+                activity_rx,
+                pending_activity,
+                "wait cancelled",
+            )
+            .await
+            .expect("waiting input is non-terminal");
+
+            assert!(matches!(
+                held.exit,
+                OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)
+            ));
+            assert!(
+                !observed.load(Ordering::Acquire),
+                "an observation abandoned for input can lose a delivered decision"
+            );
+        }
     }
 
     #[tokio::test]

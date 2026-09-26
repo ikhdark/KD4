@@ -1,12 +1,13 @@
 #![allow(clippy::expect_used)]
 
-// Bounded replacement shard for the legacy `all` integration target.
-// Command execution, sandboxing, approval, and permission integration tests.
+// Bounded codex-core integration shard.
+// Command execution, sandboxing, approval, permission, and hook integration
+// tests. The Windows sandbox modules (`approvals`, `request_permissions`, and
+// `windows_sandbox`) stage the sandbox helpers and share one cross-process lock.
 //
 // The `suite` module is rooted at `tests/suite/` so test IDs stay
 // `suite::<module>::<test>`, and the shared bootstrap comes from the one
 // included prelude. Each shard compiles only its assigned source modules.
-pub use codex_protocol::error;
 
 #[path = "suite"]
 mod suite {
@@ -20,6 +21,8 @@ mod suite {
     mod exec_policy;
     #[path = "extension_sandbox.rs"]
     mod extension_sandbox;
+    #[path = "hooks_windows.rs"]
+    mod hooks_windows;
     #[path = "permissions_messages.rs"]
     mod permissions_messages;
     #[path = "request_permissions.rs"]
@@ -34,4 +37,6 @@ mod suite {
     mod unified_exec;
     #[path = "unified_exec_process_events.rs"]
     mod unified_exec_process_events;
+    #[path = "windows_sandbox.rs"]
+    mod windows_sandbox;
 }

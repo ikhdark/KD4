@@ -6,13 +6,14 @@ use crate::logging::log_failure;
 use crate::logging::log_note;
 use crate::logging::log_success;
 use crate::process::ConsoleMode;
+use crate::process::OUTPUT_DRAIN_AFTER_ROOT_EXIT;
 use crate::process::StderrMode;
 use crate::process::StdinMode;
 use crate::process::read_handle_loop;
 use crate::process::spawn_process_with_pipes;
+use crate::process::wait_for_output_readers;
 use crate::spawn_prep::LegacyAclSids;
 use crate::spawn_prep::SpawnPrepOptions;
-use crate::spawn_prep::allow_null_device_for_workspace_write;
 use crate::spawn_prep::apply_legacy_session_acl_rules;
 use crate::spawn_prep::legacy_session_capability_roots;
 use crate::spawn_prep::prepare_legacy_session_security;
@@ -355,7 +356,9 @@ fn finalize_exit(
         }
     };
 
-    if root_exited {
+    // Preserved descendants can keep inherited output handles open indefinitely; readers left
+    // running keep forwarding their output after the exit notification.
+    if root_exited && wait_for_output_readers(&[&output_join], OUTPUT_DRAIN_AFTER_ROOT_EXIT) {
         let _ = output_join.join();
     }
     let _ = exit_tx.send(exit_code);
@@ -520,7 +523,6 @@ fn spawn_windows_sandbox_session_legacy_blocking(
     // SAFETY: successful preparation transfers one valid owned token to this
     // operation. Retain it through ACL errors/cancellation until the waiter owns it.
     let token_owner = unsafe { OwnedHandle::from_raw_handle(security.h_token.cast()) };
-    allow_null_device_for_workspace_write(common.uses_write_capabilities);
 
     apply_legacy_session_acl_rules(
         &common.permissions,

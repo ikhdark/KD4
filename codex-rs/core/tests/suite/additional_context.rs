@@ -450,6 +450,10 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
     })
     .await;
 
+    let reset = external_context(
+        "__codex_additional_context_reset__",
+        "Additional context snapshot replaced. All previously supplied additional context values are obsolete (previous_value_obsolete=\"true\"). Only additional-context entries following this reset in the current update remain available. Do not infer omitted values from earlier messages.",
+    );
     assert_eq!(
         user_texts_without_task_model_guidance(&first_request.single_request()),
         vec![
@@ -464,6 +468,8 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
             "first turn".to_string(),
+            reset.clone(),
+            external_context("automation_info", "run one"),
             external_context("terminal_info", "pty one"),
             "second turn".to_string(),
         ]
@@ -474,6 +480,8 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
             "first turn".to_string(),
+            reset,
+            external_context("automation_info", "run one"),
             external_context("terminal_info", "pty one"),
             "second turn".to_string(),
             external_context("browser_info", "tab one"),
@@ -760,6 +768,10 @@ async fn task_model_guidance_production_capture_matches_effective_settings() -> 
             "trace child failed: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "trace child must execute its assertions"
         );
         return Ok(());
     }

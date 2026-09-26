@@ -20,11 +20,18 @@ version = 1
 # lane's target directory and exports both the dashed and underscored aliases.
 # Every helper a run does not declare is exported as a missing path, so
 # `cargo_bin` cannot fall back to an older build left in the persistent lane.
+# A declaration is therefore also a denial: keep a helper declared even when no
+# target builds it. A package's integration tests receive that package's own
+# binaries from Cargo and nextest, so those are neither built nor denied.
 # ---------------------------------------------------------------------------
 
 [helpers.codex]
 package = "codex-cli"
 bin = "codex"
+
+[helpers.codex-app-server]
+package = "codex-app-server"
+bin = "codex-app-server"
 
 [helpers.codex-code-mode-host]
 package = "codex-code-mode-host"
@@ -50,23 +57,28 @@ platform = "windows"
 
 # ---------------------------------------------------------------------------
 # Named targets
+#
+# Target helpers are the upper bound for a caller-filtered `run-target`. In
+# codex-core, only `cli_stream` and `live_cli` launch the `codex` CLI; the
+# `test_codex()` fixture treats it as optional and nothing in the session runtime
+# consumes it. `test_codex()` sessions resolve `codex-code-mode-host` because
+# CodeModeHost is enabled by default.
 # ---------------------------------------------------------------------------
 
 [targets.core_lib]
 package = "codex-core"
 lib = true
 helpers = [
-  "codex",
   "codex-code-mode-host",
   "test_stdio_server",
   "codex-windows-sandbox-setup",
   "codex-command-runner",
 ]
 
-# These modules use pure data or the in-process session fixture. Unknown test
-# modules retain the conservative helper set above. Nextest resolves filters.
-[targets.core_lib.helpers_by_test_prefix]
 # These suites use data-only checks or the in-process session/Code Mode fixture.
+# Unknown test modules retain the conservative helper set above. Nextest
+# resolves caller filters before the helper set is narrowed.
+[targets.core_lib.helpers_by_test_prefix]
 "client::tests::" = []
 "validation_admission::tests::" = []
 "context_manager::history::tests::" = []
@@ -87,6 +99,224 @@ helpers = [
 "session::token_budget::tests::" = []
 "session::token_budget::runtime_tests::" = []
 "tool_history::tests::" = []
+"context::available_skills_instructions::tests::" = []
+# Tool specs, routing, file reads, event conversion, and guidance text; none
+# launches a helper or a sandboxed command.
+"context::multi_agent_mode_instructions::tests::" = []
+"context::task_model_guidance::tests::" = []
+"stream_events_utils::tests::" = []
+"tools::handlers::multi_agents_spec::tests::" = []
+"tools::handlers::read_file::tests::" = []
+"tools::handlers::request_user_input_spec::tests::" = []
+"tools::router::tests::" = []
+
+# Bounded core integration shards. MCP, CLI, and Windows sandbox helpers are
+# added only where the assigned modules need them.
+
+[targets.core_cli_workspace]
+package = "codex-core"
+test = "core_cli_workspace"
+helpers = ["codex", "codex-code-mode-host"]
+
+# Only `cli_stream` and `live_cli` spawn the CLI; they keep the full set above.
+[targets.core_cli_workspace.helpers_by_test_prefix]
+"suite::agents_md::" = ["codex-code-mode-host"]
+"suite::deprecation_notice::" = ["codex-code-mode-host"]
+"suite::remote_env::" = ["codex-code-mode-host"]
+"suite::user_shell_cmd::" = ["codex-code-mode-host"]
+
+[targets.core_code_mode_mcp]
+package = "codex-core"
+test = "core_code_mode_mcp"
+helpers = [
+  "codex-code-mode-host",
+  "test_stdio_server",
+  "test_streamable_http_server",
+]
+
+[targets.core_exec_permissions]
+package = "codex-core"
+test = "core_exec_permissions"
+helpers = [
+  "codex-code-mode-host",
+  "codex-windows-sandbox-setup",
+  "codex-command-runner",
+]
+
+[targets.core_thread_state]
+package = "codex-core"
+test = "core_thread_state"
+helpers = ["codex-code-mode-host"]
+
+[targets.core_transport_telemetry]
+package = "codex-core"
+test = "core_transport_telemetry"
+helpers = ["codex-code-mode-host"]
+
+[targets.core_agents_review]
+package = "codex-core"
+test = "core_agents_review"
+helpers = ["codex-code-mode-host"]
+
+[targets.core_model_prompt_runtime]
+package = "codex-core"
+test = "core_model_prompt_runtime"
+helpers = ["codex-code-mode-host"]
+
+[targets.config_lib]
+package = "codex-config"
+lib = true
+helpers = []
+
+[targets.cli_bin]
+package = "codex-cli"
+bin = "codex"
+helpers = []
+
+[targets.shell_command_lib]
+package = "codex-shell-command"
+lib = true
+helpers = []
+
+[targets.agent_task_store_lib]
+package = "codex-agent-task-store"
+lib = true
+helpers = []
+
+[targets.app_server_protocol_lib]
+package = "codex-app-server-protocol"
+lib = true
+helpers = []
+
+[targets.app_server_schema_fixtures]
+package = "codex-app-server-protocol"
+test = "schema_fixtures"
+helpers = []
+
+[targets.app_server_lib]
+package = "codex-app-server"
+lib = true
+helpers = []
+
+[targets.app_server_initialize]
+package = "codex-app-server"
+test = "all"
+# The app-server binaries come from this package's integration-test build.
+helpers = ["codex-code-mode-host"]
+
+[targets.tui_lib]
+package = "codex-tui"
+lib = true
+# `session_archive_commands` tests spawn the CLI as their app-server subprocess.
+helpers = ["codex"]
+
+# Only `session_archive_commands` resolves a helper binary, so every other test
+# module needs none. The CLI depends on codex-tui, so an unlisted module
+# conservatively rebuilds and relinks it after every TUI edit.
+[targets.tui_lib.helpers_by_test_prefix]
+"additional_dirs::" = []
+"analytics::" = []
+"ansi_escape::" = []
+"app::" = []
+"app_backtrack::" = []
+"app_server_approval_conversions::" = []
+"app_server_session::" = []
+"approval_presets::" = []
+"ascii_animation::" = []
+"bottom_pane::" = []
+"branch_summary::" = []
+"chatwidget::" = []
+"cli::" = []
+"clipboard_copy::" = []
+"clipboard_paste::" = []
+"clock_format::" = []
+"composer_input::" = []
+"config_update::" = []
+"custom_terminal::" = []
+"cwd_prompt::" = []
+"debug_config::" = []
+"diff_render::" = []
+"duration_format::" = []
+"exec_cell::" = []
+"exec_command::" = []
+"external_agent_config_migration::" = []
+"external_agent_config_migration_flow::" = []
+"external_editor::" = []
+"file_search::" = []
+"fuzzy_match::" = []
+"get_git_diff::" = []
+"git_action_directives::" = []
+"goal_display::" = []
+"history_cell::" = []
+"ide_context::" = []
+"insert_history::" = []
+"key_hint::" = []
+"keymap::" = []
+"keymap_setup::" = []
+"line_truncation::" = []
+"live_wrap::" = []
+"local_chatgpt_auth::" = []
+"managed_new_thread_defaults::" = []
+"markdown::" = []
+"markdown_render::" = []
+"markdown_stream::" = []
+"mention_codec::" = []
+"model_migration::" = []
+"motion::" = []
+"multi_agents::" = []
+"notifications::" = []
+"onboarding::" = []
+"oss_selection::" = []
+"pager_overlay::" = []
+"permission_compat::" = []
+"pets::" = []
+"render::" = []
+"resize_reflow_cap::" = []
+"resume_picker::" = []
+"session_log::" = []
+"session_resume::" = []
+"shimmer::" = []
+"slash_command::" = []
+"startup_hooks_review::" = []
+"status::" = []
+"status_indicator_widget::" = []
+"streaming::" = []
+"style::" = []
+"table_detect::" = []
+"terminal_hyperlinks::" = []
+"terminal_palette::" = []
+"terminal_probe::" = []
+"terminal_title::" = []
+"test_backend::" = []
+"tests::" = []
+"text_formatting::" = []
+"theme_picker::" = []
+"token_usage::" = []
+"tooltips::" = []
+"transcript_reflow::" = []
+"tui::" = []
+"update_prompt::" = []
+"updates::" = []
+"updates_cache::" = []
+"width::" = []
+"workspace_command::" = []
+"workspace_messages::" = []
+"wrapping::" = []
+
+[targets.pty_lib]
+package = "codex-utils-pty"
+lib = true
+helpers = []
+
+[targets.windows_sandbox_lib]
+package = "codex-windows-sandbox"
+lib = true
+helpers = []
+
+[targets.windows_command_runner_bin]
+package = "codex-windows-sandbox"
+bin = "codex-command-runner"
+helpers = []
 
 [targets.history_notes_lib]
 package = "codex-history-notes-extension"
@@ -98,86 +328,34 @@ package = "codex-backend-client"
 lib = true
 helpers = []
 
-[targets.available_skills_instructions]
-package = "codex-core"
-test = "available_skills_instructions"
-# Pure rendering checks; this target never builds a `test_codex()` session.
-helpers = []
-
-[targets.responses_headers]
-package = "codex-core"
-test = "responses_headers"
-helpers = ["codex", "codex-code-mode-host"]
-
-[targets.round_trip_batching]
-package = "codex-core"
-test = "round_trip_batching"
-helpers = ["codex", "codex-code-mode-host"]
-
-# Bounded core integration targets. Every shard carries the conservative
-# runtime helper pair; MCP, stdio, and Windows sandbox helpers are added only
-# where the assigned modules need them.
-
-[targets.core_cli_workspace]
-package = "codex-core"
-test = "core_cli_workspace"
-helpers = ["codex", "codex-code-mode-host"]
-
-[targets.core_code_mode_mcp]
-package = "codex-core"
-test = "core_code_mode_mcp"
-helpers = [
-  "codex",
-  "codex-code-mode-host",
-  "test_stdio_server",
-  "test_streamable_http_server",
-]
-
-[targets.core_exec_permissions]
-package = "codex-core"
-test = "core_exec_permissions"
-helpers = [
-  "codex",
-  "codex-code-mode-host",
-  "codex-windows-sandbox-setup",
-  "codex-command-runner",
-]
-
-[targets.core_thread_state]
-package = "codex-core"
-test = "core_thread_state"
-helpers = ["codex", "codex-code-mode-host"]
-
-[targets.core_transport_telemetry]
-package = "codex-core"
-test = "core_transport_telemetry"
-helpers = ["codex", "codex-code-mode-host"]
-
-[targets.core_agents_review]
-package = "codex-core"
-test = "core_agents_review"
-helpers = ["codex", "codex-code-mode-host"]
-
-[targets.core_model_prompt_runtime]
-package = "codex-core"
-test = "core_model_prompt_runtime"
-helpers = ["codex", "codex-code-mode-host"]
-
-[targets.core_windows]
-package = "codex-core"
-test = "core_windows"
-helpers = [
-  "codex",
-  "codex-code-mode-host",
-  "codex-windows-sandbox-setup",
-  "codex-command-runner",
-]
-
-# Configuration crate tests.
-[targets.config_lib]
-package = "codex-config"
+[targets.image_generation_lib]
+package = "codex-image-generation-extension"
 lib = true
 helpers = []
+
+[targets.goal_extension_backend]
+package = "codex-goal-extension"
+test = "goal_extension_backend"
+helpers = []
+
+[targets.goal_accounting]
+package = "codex-goal-extension"
+test = "accounting"
+helpers = []
+
+# ---------------------------------------------------------------------------
+# Named gates
+#
+# Each gate is an ordered list of steps with authoritative exact test IDs.
+# The runner derives exact nextest filters and requires every declared test to
+# report a pass exactly once. No discovery build is needed for normal execution;
+# `check-gates` explicitly verifies discovery without running tests or helpers.
+#
+# Each test ID is owned by one gate; batching gates runs compatible steps in one
+# invocation. Helpers on a step override the target's upper bound only for that
+# fixed proof. An omitted list inherits the target helpers; an explicit empty
+# list is a helper-free proof. Every core_lib step declares its helpers.
+# ---------------------------------------------------------------------------
 
 [gates.sampling-freshness]
 description = "Sampling freshness integration and direct-workspace evidence."
@@ -190,15 +368,6 @@ tests = [
   "session::turn::tests::workspace_evidence_coalesces_mutating_calls_at_generation_boundary",
   "tools::parallel::tests::workspace_evidence_ignores_retired_transaction_state",
 ]
-
-# ---------------------------------------------------------------------------
-# Named gates
-#
-# Each gate is an ordered list of steps with authoritative exact test IDs.
-# The runner derives exact nextest filters and requires every declared test to
-# report PASS exactly once. No discovery build is needed for normal execution;
-# `check-gates` explicitly verifies discovery without running tests or helpers.
-# ---------------------------------------------------------------------------
 
 [gates.core-retry-output]
 description = "Response retry and cancellation-atomic output regressions without unrelated helper builds."
@@ -266,198 +435,20 @@ description = "Streamable HTTP MCP round trips that require test_streamable_http
 
 [[gates.rmcp-streamable-http.steps]]
 target = "core_code_mode_mcp"
+# These round trips start only the streamable HTTP server.
+helpers = ["codex-code-mode-host", "test_streamable_http_server"]
 tests = [
   "suite::rmcp_client::streamable_http_configured_auth_precedes_chatgpt_auth",
   "suite::rmcp_client::streamable_http_tool_call_round_trip",
   "suite::rmcp_client::streamable_http_with_oauth_round_trip",
 ]
 
-
-# Capability checks reuse exact gates. Helpers on a step override the target's
-# conservative defaults only for that fixed proof. An omitted list inherits
-# the defaults; an explicit empty list is a library-only proof.
-[helpers.codex-app-server]
-package = "codex-app-server"
-bin = "codex-app-server"
-
-[targets.shell_command_lib]
-package = "codex-shell-command"
-lib = true
-helpers = []
-
-[targets.app_server_initialize]
-package = "codex-app-server"
-test = "all"
-helpers = ["codex-app-server", "codex-code-mode-host"]
-
-[targets.cli_bin]
-package = "codex-cli"
-bin = "codex"
-helpers = []
-
-[targets.agent_task_store_lib]
-package = "codex-agent-task-store"
-lib = true
-helpers = []
-
-[gates.capability-structured-command-execution]
-description = "Script and argv command shapes with untagged legacy compatibility; explicitly tagged legacy input is rejected."
-[[gates.capability-structured-command-execution.steps]]
-target = "core_lib"
-# Parser contract plus both handler boundaries: shell argv exec params and exec_command decoding.
-tests = [
-  "tools::handlers::command_shape::command_shape_tests::tagged_script_is_canonical_and_tagged_legacy_is_rejected",
-  "tools::handlers::shell::tests::shell_command_handler_preserves_structured_argv_shape",
-  "tools::handlers::unified_exec::tests::exec_command_boundary_normalizes_unambiguous_legacy_forms",
-]
-helpers = []
-
-[gates.capability-command-preflight]
-description = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
-[[gates.capability-command-preflight.steps]]
-target = "core_lib"
-# The off-state test proves the declared features.kd4_runtime switch controls preflight.
-tests = [
-  "tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos",
-  "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
-]
-helpers = []
-
-[gates.capability-kd4-turn-execution]
-description = "Required continuation survives successful validation and repeated actions while preserving configured effort."
-[[gates.capability-kd4-turn-execution.steps]]
-target = "core_lib"
-helpers = []
-tests = [
-    "session::turn_execution::tests::protocol_continuation_preserves_sampling_without_new_tool_or_state_evidence",
-    "session::turn::tests::protocol_continuation_runs_required_work_without_new_input",
-    "session::turn::tests::passing_focused_validation_keeps_the_second_change_executable",
-    "session::turn::tests::repeated_failed_read_preserves_a_different_required_action",
-    "session::turn::tests::legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not",
-    "tools::handlers::multi_agents::tests::kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents",
-]
-[[gates.capability-kd4-turn-execution.steps]]
-target = "core_transport_telemetry"
-tests = [
-    "suite::client::configured_effort_survives_tools_and_followup",
-    "suite::client::initial_turn_preserves_configured_reasoning_effort",
-    "suite::client::initial_turn_uses_model_default_reasoning_effort",
-]
-
-[gates.kd4-runtime-controls]
-description = "KD4 runtime preflight and child inheritance."
-[[gates.kd4-runtime-controls.steps]]
-target = "core_lib"
-tests = [
-  "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
-  "tools::handlers::multi_agents::tests::kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents",
-]
-helpers = []
-
-[gates.capability-known-delta-store]
-description = "Known delta reuse preserves force-fresh command execution."
-[[gates.capability-known-delta-store.steps]]
-target = "core_lib"
-# The fixture runs git directly and uses in-process code mode.
-helpers = []
-tests = ["tools::handlers::unified_exec::tests::known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches"]
-
-[gates.capability-deferred-executor]
-description = "Deferred executor readiness updates live context and tools."
-[[gates.capability-deferred-executor.steps]]
-target = "core_cli_workspace"
-tests = [
-  "suite::remote_env::deferred_executor_updates_context_and_tools_after_startup",
-  "suite::remote_env::deferred_executor_updates_context_and_tools_after_startup_with_inferred_environment",
-]
-
-[gates.capability-code-mode-runtime]
-description = "Code mode executes a native command and delivers its output."
-[[gates.capability-code-mode-runtime.steps]]
-target = "core_code_mode_mcp"
-tests = ["suite::code_mode::code_mode_can_return_exec_command_output"]
-
-[gates.capability-shell-output-summary]
-description = "Bounded failure-focused output on classic and unified execution paths."
-[[gates.capability-shell-output-summary.steps]]
-target = "core_lib"
-# The context test proves exec tool output reaches the model through the summarizer.
-tests = [
-  "tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines",
-  "tools::context::tests::exec_command_tool_output_summarizes_and_links_retained_raw_output",
-]
-helpers = []
-
-[gates.capability-command-attempt-ledger]
-description = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
-[[gates.capability-command-attempt-ledger.steps]]
-target = "core_lib"
-tests = ["tools::command_execution::tests::input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses"]
-helpers = []
-
-[gates.capability-command-output-artifacts]
-description = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
-[[gates.capability-command-output-artifacts.steps]]
-target = "core_lib"
-tests = [
-  "tools::handlers::unified_exec::tests::foreground_output_artifact_retains_bytes_beyond_transcript_cap",
-  "tools::handlers::unified_exec::tests::kd4_latency_unpolled_background_failure_retires_live_metadata",
-]
-# The fixtures run Python directly and use in-process code mode.
-helpers = []
-
-[gates.capability-preferred-powershell-host]
-description = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
-[[gates.capability-preferred-powershell-host.steps]]
-target = "shell_command_lib"
-tests = [
-  "shell_detect::tests::explicit_powershell_host_overrides_preference_order",
-  "shell_detect::tests::powershell_resolver_prefers_pwsh_then_compatibility_host",
-]
-helpers = []
-
-[gates.capability-app-server-runtime-provenance]
-description = "Build, install, runtime, and KD4 watermark metadata at initialization."
-[[gates.capability-app-server-runtime-provenance.steps]]
-target = "app_server_initialize"
-tests = ["suite::v2::initialize::initialize_response_includes_local_runtime_metadata"]
-helpers = ["codex-app-server", "codex-code-mode-host"]
-
-[gates.capability-tool-search-routing]
-description = "Cached and diversified discovery of deferred core and extension tools."
-[[gates.capability-tool-search-routing.steps]]
-target = "core_lib"
-tests = ["tools::spec_plan::tests::tool_search_cache_rebuilds_when_deferred_sources_change"]
-helpers = []
-
-[gates.capability-config-explain]
-description = "Human-readable configuration reference exposed through codex config explain."
-[[gates.capability-config-explain.steps]]
-target = "cli_bin"
-tests = ["tests::config_explain_parses_optional_filter"]
-helpers = []
-# Parsing alone is syntax; the rendered, filtered reference is the behavior.
-[[gates.capability-config-explain.steps]]
-target = "config_lib"
-tests = ["config_explain::tests::filters_config_reference_by_option_name"]
-helpers = []
-
-[gates.capability-shared-worktree-reliability]
-description = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
-[[gates.capability-shared-worktree-reliability.steps]]
-target = "agent_task_store_lib"
-tests = ["tests::completed_receipt_rejects_workspace_change_after_validation"]
-helpers = []
-# Core shell and unified-exec events must record mutation evidence in the store.
-[[gates.capability-shared-worktree-reliability.steps]]
-target = "core_lib"
-tests = ["tools::events::tests::shell_and_unified_exec_finalize_typed_mutation_evidence"]
-helpers = []
-
 [gates.search-scope-regressions]
 description = "Ripgrep argument roles, executable aliases, dependency evidence, and bounded observation latency."
+
 [[gates.search-scope-regressions.steps]]
 target = "core_lib"
+helpers = []
 tests = [
   "tools::handlers::command_preflight::command_preflight_tests::rg_argument_roles_preserve_flag_like_patterns_and_dependencies",
   "tools::handlers::command_preflight::command_preflight_tests::rg_supported_executables_share_scope_and_dependency_classification",
@@ -468,35 +459,72 @@ tests = [
   "tools::handlers::command_search::deadline_tests::slow_scope_observation_releases_the_request_and_discards_late_evidence",
   "tools::command_execution::tests::rg_pattern_file_changes_invalidate_cached_misses",
 ]
-helpers = []
 
-[targets.app_server_protocol_lib]
-package = "codex-app-server-protocol"
-lib = true
-helpers = []
+[gates.verified-findings-followup]
+description = "Focused regressions for reviewed catalog, watch, history, schema, and output findings."
 
-[targets.app_server_lib]
-package = "codex-app-server"
-lib = true
+[[gates.verified-findings-followup.steps]]
+target = "core_lib"
 helpers = []
-
-[targets.image_generation_lib]
-package = "codex-image-generation-extension"
-lib = true
-helpers = []
+tests = [
+  "tools::shell_output_summary::tests::small_output_is_unchanged",
+  "tools::shell_output_summary::tests::oversized_diagnostic_and_distinct_middle_failure_preserve_final_status",
+  "tools::shell_output_summary::tests::unretained_distinct_diagnostics_are_counted",
+  "tools::shell_output_summary::tests::ordinary_try_prose_does_not_displace_diagnostics",
+  "tools::shell_output_summary::tests::oversized_first_line_reserves_room_for_the_tail",
+  "tools::shell_output_summary::tests::summary_reports_gap_sizes_and_source_line_counts",
+  "tools::shell_output_summary::tests::summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit",
+  "tools::shell_output_summary::tests::source_prose_about_passed_does_not_displace_test_status",
+  "tools::shell_output_summary::tests::incidental_words_do_not_displace_validation_status_or_warnings",
+  "tools::shell_output_summary::tests::selected_errors_do_not_spend_the_final_status_quota",
+  "tools::shell_output_summary::tests::large_success_output_keeps_head_tail_and_warning_lines",
+  "tools::shell_output_summary::tests::large_success_output_preserves_source_order",
+  "tools::shell_output_summary::tests::critical_error_survives_earlier_warning_flood",
+  "tools::shell_output_summary::tests::benign_keywords_do_not_hide_the_first_real_error",
+  "tools::shell_output_summary::tests::over_truncation_failure_focus_keeps_late_root_cause_after_early_error_flood",
+  "tools::shell_output_summary::tests::validation_output_keeps_failure_status_and_tail",
+  "tools::shell_output_summary::tests::early_failed_suite_survives_later_passing_suites",
+  "tools::shell_output_summary::tests::validation_output_keeps_the_authoritative_final_status",
+  "tools::shell_output_summary::tests::nextest_failures_and_summary_survive_a_passing_test_flood",
+  "tools::shell_output_summary::tests::passing_validation_retains_status_with_a_short_tail",
+  "tools::shell_output_summary::tests::applied_budget_summarizes_output_below_the_default_threshold",
+  "tools::shell_output_summary::tests::disabled_summarizer_returns_unchanged_signal",
+  "tools::shell_output_summary::tests::oversized_single_line_retains_bounded_head_and_tail",
+  "tools::shell_output_summary::tests::tiny_single_line_budget_stops_before_split_utf8_character",
+  "tools::shell_output_summary::tests::validation_summary_keeps_typescript_and_npm_errors_outside_tail",
+  "tools::shell_output_summary::tests::summary_declines_output_that_would_grow",
+  "tools::shell_output_summary::optimization_tests::selection_storage_is_bounded_for_large_logs",
+  "tools::shell_output_summary::optimization_tests::line_classification_is_case_insensitive_without_retained_scratch",
+  "tools::shell_output_summary::optimization_tests::selection_flags_emit_each_index_once_in_source_order",
+  "context_manager::history::tests::prepared_prompt_truncation_releases_large_discarded_storage",
+  "context_manager::history::tests::tool_search_acknowledgement_preserves_full_schema_bytes",
+  "context_manager::history::tests::idless_token_estimates_are_cached_and_invalidated_on_rewrite",
+  "context_manager::history::tests::prepared_token_estimates_cache_existing_items_and_only_measure_appends",
+  "context_manager::history::tests::total_token_usage_caches_raw_items_without_reusing_projected_estimates",
+  "context_manager::history::tests::prompt_projections_share_primary_storage_during_runtime_append",
+  "context_manager::history::tests::prepared_prompt_index_uses_materialized_items_and_respects_truncation",
+  "context_manager::history::tests::prepared_prompt_index_walks_deep_unmaterialized_chains",
+  "tools::handlers::tool_search::tests::exact_name_search_recovers_a_definition_that_exceeds_the_result_budget",
+  "tools::handlers::tool_search::tests::audit_tool_search_contract_compaction_preserves_strictness_and_output_schema",
+  "tools::handlers::tool_search::tests::token_backfire_oversized_exact_match_stays_activatable",
+  "git_workspace::tests::source_path_batch_establishes_one_watch_and_preserves_path_scopes",
+  "git_workspace::tests::source_path_observation_ignores_unrelated_changes_and_fails_open",
+  "git_workspace::tests::recursive_source_path_observation_detects_descendant_changes",
+  "session::step_context::snapshot_deadline_tests::unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools",
+  "session::step_context::snapshot_deadline_tests::stable_catalog_keeps_its_identity_and_resource_capability",
+]
 
 [gates.attached-image-runtime-reliability]
 description = "Verified image/runtime report regressions: retries, interruption, context admission, and goal finalization."
 
 [[gates.attached-image-runtime-reliability.steps]]
 target = "core_lib"
+helpers = []
 tests = [
   "session::step_context::snapshot_deadline_tests::retry_attempt_replaces_sealed_evidence_but_preserves_capabilities",
   "tasks::tests::targeted_interrupt_leaves_successor_running_and_settles_missing_target",
-  "tools::parallel::tests::audit_reports_17_19_direct_and_nested_validation_capture_revision",
   "tools::parallel::tests::audit_reports_17_19_baselines_are_independent_by_workspace",
 ]
-helpers = []
 
 [[gates.attached-image-runtime-reliability.steps]]
 target = "app_server_lib"
@@ -510,45 +538,190 @@ tests = [
   "request_processors::thread_goal_processor::resume_finalization_tests::healthy_snapshot_precedes_continuation",
   "message_processor::message_processor_tracing_tests::interrupt_request_cancellation_releases_reservation_before_terminal",
 ]
+
+[gates.audit-docs-26-30-integration]
+description = "Failure continuation, restored-tool quarantine, and single review projection."
+
+# These `test_codex()` sessions run with the Windows sandbox disabled.
+[[gates.audit-docs-26-30-integration.steps]]
+target = "core_exec_permissions"
+helpers = ["codex-code-mode-host"]
+tests = ["suite::unified_exec::exec_command_fast_success_and_failure_lifecycles_finish_inline"]
+
+[[gates.audit-docs-26-30-integration.steps]]
+target = "core_thread_state"
+tests = ["suite::sqlite_state::resume_quarantines_invalid_dynamic_tools_from_rollout"]
+
+[[gates.audit-docs-26-30-integration.steps]]
+target = "core_agents_review"
+tests = [
+  "suite::review::review_history_surfaces_in_parent_session",
+  "suite::review::review_op_emits_lifecycle_and_review_output",
+]
+
+# Capability gates are the runtime proofs named by `kd4_features.toml`.
+
+[gates.capability-structured-command-execution]
+description = "Script and argv command shapes with untagged legacy compatibility; explicitly tagged legacy input is rejected."
+
+[[gates.capability-structured-command-execution.steps]]
+target = "core_lib"
 helpers = []
+# Parser contract plus both handler boundaries: shell argv exec params and exec_command decoding.
+tests = [
+  "tools::handlers::command_shape::command_shape_tests::tagged_script_is_canonical_and_tagged_legacy_is_rejected",
+  "tools::handlers::shell::tests::shell_command_handler_preserves_structured_argv_shape",
+  "tools::handlers::unified_exec::tests::exec_command_boundary_normalizes_unambiguous_legacy_forms",
+]
 
-[targets.app_server_schema_fixtures]
-package = "codex-app-server-protocol"
-test = "schema_fixtures"
+[gates.capability-command-preflight]
+description = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
+
+[[gates.capability-command-preflight.steps]]
+target = "core_lib"
 helpers = []
+# The off-state test proves the declared features.kd4_runtime switch controls preflight.
+tests = [
+  "tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos",
+  "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
+]
 
-[targets.tui_lib]
-package = "codex-tui"
-lib = true
-# `session_archive_commands` tests spawn the CLI as their app-server subprocess.
-helpers = ["codex"]
+[gates.capability-kd4-turn-execution]
+description = "Required continuation survives successful validation and repeated actions while preserving configured effort."
 
-# Only `session_archive_commands` resolves a helper binary; these modules hold
-# most of the suite and need none.
-[targets.tui_lib.helpers_by_test_prefix]
-"chatwidget::" = []
-"bottom_pane::" = []
-"app::" = []
-"analytics::" = []
-"history_cell::" = []
-"markdown_render::" = []
-"resume_picker::" = []
-"keymap::" = []
-
-[targets.pty_lib]
-package = "codex-utils-pty"
-lib = true
+[[gates.capability-kd4-turn-execution.steps]]
+target = "core_lib"
 helpers = []
+tests = [
+  "session::turn_execution::tests::protocol_continuation_preserves_sampling_without_new_tool_or_state_evidence",
+  "session::turn::tests::protocol_continuation_runs_required_work_without_new_input",
+  "session::turn::tests::passing_focused_validation_keeps_the_second_change_executable",
+  "session::turn::tests::repeated_failed_read_preserves_a_different_required_action",
+  "session::turn::tests::legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not",
+  "tools::handlers::multi_agents::tests::kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents",
+]
 
-[targets.windows_sandbox_lib]
-package = "codex-windows-sandbox"
-lib = true
-helpers = []
+[[gates.capability-kd4-turn-execution.steps]]
+target = "core_transport_telemetry"
+tests = [
+  "suite::client::configured_effort_survives_tools_and_followup",
+  "suite::client::initial_turn_preserves_configured_reasoning_effort",
+  "suite::client::initial_turn_uses_model_default_reasoning_effort",
+]
 
-[targets.windows_command_runner_bin]
-package = "codex-windows-sandbox"
-bin = "codex-command-runner"
+[gates.capability-known-delta-store]
+description = "Known delta reuse preserves force-fresh command execution."
+
+[[gates.capability-known-delta-store.steps]]
+target = "core_lib"
+# The fixture runs git directly and uses in-process code mode.
 helpers = []
+tests = ["tools::handlers::unified_exec::tests::known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches"]
+
+[gates.capability-deferred-executor]
+description = "Deferred executor readiness updates live context and tools."
+
+[[gates.capability-deferred-executor.steps]]
+target = "core_cli_workspace"
+# Remote environment sessions never launch the CLI.
+helpers = ["codex-code-mode-host"]
+tests = [
+  "suite::remote_env::deferred_executor_updates_context_and_tools_after_startup",
+  "suite::remote_env::deferred_executor_updates_context_and_tools_after_startup_with_inferred_environment",
+]
+
+[gates.capability-code-mode-runtime]
+description = "Code mode executes a native command and delivers its output."
+
+[[gates.capability-code-mode-runtime.steps]]
+target = "core_code_mode_mcp"
+# This turn configures no MCP server.
+helpers = ["codex-code-mode-host"]
+tests = ["suite::code_mode::code_mode_can_return_exec_command_output"]
+
+[gates.capability-shell-output-summary]
+description = "Bounded failure-focused output on classic and unified execution paths."
+
+[[gates.capability-shell-output-summary.steps]]
+target = "core_lib"
+helpers = []
+# The context test proves exec tool output reaches the model through the summarizer.
+tests = [
+  "tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines",
+  "tools::context::tests::exec_command_tool_output_summarizes_and_links_retained_raw_output",
+]
+
+[gates.capability-command-attempt-ledger]
+description = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
+
+[[gates.capability-command-attempt-ledger.steps]]
+target = "core_lib"
+helpers = []
+tests = ["tools::command_execution::tests::input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses"]
+
+[gates.capability-command-output-artifacts]
+description = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
+
+[[gates.capability-command-output-artifacts.steps]]
+target = "core_lib"
+# The fixtures run Python directly and use in-process code mode.
+helpers = []
+tests = [
+  "tools::handlers::unified_exec::tests::foreground_output_artifact_retains_bytes_beyond_transcript_cap",
+  "tools::handlers::unified_exec::tests::kd4_latency_unpolled_background_failure_retires_live_metadata",
+]
+
+[gates.capability-preferred-powershell-host]
+description = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
+
+[[gates.capability-preferred-powershell-host.steps]]
+target = "shell_command_lib"
+tests = [
+  "shell_detect::tests::explicit_powershell_host_overrides_preference_order",
+  "shell_detect::tests::powershell_resolver_prefers_pwsh_then_compatibility_host",
+]
+
+[gates.capability-app-server-runtime-provenance]
+description = "Build, install, runtime, and KD4 watermark metadata at initialization."
+
+[[gates.capability-app-server-runtime-provenance.steps]]
+target = "app_server_initialize"
+tests = ["suite::v2::initialize::initialize_response_includes_local_runtime_metadata"]
+
+[gates.capability-tool-search-routing]
+description = "Cached and diversified discovery of deferred core and extension tools."
+
+[[gates.capability-tool-search-routing.steps]]
+target = "core_lib"
+helpers = []
+tests = ["tools::spec_plan::tests::tool_search_cache_rebuilds_when_deferred_sources_change"]
+
+[gates.capability-config-explain]
+description = "Human-readable configuration reference exposed through codex config explain."
+
+[[gates.capability-config-explain.steps]]
+target = "cli_bin"
+tests = ["tests::config_explain_parses_optional_filter"]
+
+# Parsing alone is syntax; the rendered, filtered reference is the behavior.
+[[gates.capability-config-explain.steps]]
+target = "config_lib"
+tests = ["config_explain::tests::filters_config_reference_by_option_name"]
+
+[gates.capability-shared-worktree-reliability]
+description = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
+
+[[gates.capability-shared-worktree-reliability.steps]]
+target = "agent_task_store_lib"
+tests = ["tests::completed_receipt_rejects_workspace_change_after_validation"]
+
+# Core shell and unified-exec events must record mutation evidence in the store.
+[[gates.capability-shared-worktree-reliability.steps]]
+target = "core_lib"
+helpers = []
+tests = ["tools::events::tests::shell_and_unified_exec_finalize_typed_mutation_evidence"]
+
+# Recipe gates are invoked by the matching root justfile recipes.
 
 [gates.app-server-command-exec]
 description = "Exact test contract for the app-server-command-exec recipe."
@@ -562,24 +735,18 @@ tests = [
 
 [[gates.app-server-command-exec.steps]]
 target = "app_server_initialize"
-tests = [
-  "suite::v2::command_exec::command_exec_non_streaming_respects_output_cap",
-]
+tests = ["suite::v2::command_exec::command_exec_non_streaming_respects_output_cap"]
 
 [gates.app-server-process-exec]
 description = "Exact test contract for the app-server-process-exec recipe."
 
 [[gates.app-server-process-exec.steps]]
 target = "app_server_protocol_lib"
-tests = [
-  "protocol::v2::tests::process_notifications_round_trip",
-]
+tests = ["protocol::v2::tests::process_notifications_round_trip"]
 
 [[gates.app-server-process-exec.steps]]
 target = "app_server_initialize"
-tests = [
-  "suite::v2::process_exec::process_spawn_reports_buffered_output_cap_reached",
-]
+tests = ["suite::v2::process_exec::process_spawn_reports_buffered_output_cap_reached"]
 
 [gates.app-server-thread-status]
 description = "Exact test contract for the app-server-thread-status recipe."
@@ -616,9 +783,7 @@ tests = [
 
 [[gates.windows-process.steps]]
 target = "windows_sandbox_lib"
-tests = [
-  "windows_impl::tests::process_wait_failure_is_not_treated_as_exit",
-]
+tests = ["windows_impl::tests::process_wait_failure_is_not_treated_as_exit"]
 
 [[gates.windows-process.steps]]
 target = "windows_command_runner_bin"
@@ -733,87 +898,3 @@ tests = [
   "resume_picker::tests::esc_with_empty_query_starts_fresh",
   "resume_picker::tests::esc_with_query_clears_search_and_preserves_selected_result",
 ]
-
-[gates.verified-findings-followup]
-description = "Focused regressions for reviewed catalog, watch, history, schema, and output findings."
-[[gates.verified-findings-followup.steps]]
-target = "core_lib"
-helpers = []
-tests = [
-  "tools::shell_output_summary::tests::small_output_is_unchanged",
-  "tools::shell_output_summary::tests::oversized_diagnostic_and_distinct_middle_failure_preserve_final_status",
-  "tools::shell_output_summary::tests::unretained_distinct_diagnostics_are_counted",
-  "tools::shell_output_summary::tests::ordinary_try_prose_does_not_displace_diagnostics",
-  "tools::shell_output_summary::tests::oversized_first_line_reserves_room_for_the_tail",
-  "tools::shell_output_summary::tests::summary_reports_gap_sizes_and_source_line_counts",
-  "tools::shell_output_summary::tests::summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit",
-  "tools::shell_output_summary::tests::source_prose_about_passed_does_not_displace_test_status",
-  "tools::shell_output_summary::tests::incidental_words_do_not_displace_validation_status_or_warnings",
-  "tools::shell_output_summary::tests::selected_errors_do_not_spend_the_final_status_quota",
-  "tools::shell_output_summary::tests::large_success_output_keeps_head_tail_and_warning_lines",
-  "tools::shell_output_summary::tests::large_success_output_preserves_source_order",
-  "tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines",
-  "tools::shell_output_summary::tests::critical_error_survives_earlier_warning_flood",
-  "tools::shell_output_summary::tests::benign_keywords_do_not_hide_the_first_real_error",
-  "tools::shell_output_summary::tests::over_truncation_failure_focus_keeps_late_root_cause_after_early_error_flood",
-  "tools::shell_output_summary::tests::validation_output_keeps_failure_status_and_tail",
-  "tools::shell_output_summary::tests::early_failed_suite_survives_later_passing_suites",
-  "tools::shell_output_summary::tests::validation_output_keeps_the_authoritative_final_status",
-  "tools::shell_output_summary::tests::nextest_failures_and_summary_survive_a_passing_test_flood",
-  "tools::shell_output_summary::tests::passing_validation_retains_status_with_a_short_tail",
-  "tools::shell_output_summary::tests::applied_budget_summarizes_output_below_the_default_threshold",
-  "tools::shell_output_summary::tests::disabled_summarizer_returns_unchanged_signal",
-  "tools::shell_output_summary::tests::oversized_single_line_retains_bounded_head_and_tail",
-  "tools::shell_output_summary::tests::tiny_single_line_budget_stops_before_split_utf8_character",
-  "tools::shell_output_summary::tests::validation_summary_keeps_typescript_and_npm_errors_outside_tail",
-  "tools::shell_output_summary::tests::summary_declines_output_that_would_grow",
-  "tools::shell_output_summary::optimization_tests::selection_storage_is_bounded_for_large_logs",
-  "tools::shell_output_summary::optimization_tests::line_classification_is_case_insensitive_without_retained_scratch",
-  "tools::shell_output_summary::optimization_tests::selection_flags_emit_each_index_once_in_source_order",
-  "context_manager::history::tests::prepared_prompt_truncation_releases_large_discarded_storage",
-  "context_manager::history::tests::tool_search_acknowledgement_preserves_full_schema_bytes",
-  "context_manager::history::tests::idless_token_estimates_are_cached_and_invalidated_on_rewrite",
-  "context_manager::history::tests::prepared_token_estimates_cache_existing_items_and_only_measure_appends",
-  "context_manager::history::tests::total_token_usage_caches_raw_items_without_reusing_projected_estimates",
-  "context_manager::history::tests::prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append",
-  "context_manager::history::tests::prepared_prompt_index_uses_materialized_items_and_respects_truncation",
-  "context_manager::history::tests::prepared_prompt_index_walks_deep_unmaterialized_chains",
-  "tools::handlers::tool_search::tests::exact_name_search_recovers_a_definition_that_exceeds_the_result_budget",
-  "tools::handlers::tool_search::tests::audit_tool_search_contract_compaction_preserves_strictness_and_output_schema",
-  "tools::handlers::tool_search::tests::token_backfire_oversized_exact_match_stays_activatable",
-  "git_workspace::tests::source_path_batch_establishes_one_watch_and_preserves_path_scopes",
-  "git_workspace::tests::source_path_observation_ignores_unrelated_changes_and_fails_open",
-  "git_workspace::tests::recursive_source_path_observation_detects_descendant_changes",
-  "session::step_context::snapshot_deadline_tests::unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools",
-  "session::step_context::snapshot_deadline_tests::stable_catalog_keeps_its_identity_and_resource_capability",
-]
-
-# Audit unit regressions use in-process fixtures and no child CLI helpers.
-[targets.audit_docs_26_30_lib]
-package = "codex-core"
-lib = true
-helpers = []
-
-[gates.audit-docs-26-30-integration]
-description = "Failure continuation, restored-tool quarantine, and single review projection."
-# These tests build `test_codex()` sessions, which resolve codex-code-mode-host
-# (CodeModeHost is on by default); keep each shard's declared helpers.
-[[gates.audit-docs-26-30-integration.steps]]
-target = "core_exec_permissions"
-tests = ["suite::unified_exec::exec_command_fast_success_and_failure_lifecycles_finish_inline"]
-[[gates.audit-docs-26-30-integration.steps]]
-target = "core_thread_state"
-tests = ["suite::sqlite_state::resume_quarantines_invalid_dynamic_tools_from_rollout"]
-[[gates.audit-docs-26-30-integration.steps]]
-target = "core_agents_review"
-tests = ["suite::review::review_history_surfaces_in_parent_session", "suite::review::review_op_emits_lifecycle_and_review_output"]
-
-[targets.goal_extension_backend]
-package = "codex-goal-extension"
-test = "goal_extension_backend"
-helpers = []
-
-[targets.goal_accounting]
-package = "codex-goal-extension"
-test = "accounting"
-helpers = []

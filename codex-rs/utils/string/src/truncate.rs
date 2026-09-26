@@ -18,37 +18,62 @@ pub fn truncate_middle_with_token_budget(s: &str, max_tokens: usize) -> (String,
     }
 
     let total_token_count = approx_token_count(s);
+    let total_tokens = u64::try_from(total_token_count).unwrap_or(u64::MAX);
     if max_tokens == 0 {
-        let total_tokens = u64::try_from(total_token_count).unwrap_or(u64::MAX);
         return (String::new(), Some(total_tokens));
     }
     if total_token_count <= max_tokens {
         return (s.to_string(), None);
     }
 
-    let proportional_bytes = if total_token_count == 0 {
-        0
-    } else {
-        s.len()
-            .saturating_mul(max_tokens)
-            .checked_div(total_token_count)
-            .unwrap_or(0)
+    // The marker's cost does not scale with retained content, so reserve it
+    // before sizing the retained ends from the input's average density. A count
+    // derived from the whole input bounds the marker actually emitted.
+    let marker_tokens = approx_token_count(&format_truncation_marker(
+        /*use_tokens*/ true,
+        approx_tokens_from_byte_count(s.len()),
+    ));
+    let content_tokens = max_tokens.saturating_sub(marker_tokens);
+    // Scale by the retained ends' observed density, which can differ from the
+    // input average in either direction.
+    let rescale = |bytes: usize, tokens: usize| {
+        bytes.saturating_mul(content_tokens) / tokens.saturating_sub(marker_tokens).max(1)
     };
-    let mut content_bytes = proportional_bytes.min(approx_bytes_for_tokens(max_tokens));
-    let total_tokens = u64::try_from(total_token_count).unwrap_or(u64::MAX);
-    loop {
+    let mut content_bytes = (s.len().saturating_mul(content_tokens) / total_token_count)
+        .min(approx_bytes_for_tokens(content_tokens));
+    let mut underfilled: Option<(usize, String)> = None;
+    for attempt in 0usize.. {
         let truncated = truncate_with_byte_estimate(s, content_bytes, /*use_tokens*/ true);
-        if approx_token_count(&truncated) <= max_tokens {
-            return (truncated, Some(total_tokens));
+        let tokens = approx_token_count(&truncated);
+        if tokens <= max_tokens {
+            // Ends sparser than the average leave budget unused. Retry once from
+            // the rescaled size, keeping this fit in case the retry retains less.
+            let grown = rescale(content_bytes, tokens).min(s.len() - 1);
+            if attempt == 0 && grown > content_bytes {
+                underfilled = Some((content_bytes, truncated));
+                content_bytes = grown;
+                continue;
+            }
+            return match underfilled {
+                Some((fit_bytes, fit)) if fit_bytes >= content_bytes => (fit, Some(total_tokens)),
+                _ => (truncated, Some(total_tokens)),
+            };
         }
         if content_bytes == 0 {
-            return (String::new(), Some(total_tokens));
+            break;
         }
-        // Geometric reduction bounds retries even when the retained ends are
-        // much denser than the middle. Verify each candidate: the estimate is
-        // not necessarily monotonic as UTF-8 boundaries and marker digits change.
-        content_bytes -= content_bytes.div_ceil(4);
+        // Verify each candidate: the estimate is not necessarily monotonic as
+        // UTF-8 boundaries and marker digits change, so after a few precise
+        // attempts guarantee geometric progress.
+        let minimum_step = if attempt < 3 {
+            1
+        } else {
+            content_bytes.div_ceil(8)
+        };
+        content_bytes = rescale(content_bytes, tokens).min(content_bytes - minimum_step);
     }
+    let fit = underfilled.map_or_else(String::new, |(_, fit)| fit);
+    (fit, Some(total_tokens))
 }
 
 fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> String {

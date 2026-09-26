@@ -130,25 +130,28 @@ impl ModelsCacheManager {
                 expected_version,
             "models cache: attempting load_fresh"
         );
-        let Some(cache) = self.load(Some(expected_version)).await? else {
+        let Some(contents) = self.read_contents().await? else {
             return Ok(None);
         };
+        // Older caches can contain model shapes that no longer decode. Reject
+        // unusable entries from their metadata before decoding any model.
+        let header = ModelsCacheHeader::parse(&contents)?;
         info!(
             cache_path = %self.cache_path.display(),
-            cached_version = ?cache.client_version,
-            fetched_at = %cache.fetched_at,
+            cached_version = ?header.client_version,
+            fetched_at = ?header.fetched_at,
             "models cache: loaded cache file"
         );
-        if cache.client_version.as_deref() != Some(expected_version) {
+        if header.client_version.as_deref() != Some(expected_version) {
             info!(
                 cache_path = %self.cache_path.display(),
                 expected_version,
-                cached_version = ?cache.client_version,
+                cached_version = ?header.client_version,
                 "models cache: cache version mismatch"
             );
             return Ok(None);
         }
-        if cache.provider_cache_identity.as_deref() != Some(expected_identity) {
+        if header.provider_cache_identity.as_deref() != Some(expected_identity) {
             info!(
                 cache_path = %self.cache_path.display(),
                 mismatch_category = "provider_cache_identity",
@@ -156,15 +159,16 @@ impl ModelsCacheManager {
             );
             return Ok(None);
         }
-        if !cache.is_fresh(self.cache_ttl) {
+        if !header.is_fresh(self.cache_ttl) {
             info!(
                 cache_path = %self.cache_path.display(),
                 cache_ttl_secs = self.cache_ttl.as_secs(),
-                fetched_at = %cache.fetched_at,
+                fetched_at = ?header.fetched_at,
                 "models cache: cache is stale"
             );
             return Ok(None);
         }
+        let cache = decode_cache(&contents)?;
         info!(
             cache_path = %self.cache_path.display(),
             cache_ttl_secs = self.cache_ttl.as_secs(),
@@ -303,7 +307,7 @@ impl ModelsCacheManager {
         true
     }
 
-    /// Renew the cache TTL by updating the fetched_at timestamp to now.
+    /// Renew the cache TTL once more than half of it has elapsed.
     #[cfg(test)]
     pub(crate) async fn renew_cache_ttl(
         &self,
@@ -349,24 +353,30 @@ impl ModelsCacheManager {
             ));
         }
         let contents = fs::read(&self.cache_path).await?;
-        let mut cache: ModelsCache = serde_json::from_slice(&contents)
-            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-        let current_basis = cache.write_basis(contents);
+        let header = ModelsCacheHeader::parse(&contents)?;
+        let current_basis = header.write_basis(&contents);
         if &current_basis != expected_basis {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "cache revision changed before TTL renewal",
             ));
         }
-        if cache.client_version.as_deref() != Some(expected_version)
-            || cache.provider_cache_identity.as_deref() != Some(expected_identity)
-            || cache.etag.as_deref() != Some(expected_etag)
+        if header.client_version.as_deref() != Some(expected_version)
+            || header.provider_cache_identity.as_deref() != Some(expected_identity)
+            || header.etag.as_deref() != Some(expected_etag)
         {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "cache belongs to a different client, provider/auth scope, or ETag identity",
             ));
         }
+        // Model responses revalidate the ETag on every request. Rewriting the whole
+        // cache for each would cost a durable write per response without extending
+        // its useful life, so renew only once more than half the TTL has elapsed.
+        if header.age().is_some_and(|age| age < self.cache_ttl / 2) {
+            return Ok(());
+        }
+        let mut cache = decode_cache(&contents)?;
         cache.fetched_at = Utc::now();
         cache.revision = Some(next_revision(&current_basis.disk_revision));
         if !self.identity_is_current(expected_identity) {
@@ -378,47 +388,33 @@ impl ModelsCacheManager {
         self.save_internal(&cache, _file_lock).await
     }
 
-    async fn load(&self, expected_version: Option<&str>) -> io::Result<Option<ModelsCache>> {
+    async fn read_contents(&self) -> io::Result<Option<Vec<u8>>> {
         match fs::read(&self.cache_path).await {
-            Ok(contents) => {
-                if let Some(expected_version) = expected_version {
-                    #[derive(Deserialize)]
-                    struct CacheVersion {
-                        client_version: Option<String>,
-                    }
-
-                    // Older caches can contain model shapes that no longer decode.
-                    // Reject their version before decoding those obsolete entries.
-                    let version: CacheVersion = serde_json::from_slice(&contents)
-                        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-                    if version.client_version.as_deref() != Some(expected_version) {
-                        return Ok(None);
-                    }
-                }
-                let cache = serde_json::from_slice(&contents)
-                    .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-                Ok(Some(cache))
-            }
+            Ok(contents) => Ok(Some(contents)),
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
         }
     }
 
+    #[cfg(test)]
+    async fn load(&self) -> io::Result<Option<ModelsCache>> {
+        self.read_contents()
+            .await?
+            .map(|contents| decode_cache(&contents))
+            .transpose()
+    }
+
     async fn read_write_basis(&self) -> io::Result<CacheWriteBasis> {
-        let contents = match fs::read(&self.cache_path).await {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Ok(CacheWriteBasis {
-                    disk_revision: DiskRevision::Missing,
-                    client_version: None,
-                    provider_cache_identity: None,
-                    etag: None,
-                });
-            }
-            Err(err) => return Err(err),
+        let Some(contents) = self.read_contents().await? else {
+            return Ok(CacheWriteBasis {
+                disk_revision: DiskRevision::Missing,
+                client_version: None,
+                provider_cache_identity: None,
+                etag: None,
+            });
         };
-        match serde_json::from_slice::<ModelsCache>(&contents) {
-            Ok(cache) => Ok(cache.write_basis(contents)),
+        match ModelsCacheHeader::parse(&contents) {
+            Ok(header) => Ok(header.write_basis(&contents)),
             Err(_) => Ok(CacheWriteBasis {
                 disk_revision: DiskRevision::Opaque(contents),
                 client_version: None,
@@ -459,7 +455,7 @@ impl ModelsCacheManager {
     {
         let _permit = self.acquire_io_permit().await?;
         let _file_lock = self.acquire_file_lock().await?;
-        let mut cache = match self.load(None).await? {
+        let mut cache = match self.load().await? {
             Some(cache) => cache,
             None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
         };
@@ -477,7 +473,7 @@ impl ModelsCacheManager {
     {
         let _permit = self.acquire_io_permit().await?;
         let _file_lock = self.acquire_file_lock().await?;
-        let mut cache = match self.load(None).await? {
+        let mut cache = match self.load().await? {
             Some(cache) => cache,
             None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
         };
@@ -503,36 +499,58 @@ pub(crate) struct ModelsCache {
     pub(crate) models: Vec<ModelInfo>,
 }
 
-fn next_revision(revision: &DiskRevision) -> u64 {
-    match revision {
-        DiskRevision::Persisted(revision) => revision.saturating_add(1),
-        DiskRevision::Missing | DiskRevision::Legacy(_) | DiskRevision::Opaque(_) => 1,
-    }
+/// Entry metadata decoded without the model list, which dominates the file.
+/// It decides whether an entry is usable, renewable, or safely replaceable.
+#[derive(Deserialize)]
+struct ModelsCacheHeader {
+    revision: Option<u64>,
+    fetched_at: Option<DateTime<Utc>>,
+    etag: Option<String>,
+    client_version: Option<String>,
+    provider_cache_identity: Option<String>,
 }
 
-impl ModelsCache {
-    fn write_basis(&self, contents: Vec<u8>) -> CacheWriteBasis {
+impl ModelsCacheHeader {
+    fn parse(contents: &[u8]) -> io::Result<Self> {
+        serde_json::from_slice(contents)
+            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))
+    }
+
+    fn write_basis(&self, contents: &[u8]) -> CacheWriteBasis {
         CacheWriteBasis {
             disk_revision: self
                 .revision
                 .map(DiskRevision::Persisted)
-                .unwrap_or_else(|| DiskRevision::Legacy(contents)),
+                .unwrap_or_else(|| DiskRevision::Legacy(contents.to_vec())),
             client_version: self.client_version.clone(),
             provider_cache_identity: self.provider_cache_identity.clone(),
             etag: self.etag.clone(),
         }
     }
 
+    /// Time since the entry was fetched; `None` when missing or in the future.
+    fn age(&self) -> Option<Duration> {
+        Utc::now()
+            .signed_duration_since(self.fetched_at?)
+            .to_std()
+            .ok()
+    }
+
     /// Returns `true` when the cache entry has not exceeded the configured TTL.
     fn is_fresh(&self, ttl: Duration) -> bool {
-        if ttl.is_zero() {
-            return false;
-        }
-        let Ok(ttl_duration) = chrono::Duration::from_std(ttl) else {
-            return false;
-        };
-        let age = Utc::now().signed_duration_since(self.fetched_at);
-        age >= chrono::Duration::zero() && age <= ttl_duration
+        !ttl.is_zero() && self.age().is_some_and(|age| age <= ttl)
+    }
+}
+
+fn decode_cache(contents: &[u8]) -> io::Result<ModelsCache> {
+    serde_json::from_slice(contents)
+        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))
+}
+
+fn next_revision(revision: &DiskRevision) -> u64 {
+    match revision {
+        DiskRevision::Persisted(revision) => revision.saturating_add(1),
+        DiskRevision::Missing | DiskRevision::Legacy(_) | DiskRevision::Opaque(_) => 1,
     }
 }
 
@@ -721,6 +739,13 @@ mod tests {
         cache
             .persist_cache(&[], Some("same-etag".into()), "client".into())
             .await;
+        // Age the entry so its renewal is due and changes nothing but the revision.
+        cache
+            .manipulate_cache_for_test(|fetched_at| {
+                *fetched_at = Utc::now() - chrono::Duration::hours(1);
+            })
+            .await
+            .expect("age cache");
         let stale = cache
             .write_basis_for_identity("provider")
             .await
@@ -750,8 +775,92 @@ mod tests {
             .await
             .expect("read")
             .expect("cache");
-        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(persisted.revision, Some(3));
         assert_eq!(persisted.etag.as_deref(), Some("same-etag"));
+    }
+
+    #[tokio::test]
+    async fn renewal_rewrites_only_after_half_the_ttl_has_elapsed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("models_cache.json");
+        let cache = ModelsCacheManager::new(
+            path.clone(),
+            Duration::from_secs(300),
+            fixed_identity("provider"),
+        );
+        cache
+            .persist_cache(&[], Some("etag".into()), "client".into())
+            .await;
+        let persisted = std::fs::read(&path).expect("read persisted cache");
+
+        cache
+            .renew_cache_ttl("client", "etag")
+            .await
+            .expect("renew young entry");
+        assert_eq!(
+            std::fs::read(&path).expect("read cache"),
+            persisted,
+            "an entry with most of its TTL left must not be rewritten"
+        );
+
+        cache
+            .manipulate_cache_for_test(|fetched_at| {
+                *fetched_at = Utc::now() - chrono::Duration::seconds(151);
+            })
+            .await
+            .expect("age cache past half its TTL");
+        cache
+            .renew_cache_ttl("client", "etag")
+            .await
+            .expect("renew aged entry");
+        let renewed = cache
+            .load_fresh("client")
+            .await
+            .expect("read")
+            .expect("renewed cache");
+        assert_eq!(renewed.revision, Some(3));
+        assert!(Utc::now() - renewed.fetched_at < chrono::Duration::seconds(60));
+    }
+
+    #[tokio::test]
+    async fn unusable_entries_are_rejected_before_decoding_models() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("models_cache.json");
+        let cache = ModelsCacheManager::new(
+            path.clone(),
+            Duration::from_secs(300),
+            fixed_identity("provider"),
+        );
+        for (client_version, identity, fetched_at) in [
+            ("other-client", "provider", Utc::now()),
+            ("client", "other-provider", Utc::now()),
+            ("client", "provider", Utc::now() - chrono::Duration::hours(1)),
+        ] {
+            let contents = serde_json::json!({
+                "revision": 1,
+                "client_version": client_version,
+                "provider_cache_identity": identity,
+                "fetched_at": fetched_at,
+                "models": [{"slug": "undecodable-model"}],
+            });
+            std::fs::write(&path, contents.to_string()).expect("write cache");
+
+            assert!(
+                cache
+                    .load_fresh("client")
+                    .await
+                    .expect("an unusable entry is a miss, not a decode error")
+                    .is_none()
+            );
+            assert_eq!(
+                cache
+                    .write_basis_for_identity("provider")
+                    .await
+                    .expect("basis")
+                    .disk_revision,
+                DiskRevision::Persisted(1)
+            );
+        }
     }
 
     #[test]

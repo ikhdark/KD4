@@ -1,6 +1,7 @@
 //! Configuration object accepted by the `codex` MCP tool-call.
 
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::TomlValue;
 use codex_config::json_to_toml;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -14,9 +15,22 @@ use schemars::JsonSchema;
 use schemars::r#gen::SchemaSettings;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Launch configuration of the MCP server process. Every `codex` tool session
+/// starts from it and then applies the tool call's own settings.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolSessionDefaults {
+    pub(crate) codex_home: Option<PathBuf>,
+    pub(crate) arg0_paths: Arg0DispatchPaths,
+    /// Parsed `-c key=value` flags given to the server. Tool-call `config`
+    /// entries are applied after them and win on conflict.
+    pub(crate) cli_overrides: Vec<(String, TomlValue)>,
+    pub(crate) strict_config: bool,
+}
 
 /// Client-supplied configuration for a `codex` tool-call.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -141,9 +155,9 @@ fn codex_tool_output_schema() -> Arc<JsonObject> {
 impl CodexToolCallParam {
     /// Returns the initial user prompt to start the Codex conversation and the
     /// effective Config object generated from the supplied parameters.
-    pub async fn into_config(
+    pub(crate) async fn into_config(
         self,
-        arg0_paths: Arg0DispatchPaths,
+        defaults: &ToolSessionDefaults,
     ) -> std::io::Result<(String, Config)> {
         let Self {
             prompt,
@@ -163,24 +177,37 @@ impl CodexToolCallParam {
             cwd: cwd.map(PathBuf::from),
             approval_policy: approval_policy.map(Into::into),
             sandbox_mode: sandbox.map(Into::into),
-            codex_self_exe: arg0_paths.codex_self_exe.clone(),
+            codex_self_exe: defaults.arg0_paths.codex_self_exe.clone(),
             base_instructions,
             developer_instructions,
             compact_prompt,
             ..Default::default()
         };
 
-        let cli_overrides = cli_overrides
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, json_to_toml(v)))
+        // Later overrides win, so the tool call's entries follow the server's
+        // flags; key order keeps overlapping dotted paths deterministic.
+        let cli_overrides = defaults
+            .cli_overrides
+            .iter()
+            .cloned()
+            .chain(
+                cli_overrides
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(k, v)| (k, json_to_toml(v))),
+            )
             .collect();
 
-        let cfg = ConfigBuilder::default()
+        let mut builder = ConfigBuilder::default()
             .cli_overrides(cli_overrides)
-            .harness_overrides(overrides)
-            .build()
-            .await?;
+            .strict_config(defaults.strict_config)
+            .harness_overrides(overrides);
+        if let Some(codex_home) = &defaults.codex_home {
+            builder = builder.codex_home(codex_home.clone());
+        }
+        let cfg = builder.build().await?;
 
         Ok((prompt, cfg))
     }
@@ -379,6 +406,72 @@ mod tests {
           "title": "Codex"
         });
         assert_eq!(expected_tool_json, tool_json);
+    }
+
+    #[tokio::test]
+    async fn tool_sessions_apply_server_overrides_beneath_tool_overrides() -> anyhow::Result<()> {
+        let codex_home = tempfile::TempDir::new()?;
+        let defaults = ToolSessionDefaults {
+            codex_home: Some(codex_home.path().to_path_buf()),
+            cli_overrides: vec![
+                ("model".to_string(), TomlValue::String("server-model".into())),
+                (
+                    "model_reasoning_effort".to_string(),
+                    TomlValue::String("high".into()),
+                ),
+            ],
+            ..Default::default()
+        };
+        let (prompt, config) = CodexToolCallParam {
+            prompt: "hello".to_string(),
+            config: Some(HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                serde_json::json!("low"),
+            )])),
+            ..Default::default()
+        }
+        .into_config(&defaults)
+        .await?;
+
+        assert_eq!(prompt, "hello");
+        assert_eq!(config.model.as_deref(), Some("server-model"));
+        assert_eq!(
+            config.model_reasoning_effort,
+            Some(codex_protocol::openai_models::ReasoningEffort::Low)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_server_config_rejects_unknown_tool_overrides() -> anyhow::Result<()> {
+        let codex_home = tempfile::TempDir::new()?;
+        let tool_call = CodexToolCallParam {
+            prompt: "hello".to_string(),
+            config: Some(HashMap::from([(
+                "not_a_config_field".to_string(),
+                serde_json::json!(true),
+            )])),
+            ..Default::default()
+        };
+        for strict_config in [false, true] {
+            let defaults = ToolSessionDefaults {
+                codex_home: Some(codex_home.path().to_path_buf()),
+                strict_config,
+                ..Default::default()
+            };
+            let result = tool_call.clone().into_config(&defaults).await.map(|_| ());
+            match result {
+                Ok(()) => assert!(!strict_config, "strict config accepted an unknown field"),
+                Err(error) => {
+                    assert!(strict_config, "non-strict config failed: {error}");
+                    assert!(
+                        error.to_string().contains("not_a_config_field"),
+                        "unexpected strict config error: {error}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

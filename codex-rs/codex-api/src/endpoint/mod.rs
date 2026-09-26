@@ -1,4 +1,3 @@
-pub(crate) mod compact;
 pub(crate) mod images;
 pub(crate) mod models;
 pub(crate) mod responses;
@@ -6,7 +5,6 @@ pub(crate) mod responses_websocket;
 pub(crate) mod search;
 mod session;
 
-pub use compact::CompactClient;
 pub use images::ImagesClient;
 pub use models::ModelsClient;
 pub use models::ModelsListResult;

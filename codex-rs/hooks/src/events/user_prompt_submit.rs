@@ -13,6 +13,7 @@ use super::common;
 use super::common::ContextInjectingHookOutcome;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
+use crate::engine::ScopedRunGate;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
@@ -41,7 +42,7 @@ struct UserPromptSubmitHandlerData {
 
 pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
-    _request: &UserPromptSubmitRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> Vec<HookRunSummary> {
     dispatcher::select_handlers(
         handlers,
@@ -49,6 +50,7 @@ pub(crate) fn preview(
         /*matcher_input*/ None,
     )
     .into_iter()
+    .filter(|handler| gate.admits(handler))
     .map(|handler| dispatcher::running_summary(&handler))
     .collect()
 }
@@ -57,12 +59,14 @@ pub(crate) async fn run(
     handlers: &[ConfiguredHandler],
     shell: &CommandShell,
     request: UserPromptSubmitRequest,
+    gate: &ScopedRunGate<'_>,
 ) -> ContextInjectingHookOutcome {
-    let matched = dispatcher::select_handlers(
+    let mut matched = dispatcher::select_handlers(
         handlers,
         HookEventName::UserPromptSubmit,
         /*matcher_input*/ None,
     );
+    matched.retain(|handler| gate.claim(handler));
     if matched.is_empty() {
         return ContextInjectingHookOutcome::default();
     }

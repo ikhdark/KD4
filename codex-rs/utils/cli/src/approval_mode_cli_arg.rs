@@ -15,7 +15,7 @@ pub enum ApprovalModeCliArg {
     /// The model decides when to ask the user for approval.
     OnRequest,
 
-    /// Never ask for user approval
+    /// Never ask for user approval.
     /// Execution failures are immediately returned to the model.
     Never,
 }

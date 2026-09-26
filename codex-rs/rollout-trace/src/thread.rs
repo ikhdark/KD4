@@ -9,6 +9,7 @@ use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use serde::Serialize;
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,10 +105,10 @@ impl ThreadTraceContext {
     /// session unusable, because traces are diagnostic and can be enabled while
     /// debugging unrelated production failures.
     pub fn start_root_or_disabled(metadata: ThreadStartedTraceMetadata) -> Self {
-        let Some(root) = std::env::var_os(CODEX_ROLLOUT_TRACE_ROOT_ENV) else {
+        let Some(root) = configured_trace_root(std::env::var_os(CODEX_ROLLOUT_TRACE_ROOT_ENV))
+        else {
             return Self::disabled();
         };
-        let root = PathBuf::from(root);
         match start_root_in_root(root.as_path(), metadata) {
             Ok(context) => context,
             Err(err) => {
@@ -420,6 +421,11 @@ impl ThreadTraceContext {
         });
         trace
     }
+}
+
+/// An empty value means tracing is unset, not a bundle root relative to the process cwd.
+fn configured_trace_root(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|root| !root.is_empty()).map(PathBuf::from)
 }
 
 fn start_root_in_root(

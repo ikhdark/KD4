@@ -150,7 +150,9 @@ fn detect_terminal_info_from_env(env: &dyn Environment) -> TerminalInfo {
             env.var_non_empty("WEZTERM_VERSION"),
         );
     }
-    if env.has("ALACRITTY_SOCKET") {
+    // Alacritty's socket and window-id variables are Unix-only; on Windows it
+    // exports only its log path, and TERM is usually plain xterm-256color.
+    if env.has("ALACRITTY_LOG") {
         return TerminalInfo::from_name(TerminalName::Alacritty, None);
     }
     if let Some(term) = env.var_non_empty("TERM") {

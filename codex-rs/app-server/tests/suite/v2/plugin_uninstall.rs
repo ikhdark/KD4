@@ -23,6 +23,8 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+use super::plugin_test_support::write_installed_plugin;
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_PLUGIN_ID: &str = "plugins~Plugin_linear";
@@ -203,7 +205,7 @@ plugins = false
 async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -322,7 +324,7 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
 async fn plugin_uninstall_uses_detail_scope_for_cache_namespace() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -398,7 +400,7 @@ async fn plugin_uninstall_uses_detail_scope_for_cache_namespace() -> Result<()> 
 async fn plugin_uninstall_accepts_workspace_remote_plugin_id_shape() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -475,7 +477,7 @@ async fn plugin_uninstall_accepts_workspace_remote_plugin_id_shape() -> Result<(
 async fn plugin_uninstall_rejects_before_post_when_remote_detail_fetch_fails() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -532,10 +534,10 @@ async fn plugin_uninstall_rejects_before_post_when_remote_detail_fetch_fails() -
 }
 
 #[tokio::test]
-async fn plugin_uninstall_rejects_remote_plugin_id_with_spaces_before_network_call() -> Result<()> {
+async fn plugin_uninstall_rejects_invalid_remote_plugin_ids_before_network_call() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -546,135 +548,39 @@ async fn plugin_uninstall_rejects_remote_plugin_id_with_spaces_before_network_ca
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_plugin_uninstall_request(PluginUninstallParams {
-            plugin_id: "sample plugin".to_string(),
-        })
-        .await?;
+    // Validation is stateless, so one server proves every malformed shape.
+    for plugin_id in ["sample plugin", "linear/../../oops", ""] {
+        let request_id = mcp
+            .send_plugin_uninstall_request(PluginUninstallParams {
+                plugin_id: plugin_id.to_string(),
+            })
+            .await?;
+        let err = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
 
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+        assert_eq!(err.error.code, -32600, "{plugin_id:?}");
+        assert!(
+            err.error.message.contains("invalid remote plugin id"),
+            "{plugin_id:?}: {}",
+            err.error.message
+        );
+    }
 
-    assert_eq!(err.error.code, -32600);
-    assert!(err.error.message.contains("invalid remote plugin id"));
-    wait_for_remote_plugin_request_count(
-        &server,
-        "POST",
-        "/ps/plugins/sample plugin/uninstall",
-        /*expected_count*/ 0,
-    )
-    .await?;
+    // Encoded or normalized request paths would not contain the raw ids, so
+    // prove that neither the detail fetch nor the uninstall POST was issued.
+    let plugin_requests: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().contains("/ps/plugins"))
+        .map(|request| format!("{} {}", request.method, request.url.path()))
+        .collect();
+    assert_eq!(plugin_requests, Vec::<String>::new());
     Ok(())
-}
-
-#[tokio::test]
-async fn plugin_uninstall_rejects_invalid_remote_plugin_id_before_network_call() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
-        codex_home.path(),
-        &format!("{}/backend-api/", server.uri()),
-    )?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_plugin_uninstall_request(PluginUninstallParams {
-            plugin_id: "linear/../../oops".to_string(),
-        })
-        .await?;
-
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(err.error.code, -32600);
-    assert!(err.error.message.contains("invalid remote plugin id"));
-    wait_for_remote_plugin_request_count(
-        &server,
-        "POST",
-        "/ps/plugins/linear/../../oops/uninstall",
-        /*expected_count*/ 0,
-    )
-    .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn plugin_uninstall_rejects_empty_remote_plugin_id() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
-        codex_home.path(),
-        &format!("{}/backend-api/", server.uri()),
-    )?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_plugin_uninstall_request(PluginUninstallParams {
-            plugin_id: String::new(),
-        })
-        .await?;
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(err.error.code, -32600);
-    assert!(err.error.message.contains("invalid remote plugin id"));
-
-    Ok(())
-}
-
-fn write_installed_plugin(
-    codex_home: &TempDir,
-    marketplace_name: &str,
-    plugin_name: &str,
-) -> Result<()> {
-    let plugin_root = codex_home
-        .path()
-        .join("plugins/cache")
-        .join(marketplace_name)
-        .join(plugin_name)
-        .join("local/.codex-plugin");
-    std::fs::create_dir_all(&plugin_root)?;
-    std::fs::write(
-        plugin_root.join("plugin.json"),
-        format!(r#"{{"name":"{plugin_name}"}}"#),
-    )?;
-    Ok(())
-}
-
-fn write_remote_plugin_catalog_config(
-    codex_home: &std::path::Path,
-    base_url: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-chatgpt_base_url = "{base_url}"
-
-[features]
-plugins = true
-"#
-        ),
-    )
 }
 
 async fn mount_remote_plugin_detail(

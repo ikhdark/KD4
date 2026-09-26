@@ -600,10 +600,7 @@ impl ElicitationRoundTripFixture {
         .get(1)
         .expect("wall-time wrapped output should include payload")
         .as_str();
-        assert_eq!(
-            serde_json::from_str::<Value>(payload)?,
-            json!([{ "type": "text", "text": expected_text }])
-        );
+        assert_eq!(payload, expected_text);
 
         self.apps_server_handle.abort();
         let _ = self.apps_server_handle.await;

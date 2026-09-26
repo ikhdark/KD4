@@ -195,17 +195,20 @@ async fn initialize_negotiates_unknown_protocol_versions() -> anyhow::Result<()>
 async fn approval_without_form_support_denies_command_and_completes() -> anyhow::Result<()> {
     require_network!();
     let workdir = TempDir::new()?;
-    let server = create_mock_responses_server(vec![create_shell_command_sse_response(
-        vec![
-            "New-Item".into(),
-            "-ItemType".into(),
-            "File".into(),
-            "denied.txt".into(),
-        ],
-        Some(workdir.path()),
-        Some(10_000),
-        "unsupported-approval",
-    )?])
+    let server = create_mock_responses_server(vec![
+        create_shell_command_sse_response(
+            vec![
+                "New-Item".into(),
+                "-ItemType".into(),
+                "File".into(),
+                "denied.txt".into(),
+            ],
+            Some(workdir.path()),
+            Some(10_000),
+            "unsupported-approval",
+        )?,
+        create_final_assistant_message_sse_response("The command was denied.")?,
+    ])
     .await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -247,18 +250,33 @@ async fn approval_without_form_support_denies_command_and_completes() -> anyhow:
         }
     })
     .await??;
-    assert_eq!(
-        result["content"][0]["text"],
-        "required tool `shell_command` blocked"
-    );
+    assert_eq!(result["content"][0]["text"], "The command was denied.");
+    assert_ne!(result["isError"], true);
     assert!(!workdir.path().join("denied.txt").exists());
-    assert_eq!(
-        server
-            .received_requests()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?
-            .len(),
-        1
+    assert_denial_reported_to_model(&server, "unsupported-approval").await?;
+    Ok(())
+}
+
+/// A denied command is not run; the rejection is returned to the model, which
+/// makes exactly one follow-up request to finish the turn.
+async fn assert_denial_reported_to_model(server: &MockServer, call_id: &str) -> anyhow::Result<()> {
+    let requests = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?;
+    assert_eq!(requests.len(), 2);
+    let follow_up = requests[1].body_json::<serde_json::Value>()?;
+    let output = follow_up["input"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        })
+        .ok_or_else(|| anyhow::anyhow!("follow-up request lacks the denied call's output"))?;
+    assert!(
+        output["output"].to_string().contains("rejected by user"),
+        "denied call output should report the rejection: {output}"
     );
     Ok(())
 }
@@ -414,19 +432,17 @@ async fn shell_command_approval_triggers_elicitation(approve: bool) -> anyhow::R
     let final_message = if approve {
         "File created!"
     } else {
-        "required tool `shell_command` blocked"
+        "The command was denied."
     };
-    let mut responses = vec![create_shell_command_sse_response(
-        shell_command.clone(),
-        Some(workdir_for_shell_function_call.path()),
-        Some(timeout_ms),
-        "call1234",
-    )?];
-    if approve {
-        responses.push(create_final_assistant_message_sse_response(
-            "File created!",
-        )?);
-    }
+    let responses = vec![
+        create_shell_command_sse_response(
+            shell_command.clone(),
+            Some(workdir_for_shell_function_call.path()),
+            Some(timeout_ms),
+            "call1234",
+        )?,
+        create_final_assistant_message_sse_response(final_message)?,
+    ];
     let McpHandle {
         process: mut mcp_process,
         server,
@@ -542,15 +558,15 @@ async fn shell_command_approval_triggers_elicitation(approve: bool) -> anyhow::R
         codex_response
     );
 
-    let requests = server
-        .received_requests()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?;
-    assert_eq!(
-        requests.len(),
-        if approve { 2 } else { 1 },
-        "a denied required tool must terminate without another model request"
-    );
+    if approve {
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?;
+        assert_eq!(requests.len(), 2);
+    } else {
+        assert_denial_reported_to_model(&server, "call1234").await?;
+    }
 
     assert_eq!(
         created_file.is_file(),

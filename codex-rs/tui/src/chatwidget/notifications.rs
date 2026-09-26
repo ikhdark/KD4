@@ -46,17 +46,12 @@ impl Notification {
                     truncate_text(command, /*max_graphemes*/ 30)
                 )
             }
-            Notification::EditApprovalRequested { cwd, changes } => {
-                format!(
-                    "Codex wants to edit {}",
-                    if changes.len() == 1 {
-                        #[allow(clippy::unwrap_used)]
-                        display_path_for(changes.first().unwrap(), cwd)
-                    } else {
-                        format!("{} files", changes.len())
-                    }
-                )
-            }
+            // File-change approval requests do not carry their changes, so the list can be empty.
+            Notification::EditApprovalRequested { cwd, changes } => match changes.as_slice() {
+                [] => "Codex wants to edit files".to_string(),
+                [path] => format!("Codex wants to edit {}", display_path_for(path, cwd)),
+                changes => format!("Codex wants to edit {} files", changes.len()),
+            },
             Notification::ElicitationRequested { server_name } => {
                 format!("Approval requested by {server_name}")
             }

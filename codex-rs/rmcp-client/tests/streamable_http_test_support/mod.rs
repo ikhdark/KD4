@@ -9,7 +9,6 @@
 // otherwise depend on which test file compiled the module.
 #![allow(dead_code)]
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -42,10 +41,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::process::Command;
-use tokio::time::sleep;
 
 const SESSION_POST_FAILURE_CONTROL_PATH: &str = "/test/control/session-post-failure";
 const INITIALIZE_POST_FAILURE_CONTROL_PATH: &str = "/test/control/initialize-post-failure";
@@ -313,34 +310,41 @@ pub(crate) async fn arm_initialize_post_json_rpc_failure(
 }
 
 pub(crate) async fn spawn_streamable_http_server() -> anyhow::Result<(Child, String)> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-
-    let bind_addr = format!("127.0.0.1:{port}");
-    let base_url = format!("http://{bind_addr}");
+    // The server binds port 0 itself, so no other process can take a port
+    // between reservation and bind.
     let mut child = Command::new(streamable_http_server_bin()?)
         .kill_on_drop(true)
-        .env("MCP_STREAMABLE_HTTP_BIND_ADDR", &bind_addr)
+        .env("MCP_STREAMABLE_HTTP_BIND_ADDR", "127.0.0.1:0")
         .env("MCP_TEST_ECHO_SELECTED", "selected-environment-value")
         .env_remove("MCP_TEST_ECHO_MISSING_07a5ec54")
+        .stdout(Stdio::piped())
         .spawn()?;
 
-    wait_for_streamable_http_server(&mut child, &bind_addr, Duration::from_secs(5)).await?;
-    Ok((child, base_url))
+    let bind_addr = read_streamable_http_bound_addr(&mut child).await?;
+    Ok((child, format!("http://{bind_addr}")))
 }
 
 /// Owns the exec-server process used by the remote-client integration test.
 pub(crate) struct ExecServerProcess {
-    _codex_home: TempDir,
-    child: Child,
     pub(crate) client: ExecServerClient,
+    child: Child,
+    // Fields drop in declaration order: the home must outlive the exec-server
+    // that writes into it, or Windows cannot remove it.
+    _codex_home: TempDir,
 }
 
 impl Drop for ExecServerProcess {
-    /// Stops the local exec-server process best-effort when the test exits.
+    /// Stops the local exec-server and waits for it to exit before its
+    /// temporary CODEX_HOME is removed.
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(Some(_)) | Err(_) => break,
+            }
+        }
     }
 }
 
@@ -396,44 +400,19 @@ async fn read_exec_server_listen_url(child: &mut Child) -> anyhow::Result<String
     }
 }
 
-async fn wait_for_streamable_http_server(
-    server_child: &mut Child,
-    address: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        if let Some(status) = server_child.try_wait()? {
-            return Err(anyhow::anyhow!(
-                "streamable HTTP server exited early with status {status}"
-            ));
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for streamable HTTP server at {address}: deadline reached"
-            ));
-        }
-
-        match tokio::time::timeout(remaining, TcpStream::connect(address)).await {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(error)) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for streamable HTTP server at {address}: {error}"
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "timed out waiting for streamable HTTP server at {address}: connect call timed out"
-                ));
-            }
-        }
-
-        sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())))
-            .await;
-    }
+/// Reads the address `test_streamable_http_server` prints once its listener is
+/// bound; stdout closing first means the server exited before binding.
+async fn read_streamable_http_bound_addr(child: &mut Child) -> anyhow::Result<String> {
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture streamable HTTP server stdout")?;
+    let line = tokio::time::timeout(
+        Duration::from_secs(10),
+        BufReader::new(stdout).lines().next_line(),
+    )
+    .await
+    .context("timed out waiting for streamable HTTP server address")??
+    .context("streamable HTTP server stdout closed before emitting its address")?;
+    Ok(line.trim().to_string())
 }

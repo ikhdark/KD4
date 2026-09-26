@@ -8,6 +8,7 @@ use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::setup::effective_write_roots_for_permissions;
+use crate::setup::sandbox_dir;
 use crate::token::LocalSid;
 use crate::token::world_sid;
 use anyhow::Result;
@@ -65,10 +66,11 @@ pub fn world_writable_warning_details(
     cwd: impl AsRef<Path>,
 ) -> Option<(Vec<String>, usize, bool)> {
     let env_map: HashMap<String, String> = std::env::vars().collect();
+    let logs_base_dir = sandbox_dir(codex_home.as_ref());
     world_writable_warning_details_from_scan(audit_everyone_writable(
         cwd.as_ref(),
         &env_map,
-        Some(codex_home.as_ref()),
+        Some(&logs_base_dir),
     ))
 }
 
@@ -297,8 +299,10 @@ pub fn apply_world_writable_scan_and_denies_for_permissions(
     cwd: &Path,
     env_map: &std::collections::HashMap<String, String>,
     permissions: &ResolvedWindowsSandboxPermissions,
-    logs_base_dir: Option<&Path>,
 ) -> Result<()> {
+    // Audit notes belong in the daily sandbox log, not in a second log beside CODEX_HOME's files.
+    let logs_base_dir = sandbox_dir(codex_home);
+    let logs_base_dir = Some(logs_base_dir.as_path());
     let scan = audit_everyone_writable(cwd, env_map, logs_base_dir)?;
     // Preserve remediation of paths already found even when the scan hit its limit.
     if let Err(err) = apply_capability_denies_for_world_writable_for_permissions(
@@ -530,6 +534,22 @@ mod tests {
         let log = fs::read_to_string(crate::logging::current_log_file_path(logs.path()))?;
         assert!(log.contains("world-writable scan INCOMPLETE"));
         assert!(!log.contains("world-writable scan OK"));
+        Ok(())
+    }
+
+    #[test]
+    fn warning_scan_logs_to_the_sandbox_log_instead_of_codex_home() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let cwd = tempfile::tempdir()?;
+        fs::create_dir_all(crate::setup::sandbox_dir(home.path()))?;
+
+        let _ = super::world_writable_warning_details(home.path(), cwd.path());
+
+        let sandbox_log = fs::read_to_string(
+            crate::logging::current_log_file_path_for_codex_home(home.path()),
+        )?;
+        assert!(sandbox_log.contains("AUDIT: world-writable scan"));
+        assert!(!crate::logging::current_log_file_path(home.path()).exists());
         Ok(())
     }
 

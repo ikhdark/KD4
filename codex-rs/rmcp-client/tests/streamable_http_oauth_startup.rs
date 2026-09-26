@@ -124,11 +124,118 @@ async fn refreshes_expired_persisted_token_before_initialize() -> anyhow::Result
     Ok(())
 }
 
+/// Operations that start while the access token is inside the refresh window
+/// must share one token-endpoint call, not refresh once per operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/oauth/authorize", server.uri()),
+            "token_endpoint": format!("{}/oauth/token", server.uri()),
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": REFRESHED_ACCESS_TOKEN,
+            "token_type": "Bearer",
+            "expires_in": 7200,
+            "refresh_token": REFRESH_TOKEN,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(|request: &Request| {
+            let body: Value = request.body_json().expect("valid JSON-RPC request");
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            match body.get("method").and_then(Value::as_str) {
+                Some("initialize") => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": body
+                            .pointer("/params/protocolVersion")
+                            .cloned()
+                            .unwrap_or_else(|| json!("2025-06-18")),
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "oauth-refresh-test", "version": "0.0.0-test" },
+                    },
+                })),
+                Some("notifications/initialized") => ResponseTemplate::new(202),
+                Some("tools/list") => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "tools": [] },
+                })),
+                method => ResponseTemplate::new(400)
+                    .set_body_string(format!("unexpected JSON-RPC method: {method:?}")),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // RMCP refreshes once fewer than 30 seconds remain. 31.5 seconds keeps the
+    // stored token usable for initialize and puts it inside that window after
+    // the sleep below, whichever way the whole-second clocks round.
+    let codex_home = TempDir::new()?;
+    let server_url = format!("{}/mcp", server.uri());
+    let now_ms = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let mut response = OAuthTokenResponse::new(
+        AccessToken::new("near-expiry-access-token".to_string()),
+        BasicTokenType::Bearer,
+        VendorExtraTokenFields::default(),
+    );
+    response.set_refresh_token(Some(RefreshToken::new(REFRESH_TOKEN.to_string())));
+    save_oauth_tokens(
+        codex_home.path(),
+        SERVER_NAME,
+        &StoredOAuthTokens {
+            server_name: SERVER_NAME.to_string(),
+            url: server_url.clone(),
+            client_id: "test-client-id".to_string(),
+            token_response: WrappedOAuthTokenResponse(response),
+            expires_at: Some(now_ms + 31_500),
+        },
+        OAuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?;
+    let client = RmcpClient::new_streamable_http_client(
+        SERVER_NAME,
+        codex_home.path().to_path_buf(),
+        &server_url,
+        /*bearer_token*/ None,
+        /*http_headers*/ None,
+        /*env_http_headers*/ None,
+        OAuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+        Environment::default_for_tests().get_http_client(),
+        /*auth_provider*/ None,
+    )
+    .await?;
+    initialize_client(&client).await?;
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let (first, second) = tokio::join!(
+        client.list_tools(/*params*/ None, Some(Duration::from_secs(5))),
+        client.list_tools(/*params*/ None, Some(Duration::from_secs(5))),
+    );
+    first?;
+    second?;
+    server.verify().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn reports_auth_status_for_persisted_credentials() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
 
-    let status = Command::new(std::env::current_exe()?)
+    let output = Command::new(std::env::current_exe()?)
         .args([
             "persisted_credentials_auth_status_child",
             "--exact",
@@ -136,12 +243,20 @@ async fn reports_auth_status_for_persisted_credentials() -> anyhow::Result<()> {
             "--nocapture",
         ])
         .env("CODEX_HOME", codex_home.path())
-        .status()
+        .output()
         .await?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        status.success(),
-        "persisted credentials auth status child failed: {status}"
+        output.status.success(),
+        "persisted credentials auth status child failed: {}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The child owns its mock servers, so only its pass count proves it ran.
+    assert!(
+        stdout.contains("1 passed"),
+        "persisted credentials auth status child must execute its assertions"
     );
     Ok(())
 }

@@ -2755,6 +2755,16 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
+    // This contract concerns an idle resume, not recovery of an unfinished turn.
+    append_rollout_item_to_path(
+        &rollout.rollout_file_path,
+        &RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: "Saved assistant reply".to_string(),
+            phase: None,
+        })),
+    )
+    .await?;
+    set_rollout_mtime(&rollout.rollout_file_path, "2025-01-07T00:00:00Z")?;
     let thread_id = rollout.conversation_id.clone();
 
     let mut mcp = TestAppServer::builder()

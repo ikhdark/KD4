@@ -38,6 +38,10 @@ pub(super) struct InputQueueState {
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     /// Steers already submitted to core but not yet committed into history.
     pub(super) pending_steers: VecDeque<PendingSteer>,
+    /// Steers the app started as a new turn because the turn they targeted had already ended.
+    /// Unlike pending steers, an interrupted turn must neither restore nor resubmit them; they
+    /// wait only for their commit, which renders them with their history record.
+    pub(super) promoted_steers: VecDeque<PendingSteer>,
     /// When set, the next interrupt should resubmit all pending steers as one
     /// fresh user turn instead of restoring them into the composer.
     pub(super) submit_pending_steers_after_interrupt: bool,
@@ -49,6 +53,11 @@ impl InputQueueState {
         !self.rejected_steers_queue.is_empty() || !self.queued_user_messages.is_empty()
     }
 
+    /// Whether submitted steer text is still awaiting its commit, including promoted steers.
+    pub(super) fn has_uncommitted_steers(&self) -> bool {
+        !self.pending_steers.is_empty() || !self.promoted_steers.is_empty()
+    }
+
     pub(super) fn clear(&mut self) {
         self.queued_user_messages.clear();
         self.queued_user_message_history_records.clear();
@@ -56,6 +65,7 @@ impl InputQueueState {
         self.rejected_steers_queue.clear();
         self.rejected_steer_history_records.clear();
         self.pending_steers.clear();
+        self.promoted_steers.clear();
         self.submit_pending_steers_after_interrupt = false;
     }
 
@@ -74,6 +84,7 @@ impl InputQueueState {
         let pending_steers = self
             .pending_steers
             .iter()
+            .chain(&self.promoted_steers)
             .map(|steer| {
                 user_message_preview_text(&steer.user_message, Some(&steer.history_record))
             })
@@ -140,6 +151,14 @@ mod tests {
             .push_back(UserMessage::from("rejected"));
         state.user_turn_pending_start = true;
         state.submit_pending_steers_after_interrupt = true;
+        state.promoted_steers.push_back(PendingSteer {
+            user_message: UserMessage::from("promoted"),
+            history_record: UserMessageHistoryRecord::UserMessageText,
+            compare_key: crate::chatwidget::user_messages::PendingSteerCompareKey {
+                message: "promoted".to_string(),
+                image_count: 0,
+            },
+        });
 
         state.clear();
 
@@ -149,6 +168,7 @@ mod tests {
         assert!(state.rejected_steers_queue.is_empty());
         assert!(state.rejected_steer_history_records.is_empty());
         assert!(state.pending_steers.is_empty());
+        assert!(state.promoted_steers.is_empty());
         assert!(!state.submit_pending_steers_after_interrupt);
     }
 }

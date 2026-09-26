@@ -20,6 +20,7 @@ use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::EnabledToolMetadata;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use codex_code_mode_protocol::host::MAX_FRAME_BYTES;
 use codex_code_mode_protocol::normalize_code_mode_identifier;
 use codex_protocol::ToolName;
 use serde_json::Value as JsonValue;
@@ -30,11 +31,21 @@ use crate::v8_init::ensure_v8_initialized;
 
 const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 const RUNTIME_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const MAX_BUFFERED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Frame room for everything a runtime response carries besides its content
+/// items: envelope, cell ID, bounded error text (escaping can grow it
+/// sixfold), and output-loss counters.
+const RUNTIME_RESPONSE_FRAME_RESERVE: usize = 1024 * 1024;
+/// Content one cell may buffer, measured as its JSON encoding, so any
+/// response assembled from admitted output fits one host IPC frame.
+pub(crate) const MAX_BUFFERED_OUTPUT_BYTES: usize =
+    MAX_FRAME_BYTES - RUNTIME_RESPONSE_FRAME_RESERVE;
+const _: () = assert!(MAX_BUFFERED_OUTPUT_BYTES == 63 * 1024 * 1024);
 pub(crate) const MAX_ERROR_TEXT_BYTES: usize = 16 * 1024;
 const ERROR_TRUNCATION_SUFFIX: &str = "\n[code mode error truncated]";
-const OUTPUT_LIMIT_MESSAGE: &str =
-    "Code mode output was truncated because the cell buffered more than 64 MiB.";
+const OUTPUT_LIMIT_MESSAGE: &str = "Code mode output was truncated because the cell's buffered output exceeded its 63 MiB encoded limit.";
+/// Encoded size of an empty text item plus its array separator: the least any
+/// text output adds to the buffered budget beyond its raw bytes.
+const TEXT_ITEM_ENCODING_OVERHEAD: usize = r#"{"type":"input_text","text":""}"#.len() + 1;
 
 #[derive(Debug)]
 pub(crate) enum RuntimeCommand {
@@ -79,11 +90,29 @@ pub(crate) enum RuntimeEvent {
         text: String,
     },
     Result {
-        stored_value_writes: HashMap<String, Arc<JsonValue>>,
+        stored_value_writes: HashMap<String, StoredValue>,
         error_text: Option<String>,
         output_loss: Option<codex_code_mode_protocol::OutputLoss>,
     },
     ThreadPanicked,
+}
+
+/// A session value and the serialized size of its entry, measured once when
+/// stored so later cells and commits never reserialize it.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredValue {
+    pub(crate) value: Arc<JsonValue>,
+    /// Serialized bytes of the key and value, charged to the session limit.
+    pub(crate) bytes: usize,
+}
+
+impl StoredValue {
+    pub(crate) fn new(key: &str, value: JsonValue) -> Self {
+        Self {
+            bytes: stored_value_entry_bytes(key, &value),
+            value: Arc::new(value),
+        }
+    }
 }
 
 pub(crate) struct OutputAdmission {
@@ -139,7 +168,7 @@ impl OutputAdmission {
             });
         }
 
-        Self::record_loss(&mut state, admitted_bytes.saturating_sub(std::mem::size_of::<FunctionCallOutputContentItem>()))
+        Self::record_loss(&mut state, output_payload_bytes(&item))
     }
 
     fn record_loss(state: &mut OutputAdmissionState, bytes: usize) -> Option<RuntimeEvent> {
@@ -157,9 +186,11 @@ impl OutputAdmission {
         None
     }
 
+    /// Rejects text whose raw bytes alone cannot fit, before copying it out of
+    /// V8. Admission still charges the full encoded size after conversion.
     pub(super) fn reject_before_conversion(&self, bytes: usize) -> Option<Option<RuntimeEvent>> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let required = bytes.saturating_add(std::mem::size_of::<FunctionCallOutputContentItem>());
+        let required = bytes.saturating_add(TEXT_ITEM_ENCODING_OVERHEAD);
         if required <= self.max_bytes.saturating_sub(state.admitted_bytes) { return None; }
         Some(Self::record_loss(&mut state, bytes))
     }
@@ -182,13 +213,23 @@ impl OutputAdmission {
     }
 }
 
+/// Bytes an item occupies in a serialized response's content array: its JSON
+/// encoding, which matches the host wire item, plus a separator. Escaping is
+/// charged, so admitted output fits a frame however much of it is escaped.
 fn output_item_bytes(item: &FunctionCallOutputContentItem) -> usize {
-    std::mem::size_of::<FunctionCallOutputContentItem>()
-        .saturating_add(match item {
-            FunctionCallOutputContentItem::InputText { text } => text.len(),
-            FunctionCallOutputContentItem::InputImage { image_url, .. } => image_url.len(),
-        })
-        .max(1)
+    let mut counter = JsonByteCounter::default();
+    match serde_json::to_writer(&mut counter, item) {
+        Ok(()) => counter.bytes.saturating_add(1),
+        Err(_) => usize::MAX,
+    }
+}
+
+/// Raw payload bytes, a lower bound on what discarding an item loses.
+fn output_payload_bytes(item: &FunctionCallOutputContentItem) -> usize {
+    match item {
+        FunctionCallOutputContentItem::InputText { text } => text.len(),
+        FunctionCallOutputContentItem::InputImage { image_url, .. } => image_url.len(),
+    }
 }
 
 #[cfg(test)]
@@ -214,7 +255,7 @@ impl Drop for StartupTestExit {
 }
 
 pub(crate) async fn spawn_runtime(
-    stored_values: HashMap<String, Arc<JsonValue>>,
+    stored_values: HashMap<String, StoredValue>,
     request: ExecuteRequest,
     default_tool_timeout_ms: u64,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
@@ -353,7 +394,7 @@ struct RuntimeConfig {
     tool_call_id: String,
     enabled_tools: Arc<EnabledToolCatalog>,
     source: String,
-    stored_values: HashMap<String, Arc<JsonValue>>,
+    stored_values: HashMap<String, StoredValue>,
     default_tool_timeout_ms: u64,
     output_admission: Arc<OutputAdmission>,
 }
@@ -414,10 +455,9 @@ pub(super) struct RuntimeState {
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     unhandled_rejections: Vec<v8::Global<v8::Promise>>,
     rejection_tracking_overflow: bool,
-    stored_values: HashMap<String, Arc<JsonValue>>,
-    stored_value_bytes: HashMap<String, usize>,
+    stored_values: HashMap<String, StoredValue>,
     total_stored_value_bytes: usize,
-    stored_value_writes: HashMap<String, Arc<JsonValue>>,
+    stored_value_writes: HashMap<String, StoredValue>,
     stored_value_limit_error: Option<String>,
     #[cfg(test)]
     completion_collections: usize,
@@ -438,12 +478,13 @@ pub(crate) const MAX_OUTSTANDING_CALLBACKS_PER_CELL: usize = 128;
 pub(crate) const MAX_SESSION_STORED_VALUES: usize = 256;
 pub(crate) const MAX_SESSION_STORED_VALUE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Counts serialized bytes without retaining them.
 #[derive(Default)]
-struct StoredValueByteCounter {
+struct JsonByteCounter {
     bytes: usize,
 }
 
-impl std::io::Write for StoredValueByteCounter {
+impl std::io::Write for JsonByteCounter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.bytes = self.bytes.saturating_add(buffer.len());
         Ok(buffer.len())
@@ -455,7 +496,7 @@ impl std::io::Write for StoredValueByteCounter {
 }
 
 fn stored_value_entry_bytes(key: &str, value: &JsonValue) -> usize {
-    let mut counter = StoredValueByteCounter::default();
+    let mut counter = JsonByteCounter::default();
     if serde_json::to_writer(&mut counter, key).is_err()
         || serde_json::to_writer(&mut counter, value).is_err()
     {
@@ -465,8 +506,8 @@ fn stored_value_entry_bytes(key: &str, value: &JsonValue) -> usize {
 }
 
 pub(crate) fn stored_values_with_writes_within_limits(
-    current: &HashMap<String, Arc<JsonValue>>,
-    writes: &HashMap<String, Arc<JsonValue>>,
+    current: &HashMap<String, StoredValue>,
+    writes: &HashMap<String, StoredValue>,
 ) -> bool {
     let entry_count = current.len().saturating_add(
         writes
@@ -482,9 +523,7 @@ pub(crate) fn stored_values_with_writes_within_limits(
         .iter()
         .filter(|(key, _)| !writes.contains_key(*key))
         .chain(writes.iter())
-        .try_fold(0usize, |total, (key, value)| {
-            total.checked_add(stored_value_entry_bytes(key, value))
-        })
+        .try_fold(0usize, |total, (_, stored)| total.checked_add(stored.bytes))
         .is_some_and(|bytes| bytes <= MAX_SESSION_STORED_VALUE_BYTES)
 }
 
@@ -506,7 +545,7 @@ impl RuntimeState {
         }
     }
 
-    pub(super) fn stored_value_completion(&mut self) -> (HashMap<String, Arc<JsonValue>>, Option<String>) {
+    pub(super) fn stored_value_completion(&mut self) -> (HashMap<String, StoredValue>, Option<String>) {
         #[cfg(test)]
         { self.completion_collections += 1; }
         match self.stored_value_limit_error.as_ref() {
@@ -519,7 +558,7 @@ impl RuntimeState {
 pub(super) enum CompletionState {
     Pending,
     Completed {
-        stored_value_writes: HashMap<String, Arc<JsonValue>>,
+        stored_value_writes: HashMap<String, StoredValue>,
         error_text: Option<String>,
     },
 }
@@ -553,14 +592,10 @@ fn run_runtime(
     let scope = &mut v8::ContextScope::new(scope, context);
 
     let timer_scheduler = timers::TimerScheduler::new(runtime_command_tx);
-    let stored_value_bytes: HashMap<_, _> = config
+    let total_stored_value_bytes = config
         .stored_values
-        .iter()
-        .map(|(key, value)| (key.clone(), stored_value_entry_bytes(key, value)))
-        .collect();
-    let total_stored_value_bytes = stored_value_bytes
         .values()
-        .fold(0usize, |total, bytes| total.saturating_add(*bytes));
+        .fold(0usize, |total, stored| total.saturating_add(stored.bytes));
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
@@ -569,7 +604,6 @@ fn run_runtime(
         unhandled_rejections: Vec::new(),
         rejection_tracking_overflow: false,
         stored_values: config.stored_values,
-        stored_value_bytes,
         total_stored_value_bytes,
         stored_value_writes: HashMap::new(),
         stored_value_limit_error: None,
@@ -632,10 +666,10 @@ fn run_runtime(
                     completion_collections: state.completion_collections,
                     rust_conversion_bytes: state.rust_conversion_bytes,
                     stored_payload_address: state.stored_value_writes.get("payload")
-                        .and_then(|value| value.as_str()).map(|value| value.as_ptr() as usize).unwrap_or(0),
+                        .and_then(|stored| stored.value.as_str()).map(|value| value.as_ptr() as usize).unwrap_or(0),
                     stored_payload_shared: state.stored_value_writes.get("payload")
                         .zip(state.stored_values.get("payload"))
-                        .is_some_and(|(writes, local)| Arc::ptr_eq(writes, local)),
+                        .is_some_and(|(writes, local)| Arc::ptr_eq(&writes.value, &local.value)),
                 });
             }
             RuntimeCommand::ToolResponse { id, result } => {
@@ -732,7 +766,7 @@ fn capture_scope_send_error(
 fn send_result(
     scope: &v8::PinScope<'_, '_>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    stored_value_writes: HashMap<String, Arc<JsonValue>>,
+    stored_value_writes: HashMap<String, StoredValue>,
     error_text: Option<String>,
 ) {
     let _ = event_tx.send(RuntimeEvent::Result {
@@ -1114,6 +1148,91 @@ text(JSON.stringify([coded]));"#,
                 r#"{"i":0,"status":"rejected","reason":{"name":"Error","message":"nested tool `exec_command` exceeded its 60000ms timeout"}}"#.to_string(),
                 r#"[{"name":"TypeError","message":"bad input","code":7}]"#.to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn output_accounting_matches_the_wire_item_encoding() {
+        use codex_code_mode_protocol::FunctionCallOutputContentItem;
+        use codex_code_mode_protocol::ImageDetail;
+        use codex_code_mode_protocol::host::WireContentItem;
+
+        for item in [
+            FunctionCallOutputContentItem::InputText {
+                text: String::new(),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: "plain \u{1}\"\\\n\u{1F980}".to_string(),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAAA".to_string(),
+                detail: Some(ImageDetail::Original),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAAA".to_string(),
+                detail: None,
+            },
+        ] {
+            let wire = serde_json::to_vec(&WireContentItem::from(item.clone())).expect("encode");
+            assert_eq!(super::output_item_bytes(&item), wire.len() + 1, "{item:?}");
+        }
+        assert_eq!(
+            super::output_item_bytes(&FunctionCallOutputContentItem::InputText {
+                text: String::new(),
+            }),
+            super::TEXT_ITEM_ENCODING_OVERHEAD
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_heavy_output_is_charged_its_encoded_size() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        // 40 raw bytes fit this budget, but they encode to 240 escaped bytes.
+        let (_runtime_tx, _runtime_terminate_handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(r#"text("\u0001".repeat(40)); text("ok");"#),
+            60_000,
+            event_tx,
+            std::sync::Arc::new(OutputAdmission::new(128)),
+            /*task_failure_handler*/ None,
+        )
+        .await
+        .unwrap();
+
+        let mut texts = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("runtime event timeout")
+                .expect("runtime must report a result")
+            {
+                RuntimeEvent::Started => {}
+                RuntimeEvent::ContentItem {
+                    item:
+                        codex_code_mode_protocol::FunctionCallOutputContentItem::InputText { text },
+                    ..
+                } => texts.push(text),
+                RuntimeEvent::Result {
+                    error_text,
+                    output_loss,
+                    ..
+                } => {
+                    assert_eq!(error_text, None);
+                    assert_eq!(
+                        output_loss,
+                        Some(codex_code_mode_protocol::OutputLoss {
+                            discarded_items: 1,
+                            discarded_bytes_lower_bound: 40,
+                        })
+                    );
+                    break;
+                }
+                event => panic!("unexpected runtime event: {event:?}"),
+            }
+        }
+        assert_eq!(
+            texts,
+            vec![OUTPUT_LIMIT_MESSAGE.to_string(), "ok".to_string()]
         );
     }
 

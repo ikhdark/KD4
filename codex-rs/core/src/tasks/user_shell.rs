@@ -536,7 +536,12 @@ async fn execute_remote_user_shell_command(
         Ok(Ok(Err(err))) => return Err(UserShellExecError::Failed(format!("{err:?}"))),
         Ok(Ok(Ok(cleanup))) => cleanup,
     };
-    let process = Arc::clone(cleanup.process.as_ref().expect("startup owns process"));
+    // `RemoteShellCleanup::new` always owns the started process until disarmed.
+    let Some(process) = cleanup.process.as_ref().map(Arc::clone) else {
+        return Err(UserShellExecError::Failed(
+            "remote shell startup returned no process".to_string(),
+        ));
+    };
     let collect =
         collect_remote_user_shell_output(session, turn_context, Arc::clone(&process), call_id);
     let result = tokio::select! {

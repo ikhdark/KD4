@@ -13,6 +13,7 @@ use super::remote_plugin_canonical_marketplace_name;
 use crate::store::PLUGINS_CACHE_DIR;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
+use crate::store::is_reserved_plugin_cache_entry;
 use codex_login::CodexAuth;
 use codex_plugin::PluginId;
 use std::collections::BTreeMap;
@@ -600,7 +601,11 @@ fn remove_stale_remote_plugin_caches_since(
                     file_name
                 )
             })?;
-            if installed_plugin_names.contains(&plugin_name) {
+            // A mutation guard names only its plugin, while the store stages that plugin's
+            // transaction in a sibling entry; deleting it could strand the previous version.
+            if is_reserved_plugin_cache_entry(&plugin_name)
+                || installed_plugin_names.contains(&plugin_name)
+            {
                 continue;
             }
             if mutations
@@ -1079,6 +1084,64 @@ mod tests {
         .expect("cleanup after install guard is dropped");
         assert_eq!(removed, vec!["linear@openai-curated-remote".to_string()]);
         assert!(!cached_manifest.exists());
+    }
+
+    #[test]
+    fn stale_remote_plugin_cleanup_preserves_pending_store_transaction() {
+        let codex_home = tempfile::tempdir().expect("create codex home");
+        let sources = tempfile::tempdir().expect("create plugin sources");
+        let write_source = |version: &str| {
+            let root = sources.path().join(version);
+            std::fs::create_dir_all(root.join(".codex-plugin")).expect("create manifest dir");
+            std::fs::write(
+                root.join(".codex-plugin/plugin.json"),
+                format!(r#"{{"name":"linear","version":"{version}"}}"#),
+            )
+            .expect("write manifest");
+            codex_utils_absolute_path::AbsolutePathBuf::try_from(root).expect("absolute source")
+        };
+        let plugin_id = PluginId::new(
+            "linear".to_string(),
+            REMOTE_GLOBAL_MARKETPLACE_NAME.to_string(),
+        )
+        .expect("valid plugin id");
+        let store = PluginStore::new(codex_home.path().to_path_buf());
+        store
+            .install_with_version(write_source("1.0.0"), plugin_id.clone(), "1.0.0".to_string())
+            .expect("install previous version");
+        // A direct install registers only its plugin name, then stages beside the plugin root.
+        let mutation = mark_remote_plugin_cache_mutation_in_flight_inner(
+            codex_home.path(),
+            REMOTE_GLOBAL_MARKETPLACE_NAME,
+            "linear",
+            /*invalidates_snapshot*/ true,
+        );
+        let pending = store
+            .begin_install_with_version(
+                write_source("2.0.0"),
+                plugin_id.clone(),
+                "2.0.0".to_string(),
+            )
+            .expect("activate replacement before commit");
+        let stale = codex_home
+            .path()
+            .join(PLUGINS_CACHE_DIR)
+            .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
+            .join("stale");
+        std::fs::create_dir_all(&stale).expect("create stale plugin cache");
+
+        let removed = remove_stale_remote_plugin_caches(codex_home.path(), &BTreeMap::new())
+            .expect("cleanup while install is pending");
+
+        assert_eq!(removed, vec!["stale@openai-curated-remote".to_string()]);
+        assert!(!stale.exists());
+        // The interrupted install must still be able to restore the version it replaced.
+        drop(pending);
+        assert_eq!(
+            store.active_plugin_version(&plugin_id).as_deref(),
+            Some("1.0.0")
+        );
+        drop(mutation);
     }
 
     #[tokio::test]

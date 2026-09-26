@@ -189,20 +189,8 @@ pub async fn collect_git_info_assume_git_repo(cwd: &Path) -> GitInfo {
     git_info
 }
 
-/// Collect fetch remotes in a multi-root-friendly format: {"origin": "https://..."}.
-pub async fn get_git_remote_urls(cwd: &Path) -> Option<BTreeMap<String, String>> {
-    let is_git_repo = run_git_command_with_timeout(&["rev-parse", "--git-dir"], cwd)
-        .await?
-        .status
-        .success();
-    if !is_git_repo {
-        return None;
-    }
-
-    get_git_remote_urls_assume_git_repo(cwd).await
-}
-
-/// Collect fetch remotes without checking whether `cwd` is in a git repo.
+/// Collect fetch remotes in a multi-root-friendly format: {"origin": "https://..."},
+/// without checking whether `cwd` is in a git repo.
 pub async fn get_git_remote_urls_assume_git_repo(cwd: &Path) -> Option<BTreeMap<String, String>> {
     let output = run_git_command_with_timeout(&["remote", "-v"], cwd).await?;
     if !output.status.success() {
@@ -431,12 +419,14 @@ pub async fn recent_commits(cwd: &Path, limit: usize) -> Vec<CommitLogEntry> {
 
 /// Returns the closest git sha to HEAD that is on a remote as well as the diff to that sha.
 pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
-    get_git_repo_root(cwd)?;
+    // Tracked diffs cover the whole repository with root-relative paths, while untracked
+    // listings cover only the command directory with paths relative to it. Run from the root.
+    let root = get_git_repo_root(cwd)?;
 
-    let remotes = get_git_remotes(cwd).await?;
-    let branches = branch_ancestry(cwd).await?;
-    let base_sha = find_closest_sha(cwd, &branches, &remotes).await?;
-    let diff = diff_against_sha(cwd, &base_sha).await?;
+    let remotes = get_git_remotes(&root).await?;
+    let branches = branch_ancestry(&root).await?;
+    let base_sha = find_closest_sha(&root, &branches, &remotes).await?;
+    let diff = diff_against_sha(&root, &base_sha).await?;
 
     Some(GitDiffToRemote {
         sha: base_sha,
@@ -577,6 +567,11 @@ fn safe_directory_retry_args_os(
 }
 
 fn is_passive_git_inspection_os(args: &[OsString]) -> bool {
+    // `--literal-pathspecs` only changes how paths match; classify the command after it.
+    let args = match args {
+        [option, rest @ ..] if option == "--literal-pathspecs" => rest,
+        _ => args,
+    };
     let Some(command) = args.first().and_then(|arg| arg.to_str()) else {
         return false;
     };
@@ -1083,37 +1078,6 @@ fn find_ancestor_git_entry(base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
     }
 
     None
-}
-
-/// Returns a list of local git branches.
-/// Includes the default branch at the beginning of the list, if it exists.
-pub async fn local_git_branches(cwd: &Path) -> Vec<String> {
-    let mut branches: Vec<String> = if let Some(out) = run_git_command_with_timeout(
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-        cwd,
-    )
-    .await
-        && out.status.success()
-    {
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    branches.sort_unstable();
-
-    if let Some(base) = get_default_branch_local(cwd).await
-        && let Some(pos) = branches.iter().position(|name| name == &base)
-    {
-        let base_branch = branches.remove(pos);
-        branches.insert(0, base_branch);
-    }
-
-    branches
 }
 
 /// Returns the current checked out branch name.
@@ -1669,6 +1633,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diff_to_remote_from_subdirectory_keeps_repository_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _remote, _branch, _base_sha) = init_repo_with_remote(&temp);
+        let subdir = repo.join("sub");
+        std::fs::create_dir_all(&subdir).expect("create subdirectory");
+        std::fs::write(subdir.join("nested.txt"), "nested\n").expect("write nested file");
+        std::fs::write(repo.join("top.txt"), "top\n").expect("write top-level file");
+        std::fs::write(repo.join("tracked.txt"), "changed\n").expect("change tracked file");
+
+        let state = git_diff_to_remote(&subdir).await.expect("diff to remote");
+
+        for header in [
+            "diff --git a/sub/nested.txt b/sub/nested.txt",
+            "diff --git a/top.txt b/top.txt",
+            "diff --git a/tracked.txt b/tracked.txt",
+        ] {
+            assert!(
+                state.diff.contains(header),
+                "missing {header}:\n{}",
+                state.diff
+            );
+        }
+        assert!(
+            !state.diff.contains("diff --git a/nested.txt"),
+            "{}",
+            state.diff
+        );
+    }
+
+    #[tokio::test]
     async fn diff_to_remote_uses_merge_base_after_remote_diverges() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (repo, remote, branch, base_sha) = init_repo_with_remote(&temp);
@@ -1825,6 +1819,32 @@ mod tests {
                 .into_iter()
                 .any(|arg| arg.to_string_lossy() == expected_safe_directory)
         );
+        // Index-entry queries lead with a global pathspec option before `ls-files`.
+        let index_args = os_args(&[
+            "--literal-pathspecs",
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+            "a",
+        ]);
+        let index_retry = safe_directory_retry_args_os(
+            &index_args,
+            &subdir,
+            crate::FsmonitorOverride::Disabled,
+            false,
+            stderr,
+        )
+        .expect("literal-pathspec index queries should retry");
+        assert!(
+            index_retry
+                .iter()
+                .any(|arg| arg.to_string_lossy() == expected_safe_directory)
+        );
+        assert_eq!(
+            &index_retry[index_retry.len() - index_args.len()..],
+            index_args
+        );
 
         let outside = tempfile::tempdir().expect("create non-repo temp dir");
         assert!(
@@ -1856,6 +1876,7 @@ mod tests {
             &["push", "origin", "HEAD"][..],
             &["remote", "show", "origin"][..],
             &["submodule", "update", "--init"][..],
+            &["--literal-pathspecs", "add", "--", "a"][..],
         ] {
             let active_os_args = os_args(active_args);
             assert!(
@@ -1870,44 +1891,5 @@ mod tests {
                 "active Git command must not receive a safe.directory retry: {active_args:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn local_git_branches_excludes_detached_head_entry() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let repo = temp_dir.path();
-        let envs = vec![
-            ("GIT_CONFIG_GLOBAL", "/dev/null"),
-            ("GIT_CONFIG_NOSYSTEM", "1"),
-        ];
-        let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .envs(envs.clone())
-                .args(args)
-                .current_dir(repo)
-                .status()
-                .expect("run Git command");
-            assert_eq!(status.code(), Some(0), "Git command failed: {args:?}");
-        };
-
-        run_git(&["init", "-q", "--initial-branch=main"]);
-        run_git(&[
-            "-c",
-            "user.name=Codex Tests",
-            "-c",
-            "user.email=codex-tests@example.com",
-            "commit",
-            "--allow-empty",
-            "-q",
-            "-m",
-            "initial",
-        ]);
-        run_git(&["branch", "feature/local"]);
-        run_git(&["checkout", "--detach", "-q"]);
-
-        assert_eq!(
-            local_git_branches(repo).await,
-            vec!["main".to_string(), "feature/local".to_string()]
-        );
     }
 }

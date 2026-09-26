@@ -63,69 +63,19 @@ pub struct SharedCliOptions {
 }
 
 impl SharedCliOptions {
+    /// Merges these subcommand options over `root`, as
+    /// [`Self::apply_subcommand_overrides`] does for resumed sessions.
     pub fn inherit_exec_root_options(&mut self, root: &Self) {
-        let self_selected_sandbox_mode =
-            self.sandbox_mode.is_some() || self.dangerously_bypass_approvals_and_sandbox;
-        let Self {
-            images,
-            model,
-            oss,
-            oss_provider,
-            config_profile_v2,
-            sandbox_mode,
-            dangerously_bypass_approvals_and_sandbox,
-            bypass_hook_trust,
-            cwd,
-            add_dir,
-        } = self;
-        let Self {
-            images: root_images,
-            model: root_model,
-            oss: root_oss,
-            oss_provider: root_oss_provider,
-            config_profile_v2: root_config_profile_v2,
-            sandbox_mode: root_sandbox_mode,
-            dangerously_bypass_approvals_and_sandbox: root_dangerously_bypass_approvals_and_sandbox,
-            bypass_hook_trust: root_bypass_hook_trust,
-            cwd: root_cwd,
-            add_dir: root_add_dir,
-        } = root;
-
-        if model.is_none() {
-            model.clone_from(root_model);
-        }
-        if *root_oss {
-            *oss = true;
-        }
-        if oss_provider.is_none() {
-            oss_provider.clone_from(root_oss_provider);
-        }
-        if config_profile_v2.is_none() {
-            config_profile_v2.clone_from(root_config_profile_v2);
-        }
-        if !self_selected_sandbox_mode {
-            *sandbox_mode = *root_sandbox_mode;
-            *dangerously_bypass_approvals_and_sandbox =
-                *root_dangerously_bypass_approvals_and_sandbox;
-        }
-        if !*bypass_hook_trust {
-            *bypass_hook_trust = *root_bypass_hook_trust;
-        }
-        if cwd.is_none() {
-            cwd.clone_from(root_cwd);
-        }
-        if !root_images.is_empty() {
-            let mut merged_images = root_images.clone();
-            merged_images.append(images);
-            *images = merged_images;
-        }
-        if !root_add_dir.is_empty() {
-            let mut merged_add_dir = root_add_dir.clone();
-            merged_add_dir.append(add_dir);
-            *add_dir = merged_add_dir;
-        }
+        let subcommand = std::mem::replace(self, root.clone());
+        self.apply_subcommand_overrides(subcommand);
     }
 
+    /// Layers options given after a subcommand over these root options.
+    ///
+    /// Values set on the subcommand win, the sandbox selection (`--sandbox` or
+    /// `--dangerously-bypass-approvals-and-sandbox`) is replaced as a unit,
+    /// flags stay enabled if either level set them, and lists append the
+    /// subcommand's entries after the root's.
     pub fn apply_subcommand_overrides(&mut self, subcommand: Self) {
         let subcommand_selected_sandbox_mode = subcommand.sandbox_mode.is_some()
             || subcommand.dangerously_bypass_approvals_and_sandbox;
@@ -166,7 +116,7 @@ impl SharedCliOptions {
             self.cwd = Some(cwd);
         }
         if !images.is_empty() {
-            self.images = images;
+            self.images.extend(images);
         }
         if !add_dir.is_empty() {
             self.add_dir.extend(add_dir);
@@ -222,5 +172,73 @@ mod tests {
                 expected_bypass
             );
         }
+    }
+
+    #[test]
+    fn root_and_subcommand_images_merge_in_both_directions() {
+        let root = Cli::try_parse_from(["codex", "-i", "root.png"])
+            .expect("root args")
+            .shared;
+        let child = Cli::try_parse_from(["codex", "-i", "child.png"])
+            .expect("child args")
+            .shared;
+
+        let mut exec_child = child.clone();
+        exec_child.inherit_exec_root_options(&root);
+        let mut resumed = root.clone();
+        resumed.apply_subcommand_overrides(child);
+
+        let expected = vec![PathBuf::from("root.png"), PathBuf::from("child.png")];
+        assert_eq!(exec_child.images, expected);
+        assert_eq!(resumed.images, expected);
+    }
+
+    #[test]
+    fn exec_child_values_win_and_root_values_fill_gaps() {
+        let root = Cli::try_parse_from([
+            "codex",
+            "-m",
+            "root-model",
+            "-C",
+            "root-dir",
+            "--add-dir",
+            "root-extra",
+            "--oss",
+            "--local-provider",
+            "ollama",
+        ])
+        .expect("root args")
+        .shared;
+        let mut child = Cli::try_parse_from([
+            "codex",
+            "-m",
+            "child-model",
+            "--add-dir",
+            "child-extra",
+            "--dangerously-bypass-hook-trust",
+        ])
+        .expect("child args")
+        .shared;
+
+        child.inherit_exec_root_options(&root);
+
+        assert_eq!(
+            (
+                child.model.as_deref(),
+                child.cwd,
+                child.add_dir,
+                child.oss,
+                child.oss_provider.as_deref(),
+                child.bypass_hook_trust,
+            ),
+            (
+                Some("child-model"),
+                Some(PathBuf::from("root-dir")),
+                vec![PathBuf::from("root-extra"), PathBuf::from("child-extra")],
+                true,
+                Some("ollama"),
+                true,
+            )
+        );
     }
 }

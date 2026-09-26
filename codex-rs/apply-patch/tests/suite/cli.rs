@@ -312,7 +312,7 @@ fn test_apply_patch_cli_requires_exact_removed_indentation() -> anyhow::Result<(
 }
 
 #[test]
-fn test_apply_patch_cli_reports_committed_files_on_failure() -> anyhow::Result<()> {
+fn test_apply_patch_cli_rejects_stale_later_update_before_writes() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     fs::write(tmp.path().join("first.txt"), "before\n")?;
     fs::write(tmp.path().join("second.txt"), "current\n")?;
@@ -322,16 +322,13 @@ fn test_apply_patch_cli_reports_committed_files_on_failure() -> anyhow::Result<(
         .assert()
         .failure();
     let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
-    assert!(
-        stderr.contains("Patch failed after applying these changes:"),
-        "{stderr}"
+    assert!(stderr.contains("PatchContextMismatch"), "{stderr}");
+    assert!(stderr.contains("second.txt"), "{stderr}");
+    assert!(!stderr.contains("Patch failed after applying"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("first.txt"))?,
+        "before\n"
     );
-    assert!(
-        stderr.contains(&format!("M {}", tmp.path().join("first.txt").display())),
-        "{stderr}"
-    );
-    assert!(stderr.contains("remaining changes"), "{stderr}");
-    assert_eq!(fs::read_to_string(tmp.path().join("first.txt"))?, "after\n");
     assert_eq!(
         fs::read_to_string(tmp.path().join("second.txt"))?,
         "current\n"
@@ -413,8 +410,11 @@ fn test_apply_patch_cli_rejects_overlapping_eof_chunks() -> anyhow::Result<()> {
 #[test]
 fn test_apply_patch_cli_reports_committed_prefix() -> anyhow::Result<()> {
     let tmp = tempdir()?;
+    // Preflight cannot see that a directory blocks this add; the write fails
+    // after the first hunk has already been committed.
+    fs::create_dir(tmp.path().join("blocked"))?;
     let output = apply_patch_command()?
-        .arg("*** Begin Patch\n*** Add File: created.txt\n+created\n*** Delete File: missing.txt\n*** End Patch")
+        .arg("*** Begin Patch\n*** Add File: created.txt\n+created\n*** Add File: blocked\n+never written\n*** End Patch")
         .current_dir(tmp.path()).assert().failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
     assert!(
@@ -433,7 +433,7 @@ fn test_apply_patch_cli_reports_committed_prefix() -> anyhow::Result<()> {
         fs::read_to_string(tmp.path().join("created.txt"))?,
         "created\n"
     );
-    assert!(!tmp.path().join("missing.txt").exists());
+    assert!(tmp.path().join("blocked").is_dir());
     Ok(())
 }
 

@@ -831,12 +831,22 @@ impl DirectFileSystem {
     ) -> FileSystemResult<FileMetadata> {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
-        let metadata = tokio::fs::metadata(path.as_path()).await?;
-        let symlink_metadata = tokio::fs::symlink_metadata(path.as_path()).await?;
+        // One blocking task. A path that is not a link is its own target, so
+        // only links need a second, target-following query.
+        let (metadata, is_symlink) = tokio::task::spawn_blocking(move || {
+            let symlink_metadata = std::fs::symlink_metadata(path.as_path())?;
+            if symlink_metadata.file_type().is_symlink() {
+                Ok::<_, io::Error>((std::fs::metadata(path.as_path())?, true))
+            } else {
+                Ok((symlink_metadata, false))
+            }
+        })
+        .await
+        .map_err(io::Error::other)??;
         Ok(FileMetadata {
             is_directory: metadata.is_dir(),
             is_file: metadata.is_file(),
-            is_symlink: symlink_metadata.file_type().is_symlink(),
+            is_symlink,
             size: metadata.len(),
             created_at_ms: metadata.created().ok().map_or(0, system_time_to_unix_ms),
             modified_at_ms: metadata.modified().ok().map_or(0, system_time_to_unix_ms),
@@ -1263,8 +1273,14 @@ fn read_directory_sync(
         };
         let entry = entry?;
         entries_examined += 1;
-        // Preserve fresh, target-following metadata and count even skipped entries.
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+        // Enumeration already describes an entry that is not a link. Links
+        // follow their target; entries whose target cannot be read (dangling
+        // links) are skipped but still counted.
+        let metadata = match entry.file_type() {
+            Ok(file_type) if !file_type.is_symlink() => entry.metadata(),
+            _ => std::fs::metadata(entry.path()),
+        };
+        let Ok(metadata) = metadata else {
             continue;
         };
         entries.push(ReadDirectoryEntry {

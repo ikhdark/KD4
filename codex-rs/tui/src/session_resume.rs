@@ -226,12 +226,19 @@ mod tests {
     #[tokio::test]
     async fn thread_id_lookup_stops_before_unreadable_transcript() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("rollout.jsonl");
+        let path = temp_dir.path().join("rollout.jsonl.zst");
         let id = ThreadId::new();
-        let mut bytes = serde_json::to_vec(&serde_json::json!({
+        let mut block = serde_json::to_vec(&serde_json::json!({
             "type": "session_meta", "payload": {"id": id, "cwd": temp_dir.path()}
         }))?;
-        bytes.extend_from_slice(b"\n\xff\n");
+        block.push(b'\n');
+        block.resize(128 * 1024, b' ');
+        // A zstd frame with a 128 KiB window and one full, non-final raw block.
+        // The valid first line precedes a reserved block type, which is a real
+        // read error (unlike malformed UTF-8, intentionally decoded lossily).
+        let mut bytes = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38, 0x00, 0x00, 0x10];
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&[0x07, 0x00, 0x00]);
         std::fs::write(&path, bytes)?;
         assert_eq!(resolve_session_thread_id(&path, None).await, Some(id));
         assert!(read_rollout_resume_state(&path).await.is_err());

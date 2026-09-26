@@ -248,37 +248,6 @@ impl PreparedPromptItems {
 pub(crate) type SharedPromptProjections = [Arc<[ResponseItem]>; 4];
 
 #[derive(Clone, Debug)]
-struct CompactedPromptProjections([PreparedPromptItems; 4]);
-
-impl CompactedPromptProjections {
-    fn shared(&self) -> SharedPromptProjections {
-        std::array::from_fn(|index| self.0[index].shared())
-    }
-
-    fn appended(&self, suffix: Arc<[ResponseItem]>) -> Self {
-        let compacted_suffix = compact_acknowledged_tool_search_outputs(suffix);
-        let mut advanced = Vec::<PreparedPromptItems>::with_capacity(4);
-        for (index, projection) in self.0.iter().enumerate() {
-            if let Some(prior_index) = self.0[..index]
-                .iter()
-                .position(|prior| prior.shares_storage_with(projection))
-            {
-                advanced.push(advanced[prior_index].clone());
-                continue;
-            }
-
-            advanced.push(projection.appended(Arc::clone(&compacted_suffix)));
-        }
-
-        Self(
-            advanced
-                .try_into()
-                .unwrap_or_else(|_| unreachable!("prompt projections have a fixed width")),
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct PreparedPromptInput {
     items: PreparedPromptItems,
     fallback_items: PreparedPromptItems,
@@ -290,7 +259,6 @@ pub(crate) struct PreparedPromptInput {
     prompt_provenance: PromptProvenanceSidecar,
     fingerprint: Option<PreparedHistoryFingerprint>,
     policy: PreparedHistoryPolicy,
-    compacted_tool_search_outputs: Arc<OnceLock<CompactedPromptProjections>>,
     /// Aggregate-output-budget drops for the four representations above, in
     /// `[items, fallback_items, unreplaced_items, unreplaced_fallback_items]`
     /// order. Preparing an unchanged projection again leaves these untouched.
@@ -352,52 +320,19 @@ impl PreparedPromptInput {
             .map(|fingerprint| fingerprint.digest)
     }
 
-    pub(crate) fn compacted_tool_search_outputs(
-        &self,
-        mut build: impl FnMut(Arc<[ResponseItem]>) -> Arc<[ResponseItem]>,
-    ) -> SharedPromptProjections {
-        self.compacted_tool_search_outputs
-            .get_or_init(|| {
-                let projections = [
-                    &self.items,
-                    &self.fallback_items,
-                    &self.unreplaced_items,
-                    &self.unreplaced_fallback_items,
-                ];
-                let mut compacted_by_source =
-                    Vec::<(PreparedPromptItems, PreparedPromptItems)>::with_capacity(4);
-                let compacted = std::array::from_fn(|index| {
-                    let source = projections[index];
-                    if let Some((_, compacted)) = compacted_by_source
-                        .iter()
-                        .find(|(candidate, _)| candidate.shares_storage_with(source))
-                    {
-                        return compacted.clone();
-                    }
-
-                    let compacted = PreparedPromptItems::from_shared(build(source.shared()));
-                    compacted_by_source.push((source.clone(), compacted.clone()));
-                    compacted
-                });
-                CompactedPromptProjections(compacted)
-            })
-            .shared()
+    /// The four representations in `Prompt` input order: items, stable-context
+    /// fallback, tool-history fallback, and both fallbacks. Acknowledged
+    /// tool-search schemas keep their bytes because they are part of the cached
+    /// prefix. Projections sharing storage share one flattened copy, which is
+    /// also the one retry bookkeeping holds.
+    pub(crate) fn shared_prompt_projections(&self) -> SharedPromptProjections {
+        [
+            self.items.shared(),
+            self.fallback_items.shared(),
+            self.unreplaced_items.shared(),
+            self.unreplaced_fallback_items.shared(),
+        ]
     }
-
-    #[cfg(test)]
-    pub(crate) fn compacted_tool_search_outputs_are_materialized(&self) -> Option<[bool; 4]> {
-        self.compacted_tool_search_outputs
-            .get()
-            .map(|projections| std::array::from_fn(|index| projections.0[index].is_materialized()))
-    }
-}
-
-pub(crate) fn compact_acknowledged_tool_search_outputs(
-    input: Arc<[ResponseItem]>,
-) -> Arc<[ResponseItem]> {
-    // Search schemas are part of the cached conversation prefix. Keep their
-    // original bytes after acknowledgement, just like every other result.
-    input
 }
 
 #[derive(Clone, Debug)]
@@ -815,7 +750,6 @@ impl ContextManager {
             prompt_provenance,
             fingerprint,
             policy,
-            compacted_tool_search_outputs: Arc::new(OnceLock::new()),
             // Filled by `apply_tool_history_projection`, which is where the
             // aggregate budget actually runs.
             tool_output_budget_drops: Default::default(),
@@ -1943,10 +1877,6 @@ impl ContextManager {
             .prepared
             .prompt_provenance
             .with_appended_items(&append, &entry.prepared.stable_context_manifest);
-        let compacted_tool_search_outputs = Arc::new(OnceLock::new());
-        if let Some(compacted) = entry.prepared.compacted_tool_search_outputs.get() {
-            let _ = compacted_tool_search_outputs.set(compacted.appended(Arc::clone(&append)));
-        }
         *self
             .prepared_history
             .lock()
@@ -1966,7 +1896,6 @@ impl ContextManager {
                 prompt_provenance,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
-                compacted_tool_search_outputs,
                 // Appending items does not re-run the aggregate budget, so the
                 // cached attribution carries forward unchanged.
                 tool_output_budget_drops: entry.prepared.tool_output_budget_drops,
@@ -2084,7 +2013,6 @@ fn apply_tool_history_projection(
         prepared.policy,
     )
     .ok();
-    prepared.compacted_tool_search_outputs = Arc::new(OnceLock::new());
     prepared
 }
 

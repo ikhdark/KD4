@@ -1129,6 +1129,118 @@ fn durably_persisted_outer_output_closes_canceled_direct_and_nested_calls() {
     assert!(closure.complete);
 }
 
+fn record_finished_tool(
+    state: &TurnTimingState,
+    call_id: &str,
+    source: TurnTimingToolCallSource,
+    parent_call_id: Option<&str>,
+    execution_id: &ToolExecutionId,
+) {
+    state.record_tool_dispatch_timing(
+        call_id,
+        "write_stdin",
+        source,
+        ToolCallTimingLineage {
+            parent_call_id,
+            ..ToolCallTimingLineage::default()
+        },
+        ToolDispatchTimingSnapshot {
+            execution_id: execution_id.clone(),
+            outcome: Some("success"),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn code_mode_wait_result_attests_nested_calls_it_delivers() {
+    use TurnTimingToolCallSource::CodeMode;
+    use TurnTimingToolCallSource::Direct;
+
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let next_generation = || {
+        state.begin_model_generation(
+            &mut Some(ContinuationCause::ToolResult),
+            &SessionSource::Cli,
+        );
+        drop(state.begin_model_request_wait());
+    };
+    let parent = Some("exec-call");
+
+    // Generation 0: the exec yields while its cell keeps a nested call running.
+    drop(state.begin_model_request_wait());
+    let exec = ToolExecutionId("exec-execution".to_string());
+    state.record_accepted_tool_call("exec-call", &exec, Direct, None);
+    let first = ToolExecutionId("first-nested-execution".to_string());
+    state.record_accepted_tool_call("exec-1-tool-1", &first, CodeMode, parent);
+    record_finished_tool(&state, "exec-1-tool-1", CodeMode, parent, &first);
+    let second = ToolExecutionId("second-nested-execution".to_string());
+    state.record_accepted_tool_call("exec-1-tool-2", &second, CodeMode, parent);
+    record_finished_tool(&state, "exec-call", Direct, None, &exec);
+    state.record_tool_result_persistence_queued("exec-call");
+
+    // Generation 1: the first wait returns while the cell's next call runs.
+    next_generation();
+    let first_wait = ToolExecutionId("first-wait-execution".to_string());
+    state.record_accepted_tool_call("wait-call-1", &first_wait, Direct, None);
+    record_finished_tool(&state, "exec-1-tool-2", CodeMode, parent, &second);
+    let third = ToolExecutionId("third-nested-execution".to_string());
+    state.record_accepted_tool_call("exec-1-tool-3", &third, CodeMode, parent);
+    state.record_code_mode_wait_delivery("wait-call-1", "exec-call");
+    record_finished_tool(&state, "wait-call-1", Direct, None, &first_wait);
+    state.record_tool_result_persistence_queued("wait-call-1");
+
+    // Generation 2: the second wait delivers the third call; a fourth runs on.
+    next_generation();
+    let second_wait = ToolExecutionId("second-wait-execution".to_string());
+    state.record_accepted_tool_call("wait-call-2", &second_wait, Direct, None);
+    record_finished_tool(&state, "exec-1-tool-3", CodeMode, parent, &third);
+    let fourth = ToolExecutionId("fourth-nested-execution".to_string());
+    state.record_accepted_tool_call("exec-1-tool-4", &fourth, CodeMode, parent);
+    state.record_code_mode_wait_delivery("wait-call-2", "exec-call");
+    record_finished_tool(&state, "wait-call-2", Direct, None, &second_wait);
+    state.record_tool_result_persistence_queued("wait-call-2");
+    state.record_queued_tool_results_persisted();
+
+    // The exec projection attests its own generation's children exactly once,
+    // the second wait attests the third call, and the running call stays open.
+    let closure = state.tool_closure_snapshot();
+    assert_eq!(closure.persisted_count, 6);
+    assert_eq!(closure.duplicate_persistence_count, 0);
+    assert_eq!(
+        closure
+            .unresolved_calls
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["exec-1-tool-4"]
+    );
+
+    // Generation 3: the last wait delivers the fourth call and closes the
+    // ledger without waiting out the terminal publication timeout.
+    next_generation();
+    let third_wait = ToolExecutionId("third-wait-execution".to_string());
+    state.record_accepted_tool_call("wait-call-3", &third_wait, Direct, None);
+    record_finished_tool(&state, "exec-1-tool-4", CodeMode, parent, &fourth);
+    state.record_code_mode_wait_delivery("wait-call-3", "exec-call");
+    record_finished_tool(&state, "wait-call-3", Direct, None, &third_wait);
+    state.record_tool_result_persistence_queued("wait-call-3");
+    state.record_queued_tool_results_persisted();
+    state.record_tool_call_acceptance_closed();
+
+    let closure = tokio::time::timeout(
+        Duration::from_secs(1),
+        state.wait_for_tool_closure_after_seal(),
+    )
+    .await
+    .expect("delivered nested calls should close the tool ledger");
+    assert_eq!(closure.accepted_count, 8);
+    assert_eq!(closure.persisted_count, 8);
+    assert_eq!(closure.duplicate_persistence_count, 0);
+    assert!(closure.complete);
+}
+
 #[test]
 fn model_visibility_does_not_attest_tool_result_persistence() {
     let (_clock, state) = timing();
@@ -2847,7 +2959,7 @@ fn persistence_batch_only_attests_its_captured_execution() {
     state.state().current_generation_index = Some(99);
     let second = ToolExecutionId("second".into());
     state.record_accepted_tool_call("reused", &second, TurnTimingToolCallSource::Direct, None);
-    state.record_tool_result_executions_queued(&[first.clone(), second.clone()]);
+    state.record_tool_result_executions_queued(&[first, second.clone()]);
     state.record_tool_result_executions_persisted(&batch);
     let closure = state.tool_closure_snapshot();
     assert_eq!(closure.persisted_count, 1);

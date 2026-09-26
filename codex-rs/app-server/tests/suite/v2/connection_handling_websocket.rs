@@ -40,7 +40,6 @@ use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -327,12 +326,15 @@ async fn thread_start_routes_project_exec_policy_warning_to_requester() -> Resul
                 .and_then(serde_json::Value::as_str)
                 == Some(warning_summary)
     };
-    let mut response = None;
+    let mut error = None;
     let mut warning = None;
-    while response.is_none() || warning.is_none() {
+    while error.is_none() || warning.is_none() {
         match read_jsonrpc_message(&mut requester).await? {
+            JSONRPCMessage::Error(candidate) if candidate.id == target_id => {
+                error = Some(candidate);
+            }
             JSONRPCMessage::Response(candidate) if candidate.id == target_id => {
-                response = Some(candidate);
+                bail!("thread/start must reject malformed execution rules");
             }
             JSONRPCMessage::Notification(candidate) if is_exec_policy_warning(&candidate) => {
                 warning = Some(candidate);
@@ -341,7 +343,9 @@ async fn thread_start_routes_project_exec_policy_warning_to_requester() -> Resul
         }
     }
 
-    let _: ThreadStartResponse = to_response(response.context("missing thread/start response")?)?;
+    let error = error.context("missing thread/start rejection")?;
+    assert!(error.error.message.contains("failed to load rules"));
+    assert!(error.error.message.contains("broken.rules"));
     let warning: ConfigWarningNotification = serde_json::from_value(
         warning
             .context("missing exec-policy configWarning")?
@@ -668,38 +672,9 @@ async fn websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_tim
     Ok(())
 }
 
-pub(super) struct WebSocketServerProcess {
-    child: Child,
-    #[cfg(windows)]
-    process_root: codex_utils_pty::ManagedRootProcess,
-}
-
-impl std::ops::Deref for WebSocketServerProcess {
-    type Target = Child;
-
-    fn deref(&self) -> &Self::Target {
-        &self.child
-    }
-}
-
-impl std::ops::DerefMut for WebSocketServerProcess {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.child
-    }
-}
-
-impl WebSocketServerProcess {
-    pub(super) async fn kill(&mut self) -> std::io::Result<()> {
-        #[cfg(windows)]
-        {
-            // Killing only the parent can strand suspended children holding inherited pipes.
-            self.process_root.terminate()?;
-            self.child.wait().await.map(|_| ())
-        }
-        #[cfg(not(windows))]
-        self.child.kill().await
-    }
-}
+/// Killing only the parent can strand children holding inherited pipes, so the
+/// websocket app-server owns its whole process tree.
+pub(super) type WebSocketServerProcess = core_test_support::process::ContainedChild;
 
 pub(super) async fn spawn_websocket_server(
     codex_home: &Path,
@@ -779,24 +754,8 @@ async fn spawn_websocket_server_with_options(
             cmd.env("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", value);
         }
     }
-    #[cfg(windows)]
-    let process_root = {
-        let root = codex_utils_pty::ManagedRootProcess::reserve()?;
-        root.require_descendant_containment()?;
-        cmd.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
-        root
-    };
-    let child = cmd
-        .kill_on_drop(true)
-        .spawn()
+    let mut process = WebSocketServerProcess::spawn(&mut cmd)
         .context("failed to spawn websocket app-server process")?;
-    #[cfg(windows)]
-    process_root.attach_and_resume(child.id().expect("app-server process id"))?;
-    let mut process = WebSocketServerProcess {
-        child,
-        #[cfg(windows)]
-        process_root,
-    };
 
     let stderr = process
         .stderr

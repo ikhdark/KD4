@@ -21,6 +21,10 @@ pub const OPENAI_FILE_URI_PREFIX: &str = "sediment://";
 pub const OPENAI_FILE_UPLOAD_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 
 const OPENAI_FILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Slowest sustained blob-upload rate still treated as progress. The upload's
+/// whole-request timeout grows with the file so files up to the size limit remain
+/// uploadable on ordinary uplinks while a stalled transfer is still bounded.
+const OPENAI_FILE_UPLOAD_MIN_BYTES_PER_SECOND: u64 = 256 * 1024;
 const OPENAI_FILE_FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENAI_FILE_FINALIZE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const OPENAI_FILE_USE_CASE: &str = "codex";
@@ -247,7 +251,7 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
     let upload_result: Result<UploadedOpenAiFile, OpenAiFileError> = async {
         let upload_response = http_clients
             .request(Method::PUT, &create_payload.upload_url)
-            .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
+            .timeout(openai_file_upload_timeout(file_size_bytes))
             .header("x-ms-blob-type", "BlockBlob")
             .header(CONTENT_LENGTH, file_size_bytes)
             .body_stream(contents)
@@ -376,6 +380,12 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
     }
 }
 
+fn openai_file_upload_timeout(file_size_bytes: u64) -> Duration {
+    OPENAI_FILE_REQUEST_TIMEOUT.saturating_add(Duration::from_secs(
+        file_size_bytes.div_ceil(OPENAI_FILE_UPLOAD_MIN_BYTES_PER_SECOND),
+    ))
+}
+
 fn authorized_request(
     http_clients: &RouteAwareClientPool,
     auth: &dyn AuthProvider,
@@ -492,6 +502,18 @@ mod tests {
             ChatGptTestAuth.add_auth_headers(headers);
             Ok(())
         }
+    }
+
+    #[test]
+    fn upload_timeout_scales_so_the_size_limit_is_uploadable() {
+        assert_eq!(openai_file_upload_timeout(0), OPENAI_FILE_REQUEST_TIMEOUT);
+        assert_eq!(
+            openai_file_upload_timeout(5),
+            OPENAI_FILE_REQUEST_TIMEOUT + Duration::from_secs(1)
+        );
+        // A full-size file at 2 Mbit/s (256 KiB/s) must not exhaust the request timeout.
+        let full_size_transfer = Duration::from_secs(OPENAI_FILE_UPLOAD_LIMIT_BYTES / (256 * 1024));
+        assert!(openai_file_upload_timeout(OPENAI_FILE_UPLOAD_LIMIT_BYTES) > full_size_transfer);
     }
 
     #[tokio::test]
@@ -689,6 +711,10 @@ mod tests {
                         "{policy_name} failed with invalid {ca_env}\nstdout:\n{}\nstderr:\n{}",
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr),
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                        "{policy_name} with invalid {ca_env}: the child must execute its assertions"
                     );
                 }
             }

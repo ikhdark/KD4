@@ -265,23 +265,8 @@ pub(crate) fn model_provider_cache_identity_for_auth_identity(
             .collect()
     }
 
-    let uses_chatgpt_endpoint = matches!(
-        auth_identity.auth_mode,
-        Some(
-            codex_protocol::auth::AuthMode::Chatgpt
-                | codex_protocol::auth::AuthMode::ChatgptAuthTokens
-                | codex_protocol::auth::AuthMode::Headers
-                | codex_protocol::auth::AuthMode::AgentIdentity
-                | codex_protocol::auth::AuthMode::PersonalAccessToken
-        )
-    );
-    let effective_base_url = normalize_base_url(provider_info.base_url.as_deref().unwrap_or(
-        if uses_chatgpt_endpoint {
-            codex_model_provider_info::CHATGPT_CODEX_BASE_URL
-        } else {
-            "https://api.openai.com/v1"
-        },
-    ));
+    let effective_base_url =
+        normalize_base_url(provider_info.effective_base_url(auth_identity.auth_mode));
     let query_parameters = provider_info
         .query_params
         .as_ref()

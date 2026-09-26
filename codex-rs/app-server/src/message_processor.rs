@@ -743,6 +743,7 @@ impl MessageProcessor {
         }
         self.outgoing.connection_closed(connection_id).await;
         self.fs_processor.connection_closed(connection_id).await;
+        self.search_processor.connection_closed(connection_id).await;
         self.command_exec_processor
             .connection_closed(connection_id)
             .await;
@@ -1461,17 +1462,17 @@ impl MessageProcessor {
                 .map(|response| Some(response.into())),
             ClientRequest::FuzzyFileSearchSessionStart { params, .. } => self
                 .search_processor
-                .fuzzy_file_search_session_start_response(params)
+                .fuzzy_file_search_session_start_response(connection_id, params)
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::FuzzyFileSearchSessionUpdate { params, .. } => self
                 .search_processor
-                .fuzzy_file_search_session_update_response(params)
+                .fuzzy_file_search_session_update_response(connection_id, params)
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::FuzzyFileSearchSessionStop { params, .. } => self
                 .search_processor
-                .fuzzy_file_search_session_stop(params)
+                .fuzzy_file_search_session_stop(connection_id, params)
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::OneOffCommandExec { params, .. } => {

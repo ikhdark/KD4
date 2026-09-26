@@ -27,25 +27,15 @@ impl JsonLogCapture {
     }
 
     pub(crate) async fn wait_for_event(&self, event_name: &str) -> Result<Value> {
-        let mut events = self.wait_for_events(event_name, /*count*/ 1).await?;
-        Ok(events.remove(0))
-    }
-
-    pub(crate) async fn wait_for_events(
-        &self,
-        event_name: &str,
-        count: usize,
-    ) -> Result<Vec<Value>> {
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let updated = self.updated.notified();
-                let events = self
+                if let Some(event) = self
                     .events()?
                     .into_iter()
-                    .filter(|event| event["fields"]["event.name"].as_str() == Some(event_name))
-                    .collect::<Vec<_>>();
-                if events.len() >= count {
-                    return Ok(events);
+                    .find(|event| event["fields"]["event.name"].as_str() == Some(event_name))
+                {
+                    return Ok(event);
                 }
                 updated.await;
             }
@@ -60,7 +50,7 @@ impl JsonLogCapture {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .join("\n");
                 anyhow::bail!(
-                    "timed out waiting for {count} JSON log event(s) named `{event_name}`; captured stderr:\n{lines}"
+                    "timed out waiting for a JSON log event named `{event_name}`; captured stderr:\n{lines}"
                 )
             }
         }
@@ -87,6 +77,7 @@ pub fn app_server_json_shutdown_event(
     let output = Command::new(codex_utils_cargo_bin::cargo_bin(binary)?)
         .stdin(Stdio::null())
         .env("CODEX_HOME", codex_home)
+        .env_remove("CODEX_SQLITE_HOME")
         .env("LOG_FORMAT", "json")
         .env("RUST_LOG", "codex_app_server=info")
         .args(args)

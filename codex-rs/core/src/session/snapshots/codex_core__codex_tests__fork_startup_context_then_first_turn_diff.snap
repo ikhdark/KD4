@@ -1,18 +1,23 @@
 ---
 source: core/src/session/tests.rs
-assertion_line: 4533
+assertion_line: 4727
 expression: snapshot
 ---
 Scenario: First request after fork when startup preserves the parent baseline, the fork changes approval policy, and the first forked turn enters plan mode.
 
 ## First Forked Turn Request
-00:message/developer:<collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
-01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
-03:message/developer:<PERMISSIONS_INSTRUCTIONS>
-04:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the use...
-05:message/developer:<NO_TEXT>
-06:message/developer:<personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-07:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-08:message/user:fork seed
-09:message/user:after fork
+00:message/developer[4]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <configured_developer_instructions state="removed" />
+    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [04] <skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the use...
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:message/user:fork seed
+05:message/developer[2]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
+06:message/user:after fork

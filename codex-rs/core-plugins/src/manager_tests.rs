@@ -4942,6 +4942,62 @@ source = "{remote_repo_url}"
 }
 
 #[tokio::test]
+async fn configured_marketplace_upgrade_notifies_host_after_reinstalling_configured_plugin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote_repo = tmp.path().join("remote-marketplace");
+    let remote_repo_url = url::Url::from_directory_path(&remote_repo)
+        .unwrap()
+        .to_string();
+    write_file(
+        &remote_repo.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"debug","plugins":[{"name":"sample","source":{"source":"local","path":"./plugins/sample"}}]}"#,
+    );
+    write_curated_plugin(&remote_repo, "sample");
+    init_git_repo(&remote_repo);
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        &format!(
+            r#"[features]
+plugins = true
+
+[marketplaces.debug]
+source_type = "git"
+source = "{remote_repo_url}"
+
+[plugins."sample@debug"]
+enabled = true
+"#
+        ),
+    );
+    let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let on_effective_plugins_changed = EffectivePluginsChangedNotifier::capture(Some({
+        let notifications = Arc::clone(&notifications);
+        Arc::new(move || {
+            notifications.fetch_add(1, Ordering::SeqCst);
+        })
+    }));
+
+    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let config = load_config(tmp.path(), tmp.path()).await;
+    let upgrade = manager
+        .upgrade_configured_marketplaces(
+            &config,
+            /*marketplace_name*/ None,
+            on_effective_plugins_changed.as_ref(),
+        )
+        .expect("marketplace install should succeed");
+
+    assert_eq!(upgrade.errors, Vec::new());
+    assert_eq!(upgrade.upgraded_roots.len(), 1);
+    assert!(
+        manager
+            .store
+            .is_installed(&PluginId::parse("sample@debug").unwrap())
+    );
+    assert_eq!(notifications.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn list_marketplaces_uses_config_when_known_registry_is_malformed() {
     let tmp = tempfile::tempdir().unwrap();
     let marketplace_root = marketplace_install_root(tmp.path()).join("debug");
@@ -6671,6 +6727,7 @@ enabled=true"#,
         &config,
         &roots,
         NonCuratedCacheRefreshMode::IfVersionChanged,
+        /*on_effective_plugins_changed*/ None,
     );
     assert!(
         manager
@@ -6709,6 +6766,7 @@ enabled=true"#,
         &config,
         &roots,
         NonCuratedCacheRefreshMode::IfVersionChanged,
+        /*on_effective_plugins_changed*/ None,
     );
     wait();
     assert!(
@@ -6727,6 +6785,7 @@ enabled=true"#,
         &config,
         &roots,
         NonCuratedCacheRefreshMode::IfVersionChanged,
+        /*on_effective_plugins_changed*/ None,
     );
     wait();
     assert!(
@@ -6741,6 +6800,108 @@ enabled=true"#,
         manager.store.active_plugin_version(&plugin_id).as_deref(),
         Some("2.0.0")
     );
+}
+
+async fn wait_for_non_curated_refresh_idle(manager: &PluginsManager) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while manager
+        .non_curated_cache_refresh_state
+        .read()
+        .unwrap()
+        .in_flight
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "refresh worker did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn non_curated_background_refresh_notifies_host_in_runtime_only_after_reinstall() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("marketplace");
+    write_plugin_with_version(&root, "sample", "sample", Some("2.0.0"));
+    write_file(
+        &root.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"company","plugins":[{"name":"sample","source":"./sample"}]}"#,
+    );
+    let plugin_config = r#"[plugins."sample@company"]
+enabled=true"#;
+    let requirements = "[marketplaces]\nrestrict_to_allowed_sources=false";
+    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let roots = vec![AbsolutePathBuf::try_from(root).unwrap()];
+    let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (notified_tx, mut notified_rx) = tokio::sync::mpsc::unbounded_channel();
+    let on_effective_plugins_changed: Arc<dyn Fn() + Send + Sync> = {
+        let notifications = Arc::clone(&notifications);
+        Arc::new(move || {
+            notifications.fetch_add(1, Ordering::SeqCst);
+            // Host callbacks spawn follow-up work such as MCP refreshes.
+            let notified_tx = notified_tx.clone();
+            tokio::spawn(async move {
+                let _ = notified_tx.send(());
+            });
+        })
+    };
+
+    let config = PluginsConfigInput::new(
+        config_layer_stack_with_requirements(tmp.path(), plugin_config, requirements),
+        /*plugins_enabled*/ true,
+        /*remote_plugin_enabled*/ false,
+        String::new(),
+    );
+    manager.maybe_start_non_curated_plugin_cache_refresh(
+        &config,
+        &roots,
+        Some(Arc::clone(&on_effective_plugins_changed)),
+    );
+    tokio::time::timeout(Duration::from_secs(20), notified_rx.recv())
+        .await
+        .expect("reinstall should notify the host from the scheduling runtime")
+        .expect("notification channel should stay open");
+    wait_for_non_curated_refresh_idle(&manager).await;
+    assert_eq!(
+        manager
+            .store
+            .active_plugin_version(&PluginId::parse("sample@company").unwrap())
+            .as_deref(),
+        Some("2.0.0")
+    );
+
+    // A pass that finds every configured plugin current leaves host state valid.
+    let unchanged_config = PluginsConfigInput::new(
+        config_layer_stack_with_requirements(
+            tmp.path(),
+            &format!("{plugin_config}\n[plugins.\"unlisted@company\"]\nenabled=false"),
+            requirements,
+        ),
+        /*plugins_enabled*/ true,
+        /*remote_plugin_enabled*/ false,
+        String::new(),
+    );
+    manager.maybe_start_non_curated_plugin_cache_refresh(
+        &unchanged_config,
+        &roots,
+        Some(Arc::clone(&on_effective_plugins_changed)),
+    );
+    wait_for_non_curated_refresh_idle(&manager).await;
+    assert!(
+        manager
+            .non_curated_cache_refresh_state
+            .read()
+            .unwrap()
+            .last_refreshed
+            .as_ref()
+            .is_some_and(|request| request.config_layer_stack
+                == ConfigLayerStackIdentity(Arc::clone(&unchanged_config.config_layer_stack))),
+        "the unchanged pass should have run"
+    );
+    assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    // Host callbacks can own the thread manager that owns this manager, so an idle manager must
+    // not retain one.
+    assert_eq!(Arc::strong_count(&on_effective_plugins_changed), 1);
 }
 
 #[test]

@@ -398,7 +398,7 @@ fn hook_matches(
     }
 
     let path = req.uri().path();
-    if !path_matches(&hook.matcher.path_prefixes, path) {
+    if path_has_dot_segment(path) || !path_matches(&hook.matcher.path_prefixes, path) {
         return false;
     }
 
@@ -465,6 +465,17 @@ fn headers_match(header_constraints: &[HeaderConstraint], req: &Request) -> bool
 
 fn path_matches(path_prefixes: &[PathMatcher], path: &str) -> bool {
     path_prefixes.iter().any(|matcher| matcher.matches(path))
+}
+
+/// Paths are matched as sent but forwarded unchanged, so an upstream that resolves dot segments
+/// (including encoded dots or separators) could route `/allowed/../other` outside the prefix.
+fn path_has_dot_segment(path: &str) -> bool {
+    path.to_ascii_lowercase()
+        .replace("%2e", ".")
+        .replace("%2f", "/")
+        .replace("%5c", "\\")
+        .split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
 }
 
 impl PathMatcher {
@@ -904,6 +915,40 @@ mod tests {
 
         let err = validate_mitm_hook_config(&config).expect_err("invalid glob should fail");
         assert!(format!("{err:#}").contains("invalid glob pattern"));
+    }
+
+    #[test]
+    fn evaluate_rejects_dot_segments_that_can_escape_the_path_prefix() {
+        let mut config = base_config();
+        config.mitm_hooks = vec![github_hook()];
+        let hooks = compile_mitm_hooks_with_resolvers(
+            &config,
+            |_| Some("abc".to_string()),
+            |_| Err(anyhow!("unexpected file lookup")),
+        )
+        .unwrap();
+        let evaluate = |uri: &str| {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            evaluate_mitm_hooks(&hooks, "api.github.com", &req)
+        };
+
+        for uri in [
+            "/repos/openai/../../user/keys",
+            "/repos/openai/./codex/issues",
+            "/repos/openai/%2E%2e/%2e%2E/user/keys",
+            "/repos/openai/..%2F..%2Fuser/keys",
+            "/repos/openai/..%5C..%5Cuser/keys",
+        ] {
+            assert_eq!(evaluate(uri), HookEvaluation::HookedHostNoMatch, "{uri}");
+        }
+        assert!(matches!(
+            evaluate("/repos/openai/codex/.github/issues"),
+            HookEvaluation::Matched { .. }
+        ));
     }
 
     #[test]

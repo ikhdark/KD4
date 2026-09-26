@@ -237,6 +237,32 @@ struct NonCuratedCacheRefreshState {
     requested: Option<NonCuratedCacheRefreshRequest>,
     last_refreshed: Option<NonCuratedCacheRefreshRequest>,
     in_flight: bool,
+    on_effective_plugins_changed: Option<EffectivePluginsChangedNotifier>,
+}
+
+/// Delivers the host's effective-plugins callback from a background worker thread.
+///
+/// Local cache refreshes run on plain threads, while host callbacks may spawn follow-up tasks
+/// such as MCP refreshes, so the callback runs inside the runtime that scheduled the work.
+#[derive(Clone)]
+struct EffectivePluginsChangedNotifier {
+    runtime: Option<tokio::runtime::Handle>,
+    callback: Arc<dyn Fn() + Send + Sync + 'static>,
+}
+
+impl EffectivePluginsChangedNotifier {
+    fn capture(callback: Option<Arc<dyn Fn() + Send + Sync + 'static>>) -> Option<Self> {
+        let callback = callback?;
+        Some(Self {
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            callback,
+        })
+    }
+
+    fn notify(&self) {
+        let _runtime = self.runtime.as_ref().map(tokio::runtime::Handle::enter);
+        (self.callback)();
+    }
 }
 
 #[derive(Default)]
@@ -738,11 +764,24 @@ impl PluginsManager {
     fn clear_caches_after_marketplace_source_refresh(
         &self,
         installed_plugin_cache_refreshed: bool,
+        on_effective_plugins_changed: Option<&EffectivePluginsChangedNotifier>,
     ) {
         if installed_plugin_cache_refreshed {
-            self.clear_cache();
+            self.publish_installed_plugin_cache_refresh(on_effective_plugins_changed);
         } else {
             self.tool_suggest_metadata_cache.clear();
+        }
+    }
+
+    /// Publishes a background rewrite of installed plugin roots. Besides this manager's caches,
+    /// the host derives config, skills, and running MCP servers from those roots.
+    fn publish_installed_plugin_cache_refresh(
+        &self,
+        on_effective_plugins_changed: Option<&EffectivePluginsChangedNotifier>,
+    ) {
+        self.clear_cache();
+        if let Some(on_effective_plugins_changed) = on_effective_plugins_changed {
+            on_effective_plugins_changed.notify();
         }
     }
 
@@ -1286,7 +1325,11 @@ impl PluginsManager {
         options: PluginListBackgroundTaskOptions,
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
-        self.maybe_start_non_curated_plugin_cache_refresh(config, roots);
+        self.maybe_start_non_curated_plugin_cache_refresh(
+            config,
+            roots,
+            on_effective_plugins_changed.clone(),
+        );
         if options.refresh_global_remote_catalog_cache {
             self.maybe_start_global_remote_catalog_cache_refresh(config, auth.clone());
         }
@@ -2298,10 +2341,15 @@ impl PluginsManager {
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         if config.plugins_enabled {
+            let local_cache_refresh_notifier =
+                EffectivePluginsChangedNotifier::capture(on_effective_plugins_changed.clone());
             let use_remote_global_catalog =
                 config.remote_plugin_enabled && auth_manager.current_auth_uses_codex_backend();
             if !use_remote_global_catalog {
-                self.start_curated_repo_sync(config.http_client_factory.clone());
+                self.start_curated_repo_sync(
+                    config.http_client_factory.clone(),
+                    local_cache_refresh_notifier.clone(),
+                );
             }
             let should_spawn_marketplace_auto_upgrade = {
                 let mut state = match self.configured_marketplace_upgrade_state.write() {
@@ -2321,8 +2369,10 @@ impl PluginsManager {
                 if let Err(err) = std::thread::Builder::new()
                     .name("plugins-marketplace-auto-upgrade".to_string())
                     .spawn(move || {
-                        let outcome = manager.upgrade_configured_marketplaces_for_config(
-                            &config, /*marketplace_name*/ None,
+                        let outcome = manager.upgrade_configured_marketplaces(
+                            &config,
+                            /*marketplace_name*/ None,
+                            local_cache_refresh_notifier.as_ref(),
                         );
                         match outcome {
                             Ok(outcome) => {
@@ -2387,6 +2437,19 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         marketplace_name: Option<&str>,
     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
+        self.upgrade_configured_marketplaces(
+            config,
+            marketplace_name,
+            /*on_effective_plugins_changed*/ None,
+        )
+    }
+
+    fn upgrade_configured_marketplaces(
+        &self,
+        config: &PluginsConfigInput,
+        marketplace_name: Option<&str>,
+        on_effective_plugins_changed: Option<&EffectivePluginsChangedNotifier>,
+    ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
         let mut outcome = upgrade_configured_git_marketplaces(
             self.codex_home.as_path(),
             &config.config_layer_stack,
@@ -2415,6 +2478,7 @@ impl PluginsManager {
                 Ok(refresh_outcome) => {
                     self.clear_caches_after_marketplace_source_refresh(
                         refresh_outcome.cache_refreshed,
+                        on_effective_plugins_changed,
                     );
                     outcome
                         .errors
@@ -2445,11 +2509,13 @@ impl PluginsManager {
         self: &Arc<Self>,
         config: &PluginsConfigInput,
         roots: &[AbsolutePathBuf],
+        on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         self.schedule_non_curated_plugin_cache_refresh(
             config,
             roots,
             NonCuratedCacheRefreshMode::IfVersionChanged,
+            on_effective_plugins_changed,
         );
     }
 
@@ -2527,6 +2593,7 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         roots: &[AbsolutePathBuf],
         mode: NonCuratedCacheRefreshMode,
+        on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         if !config.plugins_enabled {
             return;
@@ -2539,6 +2606,8 @@ impl PluginsManager {
             config_layer_stack: ConfigLayerStackIdentity(Arc::clone(&config.config_layer_stack)),
             mode,
         };
+        let on_effective_plugins_changed =
+            EffectivePluginsChangedNotifier::capture(on_effective_plugins_changed);
 
         let should_spawn = {
             let mut state = match self.non_curated_cache_refresh_state.write() {
@@ -2558,11 +2627,16 @@ impl PluginsManager {
             // when the roots or configured plugin set changes. Forced reinstall requests are not
             // deduped against the last completed pass because the same marketplace root path can
             // point at newly activated files after an auto-upgrade.
-            if state.requested.as_ref() == Some(&request)
+            let deduped = state.requested.as_ref() == Some(&request)
                 || (request.mode == NonCuratedCacheRefreshMode::IfVersionChanged
                     && !state.in_flight
-                    && state.last_refreshed.as_ref() == Some(&request))
-            {
+                    && state.last_refreshed.as_ref() == Some(&request));
+            // A pending pass reports to the latest host callback. The worker drops it on exit,
+            // because the callback may own the thread manager that owns this manager.
+            if on_effective_plugins_changed.is_some() && (state.in_flight || !deduped) {
+                state.on_effective_plugins_changed = on_effective_plugins_changed;
+            }
+            if deduped {
                 return;
             }
             state.requested = Some(request);
@@ -2588,11 +2662,16 @@ impl PluginsManager {
             };
             state.in_flight = false;
             state.requested = None;
+            state.on_effective_plugins_changed = None;
             warn!("failed to start non-curated plugin cache refresh task: {err}");
         }
     }
 
-    fn start_curated_repo_sync(self: &Arc<Self>, http_client_factory: HttpClientFactory) {
+    fn start_curated_repo_sync(
+        self: &Arc<Self>,
+        http_client_factory: HttpClientFactory,
+        on_effective_plugins_changed: Option<EffectivePluginsChangedNotifier>,
+    ) {
         if CURATED_REPO_SYNC_STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -2611,11 +2690,16 @@ impl PluginsManager {
                             &configured_curated_plugin_ids,
                         ) {
                             Ok(cache_refreshed) => {
-                                manager
-                                    .clear_caches_after_marketplace_source_refresh(cache_refreshed);
+                                manager.clear_caches_after_marketplace_source_refresh(
+                                    cache_refreshed,
+                                    on_effective_plugins_changed.as_ref(),
+                                );
                             }
                             Err(err) => {
-                                manager.clear_cache();
+                                // Earlier plugins in this pass may already have been reinstalled.
+                                manager.publish_installed_plugin_cache_refresh(
+                                    on_effective_plugins_changed.as_ref(),
+                                );
                                 CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
                                 warn!("failed to refresh curated plugin cache after sync: {err}");
                             }
@@ -2756,6 +2840,7 @@ impl PluginsManager {
                     Err(err) => err.into_inner(),
                 };
                 state.in_flight = false;
+                state.on_effective_plugins_changed = None;
                 return;
             };
 
@@ -2815,7 +2900,16 @@ impl PluginsManager {
             let refreshed = match refresh_result {
                 Ok(refresh_outcome) => {
                     if refresh_outcome.cache_refreshed {
-                        self.clear_cache();
+                        // Read the callback now: a request that joined this pass may have
+                        // supplied it after the pass started.
+                        let on_effective_plugins_changed =
+                            match self.non_curated_cache_refresh_state.read() {
+                                Ok(state) => state.on_effective_plugins_changed.clone(),
+                                Err(err) => err.into_inner().on_effective_plugins_changed.clone(),
+                            };
+                        self.publish_installed_plugin_cache_refresh(
+                            on_effective_plugins_changed.as_ref(),
+                        );
                     }
                     for error in &refresh_outcome.errors {
                         warn!(
@@ -2843,6 +2937,7 @@ impl PluginsManager {
             if state.requested.as_ref() == Some(&request) {
                 state.requested = None;
                 state.in_flight = false;
+                state.on_effective_plugins_changed = None;
                 return;
             }
         }

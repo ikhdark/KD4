@@ -409,12 +409,14 @@ fn materialize_worktree_in_temporary_index(
         ));
     }
 
-    let mut refresh_args = vec![
+    // `--refresh` always walks the whole index. Keep it quiet so unrelated local edits do not
+    // fail the refresh, and pass no paths: positional paths are index updates, which reject
+    // files the patch has not created yet.
+    let refresh_args = [
         OsString::from("update-index"),
+        OsString::from("-q"),
         OsString::from("--refresh"),
-        OsString::from("--"),
     ];
-    refresh_args.extend(paths.iter().cloned());
     let refresh = run_git_output_os(git_root, git_cfg, &refresh_args, Some(env))?;
     if refresh.status.success() {
         Ok(())
@@ -674,42 +676,6 @@ pub fn unescape_c_bytes(input: &str) -> Vec<u8> {
 
 fn os_string_from_git_path_bytes(bytes: Vec<u8>) -> OsString {
     OsString::from(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Stage only the files that actually exist on disk for the given diff.
-pub fn stage_paths(git_root: &Path, diff: &str) -> io::Result<()> {
-    let paths = extract_paths_from_patch_os(diff);
-    let mut existing: Vec<OsString> = Vec::new();
-    for p in paths {
-        let joined = git_root.join(&p);
-        if std::fs::symlink_metadata(&joined).is_ok() {
-            existing.push(p);
-        }
-    }
-    if existing.is_empty() {
-        return Ok(());
-    }
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-c")
-        .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
-        .args(["-c", "core.fsmonitor=false", "add"]);
-    cmd.arg("--");
-    for p in &existing {
-        cmd.arg(p);
-    }
-    let out = cmd
-        .env("GIT_LITERAL_PATHSPECS", "1")
-        .current_dir(git_root)
-        .output()?;
-    let code = out.status.code().unwrap_or(-1);
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "git add failed (exit {code}): {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
-    }
 }
 
 // ============ Parser ported from VS Code (TS) ============
@@ -1136,6 +1102,56 @@ mod tests {
             read_file_normalized(&root.join("file.txt")),
             "one\nPATCH\nthree\nfour\nLOCAL\n"
         );
+    }
+
+    #[test]
+    fn apply_tolerates_unrelated_local_edits_and_new_files() {
+        let _g = env_lock().lock().unwrap();
+        for preflight in [true, false] {
+            let repo = init_repo();
+            let root = repo.path();
+            let _ = run(root, &["git", "config", "core.autocrlf", "false"]);
+
+            std::fs::write(root.join("file.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+            std::fs::write(root.join("other.txt"), "other\n").unwrap();
+            let _ = run(root, &["git", "add", "."]);
+            let _ = run(root, &["git", "commit", "-m", "seed"]);
+            std::fs::write(root.join("file.txt"), "one\nPATCH\nthree\nfour\nfive\n").unwrap();
+            std::fs::write(root.join("new.txt"), "created\n").unwrap();
+            let _ = run(root, &["git", "add", "-N", "new.txt"]);
+            let (_, diff, _) = run(root, &["git", "diff", "--full-index"]);
+            let _ = run(root, &["git", "rm", "--cached", "-q", "new.txt"]);
+            std::fs::remove_file(root.join("new.txt")).unwrap();
+            let _ = run(root, &["git", "restore", "file.txt"]);
+            // The patched file and an unrelated tracked file both carry local work.
+            std::fs::write(root.join("file.txt"), "one\ntwo\nthree\nfour\nLOCAL\n").unwrap();
+            std::fs::write(root.join("other.txt"), "other local\n").unwrap();
+
+            let result = apply_git_patch(&ApplyGitRequest {
+                cwd: root.to_path_buf(),
+                diff,
+                revert: false,
+                preflight,
+            })
+            .expect("temporary index preparation must not fail");
+
+            assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+            assert_eq!(
+                read_file_normalized(&root.join("other.txt")),
+                "other local\n"
+            );
+            if preflight {
+                assert!(!root.join("new.txt").exists());
+            } else {
+                assert_eq!(
+                    read_file_normalized(&root.join("file.txt")),
+                    "one\nPATCH\nthree\nfour\nLOCAL\n"
+                );
+                assert_eq!(read_file_normalized(&root.join("new.txt")), "created\n");
+            }
+            let (_, staged, _) = run(root, &["git", "diff", "--cached", "--name-only"]);
+            assert_eq!(staged, "");
+        }
     }
 
     #[test]

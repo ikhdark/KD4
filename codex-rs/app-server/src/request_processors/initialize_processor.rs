@@ -251,7 +251,9 @@ impl InitializeRequestProcessor {
 
         let codex_home = self.config.codex_home.clone();
         let cwd = self.config.cwd.clone();
-        let outgoing = Arc::clone(&self.outgoing);
+        // A blocking advisory scan must not keep the runtime's outbound channel
+        // alive after shutdown. Deliver only while its original owner exists.
+        let outgoing = Arc::downgrade(&self.outgoing);
         tokio::spawn(async move {
             let details = match tokio::task::spawn_blocking(move || {
                 codex_windows_sandbox::world_writable_warning_details(codex_home, cwd)
@@ -264,7 +266,9 @@ impl InitializeRequestProcessor {
                     Some((Vec::new(), 0, true))
                 }
             };
-            if let Some(details) = details {
+            if let Some(details) = details
+                && let Some(outgoing) = outgoing.upgrade()
+            {
                 send_windows_world_writable_warning_details(&outgoing, &connection_ids, details)
                     .await;
             }

@@ -520,6 +520,7 @@ impl PluginRequestProcessor {
         config_manager: ConfigManager,
     ) {
         // Cache invalidation is part of mutation completion; only MCP refresh is best-effort.
+        config_manager.invalidate_load_cache();
         thread_manager.plugins_manager().clear_cache();
         thread_manager.skills_service().clear_cache();
         tokio::spawn(async move {
@@ -531,6 +532,7 @@ impl PluginRequestProcessor {
     }
 
     fn clear_plugin_related_caches(&self) {
+        self.config_manager.invalidate_load_cache();
         self.thread_manager.plugins_manager().clear_cache();
         self.thread_manager.skills_service().clear_cache();
     }

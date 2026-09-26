@@ -1327,7 +1327,21 @@ impl PickerState {
                     return Ok(());
                 }
                 self.pagination.loading = LoadingState::Idle;
-                let page = page.map_err(color_eyre::Report::from)?;
+                let page = match page {
+                    Ok(page) => page,
+                    Err(err) => {
+                        // A failed page must not close the picker, nor the running session behind
+                        // `/resume`. Stop automatic paging so a persistent failure is not retried
+                        // on every frame; changing the sort or filter restarts from page one.
+                        warn!(%err, "failed to load session picker page");
+                        self.pagination.next_cursor = None;
+                        self.pending_page_down_target = None;
+                        self.search_state = SearchState::Idle;
+                        self.inline_error = Some(format!("Failed to load sessions: {err}"));
+                        self.request_frame();
+                        return Ok(());
+                    }
+                };
                 self.ingest_page(page);
                 self.complete_pending_page_down();
                 let completed_token = pending.search_token.or(search_token);
@@ -6681,6 +6695,58 @@ session_picker_view = "dense"
         assert!(state.filtered_rows.is_empty());
         assert!(!state.search_state.is_active());
         assert!(state.pagination.reached_scan_cap);
+    }
+
+    #[tokio::test]
+    async fn failed_page_load_keeps_picker_open_without_retrying_every_frame() {
+        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = recorded_requests.clone();
+        let loader = page_only_loader(move |req: PageLoadRequest| {
+            request_sink.lock().unwrap().push(req);
+        });
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.reset_pagination();
+        state.ingest_page(page(
+            vec![make_row(
+                "/tmp/start.jsonl",
+                "2025-01-01T00:00:00Z",
+                "alpha",
+            )],
+            Some("2025-01-02T00:00:00Z"),
+            /*num_scanned_files*/ 1,
+            /*reached_scan_cap*/ false,
+        ));
+        state.load_more_if_needed(LoadTrigger::Scroll);
+        let request = {
+            let guard = recorded_requests.lock().unwrap();
+            assert_eq!(guard.len(), 1);
+            guard[0].clone()
+        };
+
+        state
+            .handle_background_event(BackgroundEvent::Page {
+                request_token: request.request_token,
+                search_token: request.search_token,
+                page: Err(std::io::Error::other("thread/list unavailable")),
+            })
+            .await
+            .expect("a failed page must not end the picker");
+
+        assert_eq!(state.filtered_rows.len(), 1);
+        assert!(!state.pagination.loading.is_pending());
+        assert_eq!(
+            state.inline_error.as_deref(),
+            Some("Failed to load sessions: thread/list unavailable")
+        );
+        state.ensure_minimum_rows_for_view(/*minimum_rows*/ 20);
+        assert_eq!(recorded_requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

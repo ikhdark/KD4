@@ -769,34 +769,6 @@ impl OAuthPersistor {
             .persist_with_guard(client_id, maybe_credentials, operation_guard)
             .await
     }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "AuthorizationManager async access must be serialized through its mutex"
-    )]
-    pub(crate) async fn refresh_if_needed(&self) -> Result<()> {
-        let expires_at = {
-            let guard = self.inner.persistence.last_credentials.lock().await;
-            guard.as_ref().and_then(|tokens| tokens.expires_at)
-        };
-
-        if !token_needs_refresh(expires_at) {
-            return Ok(());
-        }
-
-        {
-            let manager = self.inner.authorization_manager.clone();
-            let guard = manager.lock().await;
-            guard.refresh_token().await.with_context(|| {
-                format!(
-                    "failed to refresh OAuth tokens for server {}",
-                    self.inner.persistence.server_name
-                )
-            })?;
-        }
-
-        self.persist_if_needed().await
-    }
 }
 
 const FALLBACK_FILENAME: &str = ".credentials.json";

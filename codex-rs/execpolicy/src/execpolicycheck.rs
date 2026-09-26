@@ -23,8 +23,9 @@ pub struct ExecPolicyCheckCommand {
     #[arg(long)]
     pub pretty: bool,
 
-    /// Resolve absolute program paths against basename rules, gated by any
-    /// `host_executable()` definitions in the loaded policy files.
+    /// Also apply basename rules to other spellings of the program: absolute
+    /// paths (gated by any `host_executable()` definitions in the loaded policy
+    /// files) and, on Windows, case and executable-suffix variants.
     #[arg(long)]
     pub resolve_host_executables: bool,
 

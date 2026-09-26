@@ -57,7 +57,7 @@ impl CodeModeElicitationHarness {
                     config.set_windows_sandbox_enabled(true);
                     configure(config);
                 });
-        let test = builder.build_with_auto_env(&server).await?;
+        let test = builder.build(&server).await?;
         let follow_up = mount_code_mode_responses(&server, code).await;
         let turn_id = submit_turn(&test, permission_profile).await?;
         Ok(Self {
@@ -273,7 +273,7 @@ await tools.request_permissions({
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(codex_home)]
-async fn code_mode_nested_denial_completes_without_follow_up_or_error() -> Result<()> {
+async fn code_mode_nested_denial_allows_follow_up_without_error() -> Result<()> {
     require_network!();
 
     let harness = CodeModeElicitationHarness::start(
@@ -350,9 +350,9 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
     assert_eq!(timing.terminalization.unclassified_ns, 0);
-    assert_eq!(timing.counters.model_request_count, 1);
-    assert_eq!(timing.counters.logical_generation_count, 1);
-    assert_eq!(timing.counters.attempts_by_kind.primary, 1);
+    assert_eq!(timing.counters.model_request_count, 2);
+    assert_eq!(timing.counters.logical_generation_count, 2);
+    assert_eq!(timing.counters.attempts_by_kind.primary, 2);
     assert_eq!(timing.counters.attempts_by_kind.retry, 0);
     assert_eq!(timing.counters.attempts_by_kind.fallback, 0);
     assert_eq!(timing.counters.model_retry_count, 0);
@@ -379,18 +379,18 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
         Some(direct.call_id.as_str())
     );
     assert_eq!(direct.sampling_generation_id, nested.sampling_generation_id);
-    assert!(direct.outcome.is_some());
-    assert!(nested.outcome.is_some());
+    assert_eq!(direct.outcome.as_deref(), Some("success"));
+    assert_eq!(nested.outcome.as_deref(), Some("failure"));
     assert!(
         direct.output_projection_ms.is_some(),
-        "the synthesized direct abort result must record its response projection"
+        "the direct denial result must record its response projection"
     );
     assert!(
-        nested.output_projection_ms.is_none(),
-        "the nested abort remains internal and must not record a model-boundary projection"
+        nested.output_projection_ms.is_some(),
+        "the structured nested denial must record its internal result projection"
     );
     assert!(direct.output_model_visible_at_ms.is_some());
-    assert!(direct.model_resumed_at_ms.is_none());
+    assert!(direct.model_resumed_at_ms.is_some());
     assert!(nested.model_resumed_at_ms.is_none());
 
     let closure = &timing.tool_closure;
@@ -408,7 +408,14 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
     assert!(closure.unresolved_calls.is_empty());
     assert!(closure.orphan_calls.is_empty());
     assert!(closure.complete);
-    assert!(harness.follow_up.requests().is_empty());
+    let follow_up = harness.follow_up.single_request();
+    assert!(
+        follow_up
+            .custom_tool_call_output("call-1")
+            .to_string()
+            .contains("patch rejected by user"),
+        "the next generation must receive the actual denial"
+    );
 
     Ok(())
 }
@@ -742,7 +749,8 @@ async fn code_mode_nested_nonzero_returns_to_model_for_repair() -> Result<()> {
         .expect("missing nested required exec_command call");
     assert_eq!(direct.call_id, "call-1");
     assert_eq!(direct.tool_name, "exec");
-    assert_eq!(direct.outcome.as_deref(), Some("failure"));
+    // The JavaScript completed normally; the independently recorded child command failed.
+    assert_eq!(direct.outcome.as_deref(), Some("success"));
     assert_eq!(nested.tool_name, "exec_command");
     assert_eq!(nested.outcome.as_deref(), Some("failure"));
     assert_eq!(

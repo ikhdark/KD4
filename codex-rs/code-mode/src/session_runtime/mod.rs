@@ -39,31 +39,68 @@ use crate::cell_actor::CellHost;
 use crate::cell_actor::CellState;
 use crate::cell_actor::CellToolCall;
 use crate::cell_actor::CompletionCommit;
+use crate::runtime::StoredValue;
 use crate::runtime::stored_value_limit_message;
 use crate::runtime::stored_values_with_writes_within_limits;
 
 type RuntimeEventFuture = Pin<Box<dyn Future<Output = Result<CellEvent, Error>> + Send + 'static>>;
 const TERMINAL_CELL_CACHE_CAPACITY: usize = 256;
+/// Output retained for re-observing delivered terminal events, matching the
+/// session's stored-value budget. The newest event is kept even when larger.
+const TERMINAL_CELL_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVE_CELLS: usize = 8;
 
 #[derive(Default)]
 struct TerminalCellCache {
-    events: HashMap<CellId, CellEvent>,
+    events: HashMap<CellId, (CellEvent, usize)>,
     order: VecDeque<CellId>,
+    retained_bytes: usize,
 }
 
 impl TerminalCellCache {
+    fn get(&self, cell_id: &CellId) -> Option<CellEvent> {
+        self.events.get(cell_id).map(|(event, _)| event.clone())
+    }
+
     fn insert(&mut self, cell_id: CellId, event: CellEvent) {
-        if self.events.insert(cell_id.clone(), event).is_some() {
-            return;
+        let bytes = cell_event_bytes(&event);
+        if let Some((_, replaced)) = self.events.insert(cell_id.clone(), (event, bytes)) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(replaced);
+        } else {
+            self.order.push_back(cell_id);
         }
-        self.order.push_back(cell_id);
-        while self.order.len() > TERMINAL_CELL_CACHE_CAPACITY {
-            if let Some(expired) = self.order.pop_front() {
-                self.events.remove(&expired);
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        while self.order.len() > TERMINAL_CELL_CACHE_CAPACITY
+            || (self.order.len() > 1 && self.retained_bytes > TERMINAL_CELL_CACHE_MAX_BYTES)
+        {
+            let Some(expired) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, expired_bytes)) = self.events.remove(&expired) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(expired_bytes);
             }
         }
     }
+}
+
+fn cell_event_bytes(event: &CellEvent) -> usize {
+    let (content_items, error_text) = match event {
+        CellEvent::Yielded { content_items }
+        | CellEvent::ExplicitYield { content_items }
+        | CellEvent::Terminated { content_items } => (content_items, None),
+        CellEvent::Completed {
+            content_items,
+            error_text,
+            ..
+        } => (content_items, error_text.as_deref()),
+    };
+    content_items
+        .iter()
+        .map(|item| match item {
+            OutputItem::Text { text } => text.len(),
+            OutputItem::Image { image_url, .. } => image_url.len(),
+        })
+        .fold(error_text.map_or(0, str::len), usize::saturating_add)
 }
 
 /// Owns all cells and shared state for one transport-neutral code-mode session.
@@ -73,7 +110,7 @@ pub(crate) struct SessionRuntime<D: SessionRuntimeDelegate> {
 
 struct Inner<D: SessionRuntimeDelegate> {
     // Cells snapshot keys but share immutable payloads; later commits cannot change their view.
-    stored_values: Mutex<HashMap<String, Arc<JsonValue>>>,
+    stored_values: Mutex<HashMap<String, StoredValue>>,
     cells: Mutex<HashMap<CellId, CellHandle>>,
     terminal_cells: StdMutex<TerminalCellCache>,
     active_cell_permits: Arc<Semaphore>,
@@ -138,9 +175,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 .terminal_cells
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .events
                 .get(cell_id)
-                .cloned()
                 .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
             return Ok(PendingEvent {
                 event: Box::pin(async move { Ok(event) }),
@@ -159,9 +194,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 .terminal_cells
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .events
                 .get(cell_id)
-                .cloned()
                 .ok_or_else(|| Error::MissingCell(cell_id.clone()));
         };
         handle
@@ -331,7 +364,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
 
     async fn commit_completion(
         &self,
-        stored_value_writes: HashMap<String, Arc<JsonValue>>,
+        stored_value_writes: HashMap<String, StoredValue>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,

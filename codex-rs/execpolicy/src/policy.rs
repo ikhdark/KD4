@@ -2,7 +2,6 @@ use crate::decision::Decision;
 use crate::error::Error;
 use crate::error::Result;
 use crate::executable_name::executable_lookup_key;
-use crate::executable_name::executable_path_lookup_key;
 use crate::rule::NetworkRule;
 use crate::rule::NetworkRuleProtocol;
 use crate::rule::PatternToken;
@@ -17,6 +16,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 type HeuristicsFallback<'a> = Option<&'a dyn Fn(&[String]) -> Decision>;
@@ -346,27 +346,43 @@ impl Policy {
                 }
             }
         }
-        if matched || !options.resolve_host_executables {
+        if !options.resolve_host_executables {
             return matched;
         }
-        let Ok(program) = AbsolutePathBuf::try_from(first.as_str()) else {
-            return false;
-        };
-        let Some(basename) = executable_path_lookup_key(program.as_path()) else {
-            return false;
-        };
-        if let Some(paths) = self.host_executables_by_name.get(&basename)
-            && !paths.iter().any(|path| path == &program)
+        // Rules for the resolved executable apply alongside exact-spelling rules,
+        // so an allow rule for one spelling cannot shadow a stricter rule for the
+        // same program. A bare name resolves through the search path like the
+        // exact spelling; only an explicit path is gated by host executables.
+        let program = if Path::new(first).file_name().and_then(|name| name.to_str())
+            == Some(first.as_str())
         {
-            return false;
+            None
+        } else {
+            let Ok(program) = AbsolutePathBuf::try_from(first.as_str()) else {
+                return matched;
+            };
+            Some(program)
+        };
+        let Some(filename) = program.as_ref().map_or(Some(first.as_str()), |program| {
+            program.as_path().file_name().and_then(|name| name.to_str())
+        }) else {
+            return matched;
+        };
+        let basename = executable_lookup_key(filename);
+        if let Some(program) = &program
+            && let Some(paths) = self.host_executables_by_name.get(&basename)
+            && !paths.iter().any(|path| path == program)
+        {
+            return matched;
         }
         let Some(rules) = self.basename_rules.get_vec(&basename) else {
-            return false;
-        };
-        let Some(filename) = program.as_path().file_name().and_then(|name| name.to_str()) else {
-            return false;
+            return matched;
         };
         for rule in rules {
+            // Rules keyed by this exact spelling were visited above.
+            if rule.program() == first {
+                continue;
+            }
             // Extensionless aliases keep their existing behavior. Explicit suffixes
             // only match that suffix, even though the host-path gate shares an alias.
             let name = rule.program();
@@ -377,7 +393,7 @@ impl Policy {
             };
             if applicable && rule.pattern.matches_args(&cmd[1..]) {
                 matched = true;
-                if visit(rule, Some(&program)) {
+                if visit(rule, program.as_ref()) {
                     return true;
                 }
             }

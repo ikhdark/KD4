@@ -161,6 +161,10 @@ impl SpawnLifecycle for NoopSpawnLifecycle {}
 
 pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Acquire every output copy in a fixed order before mutating any of them"
+)]
 pub(super) async fn append_output_chunk(
     pending: &OutputBuffer,
     completion: &OutputBuffer,

@@ -3,11 +3,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 
+use codex_extension_api::ConversationHistoryRequirement;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolExecutorFuture;
 use codex_extension_api::ToolName;
+use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -61,6 +63,13 @@ impl ToolExecutor<ToolCall> for ReadTool {
             TOOL_NAME,
             "Read a page from an enabled skill using known authority, package, and resource handles. Use skills.list only when a required handle is missing. Handles remain opaque and are routed to their owner. Pass next_cursor back as cursor to continue. Restart from the first page if the cursor is reported stale.",
         )
+    }
+
+    fn conversation_history_requirement(
+        &self,
+        _payload: &ToolPayload,
+    ) -> ConversationHistoryRequirement {
+        ConversationHistoryRequirement::None
     }
 
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {

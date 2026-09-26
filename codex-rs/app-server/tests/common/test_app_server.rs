@@ -5,12 +5,10 @@ use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::Lines;
-use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 
@@ -32,7 +30,6 @@ use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
 use codex_app_server_protocol::ExperimentalFeatureListParams;
-use codex_app_server_protocol::FeedbackUploadParams;
 use codex_app_server_protocol::FsCopyParams;
 use codex_app_server_protocol::FsCreateDirectoryParams;
 use codex_app_server_protocol::FsGetMetadataParams;
@@ -72,9 +69,7 @@ use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginSkillReadParams;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::ProcessKillParams;
-use codex_app_server_protocol::ProcessResizePtyParams;
 use codex_app_server_protocol::ProcessSpawnParams;
-use codex_app_server_protocol::ProcessWriteStdinParams;
 use codex_app_server_protocol::ProjectImportParams;
 use codex_app_server_protocol::ProjectListParams;
 use codex_app_server_protocol::ProjectReadParams;
@@ -120,31 +115,25 @@ use codex_exec_server::CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
+use codex_utils_cargo_bin::CargoBinError;
+use core_test_support::process::ContainedChild;
 use core_test_support::test_codex::TestEnv;
-use core_test_support::test_codex::test_env;
 use tempfile::TempDir;
 use tokio::process::Command;
 
 use crate::json_logging::JsonLogCapture;
-use crate::local_websocket_exec_server::LocalWebsocketExecServer;
-use crate::rpc_delay::WebsocketDelayInterposer;
 
 pub struct TestAppServer {
     next_request_id: AtomicI64,
-    /// Retain this child process until the client is dropped. The Tokio runtime
-    /// will make a "best effort" to reap the process after it exits, but it is
-    /// not a guarantee. See the `kill_on_drop` documentation for details.
-    #[allow(dead_code)]
-    process: Child,
+    /// The app-server and every process it launches. Dropping it terminates
+    /// that whole tree and reaps the app-server.
+    process: ContainedChild,
     stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
     pending_messages: VecDeque<JSONRPCMessage>,
     auto_env: Option<TestEnv>,
     json_logs: JsonLogCapture,
     codex_home: PathBuf,
-    // Fields drop in declaration order. Tear down the delayed child before
-    // removing an owned CODEX_HOME that may still be its cwd on Windows.
-    _delayed_exec_server: Option<(LocalWebsocketExecServer, WebsocketDelayInterposer)>,
     _owned_codex_home: Option<TempDir>,
 }
 
@@ -163,7 +152,6 @@ impl TestAppServer {
             program: None,
             env_overrides: Vec::new(),
             args: vec![DISABLE_PLUGIN_STARTUP_TASKS_ARG.to_string()],
-            exec_server_delay: None,
         }
     }
 
@@ -209,15 +197,6 @@ impl TestAppServer {
         self.json_logs.wait_for_event(event_name).await
     }
 
-    /// Waits for the requested number of JSON stderr events with the same `event.name` field.
-    pub async fn wait_for_json_log_events(
-        &self,
-        event_name: &str,
-        count: usize,
-    ) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.json_logs.wait_for_events(event_name, count).await
-    }
-
     /// Returns every stderr line parsed and validated as a JSON log event.
     pub fn json_log_events(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         self.json_logs.events()
@@ -236,6 +215,9 @@ impl TestAppServer {
         cmd.stderr(Stdio::piped());
         cmd.current_dir(codex_home);
         cmd.env("CODEX_HOME", codex_home);
+        // An inherited state DB home would escape the isolated CODEX_HOME and
+        // share a developer's live database; per-test overrides still apply below.
+        cmd.env_remove("CODEX_SQLITE_HOME");
         cmd.env("RUST_LOG", "warn");
         cmd.env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
         cmd.args(args);
@@ -251,18 +233,16 @@ impl TestAppServer {
             }
         }
 
-        let mut process = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .context("codex-mcp-server proc should start")?;
+        let mut process =
+            ContainedChild::spawn(&mut cmd).context("app-server process should start")?;
         let stdin = process
             .stdin
             .take()
-            .ok_or_else(|| anyhow::format_err!("mcp should have stdin fd"))?;
+            .ok_or_else(|| anyhow::format_err!("app-server should have stdin fd"))?;
         let stdout = process
             .stdout
             .take()
-            .ok_or_else(|| anyhow::format_err!("mcp should have stdout fd"))?;
+            .ok_or_else(|| anyhow::format_err!("app-server should have stdout fd"))?;
         let stdout = BufReader::new(stdout).lines();
 
         // Forward child's stderr to our stderr so failures are visible even
@@ -287,7 +267,6 @@ impl TestAppServer {
             auto_env: None,
             json_logs,
             codex_home: codex_home.to_path_buf(),
-            _delayed_exec_server: None,
             _owned_codex_home: None,
         })
     }
@@ -445,15 +424,6 @@ impl TestAppServer {
         };
         self.send_login_account_request(serde_json::to_value(params)?)
             .await
-    }
-
-    /// Send a `feedback/upload` JSON-RPC request.
-    pub async fn send_feedback_upload_request(
-        &mut self,
-        params: FeedbackUploadParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("feedback/upload", params).await
     }
 
     /// Send a `thread/start` JSON-RPC request.
@@ -1040,24 +1010,6 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("process/spawn", params).await
-    }
-
-    /// Send a `process/writeStdin` JSON-RPC request (v2).
-    pub async fn send_process_write_stdin_request(
-        &mut self,
-        params: ProcessWriteStdinParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("process/writeStdin", params).await
-    }
-
-    /// Send a `process/resizePty` JSON-RPC request (v2).
-    pub async fn send_process_resize_pty_request(
-        &mut self,
-        params: ProcessResizePtyParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("process/resizePty", params).await
     }
 
     /// Send a `process/kill` JSON-RPC request (v2).
@@ -1668,7 +1620,6 @@ pub struct TestAppServerBuilder {
     program: Option<PathBuf>,
     env_overrides: Vec<(String, Option<String>)>,
     args: Vec<String>,
-    exec_server_delay: Option<Duration>,
 }
 
 enum TestAppServerEnvironment {
@@ -1738,13 +1689,6 @@ impl TestAppServerBuilder {
         builder
     }
 
-    /// Adds this fixed one-way delay to the app-server/exec-server RPC stream.
-    /// A 15ms delay contributes roughly 30ms to a round trip.
-    pub fn with_exec_server_delay(mut self, exec_server_delay: Duration) -> Self {
-        self.exec_server_delay = Some(exec_server_delay);
-        self
-    }
-
     /// Builds a server with a temporary CODEX_HOME and automatic environment
     /// by default.
     pub async fn build(self) -> anyhow::Result<TestAppServer> {
@@ -1754,7 +1698,6 @@ impl TestAppServerBuilder {
             program,
             mut env_overrides,
             args,
-            exec_server_delay,
         } = self;
         let (codex_home, owned_codex_home) = match codex_home {
             Some(codex_home) => (codex_home, None),
@@ -1766,7 +1709,7 @@ impl TestAppServerBuilder {
                 )
             }
         };
-        let (auto_env, delayed_exec_server) = match environment {
+        let auto_env = match environment {
             TestAppServerEnvironment::Auto => {
                 let environments_toml = codex_home.join("environments.toml");
                 ensure!(
@@ -1777,30 +1720,7 @@ impl TestAppServerBuilder {
                     "automatic environment cannot be used when {} exists",
                     environments_toml.display()
                 );
-                let (auto_env, delayed_exec_server) = match exec_server_delay {
-                    Some(added_delay) => {
-                        let exec_server_program =
-                            codex_utils_cargo_bin::cargo_bin("exec-server")
-                                .context("should find binary for delayed exec-server fixture")?;
-                        // Local auto environments normally use stdio. Start a
-                        // host-local WebSocket fixture so the delay interposer has a
-                        // socket stream to wrap.
-                        let local_websocket_exec_server =
-                            LocalWebsocketExecServer::start(&codex_home, &exec_server_program)
-                                .await?;
-                        let interposer = WebsocketDelayInterposer::start(
-                            local_websocket_exec_server.websocket_url(),
-                            added_delay,
-                        )
-                        .await?;
-                        let auto_env = TestEnv::local_with_exec_server_url(Some(
-                            interposer.websocket_url().to_string(),
-                        ))
-                        .await?;
-                        (auto_env, Some((local_websocket_exec_server, interposer)))
-                    }
-                    None => (test_env().await?, None),
-                };
+                let auto_env = TestEnv::local().await?;
                 // Noise registry configuration takes precedence over the URL-based
                 // provider, so clear inherited values to keep the selection hermetic.
                 let mut auto_env_overrides = vec![
@@ -1824,29 +1744,31 @@ impl TestAppServerBuilder {
                 ];
                 auto_env_overrides.append(&mut env_overrides);
                 env_overrides = auto_env_overrides;
-                (Some(auto_env), delayed_exec_server)
+                Some(auto_env)
             }
-            TestAppServerEnvironment::None => {
-                ensure!(
-                    exec_server_delay.is_none(),
-                    "exec-server delay requires the automatic test environment"
-                );
-                (None, None)
-            }
+            TestAppServerEnvironment::None => None,
         };
         if !env_overrides
             .iter()
             .any(|(key, _)| key == CODE_MODE_HOST_PATH_ENV_VAR)
-            && let Ok(code_mode_host_program) =
-                codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")
         {
-            env_overrides.insert(
-                0,
-                (
-                    CODE_MODE_HOST_PATH_ENV_VAR.to_string(),
-                    Some(code_mode_host_program.to_string_lossy().into_owned()),
+            match codex_utils_cargo_bin::cargo_bin("codex-code-mode-host") {
+                Ok(code_mode_host_program) => env_overrides.insert(
+                    0,
+                    (
+                        CODE_MODE_HOST_PATH_ENV_VAR.to_string(),
+                        Some(code_mode_host_program.to_string_lossy().into_owned()),
+                    ),
                 ),
-            );
+                // Never built: the app-server's own sibling lookup finds nothing either.
+                Err(CargoBinError::NotFound { .. }) => {}
+                // A helper the runner rejected, or a stale build, must fail here.
+                // Leaving the variable unset would let the app-server run an
+                // older sibling build left in the target directory.
+                Err(error) => {
+                    return Err(error).context("resolve codex-code-mode-host for the app-server");
+                }
+            }
         }
         let program = match program {
             Some(program) => program,
@@ -1867,50 +1789,25 @@ impl TestAppServerBuilder {
         .await?;
         app_server.auto_env = auto_env;
         app_server._owned_codex_home = owned_codex_home;
-        app_server._delayed_exec_server = delayed_exec_server;
         Ok(app_server)
     }
 }
 
 impl Drop for TestAppServer {
     fn drop(&mut self) {
-        // These tests spawn a `codex-app-server` child process.
-        //
-        // We keep that child alive for the test and rely on Tokio's `kill_on_drop(true)` when this
-        // helper is dropped. Tokio documents kill-on-drop as best-effort: dropping requests
-        // termination, but it does not guarantee the child has fully exited and been reaped before
-        // teardown continues.
-        //
-        // That makes cleanup timing nondeterministic. Leak detection can occasionally observe the
-        // child still alive at teardown and report `LEAK`, which makes the test flaky.
-        //
-        // Drop can't be async, so we do a bounded synchronous cleanup:
-        //
-        // 1. Close stdin to request a graceful shutdown via EOF.
-        // 2. Poll briefly for graceful exit.
-        // 3. If still alive, request termination with `start_kill()`.
-        // 4. Poll `try_wait()` until the OS reports the child exited, with a short timeout.
+        // Close stdin to request a graceful shutdown via EOF and give the
+        // app-server a brief window to exit on its own. Dropping `process`
+        // afterwards terminates whatever remains of its process tree and reaps
+        // it before the fields declared later, such as an owned CODEX_HOME, are
+        // removed.
         drop(self.stdin.take());
 
         let graceful_start = std::time::Instant::now();
         let graceful_timeout = std::time::Duration::from_millis(200);
         while graceful_start.elapsed() < graceful_timeout {
             match self.process.try_wait() {
-                Ok(Some(_)) => return,
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
-                Err(_) => return,
-            }
-        }
-
-        let _ = self.process.start_kill();
-
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
-        while start.elapsed() < timeout {
-            match self.process.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(_) => return,
+                Ok(Some(_)) | Err(_) => return,
             }
         }
     }
@@ -1919,6 +1816,7 @@ impl Drop for TestAppServer {
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn cancelled_message_read_preserves_partial_json_and_following_message()

@@ -42,7 +42,7 @@ impl CellHost for PanickingCallbackHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, Arc<JsonValue>>,
+        _stored_value_writes: HashMap<String, crate::runtime::StoredValue>,
         _event: CellEvent,
         _pending_initial_yield_items: Option<Vec<crate::session_runtime::OutputItem>>,
         _cell_state: Arc<CellState>,
@@ -73,7 +73,7 @@ impl CellHost for NonCooperativeCallbackHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, Arc<JsonValue>>,
+        _stored_value_writes: HashMap<String, crate::runtime::StoredValue>,
         _event: CellEvent,
         _pending_initial_yield_items: Option<Vec<crate::session_runtime::OutputItem>>,
         _cell_state: Arc<CellState>,
@@ -272,7 +272,7 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
     let mut tool_tasks = JoinSet::new();
     let notification_cancellation_token = CancellationToken::new();
     let tool_cancellation = NestedCancellation::new(CancellationToken::new());
-    let (runtime_tx, _runtime_rx) = std_mpsc::channel();
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
     let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
     let task_failure_handler: TaskFailureHandler = Arc::new(move |reason| {
         let _ = failure_tx.send(reason);
@@ -315,6 +315,12 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
         .await
         .expect("bounded callback cleanup should finish");
 
-    let failure = failure_rx.recv().await.expect("timeout diagnostic");
-    assert!(failure.contains("callback cleanup exceeded"));
+    // The aborted callback never answers the runtime.
+    assert!(matches!(
+        runtime_rx.try_recv(),
+        Err(std_mpsc::TryRecvError::Disconnected)
+    ));
+    // A slow callback is not a task failure: owners such as the process host
+    // treat reported failures as fatal to every session on the connection.
+    assert_eq!(failure_rx.recv().await, None);
 }

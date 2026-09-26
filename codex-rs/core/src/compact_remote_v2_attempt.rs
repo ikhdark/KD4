@@ -163,7 +163,7 @@ fn largest_compaction_request_input(prompt: &Prompt) -> Arc<[ResponseItem]> {
             .fold(0_i64, i64::saturating_add)
     })
     .cloned()
-    .expect("four request representations")
+    .unwrap_or_else(|| Arc::clone(&prompt.input))
 }
 
 fn append_compaction_trigger(prompt: &mut Prompt) {

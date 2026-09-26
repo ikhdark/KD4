@@ -170,7 +170,6 @@ impl ExternalAgentSessionImporter {
             ledger_entry: CompletedExternalAgentSessionImport {
                 source_path: pending_import.source_path,
                 source_content_sha256: pending_import.source_content_sha256,
-                source_modified_at: pending_import.source_modified_at,
                 imported_thread_id: persisted_session.thread_id,
             },
             shutdown_warning: persisted_session.shutdown_warning,

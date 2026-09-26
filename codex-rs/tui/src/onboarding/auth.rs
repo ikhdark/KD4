@@ -52,6 +52,8 @@ use crate::motion::shimmer_text;
 use crate::onboarding::keys;
 use crate::onboarding::onboarding_screen::KeyboardHandler;
 use crate::onboarding::onboarding_screen::StepStateProvider;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
 use crate::tui::FrameRequester;
 
 /// Marks buffer cells that have cyan+underlined style as an OSC 8 hyperlink.
@@ -557,50 +559,54 @@ impl AuthModeWidget {
     }
 
     fn render_chatgpt_success_message(&self, area: Rect, buf: &mut Buffer) {
+        // Rendering drops control characters, so links are marked on the buffer afterwards.
+        let link_line = |prefix: &'static str, label: &'static str, destination: &str| {
+            let mut line = HyperlinkLine::new(Line::from(prefix));
+            line.push_span(label.underlined(), Some(destination));
+            line.style(Style::default().add_modifier(Modifier::DIM))
+        };
         let lines = vec![
-            "✓ Signed in with your ChatGPT account"
-                .fg(Color::Green)
-                .into(),
+            HyperlinkLine::new(Line::from(
+                "✓ Signed in with your ChatGPT account".fg(Color::Green),
+            )),
             "".into(),
             "  Before you start:".into(),
             "".into(),
             "  Decide how much autonomy you want to grant Codex".into(),
-            Line::from(vec![
-                "  For more details see the ".into(),
-                crate::terminal_hyperlinks::osc8_hyperlink(
-                    "https://developers.openai.com/codex/security",
-                    "Codex docs",
-                )
-                .underlined(),
-            ])
-            .dim(),
+            link_line(
+                "  For more details see the ",
+                "Codex docs",
+                "https://developers.openai.com/codex/security",
+            ),
             "".into(),
             "  Codex can make mistakes".into(),
-            "  Review the code it writes and commands it runs"
-                .dim()
-                .into(),
+            HyperlinkLine::new(Line::from(
+                "  Review the code it writes and commands it runs".dim(),
+            )),
             "".into(),
             "  Powered by your ChatGPT account".into(),
-            Line::from(vec![
-                "  Uses your plan's rate limits and ".into(),
-                crate::terminal_hyperlinks::osc8_hyperlink(
-                    "https://chatgpt.com/#settings",
-                    "training data preferences",
-                )
-                .underlined(),
-            ])
-            .dim(),
+            link_line(
+                "  Uses your plan's rate limits and ",
+                "training data preferences",
+                "https://chatgpt.com/#settings",
+            ),
             "".into(),
-            Line::from(vec![
+            HyperlinkLine::new(Line::from(vec![
                 "  Press ".fg(Color::Cyan),
                 self.confirm_binding().into(),
                 " to continue".fg(Color::Cyan),
-            ]),
+            ])),
         ];
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
+        Paragraph::new(
+            lines
+                .iter()
+                .map(|line| line.line.clone())
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .render(area, buf);
+        mark_buffer_hyperlinks(buf, area, &lines, /*scroll_rows*/ 0);
     }
 
     fn render_chatgpt_success(&self, area: Rect, buf: &mut Buffer) {
@@ -1671,6 +1677,36 @@ mod tests {
         // Every character of the URL should be present as an OSC 8 cell.
         let found = collect_osc8_chars(&buf, area, url);
         assert_eq!(found, url, "OSC 8 hyperlink should cover the full URL");
+    }
+
+    #[test]
+    fn chatgpt_success_message_links_render_without_escape_residue() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
+        *widget.sign_in_state.write().unwrap() = SignInState::ChatGptSuccessMessage;
+
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        widget.render_ref(area, &mut buf);
+
+        assert_eq!(
+            collect_osc8_chars(&buf, area, "https://developers.openai.com/codex/security"),
+            "Codexdocs"
+        );
+        assert_eq!(
+            collect_osc8_chars(&buf, area, "https://chatgpt.com/#settings"),
+            "trainingdatapreferences"
+        );
+        let text: String = buf
+            .content
+            .iter()
+            .map(|cell| crate::terminal_hyperlinks::strip_osc8(cell.symbol()))
+            .collect();
+        assert!(
+            text.contains("For more details see the Codex docs"),
+            "{text:?}"
+        );
+        assert!(!text.contains("]8;;"), "{text:?}");
     }
 
     #[tokio::test]

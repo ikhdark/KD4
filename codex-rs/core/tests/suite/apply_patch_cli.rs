@@ -21,7 +21,6 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use core_test_support::assert_regex_match;
 use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -52,7 +51,7 @@ async fn apply_patch_harness_with(
         configure(test_codex().with_config(|config| config.set_windows_sandbox_enabled(true)));
     // Box harness construction so apply_patch_cli tests do not inline the
     // full test-thread startup path into each test future.
-    Box::pin(TestCodexHarness::with_auto_env_builder(builder)).await
+    Box::pin(TestCodexHarness::with_builder(builder)).await
 }
 
 async fn submit_without_wait(harness: &TestCodexHarness, prompt: &str) -> Result<()> {
@@ -190,12 +189,7 @@ async fn apply_patch_cli_multiple_operations_integration() -> Result<()> {
 
     let out = harness.apply_patch_output(call_id).await;
 
-    let expected = r"(?s)^Success. Updated the following files:
-A nested/new.txt
-D delete.txt
-M modify.txt
-?$";
-    assert_regex_match(expected, &out);
+    assert_eq!(out, "Success. Updated the files.");
 
     assert_eq!(harness.read_file_text("nested/new.txt").await?, "created\n");
     assert_eq!(
@@ -501,8 +495,8 @@ async fn apply_patch_cli_delete_missing_file_reports_error() -> Result<()> {
         "expected verification failure message: {out}"
     );
     assert!(
-        out.contains("Failed to read"),
-        "missing delete diagnostics should mention read failure: {out}"
+        out.contains("Failed to delete file"),
+        "missing delete diagnostics should mention deletion failure: {out}"
     );
     assert!(
         out.contains("missing.txt"),
@@ -548,7 +542,8 @@ async fn apply_patch_cli_delete_directory_reports_verification_error() -> Result
 
     let out = harness.apply_patch_output(call_id).await;
     assert!(out.contains("apply_patch verification failed"));
-    assert!(out.contains("Failed to read"));
+    assert!(out.contains("Failed to delete file"));
+    assert!(harness.path_exists("dir").await?);
     Ok(())
 }
 

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codex_code_mode_protocol::NestedCancellation;
-use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -38,6 +37,7 @@ use crate::runtime::MAX_BUFFERED_OUTPUT_BYTES;
 use crate::runtime::OutputAdmission;
 use crate::runtime::RuntimeCommand;
 use crate::runtime::RuntimeEvent;
+use crate::runtime::StoredValue;
 use crate::runtime::spawn_runtime;
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::CreateCellRequest as CellRequest;
@@ -52,7 +52,7 @@ pub(crate) struct CellActor;
 impl CellActor {
     pub(crate) async fn prepare<H: CellHost>(
         request: CellRequest,
-        stored_values: HashMap<String, Arc<JsonValue>>,
+        stored_values: HashMap<String, StoredValue>,
         host: Arc<H>,
         initial_observe_mode: ObserveMode,
         cell_state: Arc<CellState>,

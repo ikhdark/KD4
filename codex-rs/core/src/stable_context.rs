@@ -730,20 +730,22 @@ pub(crate) fn project_stable_context(
     let target_fail_open = target == StableContextTarget::FailOpen;
     let enabled = target == StableContextTarget::Sampling && !ambiguous;
     let fail_open = ambiguous || target_fail_open;
-    let (projected, components) = if enabled {
-        project_items(
+    let (projected, components): (Arc<[ResponseItem]>, _) = if enabled {
+        let (projected, components) = project_items(
             &items,
             &occurrences,
             latest_real_user,
             &user_insertion_by_turn,
-        )
+        );
+        (projected.into(), components)
     } else {
+        // Unprojected history is returned unchanged; share it instead of
+        // deep-copying every item on each generic preparation.
         (
-            items.to_vec(),
+            Arc::clone(&items),
             analyze_unprojected(&items, &occurrences, fail_open),
         )
     };
-    let projected: Arc<[ResponseItem]> = projected.into();
     let fallback_items = if enabled {
         Arc::clone(&projected)
     } else {

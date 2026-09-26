@@ -6,10 +6,8 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
 
-use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_exec_server::ExecServerRuntimePaths;
-use codex_test_binary_support::TestBinaryDispatchGuard;
-use codex_test_binary_support::TestBinaryDispatchMode;
+use codex_test_binary_support::Arg0PathEntryGuard;
 use codex_test_binary_support::configure_test_binary_dispatch;
 use ctor::ctor;
 
@@ -17,20 +15,11 @@ pub(crate) mod exec_server;
 
 pub(crate) const DELAYED_OUTPUT_AFTER_EXIT_PARENT_ARG: &str =
     "--codex-test-delayed-output-after-exit-parent";
-const CODEX_WINDOWS_SANDBOX_ARG1: &str = "--run-as-windows-sandbox";
 const DELAYED_OUTPUT_AFTER_EXIT_CHILD_ARG: &str = "--codex-test-delayed-output-after-exit-child";
 
 #[ctor(unsafe)]
-pub static TEST_BINARY_DISPATCH_GUARD: Option<TestBinaryDispatchGuard> = {
-    let guard = configure_test_binary_dispatch("codex-exec-server-tests", |_exe_name, argv1| {
-        if argv1 == Some(CODEX_FS_HELPER_ARG1) {
-            return TestBinaryDispatchMode::DispatchArg0Only;
-        }
-        if argv1 == Some(CODEX_WINDOWS_SANDBOX_ARG1) {
-            return TestBinaryDispatchMode::DispatchArg0Only;
-        }
-        TestBinaryDispatchMode::InstallAliases
-    });
+pub static TEST_BINARY_DISPATCH_GUARD: Option<Arg0PathEntryGuard> = {
+    let guard = configure_test_binary_dispatch("codex-exec-server-tests");
     maybe_run_delayed_output_after_exit_from_test_binary();
     maybe_run_exec_server_from_test_binary();
     guard

@@ -22,6 +22,7 @@ use codex_windows_sandbox::FramedMessage;
 use codex_windows_sandbox::IPC_PROTOCOL_VERSION;
 use codex_windows_sandbox::LocalSid;
 use codex_windows_sandbox::Message;
+use codex_windows_sandbox::OUTPUT_DRAIN_AFTER_ROOT_EXIT;
 use codex_windows_sandbox::OutputPayload;
 use codex_windows_sandbox::OutputStream;
 use codex_windows_sandbox::PipeSpawnHandles;
@@ -31,7 +32,6 @@ use codex_windows_sandbox::SpawnRequest;
 use codex_windows_sandbox::StderrMode;
 use codex_windows_sandbox::StdinMode;
 use codex_windows_sandbox::WindowsSandboxTokenMode;
-use codex_windows_sandbox::allow_null_device;
 use codex_windows_sandbox::create_readonly_token_with_caps_and_user_from;
 use codex_windows_sandbox::create_workspace_write_token_with_caps_and_user_from;
 use codex_windows_sandbox::decode_bytes;
@@ -44,6 +44,7 @@ use codex_windows_sandbox::read_handle_loop;
 use codex_windows_sandbox::spawn_process_with_pipes;
 use codex_windows_sandbox::to_wide;
 use codex_windows_sandbox::token_mode_for_permission_profile;
+use codex_windows_sandbox::wait_for_output_readers;
 use codex_windows_sandbox::windows_wait_timeout;
 use codex_windows_sandbox::write_frame;
 use std::ffi::OsStr;
@@ -331,16 +332,6 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
             }
         }
     }?);
-    // SAFETY: cap_psids retains every LocalAlloc-backed SID while the synchronous ACL helpers
-    // borrow its raw pointers.
-    unsafe {
-        // These ACL adjustments need the raw SID values, but ownership stays with `cap_psids`.
-        // We do not manually `LocalFree` anything here; the wrappers handle every return path.
-        allow_null_device(cap_psid_ptrs[0]);
-        for psid in &cap_psid_ptrs {
-            allow_null_device(*psid);
-        }
-    }
 
     let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()));
 
@@ -896,15 +887,25 @@ pub fn main() -> Result<()> {
     }
     drop(conpty_owner.take());
 
-    if child_stopped {
-        if out_thread.join().is_err() {
-            log_note("runner stdout reader thread panicked", log_dir);
-        }
-        if let Some(thread) = err_thread
-            && thread.join().is_err()
-        {
-            log_note("runner stderr reader thread panicked", log_dir);
-        }
+    // Preserved or breakaway descendants can hold inherited output handles open indefinitely, and
+    // a preserved job ignores Terminate, so reader EOF must not withhold the exit frame.
+    let readers = std::iter::once(&out_thread)
+        .chain(err_thread.as_ref())
+        .collect::<Vec<_>>();
+    if child_stopped && !wait_for_output_readers(&readers, OUTPUT_DRAIN_AFTER_ROOT_EXIT) {
+        log_note(
+            "runner output still open after the root stopped; descendants retain stdout/stderr",
+            log_dir,
+        );
+    }
+    if out_thread.is_finished() && out_thread.join().is_err() {
+        log_note("runner stdout reader thread panicked", log_dir);
+    }
+    if let Some(thread) = err_thread
+        && thread.is_finished()
+        && thread.join().is_err()
+    {
+        log_note("runner stderr reader thread panicked", log_dir);
     }
 
     let exit_msg = FramedMessage {

@@ -3867,6 +3867,45 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     ));
 }
 
+#[test]
+fn typed_actor_heartbeat_idles_between_turns_and_stops_with_the_runtime() {
+    let statuses = [
+        AgentStatus::PendingInit,
+        AgentStatus::Running,
+        AgentStatus::Interrupted,
+        AgentStatus::Completed(Some("done".to_string())),
+        AgentStatus::CompletedWithSurface {
+            last_agent_message: None,
+            surfaced_result: codex_protocol::protocol::SurfacedToolResult {
+                adapter: "test".to_string(),
+                value: serde_json::json!({}),
+                canonical_message: None,
+            },
+        },
+        AgentStatus::Errored("failed".to_string()),
+        AgentStatus::Shutdown,
+        AgentStatus::NotFound,
+    ];
+
+    assert_eq!(
+        statuses
+            .iter()
+            .map(typed_actor_heartbeat)
+            .collect::<Vec<_>>(),
+        vec![
+            TypedActorHeartbeat::Renew { progress: false },
+            TypedActorHeartbeat::Renew { progress: true },
+            TypedActorHeartbeat::Renew { progress: false },
+            // A finished turn keeps watching: a follow-up or correction turn may reuse the runtime.
+            TypedActorHeartbeat::Idle,
+            TypedActorHeartbeat::Idle,
+            TypedActorHeartbeat::Idle,
+            TypedActorHeartbeat::Stop,
+            TypedActorHeartbeat::Stop,
+        ]
+    );
+}
+
 #[tokio::test]
 async fn completion_watcher_seals_missing_typed_receipt_and_retires_metrics() {
     let (home, mut config) = test_config().await;

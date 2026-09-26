@@ -51,12 +51,18 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
+use super::plugin_test_support::write_installed_plugin;
+use super::plugin_test_support::write_plugin_source;
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Each malformed request is rejected before auth or the network is touched,
+/// so one unauthenticated server proves every shape.
 #[tokio::test]
-async fn plugin_read_rejects_missing_read_source() -> Result<()> {
+async fn plugin_read_rejects_invalid_requests_before_side_effects() -> Result<()> {
     let codex_home = TempDir::new()?;
+    write_plugins_enabled_config_with_base_url(codex_home.path(), "https://example.invalid/backend-api/")?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -64,61 +70,59 @@ async fn plugin_read_rejects_missing_read_source() -> Result<()> {
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_plugin_read_request(PluginReadParams {
-            marketplace_path: None,
-            remote_marketplace_name: None,
-            plugin_name: "sample-plugin".to_string(),
-        })
-        .await?;
+    let exactly_one_source = "requires exactly one of marketplacePath or remoteMarketplaceName";
+    let cases = [
+        (
+            "missing read source",
+            PluginReadParams {
+                marketplace_path: None,
+                remote_marketplace_name: None,
+                plugin_name: "sample-plugin".to_string(),
+            },
+            vec![exactly_one_source],
+        ),
+        (
+            "multiple read sources",
+            PluginReadParams {
+                marketplace_path: Some(AbsolutePathBuf::try_from(
+                    codex_home.path().join("marketplace.json"),
+                )?),
+                remote_marketplace_name: Some("openai-curated-remote".to_string()),
+                plugin_name: "sample-plugin".to_string(),
+            },
+            vec![exactly_one_source],
+        ),
+        (
+            "invalid remote plugin name",
+            PluginReadParams {
+                marketplace_path: None,
+                remote_marketplace_name: Some("openai-curated-remote".to_string()),
+                plugin_name: "linear/../../oops".to_string(),
+            },
+            vec![
+                "invalid remote plugin id",
+                "only ASCII letters, digits, `_`, `-`, and `~` are allowed",
+            ],
+        ),
+    ];
 
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    for (case, params, expected_fragments) in cases {
+        let request_id = mcp.send_plugin_read_request(params).await?;
+        let err = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
 
-    assert_eq!(err.error.code, -32600);
-    assert!(
-        err.error
-            .message
-            .contains("requires exactly one of marketplacePath or remoteMarketplaceName")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn plugin_read_rejects_multiple_read_sources() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_plugin_read_request(PluginReadParams {
-            marketplace_path: Some(AbsolutePathBuf::try_from(
-                codex_home.path().join("marketplace.json"),
-            )?),
-            remote_marketplace_name: Some("openai-curated-remote".to_string()),
-            plugin_name: "sample-plugin".to_string(),
-        })
-        .await?;
-
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(err.error.code, -32600);
-    assert!(
-        err.error
-            .message
-            .contains("requires exactly one of marketplacePath or remoteMarketplaceName")
-    );
+        assert_eq!(err.error.code, -32600, "{case}");
+        for fragment in expected_fragments {
+            assert!(
+                err.error.message.contains(fragment),
+                "{case}: {}",
+                err.error.message
+            );
+        }
+    }
     Ok(())
 }
 
@@ -323,7 +327,7 @@ apps = true
 async fn plugin_read_returns_share_context_for_shared_remote_plugin() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -480,7 +484,7 @@ async fn plugin_read_returns_share_context_for_shared_remote_plugin() -> Result<
 async fn plugin_read_includes_share_url_for_admin_disabled_remote_plugin() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -712,7 +716,7 @@ async fn plugin_read_includes_share_url_for_admin_disabled_remote_plugin() -> Re
 async fn plugin_skill_read_reads_remote_skill_contents_when_remote_plugin_enabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -780,7 +784,7 @@ async fn plugin_skill_read_reads_remote_skill_contents_when_remote_plugin_enable
 async fn plugin_read_maps_missing_remote_plugin_to_invalid_request() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -888,41 +892,6 @@ remote_plugin = true
 }
 
 #[tokio::test]
-async fn plugin_read_rejects_invalid_remote_plugin_name() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    write_remote_plugin_catalog_config(codex_home.path(), "https://example.invalid/backend-api/")?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_plugin_read_request(PluginReadParams {
-            marketplace_path: None,
-            remote_marketplace_name: Some("openai-curated-remote".to_string()),
-            plugin_name: "linear/../../oops".to_string(),
-        })
-        .await?;
-
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(err.error.code, -32600);
-    assert!(err.error.message.contains("invalid remote plugin id"));
-    assert!(
-        err.error
-            .message
-            .contains("only ASCII letters, digits, `_`, `-`, and `~` are allowed")
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn plugin_read_returns_canonical_openai_curated_marketplace_name() -> Result<()> {
     let codex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
@@ -989,7 +958,7 @@ async fn plugin_read_returns_share_context_for_shared_local_plugin() -> Result<(
     let codex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -1136,7 +1105,7 @@ async fn plugin_read_keeps_remote_version_when_share_principals_are_missing() ->
     let codex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
     let server = MockServer::start().await;
-    write_remote_plugin_catalog_config(
+    write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -2101,25 +2070,6 @@ async fn plugin_read_returns_invalid_request_when_plugin_manifest_is_missing() -
     Ok(())
 }
 
-fn write_installed_plugin(
-    codex_home: &TempDir,
-    marketplace_name: &str,
-    plugin_name: &str,
-) -> Result<()> {
-    let plugin_root = codex_home
-        .path()
-        .join("plugins/cache")
-        .join(marketplace_name)
-        .join(plugin_name)
-        .join("local/.codex-plugin");
-    std::fs::create_dir_all(&plugin_root)?;
-    std::fs::write(
-        plugin_root.join("plugin.json"),
-        format!(r#"{{"name":"{plugin_name}"}}"#),
-    )?;
-    Ok(())
-}
-
 fn write_plugins_enabled_config(codex_home: &TempDir) -> Result<()> {
     std::fs::write(
         codex_home.path().join("config.toml"),
@@ -2207,23 +2157,6 @@ connectors = true
     )
 }
 
-fn write_remote_plugin_catalog_config(
-    codex_home: &std::path::Path,
-    base_url: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-chatgpt_base_url = "{base_url}"
-
-[features]
-plugins = true
-"#
-        ),
-    )
-}
-
 fn write_plugin_marketplace(
     repo_root: &std::path::Path,
     marketplace_name: &str,
@@ -2249,29 +2182,6 @@ fn write_plugin_marketplace(
 }}"#
         ),
     )
-}
-
-fn write_plugin_source(
-    repo_root: &std::path::Path,
-    plugin_name: &str,
-    app_ids: &[&str],
-) -> Result<()> {
-    let plugin_root = repo_root.join(plugin_name);
-    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
-    std::fs::write(
-        plugin_root.join(".codex-plugin/plugin.json"),
-        format!(r#"{{"name":"{plugin_name}"}}"#),
-    )?;
-
-    let apps = app_ids
-        .iter()
-        .map(|app_id| ((*app_id).to_string(), json!({ "id": app_id })))
-        .collect::<serde_json::Map<_, _>>();
-    std::fs::write(
-        plugin_root.join(".app.json"),
-        serde_json::to_vec_pretty(&json!({ "apps": apps }))?,
-    )?;
-    Ok(())
 }
 
 fn write_plugin_share_local_path_mapping(

@@ -938,6 +938,25 @@ enable_fanout = true
 }
 
 #[test]
+fn unstable_warning_event_uses_each_structured_feature_toggle_field() {
+    let mut features = Features::with_defaults();
+    features.enable(Feature::ContextManagement);
+    for (input, expected) in [
+        ("context_management = { experimental_mode = true }", true),
+        ("context_management = { experimental_mode = false }", false),
+    ] {
+        let configured_features: Table = toml::from_str(input).expect("features table");
+        let warning = unstable_features_warning_event(
+            Some(&configured_features),
+            /*suppress_unstable_features_warning*/ false,
+            &features,
+            "/tmp/config.toml",
+        );
+        assert_eq!(warning.is_some(), expected, "{input}");
+    }
+}
+
+#[test]
 fn unstable_warning_event_uses_canonical_keys() {
     let feature = Feature::CurrentTimeReminder;
     let mut configured_features = Table::new();

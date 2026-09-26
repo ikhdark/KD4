@@ -8,7 +8,7 @@ use clap::ValueEnum;
 use codex_state::LogQuery;
 use codex_state::LogReader;
 use codex_state::LogRow;
-use dirs::home_dir;
+use codex_utils_home_dir::find_codex_home;
 use owo_colors::OwoColorize;
 
 const LIVE_BATCH_SIZE: usize = 500;
@@ -18,7 +18,9 @@ const LIVE_BATCH_SIZE: usize = 500;
 #[command(about = "Tail Codex logs from the dedicated logs SQLite DB with simple filters")]
 struct Args {
     /// Path to CODEX_HOME. Defaults to $CODEX_HOME or ~/.codex.
-    #[arg(long, env = "CODEX_HOME")]
+    // Resolved through `find_codex_home` rather than clap's `env`, which rejects an empty
+    // `CODEX_HOME` that every other Codex binary treats as unset.
+    #[arg(long)]
     codex_home: Option<PathBuf>,
 
     /// Direct path to the logs SQLite database. Overrides --codex-home.
@@ -131,15 +133,11 @@ fn resolve_db_path(args: &Args) -> anyhow::Result<PathBuf> {
         return Ok(db.clone());
     }
 
-    let codex_home = args.codex_home.clone().unwrap_or_else(default_codex_home);
+    let codex_home = match args.codex_home.clone() {
+        Some(codex_home) => codex_home,
+        None => find_codex_home()?.into_path_buf(),
+    };
     Ok(codex_state::logs_db_path(codex_home.as_path()))
-}
-
-fn default_codex_home() -> PathBuf {
-    if let Some(home) = home_dir() {
-        return home.join(".codex");
-    }
-    PathBuf::from(".codex")
 }
 
 fn build_filter(args: &Args) -> anyhow::Result<LogFilter> {

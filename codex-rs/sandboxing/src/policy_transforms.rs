@@ -618,7 +618,8 @@ fn deny_entry_constrains_accepted_grant(
 fn glob_static_prefix_path(pattern: &str, cwd: &Path) -> Option<AbsolutePathBuf> {
     let resolved_pattern = AbsolutePathBuf::resolve_path_against_base(pattern, cwd);
     let resolved_pattern = resolved_pattern.as_path().to_string_lossy();
-    let prefix = match resolved_pattern.find(['*', '?', '[', ']']) {
+    // Match globset's metacharacters; a literal `{a,b}` prefix would hide overlapping grants.
+    let prefix = match resolved_pattern.find(['*', '?', '[', ']', '{', '}']) {
         Some(0) => return None,
         Some(index) => {
             let prefix = &resolved_pattern[..index];

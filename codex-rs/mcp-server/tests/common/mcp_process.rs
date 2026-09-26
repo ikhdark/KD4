@@ -6,13 +6,13 @@ use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 
 use anyhow::Context;
 use codex_mcp_server::CodexToolCallParam;
 use codex_terminal_detection::user_agent;
+use core_test_support::process::ContainedChild;
 
 use pretty_assertions::assert_eq;
 use rmcp::model::CallToolRequestParams;
@@ -35,11 +35,9 @@ use tokio::process::Command;
 
 pub struct McpProcess {
     next_request_id: AtomicI64,
-    /// Retain this child process until the client is dropped. The Tokio runtime
-    /// will make a "best effort" to reap the process after it exits, but it is
-    /// not a guarantee. See the `kill_on_drop` documentation for details.
-    #[allow(dead_code)]
-    process: Child,
+    /// The MCP server and every process it launches. Dropping it terminates
+    /// that whole tree and reaps the server.
+    process: ContainedChild,
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
 }
@@ -79,10 +77,8 @@ impl McpProcess {
             }
         }
 
-        let mut process = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .context("codex-mcp-server proc should start")?;
+        let mut process =
+            ContainedChild::spawn(&mut cmd).context("codex-mcp-server proc should start")?;
         let stdin = process
             .stdin
             .take()
@@ -402,36 +398,6 @@ impl McpProcess {
                 JsonRpcMessage::Response(_) => {
                     anyhow::bail!("unexpected JSONRPCMessage::Response: {message:?}");
                 }
-            }
-        }
-    }
-}
-
-impl Drop for McpProcess {
-    fn drop(&mut self) {
-        // These tests spawn a `codex-mcp-server` child process.
-        //
-        // We keep that child alive for the test and rely on Tokio's `kill_on_drop(true)` when this
-        // helper is dropped. Tokio documents kill-on-drop as best-effort: dropping requests
-        // termination, but it does not guarantee the child has fully exited and been reaped before
-        // teardown continues.
-        //
-        // That makes cleanup timing nondeterministic. Leak detection can occasionally observe the
-        // child still alive at teardown and report `LEAK`, which makes the test flaky.
-        //
-        // Drop can't be async, so we do a bounded synchronous cleanup:
-        //
-        // 1. Request termination with `start_kill()`.
-        // 2. Poll `try_wait()` until the OS reports the child exited, with a short timeout.
-        let _ = self.process.start_kill();
-
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
-        while start.elapsed() < timeout {
-            match self.process.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(_) => return,
             }
         }
     }

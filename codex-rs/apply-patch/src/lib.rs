@@ -37,7 +37,7 @@ pub use invocation::maybe_parse_apply_patch_verified;
 pub use invocation::maybe_parse_apply_patch_verified_for_environment;
 pub use invocation::verify_apply_patch_args;
 pub use standalone_executable::main;
-pub use standalone_executable::run_apply_patch;
+pub use standalone_executable::run_main_with_args;
 
 use crate::invocation::ExtractHeredocError;
 
@@ -640,34 +640,33 @@ async fn apply_hunks_to_files(
                 move_path, chunks, ..
             } => {
                 note_existing_path_delta_support(&path_uri, fs, sandbox, &mut delta.exact).await;
-                if fs.read_file_text(&path_uri, sandbox).await?
-                    != prepared[hunk_index]
-                        .as_ref()
-                        .expect("prepared update")
-                        .original_contents
-                {
-                    prepared[hunk_index] = Some(
-                        derive_new_contents_from_chunks(
-                            &path_uri,
-                            chunks,
-                            Some(hunk_index + 1),
-                            fs,
-                            sandbox,
-                        )
-                        .await?,
+                let Some(mut update) = prepared[hunk_index].take() else {
+                    anyhow::bail!(
+                        "update was not prepared before writes: {}",
+                        path_uri.inferred_native_path_string()
+                    );
+                };
+                // This comparison read is the pre-write source check. Only a
+                // re-derived update needs another read to confirm its snapshot.
+                if fs.read_file_text(&path_uri, sandbox).await? != update.original_contents {
+                    update = derive_new_contents_from_chunks(
+                        &path_uri,
+                        chunks,
+                        Some(hunk_index + 1),
+                        fs,
+                        sandbox,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        fs.read_file_text(&path_uri, sandbox).await? == update.original_contents,
+                        "source changed after patch preparation: {}",
+                        path_uri.inferred_native_path_string()
                     );
                 }
                 let AppliedPatch {
                     original_contents,
                     new_contents,
-                } = prepared[hunk_index]
-                    .take()
-                    .expect("updates are prepared before writes");
-                anyhow::ensure!(
-                    fs.read_file_text(&path_uri, sandbox).await? == original_contents,
-                    "source changed after patch preparation: {}",
-                    path_uri.inferred_native_path_string()
-                );
+                } = update;
                 if let Some(dest) = move_path {
                     let dest_uri = cwd.join(&dest.to_string_lossy())?;
                     if invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await?
@@ -783,25 +782,41 @@ pub(crate) async fn preflight_hunks(
         let path = hunk.resolve_path(cwd)?;
         match hunk {
             Hunk::UpdateFile { chunks, .. } => {
-                match derive_new_contents_from_chunks(&path, chunks, Some(ordinal + 1), fs, sandbox)
-                    .await
-                {
-                    Ok(update) => prepared.push(Some(update)),
+                let hunk_ordinal = Some(ordinal + 1);
+                // A read failure applies to every chunk alike; report it once.
+                let original_contents = match read_update_source(&path, fs, sandbox).await {
+                    Ok(contents) => contents,
                     Err(error) => {
-                        // Keep the ordered matching error, then enumerate other
-                        // independently broken chunks without repeating its text.
+                        failures.push(error);
+                        prepared.push(None);
+                        continue;
+                    }
+                };
+                match new_contents_from_chunks(&path, &original_contents, chunks, hunk_ordinal) {
+                    Ok(new_contents) => prepared.push(Some(AppliedPatch {
+                        original_contents,
+                        new_contents,
+                    })),
+                    Err(error) => {
+                        // Keep the ordered matching error, then enumerate later
+                        // independently broken chunks against this same snapshot.
+                        // Chunks through the failing one either matched in order
+                        // or are that failure, so alone they add nothing new.
+                        let failed_chunks = match &error {
+                            ApplyPatchError::PatchContextMismatch(mismatch) => {
+                                mismatch.chunk_ordinal
+                            }
+                            _ => 0,
+                        };
                         let first = error.to_string();
                         failures.push(error);
-                        for (index, chunk) in chunks.iter().enumerate() {
-                            if let Err(mut error) = derive_new_contents_from_chunks(
+                        for (index, chunk) in chunks.iter().enumerate().skip(failed_chunks) {
+                            if let Err(mut error) = new_contents_from_chunks(
                                 &path,
+                                &original_contents,
                                 std::slice::from_ref(chunk),
-                                Some(ordinal + 1),
-                                fs,
-                                sandbox,
-                            )
-                            .await
-                            {
+                                hunk_ordinal,
+                            ) {
                                 if let ApplyPatchError::PatchContextMismatch(ref mut mismatch) =
                                     error
                                 {
@@ -966,8 +981,7 @@ struct AppliedPatch {
     new_contents: String,
 }
 
-/// Return *only* the new file contents (joined into a single `String`) after
-/// applying the chunks to the file at `path`.
+/// Read the file at `path` and derive its contents after applying the chunks.
 async fn derive_new_contents_from_chunks(
     path: &PathUri,
     chunks: &[UpdateFileChunk],
@@ -975,7 +989,20 @@ async fn derive_new_contents_from_chunks(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
-    let original_contents = fs.read_file_text(path, sandbox).await.map_err(|err| {
+    let original_contents = read_update_source(path, fs, sandbox).await?;
+    let new_contents = new_contents_from_chunks(path, &original_contents, chunks, hunk_ordinal)?;
+    Ok(AppliedPatch {
+        original_contents,
+        new_contents,
+    })
+}
+
+async fn read_update_source(
+    path: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> std::result::Result<String, ApplyPatchError> {
+    fs.read_file_text(path, sandbox).await.map_err(|err| {
         ApplyPatchError::IoError(IoError {
             context: format!(
                 "Failed to read file to update {}",
@@ -983,14 +1010,19 @@ async fn derive_new_contents_from_chunks(
             ),
             source: err,
         })
-    })?;
+    })
+}
 
+/// Return the contents that result from applying `chunks` to one snapshot of
+/// the file at `path`.
+fn new_contents_from_chunks(
+    path: &PathUri,
+    original_contents: &str,
+    chunks: &[UpdateFileChunk],
+    hunk_ordinal: Option<usize>,
+) -> std::result::Result<String, ApplyPatchError> {
     if chunks.is_empty() {
-        let new_contents = original_contents.clone();
-        return Ok(AppliedPatch {
-            original_contents,
-            new_contents,
-        });
+        return Ok(original_contents.to_string());
     }
 
     // Match logical lines, but keep the original physical lines for untouched
@@ -1021,7 +1053,7 @@ async fn derive_new_contents_from_chunks(
     let path_text = path.inferred_native_path_string();
     let mut replacements = compute_replacements(
         &original_lines,
-        &original_contents,
+        original_contents,
         path,
         &path_text,
         hunk_ordinal,
@@ -1048,11 +1080,7 @@ async fn derive_new_contents_from_chunks(
         let ending_len = if last.ends_with("\r\n") { 2 } else { 1 };
         last.truncate(last.len() - ending_len);
     }
-    let new_contents = new_lines.concat();
-    Ok(AppliedPatch {
-        original_contents,
-        new_contents,
-    })
+    Ok(new_lines.concat())
 }
 
 /// Compute a list of replacements needed to transform `original_lines` into the
@@ -1221,12 +1249,16 @@ fn compute_replacements(
             line_index = start_idx + pattern.len();
             anchored = true;
         } else {
-            let message = format!(
-                "Failed to find expected lines in {} after line {}. Chunks must be in top-to-bottom file order; check ordering and current context:\n{}",
-                path,
-                line_index,
-                bounded_expected_lines(chunk.old_lines.iter().map(String::as_str)),
-            );
+            let expected = bounded_expected_lines(chunk.old_lines.iter().map(String::as_str));
+            // Only a search that an earlier match anchors can fail because of
+            // chunk order; otherwise the lines are absent from the whole file.
+            let message = if anchored {
+                format!(
+                    "Failed to find expected lines in {path} after line {line_index}. Chunks must be in top-to-bottom file order; check ordering and current context:\n{expected}"
+                )
+            } else {
+                format!("Failed to find expected lines in {path}:\n{expected}")
+            };
             return Err(patch_context_mismatch(
                 PatchMismatchSource {
                     original_lines,
@@ -1475,28 +1507,24 @@ pub async fn unified_diff_from_chunks_with_context(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
-    unified_diff_from_chunks_internal(path, chunks, context, None, fs, sandbox).await
+    derive_new_contents_from_chunks(path, chunks, /*hunk_ordinal*/ None, fs, sandbox)
+        .await
+        .map(|update| update.into_file_update(context))
 }
 
-async fn unified_diff_from_chunks_internal(
-    path: &PathUri,
-    chunks: &[UpdateFileChunk],
-    context: usize,
-    hunk_ordinal: Option<usize>,
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&FileSystemSandboxContext>,
-) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
-    let AppliedPatch {
-        original_contents,
-        new_contents,
-    } = derive_new_contents_from_chunks(path, chunks, hunk_ordinal, fs, sandbox).await?;
-    let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
-    let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
-    Ok(ApplyPatchFileUpdate {
-        unified_diff,
-        original_content: original_contents,
-        content: new_contents,
-    })
+impl AppliedPatch {
+    /// Renders an already derived update without reading its source again.
+    fn into_file_update(self, context: usize) -> ApplyPatchFileUpdate {
+        let unified_diff = TextDiff::from_lines(&self.original_contents, &self.new_contents)
+            .unified_diff()
+            .context_radius(context)
+            .to_string();
+        ApplyPatchFileUpdate {
+            unified_diff,
+            original_content: self.original_contents,
+            content: self.new_contents,
+        }
+    }
 }
 
 /// Print the summary of changes in git-style format.
@@ -1565,6 +1593,43 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("b.rs")).unwrap(),
             "actual b\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_reports_each_broken_chunk_once() {
+        let dir = tempdir().unwrap();
+        let original = "alpha\nbeta\ngamma\ndelta\n";
+        fs::write(dir.path().join("a.txt"), original).unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let failure = apply_patch(
+            &wrap_patch(
+                "*** Update File: a.txt\n@@\n alpha\n-beta\n+BETA\n@@\n-missing-one\n+one\n@@\n-missing-two\n+two\n@@\n-delta\n+DELTA",
+            ),
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.delta().is_empty());
+        let report = failure.to_string();
+        // The chunk that failed in sequence is not reported again alone; a
+        // later chunk that is broken even alone is its own conflict.
+        assert!(report.contains("found 2 conflicts"), "{report}");
+        assert_eq!(report.matches("Hunk 1, chunk 2").count(), 1, "{report}");
+        assert_eq!(report.matches("Hunk 1, chunk 3").count(), 1, "{report}");
+        // Only the search anchored after chunk 1 can fail because of order.
+        assert_eq!(
+            report.matches("top-to-bottom file order").count(),
+            1,
+            "{report}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            original
         );
     }
 

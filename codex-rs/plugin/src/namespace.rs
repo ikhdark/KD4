@@ -1,5 +1,4 @@
 use codex_file_system::ExecutorFileSystem;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::path::Path;
 use std::path::PathBuf;
@@ -43,27 +42,6 @@ pub async fn plugin_namespace_for_root_uri(
     )
 }
 
-pub async fn plugin_namespace_for_skill_path(
-    fs: &dyn ExecutorFileSystem,
-    path: &AbsolutePathBuf,
-) -> Option<String> {
-    plugin_namespace_for_skill_uri(fs, &PathUri::from_abs_path(path)).await
-}
-
-pub async fn plugin_namespace_for_skill_uri(
-    fs: &dyn ExecutorFileSystem,
-    path: &PathUri,
-) -> Option<String> {
-    let mut ancestor = Some(path.clone());
-    while let Some(path) = ancestor {
-        if let Some(name) = plugin_namespace_for_root_uri(fs, &path).await {
-            return Some(name);
-        }
-        ancestor = path.parent();
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,11 +50,10 @@ mod tests {
     use std::fs;
 
     #[tokio::test]
-    async fn resolves_nearest_manifest_name() {
+    async fn resolves_manifest_name_at_plugin_root() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sample");
-        let skill = root.join("skills/search/SKILL.md");
-        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("skills/search")).unwrap();
         fs::create_dir_all(root.join(".codex-plugin")).unwrap();
         fs::write(
             root.join(".codex-plugin/plugin.json"),
@@ -84,8 +61,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plugin_namespace_for_skill_path(LOCAL_FS.as_ref(), &skill.abs()).await,
+            plugin_namespace_for_root_uri(LOCAL_FS.as_ref(), &PathUri::from_abs_path(&root.abs()))
+                .await,
             Some("sample".to_string())
+        );
+        // Only the root is probed; nearest-ancestor selection belongs to the skills loader.
+        assert_eq!(
+            plugin_namespace_for_root_uri(
+                LOCAL_FS.as_ref(),
+                &PathUri::from_abs_path(&root.join("skills/search").abs())
+            )
+            .await,
+            None
         );
     }
 
@@ -93,15 +80,14 @@ mod tests {
     async fn recognizes_alternate_manifest_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sample");
-        let skill = root.join("skills/search/SKILL.md");
         let manifest = root.join(".claude-plugin/plugin.json");
-        fs::create_dir_all(skill.parent().unwrap()).unwrap();
         fs::create_dir_all(manifest.parent().unwrap()).unwrap();
         fs::write(&manifest, r#"{"name":"alternate"}"#).unwrap();
 
         assert_eq!(find_plugin_manifest_path(&root), Some(manifest));
         assert_eq!(
-            plugin_namespace_for_skill_path(LOCAL_FS.as_ref(), &skill.abs()).await,
+            plugin_namespace_for_root_uri(LOCAL_FS.as_ref(), &PathUri::from_abs_path(&root.abs()))
+                .await,
             Some("alternate".to_string())
         );
     }

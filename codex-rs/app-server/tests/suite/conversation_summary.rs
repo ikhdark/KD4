@@ -3,6 +3,7 @@ use app_test_support::TestAppServer;
 use app_test_support::create_fake_rollout;
 use app_test_support::rollout_path;
 use app_test_support::to_response;
+use app_test_support::write_in_memory_thread_store_config_toml;
 use codex_app_server::in_process;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
@@ -120,7 +121,7 @@ async fn get_conversation_summary_by_thread_id_reads_rollout() -> Result<()> {
 async fn get_conversation_summary_reads_configured_in_memory_store() -> Result<()> {
     let codex_home = TempDir::new()?;
     let store_id = Uuid::new_v4().to_string();
-    create_config_toml_with_in_memory_thread_store(codex_home.path(), &store_id)?;
+    write_in_memory_thread_store_config_toml(codex_home.path(), &store_id)?;
     let store = InMemoryThreadStore::for_id(store_id.clone());
     let _in_memory_store = InMemoryThreadStoreId { store_id };
     let thread_id = ThreadId::from_string("00000000-0000-4000-8000-000000000125")?;
@@ -282,30 +283,4 @@ impl Drop for InMemoryThreadStoreId {
     fn drop(&mut self) {
         InMemoryThreadStore::remove_id(&self.store_id);
     }
-}
-
-fn create_config_toml_with_in_memory_thread_store(
-    codex_home: &Path,
-    store_id: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-experimental_thread_store = {{ type = "in_memory", id = "{store_id}" }}
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "http://127.0.0.1:1/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
 }

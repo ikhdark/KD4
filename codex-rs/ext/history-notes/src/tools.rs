@@ -1,3 +1,4 @@
+use codex_extension_api::ConversationHistoryRequirement;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ResponsesApiTool;
 use codex_extension_api::ToolCall;
@@ -306,6 +307,13 @@ impl ToolExecutor<ToolCall> for HistoryNotesTool {
 
     fn exposure(&self) -> ToolExposure {
         ToolExposure::DirectModelOnly
+    }
+
+    fn conversation_history_requirement(
+        &self,
+        _payload: &ToolPayload,
+    ) -> ConversationHistoryRequirement {
+        ConversationHistoryRequirement::None
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {

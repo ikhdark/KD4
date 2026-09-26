@@ -342,27 +342,27 @@ async fn build_report(
         let expected_codex_home = find_codex_home()
             .ok()
             .map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf);
-        checks.push(
+        // Both checks verify the same payload; the publish script polls this report while
+        // Desktop restarts, so hash it once and let the independent probes overlap.
+        let target_sha256 = runtime::target_sha256(&local_target).await;
+        let (local_publish_check, desktop_check) = tokio::join!(
             run_async_check(
                 "local publish",
                 progress.clone(),
-                runtime::local_publish_check(local_target.clone()),
-            )
-            .await,
-        );
-
-        checks.push(
+                runtime::local_publish_check(local_target.clone(), target_sha256.clone()),
+            ),
             run_async_check(
                 "desktop",
                 progress.clone(),
                 runtime::desktop_runtime_chain_check(
                     local_target,
+                    target_sha256,
                     expected_codex_home,
                     !command.summary,
                 ),
-            )
-            .await,
+            ),
         );
+        checks.extend([local_publish_check, desktop_check]);
     }
     if command.runtime_only {
         progress.settle();
@@ -370,7 +370,7 @@ async fn build_report(
             schema_version: 1,
             generated_at: generated_at(),
             overall_status: overall_status(&checks),
-            codex_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_version: codex_utils_build_info::CODEX_VERSION.to_string(),
             checks,
         };
     }
@@ -530,7 +530,7 @@ async fn build_report(
         schema_version: 1,
         generated_at: generated_at(),
         overall_status,
-        codex_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_version: codex_utils_build_info::CODEX_VERSION.to_string(),
         checks,
     }
 }
@@ -4263,29 +4263,26 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let addr = listener.local_addr().expect("listener address");
         let server = std::thread::spawn(move || {
+            // Leave HEAD unanswered and open until the GET fallback arrives, so HEAD can only
+            // end by timing out however slowly this thread is scheduled.
             let mut head_stream = accept_probe(&listener);
-            let head = std::thread::spawn(move || {
-                let mut request = [0; 1024];
-                let _ = head_stream.read(&mut request);
-                std::thread::sleep(Duration::from_millis(50));
-            });
+            let mut request = [0; 1024];
+            let _ = head_stream.read(&mut request);
 
             let mut get_stream = accept_probe(&listener);
-            let mut request = [0; 1024];
             let _ = get_stream.read(&mut request);
             get_stream
                 .write_all(
                     b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .expect("write response");
-            head.join().expect("HEAD holder should finish");
+            drop(head_stream);
         });
 
-        let status = mcp_http_probe_url_with_timeout(
-            &format!("http://{addr}/mcp"),
-            Duration::from_millis(10),
-        )
-        .await;
+        // Long enough for the GET to be accepted and answered on a loaded machine.
+        let status =
+            mcp_http_probe_url_with_timeout(&format!("http://{addr}/mcp"), Duration::from_secs(1))
+                .await;
         server.join().expect("probe server thread should finish");
 
         assert_eq!(status, Ok("HTTP 405".to_string()));

@@ -454,7 +454,7 @@ async fn deferred_executor_startup_case(explicit_environment: bool) -> Result<()
             .iter()
             .filter(|text| text.contains("<status>starting</status>"))
             .count(),
-        0
+        1
     );
     assert_eq!(
         final_user_context
@@ -463,6 +463,14 @@ async fn deferred_executor_startup_case(explicit_environment: bool) -> Result<()
             .count(),
         1
     );
+    let active_environment = final_user_context
+        .iter()
+        .rev()
+        .find(|text| text.contains("<environment_context>"))
+        .expect("ready environment context");
+    assert!(active_environment.contains("This environment context replaces all previously provided environment context."));
+    assert!(active_environment.contains("<shell>powershell</shell>"));
+    assert!(!active_environment.contains("<status>starting</status>"));
 
     Ok(())
 }
@@ -778,7 +786,7 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
             .iter()
             .filter(|text| text.contains("<status>starting</status>"))
             .count(),
-        0
+        1
     );
     assert_eq!(
         post_compaction_context
@@ -787,6 +795,13 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
             .count(),
         1
     );
+    let active_environment = post_compaction_context
+        .iter()
+        .rev()
+        .find(|text| text.contains("<environment_context>"))
+        .expect("ready environment context after compaction");
+    assert!(active_environment.contains("<shell>powershell</shell>"));
+    assert!(!active_environment.contains("<status>starting</status>"));
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
     let rollout_path = test.codex.rollout_path().context("rollout path")?;

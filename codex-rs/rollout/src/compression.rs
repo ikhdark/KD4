@@ -10,6 +10,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use tokio::io::AsyncBufReadExt;
+
 const COMPRESSED_SUFFIX: &str = ".zst";
 const COMPRESSED_READER_CHANNEL_CAPACITY: usize = 64;
 const MAX_OPEN_RETRIES: usize = 3;
@@ -325,7 +327,7 @@ pub struct RolloutLineReader {
 }
 
 enum RolloutLineReaderInner {
-    Plain(tokio::io::Lines<tokio::io::BufReader<tokio::fs::File>>),
+    Plain(tokio::io::BufReader<tokio::fs::File>),
     Blocking(BlockingRolloutLineReader),
 }
 
@@ -338,7 +340,13 @@ impl RolloutLineReader {
     /// Reads the next JSONL record from the rollout.
     pub async fn next_line(&mut self) -> io::Result<Option<String>> {
         match &mut self.inner {
-            RolloutLineReaderInner::Plain(lines) => lines.next_line().await,
+            RolloutLineReaderInner::Plain(reader) => {
+                let mut line = Vec::new();
+                if reader.read_until(b'\n', &mut line).await? == 0 {
+                    return Ok(None);
+                }
+                Ok(Some(decode_rollout_line(line)))
+            }
             RolloutLineReaderInner::Blocking(reader) => match reader.receiver.recv().await {
                 Some(line) => line.map(Some),
                 None => {
@@ -350,6 +358,23 @@ impl RolloutLineReader {
             },
         }
     }
+}
+
+/// Converts one raw JSONL record, without its line ending, into text.
+///
+/// Records are written as complete UTF-8 lines, but a process killed mid-append can
+/// tear the last one inside a multi-byte character, and the next append then
+/// terminates that fragment in place. Decoding lossily lets that fragment fail JSON
+/// parsing like any other torn record, instead of making every later record unreadable.
+fn decode_rollout_line(mut line: Vec<u8>) -> String {
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    }
+    String::from_utf8(line)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 mod worker {
@@ -1102,26 +1127,32 @@ mod reader {
     use super::COMPRESSED_READER_CHANNEL_CAPACITY;
     use super::RolloutLineReader;
     use super::RolloutLineReaderInner;
+    use super::decode_rollout_line;
     use super::path;
-    use tokio::io::AsyncBufReadExt;
 
     pub(super) async fn open_once(path: &Path) -> io::Result<RolloutLineReader> {
         let path = path::existing_rollout_path(path)
             .await
             .unwrap_or_else(|| path.to_path_buf());
         if path::is_compressed_rollout_path(path.as_path()) {
-            let reader = tokio::task::spawn_blocking(move || {
+            let mut reader = tokio::task::spawn_blocking(move || {
                 let input = File::open(path.as_path())?;
                 let decoder = zstd::stream::read::Decoder::new(input)?;
-                Ok::<_, io::Error>(
-                    io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>).lines(),
-                )
+                Ok::<_, io::Error>(io::BufReader::new(
+                    Box::new(decoder) as Box<dyn Read + Send>
+                ))
             })
             .await
             .map_err(io::Error::other)??;
             let (sender, receiver) = tokio::sync::mpsc::channel(COMPRESSED_READER_CHANNEL_CAPACITY);
             let task = tokio::task::spawn_blocking(move || {
-                for line in reader {
+                loop {
+                    let mut line = Vec::new();
+                    let line = match reader.read_until(b'\n', &mut line) {
+                        Ok(0) => break,
+                        Ok(_) => Ok(decode_rollout_line(line)),
+                        Err(error) => Err(error),
+                    };
                     let failed = line.is_err();
                     if sender.blocking_send(line).is_err() || failed {
                         break;
@@ -1138,7 +1169,7 @@ mod reader {
         }
         let file = tokio::fs::File::open(path).await?;
         Ok(RolloutLineReader {
-            inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file).lines()),
+            inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
         })
     }
 }

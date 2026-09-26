@@ -395,6 +395,21 @@ fn command_auth_validation_rejects_blank_commands_and_conflicts() {
 }
 
 #[test]
+fn zero_stream_and_websocket_timeouts_are_rejected() {
+    for field in ["stream_idle_timeout_ms", "websocket_connect_timeout_ms"] {
+        let provider: ModelProviderInfo =
+            toml::from_str(&format!("{field} = 0")).expect("provider fixture");
+        assert_eq!(
+            provider.validate(),
+            Err(format!("provider {field} must be greater than zero"))
+        );
+        let provider: ModelProviderInfo =
+            toml::from_str(&format!("{field} = 1")).expect("provider fixture");
+        assert_eq!(provider.validate(), Ok(()));
+    }
+}
+
+#[test]
 fn test_deserialize_provider_auth_config_defaults() {
     let base_dir = tempdir().unwrap();
     let provider_toml = r#"

@@ -241,6 +241,95 @@ async fn encoded_frame_serializes_once_and_reuses_the_encoded_bytes() {
 }
 
 #[tokio::test]
+async fn frames_use_one_transport_write_and_share_buffered_reads() {
+    use std::cell::Cell;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use tokio::io::AsyncRead;
+    use tokio::io::AsyncWrite;
+    use tokio::io::ReadBuf;
+
+    // Blocking-backed pipes pay a worker handoff per transport call.
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    struct CountingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        reads: Rc<Cell<usize>>,
+    }
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads.set(self.reads.get() + 1);
+            let available = &self.bytes[self.position..];
+            let count = available.len().min(buf.remaining());
+            buf.put_slice(&available[..count]);
+            self.position += count;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let messages = [json!({"first": 1}), json!(["second", 2]), json!("third")];
+    let mut transport = CountingWriter::default();
+    let mut writer = FramedWriter::new(&mut transport);
+    for message in &messages {
+        writer.write(message).await.expect("write frame");
+    }
+    assert_eq!(transport.writes, messages.len());
+
+    let reads = Rc::new(Cell::new(0));
+    let mut reader = FramedReader::new(CountingReader {
+        bytes: transport.bytes,
+        position: 0,
+        reads: Rc::clone(&reads),
+    });
+    for message in messages {
+        assert_eq!(
+            reader
+                .read::<serde_json::Value>()
+                .await
+                .expect("read frame"),
+            Some(message)
+        );
+    }
+    assert_eq!(
+        reader
+            .read::<serde_json::Value>()
+            .await
+            .expect("boundary EOF"),
+        None
+    );
+    // One read delivers every queued frame; one more observes EOF.
+    assert_eq!(reads.get(), 2);
+}
+
+#[tokio::test]
 async fn serializer_failure_after_partial_json_writes_no_transport_bytes() {
     use serde::Serialize;
     use serde::ser::Error;

@@ -156,27 +156,6 @@ impl<T: HttpTransport> EndpointSession<T> {
         .await
     }
 
-    pub(crate) async fn execute_encoded_json_with<C>(
-        &self,
-        method: Method,
-        path: &str,
-        extra_headers: HeaderMap,
-        body: EncodedJsonBody,
-        configure: C,
-    ) -> Result<Response, ApiError>
-    where
-        C: Fn(&mut Request),
-    {
-        self.execute_body_with(
-            method,
-            path,
-            extra_headers,
-            Some(RequestBody::EncodedJson(body)),
-            configure,
-        )
-        .await
-    }
-
     async fn execute_body_with<C>(
         &self,
         method: Method,

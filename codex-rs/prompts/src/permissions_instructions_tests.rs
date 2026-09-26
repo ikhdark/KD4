@@ -201,7 +201,11 @@ fn includes_request_permissions_tool_instructions_for_unless_trusted_when_enable
     );
 
     let text = instructions.body();
-    assert!(text.contains("`approval_policy` is `unless-trusted`"));
+    // The prompt must name the value users can actually configure.
+    assert!(text.contains(&format!(
+        "`approval_policy` is `{}`",
+        AskForApproval::UnlessTrusted
+    )));
     assert!(text.contains("# request_permissions Tool"));
 }
 

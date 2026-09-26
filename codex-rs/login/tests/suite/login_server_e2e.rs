@@ -562,11 +562,12 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
 async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() -> Result<()> {
     require_network!();
 
+    // The login server only accepts its registered ports, so an occupied port
+    // leaves the fallback unverified rather than proven.
     match TcpListener::bind(("127.0.0.1", FALLBACK_LOGIN_PORT)) {
         Ok(listener) => drop(listener),
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("Skipping test because 127.0.0.1:{FALLBACK_LOGIN_PORT} is already in use");
-            return Ok(());
+            anyhow::bail!("Behavior unverified: 127.0.0.1:{FALLBACK_LOGIN_PORT} is already in use");
         }
         Err(err) => return Err(err.into()),
     }
@@ -574,8 +575,7 @@ async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() ->
     let default_port_listener = match TcpListener::bind(("127.0.0.1", DEFAULT_LOGIN_PORT)) {
         Ok(listener) => listener,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("Skipping test because 127.0.0.1:{DEFAULT_LOGIN_PORT} is already in use");
-            return Ok(());
+            anyhow::bail!("Behavior unverified: 127.0.0.1:{DEFAULT_LOGIN_PORT} is already in use");
         }
         Err(err) => return Err(err.into()),
     };

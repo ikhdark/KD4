@@ -1132,7 +1132,10 @@ async fn read_project_message(server: &mut TestAppServer) -> Result<JSONRPCMessa
         // Preserve all project events, thread/started, responses and errors so the
         // assertions still reject incorrect ordering within the operation under test.
         if let JSONRPCMessage::Notification(notification) = &message
-            && matches!(notification.method.as_str(), "mcpServer/startup/completed")
+            && matches!(
+                notification.method.as_str(),
+                "mcpServer/startup/completed" | "thread/status/changed"
+            )
         {
             continue;
         }

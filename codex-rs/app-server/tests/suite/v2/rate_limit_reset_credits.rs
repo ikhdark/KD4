@@ -160,42 +160,34 @@ async fn consume_account_rate_limit_reset_credit_forwards_selected_credit_id() -
 }
 
 #[tokio::test]
-async fn consume_account_rate_limit_reset_credit_rejects_empty_idempotency_key() -> Result<()> {
+async fn consume_account_rate_limit_reset_credit_rejects_empty_ids() -> Result<()> {
     let (codex_home, _server) = chatgpt_test_context().await?;
     let mut mcp = initialized_app_server(codex_home.path()).await?;
 
-    let request_id = mcp
-        .send_consume_account_rate_limit_reset_credit_request(
+    for (params, expected_message) in [
+        (
             ConsumeAccountRateLimitResetCreditParams {
                 idempotency_key: String::new(),
                 credit_id: None,
             },
-        )
-        .await?;
-    let error = read_error_response(&mut mcp, request_id).await?;
-
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(error.error.message, "idempotencyKey must not be empty");
-    Ok(())
-}
-
-#[tokio::test]
-async fn consume_account_rate_limit_reset_credit_rejects_empty_credit_id() -> Result<()> {
-    let (codex_home, _server) = chatgpt_test_context().await?;
-    let mut mcp = initialized_app_server(codex_home.path()).await?;
-
-    let request_id = mcp
-        .send_consume_account_rate_limit_reset_credit_request(
+            "idempotencyKey must not be empty",
+        ),
+        (
             ConsumeAccountRateLimitResetCreditParams {
                 idempotency_key: "request-1".to_string(),
                 credit_id: Some(String::new()),
             },
-        )
-        .await?;
-    let error = read_error_response(&mut mcp, request_id).await?;
+            "creditId must not be empty",
+        ),
+    ] {
+        let request_id = mcp
+            .send_consume_account_rate_limit_reset_credit_request(params)
+            .await?;
+        let error = read_error_response(&mut mcp, request_id).await?;
 
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(error.error.message, "creditId must not be empty");
+        assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+        assert_eq!(error.error.message, expected_message);
+    }
     Ok(())
 }
 

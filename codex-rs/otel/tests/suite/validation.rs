@@ -183,3 +183,42 @@ fn grpc_exporters_reject_invalid_and_ambiguous_headers_without_credentials_in_er
         }
     }
 }
+
+#[tokio::test]
+async fn grpc_exporter_tls_uses_the_shared_rustls_provider() {
+    use codex_otel::OtelExporter;
+    use codex_otel::OtelProvider;
+    use codex_otel::OtelSettings;
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
+
+    let settings = OtelSettings {
+        environment: "test".to_string(),
+        service_name: "test".to_string(),
+        service_version: "1".to_string(),
+        codex_home: ".".into(),
+        exporter: OtelExporter::OtlpGrpc {
+            endpoint: "https://127.0.0.1:1".to_string(),
+            headers: HashMap::new(),
+            tls: None,
+        },
+        trace_exporter: OtelExporter::None,
+        metrics_exporter: OtelExporter::None,
+        runtime_metrics: false,
+        span_attributes: BTreeMap::new(),
+        tracestate: BTreeMap::new(),
+    };
+    let provider = OtelProvider::from(&settings).expect("gRPC exporter builds without connecting");
+
+    // Without a process provider, tonic falls back to ring, which cannot
+    // verify the ECDSA P-521 certificates used by some enterprise proxies.
+    let installed = rustls::crypto::CryptoProvider::get_default()
+        .expect("gRPC TLS setup must install the shared rustls provider");
+    assert!(
+        installed
+            .signature_verification_algorithms
+            .supported_schemes()
+            .contains(&rustls::SignatureScheme::ECDSA_NISTP521_SHA512)
+    );
+    drop(provider);
+}

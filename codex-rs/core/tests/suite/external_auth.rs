@@ -25,7 +25,7 @@ async fn header_auth_is_attached_to_responses_requests() -> anyhow::Result<()> {
     headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer external"));
     headers.insert("x-external-auth", HeaderValue::from_static("enabled"));
     let mut builder = test_codex().with_auth(CodexAuth::Headers(AuthHeaders::new(headers)));
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
 
     test.submit_turn("hello").await?;
 

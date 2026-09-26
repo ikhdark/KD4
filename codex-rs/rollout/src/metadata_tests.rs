@@ -496,7 +496,7 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
     );
 
     // Expire this fixture explicitly, without changing the default lease for
-    // every unit test or waiting fifteen minutes to exercise recovery.
+    // every unit test or waiting out a full lease to exercise recovery.
     backfill_sessions_with_lease(
         runtime.as_ref(),
         codex_home.as_path(),
@@ -538,19 +538,20 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
 }
 
 #[tokio::test]
-async fn backfill_sessions_retries_from_first_failed_watermark() {
+async fn backfill_sessions_completes_past_unreadable_rollout() {
     let dir = tempdir().expect("tempdir");
     let codex_home = dir.path().to_path_buf();
     let first_uuid = Uuid::from_u128(1);
     let failed_uuid = Uuid::from_u128(2);
     let last_uuid = Uuid::from_u128(3);
-    let first_path = write_rollout_in_sessions(
+    write_rollout_in_sessions(
         codex_home.as_path(),
         "2026-01-27T12-34-56",
         "2026-01-27T12:34:56Z",
         first_uuid,
         /*git*/ None,
     );
+    // A crash between creating a rollout and its first write leaves it empty for good.
     let failed_path = codex_home
         .join("sessions")
         .join(format!("rollout-2026-01-27T12-35-56-{failed_uuid}.jsonl"));
@@ -572,13 +573,13 @@ async fn backfill_sessions_retries_from_first_failed_watermark() {
     let state = runtime
         .get_backfill_state()
         .await
-        .expect("get incomplete backfill state");
-    assert_eq!(state.status, BackfillStatus::Pending);
+        .expect("get backfill state");
+    assert_eq!(state.status, BackfillStatus::Complete);
     assert_eq!(
         state.last_watermark,
         Some(backfill_watermark_for_path(
             codex_home.as_path(),
-            first_path.as_path(),
+            last_path.as_path(),
         ))
     );
     let first_id = ThreadId::from_string(&first_uuid.to_string()).expect("first thread id");
@@ -602,35 +603,92 @@ async fn backfill_sessions_retries_from_first_failed_watermark() {
             .expect("get last")
             .is_some()
     );
+}
 
-    write_rollout_in_sessions(
+#[tokio::test]
+async fn stopped_backfill_checkpoints_progress_and_releases_its_claim() {
+    let dir = tempdir().expect("tempdir");
+    let codex_home = dir.path().to_path_buf();
+    let uuids = [
+        Uuid::from_u128(11),
+        Uuid::from_u128(12),
+        Uuid::from_u128(13),
+    ];
+    let paths = uuids
+        .iter()
+        .enumerate()
+        .map(|(index, uuid)| {
+            write_rollout_in_sessions(
+                codex_home.as_path(),
+                &format!("2026-01-27T12-3{index}-56"),
+                &format!("2026-01-27T12:3{index}:56Z"),
+                *uuid,
+                /*git*/ None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let thread_ids = uuids.map(|uuid| ThreadId::from_string(&uuid.to_string()).expect("thread id"));
+    let runtime = codex_state::StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+
+    // Stop after the first rollout, as a startup deadline would between rollouts.
+    let mut checks = 0;
+    backfill_sessions_until(
+        runtime.as_ref(),
         codex_home.as_path(),
-        "2026-01-27T12-35-56",
-        "2026-01-27T12:35:56Z",
-        failed_uuid,
-        /*git*/ None,
-    );
-    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
+        "test-provider",
+        BACKFILL_LEASE_SECONDS,
+        || {
+            checks += 1;
+            checks > 1
+        },
+    )
+    .await;
 
-    assert!(
-        runtime
-            .get_thread(failed_id)
-            .await
-            .expect("get repaired")
-            .is_some()
-    );
     let state = runtime
         .get_backfill_state()
         .await
-        .expect("get completed backfill state");
-    assert_eq!(state.status, BackfillStatus::Complete);
+        .expect("stopped backfill state");
+    assert_eq!(state.status, BackfillStatus::Pending);
     assert_eq!(
         state.last_watermark,
         Some(backfill_watermark_for_path(
             codex_home.as_path(),
-            last_path.as_path(),
+            paths[0].as_path()
         ))
     );
+    assert!(
+        runtime
+            .get_thread(thread_ids[0])
+            .await
+            .expect("first thread")
+            .is_some()
+    );
+    assert_eq!(
+        runtime
+            .get_thread(thread_ids[1])
+            .await
+            .expect("second thread"),
+        None
+    );
+
+    // The released claim lets the next worker start at once instead of waiting out the lease.
+    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
+    let state = runtime
+        .get_backfill_state()
+        .await
+        .expect("resumed backfill state");
+    assert_eq!(state.status, BackfillStatus::Complete);
+    for thread_id in thread_ids {
+        assert!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("resumed thread")
+                .is_some()
+        );
+    }
 }
 
 #[tokio::test]

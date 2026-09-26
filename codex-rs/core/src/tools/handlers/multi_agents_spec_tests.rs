@@ -3,6 +3,8 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::SurfacedToolResult;
 use codex_tools::JsonSchemaPrimitiveType;
 use codex_tools::JsonSchemaType;
 use pretty_assertions::assert_eq;
@@ -567,8 +569,43 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
     );
     assert_eq!(
         output_schema.expect("list_agents output schema").into_value()["properties"]["agents"]["items"]["required"],
-        json!(["agent_name", "agent_status", "last_task_message"])
+        json!([
+            "agent_name",
+            "agent_status",
+            "last_task_message",
+            "runtime_loaded"
+        ])
     );
+}
+
+#[test]
+fn agent_status_schema_accepts_every_serialized_status() {
+    let validator = jsonschema::validator_for(&agent_status_output_schema())
+        .expect("compile agent status schema");
+    for status in [
+        AgentStatus::PendingInit,
+        AgentStatus::Running,
+        AgentStatus::Interrupted,
+        AgentStatus::Completed(None),
+        AgentStatus::Completed(Some("done".to_string())),
+        AgentStatus::CompletedWithSurface {
+            last_agent_message: None,
+            surfaced_result: SurfacedToolResult {
+                adapter: "typed_result".to_string(),
+                value: json!({"rows": [1, 2]}),
+                canonical_message: Some("surfaced".to_string()),
+            },
+        },
+        AgentStatus::Errored("failed".to_string()),
+        AgentStatus::Shutdown,
+        AgentStatus::NotFound,
+    ] {
+        let value = serde_json::to_value(&status).expect("serialize agent status");
+        assert!(
+            validator.is_valid(&value),
+            "advertised agent status schema rejects {value}"
+        );
+    }
 }
 
 #[test]

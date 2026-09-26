@@ -7,7 +7,6 @@ use sqlx::sqlite::SqlitePoolOptions;
 
 use super::MigrationLineEndings;
 use super::STATE_MIGRATOR;
-use super::ensure_kd4_compatibility_indexes;
 use super::migration_checksum;
 use super::migrator_with_line_endings;
 use super::repair_legacy_recency_migration_version;
@@ -277,12 +276,6 @@ VALUES (?, ?, TRUE, ?, 0)
         .run(&pool)
         .await
         .expect("line-ending-equivalent history should be accepted");
-    ensure_kd4_compatibility_indexes(&pool)
-        .await
-        .expect("compatible index should be created after migration");
-    ensure_kd4_compatibility_indexes(&pool)
-        .await
-        .expect("compatible index creation should be idempotent");
 
     assert_eq!(migration_ledger(&pool).await, original_ledger);
     assert_eq!(latest_known_version, 47);

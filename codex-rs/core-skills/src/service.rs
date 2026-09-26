@@ -448,7 +448,9 @@ fn skills_cache_key(
         cwd: cwd_cache_key.cloned(),
         roots: roots
             .iter()
-            .filter(|_| cwd_cache_key.is_none())
+            // A cwd snapshot is reused until an explicit reload, but it must still describe the
+            // plugin skill roots it was given: reinstalls publish new versioned roots.
+            .filter(|root| cwd_cache_key.is_none() || root.plugin_id.is_some())
             .map(|root| {
                 let scope_rank = match root.scope {
                     SkillScope::Repo => 0,

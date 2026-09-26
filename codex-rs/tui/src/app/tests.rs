@@ -4989,7 +4989,9 @@ fn active_turn_interrupt_race_extracts_actual_turn_id_from_mismatch() {
 
     assert_eq!(
         active_turn_interrupt_race(&error),
-        Some("turn-actual".to_string())
+        Some(ActiveTurnInterruptRace::ExpectedTurnMismatch {
+            actual_turn_id: "turn-actual".to_string(),
+        })
     );
 }
 
@@ -5947,6 +5949,144 @@ async fn turn_start_rejection_becomes_transcript_error_and_event_loop_continues(
 }
 
 #[tokio::test]
+async fn refused_thread_ops_become_transcript_errors_and_event_loop_continues() -> Result<()> {
+    Box::pin(async {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        app.active_thread_id = Some(thread_id);
+        app.chat_widget.handle_thread_session(test_thread_session(
+            thread_id,
+            test_path_buf("/tmp/project"),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        // `/compact` keeps the widget busy until its compaction turn starts.
+        app.chat_widget
+            .set_composer_text("/compact".to_string(), Vec::new(), Vec::new());
+        app.chat_widget
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.chat_widget.is_task_running_for_test());
+        let mut ops = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::CodexOp(op) = event {
+                ops.push(op);
+            }
+        }
+        assert_eq!(ops, vec![AppCommand::compact()]);
+        ops.extend([
+            AppCommand::run_user_shell_command("echo hello".to_string()),
+            AppCommand::clean_background_terminals(),
+        ]);
+
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let mut controls = Vec::new();
+        for op in ops {
+            controls.push(
+                Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::CodexOp(op))).await,
+            );
+        }
+        app_server.shutdown().await?;
+
+        for control in controls {
+            assert!(matches!(control?, AppRunControl::Continue));
+        }
+        assert!(
+            !app.chat_widget.is_task_running_for_test(),
+            "a refused /compact must not leave the widget waiting for its turn"
+        );
+        let mut rendered_history = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered_history.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            }
+        }
+        for method in [
+            "thread/compact/start",
+            "thread/shellCommand",
+            "thread/backgroundTerminals/clean",
+        ] {
+            assert!(
+                rendered_history
+                    .iter()
+                    .any(|cell| cell.contains(&format!("{method} failed in TUI"))),
+                "expected {method} rejection in transcript, got {rendered_history:?}"
+            );
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn refused_steer_is_queued_and_the_running_turn_continues() -> Result<()> {
+    Box::pin(async {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
+        app.thread_event_channels.insert(
+            thread_id,
+            ThreadEventChannel::new_with_session(
+                THREAD_EVENT_CHANNEL_CAPACITY,
+                session.clone(),
+                vec![test_turn("turn-1", TurnStatus::InProgress, Vec::new())],
+            ),
+        );
+        app.active_thread_id = Some(thread_id);
+        app.chat_widget.handle_thread_session(session);
+        app.chat_widget.handle_server_notification(
+            turn_started_notification(thread_id, "turn-1"),
+            /*replay_kind*/ None,
+        );
+        while app_event_rx.try_recv().is_ok() {}
+
+        let op = app
+            .chat_widget
+            .submit_user_message_as_plain_user_turn(crate::chatwidget::UserMessage::from(
+                "steer the turn",
+            ))
+            .expect("a running turn should accept a steer");
+        while app_event_rx.try_recv().is_ok() {}
+
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let result =
+            Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::CodexOp(op))).await;
+        app_server.shutdown().await?;
+
+        assert!(matches!(result?, AppRunControl::Continue));
+        assert!(
+            app.chat_widget.is_task_running_for_test(),
+            "a refused steer must not end the turn it targeted"
+        );
+        assert_eq!(
+            app.chat_widget.queued_user_message_texts(),
+            vec!["steer the turn".to_string()]
+        );
+        let mut rendered_history = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered_history.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            }
+        }
+        assert!(
+            rendered_history
+                .iter()
+                .any(|cell| cell.contains("turn/steer failed in TUI")),
+            "expected turn/steer rejection in transcript, got {rendered_history:?}"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn interrupt_without_active_turn_is_treated_as_handled() {
     Box::pin(async {
         let mut app = make_test_app().await;
@@ -5974,6 +6114,50 @@ async fn interrupt_without_active_turn_is_treated_as_handled() {
         .expect("interrupt submission should not fail");
 
         assert_eq!(handled, true);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn interrupt_of_turn_finished_before_its_notification_is_treated_as_handled() {
+    Box::pin(async {
+        let mut app = make_test_app().await;
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await
+        .expect("embedded app server");
+        let started = app_server
+            .start_thread(app.chat_widget.config_ref())
+            .await
+            .expect("thread/start should succeed");
+        let thread_id = started.session.thread_id;
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await
+            .expect("primary thread should be registered");
+        // Esc can arrive after the server finished the turn but before the TUI
+        // processed `turn/completed`, so the cached id names a turn that is over.
+        app.thread_event_channels
+            .get(&thread_id)
+            .expect("primary thread channel")
+            .store
+            .lock()
+            .await
+            .active_turn_id = Some("turn-already-finished".to_string());
+
+        let handled = Box::pin(app.try_submit_active_thread_op_via_app_server(
+            &mut app_server,
+            thread_id,
+            &AppCommand::interrupt(),
+        ))
+        .await
+        .expect("interrupting a finished turn must not end the TUI session");
+        // Side-conversation cleanup interrupts through the same stale cache before closing.
+        let discarded = Box::pin(app.discard_side_thread(&mut app_server, thread_id)).await;
+        app_server.shutdown().await.expect("app server shutdown");
+
+        assert_eq!(handled, true);
+        assert_eq!(discarded, true);
     })
     .await;
 }

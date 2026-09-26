@@ -3935,7 +3935,7 @@ async fn audit_search_oversized_context_delivers_coordinates_without_skipping_ma
     let second = search_logical_artifact(
         &metadata,
         &snapshot,
-        first.continuation.clone().unwrap(),
+        first.continuation.unwrap(),
         1024,
     );
     assert_eq!(second.value.as_ref().unwrap()["matches_returned"], 1);
@@ -3944,4 +3944,157 @@ async fn audit_search_oversized_context_delivers_coordinates_without_skipping_ma
         100_007
     );
     assert!(second.complete);
+}
+
+async fn protected_artifact_for_thread(codex_home: &Path, thread_id: &str) -> PathBuf {
+    let output = format!("retained output for {thread_id}");
+    let artifact = create_raw_output_artifact(codex_home, thread_id, output.as_bytes()).await;
+    let RawOutputArtifact::Stored {
+        id, path, bytes, ..
+    } = &artifact
+    else {
+        panic!("expected stored artifact");
+    };
+    protect_active_tool_history_artifact(
+        codex_home,
+        thread_id,
+        &id.to_string(),
+        *bytes,
+        &format!("{:x}", Sha256::digest(output.as_bytes())),
+    )
+    .await
+    .expect("protect artifact");
+    path.clone()
+}
+
+/// A protected artifact is recoverable only by its own thread. Once that thread
+/// has no rollout it can never be read again, yet its marker exempted it from
+/// every sweep, so dead threads accumulated until the shared root outgrew its
+/// index and every artifact write paid a full-root scan.
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn reclaim_releases_idle_directories_of_threads_without_rollouts_only() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path();
+    let root = home.join("tool-output");
+    let [active, resumable, unresumable, lookup_failed] =
+        std::array::from_fn(|_| codex_protocol::ThreadId::new().to_string());
+    let mut artifacts = BTreeMap::new();
+    for thread_id in [&active, &resumable, &unresumable, &lookup_failed] {
+        artifacts.insert(
+            thread_id.clone(),
+            protected_artifact_for_thread(home, thread_id).await,
+        );
+    }
+    let shared_store = root.join("known-delta");
+    std::fs::create_dir_all(&shared_store).expect("shared store");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&root).await,
+        RetentionModeKind::Indexed
+    );
+    let lookup = |thread_id: String| {
+        let resumable = resumable.clone();
+        let lookup_failed = lookup_failed.clone();
+        async move {
+            if thread_id == lookup_failed {
+                Err(std::io::Error::other("rollout lookup failed"))
+            } else {
+                Ok(thread_id == resumable)
+            }
+        }
+    };
+
+    // Within the grace period a directory may belong to a live thread whose
+    // rollout is not materialized yet.
+    assert_eq!(
+        reclaim_unresumable_thread_artifacts(home, &active, SystemTime::now(), &lookup)
+            .await
+            .expect("reclaim within grace"),
+        0
+    );
+    assert!(artifacts[&unresumable].exists());
+    assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Indexed);
+
+    let later = SystemTime::now() + UNRESUMABLE_THREAD_ARTIFACT_GRACE + Duration::from_secs(60);
+    assert_eq!(
+        reclaim_unresumable_thread_artifacts(home, &active, later, &lookup)
+            .await
+            .expect("reclaim after grace"),
+        1
+    );
+    assert!(!root.join(&unresumable).exists());
+    for kept in [&active, &resumable, &lookup_failed] {
+        assert!(artifacts[kept].exists(), "{kept} must keep its artifacts");
+    }
+    assert!(shared_store.exists());
+    // The index still counts the removed records until it reconciles.
+    assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Dirty);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn session_reclaim_removes_aged_artifacts_of_a_deleted_thread() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().to_path_buf();
+    let deleted = codex_protocol::ThreadId::new().to_string();
+    let artifact = protected_artifact_for_thread(&home, &deleted).await;
+    let directory = artifact.parent().expect("thread directory").to_path_buf();
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&directory)
+        .expect("open thread directory")
+        .set_modified(
+            SystemTime::now() - UNRESUMABLE_THREAD_ARTIFACT_GRACE - Duration::from_secs(60),
+        )
+        .expect("age thread directory");
+
+    spawn_unresumable_thread_artifact_reclaim(home, codex_protocol::ThreadId::new().to_string());
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while directory.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background reclaim removes the deleted thread's artifacts");
+}
+
+#[tokio::test]
+async fn threads_with_live_or_archived_compressed_rollouts_are_resumable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path();
+    let live = "11111111-1111-7111-8111-111111111111";
+    let archived = "22222222-2222-7222-8222-222222222222";
+    let deleted = "33333333-3333-7333-8333-333333333333";
+    let sessions = home
+        .join(crate::SESSIONS_SUBDIR)
+        .join("2026")
+        .join("09")
+        .join("25");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    std::fs::write(
+        sessions.join(format!("rollout-2026-09-25T00-00-00-{live}.jsonl")),
+        b"{}\n",
+    )
+    .expect("live rollout");
+    let archived_sessions = home.join(crate::ARCHIVED_SESSIONS_SUBDIR);
+    std::fs::create_dir_all(&archived_sessions).expect("archived sessions");
+    std::fs::write(
+        archived_sessions.join(format!("rollout-2026-09-25T00-00-00-{archived}.jsonl.zst")),
+        b"compressed",
+    )
+    .expect("archived rollout");
+
+    assert!(thread_rollout_exists(home, live).await.expect("live"));
+    assert!(
+        thread_rollout_exists(home, archived)
+            .await
+            .expect("archived")
+    );
+    assert!(!thread_rollout_exists(home, deleted).await.expect("deleted"));
 }

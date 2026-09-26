@@ -96,7 +96,7 @@ pub fn run_main(args: Args) -> Result<()> {
     let server = Server::from_listener(listener, None)
         .map_err(|err| anyhow!("creating HTTP server: {err}"))?;
     let client = Arc::new(
-        BlockingHttpClientBuilder::new()
+        upstream_client_builder()
             // Disable the transport's default timeout so long-lived response streams keep flowing.
             .request_timeout(None)
             .build_with_transport_default_proxy()
@@ -124,21 +124,25 @@ pub fn run_main(args: Args) -> Result<()> {
         let client = client.clone();
         let forward_config = forward_config.clone();
         let dump_dir = dump_dir.clone();
-        std::thread::Builder::new()
-            .spawn(move || {
-                let _permit = permit;
-                if let Err(e) = forward_request(
-                    &client,
-                    auth_header,
-                    &forward_config,
-                    dump_dir.as_deref(),
-                    args.max_body_bytes,
-                    request,
-                ) {
-                    eprintln!("forwarding error: {e}");
-                }
-            })
-            .context("spawning forwarding worker")?;
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let _permit = permit;
+            if let Err(e) = forward_request(
+                &client,
+                auth_header,
+                &forward_config,
+                dump_dir.as_deref(),
+                args.max_body_bytes,
+                request,
+            ) {
+                eprintln!("forwarding error: {e}");
+            }
+        });
+        // Returning here would exit the process and cut every in-flight stream.
+        // Dropping the unstarted closure answers its request with 500 and
+        // releases its permit.
+        if let Err(err) = spawned {
+            eprintln!("spawning forwarding worker: {err}");
+        }
     }
 
     Err(anyhow!("server stopped unexpectedly"))
@@ -161,6 +165,13 @@ impl Drop for InFlightPermit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Upstream redirects are relayed to the caller instead of followed. Following
+/// one would turn the POST into a GET, or replay it with this proxy's Host
+/// header, against a URL other than `--upstream-url`.
+fn upstream_client_builder() -> BlockingHttpClientBuilder {
+    BlockingHttpClientBuilder::new().without_redirects()
 }
 
 fn parse_forward_config(upstream_url: String) -> Result<ForwardConfig> {
@@ -364,15 +375,31 @@ fn forward_request(
         }
     });
 
-    let response_body: Box<dyn Read + Send> = if let Some(exchange_dump) = exchange_dump {
+    let mut response_body: Box<dyn Read + Send> = if let Some(exchange_dump) = exchange_dump {
         let headers = upstream_resp.headers().clone();
         Box::new(exchange_dump.tee_response_body(status.as_u16(), &headers, upstream_resp))
     } else {
         Box::new(upstream_resp)
     };
 
+    let status = StatusCode(status.as_u16());
+    // tiny_http's chunked encoder holds up to 8 KiB before writing, which stalls
+    // streamed events, so unknown-length bodies are framed here instead.
+    if content_length.is_none()
+        && *req.http_version() >= (1, 1)
+        && !matches!(status.0, 100..=199 | 204 | 304)
+    {
+        let mut writer = req.into_writer();
+        return write_streaming_response(
+            &mut writer,
+            status,
+            &response_headers,
+            &mut response_body,
+        );
+    }
+
     let response = Response::new(
-        StatusCode(status.as_u16()),
+        status,
         response_headers,
         response_body,
         content_length,
@@ -380,6 +407,69 @@ fn forward_request(
     );
 
     req.respond(response).context("writing upstream response")
+}
+
+/// Writes a chunked HTTP/1.1 response, flushing after every upstream read.
+fn write_streaming_response(
+    writer: &mut dyn Write,
+    status: StatusCode,
+    headers: &[Header],
+    body: &mut dyn Read,
+) -> Result<()> {
+    match write_chunked(writer, status, headers, body) {
+        Ok(None) => Ok(()),
+        Ok(Some(err)) => Err(err).context("reading upstream response body"),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err).context("writing upstream response"),
+    }
+}
+
+/// Returns the upstream read error, if any; a truncated body is still terminated
+/// so the client connection stays correctly framed.
+fn write_chunked(
+    writer: &mut dyn Write,
+    status: StatusCode,
+    headers: &[Header],
+    body: &mut dyn Read,
+) -> std::io::Result<Option<std::io::Error>> {
+    write!(
+        writer,
+        "HTTP/1.1 {} {}\r\n",
+        status.0,
+        status.default_reason_phrase()
+    )?;
+    for header in headers {
+        write!(writer, "{header}\r\n")?;
+    }
+    writer.write_all(b"Transfer-Encoding: chunked\r\n\r\n")?;
+    writer.flush()?;
+
+    let mut buffer = [0; 8192];
+    let upstream_error = loop {
+        match body.read(&mut buffer) {
+            Ok(0) => break None,
+            Ok(read) => {
+                write!(writer, "{read:x}\r\n")?;
+                writer.write_all(&buffer[..read])?;
+                writer.write_all(b"\r\n")?;
+                writer.flush()?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => break Some(err),
+        }
+    };
+    writer.write_all(b"0\r\n\r\n")?;
+    writer.flush()?;
+    Ok(upstream_error)
 }
 
 fn connection_fields<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
@@ -416,10 +506,26 @@ mod tests {
         max_body_bytes: u64,
         extra_headers: &str,
     ) -> (String, Result<()>) {
+        let (addr, worker) = spawn_proxy_worker(upstream, max_body_bytes);
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(stream, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n", body.len()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        (response, worker.join().unwrap())
+    }
+
+    fn spawn_proxy_worker(
+        upstream: String,
+        max_body_bytes: u64,
+    ) -> (SocketAddr, std::thread::JoinHandle<Result<()>>) {
         let server = Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         let worker = std::thread::spawn(move || {
-            let client = BlockingHttpClientBuilder::new()
+            let client = upstream_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build_direct()
                 .unwrap();
@@ -437,15 +543,70 @@ mod tests {
                 request,
             )
         });
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream
+        (addr, worker)
+    }
+
+    #[test]
+    fn streaming_response_reaches_client_before_upstream_finishes() {
+        use std::io::BufRead;
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_url = format!("http://{}/v1/responses", upstream.local_addr().unwrap());
+        let (first_event_seen, first_event_seen_rx) = std::sync::mpsc::channel();
+        let upstream_worker = std::thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = [0; 2];
+            reader.read_exact(&mut body).unwrap();
+            let chunk = |data: &str| format!("{:x}\r\n{data}\r\n", data.len());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{}",
+                chunk("data: first\n\n")
+            )
+            .unwrap();
+            first_event_seen_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first event should reach the client while upstream is open");
+            write!(stream, "{}0\r\n\r\n", chunk("data: last\n\n")).unwrap();
+        });
+
+        let (addr, proxy_worker) = spawn_proxy_worker(upstream_url, 2);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        write!(stream, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n", body.len()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        (response, worker.join().unwrap())
+        client
+            .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+        let mut response = Vec::new();
+        let mut buffer = [0; 1024];
+        while !String::from_utf8_lossy(&response).contains("data: first\n\n") {
+            let read = client.read(&mut buffer).unwrap();
+            assert!(read > 0, "proxy closed before the first event");
+            response.extend_from_slice(&buffer[..read]);
+        }
+        first_event_seen.send(()).unwrap();
+        client.read_to_end(&mut response).unwrap();
+        proxy_worker.join().unwrap().unwrap();
+        upstream_worker.join().unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("content-type: text/event-stream\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("data: last\n\n"), "{response}");
+        assert!(response.ends_with("\r\n0\r\n\r\n"), "{response}");
     }
 
     #[test]
@@ -494,6 +655,49 @@ mod tests {
                 .contains("x-end-to-end: retained")
         );
         assert!(!response.to_ascii_lowercase().contains("x-upstream-hop:"));
+    }
+
+    #[test]
+    fn upstream_redirect_is_relayed_without_following() {
+        use std::io::BufRead;
+        let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
+        let location = format!("http://{}/v1/responses", elsewhere.local_addr().unwrap());
+        let relayed_location = format!("location: {location}\r\n");
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/responses", upstream.local_addr().unwrap());
+        let upstream_worker = std::thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = [0; 2];
+            reader.read_exact(&mut body).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let (response, result) = proxy_exchange(url, b"{}", 2, "");
+        result.unwrap();
+        upstream_worker.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 307"), "{response}");
+        assert!(
+            response.to_ascii_lowercase().contains(&relayed_location),
+            "{response}"
+        );
+        elsewhere.set_nonblocking(true).unwrap();
+        assert_eq!(
+            elsewhere.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the proxy must not replay the request to the redirect target"
+        );
     }
 
     #[test]

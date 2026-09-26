@@ -1677,6 +1677,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the active response lock to prove health inspection does not wait for it"
+    )]
     async fn audit_overflow_preserves_only_a_valid_accepted_completion_and_retires_connection() {
         let completed =
             json!({"type":"response.completed","response":{"id":"accepted"}}).to_string();

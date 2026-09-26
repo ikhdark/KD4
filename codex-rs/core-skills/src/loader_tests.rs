@@ -1195,6 +1195,36 @@ async fn loads_valid_skill() {
 }
 
 #[tokio::test]
+async fn loads_skill_saved_with_utf8_bom() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skill_dir = codex_home.path().join("skills/bom");
+    fs::create_dir_all(&skill_dir).unwrap();
+    let skill_path = skill_dir.join(SKILLS_FILENAME);
+    fs::write(
+        &skill_path,
+        "\u{feff}---\r\nname: bom-skill\r\ndescription: saved with a BOM\r\n---\r\n\r\n# Body\r\n",
+    )
+    .unwrap();
+    let cfg = make_config(&codex_home).await;
+
+    let outcome = load_skills_for_test(&cfg).await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "unexpected errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(
+        outcome.skills,
+        vec![expected_user_skill(
+            &skill_path,
+            "bom-skill",
+            "saved with a BOM"
+        )]
+    );
+}
+
+#[tokio::test]
 async fn falls_back_to_directory_name_when_skill_name_is_missing() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let skill_path = write_raw_skill_at(

@@ -1,1 +1,1 @@
-Approvals obtain user consent to run shell commands outside the sandbox. `approval_policy` is `unless-trusted`: the harness requests approval for most commands except a limited allowlist of safe read commands.
+Approvals obtain user consent to run shell commands outside the sandbox. `approval_policy` is `untrusted`: the harness requests approval for most commands except a limited allowlist of safe read commands.

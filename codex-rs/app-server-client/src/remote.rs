@@ -391,7 +391,10 @@ impl RemoteAppServerClient {
                             }
                         }
                     }
-                    message = stream.next(), if pending_delivery.is_empty() => {
+                    // Retained lossless events pause reads for backpressure, except while a
+                    // caller awaits an RPC: its response shares this socket, and a consumer
+                    // blocked on that response cannot drain the event queue.
+                    message = stream.next(), if pending_delivery.is_empty() || !pending_requests.is_empty() => {
                         match message {
                             Some(Ok(Message::Text(text))) => {
                                 match serde_json::from_str::<JSONRPCMessage>(&text) {
@@ -1093,6 +1096,15 @@ fn forward_remote_event(
         }
         pending_delivery.push_back(event);
         return Ok(None);
+    }
+
+    // A best-effort event must not overtake retained lossless events.
+    if !pending_delivery.is_empty() {
+        *skipped_events = skipped_events.saturating_add(1);
+        return Ok(match event {
+            AppServerEvent::ServerRequest(request) => Some(request),
+            _ => None,
+        });
     }
 
     if *skipped_events > 0 {

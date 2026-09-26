@@ -31,7 +31,9 @@ function Ensure-Command($Name) {
 }
 
 function Add-CargoBinToPath() {
-  $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+  # rustup installs into CARGO_HOME when it is set (for example scoop-managed homes).
+  $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+  $cargoBin = Join-Path $cargoHome "bin"
   if (Test-Path $cargoBin) {
     if (-not ($env:Path.Split(';') -contains $cargoBin)) {
       $env:Path = "$env:Path;$cargoBin"
@@ -51,8 +53,22 @@ function Ensure-UserPathContains([string] $Segment) {
   } catch {}
 }
 
-function Ensure-UserEnvVar([string] $Name, [string] $Value) {
-  try { [Environment]::SetEnvironmentVariable($Name, $Value, 'User') } catch {}
+function Ensure-EnvDefault([string] $Name, [string] $Value) {
+  # Supply a default without overriding a value chosen for this process or user.
+  if (-not [Environment]::GetEnvironmentVariable($Name, 'Process')) {
+    [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
+  }
+  try {
+    if (-not [Environment]::GetEnvironmentVariable($Name, 'User')) {
+      [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
+    }
+  } catch {}
+}
+
+function Assert-LastExitCode([string] $Description) {
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Description failed with exit code $LASTEXITCODE"
+  }
 }
 
 function Ensure-VSComponents([string[]]$Components) {
@@ -69,7 +85,7 @@ function Ensure-VSComponents([string[]]$Components) {
     $instPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath 2>$null
   }
   if (-not $instPath) {
-    $default2022 = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools'
+    $default2022 = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
     if (Test-Path $default2022) { $instPath = $default2022 }
   }
   if (-not $instPath) { return }
@@ -181,31 +197,30 @@ Write-Host "==> Configuring Rust toolchain per rust-toolchain.toml" -ForegroundC
 # Pin to the workspace toolchain and install components
 $toolchain = '1.98.1'
 & rustup toolchain install $toolchain --profile minimal | Out-Host
+Assert-LastExitCode "rustup toolchain install $toolchain"
 & rustup default $toolchain | Out-Host
+Assert-LastExitCode "rustup default $toolchain"
 & rustup component add clippy rustfmt rust-src --toolchain $toolchain | Out-Host
+Assert-LastExitCode "rustup component add"
 
 # 6.5) LLVM/Clang (some crates/bindgen require clang/libclang)
 function Add-LLVMToPath() {
-  $llvmBin = 'C:\\Program Files\\LLVM\\bin'
+  # PowerShell does not treat backslashes as escapes; this must match PATH entries exactly.
+  $llvmBin = 'C:\Program Files\LLVM\bin'
   if (Test-Path $llvmBin) {
     if (-not ($env:Path.Split(';') -contains $llvmBin)) {
       $env:Path = "$env:Path;$llvmBin"
     }
-    if (-not $env:LIBCLANG_PATH) {
-      $env:LIBCLANG_PATH = $llvmBin
-    }
     Ensure-UserPathContains $llvmBin
-    Ensure-UserEnvVar -Name 'LIBCLANG_PATH' -Value $llvmBin
+    Ensure-EnvDefault -Name 'LIBCLANG_PATH' -Value $llvmBin
 
     $clang = Join-Path $llvmBin 'clang.exe'
     $clangxx = Join-Path $llvmBin 'clang++.exe'
     if (Test-Path $clang) {
-      $env:CC = $clang
-      Ensure-UserEnvVar -Name 'CC' -Value $clang
+      Ensure-EnvDefault -Name 'CC' -Value $clang
     }
     if (Test-Path $clangxx) {
-      $env:CXX = $clangxx
-      Ensure-UserEnvVar -Name 'CXX' -Value $clangxx
+      Ensure-EnvDefault -Name 'CXX' -Value $clangxx
     }
   }
 }
@@ -218,10 +233,14 @@ Add-LLVMToPath
 # Ensure MSVC linker is available before building/cargo-install by entering VS dev shell
 Enter-VsDevShell
 $hasLink = $false
-try { & where.exe link | Out-Null; $hasLink = $true } catch {}
+# where.exe reports a miss through its exit code; it does not throw. Windows PowerShell may
+# still surface its redirected stderr as an error, which also means the linker is missing.
+try { & where.exe link *> $null; $hasLink = $LASTEXITCODE -eq 0 } catch {}
 if ($hasLink) {
   Write-Host "-- Installing cargo-insta" -ForegroundColor DarkCyan
+  # An already-current install exits 0, so a nonzero exit is a real failure.
   & cargo install cargo-insta | Out-Host
+  Assert-LastExitCode "cargo install cargo-insta"
 } else {
   Write-Host "-- Skipping cargo-insta for now (MSVC linker not found yet)" -ForegroundColor Yellow
 }
@@ -238,8 +257,9 @@ try {
   # than assigning '': PowerShell 7.5+ keeps an empty RUSTFLAGS, which makes
   # Cargo ignore the target rustflags in .cargo/config.toml.
   Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
-  Enter-VsDevShell
+  # The VS developer environment entered above persists for this process.
   & cargo build
+  Assert-LastExitCode "cargo build"
 }
 finally {
   popd | Out-Null

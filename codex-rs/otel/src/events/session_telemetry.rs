@@ -45,6 +45,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use eventsource_stream::Event as StreamEvent;
 use eventsource_stream::EventStreamError as StreamError;
@@ -176,8 +177,12 @@ pub struct SessionTelemetryMetadata {
     pub(crate) account_email: Option<String>,
     pub(crate) originator: String,
     pub(crate) service_name: Option<String>,
+    /// Bounded metric tag value; see [`session_source_metric_tag`].
     pub(crate) session_source: String,
     pub(crate) model: String,
+    /// Tag-safe form of `model`, so provider model names such as `gpt-oss:20b` do not fail
+    /// every metric's tag validation.
+    pub(crate) metrics_model: String,
     pub(crate) slug: String,
     pub(crate) service_tier: Option<String>,
     pub(crate) model_reasoning_effort: Option<String>,
@@ -406,6 +411,18 @@ fn normalized_model_attempt_label(value: &str) -> Option<&str> {
     .then_some(value)
 }
 
+/// Metric tags must stay low-cardinality: a spawned agent's display form embeds its parent
+/// thread id, so tag it by kind and depth only.
+fn session_source_metric_tag(session_source: &SessionSource) -> String {
+    let tag = match session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => {
+            format!("subagent_thread_spawn_d{depth}")
+        }
+        source => source.to_string(),
+    };
+    sanitize_metric_tag_value(&tag)
+}
+
 fn normalized_context_component_hash(value: &str) -> Option<&str> {
     (value.len() == 24 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(value)
 }
@@ -444,6 +461,7 @@ impl SessionTelemetry {
 
     pub fn with_model(mut self, model: &str, slug: &str) -> Self {
         self.metadata.model = model.to_owned();
+        self.metadata.metrics_model = sanitize_metric_tag_value(model);
         self.metadata.slug = slug.to_owned();
         self
     }
@@ -720,7 +738,7 @@ impl SessionTelemetry {
             session_source: self.metadata.session_source.as_str(),
             originator: self.metadata.originator.as_str(),
             service_name: self.metadata.service_name.as_deref(),
-            model: self.metadata.model.as_str(),
+            model: self.metadata.metrics_model.as_str(),
             app_version: self.metadata.app_version,
         }
         .into_tags()
@@ -748,8 +766,9 @@ impl SessionTelemetry {
                 account_email,
                 originator: sanitize_metric_tag_value(originator.as_str()),
                 service_name: None,
-                session_source: session_source.to_string(),
+                session_source: session_source_metric_tag(&session_source),
                 model: model.to_owned(),
+                metrics_model: sanitize_metric_tag_value(model),
                 slug: slug.to_owned(),
                 service_tier: None,
                 model_reasoning_effort: None,
@@ -1856,8 +1875,28 @@ fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration>
     if !ms.is_finite() || ms < 0.0 {
         return None;
     }
+    // Keep fractional milliseconds; the runtime summary rounds only after summing a window.
     let clamped = ms.min(u64::MAX as f64);
-    Some(Duration::from_millis(clamped.round() as u64))
+    Some(Duration::from_secs_f64(clamped / 1000.0))
+}
+
+#[cfg(test)]
+mod server_timing_tests {
+    use super::*;
+
+    #[test]
+    fn server_timing_fields_keep_fractional_milliseconds() {
+        assert_eq!(
+            duration_from_ms_value(Some(&serde_json::json!(0.4))),
+            Some(Duration::from_micros(400))
+        );
+        assert_eq!(
+            duration_from_ms_value(Some(&serde_json::json!(12))),
+            Some(Duration::from_millis(12))
+        );
+        assert_eq!(duration_from_ms_value(Some(&serde_json::json!(-1))), None);
+        assert_eq!(duration_from_ms_value(Some(&serde_json::json!("1"))), None);
+    }
 }
 
 #[cfg(test)]

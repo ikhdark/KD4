@@ -34,6 +34,7 @@ use core_test_support::context_snapshot::ContextSnapshotRenderMode;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::require_network;
 use core_test_support::responses;
+use core_test_support::responses::body_contains_text;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
 use core_test_support::test_codex::local_selections;
@@ -157,17 +158,6 @@ fn ev_completed_with_usage(id: &str, input_tokens: i64, output_tokens: i64) -> V
             }
         }
     })
-}
-
-fn body_contains_text(body: &str, text: &str) -> bool {
-    body.contains(&json_fragment(text))
-}
-
-fn json_fragment(text: &str) -> String {
-    serde_json::to_string(text)
-        .expect("serialize text to JSON")
-        .trim_matches('"')
-        .to_string()
 }
 
 fn read_hook_inputs(path: &Path) -> Vec<Value> {
@@ -5092,8 +5082,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
         .submit_turn("after remote v2 compaction cold resume")
         .await?;
 
-    // Cold resume canonicalizes the persisted old context to the newly loaded same-path
-    // instructions and emits one explicit replacement.
+    // Cold resume preserves the persisted context and appends one explicit replacement.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
     let replacement_fragment = format!(
@@ -5101,7 +5090,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     );
     assert_eq!(
         instruction_fragments(&requests[3]),
-        vec![replacement_fragment]
+        vec![old_fragment, replacement_fragment]
     );
     assert_eq!(
         resumed.codex.instruction_sources().await,

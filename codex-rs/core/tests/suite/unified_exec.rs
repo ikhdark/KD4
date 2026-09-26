@@ -20,6 +20,7 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::assert_regex_match;
 use core_test_support::managed_network_requirements_loader;
 use core_test_support::require_network;
+use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -106,7 +107,7 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
             );
             let bodies = requests
                 .iter()
-                .map(|request| request.body_json())
+                .map(ResponsesRequest::body_json)
                 .collect::<Vec<_>>();
             for body in &bodies {
                 let surface = body["tools"].as_array().context("model-visible tools")?;
@@ -481,7 +482,7 @@ async fn exec_command_retained_session_lifecycle_completes_without_stale_process
                 .enable(Feature::UnifiedExec)
                 .expect("test config should allow feature update");
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
 
     let fixture_program = std::env::current_exe().context("resolve unified-exec test binary")?;
     let cases = [("lifecycle-delayed-success", 0, "yielded")];
@@ -790,7 +791,7 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
                 .enable(Feature::UnifiedExec)
                 .expect("test config should allow feature update");
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     let fixture_program = std::env::current_exe().context("resolve unified-exec test binary")?;
 
     let cases = [
@@ -986,7 +987,7 @@ async fn exec_command_interrupt_closes_unpublished_retained_process_before_turn_
                 .enable(Feature::UnifiedExec)
                 .expect("test config should allow feature update");
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
     let fixture_program = std::env::current_exe().context("resolve unified-exec test binary")?;
     let arguments = retained_process_exec_args(&fixture_program, 30_000);
     let response_mock = mount_sse_sequence(
@@ -1251,7 +1252,7 @@ allow_local_binding = true
                 .set_permission_profile(permission_profile_for_config)
                 .expect("set permission profile");
         });
-    let test = builder.build_with_auto_env(server).await?;
+    let test = builder.build(server).await?;
     assert!(
         test.config.permissions.network.is_some(),
         "expected managed network proxy config to be present"
@@ -1379,7 +1380,7 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let codex = builder.build_with_auto_env(&server).await?;
+    let codex = builder.build(&server).await?;
     submit_unified_exec_turn(
         &codex,
         "run the command and wait for it to finish",
@@ -1441,7 +1442,7 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
 
     let start_call_id = format!("uexec-non-tty-interrupt-{test_name}-start");
     let interrupt_call_id = format!("uexec-non-tty-interrupt-{test_name}");
@@ -1561,7 +1562,7 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
 
     let start_call_id = "uexec-windows-interrupt-start";
     let interrupt_call_id = "uexec-windows-interrupt";
@@ -1662,7 +1663,7 @@ async fn unified_exec_runs_on_windows() -> Result<()> {
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
 
     let call_id = "uexec";
     let args = serde_json::json!({

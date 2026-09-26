@@ -142,6 +142,57 @@ impl ChatWidget {
             );
             return false;
         };
+        self.queue_rejected_steer(pending_steer);
+        true
+    }
+
+    /// Handles a steer the app server refused before it reached the running turn.
+    ///
+    /// The turn keeps running, so only the refused input moves: out of the pending steers, whose
+    /// commit can no longer arrive, and into the rejected-steer queue, where it can be edited or is
+    /// sent as the next turn.
+    pub(crate) fn on_steer_refused(&mut self, items: &[UserInput], message: String) {
+        if let Some(pending_steer) = self.take_pending_steer(items) {
+            self.queue_rejected_steer(pending_steer);
+        }
+        self.add_error_message(message);
+    }
+
+    /// Whether `items` were submitted as a steer that no turn has committed yet.
+    pub(crate) fn has_pending_steer(&self, items: &[UserInput]) -> bool {
+        let compare_key = Self::pending_steer_compare_key_from_items(items);
+        self.input_queue
+            .pending_steers
+            .iter()
+            .any(|pending| pending.compare_key == compare_key)
+    }
+
+    /// Records that the app started a new turn for input this widget submitted as a steer.
+    ///
+    /// The widget steers while it believes a turn is running, but that turn may already have
+    /// ended, so the input opened the next turn instead. It is no longer unacknowledged steer
+    /// text: interrupting the old turn must neither restore it to the composer, which would
+    /// duplicate a sent message, nor resubmit it.
+    pub(crate) fn on_steer_started_turn(&mut self, items: &[UserInput]) {
+        if let Some(pending_steer) = self.take_pending_steer(items) {
+            self.input_queue.promoted_steers.push_back(pending_steer);
+            self.refresh_pending_input_preview();
+        }
+    }
+
+    /// Removes the most recent pending steer carrying `items`; earlier identical steers may be
+    /// accepted ones still awaiting their commit.
+    fn take_pending_steer(&mut self, items: &[UserInput]) -> Option<PendingSteer> {
+        let compare_key = Self::pending_steer_compare_key_from_items(items);
+        let index = self
+            .input_queue
+            .pending_steers
+            .iter()
+            .rposition(|pending| pending.compare_key == compare_key)?;
+        self.input_queue.pending_steers.remove(index)
+    }
+
+    fn queue_rejected_steer(&mut self, pending_steer: PendingSteer) {
         self.input_queue
             .rejected_steers_queue
             .push_back(pending_steer.user_message);
@@ -149,7 +200,6 @@ impl ChatWidget {
             .rejected_steer_history_records
             .push_back(pending_steer.history_record);
         self.refresh_pending_input_preview();
-        true
     }
 
     /// Handle a turn aborted due to user interrupt (Esc), budget exhaustion,

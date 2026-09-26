@@ -21,6 +21,8 @@ use codex_code_mode_protocol::host::HostHello;
 use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
@@ -38,8 +40,13 @@ use self::peer::HostPeer;
 mod delegate;
 mod peer;
 
-const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const MAX_ACTIVE_CELLS: usize = 128;
+// Frames the host can owe the client for work it has admitted: a response and
+// an initial response per request, a request and its cancellation per pending
+// delegate call, and a closure per cell. A full queue fails every session on
+// the connection, so it must not fill below that bound.
+const OUTGOING_FRAME_CAPACITY: usize =
+    2 * MAX_IN_FLIGHT_REQUESTS + 2 * MAX_PENDING_DELEGATE_REQUESTS + MAX_ACTIVE_CELLS;
 // Bound retained session storage independently of transient request/cell
 // permits: 64 sessions can retain up to 512 MiB of serialized stored values.
 const MAX_OPEN_SESSIONS: usize = 64;
@@ -64,7 +71,7 @@ where
         return Ok(());
     }
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(/*max_capacity*/ 128);
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_FRAME_CAPACITY);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
     let state = Arc::new(HostState {
         sessions: Mutex::new(HashMap::new()),
