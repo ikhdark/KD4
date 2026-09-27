@@ -34,10 +34,10 @@ impl LMStudioClient {
 
     pub(crate) async fn try_from_provider_with_models(
         config: &Config,
-    ) -> io::Result<(Self, io::Result<Vec<String>>)> {
+    ) -> io::Result<(Self, Vec<String>)> {
         let client = Self::from_provider(config)?;
         let response = client.check_server().await?;
-        let models = Self::models_from_response(response).await;
+        let models = Self::models_from_response(response).await?;
         Ok((client, models))
     }
 
@@ -150,10 +150,17 @@ impl LMStudioClient {
                 io::Error::new(io::ErrorKind::InvalidData, "No 'data' array in response")
             })?
             .iter()
-            .filter_map(|model| model["id"].as_str())
-            .map(std::string::ToString::to_string)
+            .map(|model| {
+                model["id"]
+                    .as_str()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid model id in response")
+                    })
+            })
             .collect();
-        Ok(models)
+        models
     }
 
     // Find lms on PATH, falling back to LM Studio's per-user install location.

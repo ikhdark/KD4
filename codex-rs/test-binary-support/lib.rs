@@ -2,6 +2,20 @@ pub use codex_arg0::Arg0PathEntryGuard;
 use codex_arg0::arg0_dispatch;
 use codex_arg0::arg0_dispatch_helper;
 
+struct RestoreCodexHome(Option<std::ffi::OsString>);
+
+impl Drop for RestoreCodexHome {
+    fn drop(&mut self) {
+        // SAFETY: this guard is scoped to test startup, before test threads begin.
+        unsafe {
+            match &self.0 {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+}
+
 /// Configures arg0 dispatch for a test binary. Call it from a `#[ctor]`.
 ///
 /// A helper re-execution dispatches with its inherited environment and never
@@ -18,7 +32,7 @@ pub fn configure_test_binary_dispatch(codex_home_dir_name: &str) -> Option<Arg0P
     if let Err(error) = std::fs::create_dir_all(&codex_home) {
         panic!("failed to create test CODEX_HOME: {error}");
     }
-    let previous_codex_home = std::env::var_os("CODEX_HOME");
+    let _restore_codex_home = RestoreCodexHome(std::env::var_os("CODEX_HOME"));
     // Safety: this runs from a test ctor before test threads begin.
     unsafe {
         std::env::set_var("CODEX_HOME", &codex_home);
@@ -28,16 +42,5 @@ pub fn configure_test_binary_dispatch(codex_home_dir_name: &str) -> Option<Arg0P
         Some(arg0) => arg0,
         None => panic!("failed to configure arg0 dispatch aliases for test binary"),
     };
-    match previous_codex_home.as_ref() {
-        Some(value) => unsafe {
-            // SAFETY: the test ctor is still running before test threads start.
-            std::env::set_var("CODEX_HOME", value);
-        },
-        None => unsafe {
-            // SAFETY: the test ctor is still running before test threads start.
-            std::env::remove_var("CODEX_HOME");
-        },
-    }
-
     Some(arg0)
 }

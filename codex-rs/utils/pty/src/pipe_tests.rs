@@ -200,6 +200,44 @@ fn managed_job_terminates_root() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn pipe_root_fallback_does_not_hide_tree_termination_failure() -> anyhow::Result<()> {
+    let mut child = KillOnDrop(
+        std::process::Command::new("cmd.exe")
+            .args(["/D", "/Q", "/K"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let mut managed = ManagedRootProcess::reserve()?;
+    managed.attach(child.id())?;
+    managed.restrict_job_to_query_access_for_test()?;
+    // SAFETY: the child keeps the borrowed process handle alive during duplication.
+    let process =
+        unsafe { BorrowedHandle::borrow_raw(child.as_raw_handle()) }.try_clone_to_owned()?;
+    let mut terminator = PipeChildTerminator {
+        managed: Arc::new(managed),
+        windows: WindowsChildTerminator::Job { process },
+    };
+    let error = terminator
+        .kill()
+        .expect_err("root kill cannot prove tree cleanup");
+    assert!(error.to_string().contains("root process fallback succeeded"));
+    // SAFETY: child owns this process handle for the bounded native wait.
+    assert_eq!(
+        unsafe { WaitForSingleObject(child.as_raw_handle() as _, 5_000) },
+        WAIT_OBJECT_0
+    );
+    assert_eq!(child.wait()?.code(), Some(1));
+    terminator.managed.preserve_descendants()?;
+    assert!(
+        terminator.kill().is_err(),
+        "failed tree termination must remain retryable"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
     let args = vec![

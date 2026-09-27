@@ -181,7 +181,7 @@ pub fn approx_token_count_exceeds(text: &str, limit: usize) -> bool {
 }
 
 fn token_byte_estimate(bytes: usize) -> usize {
-    bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1)) / APPROX_BYTES_PER_TOKEN
+    bytes.div_ceil(APPROX_BYTES_PER_TOKEN)
 }
 
 fn lexical_token_count(text: &str, limit: usize) -> usize {
@@ -224,9 +224,7 @@ pub fn approx_bytes_for_tokens(tokens: usize) -> usize {
 }
 
 pub fn approx_tokens_from_byte_count(bytes: usize) -> u64 {
-    let bytes_u64 = bytes as u64;
-    bytes_u64.saturating_add((APPROX_BYTES_PER_TOKEN as u64).saturating_sub(1))
-        / (APPROX_BYTES_PER_TOKEN as u64)
+    token_byte_estimate(bytes) as u64
 }
 
 fn split_boundaries(s: &str, beginning_bytes: usize, end_bytes: usize) -> (&str, &str) {

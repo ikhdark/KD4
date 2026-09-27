@@ -34,7 +34,6 @@ const MAX_CACHED_SKILL_SNAPSHOTS: usize = 64;
 struct SnapshotCacheOptions<'a> {
     force_reload: bool,
     cache_result: bool,
-    isolate_file_system: bool,
     cwd_cache_key: Option<&'a AbsolutePathBuf>,
 }
 
@@ -153,7 +152,6 @@ impl SkillsService {
                 SnapshotCacheOptions {
                     force_reload: false,
                     cache_result: true,
-                    isolate_file_system: true,
                     cwd_cache_key: None,
                 },
             )
@@ -207,7 +205,6 @@ impl SkillsService {
             SnapshotCacheOptions {
                 force_reload,
                 cache_result,
-                isolate_file_system: false,
                 cwd_cache_key: Some(&input.cwd),
             },
         )
@@ -224,14 +221,12 @@ impl SkillsService {
         let SnapshotCacheOptions {
             force_reload,
             cache_result,
-            isolate_file_system,
             cwd_cache_key,
         } = cache_options;
         let cache_key = skills_cache_key(
             &roots,
             &skill_config_rules,
             input.plugin_skill_snapshots.as_ref(),
-            isolate_file_system,
             cwd_cache_key,
         );
         if cache_result
@@ -409,7 +404,7 @@ struct SkillsCacheKey {
 struct SkillRootCacheKey {
     path: AbsolutePathBuf,
     scope_rank: u8,
-    file_system_identity: Option<FileSystemIdentity>,
+    file_system_identity: FileSystemIdentity,
     plugin_id: Option<String>,
     plugin_namespace: Option<String>,
     plugin_root: Option<AbsolutePathBuf>,
@@ -441,16 +436,14 @@ fn skills_cache_key(
     roots: &[SkillRoot],
     skill_config_rules: &SkillConfigRules,
     plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
-    isolate_file_system: bool,
     cwd_cache_key: Option<&AbsolutePathBuf>,
 ) -> SkillsCacheKey {
     SkillsCacheKey {
         cwd: cwd_cache_key.cloned(),
         roots: roots
             .iter()
-            // A cwd snapshot is reused until an explicit reload, but it must still describe the
-            // plugin skill roots it was given: reinstalls publish new versioned roots.
-            .filter(|root| cwd_cache_key.is_none() || root.plugin_id.is_some())
+            // Cache file contents until reload, not changes to the effective discovery roots
+            // or the executor that owns them.
             .map(|root| {
                 let scope_rank = match root.scope {
                     SkillScope::Repo => 0,
@@ -461,8 +454,7 @@ fn skills_cache_key(
                 SkillRootCacheKey {
                     path: root.path.clone(),
                     scope_rank,
-                    file_system_identity: isolate_file_system
-                        .then(|| FileSystemIdentity(Arc::clone(&root.file_system))),
+                    file_system_identity: FileSystemIdentity(Arc::clone(&root.file_system)),
                     plugin_id: root.plugin_id.clone(),
                     plugin_namespace: root.plugin_namespace.clone(),
                     plugin_root: root.plugin_root.clone(),

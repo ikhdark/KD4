@@ -292,11 +292,24 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
             timeout: Duration::from_secs(60),
             deadline: None,
         },
-        runtime_tx,
+        runtime_tx.clone(),
         tool_cancellation.child(tool_cancellation.token().child_token()),
         Some(task_failure_handler.clone()),
     );
+    spawn_notification(
+        &mut notification_tasks,
+        Arc::new(NonCooperativeCallbackHost),
+        NotificationInvocation {
+            id: Some("notify-stuck".to_string()),
+            call_id: "call-1".to_string(),
+            text: "hello".to_string(),
+        },
+        runtime_tx,
+        notification_cancellation_token.clone(),
+        Some(task_failure_handler.clone()),
+    );
 
+    let started = tokio::time::Instant::now();
     let cleanup = tokio::spawn(async move {
         finish_callbacks(
             &notification_cancellation_token,
@@ -307,6 +320,10 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
             Some(&task_failure_handler),
         )
         .await;
+        assert!(notification_tasks.is_empty());
+        assert!(tool_tasks.is_empty());
+        assert!(notification_cancellation_token.is_cancelled());
+        assert!(tool_cancellation.token().is_cancelled());
     });
     tokio::task::yield_now().await;
     tokio::time::advance(CALLBACK_CANCELLATION_GRACE).await;
@@ -314,6 +331,7 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
     cleanup
         .await
         .expect("bounded callback cleanup should finish");
+    assert!(started.elapsed() <= CALLBACK_CANCELLATION_GRACE + Duration::from_millis(10));
 
     // The aborted callback never answers the runtime.
     assert!(matches!(

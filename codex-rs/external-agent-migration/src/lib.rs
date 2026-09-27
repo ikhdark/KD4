@@ -1112,6 +1112,16 @@ fn command_skill_name_if_supported(
     if source_file.file_stem().and_then(|stem| stem.to_str()) == Some("README") {
         return None;
     }
+    // A plain skill cannot preserve source runtime controls such as allowed-tools,
+    // forked execution, or disabled model invocation. Do not silently drop them.
+    if document.frontmatter_error.is_some()
+        || document
+            .frontmatter
+            .keys()
+            .any(|key| !matches!(key.as_str(), "name" | "description" | "argument-hint"))
+    {
+        return None;
+    }
     let source_name = command_source_name(source_commands, source_file);
     command_skill_description(document, &source_name)?;
     let name = command_skill_name(source_commands, source_file);
@@ -1753,6 +1763,52 @@ command = "enabled-server"
         let document = parse_document_content("# Notes\n\nThis documents commands.\n");
 
         assert!(command_skill_name_if_supported(&root, &file, &document).is_none());
+    }
+
+    #[test]
+    fn commands_with_unrepresentable_runtime_controls_are_not_offered_or_imported() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source = root.path().join("commands");
+        let target = root.path().join("skills");
+        fs::create_dir_all(&source).unwrap();
+        for (index, control) in [
+            "allowed-tools: Read",
+            "disable-model-invocation: true",
+            "context: fork",
+            "agent: reviewer",
+            "hooks: {}",
+            "model: source-opus",
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(
+                source.join(format!("restricted-{index}.md")),
+                format!("---\ndescription: Review\n{control}\n---\nReview carefully.\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            source.join("plain.md"),
+            "---\nname: plain\ndescription: Review\nargument-hint: optional notes\n---\nReview carefully.\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            missing_command_names(&source, &target).unwrap(),
+            vec!["source-command-plain"]
+        );
+        assert_eq!(
+            import_commands(&source, &target).unwrap(),
+            vec!["source-command-plain"]
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 1);
+        assert!(
+            fs::read_to_string(target.join("source-command-plain/SKILL.md"))
+                .unwrap()
+                .ends_with("Review carefully.\n")
+        );
+        assert!(import_commands(&source, &target).unwrap().is_empty());
     }
 
     #[test]

@@ -38,8 +38,7 @@ pub struct TaskSummary {
     pub id: TaskId,
     pub title: String,
     pub status: TaskStatus,
-    /// Last known update time; absent when the backend supplies no valid timestamp.
-    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
     /// Backend environment identifier (when available)
     pub environment_id: Option<String>,
     /// Human-friendly environment label (when available)
@@ -84,8 +83,6 @@ pub enum ApplyStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyOutcome {
-    /// True only for a fully successful, non-preflight application. A partial
-    /// application can modify files while this is false; inspect `status`.
     pub applied: bool,
     pub status: ApplyStatus,
     pub message: String,
@@ -145,12 +142,10 @@ pub trait CloudBackend: Send + Sync {
     ) -> CloudBackendFuture<'a, TaskListPage>;
     fn get_task_summary(&self, id: TaskId) -> CloudBackendFuture<'_, TaskSummary>;
     fn get_task_diff(&self, id: TaskId) -> CloudBackendFuture<'_, Option<String>>;
-    /// Return the creating prompt, the assistant messages (or its failure reason), the
-    /// current attempt, and the unified diff, all from one read of the task.
-    fn get_task_text_and_diff(
-        &self,
-        id: TaskId,
-    ) -> CloudBackendFuture<'_, (TaskText, Option<String>)>;
+    /// Return assistant output messages (no diff) when available.
+    fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>>;
+    /// Return the creating prompt and assistant messages (when available).
+    fn get_task_text(&self, id: TaskId) -> CloudBackendFuture<'_, TaskText>;
     /// Return any sibling attempts (best-of-N) for the given assistant turn.
     fn list_sibling_attempts(
         &self,
@@ -165,8 +160,6 @@ pub trait CloudBackend: Send + Sync {
         id: TaskId,
         diff_override: Option<String>,
     ) -> CloudBackendFuture<'_, ApplyOutcome>;
-    /// Apply locally. Dropping the future does not stop an already-started Git
-    /// worker, so cancellation alone is not a safe signal to retry a mutation.
     fn apply_task(
         &self,
         id: TaskId,

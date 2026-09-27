@@ -15,10 +15,12 @@ use serde_json::Value;
 use crate::bundle::MANIFEST_FILE_NAME;
 use crate::bundle::RAW_EVENT_LOG_FILE_NAME;
 use crate::bundle::REDUCED_TRACE_SCHEMA_VERSION;
+use crate::bundle::TRACE_MANIFEST_SCHEMA_VERSION;
 use crate::bundle::TraceBundleManifest;
 use crate::model::ExecutionStatus;
 use crate::model::RolloutTrace;
 use crate::payload::RawPayloadRef;
+use crate::raw_event::RAW_TRACE_EVENT_SCHEMA_VERSION;
 use crate::raw_event::RawTraceEvent;
 use crate::raw_event::RawTraceEventPayload;
 
@@ -47,6 +49,11 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
         bundle_dir.join(MANIFEST_FILE_NAME),
     )?))
     .with_context(|| format!("read {}", bundle_dir.join(MANIFEST_FILE_NAME).display()))?;
+    anyhow::ensure!(
+        manifest.schema_version == TRACE_MANIFEST_SCHEMA_VERSION,
+        "unsupported trace manifest schema version {}",
+        manifest.schema_version
+    );
     let mut reducer = TraceReducer {
         rollout: RolloutTrace::new(
             REDUCED_TRACE_SCHEMA_VERSION,
@@ -69,7 +76,10 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
 
     // Both passes use one snapshot, so a log that is still growing cannot give them
     // different event sets.
-    let events = read_raw_events(&bundle_dir.join(RAW_EVENT_LOG_FILE_NAME))?;
+    let events = read_raw_events(
+        &bundle_dir.join(RAW_EVENT_LOG_FILE_NAME),
+        &reducer.rollout.rollout_id,
+    )?;
     // Cell lifecycle persistence is queued off the dispatch path. Establish
     // immutable runtime identities before replay so a nested tool can precede
     // its cell-start record on disk. The normal pass still validates ownership
@@ -105,7 +115,7 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
 /// interrupted or that a live writer has not finished; it carries no reducible
 /// evidence, so replay keeps the complete prefix. Any other malformed record,
 /// including a terminated one, is corruption and fails replay.
-fn read_raw_events(event_log_path: &Path) -> Result<Vec<RawTraceEvent>> {
+fn read_raw_events(event_log_path: &Path, rollout_id: &str) -> Result<Vec<RawTraceEvent>> {
     let event_log = File::open(event_log_path)
         .with_context(|| format!("open trace event log {}", event_log_path.display()))?;
     let mut reader = BufReader::new(event_log);
@@ -122,8 +132,26 @@ fn read_raw_events(event_log_path: &Path) -> Result<Vec<RawTraceEvent>> {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        match serde_json::from_slice(&line) {
-            Ok(event) => events.push(event),
+        match serde_json::from_slice::<RawTraceEvent>(&line) {
+            Ok(event) => {
+                anyhow::ensure!(
+                    event.schema_version == RAW_TRACE_EVENT_SCHEMA_VERSION,
+                    "unsupported trace event schema version {} at line {line_number}",
+                    event.schema_version
+                );
+                anyhow::ensure!(
+                    event.rollout_id == rollout_id,
+                    "trace event line {line_number} belongs to rollout {}, expected {rollout_id}",
+                    event.rollout_id
+                );
+                let expected_seq = events.len() as u64 + 1;
+                anyhow::ensure!(
+                    event.seq == expected_seq,
+                    "trace event line {line_number} has sequence {}, expected {expected_seq}",
+                    event.seq
+                );
+                events.push(event);
+            }
             Err(err) if err.is_eof() && line.last() != Some(&b'\n') => {
                 tracing::warn!(
                     "ignoring incomplete final trace event line {line_number} in {}",
@@ -214,8 +242,11 @@ impl TraceReducer {
                 trace_id,
                 root_thread_id,
             } => {
-                self.rollout.trace_id = trace_id;
-                self.rollout.root_thread_id = root_thread_id;
+                anyhow::ensure!(
+                    trace_id == self.rollout.trace_id
+                        && root_thread_id == self.rollout.root_thread_id,
+                    "rollout start identity does not match trace manifest"
+                );
             }
             RawTraceEventPayload::RolloutEnded { status } => {
                 self.rollout.status = status;
@@ -540,3 +571,7 @@ impl TraceReducer {
             .insert(payload.raw_payload_id.clone(), payload.clone());
     }
 }
+
+#[cfg(test)]
+#[path = "replay_tests.rs"]
+mod replay_tests;

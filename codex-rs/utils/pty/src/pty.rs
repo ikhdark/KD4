@@ -336,7 +336,7 @@ async fn spawn_process_portable(
         wait_handle,
         exit_status,
         exit_code,
-        pty_handles,
+        Some(pty_handles),
         /*resizer*/ None,
     );
 
@@ -501,7 +501,7 @@ async fn spawn_process_preserving_fds(
         wait_handle,
         exit_status,
         exit_code,
-        pty_handles,
+        Some(pty_handles),
         /*resizer*/ None,
     );
 

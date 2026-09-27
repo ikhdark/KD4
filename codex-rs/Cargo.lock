@@ -440,6 +440,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-executor"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+dependencies = [
+ "async-task",
+ "concurrent-queue",
+ "fastrand",
+ "futures-lite",
+ "pin-project-lite",
+ "slab",
+]
+
+[[package]]
+name = "async-fs"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8034a681df4aed8b8edbd7fbe472401ecf009251c8b40556b304567052e294c5"
+dependencies = [
+ "async-lock",
+ "blocking",
+ "futures-lite",
+]
+
+[[package]]
 name = "async-io"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2078,6 +2103,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
  "codex-windows-sandbox",
+ "ctor",
  "dotenvy",
  "pretty_assertions",
  "tempfile",
@@ -2275,6 +2301,7 @@ name = "codex-cloud-config"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "chrono",
  "codex-agent-identity",
  "codex-backend-client",
  "codex-config",
@@ -2283,9 +2310,13 @@ dependencies = [
  "codex-login",
  "codex-otel",
  "codex-protocol",
+ "hmac 0.12.1",
  "pretty_assertions",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -2307,11 +2338,10 @@ dependencies = [
  "codex-tui",
  "codex-utils-cli",
  "crossterm",
- "http 1.5.0",
  "owo-colors",
- "percent-encoding",
  "pretty_assertions",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "supports-color 3.0.2",
@@ -2320,7 +2350,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.1",
- "wiremock",
 ]
 
 [[package]]
@@ -2335,10 +2364,7 @@ dependencies = [
  "codex-http-client",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.20",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2348,7 +2374,6 @@ dependencies = [
  "chrono",
  "codex-cloud-tasks-client",
  "diffy",
- "tokio",
 ]
 
 [[package]]
@@ -3028,6 +3053,7 @@ dependencies = [
  "pretty_assertions",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3132,6 +3158,9 @@ name = "codex-keyring-store"
 version = "0.0.0"
 dependencies = [
  "keyring",
+ "pretty_assertions",
+ "secret-service",
+ "security-framework 3.7.0",
  "tracing",
 ]
 
@@ -3159,7 +3188,6 @@ dependencies = [
  "chrono",
  "codex-agent-identity",
  "codex-config",
- "codex-file-system",
  "codex-http-client",
  "codex-keyring-store",
  "codex-model-provider-info",
@@ -3172,9 +3200,11 @@ dependencies = [
  "http 1.5.0",
  "jsonwebtoken",
  "keyring",
+ "once_cell",
  "os_info",
  "pretty_assertions",
  "rand 0.9.5",
+ "regex-lite",
  "serde",
  "serde_json",
  "serial_test",
@@ -3186,6 +3216,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "urlencoding",
  "webbrowser",
  "wiremock",
 ]
@@ -3467,7 +3498,8 @@ dependencies = [
 name = "codex-process-hardening"
 version = "0.0.0"
 dependencies = [
- "windows-sys 0.61.2",
+ "libc",
+ "pretty_assertions",
 ]
 
 [[package]]
@@ -3543,14 +3575,13 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
- "codex-http-client",
  "codex-process-hardening",
  "ctor",
- "http 1.5.0",
+ "libc",
  "pretty_assertions",
+ "reqwest",
  "serde",
  "serde_json",
- "tempfile",
  "tiny_http",
  "zeroize",
 ]
@@ -3663,15 +3694,18 @@ dependencies = [
  "age",
  "anyhow",
  "base64",
- "codex-file-system",
+ "codex-git-utils",
  "codex-keyring-store",
  "keyring",
  "pretty_assertions",
  "rand 0.9.5",
+ "regex",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -3776,6 +3810,8 @@ name = "codex-test-binary-support"
 version = "0.0.0"
 dependencies = [
  "codex-arg0",
+ "ctor",
+ "tempfile",
 ]
 
 [[package]]
@@ -7339,9 +7375,13 @@ checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
 dependencies = [
  "byteorder",
  "dbus-secret-service",
+ "linux-keyutils",
  "log",
  "secret-service",
+ "security-framework 2.11.1",
+ "security-framework 3.7.0",
  "windows-sys 0.60.2",
+ "zbus",
  "zeroize",
 ]
 
@@ -7469,6 +7509,16 @@ name = "linktime-proc-macro"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
+
+[[package]]
+name = "linux-keyutils"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
+dependencies = [
+ "bitflags 2.13.1",
+ "libc",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -10313,7 +10363,7 @@ dependencies = [
  "openssl-probe",
  "rustls-pki-types",
  "schannel",
- "security-framework",
+ "security-framework 3.7.0",
 ]
 
 [[package]]
@@ -10341,7 +10391,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki",
- "security-framework",
+ "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
  "windows-sys 0.61.2",
@@ -10594,6 +10644,19 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "zbus",
+]
+
+[[package]]
+name = "security-framework"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+dependencies = [
+ "bitflags 2.13.1",
+ "core-foundation 0.9.4",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
 ]
 
 [[package]]
@@ -11685,7 +11748,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -13769,9 +13832,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb97012beadd29e654708a0fdb4c84bc046f537aecfde2c3ee0a9e4b4d48c725"
 dependencies = [
  "async-broadcast",
+ "async-executor",
+ "async-fs",
+ "async-io",
+ "async-lock",
  "async-process",
  "async-recursion",
+ "async-task",
  "async-trait",
+ "blocking",
  "enumflags2",
  "event-listener",
  "futures-core",

@@ -12,12 +12,12 @@ use crate::TaskStatus;
 use crate::TaskSummary;
 use crate::TurnAttempt;
 use crate::api::TaskText;
-use crate::append_error_log;
 use chrono::DateTime;
 use chrono::Utc;
 
 use codex_api::SharedAuthProvider;
 use codex_backend_client as backend;
+use codex_backend_client::CodeTaskDetailsResponseExt;
 use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
 
@@ -31,10 +31,10 @@ impl HttpClient {
     pub fn new(
         base_url: impl Into<String>,
         http_client_factory: codex_http_client::HttpClientFactory,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let base_url = base_url.into();
         let backend = backend::Client::new(base_url.clone(), http_client_factory);
-        Self { base_url, backend }
+        Ok(Self { base_url, backend })
     }
 
     pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
@@ -83,11 +83,12 @@ impl CloudBackend for HttpClient {
         Box::pin(async move { self.tasks_api().diff(id).await })
     }
 
-    fn get_task_text_and_diff(
-        &self,
-        id: TaskId,
-    ) -> CloudBackendFuture<'_, (TaskText, Option<String>)> {
-        Box::pin(async move { self.tasks_api().task_text_and_diff(id).await })
+    fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>> {
+        Box::pin(async move { self.tasks_api().messages(id).await })
+    }
+
+    fn get_task_text(&self, id: TaskId) -> CloudBackendFuture<'_, TaskText> {
+        Box::pin(async move { self.tasks_api().task_text(id).await })
     }
 
     fn list_sibling_attempts(
@@ -145,12 +146,14 @@ mod api {
     use std::collections::HashMap;
 
     pub(crate) struct Tasks<'a> {
+        base_url: &'a str,
         backend: &'a backend::Client,
     }
 
     impl<'a> Tasks<'a> {
         pub(crate) fn new(client: &'a HttpClient) -> Self {
             Self {
+                base_url: &client.base_url,
                 backend: &client.backend,
             }
         }
@@ -161,9 +164,7 @@ mod api {
             limit: Option<i64>,
             cursor: Option<&str>,
         ) -> Result<TaskListPage> {
-            let limit_i32 = limit.map(i32::try_from).transpose().map_err(|_| {
-                CloudTaskError::Msg("Task limit is outside the supported i32 range".to_string())
-            })?;
+            let limit_i32 = limit.and_then(|lim| i32::try_from(lim).ok());
             let resp = self
                 .backend
                 .list_tasks(limit_i32, Some("current"), env, cursor)
@@ -176,7 +177,7 @@ mod api {
                 .map(map_task_list_item_to_summary)
                 .collect();
 
-            tracing::debug!(
+            append_error_log(&format!(
                 "http.list_tasks: env={} limit={} cursor_in={} cursor_out={} items={}",
                 env.unwrap_or("<all>"),
                 limit_i32
@@ -185,7 +186,7 @@ mod api {
                 cursor.unwrap_or("<none>"),
                 resp.cursor.as_deref().unwrap_or("<none>"),
                 tasks.len()
-            );
+            ));
             Ok(TaskListPage {
                 tasks,
                 cursor: resp.cursor,
@@ -193,31 +194,32 @@ mod api {
         }
 
         pub(crate) async fn summary(&self, id: TaskId) -> Result<TaskSummary> {
+            let id_str = id.0.clone();
             let (details, body, ct) = self
                 .details_with_body(&id.0)
                 .await
                 .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
-            // Project only task metadata; the typed response already decoded turns.
-            #[derive(serde::Deserialize)]
-            struct Metadata {
-                task: HashMap<String, Value>,
-                task_status_display: Option<HashMap<String, Value>>,
-            }
-            let parsed: Metadata = serde_json::from_str(&body).map_err(|e| {
+            let parsed: Value = serde_json::from_str(&body).map_err(|e| {
                 CloudTaskError::Http(format!(
-                    "Decode error for {}: {e}; content-type={ct}; body_bytes={}; body_excerpt={}",
-                    id.0,
-                    body.len(),
-                    excerpt(&body, 2000)
+                    "Decode error for {}: {e}; content-type={ct}; body={body}",
+                    id.0
                 ))
             })?;
-            let mut task_obj = parsed.task;
-            let status_display = parsed.task_status_display.or_else(|| {
-                match task_obj.remove("task_status_display")? {
-                    Value::Object(map) => Some(map.into_iter().collect()),
-                    _ => None,
-                }
-            });
+            let task_obj = parsed
+                .get("task")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    CloudTaskError::Http(format!("Task metadata missing from details for {id_str}"))
+                })?;
+            let status_display = parsed
+                .get("task_status_display")
+                .or_else(|| task_obj.get("task_status_display"))
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<HashMap<String, Value>>()
+                });
             let status = map_status(status_display.as_ref());
             let mut summary = diff_summary_from_status_display(status_display.as_ref());
             if summary.files_changed == 0
@@ -227,8 +229,10 @@ mod api {
             {
                 summary = diff_summary_from_diff(&diff);
             }
-            let updated_at = parse_timestamp_value(task_obj.get("updated_at"))
-                .or_else(|| parse_timestamp_value(task_obj.get("created_at")))
+            let updated_at_raw = task_obj
+                .get("updated_at")
+                .and_then(Value::as_f64)
+                .or_else(|| task_obj.get("created_at").and_then(Value::as_f64))
                 .or_else(|| latest_turn_timestamp(status_display.as_ref()));
             let environment_id = task_obj
                 .get("environment_id")
@@ -249,7 +253,7 @@ mod api {
                 id,
                 title,
                 status,
-                updated_at,
+                updated_at: parse_updated_at(updated_at_raw.as_ref()),
                 environment_id,
                 environment_label,
                 summary,
@@ -270,18 +274,59 @@ mod api {
             Ok(None)
         }
 
-        pub(crate) async fn task_text_and_diff(
-            &self,
-            id: TaskId,
-        ) -> Result<(TaskText, Option<String>)> {
+        pub(crate) async fn messages(&self, id: TaskId) -> Result<Vec<String>> {
+            let (details, body, ct) = self
+                .details_with_body(&id.0)
+                .await
+                .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
+
+            let mut msgs = details.assistant_text_messages();
+            if msgs.is_empty() {
+                msgs.extend(extract_assistant_messages_from_body(&body));
+            }
+            if !msgs.is_empty() {
+                return Ok(msgs);
+            }
+            if let Some(err) = details.assistant_error_message() {
+                return Ok(vec![format!("Task failed: {err}")]);
+            }
+
+            let url = match details_path(self.base_url, &id.0) {
+                Some(url) => url,
+                None => format!("{}/api/codex/tasks/{}", self.base_url, id.0),
+            };
+            Err(CloudTaskError::Http(format!(
+                "No assistant text messages in response. GET {url}; content-type={ct}; body={body}"
+            )))
+        }
+
+        pub(crate) async fn task_text(&self, id: TaskId) -> Result<TaskText> {
             let (details, body, _ct) = self
                 .details_with_body(&id.0)
                 .await
                 .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
-            Ok((
-                task_text_from_details(&details, &body),
-                details.unified_diff(),
-            ))
+            let prompt = details.user_text_prompt();
+            let mut messages = details.assistant_text_messages();
+            if messages.is_empty() {
+                messages.extend(extract_assistant_messages_from_body(&body));
+            }
+            let assistant_turn = details.current_assistant_turn.as_ref();
+            let turn_id = assistant_turn.and_then(|turn| turn.id.clone());
+            let sibling_turn_ids = assistant_turn
+                .map(|turn| turn.sibling_turn_ids.clone())
+                .unwrap_or_default();
+            let attempt_placement = assistant_turn.and_then(|turn| turn.attempt_placement);
+            let attempt_status = attempt_status_from_str(
+                assistant_turn.and_then(|turn| turn.turn_status.as_deref()),
+            );
+            Ok(TaskText {
+                prompt,
+                messages,
+                turn_id,
+                sibling_turn_ids,
+                attempt_placement,
+                attempt_status,
+            })
         }
 
         pub(crate) async fn create(
@@ -328,15 +373,15 @@ mod api {
 
             match self.backend.create_task(request_body).await {
                 Ok(id) => {
-                    tracing::debug!(
+                    append_error_log(&format!(
                         "new_task: created id={id} env={} prompt_chars={}",
                         env_id,
                         prompt.chars().count()
-                    );
+                    ));
                     Ok(crate::CreatedTask { id: TaskId(id) })
                 }
                 Err(e) => {
-                    append_error_log(format!(
+                    append_error_log(&format!(
                         "new_task: create failed env={} prompt_chars={}: {}",
                         env_id,
                         prompt.chars().count(),
@@ -401,8 +446,6 @@ mod api {
             diff_override: Option<String>,
             preflight: bool,
         ) -> Result<ApplyOutcome> {
-            let cwd = std::env::current_dir()
-                .map_err(|e| CloudTaskError::Io(format!("resolve patch working directory: {e}")))?;
             let id = task_id.0.clone();
             let diff = match diff_override {
                 Some(diff) => diff,
@@ -416,23 +459,10 @@ mod api {
                 }
             };
 
-            // The worker owns the request and Git's temporary files until the
-            // entire application finishes, even if the awaiting caller leaves.
-            tokio::task::spawn_blocking(move || Self::apply_diff(id, diff, preflight, cwd))
-                .await
-                .map_err(|e| CloudTaskError::Io(format!("git apply worker failed: {e}")))?
-        }
-
-        fn apply_diff(
-            id: String,
-            diff: String,
-            preflight: bool,
-            cwd: std::path::PathBuf,
-        ) -> Result<ApplyOutcome> {
             if !is_unified_diff(&diff) {
                 let summary = summarize_patch_for_logging(&diff);
                 let mode = if preflight { "preflight" } else { "apply" };
-                append_error_log(format!(
+                append_error_log(&format!(
                     "apply_error: id={id} mode={mode} format=non-unified; {summary}"
                 ));
                 return Ok(ApplyOutcome {
@@ -446,8 +476,8 @@ mod api {
             }
 
             let req = ApplyGitRequest {
-                cwd,
-                diff,
+                cwd: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+                diff: diff.clone(),
                 revert: false,
                 preflight,
             };
@@ -506,7 +536,7 @@ mod api {
                 || (preflight && !matches!(status, ApplyStatus::Success))
             {
                 let mut log = String::new();
-                let summary = summarize_patch_for_logging(&req.diff);
+                let summary = summarize_patch_for_logging(&diff);
                 let mode = if preflight { "preflight" } else { "apply" };
                 use std::fmt::Write as _;
                 let _ = writeln!(
@@ -527,6 +557,10 @@ mod api {
                     tail(&r.stderr, /*max*/ 2000)
                 );
                 let _ = writeln!(&mut log, "{summary}");
+                let _ = writeln!(
+                    &mut log,
+                    "----- PATCH BEGIN -----\n{diff}\n----- PATCH END -----"
+                );
                 append_error_log(&log);
             }
 
@@ -540,33 +574,13 @@ mod api {
         }
     }
 
-    fn task_text_from_details(details: &backend::CodeTaskDetailsResponse, body: &str) -> TaskText {
-        let prompt = details.user_text_prompt();
-        let mut messages = details.assistant_text_messages();
-        if messages.is_empty() {
-            messages.extend(extract_assistant_messages_from_body(body));
-        }
-        // A failed turn usually has no assistant text; keep its reason visible to readers.
-        if messages.is_empty()
-            && let Some(error) = details.assistant_error_message()
-        {
-            messages.push(format!("Task failed: {error}"));
-        }
-        let assistant_turn = details.current_assistant_turn.as_ref();
-        let turn_id = assistant_turn.and_then(|turn| turn.id.clone());
-        let sibling_turn_ids = assistant_turn
-            .map(|turn| turn.sibling_turn_ids.clone())
-            .unwrap_or_default();
-        let attempt_placement = assistant_turn.and_then(|turn| turn.attempt_placement);
-        let attempt_status =
-            attempt_status_from_str(assistant_turn.and_then(|turn| turn.turn_status.as_deref()));
-        TaskText {
-            prompt,
-            messages,
-            turn_id,
-            sibling_turn_ids,
-            attempt_placement,
-            attempt_status,
+    fn details_path(base_url: &str, id: &str) -> Option<String> {
+        if base_url.contains("/backend-api") {
+            Some(format!("{base_url}/wham/tasks/{id}"))
+        } else if base_url.contains("/api/codex") {
+            Some(format!("{base_url}/tasks/{id}"))
+        } else {
+            None
         }
     }
 
@@ -700,22 +714,17 @@ mod api {
             "completed" => AttemptStatus::Completed,
             "in_progress" => AttemptStatus::InProgress,
             "pending" => AttemptStatus::Pending,
-            "cancelled" => AttemptStatus::Cancelled,
-            _ => AttemptStatus::Unknown,
+            _ => AttemptStatus::Pending,
         }
     }
 
     fn parse_timestamp_value(v: Option<&Value>) -> Option<DateTime<Utc>> {
-        timestamp_from_seconds(v?.as_f64()?)
-    }
-
-    fn timestamp_from_seconds(ts: f64) -> Option<DateTime<Utc>> {
-        if !ts.is_finite() {
-            return None;
-        }
-        let seconds = ts.floor();
-        let nanos = (((ts - seconds) * 1_000_000_000.0) as u32).min(999_999_999);
-        DateTime::from_timestamp(seconds as i64, nanos)
+        let ts = v?.as_f64()?;
+        let secs = ts as i64;
+        let nanos = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+        Some(DateTime::<Utc>::from(
+            std::time::UNIX_EPOCH + std::time::Duration::new(secs.max(0) as u64, nanos),
+        ))
     }
 
     fn map_task_list_item_to_summary(src: backend::TaskListItem) -> TaskSummary {
@@ -765,8 +774,15 @@ mod api {
         TaskStatus::Pending
     }
 
-    fn parse_updated_at(ts: Option<&f64>) -> Option<DateTime<Utc>> {
-        ts.and_then(|ts| timestamp_from_seconds(*ts))
+    fn parse_updated_at(ts: Option<&f64>) -> DateTime<Utc> {
+        if let Some(v) = ts {
+            let secs = *v as i64;
+            let nanos = ((*v - secs as f64) * 1_000_000_000.0) as u32;
+            return DateTime::<Utc>::from(
+                std::time::UNIX_EPOCH + std::time::Duration::new(secs.max(0) as u64, nanos),
+            );
+        }
+        Utc::now()
     }
 
     fn env_label_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<String> {
@@ -780,45 +796,17 @@ mod api {
         let mut files_changed = 0usize;
         let mut lines_added = 0usize;
         let mut lines_removed = 0usize;
-        let mut remaining = (0usize, 0usize);
-        let mut git_headers = false;
         for line in diff.lines() {
             if line.starts_with("diff --git ") {
                 files_changed += 1;
-                git_headers = true;
-                remaining = (0, 0);
                 continue;
             }
-            if line.starts_with("@@ ") {
-                let mut ranges = line.split_whitespace().skip(1);
-                let count = |range: Option<&str>| {
-                    range
-                        .map(|r| r.split_once(',').map_or("1", |(_, count)| count))
-                        .and_then(|n| n.parse::<usize>().ok())
-                        .unwrap_or(0)
-                };
-                remaining = (count(ranges.next()), count(ranges.next()));
-                continue;
-            }
-            if remaining == (0, 0) {
-                if !git_headers && line.starts_with("--- ") {
-                    files_changed += 1;
-                }
+            if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
                 continue;
             }
             match line.as_bytes().first() {
-                Some(b'+') => {
-                    lines_added += 1;
-                    remaining.1 = remaining.1.saturating_sub(1);
-                }
-                Some(b'-') => {
-                    lines_removed += 1;
-                    remaining.0 = remaining.0.saturating_sub(1);
-                }
-                Some(b' ') => {
-                    remaining.0 = remaining.0.saturating_sub(1);
-                    remaining.1 = remaining.1.saturating_sub(1);
-                }
+                Some(b'+') => lines_added += 1,
+                Some(b'-') => lines_removed += 1,
                 _ => {}
             }
         }
@@ -853,13 +841,15 @@ mod api {
         out
     }
 
-    fn latest_turn_timestamp(v: Option<&HashMap<String, Value>>) -> Option<DateTime<Utc>> {
+    fn latest_turn_timestamp(v: Option<&HashMap<String, Value>>) -> Option<f64> {
         let map = v?;
         let latest = map
             .get("latest_turn_status_display")
             .and_then(Value::as_object)?;
-        parse_timestamp_value(latest.get("updated_at"))
-            .or_else(|| parse_timestamp_value(latest.get("created_at")))
+        latest
+            .get("updated_at")
+            .or_else(|| latest.get("created_at"))
+            .and_then(Value::as_f64)
     }
 
     fn attempt_total_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<usize> {
@@ -876,8 +866,7 @@ mod api {
         if t.starts_with("diff --git ") {
             return true;
         }
-        let has_dash_headers = diff.lines().any(|line| line.starts_with("--- "))
-            && diff.lines().any(|line| line.starts_with("+++ "));
+        let has_dash_headers = diff.contains("\n--- ") && diff.contains("\n+++ ");
         let has_hunk = diff.contains("\n@@ ") || diff.starts_with("@@ ");
         has_dash_headers && has_hunk
     }
@@ -886,7 +875,7 @@ mod api {
         if s.len() <= max {
             s.to_string()
         } else {
-            s[s.ceil_char_boundary(s.len() - max)..].to_string()
+            s[s.len() - max..].to_string()
         }
     }
 
@@ -907,494 +896,26 @@ mod api {
             .ok()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let head = excerpt(patch, 800);
-        let head_trunc = head.lines().take(20).collect::<Vec<_>>().join("\n");
+        let head: String = patch.lines().take(20).collect::<Vec<&str>>().join("\n");
+        let head_trunc = if head.len() > 800 {
+            format!("{}…", &head[..800])
+        } else {
+            head
+        };
         format!(
             "patch_summary: kind={kind} lines={lines} chars={chars} cwd={cwd} ; head=\n{head_trunc}"
         )
     }
+}
 
-    fn excerpt(text: &str, max_bytes: usize) -> String {
-        if text.len() <= max_bytes {
-            text.to_string()
-        } else {
-            format!("{}…", &text[..text.floor_char_boundary(max_bytes)])
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        async fn client_with_json_responses(
-            responses: Vec<(&'static str, Value)>,
-        ) -> (HttpClient, tokio::task::JoinHandle<()>) {
-            use tokio::io::AsyncReadExt;
-            use tokio::io::AsyncWriteExt;
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("HTTP listener");
-            let base_url = format!("http://{}", listener.local_addr().expect("server address"));
-            let server = tokio::spawn(async move {
-                for (expected_path, response) in responses {
-                    let (mut stream, _) = listener.accept().await.expect("HTTP request");
-                    let mut request = Vec::new();
-                    while !request.ends_with(b"\r\n\r\n") {
-                        let byte = stream.read_u8().await.expect("HTTP request header");
-                        request.push(byte);
-                        assert!(request.len() < 16_384, "bounded request header");
-                    }
-                    assert!(
-                        String::from_utf8(request)
-                            .expect("HTTP header")
-                            .starts_with(&format!("GET {expected_path} HTTP/1.1\r\n"))
-                    );
-                    let body = response.to_string();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("HTTP response");
-                }
-            });
-            let client = HttpClient::new(
-                base_url,
-                codex_http_client::HttpClientFactory::new(
-                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-                ),
-            );
-            (client, server)
-        }
-
-        #[tokio::test]
-        async fn cloud_backend_decodes_cancelled_and_unknown_attempt_statuses() {
-            let turns = [
-                ("failed", AttemptStatus::Failed),
-                ("completed", AttemptStatus::Completed),
-                ("in_progress", AttemptStatus::InProgress),
-                ("pending", AttemptStatus::Pending),
-                ("cancelled", AttemptStatus::Cancelled),
-                ("future_status", AttemptStatus::Unknown),
-            ];
-            let body = serde_json::json!({
-                "sibling_turns": turns.iter().enumerate().map(|(index, (status, _))| {
-                    serde_json::json!({"id": status, "attempt_placement": index, "turn_status": status})
-                }).collect::<Vec<_>>()
-            });
-            let (client, server) = client_with_json_responses(vec![(
-                "/api/codex/tasks/task/turns/turn/sibling_turns",
-                body,
-            )])
-            .await;
-            let attempts = client
-                .list_sibling_attempts(TaskId("task".to_string()), "turn".to_string())
-                .await
-                .expect("public sibling-turn response");
-            server.await.expect("HTTP server");
-            assert_eq!(attempts.len(), turns.len());
-            for (attempt, (id, status)) in attempts.iter().zip(turns) {
-                assert_eq!(attempt.turn_id, id);
-                assert_eq!(attempt.status, status);
-            }
-        }
-
-        #[tokio::test]
-        async fn cloud_backend_decodes_timestamps_without_panicking_or_losing_pre_epoch_time() {
-            let (client, server) = client_with_json_responses(vec![
-                (
-                    "/api/codex/tasks/task/turns/turn/sibling_turns",
-                    serde_json::json!({
-                        "sibling_turns": [
-                            {"id": "negative", "attempt_placement": 0, "created_at": -1.25},
-                            {"id": "positive", "attempt_placement": 1, "created_at": 1.25},
-                            {"id": "system_overflow", "attempt_placement": 2, "created_at": 1e300},
-                            {"id": "chrono_overflow", "attempt_placement": 3, "created_at": 1e13},
-                            {"id": "missing", "attempt_placement": 4}
-                        ]
-                    }),
-                ),
-                (
-                    "/api/codex/tasks/task",
-                    serde_json::json!({
-                        "task": {"id": "task", "title": "Invalid timestamp", "archived": false,
-                            "external_pull_requests": [], "created_at": 1e300}
-                    }),
-                ),
-            ])
-            .await;
-            let attempts = client
-                .list_sibling_attempts(TaskId("task".to_string()), "turn".to_string())
-                .await
-                .expect("public sibling-turn response");
-            assert_eq!(attempts.len(), 5);
-            assert_eq!(
-                attempts[0].created_at,
-                DateTime::from_timestamp(-2, 750_000_000)
-            );
-            assert_eq!(
-                attempts[1].created_at,
-                DateTime::from_timestamp(1, 250_000_000)
-            );
-            for attempt in &attempts[2..] {
-                assert_eq!(
-                    attempt.created_at, None,
-                    "{} has no usable timestamp",
-                    attempt.turn_id
-                );
-            }
-            let summary = client
-                .get_task_summary(TaskId("task".to_string()))
-                .await
-                .expect("public task summary");
-            server.await.expect("HTTP server");
-            assert_eq!(summary.id, TaskId("task".to_string()));
-            assert_eq!(summary.title, "Invalid timestamp");
-            assert_eq!(summary.updated_at, None);
-        }
-
-        #[tokio::test]
-        async fn task_summary_validates_timestamp_fallbacks_and_counts_hunk_content() {
-            let patch = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n---counter;\n+++counter;\n--- a/g\n+++ b/g\n@@ -0,0 +1 @@\n+++ value\n";
-            let (client, server) = client_with_json_responses(vec![(
-                "/api/codex/tasks/task",
-                serde_json::json!({
-                    "task": {"title": "Fallback", "updated_at": 1e300, "created_at": -1.25},
-                        "current_diff_task_turn": {"output_items": [{"type": "output_diff", "diff": patch}]}
-                }),
-                ),
-                ("/api/codex/tasks/task", serde_json::json!({
-                    "task": {"title": "Latest turn", "updated_at": 1e300},
-                    "task_status_display": {"latest_turn_status_display": {"updated_at": 1e300, "created_at": 1.25}}
-                }))
-            ]).await;
-            let summary = client
-                .get_task_summary(TaskId("task".to_string()))
-                .await
-                .expect("summary");
-            assert_eq!(
-                summary.updated_at,
-                DateTime::from_timestamp(-2, 750_000_000)
-            );
-            assert_eq!(
-                summary.summary,
-                DiffSummary {
-                    files_changed: 2,
-                    lines_added: 2,
-                    lines_removed: 1
-                }
-            );
-            let summary = client
-                .get_task_summary(TaskId("task".to_string()))
-                .await
-                .expect("latest turn timestamp");
-            assert_eq!(summary.updated_at, DateTime::from_timestamp(1, 250_000_000));
-            server.await.expect("server");
-        }
-
-        #[tokio::test]
-        async fn task_text_and_diff_share_one_task_read() {
-            // The fixture server answers exactly one request, so a second task read fails.
-            let (client, server) = client_with_json_responses(vec![(
-                "/api/codex/tasks/task",
-                serde_json::json!({
-                    "current_user_turn": {
-                        "input_items": [{"type": "message", "role": "user", "content": ["Fix it"]}]
-                    },
-                    "current_assistant_turn": {
-                        "id": "turn-1",
-                        "turn_status": "completed",
-                        "sibling_turn_ids": ["turn-2"],
-                        "output_items": [{"type": "message", "content": ["Done"]}]
-                    },
-                    "current_diff_task_turn": {
-                        "output_items": [{"type": "output_diff", "diff": "diff --git a/f b/f\n"}]
-                    }
-                }),
-            )])
-            .await;
-            let (text, diff) = client
-                .get_task_text_and_diff(TaskId("task".to_string()))
-                .await
-                .expect("text and diff from one task read");
-            server.await.expect("HTTP server");
-            assert_eq!(diff.as_deref(), Some("diff --git a/f b/f\n"));
-            assert_eq!(text.prompt.as_deref(), Some("Fix it"));
-            assert_eq!(text.messages, vec!["Done".to_string()]);
-            assert_eq!(text.turn_id.as_deref(), Some("turn-1"));
-            assert_eq!(text.sibling_turn_ids, vec!["turn-2".to_string()]);
-            assert_eq!(text.attempt_status, AttemptStatus::Completed);
-        }
-
-        #[tokio::test]
-        async fn failed_task_text_reports_the_failure_reason() {
-            let (client, server) = client_with_json_responses(vec![(
-                "/api/codex/tasks/task",
-                serde_json::json!({
-                    "current_user_turn": {
-                        "input_items": [{"type": "message", "role": "user", "content": ["Fix it"]}]
-                    },
-                    "current_assistant_turn": {
-                        "id": "turn-1",
-                        "turn_status": "failed",
-                        "error": {"code": "APPLY_FAILED", "message": "Patch could not be applied"}
-                    }
-                }),
-            )])
-            .await;
-            let (text, diff) = client
-                .get_task_text_and_diff(TaskId("task".to_string()))
-                .await
-                .expect("failed task details");
-            server.await.expect("HTTP server");
-            assert_eq!(diff, None);
-            assert_eq!(text.attempt_status, AttemptStatus::Failed);
-            assert_eq!(
-                text.messages,
-                vec!["Task failed: APPLY_FAILED: Patch could not be applied".to_string()]
-            );
-        }
-
-        #[tokio::test]
-        async fn list_rejects_unrepresentable_limit_before_sending_request() {
-            let client = HttpClient::new(
-                "http://127.0.0.1:1",
-                codex_http_client::HttpClientFactory::new(
-                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-                ),
-            );
-            let error = client
-                .list_tasks(None, Some(i64::MAX), None)
-                .await
-                .expect_err("invalid limit");
-            assert!(
-                matches!(error, CloudTaskError::Msg(ref message) if message.contains("i32 range"))
-            );
-        }
-
-        #[test]
-        fn tail_respects_byte_budget_without_splitting_unicode() {
-            for (input, budget, expected) in [
-                ("abc", 2, "bc"),
-                ("a雪b", 3, "b"),
-                ("a雪b", 4, "雪b"),
-                ("a雪b", 5, "a雪b"),
-                ("雪", 2, ""),
-                ("雪", 0, ""),
-                ("", 2, ""),
-            ] {
-                assert_eq!(tail(input, budget), expected);
-            }
-        }
-
-        #[test]
-        fn patch_summary_truncates_at_a_unicode_boundary() {
-            let patch = format!("{}雪suffix", "a".repeat(799));
-            let summary = summarize_patch_for_logging(&patch);
-            assert_eq!(
-                summary.split_once(" ; head=\n").unwrap().1,
-                format!("{}…", "a".repeat(799))
-            );
-            let short_patch = "雪\nunchanged";
-            assert_eq!(
-                summarize_patch_for_logging(short_patch)
-                    .split_once(" ; head=\n")
-                    .unwrap()
-                    .1,
-                short_patch
-            );
-        }
-
-        #[tokio::test]
-        async fn apply_task_rejects_long_unicode_non_unified_diff() {
-            let client = HttpClient::new(
-                "http://127.0.0.1:1",
-                codex_http_client::HttpClientFactory::new(
-                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-                ),
-            );
-            let patch = "雪".repeat(300);
-            for preflight in [false, true] {
-                let task = TaskId("unicode-invalid-diff".to_string());
-                let outcome = if preflight {
-                    client.apply_task_preflight(task, Some(patch.clone())).await
-                } else {
-                    client.apply_task(task, Some(patch.clone())).await
-                }
-                .expect("invalid diffs return an application outcome");
-                assert_eq!(
-                    outcome,
-                    ApplyOutcome {
-                        applied: false,
-                        status: ApplyStatus::Error,
-                        message:
-                            "Expected unified git diff; backend returned an incompatible format."
-                                .to_string(),
-                        skipped_paths: Vec::new(),
-                        conflict_paths: Vec::new(),
-                    }
-                );
-            }
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn apply_task_and_preflight_keep_executor_responsive_and_preserve_index() {
-            use std::path::Path;
-            use std::process::Command;
-            use std::sync::atomic::AtomicBool;
-            use std::sync::atomic::Ordering;
-            use std::time::Duration;
-
-            struct RestoreDirectory(std::path::PathBuf);
-            impl Drop for RestoreDirectory {
-                fn drop(&mut self) {
-                    std::env::set_current_dir(&self.0).expect("restore current directory");
-                }
-            }
-
-            fn git(cwd: &Path, args: &[&str]) -> String {
-                let output = Command::new("git")
-                    .args(args)
-                    .current_dir(cwd)
-                    .output()
-                    .expect("run git");
-                assert!(
-                    output.status.success(),
-                    "git {args:?}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                String::from_utf8(output.stdout).expect("Git output is UTF-8")
-            }
-
-            let directory = tempfile::tempdir().expect("temporary repository");
-            let cwd = directory.path();
-            // Keep apply diagnostics beside the repository so a failure can show them.
-            crate::set_error_log_dir(cwd);
-            git(cwd, &["init", "--quiet"]);
-            git(cwd, &["config", "user.email", "test@example.com"]);
-            git(cwd, &["config", "user.name", "Cloud task test"]);
-            git(cwd, &["config", "core.autocrlf", "false"]);
-            std::fs::write(cwd.join("file.txt"), "before\n").expect("original file");
-            git(cwd, &["add", "file.txt"]);
-            git(cwd, &["commit", "--quiet", "-m", "initial"]);
-            std::fs::write(cwd.join("file.txt"), "after\n").expect("changed file");
-            // An ordinary unified patch starts with the old-file header at byte zero.
-            let patch =
-                "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n".to_string();
-            std::fs::write(cwd.join("file.txt"), "before\n").expect("restore file");
-            // Git's normal clean-filter path supplies a real slow subprocess on
-            // both Windows (Git's sh) and Unix, without replacing patch logic.
-            std::fs::write(cwd.join(".gitattributes"), "file.txt filter=slow\n")
-                .expect("filter attributes");
-            git(cwd, &["config", "filter.slow.clean", "sleep 0.5; cat"]);
-            git(cwd, &["config", "filter.slow.smudge", "cat"]);
-            git(cwd, &["config", "filter.slow.required", "true"]);
-            let original_index = std::fs::read(cwd.join(".git/index")).expect("original index");
-            let _restore = RestoreDirectory(std::env::current_dir().expect("current directory"));
-            std::env::set_current_dir(cwd).expect("enter test repository");
-            let client = HttpClient::new(
-                "http://127.0.0.1:1",
-                codex_http_client::HttpClientFactory::new(
-                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-                ),
-            );
-
-            for preflight in [true, false] {
-                let completed = AtomicBool::new(false);
-                let apply = async {
-                    let task = TaskId("responsive-apply".to_string());
-                    let result = if preflight {
-                        client.apply_task_preflight(task, Some(patch.clone())).await
-                    } else {
-                        client.apply_task(task, Some(patch.clone())).await
-                    };
-                    completed.store(true, Ordering::SeqCst);
-                    result
-                };
-                let observe_executor = async {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    !completed.load(Ordering::SeqCst)
-                };
-                let (result, progressed_while_git_running) =
-                    tokio::join!(biased; apply, observe_executor);
-                let outcome = result.expect("apply outcome");
-                assert!(
-                    progressed_while_git_running,
-                    "Git blocked the async executor"
-                );
-                assert_eq!(
-                    outcome.status,
-                    ApplyStatus::Success,
-                    "preflight={preflight}, outcome={outcome:?}, log={:?}",
-                    std::fs::read_to_string(cwd.join(crate::logging::ERROR_LOG_FILE_NAME))
-                );
-                assert_eq!(outcome.applied, !preflight);
-                assert!(outcome.skipped_paths.is_empty());
-                assert!(outcome.conflict_paths.is_empty());
-                assert_eq!(
-                    std::fs::read_to_string(cwd.join("file.txt")).expect("resulting file"),
-                    if preflight { "before\n" } else { "after\n" }
-                );
-                assert_eq!(
-                    std::fs::read(cwd.join(".git/index")).expect("resulting index"),
-                    original_index
-                );
-            }
-
-            std::fs::write(cwd.join("file.txt"), "before\n").expect("reset for cancellation");
-            git(
-                cwd,
-                &[
-                    "config",
-                    "filter.slow.clean",
-                    "printf '%s' \"$GIT_INDEX_FILE\" > .git/clean-index-path; sleep 0.5; cat",
-                ],
-            );
-            let mut cancelled_apply =
-                client.apply_task(TaskId("cancelled-apply".to_string()), Some(patch));
-            let private_index = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    tokio::select! {
-                        result = &mut cancelled_apply => {
-                            panic!("apply completed before filter signalled: {result:?}");
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                            if let Ok(path) = std::fs::read_to_string(cwd.join(".git/clean-index-path"))
-                                && !path.is_empty()
-                            {
-                                break std::path::PathBuf::from(path);
-                            }
-                        }
-                    }
-                }
-            })
-            .await
-            .expect("real Git filter must start");
-            assert_ne!(private_index, cwd.join(".git/index"));
-            assert!(private_index.is_file());
-            drop(cancelled_apply);
-
-            let private_index_directory = private_index.parent().expect("private index directory");
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while private_index_directory.exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect(
-                "worker must finish and remove its private Git index after caller cancellation",
-            );
-            assert_eq!(
-                std::fs::read_to_string(cwd.join("file.txt")).expect("completed cancelled apply"),
-                "after\n"
-            );
-            assert_eq!(
-                std::fs::read(cwd.join(".git/index")).expect("real index after cancellation"),
-                original_index
-            );
-        }
+fn append_error_log(message: &str) {
+    let ts = Utc::now().to_rfc3339();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("error.log")
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "[{ts}] {message}");
     }
 }

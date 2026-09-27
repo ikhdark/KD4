@@ -420,11 +420,31 @@ impl EventProcessorWithJsonOutput {
             .iter()
             .filter_map(|item| {
                 let raw_id = item.id().to_string();
-                if !self.raw_to_exec_item_id.contains_key(&raw_id) {
-                    return None;
+                let exec_id = self.raw_to_exec_item_id.get(&raw_id)?.clone();
+                let item = Self::map_item_with_id(item.clone(), || exec_id)?;
+                let in_progress = matches!(
+                    &item.details,
+                    ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                        status: ExecCommandExecutionStatus::InProgress,
+                        ..
+                    }) | ThreadItemDetails::FileChange(FileChangeItem {
+                        status: ExecPatchApplyStatus::InProgress,
+                        ..
+                    }) | ThreadItemDetails::McpToolCall(McpToolCallItem {
+                        status: ExecMcpToolCallStatus::InProgress,
+                        ..
+                    }) | ThreadItemDetails::CollabToolCall(CollabToolCallItem {
+                        status: CollabToolCallStatus::InProgress,
+                        ..
+                    })
+                );
+                if in_progress {
+                    // A terminal turn does not prove its background work has finished.
+                    Some(ThreadEvent::ItemUpdated(ItemUpdatedEvent { item }))
+                } else {
+                    self.raw_to_exec_item_id.remove(&raw_id);
+                    Some(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }))
                 }
-                self.map_completed_item_mut(item.clone())
-                    .map(|item| ThreadEvent::ItemCompleted(ItemCompletedEvent { item }))
             })
             .collect()
     }

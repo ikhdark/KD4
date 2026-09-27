@@ -62,8 +62,18 @@ where
                 if ch.is_whitespace() {
                     if self.slug_start + ch.len_utf8() == self.line_buffer.len() {
                         self.slug_start = self.line_buffer.len();
+                        continue;
                     }
-                    continue;
+                    let before_whitespace =
+                        &self.line_buffer[self.slug_start..self.line_buffer.len() - ch.len_utf8()];
+                    // Only complete tags may have trailing whitespace. Once its first
+                    // character is accepted, check the tail without rescanning padding.
+                    if before_whitespace.ends_with(char::is_whitespace)
+                        || self.match_open(before_whitespace).is_some()
+                        || self.match_close(before_whitespace).is_some()
+                    {
+                        continue;
+                    }
                 }
                 let slug = &self.line_buffer[self.slug_start..];
                 if self.is_tag_prefix(slug) {

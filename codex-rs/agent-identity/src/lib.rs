@@ -188,15 +188,13 @@ struct RegisterAgentResponse {
 pub struct AgentIdentityRegistrationHttpError {
     operation: &'static str,
     status: StatusCode,
-    body: String,
 }
 
 impl AgentIdentityRegistrationHttpError {
-    fn new(operation: &'static str, status: StatusCode, body: String) -> Self {
+    fn new(operation: &'static str, status: StatusCode) -> Self {
         Self {
             operation,
             status,
-            body,
         }
     }
 
@@ -208,15 +206,7 @@ impl AgentIdentityRegistrationHttpError {
 
 impl fmt::Display for AgentIdentityRegistrationHttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.body.is_empty() {
-            write!(f, "{} failed with status {}", self.operation, self.status)
-        } else {
-            write!(
-                f,
-                "{} failed with status {}: {}",
-                self.operation, self.status, self.body
-            )
-        }
+        write!(f, "{} failed with status {}", self.operation, self.status)
     }
 }
 
@@ -340,7 +330,7 @@ pub async fn register_agent_task(
     };
     let url = agent_task_registration_url(agent_identity_authapi_base_url, key.agent_runtime_id);
 
-    let mut response = client
+    let response = client
         .post(url)
         .timeout(AGENT_TASK_REGISTRATION_TIMEOUT)
         .json(&request)
@@ -348,26 +338,11 @@ pub async fn register_agent_task(
         .await
         .context("failed to register agent task")?;
     if !response.status().is_success() {
-        let status = response.status();
-        let mut bytes = Vec::with_capacity(513);
-        while bytes.len() < 513 {
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
-                    bytes.extend_from_slice(&chunk[..chunk.len().min(513 - bytes.len())]);
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
-        let truncated = bytes.len() > 512;
-        bytes.truncate(512);
-        let mut body = String::from_utf8_lossy(&bytes).into_owned();
-        if truncated {
-            body.push_str("...");
-        }
+        // The status is sufficient for retry classification. Reading an untrusted
+        // body can delay recovery and expose echoed credentials in diagnostics.
         return Err(AgentIdentityRegistrationHttpError::new(
             "agent task registration",
-            status,
-            body,
+            response.status(),
         )
         .into());
     }
@@ -858,7 +833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_agent_task_stops_reading_oversized_error_body() {
+    async fn register_agent_task_does_not_wait_for_error_body() {
         use std::io::Read;
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener binds");
@@ -874,10 +849,9 @@ mod tests {
             stream
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100000\r\n\r\n")
                 .expect("headers write");
-            stream.write_all(&[b'x'; 513]).expect("prefix writes");
-            stream.flush().expect("prefix flushes");
-            // Keep the response unfinished until the client returns. Reading the
-            // whole body would wait here instead of reporting the bounded prefix.
+            stream.flush().expect("headers flush");
+            // A status failure is already actionable; even a bounded body read
+            // would wait here until the client returns.
             let _ = receiver.recv_timeout(std::time::Duration::from_secs(5));
         });
         let key = generate_agent_key_material().expect("key material");
@@ -899,13 +873,57 @@ mod tests {
         let _ = release.send(());
         server.join().expect("server joins");
         let error = result
-            .expect("registration must not consume the full body")
+            .expect("registration must not wait for the body")
             .expect_err("503 fails");
         let error = error
             .downcast_ref::<AgentIdentityRegistrationHttpError>()
             .expect("typed HTTP error");
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.body, format!("{}...", "x".repeat(512)));
+        assert_eq!(
+            error.to_string(),
+            "agent task registration failed with status 503 Service Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_agent_task_redacts_error_body_and_preserves_retryability() {
+        let server = wiremock::MockServer::start().await;
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .expect("HTTP client");
+        let key = generate_agent_key_material().expect("key material");
+        for (status, retryable) in [(401, false), (403, false), (429, true), (503, true)] {
+            server.reset().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(status)
+                        .set_body_string("echoed-credential-secret"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = register_agent_task(
+                &client,
+                &server.uri(),
+                AgentIdentityKey {
+                    agent_runtime_id: "runtime",
+                    private_key_pkcs8_base64: &key.private_key_pkcs8_base64,
+                },
+            )
+            .await
+            .expect_err("HTTP failure");
+            assert_eq!(is_retryable_registration_error(&error), retryable);
+            assert_eq!(
+                error
+                    .downcast_ref::<AgentIdentityRegistrationHttpError>()
+                    .expect("typed error")
+                    .status()
+                    .as_u16(),
+                status
+            );
+            assert!(!format!("{error:#}").contains("echoed-credential-secret"));
+            assert!(!format!("{error:?}").contains("echoed-credential-secret"));
+        }
     }
 
     fn test_jwt_header(kid: &str) -> Header {
@@ -1118,12 +1136,10 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
         let too_many_requests = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
             StatusCode::TOO_MANY_REQUESTS,
-            "rate limited".to_string(),
         ));
         let unavailable = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
             StatusCode::SERVICE_UNAVAILABLE,
-            "try later".to_string(),
         ));
 
         assert!(is_retryable_registration_error(&too_many_requests));
@@ -1135,7 +1151,6 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
         let forbidden = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
             StatusCode::FORBIDDEN,
-            "not allowed".to_string(),
         ));
         let malformed = anyhow::anyhow!("failed to sign registration request");
 

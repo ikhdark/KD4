@@ -1020,8 +1020,6 @@ class RustTestRunner:
                 or set(passed) != required
                 or any(count != 1 for count in passed.values())
             ):
-                if not quiet:
-                    print(self._failure_detail(result))
                 # `--status-level pass` hides SKIP lines and `--no-tests=fail`
                 # fails an empty run before this point, so a missing or ignored
                 # test is only known as not executed; `check-gates` names it.
@@ -1031,7 +1029,8 @@ class RustTestRunner:
                     RunnerError(
                         f"gate {steps} did not report every required test passed exactly once: "
                         f"expected={sorted(f'{binary} {test}' for binary, test in required)}, "
-                        f"passed={reported}, unexpected={unexpected}",
+                        f"passed={reported}, unexpected={unexpected}\n"
+                        + self._failure_detail(result),
                         outcome="not_executed",
                     )
                 )

@@ -1293,6 +1293,70 @@ fn dependency_scoped_workspace_evidence_invalidates_on_external_revision_change(
     assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
 }
 
+#[tokio::test]
+async fn external_source_evidence_survives_repo_edits_but_not_attachment_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let attachments = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.rs");
+    let attachment = attachments.path().join("prompt.txt");
+    std::fs::write(&source, "source").unwrap();
+    std::fs::write(&attachment, "original requirements").unwrap();
+    let cache = GitWorkspaceCache::new();
+    let observations = cache
+        .begin_source_path_change_observations(
+            root.path(),
+            &[(source.clone(), false), (attachment.clone(), false)],
+        )
+        .await
+        .expect("native watches for repository and attachment");
+    assert_eq!(observations.len(), 2, "no dependency may be silently dropped");
+    let mut before = workspace_identity("before");
+    before.repository_root = Some(root.path().to_string_lossy().into_owned());
+    let mut after = workspace_identity("unrelated-repo-edit");
+    after.repository_root = before.repository_root.clone();
+    let output = text_output("mixed-read", "source and original requirements".into());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call("mixed-read"), output.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(before),
+            &output,
+            BTreeSet::from([
+                SourceDependencyV1::new(&source, false),
+                SourceDependencyV1::new(&attachment, false),
+            ]),
+        )
+        .unwrap()
+        .with_source_path_observations(observations.clone()),
+    );
+    std::fs::write(root.path().join("unrelated.txt"), "unrelated edit").unwrap();
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["unrelated.txt".into()])
+        .await;
+    assert_eq!(
+        state
+            .project_with_workspace_cache(Arc::clone(&canonical), Some(&after), &cache)
+            .items,
+        canonical,
+        "an unrelated repository edit must preserve both unchanged inputs"
+    );
+
+    std::fs::write(&attachment, "changed requirements").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while cache.source_path_change_observation_is_current(&observations[1]) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native watcher must observe the external attachment changing");
+    assert!(cache.source_path_change_observation_is_current(&observations[0]));
+    let projected = state.project_with_workspace_cache(canonical, Some(&after), &cache);
+    let (_, output) = textual_output_identity(&projected.items[1]).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
+    assert_eq!(notice["stale_workspace_evidence"], true);
+    assert_eq!(notice["valid_for_current_workspace"], false);
+}
+
 #[test]
 fn nested_workspace_evidence_retains_only_current_results_after_resume() {
     let mut state = ToolHistoryState::default();

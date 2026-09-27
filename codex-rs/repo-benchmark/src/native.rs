@@ -50,6 +50,8 @@ pub struct NativeAttemptEvidence {
     pub cleanup_ms: u64,
     pub thread_id: Option<String>,
     pub completed_turns: usize,
+    /// Observed completed tool items in the primary thread, including failed turns.
+    /// This is not a count of nested executions or proof of complete event coverage.
     pub tool_executions: usize,
     pub failure: Option<NativeFailure>,
     pub effective_config: Value,
@@ -107,6 +109,8 @@ pub fn run_attempt(request: &NativeAttemptRequest) -> NativeAttemptEvidence {
             message,
         });
     }
+    evidence.tool_executions =
+        client::completed_tool_count(&evidence.events, evidence.thread_id.as_deref());
     if let Err(error) = save_evidence(&evidence) {
         evidence.status = "failed".into();
         let previous = evidence
@@ -230,7 +234,6 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                 if cancel { Some(&mut checkpoint) } else { None },
             )?;
             turn_elapsed += turn_started.elapsed();
-            evidence.tool_executions += terminal.tool_executions;
             if cancel {
                 if terminal.status != "interrupted" {
                     bail!(

@@ -424,14 +424,33 @@ impl PathUri {
             ));
         }
 
+        // The URL adapter accepts only some escaped drive spellings. Normalize the drive in a
+        // temporary URL, leaving this URI's serialized identity and all other escapes intact.
+        let mut url = std::borrow::Cow::Borrowed(&self.0);
+        if self.0.host_str().is_none()
+            && let Some(drive) = self
+                .0
+                .path_segments()
+                .and_then(|mut segments| segments.next())
+            && drive.contains('%')
+            && is_windows_drive_uri_segment(drive)
+        {
+            let path = format!(
+                "/{}{}",
+                decode_uri_path(drive),
+                &self.0.path()[1 + drive.len()..]
+            );
+            url.to_mut().set_path(&path);
+        }
+
         // Lexical parents and joins stop at `file:///C:`, the drive root. `Url::to_file_path`
         // renders that URI as the drive-relative path `C:` (and debug-asserts that its result is
         // absolute), so give the root its separator.
-        let path = match self.0.path().as_bytes() {
-            [b'/', drive, b':'] if self.0.host_str().is_none() && drive.is_ascii_alphabetic() => {
+        let path = match url.path().as_bytes() {
+            [b'/', drive, b':'] if url.host_str().is_none() && drive.is_ascii_alphabetic() => {
                 Ok(PathBuf::from(format!("{}:\\", char::from(*drive))))
             }
-            _ => self.0.to_file_path(),
+            _ => url.to_file_path(),
         }
         .map_err(|()| {
             io::Error::new(
@@ -565,7 +584,8 @@ fn decode_bad_path_uri(url: &Url) -> Option<Vec<u8>> {
 }
 
 fn is_windows_drive_uri_segment(segment: &str) -> bool {
-    matches!(segment.as_bytes(), [drive, b':'] if drive.is_ascii_alphabetic())
+    let decoded = urlencoding::decode_binary(segment.as_bytes());
+    matches!(decoded.as_ref(), [drive, b':'] if drive.is_ascii_alphabetic())
 }
 
 fn containment_path_segments(

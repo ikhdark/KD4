@@ -26,7 +26,6 @@ mod tests {
             Some("false"),
             Some("release"),
             Some("2026-08-24T00:00:00Z"),
-            false,
         );
 
         assert_eq!(

@@ -599,10 +599,14 @@ async fn apply_hunks_to_files(
                         )
                     })?;
                 delta.exact &= metadata.is_file && !metadata.is_symlink;
-                let deleted_content = fs.read_file_text(&path_uri, sandbox).await.ok();
-                if deleted_content.is_none() {
-                    delta.exact = false;
-                }
+                let deleted_content = fs.read_file_text(&path_uri, sandbox).await?;
+                anyhow::ensure!(
+                    prepared[hunk_index]
+                        .as_ref()
+                        .is_some_and(|source| source.original_contents == deleted_content),
+                    "source changed after patch preparation; refusing to delete {}",
+                    path_uri.inferred_native_path_string()
+                );
                 if let Err(error) = fs
                     .remove(
                         &path_uri,
@@ -622,19 +626,19 @@ async fn apply_hunks_to_files(
                 {
                     delta.exact &= remove_failure_was_side_effect_free(
                         &path_uri,
-                        deleted_content.as_deref(),
+                        Some(&deleted_content),
                         fs,
                         sandbox,
                     )
                     .await;
                     return Err(error);
                 }
-                if let Some(content) = deleted_content {
-                    delta.changes.push(AppliedPatchChange {
-                        path: path_uri.to_path_buf(),
-                        change: AppliedPatchFileChange::Delete { content },
-                    });
-                }
+                delta.changes.push(AppliedPatchChange {
+                    path: path_uri.to_path_buf(),
+                    change: AppliedPatchFileChange::Delete {
+                        content: deleted_content,
+                    },
+                });
             }
             Hunk::UpdateFile {
                 move_path, chunks, ..
@@ -2253,6 +2257,59 @@ mod tests {
                 absolute_update.display(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_source_changed_after_preflight_and_reports_committed_prefix() {
+        for changed in [b"concurrent\r\nedit\n".as_slice(), b"\xff\xfe".as_slice()] {
+            let dir = tempdir().unwrap();
+            let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+            let source = dir.path().join("source.txt");
+            let prefix = dir.path().join("prefix.txt");
+            fs::write(&source, "original\n").unwrap();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let failure = apply_patch_with_cancellation(
+                &wrap_patch("*** Add File: prefix.txt\n+committed\n*** Delete File: source.txt\n*** Add File: suffix.txt\n+not committed"),
+                &cwd,
+                &mut stdout,
+                &mut stderr,
+                LOCAL_FS.as_ref(),
+                None,
+                &|| {
+                    // The real publication boundary runs after global preflight.
+                    if prefix.exists() {
+                        fs::write(&source, changed).unwrap();
+                    }
+                    false
+                },
+            )
+            .await
+            .expect_err("an intervening edit must not be deleted");
+            assert_eq!(fs::read(&source).unwrap(), changed);
+            assert_eq!(fs::read_to_string(&prefix).unwrap(), "committed\n");
+            assert!(!dir.path().join("suffix.txt").exists());
+            assert!(stdout.is_empty());
+            assert!(failure.delta().is_exact());
+            assert_eq!(
+                failure.delta().changes(),
+                &[AppliedPatchChange {
+                    path: prefix,
+                    change: AppliedPatchFileChange::Add {
+                        content: "committed\n".into(),
+                        overwritten_content: None,
+                    },
+                }]
+            );
+            if std::str::from_utf8(changed).is_ok() {
+                assert!(failure.to_string().contains("refusing to delete"));
+            }
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains("do not retry the whole patch")
+            );
+        }
     }
 
     #[tokio::test]

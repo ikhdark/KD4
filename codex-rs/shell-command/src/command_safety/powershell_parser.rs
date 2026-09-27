@@ -98,6 +98,10 @@ pub(crate) fn parse_powershell_invocation(args: &[String]) -> PowershellInvocati
                 if idx + 2 != args.len() {
                     return PowershellInvocation::Invalid;
                 }
+                // A lone dash reads source from stdin; it is not inline script text.
+                if script == "-" {
+                    return PowershellInvocation::Opaque;
+                }
                 return PowershellInvocation::InlineCommand { script, no_profile };
             }
             _ if lower.starts_with("-command:") || lower.starts_with("/command:") => {
@@ -107,6 +111,9 @@ pub(crate) fn parse_powershell_invocation(args: &[String]) -> PowershellInvocati
                 let Some((_, script)) = arg.split_once(':') else {
                     return PowershellInvocation::Invalid;
                 };
+                if script == "-" {
+                    return PowershellInvocation::Opaque;
+                }
                 return PowershellInvocation::InlineCommand { script, no_profile };
             }
             "-noprofile" => {

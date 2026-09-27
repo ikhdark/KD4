@@ -5059,6 +5059,40 @@ async fn wake_wait_is_event_driven_and_observes_the_next_commit() {
 }
 
 #[tokio::test]
+async fn wake_wait_rejects_invalid_cursor_even_without_a_stream() {
+    let fixture = Fixture::new().await;
+    fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("cursor-owner", "src"))
+        .await
+        .expect("assignment");
+    let cursor = fixture
+        .store
+        .read_wake_events("cursor-owner".into(), None)
+        .await
+        .expect("owner stream")
+        .latest_event_id
+        .expect("cursor");
+    for cursor in [cursor, WakeEventId::new()] {
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.store.wait_for_wake_events("missing-root".into(), Some(cursor)),
+        )
+        .await
+        .expect("invalid cursor must fail without waiting for a commit")
+        .expect_err("cursor does not belong to missing root");
+        assert!(matches!(error, StoreError::InvalidWakeWatermark(_)));
+    }
+    let empty = fixture
+        .store
+        .read_wake_events("missing-root".into(), None)
+        .await
+        .expect("cursorless empty read remains valid");
+    assert_eq!(empty.status, WakeReadStatus::NoStream);
+    assert!(empty.updated_agents.is_empty());
+}
+
+#[tokio::test]
 async fn wake_wait_observes_a_commit_from_an_independent_store_instance() {
     let fixture = Fixture::new().await;
     let (_, attempt) = fixture

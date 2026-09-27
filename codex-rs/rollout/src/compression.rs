@@ -364,8 +364,9 @@ impl RolloutLineReader {
 ///
 /// Records are written as complete UTF-8 lines, but a process killed mid-append can
 /// tear the last one inside a multi-byte character, and the next append then
-/// terminates that fragment in place. Decoding lossily lets that fragment fail JSON
-/// parsing like any other torn record, instead of making every later record unreadable.
+/// terminates that fragment in place. Emit a non-JSON record for invalid UTF-8 so
+/// callers count and skip it without losing later records. Lossy decoding could
+/// instead turn corrupted bytes inside a JSON string into apparently valid evidence.
 fn decode_rollout_line(mut line: Vec<u8>) -> String {
     if line.last() == Some(&b'\n') {
         line.pop();
@@ -373,8 +374,7 @@ fn decode_rollout_line(mut line: Vec<u8>) -> String {
             line.pop();
         }
     }
-    String::from_utf8(line)
-        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+    String::from_utf8(line).unwrap_or_else(|_| "invalid UTF-8 rollout record".to_owned())
 }
 
 mod worker {

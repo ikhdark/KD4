@@ -43,6 +43,13 @@ impl<T: HttpTransport> ModelsClient<T> {
     }
 
     fn append_client_version_query(req: &mut codex_client::Request, client_version: &str) {
+        if let Ok(mut url) = url::Url::parse(&req.url) {
+            url.query_pairs_mut()
+                .append_pair("client_version", client_version);
+            req.url = url.into();
+            return;
+        }
+        // Preserve invalid configurations for the fallible transport boundary.
         let separator = if req.url.contains('?') { '&' } else { '?' };
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("client_version", client_version)
@@ -341,6 +348,26 @@ mod tests {
             ]
         );
         assert_eq!(url.fragment(), None);
+    }
+
+    #[test]
+    fn client_version_precedes_fragment() {
+        for query in ["", "?tenant=a%26b"] {
+            let provider = provider(&format!(
+                "https://example.com/api/codex{query}#section?key=value"
+            ));
+            let version = "1.0+dev&extra=value #/?";
+            let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, version);
+            let url = url::Url::parse(&request_url).unwrap();
+            let mut expected = Vec::new();
+            if !query.is_empty() {
+                expected.push(("tenant".into(), "a&b".into()));
+            }
+            expected.push(("client_version".into(), version.into()));
+            assert_eq!(url.query_pairs().collect::<Vec<_>>(), expected);
+            assert_eq!(url.path(), "/api/codex/models");
+            assert_eq!(url.fragment(), Some("section?key=value"));
+        }
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ background_terminal_max_timeout = 300000
 
 
 model_verbosity = "low"
-model_reasoning_summary = "auto"
+model_reasoning_summary = "none"
 [agents]
 max_depth = 1
 

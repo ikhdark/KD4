@@ -912,6 +912,66 @@ async fn rescan_moves_a_stable_watch_whose_root_disappeared() {
 }
 
 #[tokio::test]
+async fn overflow_rearms_a_lost_backend_watch_before_delivering_rescan() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(root.clone(), /*recursive*/ true);
+
+    // Model the backend losing its watch while the removal report is dropped.
+    // Logical state still claims the root is watched; the real backend is not.
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .watcher
+        .unwatch(&root)
+        .expect("stop backend watch");
+    std::fs::remove_dir(&root).expect("remove root");
+    std::fs::create_dir(&root).expect("recreate root");
+
+    let (raw_tx, raw_rx) = mpsc::channel(1);
+    let raw_overflow = Arc::new(AtomicBool::new(false));
+    let raw_overflow_notify = Arc::new(Notify::new());
+    for kind in [
+        EventKind::Other,
+        EventKind::Remove(notify::event::RemoveKind::Folder),
+    ] {
+        enqueue_raw_event(
+            &raw_tx,
+            &raw_overflow,
+            &raw_overflow_notify,
+            Ok(notify_event(kind, vec![root.clone()])),
+        );
+    }
+    assert!(raw_overflow.load(Ordering::Acquire));
+    watcher.spawn_event_loop(
+        &Handle::current(),
+        raw_rx,
+        raw_overflow,
+        raw_overflow_notify,
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("overflow rescan timeout"),
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
+    assert_eq!(watcher.watch_counts_for_test(&root), Some((0, 1)));
+
+    let child = root.join("after-overflow.txt");
+    std::fs::write(&child, "must reach the subscriber").expect("write child");
+    recv_event_for(&mut rx, &child).await;
+}
+
+#[tokio::test]
 async fn queued_raw_events_are_reconciled_in_one_pass() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let requested = temp_dir.path().join("requested");

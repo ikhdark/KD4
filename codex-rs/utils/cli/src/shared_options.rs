@@ -36,7 +36,11 @@ pub struct SharedCliOptions {
 
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
-    #[arg(long = "sandbox", short = 's')]
+    #[arg(
+        long = "sandbox",
+        short = 's',
+        conflicts_with = "dangerously_bypass_approvals_and_sandbox"
+    )]
     pub sandbox_mode: Option<SandboxModeCliArg>,
 
     /// Skip all confirmation prompts and execute commands without sandboxing.
@@ -63,6 +67,58 @@ pub struct SharedCliOptions {
 }
 
 impl SharedCliOptions {
+    /// Preserve where sandbox bypass flags were given instead of letting clap
+    /// copy a global exec flag into unrelated ancestor selections.
+    pub fn scope_sandbox_selection(command: clap::Command) -> clap::Command {
+        fn scope(mut command: clap::Command, inherited: Option<clap::Arg>) -> clap::Command {
+            const BYPASS: &str = "dangerously_bypass_approvals_and_sandbox";
+            let local = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == BYPASS)
+                .cloned();
+            let propagated = local
+                .as_ref()
+                .filter(|arg| arg.is_global_set())
+                .cloned()
+                .or(inherited.clone());
+            if local.is_some() {
+                command = command.mut_arg(BYPASS, |arg| arg.global(false));
+            } else if let Some(inherited) = inherited {
+                command = command.arg(inherited.global(false));
+            }
+            for subcommand in command.get_subcommands_mut() {
+                *subcommand = scope(std::mem::take(subcommand), propagated.clone());
+            }
+            command
+        }
+
+        scope(command, None)
+    }
+
+    /// Apply the deepest explicit sandbox selection from scoped command matches.
+    /// Other shared options retain their normal parsing and merge behavior.
+    pub fn apply_sandbox_selection(&mut self, matches: &clap::ArgMatches) {
+        let mut level = Some(matches);
+        while let Some(matches) = level {
+            let sandbox_mode = matches
+                .try_get_one::<SandboxModeCliArg>("sandbox_mode")
+                .ok()
+                .flatten()
+                .copied();
+            let bypass = matches
+                .try_get_one::<bool>("dangerously_bypass_approvals_and_sandbox")
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false);
+            if sandbox_mode.is_some() || bypass {
+                self.sandbox_mode = sandbox_mode;
+                self.dangerously_bypass_approvals_and_sandbox = bypass;
+            }
+            level = matches.subcommand().map(|(_, matches)| matches);
+        }
+    }
+
     /// Merges these subcommand options over `root`, as
     /// [`Self::apply_subcommand_overrides`] does for resumed sessions.
     pub fn inherit_exec_root_options(&mut self, root: &Self) {
@@ -133,6 +189,91 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         shared: SharedCliOptions,
+    }
+
+    #[test]
+    fn rejects_conflicting_sandbox_selections() {
+        for bypass in ["--yolo", "--dangerously-bypass-approvals-and-sandbox"] {
+            for mode in ["read-only", "workspace-write", "danger-full-access"] {
+                for args in [
+                    vec!["codex", "--sandbox", mode, bypass],
+                    vec!["codex", bypass, "--sandbox", mode],
+                ] {
+                    let error = Cli::try_parse_from(args).err().expect("conflicting modes");
+                    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_selection_still_overrides_across_command_levels() {
+        use clap::CommandFactory;
+        use clap::FromArgMatches;
+
+        for (args, expected_bypass) in [
+            (
+                vec!["codex", "--sandbox", "read-only", "exec", "--yolo"],
+                true,
+            ),
+            (
+                vec!["codex", "--yolo", "exec", "--sandbox", "read-only"],
+                false,
+            ),
+            (
+                vec![
+                    "codex",
+                    "--yolo",
+                    "exec",
+                    "--sandbox",
+                    "read-only",
+                    "resume",
+                    "--yolo",
+                ],
+                true,
+            ),
+        ] {
+            let command = Cli::command().subcommand(
+                SharedCliOptions::augment_args(clap::Command::new("exec"))
+                    .mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
+                        arg.global(true)
+                    })
+                    .subcommand(clap::Command::new("resume")),
+            );
+            let matches = SharedCliOptions::scope_sandbox_selection(command)
+                .try_get_matches_from(args)
+                .expect("parse");
+            let root = Cli::from_arg_matches(&matches)
+                .expect("root options")
+                .shared;
+            let mut child = SharedCliOptions::from_arg_matches(
+                matches.subcommand_matches("exec").expect("exec matches"),
+            )
+            .expect("exec options");
+            child.apply_sandbox_selection(&matches);
+            child.inherit_exec_root_options(&root);
+            assert_eq!(
+                child.dangerously_bypass_approvals_and_sandbox,
+                expected_bypass
+            );
+            assert_eq!(child.sandbox_mode.is_some(), !expected_bypass);
+        }
+    }
+
+    #[test]
+    fn resumed_exec_bypass_overrides_exec_sandbox() {
+        let command = SharedCliOptions::augment_args(clap::Command::new("exec"))
+            .mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
+                arg.global(true)
+            })
+            .subcommand(clap::Command::new("resume"));
+        let matches = SharedCliOptions::scope_sandbox_selection(command)
+            .try_get_matches_from(["exec", "--sandbox", "read-only", "resume", "--yolo"])
+            .expect("parse");
+        let mut shared = SharedCliOptions::default();
+        shared.apply_sandbox_selection(&matches);
+        assert!(shared.dangerously_bypass_approvals_and_sandbox);
+        assert!(shared.sandbox_mode.is_none());
     }
 
     #[test]

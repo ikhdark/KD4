@@ -427,6 +427,59 @@ async fn clear_cache_invalidates_cached_tool_suggest_metadata() {
 }
 
 #[tokio::test]
+async fn tool_suggest_metadata_tracks_local_plugin_versions() {
+    let codex_home = tempdir().expect("tempdir should succeed");
+    let curated_root = curated_plugins_repo_path(codex_home.path());
+    write_openai_curated_marketplace(&curated_root, &["slack"]);
+    let plugin_root = curated_root.join("plugins/slack");
+    let plugin_manifest = plugin_root.join(".codex-plugin/plugin.json");
+    write_file(
+        &plugin_manifest,
+        r#"{"name":"slack","version":"1.0.0","description":"Version one"}"#,
+    );
+    let plugins = load_plugins_config(codex_home.path(), codex_home.path()).await;
+    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let input = discovery_input(plugins, &[], &[], &[]);
+    let initial = list_discoverable_plugins(&manager, input.clone(), None).await;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].description.as_deref(), Some("Version one"));
+    assert_eq!(initial[0].mcp_server_names, ["sample-docs"]);
+
+    // Unchanged identity keeps the warm metadata even if a capability file is
+    // rewritten before the publisher advances the manifest version.
+    write_file(
+        &plugin_root.join(".mcp.json"),
+        r#"{"mcpServers":{"new-docs":{"type":"http","url":"https://sample.example/mcp"}}}"#,
+    );
+    assert_eq!(
+        list_discoverable_plugins(&manager, input.clone(), None).await,
+        initial
+    );
+
+    write_file(
+        &plugin_manifest,
+        r#"{"name":"slack","version":"2.0.0","description":"Version two"}"#,
+    );
+    let updated = list_discoverable_plugins(&manager, input.clone(), None).await;
+    assert_eq!(
+        updated,
+        vec![ToolSuggestDiscoverablePlugin {
+            description: Some("Version two".to_string()),
+            mcp_server_names: vec!["new-docs".to_string()],
+            ..initial[0].clone()
+        }]
+    );
+    assert_eq!(
+        list_discoverable_plugins(&manager, input, None).await,
+        updated
+    );
+    assert!(
+        !codex_home.path().join("plugins/cache").exists(),
+        "metadata discovery must not install the plugin"
+    );
+}
+
+#[tokio::test]
 async fn ignores_missing_marketplace_plugin() {
     let codex_home = tempdir().expect("tempdir should succeed");
     let curated_root = curated_plugins_repo_path(codex_home.path());

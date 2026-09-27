@@ -214,9 +214,10 @@ impl CodexToolCallParam {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct CodexToolCallReplyParam {
-    /// DEPRECATED: use threadId instead.
+    /// DEPRECATED: use threadId instead. If both are supplied, they must match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_id: Option<String>,
 
@@ -232,16 +233,24 @@ pub struct CodexToolCallReplyParam {
 
 impl CodexToolCallReplyParam {
     pub(crate) fn get_thread_id(&self) -> anyhow::Result<ThreadId> {
-        if let Some(thread_id) = &self.thread_id {
-            let thread_id = ThreadId::from_string(thread_id)?;
-            Ok(thread_id)
-        } else if let Some(conversation_id) = &self.conversation_id {
-            let thread_id = ThreadId::from_string(conversation_id)?;
-            Ok(thread_id)
-        } else {
-            Err(anyhow::anyhow!(
+        let thread_id = self
+            .thread_id
+            .as_deref()
+            .map(ThreadId::from_string)
+            .transpose()?;
+        let conversation_id = self
+            .conversation_id
+            .as_deref()
+            .map(ThreadId::from_string)
+            .transpose()?;
+        match (thread_id, conversation_id) {
+            (Some(thread_id), Some(conversation_id)) if thread_id != conversation_id => {
+                anyhow::bail!("threadId and conversationId must refer to the same thread")
+            }
+            (Some(thread_id), _) | (_, Some(thread_id)) => Ok(thread_id),
+            (None, None) => Err(anyhow::anyhow!(
                 "either threadId or conversationId must be provided"
-            ))
+            )),
         }
     }
 }
@@ -489,19 +498,45 @@ mod tests {
     }
 
     #[test]
+    fn reply_thread_aliases_must_identify_one_thread() {
+        let thread_id = ThreadId::new();
+        for ids in [
+            serde_json::json!({"threadId": thread_id}),
+            serde_json::json!({"conversationId": thread_id}),
+            serde_json::json!({"threadId": thread_id, "conversationId": thread_id}),
+        ] {
+            let mut params = ids;
+            params["prompt"] = serde_json::json!("continue");
+            let params: CodexToolCallReplyParam = serde_json::from_value(params).unwrap();
+            assert_eq!(params.get_thread_id().unwrap(), thread_id);
+        }
+        for ids in [
+            serde_json::json!({}),
+            serde_json::json!({"threadId": thread_id, "conversationId": ThreadId::new()}),
+            serde_json::json!({"threadId": thread_id, "conversationId": "invalid"}),
+        ] {
+            let mut params = ids;
+            params["prompt"] = serde_json::json!("continue");
+            let params: CodexToolCallReplyParam = serde_json::from_value(params).unwrap();
+            assert!(params.get_thread_id().is_err());
+        }
+    }
+
+    #[test]
     fn verify_codex_tool_reply_json_schema() {
         let tool = create_tool_for_codex_tool_call_reply_param();
         let tool_json = serde_json::to_value(&tool).expect("tool serializes");
         let expected_tool_json = serde_json::json!({
           "description": "Continue a Codex conversation by providing the thread id and prompt.",
           "inputSchema": {
+            "additionalProperties": false,
             "anyOf": [
               { "required": ["threadId"] },
               { "required": ["conversationId"] }
             ],
             "properties": {
               "conversationId": {
-                "description": "DEPRECATED: use threadId instead.",
+                "description": "DEPRECATED: use threadId instead. If both are supplied, they must match.",
                 "type": "string"
               },
               "prompt": {

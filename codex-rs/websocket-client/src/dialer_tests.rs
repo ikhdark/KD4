@@ -7,6 +7,7 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::OutboundProxyRoute;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
+use futures::FutureExt;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -35,6 +36,56 @@ use super::*;
 use crate::AsyncIo;
 use crate::WebSocketConnection;
 use crate::WebSocketConnector;
+
+#[tokio::test]
+async fn unsupported_scheme_with_explicit_port_never_opens_a_socket() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let tls_config = test_tls_configs().0;
+        for scheme in ["http", "https", "ftp"] {
+            for route in [
+                OutboundProxyRoute::TransportDefault,
+                OutboundProxyRoute::Direct,
+                OutboundProxyRoute::Proxy {
+                    url: format!("http://{address}"),
+                    no_proxy: None,
+                },
+                OutboundProxyRoute::Proxy {
+                    url: format!("http://{address}"),
+                    no_proxy: Some("unrelated.example".to_string()),
+                },
+            ] {
+                let request = Request::builder()
+                    .uri(format!("{scheme}://{address}/v1/responses"))
+                    .body(())
+                    .expect("request with unsupported scheme should build");
+                let result = tokio::select! {
+                    result = connect(
+                        request,
+                        WebSocketConfig::default(),
+                        Arc::clone(&tls_config),
+                        route.clone(),
+                        TcpNodelay::Default,
+                    ) => result,
+                    _ = listener.accept() => panic!("{scheme} over {route:?} opened a socket"),
+                };
+                assert!(matches!(
+                    result,
+                    Err(WebSocketError::Url(UrlError::UnsupportedUrlScheme))
+                ));
+                assert!(
+                    listener.accept().now_or_never().is_none(),
+                    "{scheme} over {route:?} opened a socket before rejection"
+                );
+            }
+        }
+    })
+    .await
+    .expect("scheme rejection deadline");
+}
 
 #[tokio::test]
 async fn public_connector_uses_factory_and_exposes_stream_and_sink() {

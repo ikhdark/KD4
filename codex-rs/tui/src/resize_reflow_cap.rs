@@ -62,9 +62,16 @@ fn auto_resize_reflow_max_rows(
         TerminalName::WindowsTerminal => WINDOWS_TERMINAL_RESIZE_REFLOW_MAX_ROWS,
         TerminalName::WezTerm => WEZTERM_RESIZE_REFLOW_MAX_ROWS,
         TerminalName::Alacritty => ALACRITTY_RESIZE_REFLOW_MAX_ROWS,
-        TerminalName::WarpTerminal | TerminalName::Dumb | TerminalName::Unknown => {
-            DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS
-        }
+        TerminalName::AppleTerminal
+        | TerminalName::Ghostty
+        | TerminalName::Iterm2
+        | TerminalName::WarpTerminal
+        | TerminalName::Kitty
+        | TerminalName::Konsole
+        | TerminalName::GnomeTerminal
+        | TerminalName::Vte
+        | TerminalName::Dumb
+        | TerminalName::Unknown => DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS,
     }
 }
 
@@ -78,6 +85,7 @@ mod tests {
             term_program: None,
             version: None,
             term: None,
+            multiplexer: None,
         }
     }
 
@@ -97,6 +105,10 @@ mod tests {
             ),
             (
                 TerminalName::Unknown,
+                DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS,
+            ),
+            (
+                TerminalName::Ghostty,
                 DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS,
             ),
         ];
@@ -160,6 +172,7 @@ mod tests {
             term_program: None,
             version: None,
             term: Some("xterm-256color".to_string()),
+            multiplexer: None,
         };
         let config = TerminalResizeReflowConfig::default();
 

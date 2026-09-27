@@ -4,14 +4,14 @@ use unicode_width::UnicodeWidthStr;
 /// Scroll position and geometry for a vertical scroll view.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScrollViewState {
-    pub scroll: usize,
+    pub scroll: u16,
     pub viewport_h: u16,
-    pub content_h: usize,
+    pub content_h: u16,
 }
 
 impl ScrollViewState {
     pub fn clamp(&mut self) {
-        let max_scroll = self.content_h.saturating_sub(usize::from(self.viewport_h));
+        let max_scroll = self.content_h.saturating_sub(self.viewport_h);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
@@ -77,11 +77,8 @@ impl ScrollableDiff {
 
     /// Scroll by a signed delta; clamps to content.
     pub fn scroll_by(&mut self, delta: i16) {
-        self.state.scroll = self
-            .state
-            .scroll
-            .saturating_add_signed(isize::from(delta))
-            .min(self.max_scroll());
+        let s = self.state.scroll as i32 + delta as i32;
+        self.state.scroll = s.clamp(0, self.max_scroll() as i32) as u16;
     }
 
     /// Page by a signed delta; typically viewport_h - 1.
@@ -102,28 +99,22 @@ impl ScrollableDiff {
         if self.state.content_h == 0 || self.state.viewport_h == 0 {
             return None;
         }
-        if self.state.content_h <= usize::from(self.state.viewport_h) {
+        if self.state.content_h <= self.state.viewport_h {
             return None;
         }
-        let visible_bottom = self
-            .state
-            .scroll
-            .saturating_add(usize::from(self.state.viewport_h)) as f32;
+        let visible_bottom = self.state.scroll.saturating_add(self.state.viewport_h) as f32;
         let pct = (visible_bottom / self.state.content_h as f32 * 100.0).round();
         Some(pct.clamp(0.0, 100.0) as u8)
     }
 
-    fn max_scroll(&self) -> usize {
-        self.state
-            .content_h
-            .saturating_sub(usize::from(self.state.viewport_h))
+    fn max_scroll(&self) -> u16 {
+        self.state.content_h.saturating_sub(self.state.viewport_h)
     }
 
     fn rewrap(&mut self, width: u16) {
         if width == 0 {
             self.wrapped = self.raw.clone();
-            self.wrapped_src_idx = (0..self.raw.len()).collect();
-            self.state.content_h = self.wrapped.len();
+            self.state.content_h = self.wrapped.len() as u16;
             return;
         }
         let max_cols = width as usize;
@@ -150,19 +141,14 @@ impl ScrollableDiff {
                 }
                 let w = UnicodeWidthChar::width(ch).unwrap_or(0);
                 if line_cols.saturating_add(w) > max_cols {
-                    // A break with only whitespace before it (at a leading diff marker or
-                    // after indentation) would emit a blank row; hard-break instead.
-                    if let Some(split) = last_soft_idx.take()
-                        && !line[..split].trim_end().is_empty()
-                    {
+                    if let Some(split) = last_soft_idx {
                         let (prefix, rest) = line.split_at(split);
                         out.push(prefix.trim_end().to_string());
                         out_idx.push(raw_idx);
                         line = rest.trim_start().to_string();
-                        line_cols = UnicodeWidthStr::width(line.as_str());
-                    }
-                    // The rendered rows are clipped, not rewrapped, so never let `ch` overflow.
-                    if line_cols.saturating_add(w) > max_cols && !line.is_empty() {
+                        last_soft_idx = None;
+                        // retry add current ch now that line may be shorter
+                    } else if !line.is_empty() {
                         out.push(std::mem::take(&mut line));
                         out_idx.push(raw_idx);
                     }
@@ -185,63 +171,6 @@ impl ScrollableDiff {
         }
         self.wrapped = out;
         self.wrapped_src_idx = out_idx;
-        self.state.content_h = self.wrapped.len();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ScrollableDiff;
-    use pretty_assertions::assert_eq;
-    use unicode_width::UnicodeWidthStr;
-
-    #[test]
-    fn wrapping_keeps_every_row_filled_and_within_the_width() {
-        let mut diff = ScrollableDiff::new();
-        diff.set_content(vec![
-            // Removal marker followed by an unbroken run.
-            "-abcdefghijkl".to_string(),
-            // Context-line indentation followed by an unbroken run.
-            "    abcdefghijkl".to_string(),
-            // A soft break that frees too little room for a wide character.
-            "a.bcdefg中".to_string(),
-        ]);
-        diff.set_width(8);
-
-        assert_eq!(
-            diff.wrapped_lines(),
-            &[
-                "-abcdefg", "hijkl", "    abcd", "efghijkl", "a", ".bcdefg", "中"
-            ]
-        );
-        assert_eq!(diff.wrapped_src_indices(), &[0, 0, 1, 1, 2, 2, 2]);
-        for row in diff.wrapped_lines() {
-            assert!(
-                !row.trim().is_empty(),
-                "blank row in {:?}",
-                diff.wrapped_lines()
-            );
-            assert!(row.width() <= 8, "{row:?} overflows the width");
-        }
-    }
-
-    #[test]
-    fn zero_width_preserves_large_content_and_source_indices() {
-        let mut diff = ScrollableDiff::new();
-        diff.set_content(vec!["line".to_string(); 65_537]);
-        diff.set_width(0);
-        diff.set_viewport(1);
-        diff.scroll_to_bottom();
-        assert_eq!(diff.state.scroll, 65_536);
-        assert_eq!(diff.wrapped_src_indices().last(), Some(&65_536));
-        diff.scroll_by(-1);
-        assert_eq!(diff.state.scroll, 65_535);
-        diff.scroll_by(10);
-        assert_eq!(diff.state.scroll, 65_536);
-        diff.set_content(vec!["replacement".to_string()]);
-        diff.set_width(0);
-        assert_eq!(diff.state.scroll, 0);
-        assert_eq!(diff.wrapped_src_indices(), &[0]);
-        assert_eq!(diff.raw_line_at(0), "replacement");
+        self.state.content_h = self.wrapped.len() as u16;
     }
 }

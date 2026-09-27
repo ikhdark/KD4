@@ -57,6 +57,7 @@ fn install_system_skills_with(
         }
     }
 
+    remove_abandoned_staging_dirs(&skills_root_dir);
     let marker_path = dest_system.join(SYSTEM_SKILLS_MARKER_FILENAME);
     let expected_fingerprint = embedded_system_skills_fingerprint();
     if dest_system.as_path().is_dir()
@@ -65,7 +66,6 @@ fn install_system_skills_with(
         return Ok(());
     }
 
-    remove_abandoned_staging_dirs(&skills_root_dir);
     let staging = tempfile::Builder::new()
         .prefix(SYSTEM_SKILLS_STAGING_PREFIX)
         .tempdir_in(skills_root_dir.as_path())
@@ -362,6 +362,30 @@ mod tests {
             })
             .count();
         assert_eq!(staging_dirs, 0);
+    }
+
+    #[test]
+    fn warm_install_reclaims_staging_without_rewriting_installed_content() {
+        use super::*;
+        let home = tempfile::tempdir().expect("home");
+        let home = AbsolutePathBuf::from_absolute_path(home.path()).expect("absolute home");
+        install_system_skills(&home).expect("initial install");
+        let skill = system_cache_root_dir(&home).join("skill-creator/SKILL.md");
+        fs::write(skill.as_path(), "user-modified instructions").expect("modify installed skill");
+        let abandoned = home
+            .join(SKILLS_DIR_NAME)
+            .join(format!("{SYSTEM_SKILLS_STAGING_PREFIX}interrupted"));
+        fs::create_dir_all(abandoned.as_path()).expect("abandoned staging");
+        fs::write(abandoned.join("partial.txt").as_path(), "partial").expect("partial write");
+
+        install_system_skills_with(&home, |_| panic!("warm install must not extract assets"))
+            .expect("warm install");
+
+        assert!(!abandoned.as_path().exists());
+        assert_eq!(
+            fs::read_to_string(skill.as_path()).expect("installed skill"),
+            "user-modified instructions"
+        );
     }
 
     #[test]

@@ -19,6 +19,63 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class BuildToolingPerformanceTest(unittest.TestCase):
+    def test_perf_env_disables_incremental_independently_of_wrapper(self):
+        shell = pwsh_only()
+        if shell is None:
+            self.skipTest("pwsh is not available")
+        script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
+        for wrapper, incremental, exit_code in (
+            (None, None, 0),
+            ("", "1", 0),
+            ("custom-wrapper", "", 7),
+        ):
+            with self.subTest(wrapper=wrapper, incremental=incremental):
+                env = os.environ.copy()
+                # Use absolute executables, with no sccache discoverable on PATH.
+                env["PATH"] = ""
+                setup = []
+                names = {"RUSTC_WRAPPER": wrapper, "CARGO_INCREMENTAL": incremental}
+                for name, value in names.items():
+                    setup.append(
+                        f"Remove-Item Env:{name} -ErrorAction SilentlyContinue"
+                        if value is None
+                        else f"$env:{name} = {ps_single_quote(value)}"
+                    )
+                child = (
+                    "import json,os,sys; print('CHILD='+json.dumps({k:os.environ.get(k) "
+                    f"for k in {list(names)!r}}})); sys.exit({exit_code})"
+                )
+                entries = "; ".join(
+                    f"{name}=[Environment]::GetEnvironmentVariable('{name}')"
+                    for name in names
+                )
+                command = (
+                    "; ".join(setup)
+                    + f"; & {ps_single_quote(script)} -ProgramArgs @("
+                    + f"{ps_single_quote(sys.executable)}, '-c', {ps_single_quote(child)}); "
+                    + "$childExit = $LASTEXITCODE; 'RESTORED=' + (@{"
+                    + entries
+                    + "} | ConvertTo-Json -Compress); exit $childExit"
+                )
+                result = subprocess.run(
+                    [shell, "-NoProfile", "-Command", command],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                proofs = {
+                    line.split("=", 1)[0]: json.loads(line.split("=", 1)[1])
+                    for line in result.stdout.splitlines()
+                    if line.startswith(("CHILD=", "RESTORED="))
+                }
+                self.assertEqual(proofs["RESTORED"], names)
+                self.assertEqual(
+                    proofs["CHILD"], {"RUSTC_WRAPPER": wrapper, "CARGO_INCREMENTAL": "0"}
+                )
+
     def test_perf_env_no_sccache_disables_incremental_and_uses_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:

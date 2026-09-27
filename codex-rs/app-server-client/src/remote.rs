@@ -125,7 +125,8 @@ pub struct RemoteAppServerConnectArgs {
     pub experimental_api: bool,
     pub mcp_server_openai_form_elicitation: bool,
     pub opt_out_notification_methods: Vec<String>,
-    /// Capacity for both command and event queues (clamped to at least one).
+    /// Capacity for command/event queues and dispatched requests awaiting replies
+    /// (clamped to at least one). Excess requests receive a retryable overload error.
     pub channel_capacity: usize,
 }
 impl RemoteAppServerConnectArgs {
@@ -294,6 +295,15 @@ impl RemoteAppServerClient {
                                         ErrorKind::InvalidInput,
                                         format!("duplicate remote app-server request id `{request_id}`"),
                                     )));
+                                    continue;
+                                }
+                                // Keep dispatched IDs reserved even if their caller is cancelled:
+                                // a late reply must not be routed to a newer request with that ID.
+                                if pending_requests.len() >= channel_capacity {
+                                    let _ = response_tx.send(Ok(Err(overloaded_error(
+                                        OverloadReason::InFlightTaskCapacity,
+                                        "remote app-server in-flight request capacity reached",
+                                    ))));
                                     continue;
                                 }
                                 pending_requests.insert(request_id.clone(), response_tx);

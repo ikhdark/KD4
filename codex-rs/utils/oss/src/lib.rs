@@ -13,7 +13,8 @@ pub fn get_default_model_for_oss_provider(provider_id: &str) -> Option<&'static 
     }
 }
 
-/// Ensures the specified OSS provider is ready (models downloaded, service reachable).
+/// Runs the selected provider's setup, preserving its I/O error kind.
+/// LM Studio warm-up is best-effort and may still be running on return.
 pub async fn ensure_oss_provider_ready(
     provider_id: &str,
     config: &Config,
@@ -22,12 +23,12 @@ pub async fn ensure_oss_provider_ready(
         LMSTUDIO_OSS_PROVIDER_ID => {
             codex_lmstudio::ensure_oss_ready(config)
                 .await
-                .map_err(|e| std::io::Error::other(format!("OSS setup failed: {e}")))?;
+                .map_err(oss_setup_error)?;
         }
         OLLAMA_OSS_PROVIDER_ID => {
             codex_ollama::ensure_oss_ready(config)
                 .await
-                .map_err(|e| std::io::Error::other(format!("OSS setup failed: {e}")))?;
+                .map_err(oss_setup_error)?;
         }
         _ => {
             // Unknown provider, skip setup
@@ -36,9 +37,26 @@ pub async fn ensure_oss_provider_ready(
     Ok(())
 }
 
+fn oss_setup_error(error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("OSS setup failed: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_errors_preserve_kind_and_diagnostic() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let error = oss_setup_error(std::io::Error::new(kind, "provider diagnostic"));
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "OSS setup failed: provider diagnostic");
+        }
+    }
 
     #[test]
     fn test_get_default_model_for_provider_lmstudio() {

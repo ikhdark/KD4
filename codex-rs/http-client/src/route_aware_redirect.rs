@@ -22,6 +22,7 @@ use http::header::CONTENT_ENCODING;
 use http::header::CONTENT_LENGTH;
 use http::header::CONTENT_TYPE;
 use http::header::COOKIE;
+use http::header::HOST;
 use http::header::LOCATION;
 use http::header::PROXY_AUTHORIZATION;
 use http::header::REFERER;
@@ -101,6 +102,8 @@ pub(super) fn remove_sensitive_headers(
     next: &reqwest::Url,
 ) {
     if !same_origin(previous, next) {
+        // Let the transport derive the authority from the redirect destination.
+        headers.remove(HOST);
         for header in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
             headers.remove(header);
         }

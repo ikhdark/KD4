@@ -89,7 +89,7 @@ function Get-FileSha256 {
 $script:LocalPublishContentHashCache = @{}
 # Git pathspec of the tracked publish inputs; the build fingerprint and the
 # embedded dirty flag must describe the same files.
-$script:LocalPublishBuildInputPathspec = @("codex-rs", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
+$script:LocalPublishBuildInputPathspec = @("codex-rs", "DO-NOT-CHANGE", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
 
 function Get-TextSha256 {
     param([string]$Value)
@@ -640,6 +640,7 @@ function Test-LocalPublishBuildRelevantPath {
     $normalized = $Path.Trim('"') -replace "\\", "/"
     return (
         $normalized -like "codex-rs/*" -or
+        $normalized -like "DO-NOT-CHANGE/*" -or
         $normalized -eq "justfile" -or
         $normalized -eq "scripts/publish-local-codex.ps1" -or
         $normalized -eq "scripts/common-rust-env.ps1"

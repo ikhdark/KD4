@@ -22,6 +22,7 @@ use codex_app_server_protocol::ConfiguredHookHandler;
 use codex_app_server_protocol::ConfiguredHookMatcherGroup;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
+use codex_app_server_protocol::GatewayOAuthReadResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ManagedHooksRequirements;
 use codex_app_server_protocol::ModelProviderCapabilitiesReadResponse;
@@ -171,6 +172,20 @@ impl ConfigRequestProcessor {
             namespace_tools: capabilities.namespace_tools,
             image_generation: capabilities.image_generation,
             web_search: capabilities.web_search,
+        })
+    }
+
+    /// This fork has no gateway-OAuth providers, so the effective provider never requires it.
+    pub(crate) async fn gateway_oauth_read(
+        &self,
+    ) -> Result<GatewayOAuthReadResponse, JSONRPCErrorError> {
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        Ok(GatewayOAuthReadResponse {
+            provider_id: config.model_provider_id,
+            provider_name: config.model_provider.name,
+            required: false,
+            status: None,
+            error: None,
         })
     }
 

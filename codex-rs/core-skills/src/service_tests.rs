@@ -286,7 +286,7 @@ async fn skills_for_config_short_circuits_on_the_stable_input_identity() {
 }
 
 #[tokio::test]
-async fn skills_for_config_isolates_snapshots_by_executor_file_system() {
+async fn skills_snapshots_isolate_executor_file_systems() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
     let repo_dot_codex = cwd.path().join(".codex");
@@ -317,8 +317,18 @@ async fn skills_for_config_isolates_snapshots_by_executor_file_system() {
     );
     let first_fs: Arc<dyn ExecutorFileSystem> = Arc::new(LocalFileSystem::unsandboxed());
     let first_snapshot = skills_service
-        .snapshot_for_config(&skills_input, Some(first_fs))
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&first_fs)))
         .await;
+    let first_cwd_snapshot = skills_service
+        .snapshot_for_cwd(&skills_input, false, Some(Arc::clone(&first_fs)))
+        .await;
+    assert!(
+        first_cwd_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "environment-skill")
+    );
     assert!(
         first_snapshot
             .outcome()
@@ -336,6 +346,38 @@ async fn skills_for_config_isolates_snapshots_by_executor_file_system() {
     .expect("write environment skill");
 
     let second_fs: Arc<dyn ExecutorFileSystem> = Arc::new(LocalFileSystem::unsandboxed());
+    let cached_cwd_snapshot = skills_service
+        .snapshot_for_cwd(&skills_input, false, Some(first_fs))
+        .await;
+    assert!(
+        cached_cwd_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "environment-skill"),
+        "unchanged discovery inputs must retain the cached snapshot until reload"
+    );
+    let second_cwd_snapshot = skills_service
+        .snapshot_for_cwd(&skills_input, false, Some(Arc::clone(&second_fs)))
+        .await;
+    assert!(
+        second_cwd_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .any(|skill| skill.name == "environment-skill")
+    );
+    let no_fs_snapshot = skills_service
+        .snapshot_for_cwd(&skills_input, false, None)
+        .await;
+    assert!(
+        no_fs_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "environment-skill"),
+        "removing repo roots must not reuse the executor-backed snapshot"
+    );
     let second_snapshot = skills_service
         .snapshot_for_config(&skills_input, Some(second_fs))
         .await;
@@ -753,6 +795,31 @@ async fn skills_for_config_excludes_bundled_skills_when_disabled_in_config() {
             .iter()
             .all(|skill| skill.scope != SkillScope::System)
     );
+}
+
+#[tokio::test]
+async fn skills_for_cwd_refreshes_when_bundled_roots_change() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let service = SkillsService::new(codex_home.path().abs(), false);
+    write_user_skill(&codex_home, ".system/bundled", "bundled-skill", "bundled");
+
+    for enabled in [true, false, true] {
+        let stack = config_stack(
+            &codex_home,
+            &format!("[skills.bundled]\nenabled = {enabled}\n"),
+        );
+        let input = SkillsLoadInput::new(cwd.path().abs(), Vec::new(), stack, enabled);
+        let snapshot = service.snapshot_for_cwd(&input, false, None).await;
+        assert_eq!(
+            snapshot
+                .outcome()
+                .skills
+                .iter()
+                .any(|skill| skill.name == "bundled-skill" && skill.scope == SkillScope::System),
+            enabled
+        );
+    }
 }
 
 #[tokio::test]

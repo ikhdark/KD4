@@ -146,6 +146,51 @@ async fn unsupported_methods_and_malformed_frames_respond_and_keep_transport_usa
 }
 
 #[tokio::test]
+async fn invalid_reply_arguments_fail_before_starting_work() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut process = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, process.initialize()).await??;
+    let thread_id = codex_protocol::ThreadId::new();
+    for (arguments, expected) in [
+        (
+            json!({"threadId": thread_id, "prompt": "must not run", "model": "ignored-model"}),
+            "unknown field `model`",
+        ),
+        (
+            json!({"threadId": thread_id, "conversationId": codex_protocol::ThreadId::new(), "prompt": "must not run"}),
+            "threadId and conversationId must refer to the same thread",
+        ),
+    ] {
+        let id = process
+            .send_request(
+                "tools/call",
+                Some(json!({"name": "codex-reply", "arguments": arguments})),
+            )
+            .await?;
+        // The first frame must be the rejection, not a session or turn event.
+        let response = timeout(DEFAULT_READ_TIMEOUT, process.read_jsonrpc_message()).await??;
+        let rmcp::model::JsonRpcMessage::Response(response) = response else {
+            anyhow::bail!("invalid reply must fail without starting work: {response:?}");
+        };
+        assert_eq!(response.id, RequestId::Number(id));
+        assert_eq!(response.result["isError"], true);
+        assert!(
+            response.result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected)
+        );
+    }
+    process.close_stdin();
+    assert!(
+        timeout(DEFAULT_READ_TIMEOUT, process.wait_for_exit())
+            .await??
+            .success()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn eof_bounds_shutdown_when_stdout_is_open_but_not_drained() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
     let mut process = McpProcess::new(codex_home.path()).await?;

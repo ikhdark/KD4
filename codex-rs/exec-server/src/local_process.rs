@@ -442,6 +442,13 @@ impl LocalProcess {
                         params.process_id
                     )));
                 };
+                if after_seq >= process.next_seq {
+                    return Err(invalid_params(format!(
+                        "afterSeq {after_seq} exceeds the last available sequence {} for process {}",
+                        process.next_seq - 1,
+                        params.process_id
+                    )));
+                }
 
                 let mut chunks = Vec::new();
                 let mut total_bytes = 0;
@@ -1634,6 +1641,109 @@ mod tests {
             .expect("read");
         assert_eq!(response.chunks.len(), 1);
         assert_eq!(response.chunks[0].chunk.0, b"ready");
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_read_cursors_preserve_real_process_output() {
+        let backend = LocalProcess::default();
+        let mut params = test_exec_params(std::env::vars().collect());
+        params.argv = vec![
+            "cmd.exe".into(),
+            "/d".into(),
+            "/c".into(),
+            "echo retained".into(),
+        ];
+        let started = backend.start(params).await.expect("start real process");
+        let process = started.process;
+        let mut events = process.subscribe_events();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.recv().await.expect("process event"),
+                    ExecProcessEvent::Closed { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("real process closes");
+
+        let original = process
+            .read(None, None, None)
+            .await
+            .expect("retained output");
+        assert!(original.closed);
+        assert_eq!(original.exit_code, Some(0));
+        assert_eq!(original.failure, None);
+        assert_eq!(
+            original
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.chunk.0.iter().copied())
+                .collect::<Vec<_>>(),
+            b"retained\r\n"
+        );
+        for after_seq in [original.next_seq, u64::MAX] {
+            let error = process
+                .read(Some(after_seq), None, Some(0))
+                .await
+                .expect_err("a future cursor is not a successful empty read");
+            assert!(
+                matches!(error, ExecServerError::Server { code: -32602, message }
+                if message.contains("afterSeq") && message.contains("last available sequence"))
+            );
+        }
+        assert_eq!(
+            process
+                .read(None, None, Some(0))
+                .await
+                .expect("replay after errors"),
+            original
+        );
+        let drained = process
+            .read(Some(original.next_seq - 1), Some(1), Some(30_000))
+            .await
+            .expect("last observed sequence remains a valid cursor");
+        assert!(drained.closed && drained.chunks.is_empty());
+        assert_eq!(drained.exit_code, Some(0));
+        assert_eq!(drained.failure, None);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_read_cursor_does_not_wait_for_running_process() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "invalid-cursor").await;
+        let error = timeout(
+            Duration::from_secs(1),
+            backend.exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: Some(1),
+                max_bytes: None,
+                wait_ms: Some(30_000),
+            }),
+        )
+        .await
+        .expect("invalid cursor must not enter the long poll")
+        .expect_err("no events have been emitted yet");
+        assert_eq!(
+            error,
+            invalid_params(
+                "afterSeq 1 exceeds the last available sequence 0 for process invalid-cursor"
+                    .to_string()
+            )
+        );
+        process
+            .stdout_tx
+            .send(b"still running".to_vec())
+            .await
+            .expect("send output");
+        let response = read_process_until_change(&backend, &process.process_id, Some(0)).await;
+        assert_eq!(response.chunks[0].chunk.0, b"still running");
+        assert!(!response.exited && !response.closed);
+        assert_eq!(response.failure, None);
         backend.shutdown().await;
     }
 

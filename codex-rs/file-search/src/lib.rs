@@ -103,7 +103,8 @@ pub struct FileSearchResults {
     pub matches: Vec<FileMatch>,
     pub total_match_count: usize,
     pub scanned_file_count: usize,
-    /// False if walk limits, cancellation, or traversal errors left paths unsearched.
+    /// False if walk limits, cancellation, traversal errors, or ignore-file errors
+    /// prevented a reliable complete search.
     pub walk_complete: bool,
 }
 
@@ -113,7 +114,7 @@ pub struct FileSearchSnapshot {
     pub matches: Vec<FileMatch>,
     pub total_match_count: usize,
     pub scanned_file_count: usize,
-    /// True only after the walker finishes without omitting paths due to limits or errors.
+    /// True only after the walker finishes without limits, traversal errors, or ignore-file errors.
     pub walk_complete: bool,
 }
 
@@ -123,13 +124,13 @@ pub struct FileSearchOptions {
     pub exclude: Vec<String>,
     pub threads: NonZero<usize>,
     pub compute_indices: bool,
-    /// Toggle ignore-file processing in the walker.
+    /// Toggle git ignore-file processing in the walker.
     ///
     /// When enabled, `.gitignore` files are scoped by
     /// `WalkBuilder::require_git(true)`, so they are honored only when the
     /// traversed path is inside a git repository. When disabled, the walker
-    /// turns off `.gitignore`, git-global/exclude rules, `.ignore`, and
-    /// parent-directory ignore scanning.
+    /// turns off `.gitignore` and git-global/exclude rules. Local and ancestor
+    /// `.ignore` and `.rgignore` rules remain active in either mode.
     pub respect_gitignore: bool,
 }
 
@@ -164,6 +165,8 @@ pub struct FileSearchSession {
 
 impl FileSearchSession {
     /// Update the query. This should be cheap relative to re-walking.
+    /// Queries reuse the session's walk snapshot; create a new session to discover
+    /// subsequent filesystem changes.
     pub fn update_query(&self, pattern_text: &str) {
         self.inner
             .latest_query
@@ -569,6 +572,11 @@ fn walker_worker(
                 continue;
             }
         };
+        // Ignore-file errors accompany otherwise usable entries rather than
+        // appearing as iterator errors. Keep the results, but not a completeness claim.
+        if entry.error().is_some() {
+            walk_complete.store(false, Ordering::Relaxed);
+        }
         // The ignore walker does not call filter_entry for roots. Admit each
         // root as it is visited so excess roots retain earlier partial results.
         if entry.depth() == 0

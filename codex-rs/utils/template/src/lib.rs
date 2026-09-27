@@ -28,16 +28,16 @@ impl fmt::Display for TemplateParseError {
             Self::NestedPlaceholder { start } => {
                 write!(
                     f,
-                    "template placeholder starting at byte {start} contains a nested `{{`"
+                    "template placeholder starting at byte {start} contains a nested `{{{{`"
                 )
             }
             Self::UnmatchedClosingDelimiter { start } => {
-                write!(f, "template contains an unmatched `}}` at byte {start}")
+                write!(f, "template contains an unmatched `}}}}` at byte {start}")
             }
             Self::UnterminatedPlaceholder { start } => {
                 write!(
                     f,
-                    "template placeholder starting at byte {start} is missing `}}`"
+                    "template placeholder starting at byte {start} is missing `}}}}`"
                 )
             }
         }
@@ -316,6 +316,23 @@ mod tests {
     use super::TemplateRenderError;
     use super::render;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parse_diagnostics_show_exact_delimiters_and_unicode_byte_offsets() {
+        for (source, expected) in [
+            (
+                "雪 {{ outer {{ inner }} }}",
+                "template placeholder starting at byte 4 contains a nested `{{`",
+            ),
+            ("雪 }}", "template contains an unmatched `}}` at byte 4"),
+            (
+                "雪 {{ name",
+                "template placeholder starting at byte 4 is missing `}}`",
+            ),
+        ] {
+            assert_eq!(Template::parse(source).unwrap_err().to_string(), expected);
+        }
+    }
 
     #[test]
     fn render_replaces_placeholders_with_and_without_whitespace() {

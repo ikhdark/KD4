@@ -190,6 +190,16 @@ pub(super) async fn finish_callbacks(
     // own cause keeps it.
     if matches!(completion, CallbackCompletion::Cancel) {
         tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
+        // Both groups now have independent cleanup work. Give notifications
+        // their delivery grace without adding it to cancelled tools' grace.
+        tokio::join!(
+            async {
+                drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
+                notification_cancellation_token.cancel();
+            },
+            drain_tasks_bounded(tool_tasks, "tool", task_failure_handler),
+        );
+        return;
     }
     drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
     notification_cancellation_token.cancel();

@@ -62,6 +62,8 @@ const ANALYTICS_EVENTS_TIMEOUT: Duration = Duration::from_secs(10);
 const ANALYTICS_EVENT_DEDUPE_MAX_KEYS: usize = 4096;
 const ANALYTICS_EVENTS_BATCH_SIZE: usize = 32;
 
+type UsageEventKey = (String, String, String);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AnalyticsFailureLogMetadata {
     status: u16,
@@ -81,8 +83,8 @@ fn analytics_failure_log_metadata(
 #[derive(Clone)]
 pub(crate) struct AnalyticsEventsQueue {
     pub(crate) sender: mpsc::Sender<AnalyticsFact>,
-    pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
-    pub(crate) plugin_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
+    pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<UsageEventKey>>>,
+    pub(crate) plugin_used_emitted_keys: Arc<Mutex<HashSet<UsageEventKey>>>,
 }
 
 #[derive(Clone)]
@@ -202,7 +204,11 @@ impl AnalyticsEventsQueue {
             .app_used_emitted_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = (tracking.turn_id.clone(), connector_id.clone());
+        let key = (
+            tracking.thread_id.clone(),
+            tracking.turn_id.clone(),
+            connector_id.clone(),
+        );
         if emitted.contains(&key) {
             return false;
         }
@@ -229,7 +235,7 @@ impl AnalyticsEventsQueue {
         else {
             return true;
         };
-        let key = (tracking.turn_id.clone(), plugin_id);
+        let key = (tracking.thread_id.clone(), tracking.turn_id.clone(), plugin_id);
         if emitted.contains(&key) {
             return false;
         }

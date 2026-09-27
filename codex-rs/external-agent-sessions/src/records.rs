@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 const NOTE_MAX_LEN: usize = 2_000;
 const TOOL_NAME_MAX_LEN: usize = 120;
+const TOOL_ID_MAX_LEN: usize = 200;
 const TOOL_RESULT_MAX_LEN: usize = 4_000;
 const EXTERNAL_AGENT_TOOL_CALL_TAG: &str = "external_agent_tool_call";
 const EXTERNAL_AGENT_TOOL_RESULT_TAG: &str = "external_agent_tool_result";
@@ -279,9 +280,13 @@ fn tool_call_note(block: &JsonValue) -> String {
         .and_then(JsonValue::as_str)
         .unwrap_or("unknown");
     let mut lines = Vec::new();
+    if let Some(id) = tool_id_note(block, "id") {
+        lines.push(id);
+    }
     if let Some(input) = block.get("input")
         && input.is_object()
     {
+        let input_start = lines.len();
         if let Some(description) = input.get("description").and_then(JsonValue::as_str) {
             lines.push(format!(
                 "description: {}",
@@ -298,7 +303,7 @@ fn tool_call_note(block: &JsonValue) -> String {
         {
             lines.push(format!("file: {}", truncate(file, NOTE_MAX_LEN)));
         }
-        if lines.is_empty() {
+        if lines.len() == input_start {
             lines.push(format!(
                 "input: {}",
                 truncate(&input.to_string(), NOTE_MAX_LEN)
@@ -336,11 +341,23 @@ fn tool_result_note(block: &JsonValue) -> String {
         format!("[{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     };
     let text = tool_result_text(block.get("content"));
+    let text = match tool_id_note(block, "tool_use_id") {
+        Some(id) if text.is_empty() => id,
+        Some(id) => format!("{id}\n{text}"),
+        None => text,
+    };
     if text.is_empty() {
         format!("{label}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     } else {
         format!("{label}\n{text}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     }
+}
+
+fn tool_id_note(block: &JsonValue, field: &str) -> Option<String> {
+    let id = block.get(field)?.as_str()?;
+    // Quote source IDs so embedded newlines cannot masquerade as note fields.
+    let id = JsonValue::String(truncate(id, TOOL_ID_MAX_LEN));
+    Some(format!("call_id: {id}"))
 }
 
 fn tool_result_text(content: Option<&JsonValue>) -> String {
@@ -438,6 +455,7 @@ mod tests {
     fn bounds_oversized_recognized_tool_call_fields_and_preserves_closing_tag() {
         let block = serde_json::json!({
             "type": "tool_use",
+            "id": "\n".repeat(TOOL_ID_MAX_LEN * 2),
             "name": "B".repeat(TOOL_NAME_MAX_LEN * 2),
             "input": {
                 "command": "x".repeat(NOTE_MAX_LEN * 2),
@@ -447,6 +465,10 @@ mod tests {
         let note = tool_call_note(&block);
 
         assert!(note.chars().count() <= NOTE_MAX_LEN);
+        assert!(note.contains(&format!(
+            "call_id: \"{}...\"",
+            "\\n".repeat(TOOL_ID_MAX_LEN - 3)
+        )));
         assert!(note.contains("\ncommand: "));
         assert!(note.ends_with("[/external_agent_tool_call]"));
     }

@@ -30,10 +30,8 @@ pub use codex_protocol::protocol::GitInfo;
 /// approach does **not** require the `git` binary or the `git2` crate and is
 /// therefore fairly lightweight.
 ///
-/// Note that this does **not** detect *work‑trees* created with
-/// `git worktree add` where the checkout lives outside the main repository
-/// directory. If you need Codex to work from such a checkout simply pass the
-/// `--allow-no-git-exec` CLI flag that disables the repo requirement.
+/// Linked worktrees are detected through their `.git` file and return the
+/// checkout root, not the main repository's root.
 pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
     let base = if base_dir.is_dir() {
         base_dir
@@ -424,7 +422,7 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     let root = get_git_repo_root(cwd)?;
 
     let remotes = get_git_remotes(&root).await?;
-    let branches = branch_ancestry(&root).await?;
+    let branches = branch_ancestry(&root, &remotes).await?;
     let base_sha = find_closest_sha(&root, &branches, &remotes).await?;
     let diff = diff_against_sha(&root, &base_sha).await?;
 
@@ -720,9 +718,8 @@ async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {
 /// Preference order:
 /// 1) The symbolic ref at `refs/remotes/<remote>/HEAD` for the first remote (origin prioritized)
 /// 2) Local fallback to existing `main` or `master` if present
-async fn get_default_branch(cwd: &Path) -> Option<String> {
+async fn get_default_branch(cwd: &Path, remotes: &[String]) -> Option<String> {
     // Prefer the first remote (with origin prioritized)
-    let remotes = get_git_remotes(cwd).await.unwrap_or_default();
     for remote in remotes {
         // Try symbolic-ref, which returns something like: refs/remotes/origin/main
         if let Some(symref_output) = run_git_command_with_timeout(
@@ -758,7 +755,8 @@ async fn get_default_branch(cwd: &Path) -> Option<String> {
 /// `master`. Returns `None` when the information cannot be determined, for
 /// example when the current directory is not inside a Git repository.
 pub async fn default_branch_name(cwd: &Path) -> Option<String> {
-    get_default_branch(cwd).await
+    let remotes = get_git_remotes(cwd).await.unwrap_or_default();
+    get_default_branch(cwd, &remotes).await
 }
 
 /// Attempt to determine the repository's default branch name from local branches.
@@ -785,7 +783,7 @@ async fn get_default_branch_local(cwd: &Path) -> Option<String> {
 
 /// Build an ancestry of branches starting at the current branch and ending at the
 /// repository's default branch (if determinable)..
-async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
+async fn branch_ancestry(cwd: &Path, remotes: &[String]) -> Option<Vec<String>> {
     // Discover current branch (ignore detached HEAD by treating it as None)
     let current_branch = run_git_command_with_timeout(&["rev-parse", "--abbrev-ref", "HEAD"], cwd)
         .await
@@ -800,7 +798,7 @@ async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
         .filter(|s| s != "HEAD");
 
     // Discover default branch
-    let default_branch = get_default_branch(cwd).await;
+    let default_branch = get_default_branch(cwd, remotes).await;
 
     let mut ancestry: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -819,7 +817,6 @@ async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
     // This addresses cases where we're on a new local-only branch forked from a
     // remote branch that isn't the repository default. We prioritize remotes in
     // the order returned by get_git_remotes (origin first).
-    let remotes = get_git_remotes(cwd).await.unwrap_or_default();
     for remote in remotes {
         if let Some(output) = run_git_command_with_timeout(
             &[
@@ -1689,6 +1686,52 @@ mod tests {
         assert_eq!(state.sha, GitSha::new(&base_sha));
         assert!(state.diff.contains("local-only.txt"));
         assert!(!state.diff.contains("remote-only.txt"));
+    }
+
+    #[tokio::test]
+    async fn diff_to_remote_preserves_linked_worktree_state_and_refreshes_remotes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _remote, branch, base_sha) = init_repo_with_remote(&temp);
+        let linked = temp.path().join("linked");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(repo.join("primary-only.txt"), "primary work\n").unwrap();
+        std::fs::write(linked.join("tracked.txt"), "staged work\n").unwrap();
+        run_git(&linked, &["add", "tracked.txt"]);
+        std::fs::write(linked.join("tracked.txt"), "staged work\nunstaged work\n").unwrap();
+        std::fs::write(linked.join("new.txt"), "untracked work\n").unwrap();
+        let index_before = run_git(&linked, &["diff", "--cached", "--binary"]);
+        let status_before = run_git(&linked, &["status", "--porcelain"]);
+
+        let state = git_diff_to_remote(&linked).await.expect("linked diff");
+        assert_eq!(state.sha, GitSha::new(&base_sha));
+        for expected in ["+staged work", "+unstaged work", "+untracked work"] {
+            assert!(
+                state.diff.contains(expected),
+                "missing {expected}: {}",
+                state.diff
+            );
+        }
+        assert!(!state.diff.contains("primary-only.txt"));
+        assert_eq!(
+            run_git(&linked, &["diff", "--cached", "--binary"]),
+            index_before
+        );
+        assert_eq!(run_git(&linked, &["status", "--porcelain"]), status_before);
+        assert_eq!(default_branch_name(&linked).await, Some(branch));
+
+        // Reuse is limited to one request, not a cache of mutable remote config.
+        run_git(&repo, &["remote", "remove", "origin"]);
+        assert!(git_diff_to_remote(&linked).await.is_none());
+        assert_eq!(run_git(&linked, &["status", "--porcelain"]), status_before);
     }
 
     #[test]

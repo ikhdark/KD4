@@ -76,6 +76,8 @@ async fn loads_resolved_plugin_through_function_entry_point() {
     let servers = load_executor_plugin_mcp_servers(&plugin)
         .await
         .expect("load executor MCP config");
+    assert!(servers.errors.is_empty());
+    let servers = servers.servers.into_iter().collect::<Vec<_>>();
 
     assert_eq!(
         servers
@@ -213,6 +215,8 @@ async fn reads_declared_config_only_through_executor_file_system() {
     let servers = load_from_file_system(&plugin, &plugin_root_uri, &file_system)
         .await
         .expect("load executor MCP config");
+    assert!(servers.errors.is_empty());
+    let servers = servers.servers.into_iter().collect::<Vec<_>>();
 
     assert_eq!(
         servers,
@@ -297,6 +301,8 @@ async fn reads_manifest_object_config_without_executor_file_system_access() {
     let servers = load_from_file_system(&plugin, &plugin_root_uri, &file_system)
         .await
         .expect("load manifest object executor MCP config");
+    assert!(servers.errors.is_empty());
+    let servers = servers.servers.into_iter().collect::<Vec<_>>();
 
     assert_eq!(
         servers,
@@ -349,7 +355,8 @@ async fn missing_default_config_is_empty() {
         .await
         .expect("missing default config should be ignored");
 
-    assert_eq!(servers, Vec::new());
+    assert!(servers.servers.is_empty());
+    assert!(servers.errors.is_empty());
     assert_eq!(reads(&file_system), vec![config_path]);
 }
 

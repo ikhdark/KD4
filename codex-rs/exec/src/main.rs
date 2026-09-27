@@ -10,6 +10,7 @@ use codex_arg0::arg0_dispatch_or_else;
 use codex_exec::Cli;
 use codex_exec::run_main;
 use codex_utils_cli::CliConfigOverrides;
+use codex_utils_cli::SharedCliOptions;
 
 #[derive(Parser, Debug)]
 struct TopCli {
@@ -24,11 +25,14 @@ impl TopCli {
     fn parse_exec_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> Cli {
         // Keep `-c` values from every level; plain clap parsing would keep only
         // the deepest subcommand's values.
-        let command = CliConfigOverrides::scope_to_each_command_level(Self::command());
+        let command = SharedCliOptions::scope_sandbox_selection(
+            CliConfigOverrides::scope_to_each_command_level(Self::command()),
+        );
         let matches = command.get_matches_from(args);
         let top = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
         let mut inner = top.inner;
         inner.config_overrides = CliConfigOverrides::from_command_levels(&matches);
+        inner.shared.apply_sandbox_selection(&matches);
         inner
     }
 }

@@ -2108,3 +2108,128 @@ async fn partial_discovery_cursor_recovers_a_previously_unavailable_skill() -> T
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     Ok(())
 }
+
+#[tokio::test]
+async fn empty_incomplete_catalog_advertises_recovery_without_automatic_rediscovery() -> TestResult
+{
+    struct IncompleteProvider(Arc<AtomicUsize>);
+    impl SkillProvider for IncompleteProvider {
+        fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(if query.continuation.is_none() {
+                    SkillCatalog {
+                        continuation: Some(Default::default()),
+                        ..Default::default()
+                    }
+                } else {
+                    SkillCatalog {
+                        entries: vec![test_entry(
+                            SkillSourceKind::Orchestrator,
+                            "codex_apps",
+                            "orchestrator/recovered",
+                            "skill://orchestrator/recovered/SKILL.md",
+                        )],
+                        ..Default::default()
+                    }
+                })
+            })
+        }
+
+        fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+            Box::pin(async move {
+                Ok(SkillReadResult {
+                    resource: request.resource,
+                    contents: "Recovered task guidance.".to_string(),
+                })
+            })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (registry, session, thread) = start_test_extension(
+        SkillProviders::new()
+            .with_orchestrator_provider(Arc::new(IncompleteProvider(calls.clone()))),
+        default_config(),
+    )
+    .await;
+    let mut recovery_args = None;
+    for _ in 0..2 {
+        let fragments = registry.context_contributors()[0]
+            .contribute_thread_context(&session, &thread)
+            .await;
+        assert_eq!(fragments.len(), 1);
+        let text = fragments[0].text();
+        assert!(text.contains("discovery is incomplete"));
+        assert!(text.contains("only if needed for this task"));
+        let args = text
+            .split("skills.list(")
+            .nth(1)
+            .ok_or("recovery route")?
+            .split(");")
+            .next()
+            .ok_or("recovery arguments")?;
+        recovery_args = Some(serde_json::from_str::<serde_json::Value>(args)?);
+    }
+    let fragments = registry.turn_input_contributors()[0]
+        .contribute(
+            &TurnInputContext {
+                turn_id: "initial-turn".to_string(),
+                user_input: Vec::new(),
+                environments: Vec::new(),
+                ready_selected_capability_roots: Vec::new(),
+            },
+            &session,
+            &thread,
+            &ExtensionData::new("initial-turn"),
+        )
+        .await;
+    assert!(
+        fragments.is_empty(),
+        "thread recovery must not be duplicated per turn"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let tools = registry.tool_contributors()[0].tools(&session, &thread);
+    let list = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("list")?;
+    let call = skills_tool_call(list.tool_name(), recovery_args.ok_or("arguments")?, 8_000);
+    let payload = call.payload.clone();
+    let listed = list
+        .handle(call)
+        .await?
+        .post_tool_use_response("call", &payload)
+        .ok_or("list response")?;
+    assert_eq!(listed["skills"][0]["package"], "orchestrator/recovered");
+    assert!(listed["next_cursor"].is_null());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session, &thread)
+        .await;
+    assert_eq!(fragments.len(), 1);
+    assert!(!fragments[0].text().contains("discovery is incomplete"));
+    let turn = ExtensionData::new("later-turn");
+    let selected = registry.turn_input_contributors()[0]
+        .contribute(
+            &TurnInputContext {
+                turn_id: "later-turn".to_string(),
+                user_input: vec![UserInput::Text {
+                    text: "$recovered".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                environments: Vec::new(),
+                ready_selected_capability_roots: Vec::new(),
+            },
+            &session,
+            &thread,
+            &turn,
+        )
+        .await;
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].render().contains("Recovered task guidance."));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}

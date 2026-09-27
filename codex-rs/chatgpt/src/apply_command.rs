@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use codex_backend_client::CodeTaskDetailsResponseExt;
 use codex_core::config::Config;
+use codex_core::config::ConfigOverrides;
 use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
 use codex_utils_cli::CliConfigOverrides;
@@ -21,16 +23,20 @@ pub async fn run_apply_command(
     apply_cli: ApplyCommand,
     cwd: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let config = Config::load_with_cli_overrides(
+    let config = Config::load_with_cli_overrides_and_harness_overrides(
         apply_cli
             .config_overrides
             .parse_overrides()
             .map_err(anyhow::Error::msg)?,
+        ConfigOverrides {
+            cwd,
+            ..Default::default()
+        },
     )
     .await?;
 
     let task_response = get_task(&config, apply_cli.task_id).await?;
-    apply_diff_from_task(task_response, cwd).await
+    apply_diff_from_task(task_response, Some(config.cwd.to_path_buf())).await
 }
 
 pub async fn apply_diff_from_task(

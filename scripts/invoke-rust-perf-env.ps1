@@ -128,23 +128,21 @@ $exitCode = 1
 
 try {
     $PSNativeCommandUseErrorActionPreference = $false
+    # Performance runs must not fall back to the repository's incremental
+    # default when sccache is missing, explicitly disabled, or replaced.
+    $env:CARGO_INCREMENTAL = "0"
     if ($NoSccache) {
         Remove-Item Env:SCCACHE_BASEDIR -ErrorAction SilentlyContinue
         Remove-Item Env:SCCACHE_CACHE_SIZE -ErrorAction SilentlyContinue
         $env:RUSTC_WRAPPER = ""
         $env:RUSTC_WORKSPACE_WRAPPER = ""
-        # This lane isolates sccache's effect, so it must not silently fall back
-        # to the repository's incremental cache instead of running uncached.
-        $env:CARGO_INCREMENTAL = "0"
     }
     elseif (-not (Test-Path Env:RUSTC_WRAPPER) -and (Get-Command sccache -ErrorAction SilentlyContinue)) {
         Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
-        $env:CARGO_INCREMENTAL = "0"
         $env:RUSTC_WRAPPER = "sccache"
     }
     elseif (Test-SccacheWrapper -Value $env:RUSTC_WRAPPER) {
         Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
-        $env:CARGO_INCREMENTAL = "0"
     }
     Set-CodexRustMsvcLinkerEnvironment
 

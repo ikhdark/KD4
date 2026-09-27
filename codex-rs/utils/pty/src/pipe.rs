@@ -27,7 +27,6 @@ use crate::configure_windows_command_args;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
-use crate::process::SharedPtyHandles;
 use crate::process::SpawnedProcess;
 use crate::process::exit_code_from_status;
 use crate::process::publish_exit_status;
@@ -85,10 +84,19 @@ impl ChildTerminator for PipeChildTerminator {
         #[cfg(windows)]
         {
             match &self.windows {
-                WindowsChildTerminator::Job { process } => self
-                    .managed
-                    .terminate()
-                    .or_else(|_| terminate_process(process)),
+                WindowsChildTerminator::Job { process } => {
+                    self.managed.terminate().map_err(|job_error| {
+                        // Killing only the root cannot establish that its descendants stopped.
+                        // Keep the tree error visible and the terminator available for retry.
+                        let fallback = match terminate_process(process) {
+                            Ok(()) => "succeeded".to_owned(),
+                            Err(error) => format!("also failed: {error}"),
+                        };
+                        io::Error::other(format!(
+                            "failed to terminate pipe job ({job_error}); root process fallback {fallback}"
+                        ))
+                    })
+                }
             }
         }
         #[cfg(not(any(unix, windows)))]
@@ -382,7 +390,7 @@ async fn finish_pipe_process_setup(
         wait_handle,
         exit_status,
         exit_code,
-        SharedPtyHandles::default(),
+        None,
         /*resizer*/ None,
     );
 

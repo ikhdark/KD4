@@ -8,6 +8,43 @@ fn test_user_config_path(temp_dir: &TempDir, file_name: &str) -> AbsolutePathBuf
 }
 
 #[test]
+fn layer_versions_track_effective_domain_alias_precedence() {
+    let layer = |domains: &str| {
+        ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str(&format!(
+                "model_reasoning_effort = 'high'\n[permissions.dev.network.domains]\n{domains}"
+            ))
+            .expect("config"),
+        )
+    };
+    let denied = layer("'EXAMPLE.COM' = 'allow'\n'example.com' = 'deny'");
+    let allowed = layer("'example.com' = 'deny'\n'EXAMPLE.COM' = 'allow'");
+    assert_ne!(denied.version, allowed.version);
+    assert_eq!(denied.version, layer("'example.com' = 'deny'").version);
+    assert_eq!(allowed.version, layer("'example.com' = 'allow'").version);
+
+    for (layer, expected) in [(denied, "deny"), (allowed, "allow")] {
+        let stack = ConfigLayerStack::new(
+            vec![layer],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect("config stack");
+        let effective = stack.effective_config();
+        assert_eq!(
+            effective["permissions"]["dev"]["network"]["domains"]["example.com"].as_str(),
+            Some(expected)
+        );
+        assert_eq!(effective["model_reasoning_effort"].as_str(), Some("high"));
+    }
+    assert_eq!(
+        layer("'example.com' = 'deny'\n'other.example' = 'allow'").version,
+        layer("'other.example' = 'allow'\n'example.com' = 'deny'").version
+    );
+}
+
+#[test]
 fn active_user_layer_is_highest_precedence_user_layer() {
     let temp_dir = TempDir::new().expect("tempdir");
     let base_file = test_user_config_path(&temp_dir, "config.toml");

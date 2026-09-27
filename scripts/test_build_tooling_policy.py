@@ -1388,7 +1388,7 @@ function Get-Command($Name) {
             "codex-cli/scripts/build_npm_package.py": "python",
             "codex-rs/app-server-test-client/scripts/live_elicitation_hold.ps1": "powershell",
             "codex-rs/config/scripts/generate-proto.ps1": "powershell",
-            "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js": "javascript",
+            "DO-NOT-CHANGE/responses-api-proxy/npm/bin/codex-responses-api-proxy.js": "javascript",
             "codex-rs/scripts/nextest_windows_stack.py": "python",
             "codex-rs/skills/src/assets/samples/imagegen/scripts/image_gen.py": "python",
             "sdk/python/scripts/update_sdk_artifacts.py": "python",
@@ -1413,6 +1413,7 @@ function Get-Command($Name) {
                 if not name.startswith("CODEX_")
             }
             env["NEXTEST_ENV"] = str(nextest_env)
+            env.pop("RUST_MIN_STACK", None)
             env["CODEX_HOME"] = str(Path(temp) / "desktop-home")
             env["CODEX_PERMISSION_PROFILE"] = ":danger-full-access"
             env["CODEX_SQLITE_HOME"] = str(Path(temp) / "desktop-sqlite")
@@ -1434,6 +1435,89 @@ function Get-Command($Name) {
                 "CODEX_SQLITE_HOME=\n"
                 "RUST_MIN_STACK=8388608\n",
             )
+
+    def test_windows_nextest_stack_reaches_consumer_and_preserves_fixture_overrides(
+        self,
+    ) -> None:
+        for inherited, expected in (
+            (None, "8388608"),
+            ("1024", "8388608"),
+            ("16777216", "16777216"),
+            ("+00016777216", "16777216"),
+        ):
+            with self.subTest(stack=inherited), tempfile.TemporaryDirectory() as temp:
+                env = {
+                    name: value
+                    for name, value in os.environ.items()
+                    if not name.startswith("CODEX_")
+                }
+                env.pop("RUST_MIN_STACK", None)
+                if inherited is not None:
+                    env["RUST_MIN_STACK"] = inherited
+                env["CODEX_HOME"] = "inherited-desktop-home"
+                env["NEXTEST_ENV"] = str(Path(temp) / "worker env.txt")
+                result = subprocess.run(
+                    [sys.executable, "codex-rs/scripts/nextest_windows_stack.py"],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                worker = env.copy()
+                for line in (
+                    Path(env["NEXTEST_ENV"]).read_text(encoding="utf-8").splitlines()
+                ):
+                    name, value = line.split("=", 1)
+                    worker[name] = value
+                # Fixtures set their child overrides after nextest's isolation boundary.
+                consumer = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json, os; print(json.dumps([os.environ.get('RUST_MIN_STACK'), os.environ.get('CODEX_HOME')])); os.environ['CODEX_HOME'] = 'fixture-home'; print(os.environ['CODEX_HOME'])",
+                    ],
+                    env=worker,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(consumer.returncode, 0, consumer.stderr)
+                lines = consumer.stdout.splitlines()
+                self.assertEqual(json.loads(lines[0]), [expected, ""])
+                self.assertEqual(lines[1], "fixture-home")
+
+    def test_windows_nextest_setup_rejects_invalid_inputs_without_publication(
+        self,
+    ) -> None:
+        for stack in (
+            None,
+            "",
+            "-1",
+            "invalid",
+            "18446744073709551616",
+            "1\nCODEX_HOME=bad",
+        ):
+            with self.subTest(stack=stack), tempfile.TemporaryDirectory() as temp:
+                env = os.environ.copy()
+                path = Path(temp) / "nextest.env"
+                path.write_bytes(b"EXISTING=kept\n")
+                if stack is None:
+                    env.pop("NEXTEST_ENV", None)
+                    expected = "NEXTEST_ENV is required"
+                else:
+                    env["NEXTEST_ENV"] = str(path)
+                    env["RUST_MIN_STACK"] = stack
+                    expected = "RUST_MIN_STACK must be"
+                result = subprocess.run(
+                    [sys.executable, "codex-rs/scripts/nextest_windows_stack.py"],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertEqual(path.read_bytes(), b"EXISTING=kept\n")
 
     def test_root_maintenance_does_not_route_retired_task_continuity_paths(
         self,
@@ -1561,18 +1645,8 @@ function Get-Command($Name) {
                 self.assertIn("winapi", dependencies["codex-utils-pty"])
                 self.assertNotIn("close_fds", dependencies["codex-utils-pty"])
 
-        response_proxy_launcher = (
-            REPO_ROOT
-            / "codex-rs"
-            / "responses-api-proxy"
-            / "npm"
-            / "bin"
-            / "codex-responses-api-proxy.js"
-        ).read_text(encoding="utf-8")
-        for retired_platform in ("linux", "android", "darwin", "SIGHUP"):
-            with self.subTest(response_proxy_platform=retired_platform):
-                self.assertNotIn(retired_platform, response_proxy_launcher)
-
+        # The frozen proxy keeps its upstream launcher; its staged npm package
+        # is still Windows-only (covered by test_responses_proxy_staging_is_windows_only).
         codex_launcher = (REPO_ROOT / "codex-cli" / "bin" / "codex.js").read_text(
             encoding="utf-8"
         )

@@ -851,12 +851,12 @@ class RealExecutorTest(RunnerTestCase):
         runner = RustTestRunner(
             Manifest.from_data(data), self.metadata(), target_dir=self.target_dir
         )
-        for count in (1, 2):
+        for count in (0, 1, 2):
             with self.subTest(count=count):
                 command = [
                     sys.executable,
                     "-c",
-                    f"print('PASS [0.1s] codex-core mod::tests::alpha\\n' * {count}); print('x' * 2000000)",
+                    f"import sys; print('PASS [0.1s] codex-core mod::tests::alpha\\n' * {count}); print('x' * 2000000); print('gate evidence diagnostic', file=sys.stderr)",
                 ]
                 with mock.patch.object(
                     runner, "_gate_run_command", return_value=command
@@ -870,6 +870,24 @@ class RealExecutorTest(RunnerTestCase):
                         with self.assertRaises(RunnerError) as failure:
                             runner.run_gates(["demo-gate"], quiet=True)
                         self.assertEqual(failure.exception.outcome, "not_executed")
+                        detail = str(failure.exception)
+                        self.assertIn("gate evidence diagnostic", detail)
+                        self.assertLess(len(detail), 10000)
+                        for stream in ("stdout", "stderr"):
+                            prefix = f"Full {stream}: "
+                            paths = [
+                                Path(line.removeprefix(prefix))
+                                for line in detail.splitlines()
+                                if line.startswith(prefix)
+                            ]
+                            self.assertEqual(len(paths), 1)
+                            retained = paths[0].read_text()
+                            self.assertIn(
+                                "x" * 2000000
+                                if stream == "stdout"
+                                else "gate evidence diagnostic",
+                                retained,
+                            )
 
     def test_interrupt_is_cancelled_and_reaps_the_child(self):
         real_wait = subprocess.Popen.wait

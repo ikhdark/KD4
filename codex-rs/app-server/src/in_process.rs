@@ -234,7 +234,8 @@ pub struct InProcessStartArgs {
     pub enable_codex_api_key_env: bool,
     /// Initialize params used for initial handshake.
     pub initialize: InitializeParams,
-    /// Capacity used for all runtime queues (clamped to at least 1).
+    /// Capacity used for runtime queues and dispatched requests awaiting replies
+    /// (clamped to at least 1). Excess requests receive a retryable overload error.
     pub channel_capacity: usize,
 }
 
@@ -702,8 +703,18 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         Some(InProcessClientMessage::Request { request, response_tx }) => {
                             let request = *request;
                             let request_id = request.id().clone();
+                            let at_capacity = pending_request_responses.len() >= channel_capacity;
                             match pending_request_responses.entry(request_id.clone()) {
                                 Entry::Vacant(entry) => {
+                                    // Cancellation of a waiter does not cancel dispatched work;
+                                    // retain its ID and capacity until the real reply arrives.
+                                    if at_capacity {
+                                        let _ = response_tx.send(Err(overloaded_error(
+                                            OverloadReason::InFlightTaskCapacity,
+                                            "in-process app-server in-flight request capacity reached",
+                                        )));
+                                        continue;
+                                    }
                                     entry.insert(response_tx);
                                 }
                                 Entry::Occupied(_) => {
@@ -940,6 +951,19 @@ mod tests {
         session_source: SessionSource,
         channel_capacity: usize,
     ) -> InProcessClientHandle {
+        start_test_client_with_loader(
+            session_source,
+            channel_capacity,
+            Arc::new(codex_config::NoopThreadConfigLoader),
+        )
+        .await
+    }
+
+    async fn start_test_client_with_loader(
+        session_source: SessionSource,
+        channel_capacity: usize,
+        thread_config_loader: Arc<dyn ThreadConfigLoader>,
+    ) -> InProcessClientHandle {
         let codex_home = TempDir::new().expect("temp dir");
         let config = Arc::new(build_test_config(codex_home.path()).await);
         let state_db = codex_rollout::state_integration::try_init(config.as_ref())
@@ -952,7 +976,7 @@ mod tests {
             loader_overrides: LoaderOverrides::default(),
             strict_config: false,
             cloud_config_bundle: CloudConfigBundleLoader::default(),
-            thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
+            thread_config_loader,
             feedback: CodexFeedback::new(),
             log_db: None,
             state_db: Some(state_db),
@@ -977,6 +1001,95 @@ mod tests {
 
     async fn start_test_client(session_source: SessionSource) -> InProcessClientHandle {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
+    }
+
+    #[tokio::test]
+    async fn in_flight_capacity_rejects_before_dispatch_and_releases_on_error() {
+        #[derive(Default)]
+        struct BlockingLoader {
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ThreadConfigLoader for BlockingLoader {
+            fn load(
+                &self,
+                _context: codex_config::ThreadConfigContext,
+            ) -> codex_config::ThreadConfigLoaderFuture<'_, Vec<codex_config::ThreadConfigSource>>
+            {
+                Box::pin(async {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    Err(codex_config::ThreadConfigLoadError::new(
+                        codex_config::ThreadConfigLoadErrorCode::Internal,
+                        None,
+                        "intentional loader failure",
+                    ))
+                })
+            }
+        }
+        let loader = Arc::new(BlockingLoader::default());
+        let client = start_test_client_with_loader(SessionSource::Cli, 1, loader.clone()).await;
+        let sender = client.sender();
+        let request = |id| ClientRequest::ThreadStart {
+            request_id: RequestId::Integer(id),
+            params: ThreadStartParams::default(),
+        };
+        let mut first = Box::pin(sender.request(request(1)));
+        assert!(futures::poll!(&mut first).is_pending());
+        timeout(Duration::from_secs(5), loader.started.notified())
+            .await
+            .expect("first request reaches real thread config loading");
+        let duplicate = timeout(Duration::from_secs(2), sender.request(request(1)))
+            .await
+            .expect("duplicate rejected promptly")
+            .expect("transport")
+            .expect_err("duplicate ID rejected even at capacity");
+        assert_eq!(
+            duplicate.code,
+            crate::error_code::INVALID_REQUEST_ERROR_CODE
+        );
+        let overload = timeout(Duration::from_secs(2), sender.request(request(2)))
+            .await
+            .expect("excess request rejected promptly")
+            .expect("transport")
+            .expect_err("in-flight request capacity reached");
+        assert_eq!(
+            overload.code,
+            codex_app_server_protocol::OVERLOADED_ERROR_CODE
+        );
+        assert_eq!(
+            overload.data,
+            Some(serde_json::json!({"reason": "inFlightTaskCapacity", "retryable": true}))
+        );
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+        loader.release.notify_one();
+        let error = timeout(Duration::from_secs(5), first)
+            .await
+            .expect("original request finishes")
+            .expect("transport")
+            .expect_err("loader error delivered to original waiter");
+        assert!(error.message.contains("intentional loader failure"));
+        let response = timeout(
+            Duration::from_secs(5),
+            sender.request(ClientRequest::ConfigRequirementsRead {
+                request_id: RequestId::Integer(1),
+                params: None,
+            }),
+        )
+        .await
+        .expect("request after error completes")
+        .expect("transport")
+        .expect("capacity and request ID released");
+        let _: ConfigRequirementsReadResponse =
+            serde_json::from_value(response).expect("real handler response");
+        client.shutdown().await.expect("shutdown");
+        assert_eq!(
+            loader.calls.load(Ordering::SeqCst),
+            1,
+            "rejected request never dispatched"
+        );
     }
 
     #[tokio::test]

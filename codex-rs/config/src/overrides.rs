@@ -15,14 +15,27 @@ pub fn build_cli_overrides_layer(
 }
 
 /// Parse a TOML dotted key, including quoted segments, before changing config.
+///
+/// Unquoted keys that are not valid TOML bare keys (e.g. plugin ids such as
+/// `codex-app-tools@openai-bundled`) fall back to the upstream `.` split so
+/// callers like Desktop can keep passing them unquoted.
 pub fn parse_override_key(path: &str) -> std::io::Result<Vec<String>> {
     toml_edit::Key::parse(path)
         .map(|keys| keys.into_iter().map(|key| key.get().to_owned()).collect())
-        .map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid configuration override key `{path}`: {err}"),
-            )
+        .or_else(|err| {
+            let segments: Vec<&str> = path.split('.').collect();
+            let is_plain = !path.contains(['"', '\''])
+                && segments
+                    .iter()
+                    .all(|segment| !segment.is_empty() && !segment.contains(char::is_whitespace));
+            if is_plain {
+                Ok(segments.into_iter().map(str::to_owned).collect())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid configuration override key `{path}`: {err}"),
+                ))
+            }
         })
 }
 
@@ -92,6 +105,20 @@ mod tests {
             TomlValue::Boolean(false)
         );
         assert!(root["mcp_servers"].get("docs").is_none());
+    }
+
+    #[test]
+    fn unquoted_plugin_id_segments_are_accepted() {
+        let root = build_cli_overrides_layer(&[(
+            "plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled".into(),
+            TomlValue::Boolean(false),
+        )])
+        .unwrap();
+        assert_eq!(
+            root["plugins"]["codex-app-tools@openai-bundled"]["mcp_servers"]["codex_app"]
+                ["enabled"],
+            TomlValue::Boolean(false)
+        );
     }
 
     #[test]

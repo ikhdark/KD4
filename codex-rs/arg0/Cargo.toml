@@ -26,4 +26,5 @@ codex-windows-sandbox = { workspace = true }
 
 [dev-dependencies]
 codex-utils-absolute-path = { workspace = true }
+ctor = { workspace = true }
 pretty_assertions = { workspace = true }

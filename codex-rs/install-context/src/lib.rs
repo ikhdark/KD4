@@ -279,7 +279,9 @@ fn standalone_install_method(
         .join("packages")
         .join(STANDALONE_PACKAGES_DIRNAME)
         .join(RELEASES_DIRNAME);
-    if !release_dir.starts_with(releases_root.as_path()) {
+    // Only immediate release children belong to the installer. A nested helper
+    // or an unrelated executable in the releases root is not an update target.
+    if release_dir.parent().as_ref() != Some(&releases_root) {
         return None;
     }
 
@@ -417,6 +419,32 @@ mod tests {
             context.bundled_resource(TEST_RESOURCE_NAME),
             Some(canonical_resources_dir.join(TEST_RESOURCE_NAME))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_executables_outside_immediate_standalone_releases() -> std::io::Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let releases_root = codex_home.path().join("packages/standalone/releases");
+        for relative_dir in ["", "1.2.3/codex-resources", "1.2.3/nested-package/bin"] {
+            let directory = releases_root.join(relative_dir);
+            fs::create_dir_all(&directory)?;
+            if relative_dir.ends_with("bin") {
+                fs::write(
+                    directory.parent().unwrap().join(PACKAGE_METADATA_FILENAME),
+                    "{}",
+                )?;
+            }
+            let exe_path = directory.join("codex.exe");
+            fs::write(&exe_path, "")?;
+            let context = InstallContext::from_exe_with_codex_home(
+                Some(&exe_path),
+                None,
+                Some(codex_home.path()),
+            );
+            assert_eq!(context.method, InstallMethod::Other, "{relative_dir}");
+            assert_eq!(UpdateAction::from_install_context(&context), None);
+        }
         Ok(())
     }
 

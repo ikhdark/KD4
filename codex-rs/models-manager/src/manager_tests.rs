@@ -510,6 +510,58 @@ async fn etag_notices_are_non_blocking_coalesced_latest_wins_and_are_waitable() 
 }
 
 #[tokio::test]
+async fn etag_refresh_reuses_unchanged_picker_snapshot() {
+    let codex_home = tempdir().expect("temp dir");
+    let original = remote_model("etag-picker-snapshot", "Original", 0);
+    let changed = remote_model("etag-picker-snapshot", "Changed", 0);
+    let endpoint = ControlledModelsEndpoint::new(vec![
+        ControlledResponse::Models(vec![original.clone()], Some("etag-one".into())),
+        ControlledResponse::Models(vec![original], Some("etag-two".into())),
+        ControlledResponse::Models(vec![changed], Some("etag-three".into())),
+    ]);
+    let manager = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+    let mut previous = None;
+    for (index, etag, display) in [
+        (1, "etag-one", "Original"),
+        (2, "etag-two", "Original"),
+        (3, "etag-three", "Changed"),
+    ] {
+        let refresh = Arc::clone(&manager).notify_etag(etag.into(), DEFAULT_HTTP_CLIENT_FACTORY);
+        endpoint.wait_for_fetches(index).await;
+        endpoint.release_one();
+        timeout(Duration::from_secs(5), refresh)
+            .await
+            .expect("ETag refresh completes");
+        let snapshot = manager.try_list_models_shared().expect("picker snapshot");
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|model| model.model == "etag-picker-snapshot")
+                .expect("remote model is visible")
+                .display_name,
+            display
+        );
+        if let Some(previous) = &previous {
+            assert_eq!(Arc::ptr_eq(previous, &snapshot), index == 2);
+        }
+        assert_eq!(manager.get_etag().await.as_deref(), Some(etag));
+        let persisted: super::super::cache::ModelsCache = serde_json::from_slice(
+            &tokio::fs::read(codex_home.path().join(MODEL_CACHE_FILE))
+                .await
+                .expect("persisted catalog"),
+        )
+        .expect("valid cache");
+        assert_eq!(persisted.etag.as_deref(), Some(etag));
+        assert_eq!(persisted.models[0].display_name, display);
+        previous = Some(snapshot);
+    }
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn etag_refresh_failure_preserves_catalog_and_can_retry() {
     let codex_home = tempdir().expect("temp dir");
     let endpoint = ControlledModelsEndpoint::new(vec![

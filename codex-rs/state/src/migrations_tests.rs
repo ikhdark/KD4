@@ -65,6 +65,36 @@ ORDER BY version
 }
 
 #[tokio::test]
+async fn recency_repair_skips_writer_lock_for_current_history() {
+    let home = tempfile::tempdir().expect("temporary SQLite home");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(home.path().join("state.sqlite"))
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::ZERO),
+        )
+        .await
+        .expect("open on-disk database");
+    STATE_MIGRATOR.run(&pool).await.expect("current history");
+    let original_ledger = migration_ledger(&pool).await;
+    let writer = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("hold writer slot");
+
+    repair_legacy_recency_migration_version(&pool, &STATE_MIGRATOR)
+        .await
+        .expect("no-op repair must not request the writer slot");
+    assert_eq!(migration_ledger(&pool).await, original_ledger);
+
+    writer.rollback().await.expect("release writer");
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn recency_migration_backfills_and_seeds_old_binary_inserts() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

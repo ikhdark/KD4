@@ -35,6 +35,35 @@ fn incomplete_walk_warns_even_when_no_files_match() {
 }
 
 #[test]
+fn ignore_file_errors_report_incomplete_search_without_discarding_matches() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    std::fs::write(temp.path().join("needle.txt"), "match").expect("write match");
+    for (rules, incomplete) in [("[z-a]\n", true), ("unrelated.txt\n", false)] {
+        std::fs::write(temp.path().join(".ignore"), rules).expect("write ignore rules");
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-file-search"))
+            .arg("--cwd")
+            .arg(temp.path())
+            .args(["--json", "needle"])
+            .output()
+            .expect("execute file-search CLI");
+        assert!(output.status.success(), "{output:?}");
+        let rows: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+            .expect("UTF-8 output")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON output"))
+            .collect();
+        assert_eq!(rows[0]["path"], "needle.txt");
+        if incomplete {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1], serde_json::json!({"walk_incomplete": true}));
+        } else {
+            assert_eq!(rows.len(), 1);
+        }
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
+
+#[test]
 fn match_limit_does_not_report_an_incomplete_walk() {
     let temp = tempfile::tempdir().expect("temp directory");
     for name in ["a-needle.txt", "b-needle.txt"] {

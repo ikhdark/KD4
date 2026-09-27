@@ -48,6 +48,7 @@ struct ToolSuggestMetadataCacheState {
 struct PluginArtifactIdentity {
     plugin_id: String,
     source: MarketplacePluginSource,
+    local_version: Option<String>,
 }
 
 pub(crate) struct ToolSuggestMetadataFragment {
@@ -118,6 +119,7 @@ impl ToolSuggestMetadataCache {
         let artifact = PluginArtifactIdentity {
             plugin_id: plugin.id.clone(),
             source: plugin.source.clone(),
+            local_version: plugin.local_version.clone(),
         };
         loop {
             if let Some(entry) = self.cached_entry(&artifact) {

@@ -251,13 +251,12 @@ impl ProcessHandle {
         wait_handle: JoinHandle<()>,
         exit_status: Arc<AtomicBool>,
         exit_code: Arc<StdMutex<Option<i32>>>,
-        pty_handles: SharedPtyHandles,
+        pty_handles: Option<SharedPtyHandles>,
         resizer: Option<ResizeFn>,
     ) -> Self {
-        let has_pty = pty_handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
+        // The waiter can release the terminal before this handle is constructed. Backend
+        // identity must survive that release so finish still drains the final ConPTY frame.
+        let has_pty = pty_handles.is_some();
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
@@ -267,7 +266,7 @@ impl ProcessHandle {
             wait_handle: StdMutex::new(Some(wait_handle)),
             exit_status,
             exit_code,
-            pty_handles,
+            pty_handles: pty_handles.unwrap_or_default(),
             has_pty,
             resizer: StdMutex::new(resizer),
         }
@@ -555,7 +554,7 @@ mod tests {
             idle_task(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(StdMutex::new(Some(0))),
-            SharedPtyHandles::default(),
+            None,
             None,
         );
 
@@ -594,6 +593,49 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn already_released_pty_keeps_its_final_output_reader() {
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (release_tx, release_rx) = oneshot::channel();
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let reader = tokio::spawn(async move {
+            release_rx.await.unwrap();
+            output_tx.send(b"final frame".to_vec()).await.unwrap();
+        });
+        let killed = Arc::new(AtomicBool::new(false));
+        let handle = ProcessHandle::new(
+            writer_tx,
+            Box::new(TestTerminator {
+                dropped: Arc::new(AtomicBool::new(false)),
+                killed: Arc::clone(&killed),
+            }),
+            reader,
+            Vec::new(),
+            tokio::spawn(async {}),
+            tokio::spawn(async {}),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(StdMutex::new(Some(0))),
+            // Model the waiter winning the race before ProcessHandle construction.
+            Some(SharedPtyHandles::default()),
+            None,
+        );
+        handle.resize(TerminalSize::default()).unwrap();
+        handle.finish();
+        release_tx.send(()).unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = output_rx.recv().await {
+                bytes.extend(chunk);
+            }
+            bytes
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, b"final frame");
+        assert!(!killed.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn failed_termination_keeps_terminator_for_retry() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -610,7 +652,7 @@ mod tests {
             idle_task(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(StdMutex::new(None)),
-            SharedPtyHandles::default(),
+            None,
             None,
         );
 
@@ -1000,7 +1042,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         wait_handle,
         exit_status,
         exit_code,
-        SharedPtyHandles::default(),
+        None,
         resizer,
     );
 

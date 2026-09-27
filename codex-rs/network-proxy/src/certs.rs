@@ -326,35 +326,58 @@ fn read_ca_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let pem = fs::read(path)
         .with_context(|| format!("failed to read startup CA bundle: {}", path.display()))?;
     let pem = String::from_utf8_lossy(&pem);
-    let contains_trusted_certificates = pem.contains("TRUSTED CERTIFICATE");
-    let normalized_pem = pem
-        .replace("BEGIN TRUSTED CERTIFICATE", "BEGIN CERTIFICATE")
-        .replace("END TRUSTED CERTIFICATE", "END CERTIFICATE");
-    let certs = CertificateDer::pem_slice_iter(normalized_pem.as_bytes())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to parse startup CA bundle: {}", path.display()))?;
+    // Keep each block's label: comments or other trusted blocks must not cause
+    // trailing bytes in ordinary certificates to be silently discarded.
+    let mut blocks = Vec::new();
+    let mut contents = String::new();
+    let mut trusted = false;
+    for line in pem.split_inclusive(['\r', '\n']) {
+        if line.starts_with("-----BEGIN ") {
+            if !contents.is_empty() {
+                blocks.push((trusted, std::mem::take(&mut contents)));
+            }
+            trusted = line.trim_end() == "-----BEGIN TRUSTED CERTIFICATE-----";
+        }
+        contents.push_str(line);
+    }
+    if !contents.is_empty() {
+        blocks.push((trusted, contents));
+    }
+
+    let mut certs = Vec::new();
+    for (trusted, contents) in blocks {
+        let normalized_pem = if trusted {
+            contents
+                .replace("BEGIN TRUSTED CERTIFICATE", "BEGIN CERTIFICATE")
+                .replace("END TRUSTED CERTIFICATE", "END CERTIFICATE")
+        } else {
+            contents
+        };
+        for cert in CertificateDer::pem_slice_iter(normalized_pem.as_bytes()) {
+            let cert = cert.with_context(|| {
+                format!("failed to parse startup CA bundle: {}", path.display())
+            })?;
+            let cert = if trusted {
+                let der = first_der_item(cert.as_ref()).ok_or_else(|| {
+                    anyhow!(
+                        "startup CA bundle contained an invalid trusted certificate: {}",
+                        path.display()
+                    )
+                })?;
+                CertificateDer::from(der.to_vec())
+            } else {
+                cert
+            };
+            certs.push(cert);
+        }
+    }
     if certs.is_empty() {
         return Err(anyhow!(
             "startup CA bundle contained no certificates: {}",
             path.display()
         ));
     }
-    certs
-        .into_iter()
-        .map(|cert| {
-            let cert = if contains_trusted_certificates {
-                first_der_item(cert.as_ref()).ok_or_else(|| {
-                    anyhow!(
-                        "startup CA bundle contained an invalid trusted certificate: {}",
-                        path.display()
-                    )
-                })?
-            } else {
-                cert.as_ref()
-            };
-            Ok(CertificateDer::from(cert.to_vec()))
-        })
-        .collect()
+    Ok(certs)
 }
 
 fn load_ca_directory_certificates(path: &Path) -> Vec<CertificateDer<'static>> {
@@ -760,6 +783,54 @@ mod tests {
     use tempfile::tempdir;
 
     struct StaticCaConfigReloader(crate::ConfigState);
+
+    #[test]
+    fn startup_ca_bundle_trims_only_trusted_certificate_blocks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed.pem");
+        let der_with_trailing_data = [0x30, 0x00, 0x05, 0x00];
+        let mut ordinary = String::new();
+        push_certificate_pem(&mut ordinary, &der_with_trailing_data);
+        let trusted = ordinary.replace("CERTIFICATE", "TRUSTED CERTIFICATE");
+
+        for newline in ["\n", "\r\n", "\r"] {
+            for (pem, expected) in [
+                (
+                    format!("# TRUSTED CERTIFICATE comment\n{ordinary}"),
+                    vec![der_with_trailing_data.as_slice()],
+                ),
+                (
+                    format!("{ordinary}{trusted}{ordinary}"),
+                    vec![
+                        der_with_trailing_data.as_slice(),
+                        &[0x30, 0x00],
+                        der_with_trailing_data.as_slice(),
+                    ],
+                ),
+            ] {
+                fs::write(&path, pem.replace('\n', newline)).unwrap();
+                let certs = read_ca_certificates(&path).unwrap();
+                assert_eq!(
+                    certs.iter().map(|cert| cert.as_ref()).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_ca_bundle_rejects_truncated_trusted_certificate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invalid.pem");
+        let mut pem = String::new();
+        push_certificate_pem(&mut pem, &[0x30, 0x02, 0xaa]);
+        fs::write(&path, pem.replace("CERTIFICATE", "TRUSTED CERTIFICATE")).unwrap();
+
+        let error = read_ca_certificates(&path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid trusted certificate"));
+        assert!(message.contains(path.to_str().unwrap()));
+    }
 
     #[test]
     fn ca_publication_preserves_existing_file_and_removes_temporary_artifact() {

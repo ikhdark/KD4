@@ -184,6 +184,82 @@ async fn failed_declaration_load_is_retried_by_the_next_projection() -> TestResu
     Ok(())
 }
 
+#[tokio::test]
+async fn partial_declaration_failure_recovers_before_freezing_successful_metadata() -> TestResult {
+    let codex_home = tempfile::tempdir()?;
+    let plugin_root = tempfile::tempdir()?;
+    std::fs::create_dir_all(plugin_root.path().join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.path().join(".codex-plugin/plugin.json"),
+        r#"{"name":"partial-config","apps":"./apps.json"}"#,
+    )?;
+    std::fs::write(
+        plugin_root.path().join("apps.json"),
+        r#"{"apps":{"calendar":{"id":"connector_calendar"}}}"#,
+    )?;
+    let declarations = plugin_root.path().join(".mcp.json");
+    std::fs::write(
+        &declarations,
+        r#"{"mcpServers":{"good":{"command":"good-command"},"repaired":{"command":42}}}"#,
+    )?;
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+    let thread = SelectedPluginThread::new(plugin_root.path())?;
+
+    let partial = thread.contribute(&config).await;
+    assert_eq!(server_names(&partial), vec!["good"]);
+    assert!(
+        partial.iter().any(|contribution| matches!(
+            contribution,
+            McpServerContribution::SelectedPluginPackage { connector_ids, .. }
+                if connector_ids == &["connector_calendar"]
+        )),
+        "valid connector declarations must survive a partial MCP failure"
+    );
+    std::fs::write(
+        &declarations,
+        r#"{"mcpServers":{"good":{"command":"good-command"},"repaired":{"command":"repaired-command"}}}"#,
+    )?;
+    let recovered = thread.contribute(&config).await;
+    assert_eq!(server_names(&recovered), vec!["good", "repaired"]);
+    assert!(
+        recovered.iter().any(|contribution| matches!(
+            contribution,
+            McpServerContribution::SelectedPluginPackage { connector_ids, .. }
+                if connector_ids == &["connector_calendar"]
+        )),
+        "connector declarations must survive MCP recovery"
+    );
+
+    // Successful declarations are frozen for the selected package, not rescanned per step.
+    std::fs::write(&declarations, "{not-json")?;
+    assert_eq!(
+        server_names(&thread.contribute(&config).await),
+        vec!["good", "repaired"]
+    );
+    let unavailable = thread.registry.mcp_server_contributors()[0]
+        .contribute(McpServerContributionContext::for_step(
+            &config,
+            &thread.thread_init,
+            &thread.thread_store,
+            "test_originator",
+            &[],
+        ))
+        .await;
+    assert!(
+        unavailable.is_empty(),
+        "cached metadata must not confer availability"
+    );
+    assert_eq!(
+        server_names(&thread.contribute(&config).await),
+        vec!["good", "repaired"]
+    );
+    Ok(())
+}
+
 fn server_names(contributions: &[McpServerContribution]) -> Vec<String> {
     contributions
         .iter()

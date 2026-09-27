@@ -52,8 +52,8 @@ pub fn continuation_prompt(goal: &ThreadGoal) -> String {
     }
 }
 
-/// Builds the hidden prompt used to ask the model to wrap up after a goal
-/// exhausts its budget.
+/// Builds the hidden prompt that preserves unfinished work when an enforced
+/// goal budget prevents further execution.
 pub fn budget_limit_prompt(goal: &ThreadGoal) -> String {
     let token_budget = goal
         .token_budget

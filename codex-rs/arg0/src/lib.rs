@@ -46,7 +46,7 @@ pub fn arg0_dispatch_helper() {
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
-    if exe_name == APPLY_PATCH_ARG0 || exe_name == MISSPELLED_APPLY_PATCH_ARG0 {
+    if is_apply_patch_executable(exe_name) {
         codex_apply_patch::main();
     }
 
@@ -59,6 +59,16 @@ pub fn arg0_dispatch_helper() {
     }
     if argv1 == CODEX_CORE_APPLY_PATCH_ARG1 {
         std::process::exit(codex_apply_patch::run_main_with_args(args));
+    }
+}
+
+fn is_apply_patch_executable(name: &str) -> bool {
+    if cfg!(windows) {
+        let name = name.to_ascii_lowercase();
+        let name = name.strip_suffix(".exe").unwrap_or(&name);
+        name == APPLY_PATCH_ARG0 || name == MISSPELLED_APPLY_PATCH_ARG0
+    } else {
+        name == APPLY_PATCH_ARG0 || name == MISSPELLED_APPLY_PATCH_ARG0
     }
 }
 

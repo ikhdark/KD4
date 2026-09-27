@@ -17,6 +17,10 @@ async fn route_aware_pool_strips_credentials_on_cross_origin_redirect() {
         cache_system_proxy_decision(&destination_url, SystemProxyDecision::Direct);
         let mut headers = http::HeaderMap::new();
         headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("original-virtual-host.test"),
+        );
+        headers.insert(
             AUTHORIZATION,
             http::HeaderValue::from_static("Bearer origin-secret"),
         );
@@ -55,6 +59,16 @@ async fn route_aware_pool_strips_credentials_on_cross_origin_redirect() {
         let destination_request = only_request(destination_thread, "destination");
 
         assert_eq!(response.url().as_str(), destination_url);
+        assert!(
+            initial_request
+                .to_ascii_lowercase()
+                .contains("\r\nhost: original-virtual-host.test\r\n")
+        );
+        assert!(
+            destination_request
+                .to_ascii_lowercase()
+                .contains(&format!("\r\nhost: {destination_addr}\r\n"))
+        );
         assert_eq!(
             [
                 credential_headers(&initial_request),
@@ -87,6 +101,7 @@ async fn route_aware_pool_retains_credentials_for_same_origin_and_route() {
     let response = tokio::time::timeout(
         Duration::from_secs(2),
         pool.get(initial_url)
+            .header(http::header::HOST, "original-virtual-host.test")
             .header(AUTHORIZATION, "Bearer origin-secret")
             .header(COOKIE, "session=origin-secret")
             .header(PROXY_AUTHORIZATION, "Basic proxy-secret")
@@ -98,6 +113,12 @@ async fn route_aware_pool_retains_credentials_for_same_origin_and_route() {
     let requests = proxy_thread.join().expect("proxy thread should finish");
 
     assert_eq!(response.url().as_str(), redirected_url);
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request
+            .to_ascii_lowercase()
+            .contains("\r\nhost: original-virtual-host.test\r\n")
+    }));
     assert_eq!(
         requests
             .iter()

@@ -39,8 +39,8 @@ const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
 const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
 const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
 // Tool-search outputs stay in model-visible history. Keep ordinary serialized
-// results near a 768-token projection (using the core's 4 bytes/token estimate).
-const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 3 * 1024;
+// results near a 1,536-token projection (using the core's 4 bytes/token estimate).
+const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 6 * 1024;
 const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
@@ -2692,6 +2692,36 @@ mod tests {
         assert_eq!(compact.output_schema, Some(output_schema.into()));
         assert_eq!(compact.parameters.required, Some(Vec::new()));
         assert_eq!(compact.parameters.additional_properties, Some(false.into()));
+    }
+
+    #[test]
+    fn search_preserves_complete_definition_at_six_kib_limit() {
+        let mut info = search_info("calendar", None, "calendar", "create_event");
+        let original_bytes = serde_json::to_vec(&[info.entry.output.as_ref()])
+            .expect("fixture should serialize")
+            .len();
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
+            panic!("namespace fixture");
+        };
+        let [ResponsesApiNamespaceTool::Function(tool)] = namespace.tools.as_mut_slice() else {
+            panic!("single tool fixture");
+        };
+        tool.description
+            .push_str(&"x".repeat(6 * 1024 - original_bytes));
+        let expected = serde_json::to_value([info.entry.output.as_ref()])
+            .expect("complete definition should serialize");
+
+        let result = ToolSearchHandler::new(vec![info])
+            .search("calendar", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("six-KiB definition should fit without compaction");
+
+        assert_eq!(result.encoded_tools_len, 6 * 1024);
+        assert_eq!(result.omitted_result_count, 0);
+        assert_eq!(serde_json::to_value(&result.tools).unwrap(), expected);
+        assert_eq!(
+            result.activation_tools,
+            vec![ToolName::namespaced("mcp__calendar", "create_event")]
+        );
     }
 
     #[test]

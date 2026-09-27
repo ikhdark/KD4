@@ -1995,10 +1995,17 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
 
 fn terminal_name(info: &TerminalInfo) -> &'static str {
     match info.name {
+        TerminalName::AppleTerminal => "Apple Terminal",
+        TerminalName::Ghostty => "Ghostty",
+        TerminalName::Iterm2 => "iTerm2",
         TerminalName::WarpTerminal => "Warp",
         TerminalName::VsCode => "VS Code",
         TerminalName::WezTerm => "WezTerm",
+        TerminalName::Kitty => "kitty",
         TerminalName::Alacritty => "Alacritty",
+        TerminalName::Konsole => "Konsole",
+        TerminalName::GnomeTerminal => "GNOME Terminal",
+        TerminalName::Vte => "VTE",
         TerminalName::WindowsTerminal => "Windows Terminal",
         TerminalName::Dumb => "dumb",
         TerminalName::Unknown => "unknown",
@@ -4420,6 +4427,7 @@ mod tests {
                 term_program: None,
                 version: None,
                 term: Some("xterm-256color".to_string()),
+                multiplexer: None,
             },
             env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
             present_env: BTreeSet::from(["TERM".to_string()]),

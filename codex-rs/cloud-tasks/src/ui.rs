@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use crate::app::App;
 use crate::app::AttemptView;
-use crate::time::format_relative_time_now;
+use crate::util::format_relative_time_now;
 use codex_cloud_tasks_client::AttemptStatus;
 use codex_cloud_tasks_client::TaskStatus;
 use codex_tui::render_markdown_text;
@@ -202,15 +202,13 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
         let p = ((app.selected as f32) / ((app.tasks.len() - 1) as f32) * 100.0).round() as i32;
         format!("  • {}%", p.clamp(0, 100)).dim()
     };
-    let title_line = Line::from(vec![
-        crate::CODEX_CLOUD_NAME.into(),
-        suffix_span,
-        percent_span,
-    ]);
-    let title_line = if dim_bg {
-        title_line.style(Style::default().add_modifier(Modifier::DIM))
-    } else {
-        title_line
+    let title_line = {
+        let base = Line::from(vec!["Cloud Tasks".into(), suffix_span, percent_span]);
+        if dim_bg {
+            base.style(Style::default().add_modifier(Modifier::DIM))
+        } else {
+            base
+        }
     };
     let block = Block::default().borders(Borders::ALL).title(title_line);
     // Render the outer block first
@@ -302,7 +300,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut status_line = app.status.replace('\n', " ");
     if status_line.len() > 2000 {
         // hard cap to avoid TUI noise
-        status_line.truncate(status_line.floor_char_boundary(2000));
+        status_line.truncate(2000);
         status_line.push('…');
     }
     // Clear the status row to avoid trailing characters when the message shrinks.
@@ -324,8 +322,9 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
     let is_error = app
         .diff_overlay
         .as_ref()
-        .and_then(super::app::DiffOverlay::current_attempt)
-        .is_some_and(|attempt| attempt.status == AttemptStatus::Failed)
+        .and_then(|o| o.sd.wrapped_lines().first().cloned())
+        .map(|s| s.trim_start().starts_with("Task failed:"))
+        .unwrap_or(false)
         && !ov_can_apply;
     let title = app
         .diff_overlay
@@ -432,32 +431,16 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .map(|o| matches!(o.current_view, crate::app::DetailView::Diff))
         .unwrap_or(false);
-    // Style only the rows that fit; wrapped content can be very large and is redrawn per frame.
-    // Selecting rows here also keeps large diffs reachable despite Paragraph's u16 scroll offset.
-    let visible = app
-        .diff_overlay
-        .as_ref()
-        .map(|o| {
-            let start = o.sd.state.scroll;
-            start..start.saturating_add(usize::from(o.sd.state.viewport_h))
-        })
-        .unwrap_or(0..0);
     let styled_lines: Vec<Line<'static>> = if is_diff_view {
-        app.diff_overlay
-            .as_ref()
-            .map(|o| {
-                o.sd.wrapped_lines()
-                    .iter()
-                    .skip(visible.start)
-                    .take(visible.len())
-                    .map(|l| style_diff_line(l))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let raw = app.diff_overlay.as_ref().map(|o| o.sd.wrapped_lines());
+        raw.unwrap_or(&[])
+            .iter()
+            .map(|l| style_diff_line(l))
+            .collect()
     } else {
         app.diff_overlay
             .as_ref()
-            .map(|o| style_conversation_lines(&o.sd, o.current_attempt(), visible.clone()))
+            .map(|o| style_conversation_lines(&o.sd, o.current_attempt()))
             .unwrap_or_default()
     };
     let raw_empty = app
@@ -473,7 +456,12 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
             "Loading details…",
         );
     } else {
-        let content = Paragraph::new(Text::from(styled_lines));
+        let scroll = app
+            .diff_overlay
+            .as_ref()
+            .map(|o| o.sd.state.scroll)
+            .unwrap_or(0);
+        let content = Paragraph::new(Text::from(styled_lines)).scroll((scroll, 0));
         frame.render_widget(content, content_area);
     }
 }
@@ -567,12 +555,9 @@ enum ConversationSpeaker {
     Assistant,
 }
 
-/// Styles the wrapped rows in `visible`. Rows above it are scanned only for the speaker,
-/// code-fence, and bullet state they carry; rows below it cannot affect it.
 fn style_conversation_lines(
     sd: &crate::scrollable_diff::ScrollableDiff,
     attempt: Option<&AttemptView>,
-    visible: std::ops::Range<usize>,
 ) -> Vec<Line<'static>> {
     use ratatui::text::Span;
 
@@ -588,13 +573,7 @@ fn style_conversation_lines(
     let mut last_src: Option<usize> = None;
     let mut bullet_indent: Option<usize> = None;
 
-    for (row, (display, &src_idx)) in wrapped
-        .iter()
-        .zip(indices.iter())
-        .enumerate()
-        .take(visible.end)
-    {
-        let shown = row >= visible.start;
+    for (display, &src_idx) in wrapped.iter().zip(indices.iter()) {
         let raw = sd.raw_line_at(src_idx);
         let trimmed = raw.trim();
         let is_new_raw = last_src.map(|prev| prev != src_idx).unwrap_or(true);
@@ -603,12 +582,10 @@ fn style_conversation_lines(
             speaker = Some(ConversationSpeaker::User);
             in_code = false;
             bullet_indent = None;
-            if shown {
-                styled.push(conversation_header_line(
-                    ConversationSpeaker::User,
-                    /*attempt*/ None,
-                ));
-            }
+            styled.push(conversation_header_line(
+                ConversationSpeaker::User,
+                /*attempt*/ None,
+            ));
             last_src = Some(src_idx);
             continue;
         }
@@ -616,25 +593,21 @@ fn style_conversation_lines(
             speaker = Some(ConversationSpeaker::Assistant);
             in_code = false;
             bullet_indent = None;
-            if shown {
-                styled.push(conversation_header_line(
-                    ConversationSpeaker::Assistant,
-                    attempt,
-                ));
-            }
+            styled.push(conversation_header_line(
+                ConversationSpeaker::Assistant,
+                attempt,
+            ));
             last_src = Some(src_idx);
             continue;
         }
         if raw.is_empty() {
-            if shown {
-                let mut spans: Vec<Span> = Vec::new();
-                if let Some(role) = speaker {
-                    spans.push(conversation_gutter_span(role));
-                } else {
-                    spans.push(Span::raw(String::new()));
-                }
-                styled.push(Line::from(spans));
+            let mut spans: Vec<Span> = Vec::new();
+            if let Some(role) = speaker {
+                spans.push(conversation_gutter_span(role));
+            } else {
+                spans.push(Span::raw(String::new()));
             }
+            styled.push(Line::from(spans));
             last_src = Some(src_idx);
             bullet_indent = None;
             continue;
@@ -655,25 +628,27 @@ fn style_conversation_lines(
             }
         }
 
-        if shown {
-            let mut spans: Vec<Span> = Vec::new();
-            if let Some(role) = speaker {
-                spans.push(conversation_gutter_span(role));
-            }
-
-            spans.extend(conversation_text_spans(
-                display,
-                in_code,
-                is_new_raw,
-                bullet_indent,
-            ));
-
-            styled.push(Line::from(spans));
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(role) = speaker {
+            spans.push(conversation_gutter_span(role));
         }
+
+        spans.extend(conversation_text_spans(
+            display,
+            in_code,
+            is_new_raw,
+            bullet_indent,
+        ));
+
+        styled.push(Line::from(spans));
         last_src = Some(src_idx);
     }
 
-    styled
+    if styled.is_empty() {
+        wrapped.iter().map(|l| Line::from(l.to_string())).collect()
+    } else {
+        styled
+    }
 }
 
 fn conversation_header_line(
@@ -831,11 +806,7 @@ fn render_task_item(_app: &App, t: &codex_cloud_tasks_client::TaskSummary) -> Li
     if let Some(lbl) = t.environment_label.as_ref().filter(|s| !s.is_empty()) {
         meta.push(lbl.clone().dim());
     }
-    let when = t
-        .updated_at
-        .map(format_relative_time_now)
-        .unwrap_or_else(|| "unknown".to_string())
-        .dim();
+    let when = format_relative_time_now(t.updated_at).dim();
     if !meta.is_empty() {
         meta.push("  ".into());
         meta.push("•".dim());
@@ -943,26 +914,20 @@ pub fn draw_env_modal(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // Keep cached choices available while making refresh failures visible.
-    let error = app.env_error.as_deref();
     // Layout: subheader + search + results list
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if error.is_some() { 2 } else { 1 }), // subheader
-            Constraint::Length(1),                                   // search
-            Constraint::Min(1),                                      // list
+            Constraint::Length(1), // subheader
+            Constraint::Length(1), // search
+            Constraint::Min(1),    // list
         ])
         .split(content);
 
     // Subheader with usage hints (dim cyan)
-    let subheader = match error {
-        Some(error) => Paragraph::new(format!("Failed to load environments: {error}"))
-            .style(Style::default().fg(Color::Red)),
-        None => Paragraph::new(Line::from(
-            "Type to search, Enter select, Esc cancel".cyan().dim(),
-        )),
-    }
+    let subheader = Paragraph::new(Line::from(
+        "Type to search, Enter select, Esc cancel".cyan().dim(),
+    ))
     .wrap(Wrap { trim: true });
     frame.render_widget(subheader, rows[0]);
 
@@ -971,11 +936,31 @@ pub fn draw_env_modal(frame: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .map(|m| m.query.clone())
         .unwrap_or_default();
+    let ql = query.to_lowercase();
     let search = Paragraph::new(format!("Search: {query}")).wrap(Wrap { trim: true });
     frame.render_widget(search, rows[1]);
 
-    // Enter resolves the highlighted row through the same filter.
-    let envs = app.filtered_environments(&query);
+    // Filter environments by query (case-insensitive substring over label/id/hints)
+    let envs: Vec<&crate::app::EnvironmentRow> = app
+        .environments
+        .iter()
+        .filter(|e| {
+            if ql.is_empty() {
+                return true;
+            }
+            let mut hay = String::new();
+            if let Some(l) = &e.label {
+                hay.push_str(&l.to_lowercase());
+                hay.push(' ');
+            }
+            hay.push_str(&e.id.to_lowercase());
+            if let Some(h) = &e.repo_hints {
+                hay.push(' ');
+                hay.push_str(&h.to_lowercase());
+            }
+            hay.contains(&ql)
+        })
+        .collect();
 
     let mut items: Vec<ListItem> = Vec::new();
     items.push(ListItem::new(Line::from("All Environments (Global)")));
@@ -1058,197 +1043,4 @@ pub fn draw_best_of_modal(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(Style::default().bold())
         .block(Block::default().borders(Borders::NONE));
     frame.render_stateful_widget(list, rows[1], &mut list_state);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    #[test]
-    fn draw_list_uses_codex_cloud_name_in_title() {
-        let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("terminal");
-        let mut app = App::new();
-        terminal
-            .draw(|frame| draw_list(frame, frame.area(), &mut app))
-            .expect("draw list");
-        let text = terminal.backend().buffer().content()[..40]
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-
-        assert!(text.contains("Codex Cloud • All  • 0%"));
-    }
-
-    #[test]
-    fn draw_truncates_unicode_status_at_a_character_boundary() {
-        let mut terminal = Terminal::new(TestBackend::new(2020, 6)).expect("terminal");
-        let mut app = App::new();
-        let prefix = "x".repeat(1999);
-        app.status = format!("{prefix}é trailing detail");
-        let original_status = app.status.clone();
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("draw Unicode status");
-        let rendered: String = terminal.backend().buffer().content()[2020 * 5..]
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert_eq!(rendered.trim_end(), format!("{prefix}…"));
-        assert_eq!(app.status, original_status);
-    }
-
-    #[test]
-    fn environment_load_failure_is_visible_and_recovery_replaces_cached_choices() {
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
-        let mut app = App::new();
-        app.env_modal = Some(crate::app::EnvModalState {
-            query: String::new(),
-            selected: 0,
-        });
-        let environment = |id: &str, label: &str| crate::app::EnvironmentRow {
-            id: id.to_string(),
-            label: Some(label.to_string()),
-            is_pinned: false,
-            repo_hints: None,
-        };
-        app.apply_environments_loaded(Ok(vec![environment("cached", "Cached environment")]));
-        app.env_loading = true;
-        app.apply_environments_loaded(Err(anyhow::anyhow!("network unavailable")));
-        assert!(!app.env_loading);
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("failure draw");
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert!(rendered.contains("Failed to load environments: network unavailable"));
-        assert!(rendered.contains("Cached environment"));
-        assert!(!rendered.contains("Loading environments"));
-
-        app.apply_environments_loaded(Ok(vec![environment("fresh", "Fresh environment")]));
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("recovery draw");
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert!(rendered.contains("Fresh environment"));
-        assert!(!rendered.contains("Cached environment"));
-        assert!(!rendered.contains("Failed to load environments"));
-        assert!(app.env_error.is_none());
-    }
-
-    #[test]
-    fn conversation_window_keeps_code_fence_state_from_rows_above_it() {
-        let mut sd = crate::scrollable_diff::ScrollableDiff::new();
-        let mut lines = vec!["assistant:".to_string(), "```".to_string()];
-        lines.extend((0..100).map(|n| format!("code {n}")));
-        lines.push("```".to_string());
-        sd.set_content(lines);
-        sd.set_width(80);
-
-        let window = style_conversation_lines(&sd, /*attempt*/ None, 52..55);
-
-        assert_eq!(window.len(), 3);
-        // Row 52 (`code 50`) is inside the fence opened on row 1, above the window.
-        let code = window[0]
-            .spans
-            .iter()
-            .find(|span| span.content.contains("code 50"))
-            .expect("first visible row");
-        assert_eq!(code.style.fg, Some(Color::Cyan));
-    }
-
-    #[test]
-    fn failed_attempt_details_are_titled_failed_and_show_the_reason() {
-        let render = |status: AttemptStatus| {
-            let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
-            let mut app = App::new();
-            let mut overlay = crate::app::DiffOverlay::new(
-                codex_cloud_tasks_client::TaskId("task".to_string()),
-                "Broken task".to_string(),
-                None,
-            );
-            let base = overlay.base_attempt_mut();
-            base.status = status;
-            base.prompt = Some("Fix it".to_string());
-            base.text_lines = crate::conversation_lines(
-                Some("Fix it".to_string()),
-                &["Task failed: APPLY_FAILED: Patch could not be applied".to_string()],
-            );
-            overlay.set_view(crate::app::DetailView::Prompt);
-            app.diff_overlay = Some(overlay);
-            terminal
-                .draw(|frame| draw(frame, &mut app))
-                .expect("draw details");
-            terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(ratatui::buffer::Cell::symbol)
-                .collect::<String>()
-        };
-
-        let failed = render(AttemptStatus::Failed);
-        assert!(failed.contains("[FAILED]"), "{failed}");
-        assert!(failed.contains("APPLY_FAILED: Patch could not be applied"));
-        assert!(!render(AttemptStatus::Completed).contains("[FAILED]"));
-    }
-
-    #[test]
-    fn draw_renders_final_line_of_diff_larger_than_u16() {
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
-        let mut app = App::new();
-        let mut overlay = crate::app::DiffOverlay::new(
-            codex_cloud_tasks_client::TaskId("large-diff".to_string()),
-            "Large diff".to_string(),
-            None,
-        );
-        let mut lines = vec!["ordinary row".to_string(); 65_536];
-        lines.push("+FINAL DIFF ROW".to_string());
-        overlay.base_attempt_mut().diff_lines = lines;
-        overlay.set_view(crate::app::DetailView::Diff);
-        app.diff_overlay = Some(overlay);
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("initial draw");
-        app.diff_overlay
-            .as_mut()
-            .expect("overlay")
-            .sd
-            .scroll_to_bottom();
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("scrolled draw");
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert!(
-            text.contains("+FINAL DIFF ROW"),
-            "final diff row missing: {text}"
-        );
-        assert_eq!(
-            app.diff_overlay
-                .as_ref()
-                .expect("overlay")
-                .sd
-                .percent_scrolled(),
-            Some(100)
-        );
-    }
 }

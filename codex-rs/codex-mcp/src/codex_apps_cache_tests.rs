@@ -214,11 +214,11 @@ async fn codex_apps_tools_cache_preserves_formerly_disallowed_connectors() {
             .map(|tool| (tool.callable_name.as_str(), tool.connector_id.as_deref()))
             .collect::<Vec<_>>(),
         vec![
+            ("calendar_tool", Some("calendar")),
             (
                 "formerly_blocked_tool",
                 Some("connector_2b0a9009c9c64bf9933a3dae3f2b1254")
             ),
-            ("calendar_tool", Some("calendar")),
         ]
     );
 }
@@ -273,10 +273,10 @@ async fn startup_cached_codex_apps_tools_loads_from_disk_cache() {
         Some("user-one"),
     )
     .await;
-    let cached_tools = vec![create_test_tool(
-        CODEX_APPS_MCP_SERVER_NAME,
-        "calendar_search",
-    )];
+    let cached_tools = vec![
+        create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "mail_search"),
+        create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "calendar_search"),
+    ];
     let server_info = create_test_server_info("Codex Apps");
     write_cached_codex_apps_tools_for_test(&writer_cache_context, &server_info, &cached_tools);
     let cache_context = create_codex_apps_tools_cache_context(
@@ -291,9 +291,31 @@ async fn startup_cached_codex_apps_tools_loads_from_disk_cache() {
         .expect("expected startup snapshot to load from cache");
     let cached_server_info = load_startup_cached_codex_apps_server_info(&cache_context);
 
-    assert_eq!(startup_tools.len(), 1);
+    assert_eq!(startup_tools.len(), 2);
     assert_eq!(startup_tools[0].server_name, CODEX_APPS_MCP_SERVER_NAME);
     assert_eq!(startup_tools[0].callable_name, "calendar_search");
+    assert_eq!(startup_tools[1].callable_name, "mail_search");
+    let revision = cache_context.content_revision();
+    assert!(
+        !cache_context
+            .current_snapshot()
+            .expect("snapshot")
+            .codex_apps_ready()
+    );
+    cache_context
+        .publish_if_newest_accepted(
+            cache_context.begin_fetch(CodexAppsToolsFetchSource::Startup),
+            &server_info,
+            startup_tools,
+        )
+        .await;
+    assert_eq!(cache_context.content_revision(), revision);
+    assert!(
+        cache_context
+            .current_snapshot()
+            .expect("snapshot")
+            .codex_apps_ready()
+    );
     assert_eq!(cached_server_info, Some(server_info));
 }
 

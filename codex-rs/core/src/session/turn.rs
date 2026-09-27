@@ -1354,7 +1354,7 @@ fn authoritative_wait_terminal_surface(
 // Bound generations without new evidence. Productive work renews this window;
 // executor-owned process monitoring does not consume it. Deterministic repeated
 // cycles are also handled by the turn execution control.
-const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 128;
+const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogicalGenerationAdmission {

@@ -115,6 +115,14 @@
       "title": "AccountRateLimitsUpdatedNotification",
       "type": "object"
     },
+    "AccountRoutingOverride": {
+      "enum": [
+        "NO_CONSTRAINT",
+        "us",
+        "us_cr"
+      ],
+      "type": "string"
+    },
     "AccountTokenUsageDailyBucket": {
       "properties": {
         "startDate": {
@@ -2621,6 +2629,29 @@
             "params"
           ],
           "title": "Model/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "account/gatewayOAuth/read"
+              ],
+              "title": "Account/gatewayOAuth/readRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "Account/gatewayOAuth/readRequest",
           "type": "object"
         },
         {
@@ -6858,6 +6889,54 @@
       "title": "FuzzyFileSearchSessionUpdatedNotification",
       "type": "object"
     },
+    "GatewayOAuthReadResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providerId": {
+          "type": "string"
+        },
+        "providerName": {
+          "type": "string"
+        },
+        "required": {
+          "description": "Whether the selected provider uses gateway OAuth, even when already signed in.",
+          "type": "boolean"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GatewayOAuthStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Null when the effective provider does not use gateway OAuth."
+        }
+      },
+      "required": [
+        "providerId",
+        "providerName",
+        "required"
+      ],
+      "title": "GatewayOAuthReadResponse",
+      "type": "object"
+    },
+    "GatewayOAuthStatus": {
+      "enum": [
+        "notReady",
+        "started",
+        "succeeded",
+        "failed"
+      ],
+      "type": "string"
+    },
     "GetAccountParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -6922,6 +7001,18 @@
         },
         "requiresOpenaiAuth": {
           "type": "boolean"
+        },
+        "workspaceRouting": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkspaceRouting"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Authoritative routing for the signed-in ChatGPT workspace, when available."
         }
       },
       "required": [
@@ -21060,6 +21151,25 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "WorkspaceRouting": {
+      "properties": {
+        "accountRoutingOverride": {
+          "$ref": "#/definitions/AccountRoutingOverride"
+        },
+        "backendOrigin": {
+          "type": "string"
+        },
+        "chatgptAccountId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "accountRoutingOverride",
+        "backendOrigin",
+        "chatgptAccountId"
+      ],
+      "type": "object"
     },
     "WriteStatus": {
       "enum": [

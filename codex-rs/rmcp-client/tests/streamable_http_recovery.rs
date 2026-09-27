@@ -628,6 +628,25 @@ async fn streamable_http_timeout_cancels_the_live_request_id() -> anyhow::Result
     assert_eq!(cancellation.request_id, started_request_id);
     assert_eq!(cancellation.reason.as_deref(), Some("request timeout"));
 
+    assert!(codex_rmcp_client::is_timeout_error(&error));
+    assert!(error.to_string().contains("execution may have completed"));
+    assert!(
+        error
+            .to_string()
+            .contains("check its state before retrying")
+    );
+    assert!(matches!(
+        started_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    // Cancellation must not discard the warm service or replay the timed-out call.
+    let tools = client
+        .list_tools(None, Some(Duration::from_secs(2)))
+        .await?;
+    assert_eq!(tools.tools.len(), 1);
+    assert_eq!(tools.tools[0].name, "slow");
+
     server_handle.abort();
     let _ = server_handle.await;
 

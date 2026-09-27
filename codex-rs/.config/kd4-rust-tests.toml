@@ -99,6 +99,7 @@ helpers = [
 "session::token_budget::tests::" = []
 "session::token_budget::runtime_tests::" = []
 "tool_history::tests::" = []
+"git_workspace::tests::" = []
 "context::available_skills_instructions::tests::" = []
 # Tool specs, routing, file reads, event conversion, and guidance text; none
 # launches a helper or a sandboxed command.

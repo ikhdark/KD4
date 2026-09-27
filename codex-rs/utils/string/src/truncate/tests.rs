@@ -6,6 +6,24 @@ use super::truncate_middle_with_token_budget;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn byte_token_estimates_round_up_without_overflow() {
+    let upper = 1usize << (usize::BITS - 2);
+    for (bytes, expected) in [
+        (0, 0),
+        (1, 1),
+        (4, 1),
+        (5, 2),
+        (usize::MAX - 3, upper - 1),
+        (usize::MAX - 2, upper),
+        (usize::MAX - 1, upper),
+        (usize::MAX, upper),
+    ] {
+        assert_eq!(super::token_byte_estimate(bytes), expected);
+        assert_eq!(super::approx_tokens_from_byte_count(bytes), expected as u64);
+    }
+}
+
+#[test]
 fn token_estimates_preserve_unicode_and_ascii_boundaries() {
     for (text, expected) in [
         ("", 0),

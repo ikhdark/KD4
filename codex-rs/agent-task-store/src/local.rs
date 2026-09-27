@@ -2369,6 +2369,9 @@ LIMIT 1
             .fetch_optional(&mut *transaction)
             .await?
         else {
+            if let Some(event_id) = after_event_id {
+                return Err(StoreError::InvalidWakeWatermark(event_id.to_string()));
+            }
             return Ok(WakeRead {
                 status: WakeReadStatus::NoStream,
                 reason: None,

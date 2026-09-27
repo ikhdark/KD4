@@ -117,6 +117,60 @@ fn path_convention_splits_absolute_relative_and_bare_path_text() {
 }
 
 #[test]
+fn escaped_windows_drives_keep_windows_lexical_semantics() {
+    for drive in ["C%3A", "C%3a", "%43:", "%43%3A"] {
+        let spelling = format!("file:///{drive}/workspace");
+        let uri = PathUri::parse(&spelling).unwrap();
+        assert_eq!(uri.infer_path_convention(), Some(PathConvention::Windows));
+        assert_eq!(uri.as_str(), spelling);
+        assert_eq!(
+            LegacyAppPathString::from(uri.clone()).as_str(),
+            r"C:\workspace"
+        );
+        assert_eq!(
+            uri.join(r"..\child").unwrap().inferred_native_path_string(),
+            r"C:\child"
+        );
+        let root = uri.parent().unwrap();
+        assert_eq!(root.parent(), None);
+        assert_eq!(root.to_abs_path().unwrap().as_path(), Path::new(r"C:\"));
+        assert!(uri.starts_with(&PathUri::parse("file:///C:/workspace").unwrap()));
+        let escaped_separator = PathUri::parse(&format!("{spelling}/%5C..%5Coutside")).unwrap();
+        assert!(!escaped_separator.starts_with(&uri));
+        assert!(!uri.starts_with(&PathUri::parse("file://other/workspace").unwrap()));
+    }
+    assert_eq!(
+        PathUri::parse("file:///C%253A/workspace")
+            .unwrap()
+            .infer_path_convention(),
+        Some(PathConvention::Posix),
+        "decode only once"
+    );
+}
+
+#[test]
+fn escaped_windows_drive_opens_the_same_native_file() {
+    let path = AbsolutePathBuf::from_absolute_path_checked(env!("CARGO_MANIFEST_DIR"))
+        .unwrap()
+        .join("Cargo.toml");
+    let uri = PathUri::from_abs_path(&path);
+    let local_path = uri.encoded_path();
+    let drive = local_path.as_bytes()[1];
+    assert!(drive.is_ascii_alphabetic());
+    for escaped_drive in [format!("{}%3A", char::from(drive)), format!("%{drive:02X}%3A")] {
+        let spelling = format!("file:///{escaped_drive}{}", &local_path[3..]);
+        let escaped = PathUri::parse(&spelling).unwrap();
+        let converted = escaped.to_abs_path().unwrap();
+        assert_eq!(converted, path);
+        assert_eq!(
+            std::fs::read(converted.as_path()).unwrap(),
+            std::fs::read(path.as_path()).unwrap()
+        );
+        assert_eq!(escaped.as_str(), spelling);
+    }
+}
+
+#[test]
 fn drive_shaped_posix_uri_is_intentionally_inferred_as_windows() {
     let path = PathUri::parse("file:///C:/actually/a/posix/path").expect("valid path URI");
 

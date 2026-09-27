@@ -1191,6 +1191,7 @@ async fn shift_left_edits_most_recent_queued_message_in_warp_terminal() {
         term_program: None,
         version: None,
         term: None,
+        multiplexer: None,
     })
     .await;
 }
@@ -1202,18 +1203,40 @@ async fn shift_left_edits_most_recent_queued_message_in_vscode_terminal() {
         term_program: None,
         version: None,
         term: None,
+        multiplexer: None,
     })
     .await;
 }
 
 #[test]
 fn queued_message_edit_binding_mapping_covers_windows_terminals() {
+    for name in [
+        TerminalName::AppleTerminal,
+        TerminalName::Ghostty,
+        TerminalName::Iterm2,
+        TerminalName::Kitty,
+        TerminalName::Konsole,
+        TerminalName::GnomeTerminal,
+        TerminalName::Vte,
+    ] {
+        assert_eq!(
+            queued_message_edit_binding_for_terminal(TerminalInfo {
+                name,
+                term_program: None,
+                version: None,
+                term: None,
+                multiplexer: None,
+            }),
+            crate::key_hint::alt(KeyCode::Up)
+        );
+    }
     assert_eq!(
         queued_message_edit_binding_for_terminal(TerminalInfo {
             name: TerminalName::WarpTerminal,
             term_program: None,
             version: None,
             term: None,
+            multiplexer: None,
         }),
         crate::key_hint::shift(KeyCode::Left)
     );
@@ -1223,6 +1246,7 @@ fn queued_message_edit_binding_mapping_covers_windows_terminals() {
             term_program: None,
             version: None,
             term: None,
+            multiplexer: None,
         }),
         crate::key_hint::shift(KeyCode::Left)
     );
@@ -1232,6 +1256,7 @@ fn queued_message_edit_binding_mapping_covers_windows_terminals() {
             term_program: None,
             version: None,
             term: None,
+            multiplexer: None,
         }),
         crate::key_hint::alt(KeyCode::Up)
     );

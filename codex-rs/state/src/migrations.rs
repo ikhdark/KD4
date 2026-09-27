@@ -336,6 +336,25 @@ pub(crate) async fn repair_legacy_recency_migration_version(
         return Ok(());
     }
 
+    // Even a no-op UPDATE requires SQLite's writer slot. Keep current histories
+    // read-only, and retain the atomic predicates below if another initializer repairs first.
+    let needs_repair = sqlx::query_scalar::<_, i64>(
+        r#"
+SELECT 1 FROM _sqlx_migrations
+WHERE version = ? AND checksum = ?
+  AND NOT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = ?)
+        "#,
+    )
+    .bind(38_i64)
+    .bind(recency_migration.checksum.as_ref())
+    .bind(recency_migration.version)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !needs_repair {
+        return Ok(());
+    }
+
     sqlx::query(
         r#"
 UPDATE _sqlx_migrations

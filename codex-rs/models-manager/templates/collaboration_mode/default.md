@@ -14,4 +14,7 @@ message can change the active mode.
   otherwise ask one concise direct question.
 - Permission, sandbox, external-action, and destructive-action boundaries remain
   unchanged.
-- Finish at the nearest sufficient proof, or report the genuine blocker.
+- Complete the entire requested task and required validation before finalizing.
+  A blocker requires evidence that further progress needs user input,
+  unavailable authorization, or an external change; complete all permitted
+  independent work before reporting it. Cancellation and host limits still apply.

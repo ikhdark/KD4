@@ -8,3 +8,4 @@ prompt.md
 **/target/**
 .git/**
 .worktrees/**
+/DO-NOT-CHANGE/**

@@ -490,11 +490,6 @@ async fn run_codex_tool_session_inner(
                             ),
                         };
                         outgoing.send_response(request_id.clone(), result).await;
-                        // unregister the id so we don't keep it in the map
-                        running_requests_id_to_codex_uuid
-                            .lock()
-                            .await
-                            .remove(&request_id);
                         break;
                     }
                     EventMsg::SessionConfigured(_) => {
@@ -582,6 +577,8 @@ async fn run_codex_tool_session_inner(
         }
     }
     elicitation_cancellation.cancel();
+    // Release ownership exactly once: a client may reuse the ID immediately
+    // after removal, so a second cleanup could unregister its newer request.
     running_requests_id_to_codex_uuid
         .lock()
         .await

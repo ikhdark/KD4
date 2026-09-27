@@ -358,6 +358,7 @@ mod tests {
             term_program: term_program.map(str::to_string),
             version: None,
             term: term.map(str::to_string),
+            multiplexer: None,
         }
     }
 

@@ -1097,6 +1097,11 @@ impl MessageProcessor {
                 .model_provider_capabilities_read()
                 .await
                 .map(|response| Some(response.into())),
+            ClientRequest::GatewayOAuthRead { params: _, .. } => self
+                .config_processor
+                .gateway_oauth_read()
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadStart { params, .. } => self
                 .thread_processor
                 .thread_start(

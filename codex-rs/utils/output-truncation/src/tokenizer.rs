@@ -6,6 +6,11 @@ pub fn model_token_count(text: &str) -> usize {
 
 /// Keep the head and failure tail, counting the complete rendered packet.
 pub fn truncate_model_text(text: &str, limit: usize) -> String {
+    // Silent projections need neither the vocabulary nor a token vector for
+    // output that will be discarded, including logs preceding a script error.
+    if limit == 0 {
+        return String::new();
+    }
     // Every ordinary token encodes at least one byte, so text this short fits
     // without encoding it or loading the vocabulary.
     if text.len() <= limit {

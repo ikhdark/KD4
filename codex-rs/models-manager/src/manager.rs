@@ -437,6 +437,9 @@ impl ModelState {
     }
 
     fn replace_remote_models(&mut self, remote_models: Vec<ModelInfo>) {
+        if self.remote_models == remote_models {
+            return;
+        }
         self.available_models = AvailableModelPresets::new(&remote_models);
         self.remote_models = remote_models;
     }
@@ -1132,9 +1135,7 @@ impl OpenAiModelsManager {
         {
             return false;
         }
-        if state.remote_models != merged_models {
-            state.replace_remote_models(merged_models);
-        }
+        state.replace_remote_models(merged_models);
         state.etag = etag;
         state.fresh_until = None;
         true

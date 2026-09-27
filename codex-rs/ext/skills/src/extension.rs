@@ -339,6 +339,8 @@ where
                     entry.authority.kind != SkillSourceKind::Executor
                         && entry.authority.kind != SkillSourceKind::Orchestrator
                 });
+                // Orchestrator discovery and its recovery route belong to thread context.
+                catalog.continuation = None;
                 if let Some(fragment) = available_skills_fragment(&catalog) {
                     fragments.push(Box::new(fragment));
                 }

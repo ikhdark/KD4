@@ -577,6 +577,95 @@ async fn manager_with_shared_apps_cache(
 }
 
 #[tokio::test]
+async fn reordered_shared_tools_reuse_catalog_but_schema_changes_and_removal_invalidate() {
+    let home = tempdir().expect("home");
+    let context =
+        create_codex_apps_tools_cache_context(home.path().to_path_buf(), None, None).await;
+    let info = create_test_server_info("Apps");
+    let alpha = create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "alpha");
+    let beta = create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "beta");
+    context
+        .publish_if_newest_accepted(
+            context.begin_fetch(CodexAppsToolsFetchSource::Startup),
+            &info,
+            vec![beta.clone(), alpha.clone()],
+        )
+        .await;
+    let manager = manager_with_shared_apps_cache(&context).await;
+    let initial = manager.list_all_tools_snapshot().await;
+    let revision = manager.tool_catalog_revision();
+    assert_eq!(
+        initial
+            .iter()
+            .map(|tool| tool.tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+    context
+        .publish_if_newest_accepted(
+            context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+            &info,
+            vec![alpha.clone(), beta.clone()],
+        )
+        .await;
+    assert_eq!(manager.tool_catalog_revision(), revision);
+    assert!(Arc::ptr_eq(
+        &initial,
+        &manager.list_all_tools_snapshot().await
+    ));
+    let disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(context.tools_cache_path()).expect("cache file"))
+            .expect("cache JSON");
+    assert_eq!(disk["tools"][0]["tool"]["name"], "alpha");
+    assert_eq!(disk["tools"][1]["tool"]["name"], "beta");
+
+    let mut changed = alpha;
+    changed.tool.input_schema = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        }))
+        .expect("schema"),
+    );
+    context
+        .publish_if_newest_accepted(
+            context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+            &info,
+            vec![beta, changed.clone()],
+        )
+        .await;
+    assert!(manager.tool_catalog_revision() > revision);
+    assert!(!Arc::ptr_eq(
+        &initial,
+        &manager.list_all_tools_snapshot().await
+    ));
+    assert_eq!(
+        manager
+            .tool_info(CODEX_APPS_MCP_SERVER_NAME, "alpha")
+            .await
+            .expect("alpha")
+            .tool
+            .input_schema,
+        changed.tool.input_schema
+    );
+    context
+        .publish_if_newest_accepted(
+            context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+            &info,
+            Vec::new(),
+        )
+        .await;
+    assert!(manager.list_all_tools_snapshot().await.is_empty());
+    assert!(
+        manager
+            .tool_info(CODEX_APPS_MCP_SERVER_NAME, "alpha")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn shared_publications_update_ready_managers_and_preserve_unchanged_catalogs() {
     let home = tempdir().expect("home");
     let context =

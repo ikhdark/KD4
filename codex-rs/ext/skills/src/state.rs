@@ -300,28 +300,35 @@ impl SkillsThreadState {
         root: SelectedCapabilityRoot,
         query: SkillListQuery,
     ) -> SkillCatalog {
-        if let Some(cached) = self.cached_executor_catalog(&root, &query.turn_id) {
-            return cached;
-        }
-
-        let turn_id = query.turn_id.clone();
-        let discovered = providers.list_executor_for_turn(query).await;
-        let mut cache = self
-            .executor_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.iter().find(|cached| {
-            cached.root == root && (cached.catalog.is_ok() || cached.turn_id == turn_id)
-        }) {
-            return catalog_or_warning(cached.catalog.clone());
-        }
-        cache.retain(|cached| cached.root != root);
-        cache.push(CachedExecutorCatalog {
-            root,
-            turn_id,
-            catalog: discovered.clone(),
-        });
-        catalog_or_warning(discovered)
+        let slot = {
+            let mut cache = self
+                .executor_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.iter().find(|cached| {
+                cached.root == root
+                    && (matches!(cached.catalog.get(), Some(Ok(_)))
+                        || cached.turn_id == query.turn_id)
+            }) {
+                Arc::clone(&cached.catalog)
+            } else {
+                cache.retain(|cached| cached.root != root);
+                let slot = Arc::new(OnceCell::new());
+                cache.push(CachedExecutorCatalog {
+                    root,
+                    turn_id: query.turn_id.clone(),
+                    catalog: Arc::clone(&slot),
+                });
+                slot
+            }
+        };
+        // Publish the slot before discovery, without holding the cache mutex
+        // across I/O. Cancellation leaves it empty for the next observer.
+        catalog_or_warning(
+            slot.get_or_init(|| providers.list_executor_for_turn(query))
+                .await
+                .clone(),
+        )
     }
 
     fn cached_executor_catalog(
@@ -334,16 +341,18 @@ impl SkillsThreadState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|cached| {
-                &cached.root == root && (cached.catalog.is_ok() || cached.turn_id == turn_id)
+                &cached.root == root
+                    && (matches!(cached.catalog.get(), Some(Ok(_))) || cached.turn_id == turn_id)
             })
-            .map(|cached| catalog_or_warning(cached.catalog.clone()))
+            .and_then(|cached| cached.catalog.get().cloned())
+            .map(catalog_or_warning)
     }
 }
 
 struct CachedExecutorCatalog {
     root: SelectedCapabilityRoot,
     turn_id: String,
-    catalog: SkillProviderResult<SkillCatalog>,
+    catalog: Arc<OnceCell<SkillProviderResult<SkillCatalog>>>,
 }
 
 struct OrchestratorGenerationCache {
@@ -451,6 +460,163 @@ impl EmittedTurnWarnings {
 mod tests {
     use super::*;
     use crate::catalog::SkillCatalogEntry;
+    use crate::provider::SkillProvider;
+    use crate::provider::SkillProviderFuture;
+    use codex_protocol::capabilities::CapabilityRootLocation;
+    use codex_utils_path_uri::PathUri;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    struct CountingCatalog {
+        calls: AtomicUsize,
+        fail_first: bool,
+        pause_first: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl SkillProvider for CountingCatalog {
+        fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    if let Some(started) = &self.pause_first {
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    tokio::task::yield_now().await;
+                    if self.fail_first {
+                        return Err(SkillProviderError::new("temporary discovery failure"));
+                    }
+                }
+                Ok(executor_catalog(&query.executor_roots[0].id))
+            })
+        }
+
+        fn read(&self, _: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+            Box::pin(async { panic!("catalog discovery must not read instructions") })
+        }
+    }
+
+    fn executor_catalog(root: &str) -> SkillCatalog {
+        SkillCatalog {
+            entries: vec![SkillCatalogEntry::new(
+                SkillPackageId(root.to_string()),
+                SkillAuthority::new(SkillSourceKind::Executor, root),
+                root,
+                "Selected executor skill",
+                SkillResourceId::new(format!("skill://{root}/SKILL.md")),
+            )],
+            ..Default::default()
+        }
+    }
+
+    fn executor_query(turn_id: &str, root: &str) -> SkillListQuery {
+        SkillListQuery {
+            continuation: None,
+            turn_id: turn_id.to_string(),
+            executor_roots: vec![SelectedCapabilityRoot {
+                id: root.to_string(),
+                location: CapabilityRootLocation::Environment {
+                    environment_id: "env".to_string(),
+                    path: PathUri::parse(&format!("file:///skills/{root}")).unwrap(),
+                },
+            }],
+            host_snapshot: None,
+            include_host_skills: false,
+            include_bundled_skills: false,
+            include_orchestrator_skills: false,
+            mcp_resources: None,
+        }
+    }
+
+    fn executor_state() -> SkillsThreadState {
+        SkillsThreadState::new(
+            SkillsExtensionConfig {
+                include_instructions: true,
+                bundled_skills_enabled: false,
+                orchestrator_skills_enabled: false,
+            },
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn executor_discovery_coalesces_and_retries_only_failed_turns() {
+        for fail_first in [false, true] {
+            let state = executor_state();
+            let provider = Arc::new(CountingCatalog {
+                calls: AtomicUsize::new(0),
+                fail_first,
+                pause_first: None,
+            });
+            let providers = SkillProviders::new().with_executor_provider(provider.clone());
+            let (first, second) = tokio::join!(
+                state.executor_catalog_snapshot(&providers, executor_query("one", "root")),
+                state.executor_catalog_snapshot(&providers, executor_query("one", "root")),
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(first, second);
+            if fail_first {
+                assert!(first.entries.is_empty());
+                assert_eq!(
+                    first.warnings,
+                    vec!["executor skills unavailable: temporary discovery failure"]
+                );
+            } else {
+                assert_eq!(first, executor_catalog("root"));
+            }
+            assert_eq!(
+                state
+                    .executor_catalog_snapshot(&providers, executor_query("one", "root"))
+                    .await,
+                first
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            for turn in ["two", "three"] {
+                assert_eq!(
+                    state
+                        .executor_catalog_snapshot(&providers, executor_query(turn, "root"))
+                        .await,
+                    executor_catalog("root")
+                );
+                assert_eq!(
+                    provider.calls.load(Ordering::SeqCst),
+                    if fail_first { 2 } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_executor_discovery_does_not_block_other_roots_or_poison_retry() {
+        let state = executor_state();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(CountingCatalog {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+            pause_first: Some(started.clone()),
+        });
+        let providers = SkillProviders::new().with_executor_provider(provider.clone());
+        let mut pending =
+            Box::pin(state.executor_catalog_snapshot(&providers, executor_query("one", "root")));
+        tokio::select! {
+            _ = &mut pending => panic!("first discovery must remain pending"),
+            _ = started.notified() => {}
+        }
+        assert_eq!(
+            state
+                .executor_catalog_snapshot(&providers, executor_query("one", "other"))
+                .await,
+            executor_catalog("other")
+        );
+        drop(pending);
+        assert_eq!(
+            state
+                .executor_catalog_snapshot(&providers, executor_query("one", "root"))
+                .await,
+            executor_catalog("root")
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    }
 
     #[tokio::test]
     async fn estimate_includes_explicitly_continued_catalog_without_discovery() {

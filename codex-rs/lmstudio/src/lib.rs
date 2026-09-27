@@ -20,16 +20,8 @@ pub async fn ensure_oss_ready(config: &Config) -> std::io::Result<()> {
     // Verify local LM Studio is reachable.
     let (lmstudio_client, models) = LMStudioClient::try_from_provider_with_models(config).await?;
 
-    match models {
-        Ok(models) => {
-            if !models.iter().any(|m| m == model) {
-                lmstudio_client.download_model(model).await?;
-            }
-        }
-        Err(err) => {
-            // Not fatal; higher layers may still proceed and surface errors later.
-            tracing::warn!("Failed to query local models from LM Studio: {}.", err);
-        }
+    if !models.iter().any(|m| m == model) {
+        lmstudio_client.download_model(model).await?;
     }
 
     // Load the model in the background
@@ -44,4 +36,54 @@ pub async fn ensure_oss_ready(config: &Config) -> std::io::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
+    use serde_json::json;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    #[tokio::test]
+    async fn malformed_catalogue_stops_setup_before_model_preparation() {
+        // Include the selected model in malformed lists so even the old permissive
+        // parser cannot start a real download during this regression test.
+        for body in [
+            json!({}),
+            json!({"data": [{"id": "test-model"}, null]}),
+            json!({"data": [{"id": "test-model"}, {}]}),
+            json!({"data": [{"id": "test-model"}, {"id": 7}]}),
+            json!({"data": [{"id": "test-model"}, {"id": "  "}]}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let home = tempfile::tempdir().unwrap();
+            let mut config = codex_core::config::ConfigBuilder::default()
+                .codex_home(home.path().to_path_buf())
+                .build()
+                .await
+                .unwrap();
+            config.model = Some("test-model".into());
+            config
+                .model_providers
+                .get_mut(LMSTUDIO_OSS_PROVIDER_ID)
+                .unwrap()
+                .base_url = Some(server.uri());
+            let error = ensure_oss_ready(&config).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method.as_str(), "GET");
+        }
+    }
 }

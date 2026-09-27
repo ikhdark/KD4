@@ -16,6 +16,8 @@ pub struct BuildInfo {
     pub version: &'static str,
     pub commit: &'static str,
     pub dirty: &'static str,
+    /// Explicit build profile, or `unknown` when the producer did not embed it.
+    /// Debug assertions cannot distinguish standard profiles from custom ones.
     pub profile: &'static str,
     pub built: &'static str,
 }
@@ -29,7 +31,6 @@ impl BuildInfo {
             option_env!("CODEX_BUILD_DIRTY"),
             option_env!("CODEX_BUILD_PROFILE"),
             option_env!("CODEX_BUILD_TIMESTAMP"),
-            cfg!(debug_assertions),
         )
     }
 
@@ -41,7 +42,6 @@ impl BuildInfo {
         dirty: Option<&'static str>,
         profile: Option<&'static str>,
         built: Option<&'static str>,
-        debug_assertions: bool,
     ) -> Self {
         Self {
             version,
@@ -58,8 +58,7 @@ impl BuildInfo {
             },
             profile: match profile {
                 Some(profile) => profile,
-                None if debug_assertions => "debug",
-                None => "release",
+                None => "unknown",
             },
             built: match built {
                 Some(built) => built,
@@ -84,11 +83,7 @@ mod tests {
                     .or(option_env!("GIT_COMMIT"))
                     .unwrap_or("unknown"),
                 dirty: option_env!("CODEX_BUILD_DIRTY").unwrap_or("unknown"),
-                profile: option_env!("CODEX_BUILD_PROFILE").unwrap_or(if cfg!(debug_assertions) {
-                    "debug"
-                } else {
-                    "release"
-                }),
+                profile: option_env!("CODEX_BUILD_PROFILE").unwrap_or("unknown"),
                 built: option_env!("CODEX_BUILD_TIMESTAMP").unwrap_or("unknown"),
             }
         );
@@ -104,7 +99,6 @@ mod tests {
                 Some("true"),
                 Some("custom"),
                 Some("now"),
-                true,
             ),
             BuildInfo {
                 version: "1.2.3",
@@ -115,22 +109,22 @@ mod tests {
             }
         );
         assert_eq!(
-            BuildInfo::from_values("1.2.3", None, Some("legacy"), None, None, None, false),
+            BuildInfo::from_values("1.2.3", None, Some("legacy"), None, None, None),
             BuildInfo {
                 version: "1.2.3",
                 commit: "legacy",
                 dirty: "unknown",
-                profile: "release",
+                profile: "unknown",
                 built: "unknown",
             }
         );
         assert_eq!(
-            BuildInfo::from_values("1.2.3", None, None, None, None, None, true),
+            BuildInfo::from_values("1.2.3", None, None, None, None, None),
             BuildInfo {
                 version: "1.2.3",
                 commit: "unknown",
                 dirty: "unknown",
-                profile: "debug",
+                profile: "unknown",
                 built: "unknown",
             }
         );

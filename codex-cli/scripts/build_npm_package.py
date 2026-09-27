@@ -22,7 +22,9 @@ from scripts.codex_package.targets import NPM_TARGETS  # noqa: E402
 from scripts.codex_package.targets import PACKAGE_VARIANTS  # noqa: E402
 from scripts.codex_package.targets import TARGET_SPECS  # noqa: E402
 
-RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
+RESPONSES_API_PROXY_NPM_ROOT = (
+    REPO_ROOT / "DO-NOT-CHANGE" / "responses-api-proxy" / "npm"
+)
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
 CODEX_PACKAGE_COMPONENT = "codex-package"

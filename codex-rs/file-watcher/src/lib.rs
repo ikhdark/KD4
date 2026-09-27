@@ -1353,7 +1353,15 @@ impl FileWatcher {
             }
         }
 
-        for root in &changes.lost_watch_roots {
+        // Overflow can discard the removal report for a root recreated before
+        // this pass. Its logical path is unchanged, but its backend watch may
+        // be gone. Re-arm each shared actual watch once before publishing rescan.
+        let roots_to_rearm = if rescan {
+            state.path_ref_counts.keys().cloned().collect::<Vec<_>>()
+        } else {
+            changes.lost_watch_roots.clone()
+        };
+        for root in &roots_to_rearm {
             // The backend drops a watch whose root is removed. When the root is
             // back before this pass, resolution keeps the watch where it was,
             // so re-arm it before subscribers learn that the root changed.

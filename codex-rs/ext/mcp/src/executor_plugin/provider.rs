@@ -1,6 +1,6 @@
-use codex_config::McpServerConfig;
 use codex_core_plugins::ResolvedExecutorPlugin;
 use codex_exec_server::ExecutorFileSystem;
+use codex_mcp::PluginMcpConfigParseOutcome;
 use codex_mcp::parse_executor_plugin_mcp_config;
 use codex_plugin::PluginResourceLocator;
 use codex_plugin::ResolvedPlugin;
@@ -45,7 +45,7 @@ pub(super) enum ExecutorPluginMcpProviderError {
 /// Returns MCP servers declared by `plugin`, bound to its environment.
 pub(super) async fn load_executor_plugin_mcp_servers(
     plugin: &ResolvedExecutorPlugin,
-) -> Result<Vec<(String, McpServerConfig)>, ExecutorPluginMcpProviderError> {
+) -> Result<PluginMcpConfigParseOutcome, ExecutorPluginMcpProviderError> {
     let ResolvedPluginLocation::Environment { root, .. } = plugin.plugin().location();
 
     load_from_file_system(plugin.plugin(), root, plugin.file_system()).await
@@ -55,7 +55,7 @@ async fn load_from_file_system(
     plugin: &ResolvedPlugin,
     plugin_root: &PathUri,
     file_system: &dyn ExecutorFileSystem,
-) -> Result<Vec<(String, McpServerConfig)>, ExecutorPluginMcpProviderError> {
+) -> Result<PluginMcpConfigParseOutcome, ExecutorPluginMcpProviderError> {
     let ResolvedPluginLocation::Environment { environment_id, .. } = plugin.location();
     let plugin_id = plugin.selected_root_id();
     let (contents, config_path) = match plugin.manifest().paths.mcp_servers.as_ref() {
@@ -93,7 +93,7 @@ async fn load_from_file_system(
             {
                 Ok(contents) => contents,
                 Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                    return Ok(Vec::new());
+                    return Ok(PluginMcpConfigParseOutcome::default());
                 }
                 Err(source) => {
                     return Err(ExecutorPluginMcpProviderError::ReadConfig {
@@ -114,7 +114,7 @@ async fn load_from_file_system(
         },
     )?;
 
-    for error in parsed.errors {
+    for error in &parsed.errors {
         tracing::warn!(
             plugin = plugin_id,
             server = error.name,
@@ -123,7 +123,7 @@ async fn load_from_file_system(
         );
     }
 
-    Ok(parsed.servers.into_iter().collect())
+    Ok(parsed)
 }
 
 #[cfg(test)]

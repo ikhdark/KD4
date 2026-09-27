@@ -718,6 +718,37 @@ fn usage_deduplication_survives_queue_overflow_and_capacity_duplicates() {
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 }
 
+#[test]
+fn usage_deduplication_is_scoped_to_thread_and_turn() {
+    use crate::analytics_client_tests::sample_plugin_metadata;
+    use crate::analytics_client_tests::test_tracking_context;
+    use crate::facts::AppInvocation;
+    use crate::facts::CustomAnalyticsFact;
+
+    let (client, mut receiver) = client_with_receiver();
+    for thread in ["parent", "child"] {
+        let tracking = test_tracking_context(thread, "shared-turn-id");
+        for _ in 0..2 {
+            client.track_app_used(
+                tracking.clone(),
+                AppInvocation {
+                    connector_id: Some("calendar".to_string()),
+                    app_name: None,
+                    invocation_type: None,
+                },
+            );
+            client.track_plugin_used(tracking.clone(), sample_plugin_metadata());
+        }
+        assert!(
+            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input))) if input.tracking.thread_id == thread)
+        );
+        assert!(
+            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(input))) if input.tracking.thread_id == thread)
+        );
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+}
+
 #[tokio::test]
 async fn queued_facts_are_sent_in_bounded_fifo_batches() {
     let server = MockServer::start().await;

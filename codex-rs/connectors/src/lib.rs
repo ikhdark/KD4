@@ -239,17 +239,19 @@ where
     }
 
     let apps = if cache_context.cache_key.is_workspace_account {
-        // The workspace page is independent of the paginated public directory.
-        // Overlap both request chains; either failure still publishes nothing.
+        // Overlap the first workspace page with the public directory, then finish
+        // workspace pagination before publishing either listing.
         let workspace_page =
             fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string());
         let (mut apps, workspace_page) =
             tokio::try_join!(list_directory_connectors(&mut fetch_page), workspace_page)?;
         apps.extend(
-            workspace_page
-                .apps
-                .into_iter()
-                .filter(|app| !is_hidden_directory_app(app)),
+            list_directory_pages(
+                &mut fetch_page,
+                "/connectors/directory/list_workspace",
+                workspace_page,
+            )
+            .await?,
         );
         apps
     } else {
@@ -317,25 +319,29 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = anyhow::Result<DirectoryListResponse>>,
 {
+    let response = fetch_page("/connectors/directory/list?external_logos=true".to_string()).await?;
+    list_directory_pages(fetch_page, "/connectors/directory/list", response).await
+}
+
+async fn list_directory_pages<F, Fut>(
+    fetch_page: &mut F,
+    directory_path: &str,
+    mut response: DirectoryListResponse,
+) -> anyhow::Result<Vec<DirectoryApp>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<DirectoryListResponse>>,
+{
     let mut apps = Vec::new();
-    let mut next_token: Option<String> = None;
     let mut seen_tokens = HashSet::new();
     loop {
-        let path = match next_token.as_deref() {
-            Some(token) => {
-                let encoded_token = urlencoding::encode(token);
-                format!("/connectors/directory/list?token={encoded_token}&external_logos=true")
-            }
-            None => "/connectors/directory/list?external_logos=true".to_string(),
-        };
-        let response = fetch_page(path).await?;
         apps.extend(
             response
                 .apps
                 .into_iter()
                 .filter(|app| !is_hidden_directory_app(app)),
         );
-        next_token = response
+        let next_token = response
             .next_token
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty());
@@ -346,6 +352,11 @@ where
             seen_tokens.insert(token.clone()),
             "connector directory returned a repeated pagination token"
         );
+        let encoded_token = urlencoding::encode(token);
+        response = fetch_page(format!(
+            "{directory_path}?token={encoded_token}&external_logos=true"
+        ))
+        .await?;
     }
     Ok(apps)
 }
@@ -596,6 +607,110 @@ mod tests {
 
     static CONNECTOR_DIRECTORY_CACHE_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test]
+    async fn workspace_pagination_is_complete_and_reused_without_granting_access()
+    -> anyhow::Result<()> {
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let home = TempDir::new()?;
+        let context = cache_context(&home, "workspace-pages", true);
+        let mut paths = Vec::new();
+        let connectors = list_all_connectors_with_options(context.clone(), false, |path| {
+            paths.push(path.clone());
+            async move {
+                let (apps, next_token) = match path.as_str() {
+                    "/connectors/directory/list?external_logos=true" => {
+                        (vec![app("alpha", "Alpha")], None)
+                    }
+                    "/connectors/directory/list_workspace?external_logos=true" => {
+                        (vec![app("beta", "Beta")], Some("page 2&x".to_string()))
+                    }
+                    "/connectors/directory/list_workspace?token=page%202%26x&external_logos=true" => {
+                        (vec![
+                            app("gamma", "Gamma"),
+                            DirectoryApp {
+                                description: Some("Workspace description".to_string()),
+                                ..app("alpha", "Alpha")
+                            },
+                            DirectoryApp {
+                                visibility: Some("HIDDEN".to_string()),
+                                ..app("hidden", "Hidden")
+                            },
+                        ], None)
+                    }
+                    _ => anyhow::bail!("unexpected directory path: {path}"),
+                };
+                Ok(DirectoryListResponse { apps, next_token })
+            }
+        })
+        .await?;
+        assert_eq!(paths.len(), 3);
+        assert_eq!(
+            connectors
+                .iter()
+                .map(|app| app.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        assert_eq!(
+            connectors[0].description.as_deref(),
+            Some("Workspace description")
+        );
+        assert!(connectors.iter().all(|app| !app.is_accessible));
+        let cached = list_all_connectors_with_options(context.clone(), false, |_| async {
+            anyhow::bail!("warm directory must not fetch")
+        })
+        .await?;
+        assert_eq!(cached, connectors);
+        clear_directory_memory_cache();
+        assert_eq!(cached_directory_connectors(&context), Some(connectors));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_pagination_failure_preserves_complete_memory_and_disk_cache()
+    -> anyhow::Result<()> {
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let home = TempDir::new()?;
+        let context = cache_context(&home, "workspace-pages-failure", true);
+        let previous = vec![directory_app_to_app_info(app("previous", "Previous"))];
+        write_cached_directory_connectors(&context, &previous);
+        let disk_before = std::fs::read(context.cache_path())?;
+        for cycle in [false, true] {
+            let mut workspace_calls = 0;
+            let result = list_all_connectors_with_options(context.clone(), true, |path| {
+                let workspace = path.starts_with("/connectors/directory/list_workspace");
+                if workspace {
+                    workspace_calls += 1;
+                }
+                let page = workspace_calls;
+                async move {
+                    if workspace && page > 1 && !cycle {
+                        anyhow::bail!("workspace page failed");
+                    }
+                    anyhow::ensure!(page <= 2, "unexpected extra page");
+                    Ok(DirectoryListResponse {
+                        apps: vec![app("partial", "Partial")],
+                        next_token: workspace.then(|| "again".to_string()),
+                    })
+                }
+            })
+            .await;
+            let error = result.expect_err("incomplete workspace listing must fail");
+            assert!(error.to_string().contains(if cycle {
+                "repeated pagination token"
+            } else {
+                "workspace page failed"
+            }));
+            assert_eq!(workspace_calls, 2);
+            assert_eq!(
+                cached_directory_connectors(&context),
+                Some(previous.clone())
+            );
+            assert_eq!(std::fs::read(context.cache_path())?, disk_before);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn alternating_scopes_keep_independent_fresh_snapshots_with_bounded_storage() {

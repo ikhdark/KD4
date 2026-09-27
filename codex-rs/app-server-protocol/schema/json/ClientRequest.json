@@ -6307,6 +6307,29 @@
         },
         "method": {
           "enum": [
+            "account/gatewayOAuth/read"
+          ],
+          "title": "Account/gatewayOAuth/readRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "Account/gatewayOAuth/readRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
             "modelProvider/capabilities/read"
           ],
           "title": "ModelProvider/capabilities/readRequestMethod",

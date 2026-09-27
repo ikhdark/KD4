@@ -84,6 +84,7 @@ pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
                     command.arg(notify_payload);
                 }
 
+                command.current_dir(payload.cwd.as_path());
                 let result =
                     crate::engine::command_runner::run_finalizer_command(command, 600).await;
                 match (result.exit_code, result.error) {
@@ -232,6 +233,54 @@ mod tests {
         assert_eq!(actual, expected_notification_json());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutating_finalizer_dispatch_uses_task_cwd() {
+        let directory = tempfile::tempdir().expect("task directory");
+        std::fs::write(directory.path().join("finalizer-input.txt"), "input")
+            .expect("write task input");
+        #[cfg(windows)]
+        let argv = {
+            let script = directory.path().join("finalize.ps1");
+            std::fs::write(
+                &script,
+                "if ((Get-Content -LiteralPath ./finalizer-input.txt -Raw) -ne 'input') { exit 1 }; Set-Content -LiteralPath ./finalizer-output.txt -NoNewline -Value done",
+            )
+            .expect("write finalizer script");
+            vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-File".to_string(),
+                script.to_string_lossy().into_owned(),
+            ]
+        };
+        #[cfg(not(windows))]
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "test \"$(cat finalizer-input.txt)\" = input && printf done > finalizer-output.txt"
+                .to_string(),
+        ];
+        let hooks = crate::Hooks::new(crate::HooksConfig {
+            legacy_notify_argv: Some(argv),
+            mutating_finalizer: true,
+            ..Default::default()
+        });
+        let outcomes = hooks.dispatch(after_agent_payload(directory.path())).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].result, HookResult::Success));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("finalizer-output.txt"))
+                .expect("finalizer wrote in task directory"),
+            "done"
+        );
+
+        let outcomes = hooks
+            .dispatch(after_agent_payload(&directory.path().join("missing")))
+            .await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].result, HookResult::FailedAbort(_)));
     }
 
     #[tokio::test]

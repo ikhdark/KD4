@@ -2181,7 +2181,7 @@ impl GitWorkspaceCache {
             .pop()
     }
 
-    /// Establish one retained repository watch for the whole dependency set.
+    /// Share one repository watch, retaining narrow watches for external inputs.
     /// Canonicalization finishes before the observation generation is captured.
     pub(crate) async fn begin_source_path_change_observations(
         &self,
@@ -2197,22 +2197,49 @@ impl GitWorkspaceCache {
         }
         let repo_root = repo_root.to_path_buf();
         let paths = paths.to_vec();
-        let (repo_root, paths) = tokio::task::spawn_blocking(move || {
+        let paths = tokio::task::spawn_blocking(move || {
             let repo_root = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
-            let paths = paths
+            paths
                 .into_iter()
-                .filter_map(|(path, recursive)| {
+                .map(|(path, recursive)| {
                     let path = dunce::canonicalize(&path).unwrap_or(path);
-                    path_is_same_or_descendant(&path, &repo_root).then_some((path, recursive))
+                    let watch_root = if path_is_same_or_descendant(&path, &repo_root) {
+                        repo_root.clone()
+                    } else {
+                        // FileWatcher handles files and missing paths without
+                        // recursively watching their entire parent directory.
+                        path.clone()
+                    };
+                    (watch_root, path, recursive)
                 })
-                .collect::<Vec<_>>();
-            (repo_root, paths)
+                .collect::<Vec<_>>()
         })
         .await
         .ok()?;
-        if paths.is_empty() {
-            return Some(Vec::new());
+        let mut registrations = BTreeMap::new();
+        for (watch_root, _, _) in &paths {
+            if !registrations.contains_key(watch_root) {
+                let generation = self.retain_source_watch(watch_root).await?;
+                registrations.insert(watch_root.clone(), generation);
+            }
         }
+        let watcher_generation = self.reliable_source_watcher_generation()?;
+        Some(
+            paths
+                .into_iter()
+                .map(|(watch_root, path, recursive)| SourcePathChangeObservation {
+                    watcher_epoch: self.watcher_epoch,
+                    watcher_generation,
+                    registration_generation: registrations[&watch_root],
+                    repo_root: watch_root,
+                    path,
+                    recursive,
+                })
+                .collect(),
+        )
+    }
+
+    async fn retain_source_watch(&self, repo_root: &Path) -> Option<u64> {
         let existing_generation = {
             let mut retention = self
                 .repository_retention
@@ -2220,10 +2247,10 @@ impl GitWorkspaceCache {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let generation = retention
                 .source_watch_registrations
-                .get(&repo_root)
+                .get(repo_root)
                 .map(|registration| registration.generation);
             if generation.is_some() {
-                retention.touch(&repo_root);
+                retention.touch(repo_root);
             }
             generation
         };
@@ -2239,7 +2266,7 @@ impl GitWorkspaceCache {
                 .register(
                     GitWatchKind::Source,
                     vec![WatchPath {
-                        path: repo_root.clone(),
+                        path: repo_root.to_path_buf(),
                         recursive: true,
                     }],
                 )
@@ -2250,12 +2277,12 @@ impl GitWorkspaceCache {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let generation =
-                if let Some(existing) = retention.source_watch_registrations.get(&repo_root) {
+                if let Some(existing) = retention.source_watch_registrations.get(repo_root) {
                     existing.generation
                 } else {
                     let generation = retention.allocate_registration_generation();
                     retention.source_watch_registrations.insert(
-                        repo_root.clone(),
+                        repo_root.to_path_buf(),
                         RetainedSourceWatchRegistration {
                             generation,
                             _registration: registration,
@@ -2263,23 +2290,10 @@ impl GitWorkspaceCache {
                     );
                     generation
                 };
-            retention.touch(&repo_root);
+            retention.touch(repo_root);
             generation
         };
-        let watcher_generation = self.reliable_source_watcher_generation()?;
-        Some(
-            paths
-                .into_iter()
-                .map(|(path, recursive)| SourcePathChangeObservation {
-                    watcher_epoch: self.watcher_epoch,
-                    watcher_generation,
-                    registration_generation,
-                    repo_root: repo_root.clone(),
-                    path,
-                    recursive,
-                })
-                .collect(),
-        )
+        Some(registration_generation)
     }
 
     pub(crate) fn source_path_change_observation_is_current(

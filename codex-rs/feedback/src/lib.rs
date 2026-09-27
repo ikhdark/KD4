@@ -307,6 +307,7 @@ impl Write for FeedbackWriter {
 struct RingBuffer {
     max: usize,
     buf: VecDeque<u8>,
+    dropped_bytes: usize,
 }
 
 impl RingBuffer {
@@ -314,6 +315,7 @@ impl RingBuffer {
         Self {
             max: capacity,
             buf: VecDeque::with_capacity(capacity),
+            dropped_bytes: 0,
         }
     }
 
@@ -325,6 +327,9 @@ impl RingBuffer {
         if data.is_empty() {
             return;
         }
+
+        let dropped = data.len().saturating_sub(self.max - self.len());
+        self.dropped_bytes = self.dropped_bytes.saturating_add(dropped);
 
         // If the incoming chunk is larger than capacity, keep only the trailing bytes.
         if data.len() >= self.max {
@@ -345,7 +350,18 @@ impl RingBuffer {
     }
 
     fn snapshot_bytes(&self) -> Vec<u8> {
-        self.buf.iter().copied().collect()
+        if self.dropped_bytes == 0 {
+            return self.buf.iter().copied().collect();
+        }
+        // Add the marker only at capture time so it cannot evict useful log bytes.
+        let mut bytes = format!(
+            "[codex-feedback: log truncated; {} earlier bytes discarded]\n",
+            self.dropped_bytes
+        )
+        .into_bytes();
+        bytes.reserve(self.buf.len());
+        bytes.extend(self.buf.iter().copied());
+        bytes
     }
 }
 
@@ -1233,7 +1249,54 @@ mod tests {
         }
         let snap = fb.snapshot(/*session_id*/ None);
         // Capacity 8: after writing 10 bytes, we should keep the last 8.
-        pretty_assertions::assert_eq!(std::str::from_utf8(snap.as_bytes()).unwrap(), "cdefghij");
+        assert_eq!(
+            snap.as_bytes(),
+            b"[codex-feedback: log truncated; 2 earlier bytes discarded]\ncdefghij"
+        );
+    }
+
+    #[test]
+    fn truncated_logs_keep_disclosure_in_exports_and_uploads_but_not_overrides() {
+        let fb = CodexFeedback::with_capacity(8);
+        let mut writer = fb.make_writer().make_writer();
+        writer.write_all(b"first").unwrap();
+        let complete = fb.snapshot(None);
+        assert_eq!(complete.as_bytes(), b"first");
+        writer.write_all(b"0123456789").unwrap();
+        writer.write_all(b"AB").unwrap();
+        let snapshot = fb.snapshot(None);
+        let expected = b"[codex-feedback: log truncated; 9 earlier bytes discarded]\n456789AB";
+        assert_eq!(snapshot.as_bytes(), expected);
+        assert_eq!(complete.as_bytes(), b"first");
+
+        let path = snapshot.save_to_temp_file().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        fs::remove_file(path).unwrap();
+        let (attachments, omitted) = snapshot.feedback_attachments(true, &[], &[], None);
+        assert_eq!(attachments[0].filename, "codex-logs.log");
+        assert_eq!(attachments[0].buffer, expected);
+        assert!(omitted.is_empty());
+        let (attachments, _) =
+            snapshot.feedback_attachments(true, &[], &[], Some(b"sqlite logs".to_vec()));
+        assert_eq!(attachments[0].buffer, b"sqlite logs");
+        let (attachments, omitted) = snapshot.feedback_attachments(false, &[], &[], None);
+        assert!(attachments.is_empty());
+        assert!(omitted.is_empty());
+    }
+
+    #[test]
+    fn ring_buffer_discloses_zero_capacity_and_keeps_exact_capacity_complete() {
+        let mut ring = RingBuffer::new(0);
+        ring.push_bytes(b"");
+        assert!(ring.snapshot_bytes().is_empty());
+        ring.push_bytes(b"lost");
+        assert_eq!(
+            ring.snapshot_bytes(),
+            b"[codex-feedback: log truncated; 4 earlier bytes discarded]\n"
+        );
+        let mut ring = RingBuffer::new(4);
+        ring.push_bytes(b"kept");
+        assert_eq!(ring.snapshot_bytes(), b"kept");
     }
 
     #[test]

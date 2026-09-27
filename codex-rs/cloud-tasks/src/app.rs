@@ -54,14 +54,11 @@ pub struct App {
     pub details_inflight: bool,
     // Environment filter state
     pub env_filter: Option<String>,
-    // Set once the user picks an environment; autodetection never replaces that choice.
-    pub env_selected_by_user: bool,
-    // One environment-list request at a time; the modal waits for the in-flight result.
-    pub env_fetch_inflight: bool,
     pub env_modal: Option<EnvModalState>,
     pub apply_modal: Option<ApplyModalState>,
     pub best_of_modal: Option<BestOfModalState>,
     pub environments: Vec<EnvironmentRow>,
+    pub env_last_loaded: Option<std::time::Instant>,
     pub env_loading: bool,
     pub env_error: Option<String>,
     // New Task page
@@ -88,12 +85,11 @@ impl App {
             refresh_inflight: false,
             details_inflight: false,
             env_filter: None,
-            env_selected_by_user: false,
-            env_fetch_inflight: false,
             env_modal: None,
             apply_modal: None,
             best_of_modal: None,
             environments: Vec::new(),
+            env_last_loaded: None,
             env_loading: false,
             env_error: None,
             new_task: None,
@@ -120,134 +116,6 @@ impl App {
             self.selected -= 1;
         }
     }
-
-    pub(crate) fn begin_task_list_refresh(&mut self) -> u64 {
-        self.refresh_inflight = true;
-        self.list_generation = self.list_generation.saturating_add(1);
-        self.list_generation
-    }
-
-    /// Claims the environment-list request slot; false while a request is in flight.
-    pub(crate) fn begin_environment_fetch(&mut self) -> bool {
-        !std::mem::replace(&mut self.env_fetch_inflight, true)
-    }
-
-    /// Environments matching an environment-modal query, in display order.
-    pub(crate) fn filtered_environments(&self, query: &str) -> Vec<&EnvironmentRow> {
-        let query = query.to_lowercase();
-        self.environments
-            .iter()
-            .filter(|row| {
-                if query.is_empty() {
-                    return true;
-                }
-                let mut hay = String::new();
-                if let Some(label) = &row.label {
-                    hay.push_str(&label.to_lowercase());
-                    hay.push(' ');
-                }
-                hay.push_str(&row.id.to_lowercase());
-                if let Some(hints) = &row.repo_hints {
-                    hay.push(' ');
-                    hay.push_str(&hints.to_lowercase());
-                }
-                hay.contains(&query)
-            })
-            .collect()
-    }
-
-    /// The row the modal highlights: 0 is "All", and larger indices clamp to the last match.
-    pub(crate) fn env_modal_selection(&self, state: &EnvModalState) -> Option<&EnvironmentRow> {
-        let filtered = self.filtered_environments(&state.query);
-        match state.selected.min(filtered.len()) {
-            0 => None,
-            index => Some(filtered[index - 1]),
-        }
-    }
-
-    /// Applies an explicit environment choice, including "All" (`None`).
-    pub(crate) fn select_environment(&mut self, env: Option<String>) {
-        self.env_filter = env;
-        self.env_selected_by_user = true;
-        if let Some(page) = self.new_task.as_mut() {
-            page.env_id = self.env_filter.clone();
-        }
-    }
-
-    /// Applies an autodetected environment unless the user already chose one.
-    /// Returns whether the filter changed and the task list must be reloaded.
-    pub(crate) fn apply_autodetected_environment(
-        &mut self,
-        selection: crate::env_detect::AutodetectSelection,
-    ) -> bool {
-        if self.env_selected_by_user || self.env_filter.as_deref() == Some(selection.id.as_str()) {
-            return false;
-        }
-        // Preseed the label so the header can name it before the environment list arrives.
-        if let Some(label) = selection.label
-            && !self.environments.iter().any(|row| row.id == selection.id)
-        {
-            self.environments.push(EnvironmentRow {
-                id: selection.id.clone(),
-                label: Some(label),
-                is_pinned: false,
-                repo_hints: None,
-            });
-        }
-        self.env_filter = Some(selection.id);
-        true
-    }
-
-    pub(crate) fn apply_environments_loaded(
-        &mut self,
-        result: anyhow::Result<Vec<EnvironmentRow>>,
-    ) {
-        self.env_loading = false;
-        self.env_fetch_inflight = false;
-        match result {
-            Ok(list) => {
-                self.environments = list;
-                self.env_error = None;
-            }
-            Err(error) => self.env_error = Some(error.to_string()),
-        }
-    }
-
-    pub(crate) fn apply_tasks_loaded(
-        &mut self,
-        generation: u64,
-        env: Option<&str>,
-        result: anyhow::Result<Vec<TaskSummary>>,
-    ) -> TasksLoadedOutcome {
-        if generation != self.list_generation || env != self.env_filter.as_deref() {
-            return TasksLoadedOutcome::Stale;
-        }
-
-        self.refresh_inflight = false;
-        match result {
-            Ok(tasks) => {
-                let count = tasks.len();
-                self.tasks = tasks;
-                if self.selected >= self.tasks.len() {
-                    self.selected = self.tasks.len().saturating_sub(1);
-                }
-                self.status = "Loaded tasks".to_string();
-                TasksLoadedOutcome::Loaded { count }
-            }
-            Err(error) => {
-                let error = error.to_string();
-                self.status = format!("Failed to load tasks: {error}");
-                TasksLoadedOutcome::Failed { error }
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TasksLoadedOutcome {
-    Stale,
-    Loaded { count: usize },
-    Failed { error: String },
 }
 
 pub async fn load_tasks(
@@ -272,9 +140,12 @@ pub struct DiffOverlay {
     pub base_can_apply: bool,
     pub diff_lines: Vec<String>,
     pub text_lines: Vec<String>,
+    pub prompt: Option<String>,
     pub attempts: Vec<AttemptView>,
     pub selected_attempt: usize,
     pub current_view: DetailView,
+    pub base_turn_id: Option<String>,
+    pub sibling_turn_ids: Vec<String>,
     pub attempt_total_hint: Option<usize>,
 }
 
@@ -310,9 +181,12 @@ impl DiffOverlay {
             base_can_apply: false,
             diff_lines: Vec::new(),
             text_lines: Vec::new(),
+            prompt: None,
             attempts: vec![AttemptView::default()],
             selected_attempt: 0,
             current_view: DetailView::Prompt,
+            base_turn_id: None,
+            sibling_turn_ids: Vec::new(),
             attempt_total_hint,
         }
     }
@@ -377,17 +251,23 @@ impl DiffOverlay {
     }
 
     pub fn apply_selection_to_fields(&mut self) {
-        let (diff_lines, text_lines) = if let Some(attempt) = self.current_attempt() {
-            (attempt.diff_lines.clone(), attempt.text_lines.clone())
+        let (diff_lines, text_lines, prompt) = if let Some(attempt) = self.current_attempt() {
+            (
+                attempt.diff_lines.clone(),
+                attempt.text_lines.clone(),
+                attempt.prompt.clone(),
+            )
         } else {
             self.diff_lines.clear();
             self.text_lines.clear();
+            self.prompt = None;
             self.sd.set_content(vec!["<loading attempt>".to_string()]);
             return;
         };
 
         self.diff_lines = diff_lines.clone();
         self.text_lines = text_lines.clone();
+        self.prompt = prompt;
 
         match self.current_view {
             DetailView::Diff => {
@@ -419,7 +299,6 @@ pub enum DetailView {
 #[derive(Debug)]
 pub enum AppEvent {
     TasksLoaded {
-        generation: u64,
         env: Option<String>,
         result: anyhow::Result<Vec<TaskSummary>>,
     },
@@ -454,12 +333,6 @@ pub enum AppEvent {
     },
     /// Background completion of new task submission
     NewTaskSubmitted(Result<codex_cloud_tasks_client::CreatedTask, String>),
-    /// Background completion of the diff fetch for applying a task from the list
-    ApplyDiffLoaded {
-        id: TaskId,
-        title: String,
-        result: std::result::Result<Option<String>, String>,
-    },
     /// Background completion of apply preflight when opening modal or on demand
     ApplyPreflightFinished {
         id: TaskId,
@@ -508,7 +381,7 @@ mod tests {
                     id: TaskId(format!("T-{i}")),
                     title: t.to_string(),
                     status: codex_cloud_tasks_client::TaskStatus::Ready,
-                    updated_at: Some(Utc::now()),
+                    updated_at: Utc::now(),
                     environment_id: env.map(str::to_string),
                     environment_label: None,
                     summary: codex_cloud_tasks_client::DiffSummary::default(),
@@ -540,21 +413,18 @@ mod tests {
                 .ok_or_else(|| CloudTaskError::Msg(format!("Task {} not found", id.0)))
         }
 
-        async fn get_task_text_and_diff(
+        async fn get_task_text(
             &self,
             _id: TaskId,
-        ) -> Result<(codex_cloud_tasks_client::TaskText, Option<String>), CloudTaskError> {
-            Ok((
-                codex_cloud_tasks_client::TaskText {
-                    prompt: Some("Example prompt".to_string()),
-                    messages: Vec::new(),
-                    turn_id: Some("fake-turn".to_string()),
-                    sibling_turn_ids: Vec::new(),
-                    attempt_placement: Some(0),
-                    attempt_status: codex_cloud_tasks_client::AttemptStatus::Completed,
-                },
-                None,
-            ))
+        ) -> Result<codex_cloud_tasks_client::TaskText, CloudTaskError> {
+            Ok(codex_cloud_tasks_client::TaskText {
+                prompt: Some("Example prompt".to_string()),
+                messages: Vec::new(),
+                turn_id: Some("fake-turn".to_string()),
+                sibling_turn_ids: Vec::new(),
+                attempt_placement: Some(0),
+                attempt_status: codex_cloud_tasks_client::AttemptStatus::Completed,
+            })
         }
     }
 
@@ -580,11 +450,15 @@ mod tests {
             })
         }
 
-        fn get_task_text_and_diff(
+        fn get_task_messages(&self, _id: TaskId) -> CloudBackendFuture<'_, Vec<String>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn get_task_text(
             &self,
             id: TaskId,
-        ) -> CloudBackendFuture<'_, (codex_cloud_tasks_client::TaskText, Option<String>)> {
-            Box::pin(FakeBackend::get_task_text_and_diff(self, id))
+        ) -> CloudBackendFuture<'_, codex_cloud_tasks_client::TaskText> {
+            Box::pin(FakeBackend::get_task_text(self, id))
         }
 
         fn list_sibling_attempts(
@@ -656,106 +530,5 @@ mod tests {
         let b = load_tasks(&backend, Some("env-B")).await.unwrap();
         assert_eq!(b.len(), 3);
         assert_eq!(b[2].title, "B-3");
-    }
-
-    fn environment(id: &str, label: &str) -> EnvironmentRow {
-        EnvironmentRow {
-            id: id.to_string(),
-            label: Some(label.to_string()),
-            is_pinned: false,
-            repo_hints: None,
-        }
-    }
-
-    fn detected(id: &str) -> crate::env_detect::AutodetectSelection {
-        crate::env_detect::AutodetectSelection {
-            id: id.to_string(),
-            label: Some(format!("{id} label")),
-        }
-    }
-
-    #[test]
-    fn explicit_environment_choice_is_never_replaced_by_autodetection() {
-        let mut app = App::new();
-        assert!(app.apply_autodetected_environment(detected("env-a")));
-        assert_eq!(app.env_filter.as_deref(), Some("env-a"));
-
-        app.new_task = Some(crate::new_task::NewTaskPage::new(app.env_filter.clone(), 1));
-        // Choosing "All" is explicit too, and it retargets the open New Task page.
-        app.select_environment(None);
-        assert!(!app.apply_autodetected_environment(detected("env-b")));
-        assert_eq!(app.env_filter, None);
-        assert_eq!(
-            app.new_task.as_ref().and_then(|page| page.env_id.clone()),
-            None
-        );
-    }
-
-    #[test]
-    fn env_modal_selection_matches_the_clamped_highlighted_row() {
-        let mut app = App::new();
-        app.environments = vec![
-            environment("env-a", "Alpha"),
-            environment("env-b", "Beta"),
-            environment("env-c", "Beta two"),
-        ];
-        let state = |query: &str, selected: usize| EnvModalState {
-            query: query.to_string(),
-            selected,
-        };
-        let selected_id =
-            |state: EnvModalState| app.env_modal_selection(&state).map(|row| row.id.clone());
-
-        assert_eq!(selected_id(state("", 0)), None);
-        assert_eq!(selected_id(state("", 2)).as_deref(), Some("env-b"));
-        // End or PageDown can move past a filtered list; the modal highlights the last match.
-        assert_eq!(selected_id(state("beta", 10)).as_deref(), Some("env-c"));
-    }
-
-    #[test]
-    fn environment_list_requests_wait_for_the_one_in_flight() {
-        let mut app = App::new();
-        assert!(app.begin_environment_fetch());
-        assert!(!app.begin_environment_fetch());
-        app.apply_environments_loaded(Ok(Vec::new()));
-        assert!(app.begin_environment_fetch());
-    }
-
-    #[test]
-    fn stale_same_environment_task_generation_cannot_overwrite_newer_result() {
-        fn task(title: &str) -> TaskSummary {
-            TaskSummary {
-                id: TaskId(title.to_string()),
-                title: title.to_string(),
-                status: codex_cloud_tasks_client::TaskStatus::Ready,
-                updated_at: Some(Utc::now()),
-                environment_id: Some("env-A".to_string()),
-                environment_label: None,
-                summary: codex_cloud_tasks_client::DiffSummary::default(),
-                is_review: false,
-                attempt_total: Some(1),
-            }
-        }
-
-        let mut app = App::new();
-        app.env_filter = Some("env-A".to_string());
-        let older_generation = app.begin_task_list_refresh();
-        let newer_generation = app.begin_task_list_refresh();
-
-        assert_eq!(
-            app.apply_tasks_loaded(newer_generation, Some("env-A"), Ok(vec![task("newer")]),),
-            TasksLoadedOutcome::Loaded { count: 1 }
-        );
-        assert_eq!(app.tasks[0].title, "newer");
-        assert_eq!(app.status, "Loaded tasks");
-        assert!(!app.refresh_inflight);
-
-        assert_eq!(
-            app.apply_tasks_loaded(older_generation, Some("env-A"), Ok(vec![task("older")]),),
-            TasksLoadedOutcome::Stale
-        );
-        assert_eq!(app.tasks[0].title, "newer");
-        assert_eq!(app.status, "Loaded tasks");
-        assert!(!app.refresh_inflight);
     }
 }

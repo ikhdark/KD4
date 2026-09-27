@@ -65,6 +65,99 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
+    fn releases_malformed_tag_prefixes_as_soon_as_whitespace_disproves_them() {
+        for (tag, in_plan) in [("<proposed_plan>", false), ("</proposed_plan>", true)] {
+            for end in 1..tag.len() {
+                for whitespace in [" ", "\t", "\r", "\u{2003}"] {
+                    let mut parser = AssistantTextStreamParser::new(true);
+                    if in_plan {
+                        assert_eq!(
+                            parser.push_str("<proposed_plan>\n").plan_segments,
+                            vec![ProposedPlanSegment::ProposedPlanStart]
+                        );
+                    }
+                    assert!(parser.push_str(&tag[..end]).is_empty());
+                    let text = format!("{}{whitespace}", &tag[..end]);
+                    let parsed = parser.push_str(whitespace);
+                    if in_plan {
+                        assert_eq!(parsed.visible_text, "");
+                        assert_eq!(
+                            parsed.plan_segments,
+                            vec![ProposedPlanSegment::ProposedPlanDelta(text)]
+                        );
+                        assert_eq!(
+                            parser.finish().plan_segments,
+                            vec![ProposedPlanSegment::ProposedPlanEnd]
+                        );
+                    } else {
+                        assert_eq!(parsed.visible_text, text);
+                        assert_eq!(
+                            parsed.plan_segments,
+                            vec![ProposedPlanSegment::Normal(text)]
+                        );
+                        assert!(parser.finish().is_empty());
+                    }
+                    assert!(parser.finish().is_empty());
+                    assert_eq!(parser.push_str("reused").visible_text, "reused");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_plan_content_across_every_unicode_chunk_boundary() {
+        let source = "Intro 雪\r\n\u{2003}<proposed_plan> \t\r\n<proposed \u{2003}\n- 🦀\n</proposed_plan> \u{2003}\r\nOutro <proposed";
+        let assert_chunks = |chunks: Vec<&str>| {
+            let mut parser = AssistantTextStreamParser::new(true);
+            let mut visible = String::new();
+            let mut plan = String::new();
+            let mut active = false;
+            let mut starts = 0;
+            let mut ends = 0;
+            let mut outputs: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| parser.push_str(chunk))
+                .collect();
+            outputs.push(parser.finish());
+            for output in outputs {
+                visible.push_str(&output.visible_text);
+                for segment in output.plan_segments {
+                    match segment {
+                        ProposedPlanSegment::Normal(_) => assert!(!active),
+                        ProposedPlanSegment::ProposedPlanStart => {
+                            assert!(!active);
+                            active = true;
+                            starts += 1;
+                        }
+                        ProposedPlanSegment::ProposedPlanDelta(text) => {
+                            assert!(active);
+                            plan.push_str(&text);
+                        }
+                        ProposedPlanSegment::ProposedPlanEnd => {
+                            assert!(active);
+                            active = false;
+                            ends += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(visible, "Intro 雪\r\nOutro <proposed");
+            assert_eq!(plan, "<proposed \u{2003}\n- 🦀\n");
+            assert_eq!((starts, ends, active), (1, 1, false));
+            assert!(parser.finish().is_empty());
+        };
+        for split in (0..=source.len()).filter(|&i| source.is_char_boundary(i)) {
+            assert_chunks(vec![&source[..split], &source[split..]]);
+        }
+        assert_chunks(
+            source
+                .char_indices()
+                .map(|(i, ch)| &source[i..i + ch.len_utf8()])
+                .collect(),
+        );
+    }
+
+    #[test]
     fn passes_literal_markup_through_outside_plan_mode() {
         let mut parser = AssistantTextStreamParser::new(/*plan_mode*/ false);
 

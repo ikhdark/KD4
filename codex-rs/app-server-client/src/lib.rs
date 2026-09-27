@@ -11,8 +11,11 @@
 //! - Bounded graceful shutdown with abort fallback.
 //!
 //! Each transport interposes a worker task between the caller and the underlying
-//! runtime or connection. Command and event queues are bounded; these queue
-//! capacities do not bound the number of dispatched requests awaiting responses.
+//! runtime or connection. Command/event queues and dispatched requests awaiting
+//! responses are each bounded by the configured channel capacity. Excess requests
+//! receive a retryable `inFlightTaskCapacity` overload error before dispatch.
+//! Cancelling a dispatched request's waiter does not cancel server-side work or
+//! release its request ID/capacity; the response or transport shutdown does that.
 
 mod path;
 mod remote;
@@ -405,7 +408,7 @@ impl Error for TypedRequestError {
 }
 
 impl TypedRequestError {
-    /// Returns the server's structured JSON-RPC error when this request reached the server.
+    /// Returns the structured JSON-RPC error, including local pre-dispatch overloads.
     pub fn server_error(&self) -> Option<&JSONRPCErrorError> {
         match self {
             Self::Server { source, .. } => Some(source),
@@ -455,7 +458,8 @@ pub struct InProcessClientStartArgs {
     pub mcp_server_openai_form_elicitation: bool,
     /// Notification methods this client opts out of receiving.
     pub opt_out_notification_methods: Vec<String>,
-    /// Queue capacity for command/event channels (clamped to at least 1).
+    /// Capacity for command/event channels and dispatched requests awaiting replies
+    /// (clamped to at least 1). Excess requests receive a retryable overload error.
     pub channel_capacity: usize,
 }
 
@@ -1890,6 +1894,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1998,6 +2003,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -2078,6 +2084,7 @@ mod tests {
         assert_eq!(
             response,
             GetAccountResponse {
+                workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
             }
@@ -2189,6 +2196,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -2242,6 +2250,7 @@ mod tests {
         assert_eq!(
             first_response,
             GetAccountResponse {
+                workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
             }
@@ -2252,6 +2261,164 @@ mod tests {
             .await
             .expect("server should finish")
             .expect("server assertions should pass");
+    }
+
+    #[tokio::test]
+    async fn remote_in_flight_capacity_survives_cancellation_and_releases_on_reply() {
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(first) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("first request");
+            };
+            assert_eq!(first.id, RequestId::Integer(1));
+            seen_tx.send(()).expect("first request observed");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("approval".into()),
+                    method: "item/tool/requestUserInput".into(),
+                    params: Some(serde_json::json!({
+                        "threadId": "thread", "turnId": "turn", "itemId": "item",
+                        "questions": []
+                    })),
+                    trace: None,
+                }),
+            )
+            .await;
+            // Neither rejected request may reach the wire. Control replies must
+            // still pass while the request budget is exhausted.
+            let JSONRPCMessage::Response(control) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected control reply, not another dispatched request");
+            };
+            assert_eq!(control.id, RequestId::String("approval".into()));
+            assert_eq!(control.result, serde_json::json!({"approved": true}));
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: first.id,
+                    result: serde_json::json!({"late": true}),
+                }),
+            )
+            .await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(turn_completed_notification())
+                            .expect("terminal notification JSON"),
+                    )
+                    .expect("terminal notification"),
+                ),
+            )
+            .await;
+            for id in [1, 3] {
+                let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+                else {
+                    panic!("request after capacity released");
+                };
+                assert_eq!(request.id, RequestId::Integer(id));
+                let reply = if id == 1 {
+                    JSONRPCMessage::Error(codex_app_server_protocol::JSONRPCError {
+                        id: request.id,
+                        error: JSONRPCErrorError {
+                            code: -32602,
+                            message: "new request failed".into(),
+                            data: None,
+                        },
+                    })
+                } else {
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::json!({"recovered": true}),
+                    })
+                };
+                write_websocket_message(&mut websocket, reply).await;
+            }
+            let _ = websocket.next().await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            channel_capacity: 1,
+            ..test_remote_connect_args(websocket_url)
+        })
+        .await
+        .expect("connect");
+        let handle = client.request_handle();
+        let request = |id| JSONRPCRequest {
+            id: RequestId::Integer(id),
+            method: "test/pending".into(),
+            params: None,
+            trace: None,
+        };
+        let mut first = Box::pin(handle.request_json_rpc(request(1)));
+        assert!(futures::poll!(&mut first).is_pending());
+        timeout(Duration::from_secs(2), seen_rx)
+            .await
+            .expect("first request dispatched")
+            .expect("server signal");
+        drop(first);
+
+        let duplicate = timeout(Duration::from_secs(2), handle.request_json_rpc(request(1)))
+            .await
+            .expect("duplicate rejected promptly")
+            .expect_err("cancelled waiter still reserves its ID");
+        assert_eq!(duplicate.kind(), ErrorKind::InvalidInput);
+        let overload = timeout(Duration::from_secs(2), handle.request_json_rpc(request(2)))
+            .await
+            .expect("overload rejected promptly")
+            .expect("transport remains connected")
+            .expect_err("dispatched request still occupies capacity");
+        assert_eq!(
+            overload.code,
+            codex_app_server_protocol::OVERLOADED_ERROR_CODE
+        );
+        assert_eq!(
+            overload.data,
+            Some(serde_json::json!({"reason": "inFlightTaskCapacity", "retryable": true}))
+        );
+        let Some(AppServerEvent::ServerRequest(approval)) =
+            timeout(Duration::from_secs(2), client.next_event())
+                .await
+                .expect("approval delivered at capacity")
+        else {
+            panic!("expected approval request");
+        };
+        assert_eq!(approval.id(), &RequestId::String("approval".into()));
+        client
+            .resolve_server_request(approval.id().clone(), serde_json::json!({"approved": true}))
+            .await
+            .expect("control replies bypass request capacity");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), client.next_event())
+                .await
+                .expect("terminal event"),
+            Some(AppServerEvent::ServerNotification(
+                ServerNotification::TurnCompleted(_)
+            ))
+        ));
+        let error = handle
+            .request_json_rpc(request(1))
+            .await
+            .expect("reused ID transport")
+            .expect_err("new response, not cancelled request's late success");
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "new request failed");
+        assert_eq!(
+            handle
+                .request_json_rpc(request(3))
+                .await
+                .expect("transport")
+                .expect("response"),
+            serde_json::json!({"recovered": true})
+        );
+        client.shutdown().await.expect("shutdown");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server finishes")
+            .expect("server assertions");
     }
 
     #[tokio::test]
@@ -2497,6 +2664,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })

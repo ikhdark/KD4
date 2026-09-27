@@ -32,7 +32,7 @@ fn continuation_prompt_allows_complete_and_strict_blocked_updates() {
 }
 
 #[test]
-fn budget_limit_prompt_steers_model_to_wrap_up_without_pausing() {
+fn budget_limit_prompt_preserves_incomplete_work_at_enforced_limit() {
     let prompt = budget_limit_prompt(&ThreadGoal {
         thread_id: ThreadId::new(),
         objective: "finish the stack".to_string(),
@@ -48,7 +48,15 @@ fn budget_limit_prompt_steers_model_to_wrap_up_without_pausing() {
     assert!(prompt.contains("<objective>\nfinish the stack\n</objective>"));
     assert!(prompt.contains("Token budget: 10000"));
     assert!(prompt.contains("Tokens used: 10100"));
-    assert!(prompt.to_lowercase().contains("wrap up this turn soon"));
+    assert!(prompt.contains("enforced execution limit, not task completion"));
+    assert!(prompt.contains(
+        "Do not start new substantive work for this goal while this limit remains active."
+    ));
+    assert!(prompt.contains("Preserve progress and unfinished work for resumption"));
+    assert!(prompt.contains("budget change needed to continue"));
+    assert!(prompt.contains("Do not infer completion from budget exhaustion."));
+    assert!(prompt.contains("Do not call update_goal unless the goal is actually complete."));
+    assert!(!prompt.to_lowercase().contains("wrap up"));
     assert!(!prompt.contains("status \"paused\""));
 }
 

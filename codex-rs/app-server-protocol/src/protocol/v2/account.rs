@@ -420,6 +420,29 @@ pub struct GetAccountParams {
 pub struct GetAccountResponse {
     pub account: Option<Account>,
     pub requires_openai_auth: bool,
+    /// Authoritative routing for the signed-in ChatGPT workspace, when available.
+    #[serde(default)]
+    pub workspace_routing: Option<WorkspaceRouting>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WorkspaceRouting {
+    pub chatgpt_account_id: String,
+    pub backend_origin: String,
+    pub account_routing_override: AccountRoutingOverride,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[ts(export_to = "v2/")]
+pub enum AccountRoutingOverride {
+    #[serde(rename = "NO_CONSTRAINT")]
+    NoConstraint,
+    #[serde(rename = "us")]
+    Us,
+    #[serde(rename = "us_cr")]
+    UsCr,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -428,6 +451,29 @@ pub struct GetAccountResponse {
 pub struct AccountUpdatedNotification {
     pub auth_mode: Option<AuthMode>,
     pub plan_type: Option<PlanType>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/", rename_all = "camelCase")]
+pub enum GatewayOAuthStatus {
+    NotReady,
+    Started,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthReadResponse {
+    pub provider_id: String,
+    pub provider_name: String,
+    /// Whether the selected provider uses gateway OAuth, even when already signed in.
+    pub required: bool,
+    /// Null when the effective provider does not use gateway OAuth.
+    pub status: Option<GatewayOAuthStatus>,
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

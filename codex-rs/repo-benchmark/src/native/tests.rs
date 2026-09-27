@@ -131,6 +131,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             Send @{method='item/started';params=@{threadId='thread-1';turnId='turn-1';item=@{id='tool-1';type='commandExecution'}}}
             if ('TERMINAL' -eq 'hang') { Start-Sleep -Seconds 30 }
             Send @{method='item/completed';params=@{threadId='thread-1';turnId='turn-1';item=@{id='tool-1';type='commandExecution';status='completed'}}}
+            if ('TERMINAL' -eq 'disconnect_after_tool') { exit }
+            if ('TERMINAL' -eq 'hang_after_tool') { Start-Sleep -Seconds 30 }
             Send @{method='turn/completed';params=@{threadId='thread-1';turn=@{id='turn-1';status='TERMINAL';error=@{message='deliberate turn failure'}}}}
             Send @{id=$request.id;result=@{turn=@{id='turn-1'}}}
         }
@@ -253,6 +255,93 @@ fn native_stdio_preserves_early_notifications_and_rejects_failed_terminal() {
                 .contains("turn/completed")
         );
     }
+}
+
+#[test]
+#[cfg(windows)]
+fn native_stdio_retains_tool_counts_without_a_terminal_event() {
+    for (terminal, status) in [
+        ("disconnect_after_tool", "failed"),
+        ("hang_after_tool", "timeout"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = peer_request(temp.path(), terminal);
+        request.timeout_ms = 3000;
+        let evidence = run_attempt(&request);
+        assert_eq!(evidence.status, status, "{:?}", evidence.failure);
+        assert_eq!(evidence.completed_turns, 0);
+        assert_eq!(evidence.turn_elapsed_ms, None);
+        assert_eq!(evidence.tool_executions, 1);
+        assert!(
+            !evidence
+                .events
+                .iter()
+                .any(|event| { event["message"]["method"] == "turn/completed" })
+        );
+        let saved: Value =
+            serde_json::from_slice(&fs::read(&evidence.evidence_path).unwrap()).unwrap();
+        assert_eq!(saved["toolExecutions"], 1);
+        assert_eq!(saved["status"], status);
+    }
+}
+
+#[test]
+fn completed_tool_counts_preserve_identity_and_ignore_noncompletions() {
+    let event = |method, thread, turn, id, kind| {
+        json!({"message": {"method": method, "params": {
+            "threadId": thread, "turnId": turn, "item": {"id": id, "type": kind}
+        }}})
+    };
+    let completed = event(
+        "item/completed",
+        "thread-1",
+        "turn-1",
+        "tool-1",
+        "commandExecution",
+    );
+    let events = vec![
+        completed.clone(),
+        event(
+            "item/started",
+            "thread-1",
+            "turn-1",
+            "tool-1",
+            "commandExecution",
+        ),
+        completed,
+        event(
+            "item/completed",
+            "thread-1",
+            "turn-2",
+            "tool-1",
+            "commandExecution",
+        ),
+        event(
+            "item/completed",
+            "other",
+            "turn-1",
+            "tool-2",
+            "commandExecution",
+        ),
+        event(
+            "item/completed",
+            "thread-1",
+            "turn-1",
+            "message-1",
+            "agentMessage",
+        ),
+        event(
+            "item/started",
+            "thread-1",
+            "turn-1",
+            "tool-3",
+            "commandExecution",
+        ),
+        json!({"message": {"method": "item/completed", "params": {"threadId": "thread-1"}}}),
+    ];
+    assert_eq!(client::completed_tool_count(&events, Some("thread-1")), 2);
+    assert_eq!(client::completed_tool_count(&events, None), 0);
+    assert_eq!(client::completed_tool_count(&events, Some("absent")), 0);
 }
 
 #[test]
@@ -430,7 +519,10 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         .finish_turn("thread-1", "turn-1", Some(&mut checkpoint))
         .unwrap();
     assert_eq!(terminal.status, "interrupted");
-    assert_eq!(terminal.tool_executions, 0);
+    assert_eq!(
+        client::completed_tool_count(&client.events, Some("thread-1")),
+        0
+    );
     assert!(!temp.path().join("next-tool.txt").exists());
     let second = client
         .rpc("turn/start", json!({"threadId":"thread-1"}))
@@ -438,7 +530,10 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     assert_eq!(second["turn"]["id"], "turn-2");
     let terminal = client.finish_turn("thread-1", "turn-2", None).unwrap();
     assert_eq!(terminal.status, "completed");
-    assert_eq!(terminal.tool_executions, 1);
+    assert_eq!(
+        client::completed_tool_count(&client.events, Some("thread-1")),
+        1
+    );
     assert_eq!(
         fs::read_to_string(temp.path().join("next-tool.txt")).unwrap(),
         "executed after interruption"

@@ -49,7 +49,45 @@ pub(super) struct NativeClient {
 pub(super) struct TurnTerminal {
     pub status: String,
     pub error: Value,
-    pub tool_executions: usize,
+}
+
+fn is_tool(kind: &str) -> bool {
+    matches!(
+        kind,
+        "commandExecution"
+            | "dynamicToolCall"
+            | "mcpToolCall"
+            | "collabAgentToolCall"
+            | "fileChange"
+            | "webSearch"
+            | "imageView"
+            | "imageGeneration"
+            | "sleep"
+            | "toolCall"
+    )
+}
+
+pub(super) fn completed_tool_count(events: &[Value], thread_id: Option<&str>) -> usize {
+    let Some(thread_id) = thread_id else {
+        return 0;
+    };
+    // Count retained notifications, not successful waits: a deadline or disconnect
+    // can follow completed work, and cleanup can drain additional notifications.
+    events
+        .iter()
+        .filter_map(|event| {
+            let message = &event["message"];
+            let params = &message["params"];
+            if message["method"] != "item/completed"
+                || params["threadId"].as_str() != Some(thread_id)
+                || !is_tool(params["item"]["type"].as_str()?)
+            {
+                return None;
+            }
+            Some((params["turnId"].as_str()?, params["item"]["id"].as_str()?))
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 impl NativeClient {
@@ -248,7 +286,6 @@ impl NativeClient {
         turn_id: &str,
         mut cancellation_checkpoint: Option<&mut dyn FnMut() -> Result<Option<Value>>>,
     ) -> Result<TurnTerminal> {
-        let mut tools = BTreeSet::new();
         let mut interrupted = false;
         let mut tool_started = false;
         loop {
@@ -287,26 +324,7 @@ impl NativeClient {
             if params.get("turnId").and_then(Value::as_str) == Some(turn_id) {
                 let item = &params["item"];
                 let kind = item["type"].as_str().unwrap_or_default();
-                let is_tool = matches!(
-                    kind,
-                    "commandExecution"
-                        | "dynamicToolCall"
-                        | "mcpToolCall"
-                        | "collabAgentToolCall"
-                        | "fileChange"
-                        | "webSearch"
-                        | "imageView"
-                        | "imageGeneration"
-                        | "sleep"
-                        | "toolCall"
-                );
-                if method == "item/completed"
-                    && is_tool
-                    && let Some(id) = item["id"].as_str()
-                {
-                    tools.insert(id.to_owned());
-                }
-                tool_started |= method == "item/started" && is_tool;
+                tool_started |= method == "item/started" && is_tool(kind);
             }
             if method == "turn/completed"
                 && params.pointer("/turn/id").and_then(Value::as_str) == Some(turn_id)
@@ -323,7 +341,6 @@ impl NativeClient {
                         .context("turn/completed omitted status")?
                         .into(),
                     error: params["turn"]["error"].clone(),
-                    tool_executions: tools.len(),
                 });
             }
         }

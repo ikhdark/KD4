@@ -54,6 +54,7 @@ impl SelectedExecutorPluginMcpContributor {
     /// Successful resolution, including a root that is not a plugin or declares no capabilities,
     /// is cached until the thread state is dropped. A failed MCP or connector declaration load is
     /// projected without its failed part but not cached, so the next projection retries it.
+    /// This includes per-server parse failures, while retaining valid sibling servers.
     /// Environment availability never invalidates this cache; it only controls whether the cached
     /// metadata is projected into a model step.
     async fn metadata_for_root(
@@ -94,8 +95,9 @@ impl SelectedExecutorPluginMcpContributor {
                             error = %err,
                             "failed to load selected executor plugin MCP servers"
                         );
-                        Vec::new()
+                        Default::default()
                     });
+                load_failed |= !servers.errors.is_empty();
                 let connector_ids = load_executor_plugin_connectors(&plugin)
                     .await
                     .unwrap_or_else(|err| {
@@ -113,7 +115,7 @@ impl SelectedExecutorPluginMcpContributor {
                 Some(SelectedPluginMetadata {
                     plugin_id: plugin.plugin().selected_root_id().to_string(),
                     plugin_display_name: plugin.plugin().manifest().display_name().to_string(),
-                    servers,
+                    servers: servers.servers.into_iter().collect(),
                     connector_ids,
                 })
             }

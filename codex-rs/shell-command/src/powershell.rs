@@ -450,6 +450,56 @@ mod tests {
     }
 
     #[test]
+    fn stdin_commands_are_not_extracted_or_rewritten() {
+        for flag in ["-Command", "/Command", "-c", "-Command:", "/Command:"] {
+            let mut command = vec!["pwsh".to_string(), "-NoProfile".to_string()];
+            if flag.ends_with(':') {
+                command.push(format!("{flag}-"));
+            } else {
+                command.extend([flag.to_string(), "-".to_string()]);
+            }
+            assert_eq!(extract_powershell_command(&command), None);
+            assert_eq!(prefix_powershell_script_with_utf8(&command), command);
+            assert_eq!(parse_powershell_command_into_plain_commands(&command), None);
+            assert!(!crate::is_safe_command::is_known_safe_command(&command));
+            assert!(crate::is_dangerous_command::command_might_be_dangerous(&command));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stdin_command_executes_after_utf8_preparation() {
+        use std::io::Write;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        let host = super::try_find_powershell_executable_blocking().expect("Windows PowerShell");
+        let command = prefix_powershell_script_with_utf8(&[
+            host.as_path().to_string_lossy().into_owned(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "-".to_string(),
+        ]);
+        let mut child = Command::new(&command[0])
+            .args(&command[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start stdin command");
+        child.stdin.take().expect("stdin").write_all(
+            b"Write-Output 'space and quote: it''s --flag' | ForEach-Object { $_.ToUpperInvariant() }\r\n",
+        ).expect("write stdin script");
+        let output = child.wait_with_output().expect("wait for stdin command");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("output").trim(),
+            "SPACE AND QUOTE: IT'S --FLAG"
+        );
+    }
+
+    #[test]
     fn extracts_basic_powershell_command() {
         let cmd = vec![
             "powershell".to_string(),

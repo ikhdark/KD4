@@ -55,8 +55,12 @@ pub(crate) fn available_skills_fragment(
         skill_lines.push(render_skill_line(entry, description.as_ref(), locator_kind));
     }
 
-    if skill_lines.is_empty() && omitted == 0 {
+    let incomplete = catalog.continuation.is_some();
+    if skill_lines.is_empty() && omitted == 0 && !incomplete {
         return None;
+    }
+    if incomplete {
+        skill_lines.push("- Orchestrator skill discovery is incomplete; undiscovered skills may still be available. Continue discovery only if needed for this task.".to_string());
     }
     if omitted > 0 {
         let skill_word = if omitted == 1 { "skill" } else { "skills" };
@@ -64,11 +68,13 @@ pub(crate) fn available_skills_fragment(
             "- {omitted} additional {skill_word} omitted from this bounded skills list."
         ));
     }
-    if catalog.entries.iter().any(|entry| {
-        entry.enabled
-            && entry.prompt_visible
-            && entry.authority.kind == SkillSourceKind::Orchestrator
-    }) {
+    if incomplete
+        || catalog.entries.iter().any(|entry| {
+            entry.enabled
+                && entry.prompt_visible
+                && entry.authority.kind == SkillSourceKind::Orchestrator
+        })
+    {
         skill_lines.push("- Recover orchestrator skills with skills.list({\"authority\":{\"kind\":\"orchestrator\"}}); follow next_cursor as cursor, then pass the returned authority, package, and main_resource as resource to skills.read.".to_string());
     }
     if omitted > 0

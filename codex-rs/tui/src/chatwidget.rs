@@ -199,8 +199,15 @@ const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
 fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyBinding {
     match terminal_info.name {
         TerminalName::WarpTerminal | TerminalName::VsCode => key_hint::shift(KeyCode::Left),
-        TerminalName::WezTerm
+        TerminalName::AppleTerminal
+        | TerminalName::Ghostty
+        | TerminalName::Iterm2
+        | TerminalName::WezTerm
+        | TerminalName::Kitty
         | TerminalName::Alacritty
+        | TerminalName::Konsole
+        | TerminalName::GnomeTerminal
+        | TerminalName::Vte
         | TerminalName::WindowsTerminal
         | TerminalName::Dumb
         | TerminalName::Unknown => key_hint::alt(KeyCode::Up),

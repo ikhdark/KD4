@@ -46,6 +46,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
@@ -712,6 +713,7 @@ fn kill_listeners_on_same_port(listen: &str) -> Result<()> {
 
 struct SendMessagePolicies<'a> {
     command_name: &'static str,
+    approval_expectation: Option<ApprovalExpectation>,
     experimental_api: bool,
     approval_policy: Option<AskForApproval>,
     sandbox_policy: Option<SandboxPolicy>,
@@ -730,6 +732,7 @@ async fn send_message(
         user_message,
         SendMessagePolicies {
             command_name: "send-message",
+            approval_expectation: None,
             experimental_api: false,
             approval_policy: None,
             sandbox_policy: None,
@@ -773,6 +776,7 @@ async fn send_message_v2_endpoint(
         user_message,
         SendMessagePolicies {
             command_name: "send-message-v2",
+            approval_expectation: None,
             experimental_api,
             approval_policy: None,
             sandbox_policy: None,
@@ -866,6 +870,7 @@ async fn trigger_cmd_approval(
         message,
         SendMessagePolicies {
             command_name: "trigger-cmd-approval",
+            approval_expectation: Some(ApprovalExpectation::Command),
             experimental_api: true,
             approval_policy: Some(AskForApproval::OnRequest),
             sandbox_policy: Some(SandboxPolicy::ReadOnly {
@@ -892,6 +897,7 @@ async fn trigger_patch_approval(
         message,
         SendMessagePolicies {
             command_name: "trigger-patch-approval",
+            approval_expectation: Some(ApprovalExpectation::FileChange),
             experimental_api: true,
             approval_policy: Some(AskForApproval::OnRequest),
             sandbox_policy: Some(SandboxPolicy::ReadOnly {
@@ -915,6 +921,7 @@ async fn no_trigger_cmd_approval(
         prompt.to_string(),
         SendMessagePolicies {
             command_name: "no-trigger-cmd-approval",
+            approval_expectation: Some(ApprovalExpectation::NoCommand),
             experimental_api: true,
             approval_policy: None,
             sandbox_policy: None,
@@ -956,6 +963,7 @@ async fn send_message_v2_with_policies(
             turn_params.approval_policy = policies.approval_policy;
             turn_params.sandbox_policy = policies.sandbox_policy;
 
+            client.approval_expectation = policies.approval_expectation;
             let turn_response = client.turn_start(turn_params)?;
             println!("< turn/start: {}", turn_response.turn.id);
 
@@ -1587,6 +1595,8 @@ struct CodexClient {
     pending_notifications: VecDeque<JSONRPCNotification>,
     command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
+    approval_expectation: Option<ApprovalExpectation>,
+    approval_requests: Vec<(String, String, ApprovalExpectation)>,
     command_execution_statuses: Vec<CommandExecutionStatus>,
     command_execution_outputs: Vec<String>,
     command_output_stream: String,
@@ -1604,6 +1614,13 @@ struct CodexClient {
 #[derive(Debug, Clone, Copy)]
 enum CommandApprovalBehavior {
     AlwaysAccept,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalExpectation {
+    Command,
+    FileChange,
+    NoCommand,
 }
 
 fn item_started_before_helper_done_is_unexpected(
@@ -1689,6 +1706,8 @@ impl CodexClient {
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
+            approval_expectation: None,
+            approval_requests: Vec::new(),
             command_execution_statuses: Vec::new(),
             command_execution_outputs: Vec::new(),
             command_output_stream: String::new(),
@@ -1870,6 +1889,9 @@ impl CodexClient {
     }
 
     fn turn_start(&mut self, params: TurnStartParams) -> Result<TurnStartResponse> {
+        // Approvals may arrive before the turn/start response, so reset here,
+        // not when stream_turn begins consuming queued notifications.
+        self.approval_requests.clear();
         let request_id = self.request_id();
         let request = ClientRequest::TurnStart {
             request_id: request_id.clone(),
@@ -1988,6 +2010,7 @@ impl CodexClient {
     }
 
     fn stream_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
+        let mut approval_operation_succeeded = None;
         self.last_turn_status = None;
         self.last_turn_error_message = None;
         self.command_execution_statuses.clear();
@@ -2071,6 +2094,22 @@ impl CodexClient {
                     if payload.thread_id != thread_id || payload.turn_id != turn_id {
                         continue;
                     }
+                    let operation_succeeded = match (&payload.item, self.approval_expectation) {
+                        (
+                            ThreadItem::CommandExecution { status, exit_code, .. },
+                            Some(ApprovalExpectation::Command | ApprovalExpectation::NoCommand),
+                        ) => Some(*status == CommandExecutionStatus::Completed && *exit_code == Some(0)),
+                        (
+                            ThreadItem::FileChange { status, .. },
+                            Some(ApprovalExpectation::FileChange),
+                        ) => Some(*status == PatchApplyStatus::Completed),
+                        _ => None,
+                    };
+                    if let Some(succeeded) = operation_succeeded {
+                        approval_operation_succeeded = Some(
+                            approval_operation_succeeded.unwrap_or(true) && succeeded,
+                        );
+                    }
                     if let ThreadItem::CommandExecution {
                         id,
                         status,
@@ -2141,6 +2180,38 @@ impl CodexClient {
             }
         }
 
+        if let Some(expectation) = self.approval_expectation {
+            if approval_operation_succeeded != Some(true) {
+                bail!(
+                    "approval smoke {expectation:?} did not observe successful tool execution for thread {thread_id}, turn {turn_id}"
+                );
+            }
+            self.verify_approval_expectation(thread_id, turn_id, expectation)?;
+        }
+        Ok(())
+    }
+
+    fn verify_approval_expectation(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        expectation: ApprovalExpectation,
+    ) -> Result<()> {
+        let requested = |kind| {
+            self.approval_requests.iter().any(|(thread, turn, actual)| {
+                thread == thread_id && turn == turn_id && *actual == kind
+            })
+        };
+        let satisfied = match expectation {
+            ApprovalExpectation::Command => requested(ApprovalExpectation::Command),
+            ApprovalExpectation::FileChange => requested(ApprovalExpectation::FileChange),
+            ApprovalExpectation::NoCommand => !requested(ApprovalExpectation::Command),
+        };
+        if !satisfied {
+            bail!(
+                "approval expectation {expectation:?} was not met for thread {thread_id}, turn {turn_id}"
+            );
+        }
         Ok(())
     }
 
@@ -2316,6 +2387,13 @@ impl CodexClient {
             approval_id.as_deref().unwrap_or("<none>")
         );
         self.command_approval_count += 1;
+        if self.approval_expectation.is_some() {
+            self.approval_requests.push((
+                thread_id.clone(),
+                turn_id.clone(),
+                ApprovalExpectation::Command,
+            ));
+        }
         if let Some(environment_id) = environment_id.as_deref() {
             println!("< environment: {environment_id}");
         }
@@ -2377,6 +2455,13 @@ impl CodexClient {
             grant_root,
         } = params;
 
+        if self.approval_expectation.is_some() {
+            self.approval_requests.push((
+                thread_id.clone(),
+                turn_id.clone(),
+                ApprovalExpectation::FileChange,
+            ));
+        }
         println!(
             "\n< fileChange approval requested for thread {thread_id}, turn {turn_id}, item {item_id}"
         );
@@ -2634,6 +2719,167 @@ impl Drop for CodexClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approval_smoke_requires_matching_wire_requests() {
+        use super::*;
+        use serde_json::json;
+
+        for (expectation, method, thread_id, turn_id, status, succeeds) in [
+            (
+                ApprovalExpectation::Command,
+                Some("commandExecution"),
+                "thread",
+                "turn",
+                "completed",
+                true,
+            ),
+            (
+                ApprovalExpectation::Command,
+                None,
+                "thread",
+                "turn",
+                "completed",
+                false,
+            ),
+            (
+                ApprovalExpectation::Command,
+                Some("commandExecution"),
+                "other",
+                "turn",
+                "completed",
+                false,
+            ),
+            (
+                ApprovalExpectation::Command,
+                Some("commandExecution"),
+                "thread",
+                "other",
+                "completed",
+                false,
+            ),
+            (
+                ApprovalExpectation::Command,
+                Some("fileChange"),
+                "thread",
+                "turn",
+                "completed",
+                false,
+            ),
+            (
+                ApprovalExpectation::FileChange,
+                Some("fileChange"),
+                "thread",
+                "turn",
+                "completed",
+                true,
+            ),
+            (
+                ApprovalExpectation::FileChange,
+                None,
+                "thread",
+                "turn",
+                "completed",
+                false,
+            ),
+            (
+                ApprovalExpectation::NoCommand,
+                None,
+                "thread",
+                "turn",
+                "completed",
+                true,
+            ),
+            (
+                ApprovalExpectation::NoCommand,
+                Some("commandExecution"),
+                "thread",
+                "turn",
+                "completed",
+                false,
+            ),
+            (
+                ApprovalExpectation::Command,
+                Some("commandExecution"),
+                "thread",
+                "turn",
+                "failed",
+                false,
+            ),
+        ] {
+            for tool_status in [Some("completed"), Some("failed"), None] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let peer = thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut socket = tungstenite::accept(stream).unwrap();
+                    let request: Value =
+                        serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], "turn/start");
+                    if let Some(method) = method {
+                        socket.send(tungstenite::Message::Text(json!({
+                        "id": "approval", "method": format!("item/{method}/requestApproval"),
+                        "params": {"threadId":thread_id, "turnId":turn_id, "itemId":"item", "startedAtMs":0}
+                    }).to_string().into())).unwrap();
+                        let response: Value =
+                            serde_json::from_str(socket.read().unwrap().to_text().unwrap())
+                                .unwrap();
+                        assert_eq!(response["id"], "approval");
+                        assert_eq!(response["result"]["decision"], "accept");
+                    }
+                    socket.send(tungstenite::Message::Text(json!({
+                    "id":request["id"], "result":{"turn":{"id":"turn", "items":[], "status":"inProgress", "error":null}}
+                }).to_string().into())).unwrap();
+                    if let Some(tool_status) = tool_status {
+                        let item = if expectation == ApprovalExpectation::FileChange {
+                            json!({"type":"fileChange", "id":"item", "changes":[], "status":tool_status})
+                        } else {
+                            json!({"type":"commandExecution", "id":"item", "command":"fixture", "cwd":std::env::temp_dir(), "commandActions":[], "status":tool_status, "exitCode":if tool_status == "completed" { 0 } else { 1 }})
+                        };
+                        socket.send(tungstenite::Message::Text(json!({
+                        "method":"item/completed", "params":{"threadId":"thread", "turnId":"turn", "item":item, "completedAtMs":0}
+                    }).to_string().into())).unwrap();
+                    }
+                    socket.send(tungstenite::Message::Text(json!({
+                    "method":"turn/completed", "params":{"threadId":"thread", "turn":{
+                        "id":"turn", "items":[], "status":status,
+                        "error":if status == "failed" { json!({"message":"backend failed"}) } else { Value::Null }
+                    }}
+                }).to_string().into())).unwrap();
+                });
+                let mut client =
+                    CodexClient::connect_websocket(&format!("ws://{address}")).unwrap();
+                client.approval_expectation = Some(expectation);
+                // A previous turn's observation must not satisfy this request.
+                client
+                    .approval_requests
+                    .push(("thread".into(), "turn".into(), expectation));
+                let result = client.with_operation_deadline(
+                    Instant::now() + Duration::from_secs(5),
+                    |client| {
+                        let response = client.turn_start(TurnStartParams {
+                            thread_id: "thread".into(),
+                            input: vec![],
+                            ..Default::default()
+                        })?;
+                        client.stream_turn("thread", &response.turn.id)
+                    },
+                );
+                peer.join().unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    succeeds && tool_status == Some("completed"),
+                    "{expectation:?}, {method:?}, {thread_id}, {turn_id}, {status}, {tool_status:?}: {result:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn websocket_rpc_deadline_closes_stalled_peer() {
         use super::*;

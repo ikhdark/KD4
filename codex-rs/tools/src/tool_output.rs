@@ -801,6 +801,7 @@ fn is_essential_key(key: &str) -> bool {
             "agent_status",
             "attempt_state",
             "command_was_executed",
+            "complete",
             "content_identity",
             "coverage_status",
             "cursor",
@@ -848,6 +849,7 @@ fn is_essential_key(key: &str) -> bool {
             "state",
             "state_revision",
             "status",
+            "truncated",
             "truncated_count",
             "truncatedcount",
             "unchanged",
@@ -1414,12 +1416,32 @@ mod canonical_tests {
     }
 
     #[test]
+    fn json_projection_preserves_completeness_without_promoting_payloads() {
+        for (complete, truncated) in [(false, true), (true, false)] {
+            let value = serde_json::json!({
+                "complete": complete,
+                "truncated": truncated,
+                "output": "spillable payload",
+            });
+            let output = JsonToolOutput::new(value.clone());
+            let metadata = output.projection_metadata().expect("JSON projection");
+            assert_eq!(
+                metadata.essential_inline,
+                serde_json::json!({"complete": complete, "truncated": truncated})
+            );
+            assert_eq!(metadata.spillable_text, vec![value.to_string()]);
+        }
+    }
+
+    #[test]
     fn mcp_projection_preserves_nested_cursors_and_omission_counts() {
         let result = codex_protocol::mcp::CallToolResult {
             content: vec![serde_json::json!({"type": "text", "text": "page"})],
             structured_content: Some(serde_json::json!({
                 "nextCursor": "provider-cursor",
                 "omittedResultCount": 4,
+                "complete": false,
+                "truncated": true,
                 "items": ["spillable"],
             })),
             is_error: Some(false),
@@ -1435,6 +1457,14 @@ mod canonical_tests {
         assert_eq!(
             metadata.essential_inline["structuredContent"]["omittedResultCount"],
             4
+        );
+        assert_eq!(
+            metadata.essential_inline["structuredContent"]["complete"],
+            false
+        );
+        assert_eq!(
+            metadata.essential_inline["structuredContent"]["truncated"],
+            true
         );
         assert!(
             metadata.essential_inline["structuredContent"]

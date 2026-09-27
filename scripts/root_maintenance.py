@@ -26,6 +26,7 @@ SCRIPT_AUDIT_ROOTS = (
     REPO_ROOT / "codex-cli" / "scripts",
     REPO_ROOT / "codex-rs" / "app-server-test-client" / "scripts",
     REPO_ROOT / "codex-rs" / "config" / "scripts",
+    REPO_ROOT / "DO-NOT-CHANGE" / "responses-api-proxy" / "npm" / "bin",
     REPO_ROOT / "codex-rs" / "scripts",
     REPO_ROOT / "codex-rs" / "skills" / "src" / "assets" / "samples",
     REPO_ROOT / "sdk" / "python" / "scripts",

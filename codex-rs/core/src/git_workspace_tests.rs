@@ -1456,7 +1456,7 @@ async fn source_path_batch_establishes_one_watch_and_preserves_path_scopes() {
         )
         .await
         .unwrap();
-    assert_eq!(observations.len(), 2);
+    assert_eq!(observations.len(), 3);
     assert_eq!(
         observations[0].registration_generation,
         observations[1].registration_generation
@@ -1468,7 +1468,7 @@ async fn source_path_batch_establishes_one_watch_and_preserves_path_scopes() {
             .unwrap()
             .source_watch_registrations
             .len(),
-        1
+        2
     );
     assert!(
         observations
@@ -1480,6 +1480,12 @@ async fn source_path_batch_establishes_one_watch_and_preserves_path_scopes() {
         .await;
     assert!(!cache.source_path_change_observation_is_current(&observations[0]));
     assert!(cache.source_path_change_observation_is_current(&observations[1]));
+    assert!(cache.source_path_change_observation_is_current(&observations[2]));
+    cache
+        .note_host_workspace_mutation_paths(outside.path(), &["attachment.txt".to_string()])
+        .await;
+    assert!(cache.source_path_change_observation_is_current(&observations[1]));
+    assert!(!cache.source_path_change_observation_is_current(&observations[2]));
     cache.note_host_workspace_mutation();
     assert!(
         observations

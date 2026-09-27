@@ -81,6 +81,7 @@ pub(crate) async fn read_session_model(
     read_rollout_resume_state(path)
         .await
         .ok()
+        .filter(|state| state.thread_id == Some(thread_id))
         .and_then(|state| state.model)
 }
 
@@ -125,7 +126,8 @@ async fn read_session_cwd(
 
     let path = path?;
     match read_rollout_resume_state(path).await {
-        Ok(state) => state.cwd,
+        Ok(state) if state.thread_id == Some(thread_id) => state.cwd,
+        Ok(_) => None,
         Err(err) => {
             let rollout_path = path.display().to_string();
             tracing::warn!(
@@ -221,6 +223,56 @@ mod tests {
             text.push('\n');
         }
         std::fs::write(path, text)
+    }
+
+    #[tokio::test]
+    async fn resume_settings_require_matching_rollout_identity() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("rollout.jsonl");
+        let thread_id = ThreadId::new();
+        let other_thread_id = ThreadId::new();
+        let cwd = temp_dir.path().join("selected-workspace");
+        let context = rollout_line(
+            "t1",
+            "turn_context",
+            serde_json::json!({"cwd": cwd, "model": "saved-model"}),
+        );
+        write_rollout_lines(
+            &path,
+            &[
+                rollout_line(
+                    "t0",
+                    "session_meta",
+                    serde_json::json!({"id": thread_id, "cwd": temp_dir.path()}),
+                ),
+                context.clone(),
+            ],
+        )?;
+
+        assert_eq!(
+            read_session_model(None, thread_id, Some(&path))
+                .await
+                .as_deref(),
+            Some("saved-model")
+        );
+        assert_eq!(
+            read_session_cwd(None, thread_id, Some(&path)).await,
+            Some(cwd)
+        );
+        assert_eq!(
+            read_session_model(None, other_thread_id, Some(&path)).await,
+            None
+        );
+        assert_eq!(
+            read_session_cwd(None, other_thread_id, Some(&path)).await,
+            None
+        );
+
+        // A context alone cannot establish which thread owns the saved settings.
+        write_rollout_lines(&path, &[context])?;
+        assert_eq!(read_session_model(None, thread_id, Some(&path)).await, None);
+        assert_eq!(read_session_cwd(None, thread_id, Some(&path)).await, None);
+        Ok(())
     }
 
     #[tokio::test]

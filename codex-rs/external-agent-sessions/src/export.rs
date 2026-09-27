@@ -318,6 +318,54 @@ mod tests {
     }
 
     #[test]
+    fn imported_history_preserves_parallel_tool_correlation_without_native_calls() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("session.jsonl");
+        std::fs::write(&path, jsonl(&[
+            record("user", "Compare two files", root.path()),
+            serde_json::json!({"type":"assistant", "message":{"content":[
+                {"type":"tool_use", "id":"call-a", "name":"Read", "input":{"path":"a.rs"}},
+                {"type":"tool_use", "id":"call-b", "name":"Read", "input":{"path":"b.rs"}}
+            ]}}),
+            serde_json::json!({"type":"user", "message":{"content":[
+                {"type":"tool_result", "tool_use_id":"call-b", "content":"second file"},
+                {"type":"tool_result", "tool_use_id":"call-a", "is_error":true, "content":"missing"}
+            ]}}),
+        ])).unwrap();
+
+        let imported = load_session_for_import(&path).unwrap().unwrap();
+        let messages = imported
+            .rollout_items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {
+                    Some((role.as_str(), content))
+                }
+                RolloutItem::ResponseItem(_) => {
+                    panic!("imports must not activate native tool calls")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].0, "assistant");
+        assert_eq!(messages[2].0, "assistant");
+        assert_eq!(messages[1].1, &vec![ContentItem::OutputText { text:
+            "[external_agent_tool_call: Read]\ncall_id: \"call-a\"\ninput: {\"path\":\"a.rs\"}\n[/external_agent_tool_call]\n\n[external_agent_tool_call: Read]\ncall_id: \"call-b\"\ninput: {\"path\":\"b.rs\"}\n[/external_agent_tool_call]".into()
+        }]);
+        let result_text = "[external_agent_tool_result]\ncall_id: \"call-b\"\nsecond file\n[/external_agent_tool_result]\n\n[external_agent_tool_result: error]\ncall_id: \"call-a\"\nmissing\n[/external_agent_tool_result]";
+        assert_eq!(
+            messages[2].1,
+            &vec![ContentItem::OutputText {
+                text: result_text.into()
+            }]
+        );
+        assert!(imported.rollout_items.iter().any(|item| matches!(item,
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) if event.message == result_text
+        )));
+    }
+
+    #[test]
     fn loads_custom_title_for_imported_session() {
         let root = TempDir::new().expect("tempdir");
         let project_root = root.path().join("repo");

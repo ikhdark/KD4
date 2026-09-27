@@ -1,4 +1,5 @@
 use crate::ConfigLayerMetadata;
+use crate::key_aliases::normalized_with_key_aliases;
 use crate::schema::canonicalize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
@@ -36,7 +37,9 @@ pub(super) fn record_origins(
 }
 
 pub fn version_for_toml(value: &TomlValue) -> String {
-    let json = serde_json::to_value(value).unwrap_or(JsonValue::Null);
+    // Resolve order-sensitive aliases before canonical sorting erases their precedence.
+    let normalized = normalized_with_key_aliases(value, &[]);
+    let json = serde_json::to_value(&normalized).unwrap_or(JsonValue::Null);
     let canonical = canonicalize(&json);
     let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();

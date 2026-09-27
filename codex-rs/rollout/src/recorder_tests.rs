@@ -384,6 +384,56 @@ async fn for_each_rollout_item_streams_items_and_reports_identity() -> std::io::
 }
 
 #[tokio::test]
+async fn resume_skips_invalid_utf8_without_fabricating_or_losing_history() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::new_v4();
+    let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+    let (mut expected, thread_id, _) = RolloutRecorder::load_rollout_items(&path).await?;
+    let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+    // This complete JSON record becomes valid only if its corrupt byte is replaced lossily.
+    file.write_all(b"{\"timestamp\":\"2025-01-03T12:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"bad\xff\",\"kind\":\"plain\"}}\n")?;
+    // A crash inside a UTF-8 character must not prevent a later append and resume.
+    file.write_all(b"{\"torn\":\"\xc3")?;
+    drop(file);
+    let retained = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: "completed evidence survives: \u{fffd}".into(),
+        ..Default::default()
+    }));
+    append_rollout_item_to_path(&path, &retained).await?;
+    expected.push(retained);
+    let bytes = fs::read(&path)?;
+    let compressed_path = compression::compressed_rollout_path(&path);
+    fs::write(
+        &compressed_path,
+        zstd::stream::encode_all(bytes.as_slice(), 0)?,
+    )?;
+
+    for compressed in [false, true] {
+        if compressed {
+            // Force the real compressed reader, which prefers the plain sibling when present.
+            fs::rename(&path, home.path().join("original.jsonl"))?;
+        }
+        let (items, loaded_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
+        assert_eq!(parse_errors, 2);
+        assert_eq!(loaded_id, thread_id);
+        assert_eq!(
+            serde_json::to_value(&items)?,
+            serde_json::to_value(&expected)?
+        );
+        let InitialHistory::Resumed(history) = RolloutRecorder::get_rollout_history(&path).await?
+        else {
+            panic!("expected resumed history");
+        };
+        assert_eq!(
+            serde_json::to_value(history.history.as_ref())?,
+            serde_json::to_value(&expected)?
+        );
+    }
+    assert_eq!(fs::read(home.path().join("original.jsonl"))?, bytes);
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_rollout_items_ignores_unknown_fork_source_history_mode() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::new_v4();

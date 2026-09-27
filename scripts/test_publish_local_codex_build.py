@@ -916,6 +916,51 @@ $fingerprints | ConvertTo-Json -Compress
                 {Path(line.strip()).resolve() for line in observed_dirs}, {codex_rs}
             )
 
+    def test_root_frozen_sources_affect_publish_fingerprint_and_dirty_flag(self) -> None:
+        self.init_repo_fixture()
+        repo = ps_single_quote(self.repo_root)
+        source = self.repo_root / "DO-NOT-CHANGE" / "fixture" / "src" / "lib.rs"
+        command = rf"""
+$ErrorActionPreference = 'Stop'
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$states = [ordered]@{{}}
+$states.before = Get-LocalPublishBuildInputFingerprint -RepoRoot {repo}
+$states.clean = Get-GitBuildDirty -RepoRoot {repo}
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent {ps_single_quote(source)}) | Out-Null
+[IO.File]::WriteAllText({ps_single_quote(source)}, 'initial frozen source')
+$states.added = Get-LocalPublishBuildInputFingerprint -RepoRoot {repo}
+$states.addedDirty = Get-GitBuildDirty -RepoRoot {repo}
+[IO.File]::WriteAllText({ps_single_quote(source)}, 'changed frozen source contents')
+$states.changed = Get-LocalPublishBuildInputFingerprint -RepoRoot {repo}
+Remove-Item -LiteralPath {ps_single_quote(source)}
+$states.removed = Get-LocalPublishBuildInputFingerprint -RepoRoot {repo}
+$states.cleanAgain = Get-GitBuildDirty -RepoRoot {repo}
+$states | ConvertTo-Json -Compress
+"""
+        result = subprocess.run(
+            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=clean_env(),
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        states = json.loads(result.stdout)
+        for key in ("before", "added", "changed", "removed"):
+            self.assertRegex(states[key], r"^[0-9a-f]{64}$")
+        self.assertNotEqual(states["before"], states["added"])
+        self.assertNotEqual(states["added"], states["changed"])
+        self.assertEqual(states["before"], states["removed"])
+        self.assertEqual(states["clean"], "false")
+        self.assertEqual(states["addedDirty"], "true")
+        self.assertEqual(states["cleanAgain"], "false")
+
     def test_build_dirty_flag_describes_publish_inputs(self) -> None:
         # Auto-skip reuses a binary while the publish inputs are unchanged, so
         # its embedded dirty flag must depend on exactly those inputs.

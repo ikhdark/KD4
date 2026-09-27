@@ -240,7 +240,11 @@ where
 enum ClientOperationError {
     #[error(transparent)]
     Service(#[from] rmcp::service::ServiceError),
-    #[error("timed out awaiting {label} after {duration:.0?}")]
+    #[error("timed out awaiting {label} after {duration:.0?}{}", if .label == "tools/call" {
+        "; execution may have completed; check its state before retrying"
+    } else {
+        ""
+    })]
     Timeout { label: String, duration: Duration },
 }
 

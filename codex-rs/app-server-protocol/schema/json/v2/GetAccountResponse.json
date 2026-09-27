@@ -72,6 +72,14 @@
         }
       ]
     },
+    "AccountRoutingOverride": {
+      "enum": [
+        "NO_CONSTRAINT",
+        "us",
+        "us_cr"
+      ],
+      "type": "string"
+    },
     "AmazonBedrockCredentialSource": {
       "enum": [
         "codexManaged",
@@ -99,6 +107,25 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "WorkspaceRouting": {
+      "properties": {
+        "accountRoutingOverride": {
+          "$ref": "#/definitions/AccountRoutingOverride"
+        },
+        "backendOrigin": {
+          "type": "string"
+        },
+        "chatgptAccountId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "accountRoutingOverride",
+        "backendOrigin",
+        "chatgptAccountId"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -114,6 +141,18 @@
     },
     "requiresOpenaiAuth": {
       "type": "boolean"
+    },
+    "workspaceRouting": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WorkspaceRouting"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Authoritative routing for the signed-in ChatGPT workspace, when available."
     }
   },
   "required": [

@@ -254,7 +254,7 @@ impl CodexAppsToolsCacheContext {
         &self,
         ticket: CodexAppsToolsFetchTicket,
         server_info: &McpServerInfo,
-        tools: Vec<ToolInfo>,
+        mut tools: Vec<ToolInfo>,
     ) -> Vec<ToolInfo> {
         let publish_start = Instant::now();
         let mut last_accepted_generation = lock_unpoisoned(&self.entry.last_accepted_generation);
@@ -268,6 +268,7 @@ impl CodexAppsToolsCacheContext {
         }
 
         *last_accepted_generation = ticket.generation;
+        sort_raw_tools(&mut tools);
         let previous = self.current_snapshot();
         let content_revision = previous
             .as_ref()
@@ -470,8 +471,22 @@ fn load_cached_codex_apps_tools_for_identity(
 ) -> Option<Vec<ToolInfo>> {
     let cache_path = identity.cache_path_in(CODEX_APPS_TOOLS_CACHE_DIR);
     let bytes = std::fs::read(cache_path).ok()?;
-    let cache: CodexAppsToolsDiskCache = serde_json::from_slice(&bytes).ok()?;
+    let mut cache: CodexAppsToolsDiskCache = serde_json::from_slice(&bytes).ok()?;
+    sort_raw_tools(&mut cache.tools);
     (cache.schema_version == CODEX_APPS_TOOLS_CACHE_SCHEMA_VERSION).then_some(cache.tools)
+}
+
+fn sort_raw_tools(tools: &mut [ToolInfo]) {
+    // Match model-facing identity without rewriting names or discarding metadata.
+    // Stable sorting preserves first-wins handling of duplicate raw identities.
+    tools.sort_by(|left, right| {
+        left.server_name
+            .cmp(&right.server_name)
+            .then_with(|| left.callable_namespace.cmp(&right.callable_namespace))
+            .then_with(|| left.connector_id.cmp(&right.connector_id))
+            .then_with(|| left.callable_name.cmp(&right.callable_name))
+            .then_with(|| left.tool.name.cmp(&right.tool.name))
+    });
 }
 
 fn write_cached_codex_apps_tools(

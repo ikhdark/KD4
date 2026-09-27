@@ -17,6 +17,134 @@ fn agent_completion(id: &str, text: &str) -> ServerNotification {
 }
 
 #[test]
+fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
+    let items = vec![
+        ThreadItem::CommandExecution {
+            id: "command".into(),
+            command: "background work".into(),
+            cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()
+                .expect("cwd")
+                .into(),
+            process_id: Some("123".into()),
+            parent_call_id: None,
+            parent_cell_id: None,
+            runtime_tool_call_id: None,
+            execution_id: None,
+            source: codex_app_server_protocol::CommandExecutionSource::UserShell,
+            status: CommandExecutionStatus::InProgress,
+            command_actions: Vec::new(),
+            aggregated_output: Some("partial output".into()),
+            exit_code: None,
+            duration_ms: None,
+        },
+        ThreadItem::FileChange {
+            id: "patch".into(),
+            changes: Vec::new(),
+            status: PatchApplyStatus::InProgress,
+        },
+        ThreadItem::McpToolCall {
+            id: "mcp".into(),
+            server: "server".into(),
+            tool: "tool".into(),
+            status: McpToolCallStatus::InProgress,
+            arguments: json!({}),
+            app_context: None,
+            mcp_app_resource_uri: None,
+            plugin_id: None,
+            result: None,
+            error: None,
+            duration_ms: None,
+        },
+        ThreadItem::CollabAgentToolCall {
+            id: "collab".into(),
+            tool: CollabAgentTool::Wait,
+            status: CollabAgentToolCallStatus::InProgress,
+            sender_thread_id: "parent".into(),
+            receiver_thread_ids: vec!["child".into()],
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            agents_states: HashMap::new(),
+        },
+    ];
+    for turn_status in [
+        TurnStatus::Completed,
+        TurnStatus::Failed,
+        TurnStatus::Interrupted,
+    ] {
+        for mut item in items.clone() {
+            let mut processor = EventProcessorWithJsonOutput::new(None);
+            let started = processor.collect_thread_events(ServerNotification::ItemStarted(
+                codex_app_server_protocol::ItemStartedNotification {
+                    thread_id: "thread-1".into(),
+                    turn_id: "turn-1".into(),
+                    started_at_ms: 0,
+                    item: item.clone(),
+                },
+            ));
+            let [ThreadEvent::ItemStarted(ItemStartedEvent { item: started_item })] =
+                started.events.as_slice()
+            else {
+                panic!("expected started item");
+            };
+            let ServerNotification::TurnCompleted(mut completion) =
+                crate::tests::recovery_completion()
+            else {
+                panic!("expected turn completion");
+            };
+            completion.turn.status = turn_status.clone();
+            completion.turn.items = vec![item.clone()];
+            let recovered = processor
+                .collect_thread_events(ServerNotification::TurnCompleted(completion.clone()));
+            assert_eq!(recovered.events.len(), 2);
+            assert_eq!(
+                recovered.events[0],
+                ThreadEvent::ItemUpdated(ItemUpdatedEvent {
+                    item: started_item.clone()
+                })
+            );
+            let serialized = serde_json::to_value(&recovered.events[0]).expect("serialize update");
+            assert_eq!(serialized["type"], "item.updated");
+            assert_eq!(serialized["item"]["status"], "in_progress");
+
+            match &mut item {
+                ThreadItem::CommandExecution {
+                    status, exit_code, ..
+                } => {
+                    *status = CommandExecutionStatus::Failed;
+                    *exit_code = Some(1);
+                }
+                ThreadItem::FileChange { status, .. } => *status = PatchApplyStatus::Failed,
+                ThreadItem::McpToolCall { status, .. } => *status = McpToolCallStatus::Failed,
+                ThreadItem::CollabAgentToolCall { status, .. } => {
+                    *status = CollabAgentToolCallStatus::Failed;
+                }
+                _ => unreachable!(),
+            }
+            completion.turn.items = vec![item];
+            let terminal = processor
+                .collect_thread_events(ServerNotification::TurnCompleted(completion.clone()));
+            let ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) = &terminal.events[0]
+            else {
+                panic!("expected terminal item");
+            };
+            assert_eq!(item.id, started_item.id);
+            assert_eq!(
+                serde_json::to_value(item).expect("serialize item")["status"],
+                "failed"
+            );
+            let duplicate =
+                processor.collect_thread_events(ServerNotification::TurnCompleted(completion));
+            assert_eq!(
+                duplicate.events.len(),
+                1,
+                "terminal items must not be recovered twice"
+            );
+        }
+    }
+}
+
+#[test]
 fn recovered_message_is_deduplicated_by_identity_not_text() {
     for (recovered_id, expected_count) in [("streamed", 0), ("recovered", 1)] {
         let mut processor = EventProcessorWithJsonOutput::new(None);

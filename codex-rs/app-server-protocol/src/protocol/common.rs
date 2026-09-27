@@ -972,6 +972,11 @@ client_request_definitions! {
         serialization: None,
         response: v2::ModelListResponse,
     },
+    GatewayOAuthRead => "account/gatewayOAuth/read" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        serialization: None,
+        response: v2::GatewayOAuthReadResponse,
+    },
     ModelProviderCapabilitiesRead => "modelProvider/capabilities/read" {
         params: v2::ModelProviderCapabilitiesReadParams,
         serialization: None,
@@ -1617,7 +1622,16 @@ fn decode_jsonrpc_params<T: serde::de::DeserializeOwned>(
     // JSON null so request definitions using `Option<_>` or `()` can accept
     // their parameterless wire form while required parameter structs still
     // reject it through their normal type validation.
-    serde_json::from_value(params.unwrap_or(serde_json::Value::Null))
+    match params {
+        // Clients such as Codex Desktop also send `{}` to parameterless methods,
+        // which serde's derived tagged-enum decoding accepts as unit. Keep that
+        // form working; parameter structs still decode `{}` or keep its error.
+        Some(serde_json::Value::Object(map)) if map.is_empty() => {
+            serde_json::from_value(serde_json::Value::Object(map))
+                .or_else(|err| serde_json::from_value(serde_json::Value::Null).map_err(|_| err))
+        }
+        params => serde_json::from_value(params.unwrap_or(serde_json::Value::Null)),
+    }
 }
 
 /// Notifications sent from the client to the server.
@@ -3189,6 +3203,37 @@ mod tests {
                 "id": 1,
             }),
             serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_parameterless_request_with_empty_params_object() -> Result<()> {
+        // Codex Desktop's startup policy gate sends this exact request.
+        let request = ClientRequest::try_from(JSONRPCRequest {
+            id: RequestId::String("network-requirements".to_string()),
+            method: "configRequirements/read".to_string(),
+            params: Some(json!({})),
+            trace: None,
+        })?;
+        assert_eq!(
+            request,
+            ClientRequest::ConfigRequirementsRead {
+                request_id: RequestId::String("network-requirements".to_string()),
+                params: None,
+            }
+        );
+
+        let err = ClientRequest::try_from(JSONRPCRequest {
+            id: RequestId::Integer(2),
+            method: "turn/start".to_string(),
+            params: Some(json!({})),
+            trace: None,
+        })
+        .expect_err("required params must still reject an empty object");
+        assert!(
+            err.to_string().contains("missing field `threadId`"),
+            "unexpected error: {err}"
         );
         Ok(())
     }

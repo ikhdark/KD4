@@ -11,12 +11,15 @@ use codex_login::AuthManager;
 use codex_login::AuthRouteConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use tokio::task::JoinHandle;
 
-/// Starts fetching the bundle for the current auth and returns a loader that shares it.
-///
-/// A successful result is retained for the loader's lifetime; only failed attempts are
-/// retried by later callers. Build a new loader (for example after an account change) to
-/// load policy for a different identity.
+fn refresher_task_slot() -> &'static Mutex<Option<JoinHandle<()>>> {
+    static REFRESHER_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+    REFRESHER_TASK.get_or_init(|| Mutex::new(None))
+}
+
 pub fn cloud_config_bundle_loader(
     auth_manager: Arc<AuthManager>,
     chatgpt_base_url: String,
@@ -25,26 +28,30 @@ pub fn cloud_config_bundle_loader(
 ) -> CloudConfigBundleLoader {
     let service = CloudConfigBundleService::new(
         auth_manager,
-        Arc::new(BackendBundleClient::new(
-            chatgpt_base_url,
-            http_client_factory,
-        )),
+        Arc::new(BackendBundleClient::new(chatgpt_base_url, http_client_factory)),
         codex_home,
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    CloudConfigBundleLoader::retryable(move || {
-        let service = service.clone();
-        let task = tokio::spawn(async move { service.load_startup_bundle_with_timeout().await });
-        async move {
-            task.await.map_err(|err| {
-                tracing::error!(error = %err, "Cloud config bundle task failed");
-                CloudConfigBundleLoadError::new(
-                    CloudConfigBundleLoadErrorCode::Internal,
-                    None,
-                    format!("cloud config bundle load failed: {err}"),
-                )
-            })?
-        }
+    let refresh_service = service.clone();
+    let task = tokio::spawn(async move { service.load_startup_bundle_with_timeout().await });
+    let refresh_task =
+        tokio::spawn(async move { refresh_service.refresh_cache_in_background().await });
+    let mut refresher_guard = refresher_task_slot().lock().unwrap_or_else(|err| {
+        tracing::warn!("cloud config bundle refresher task slot was poisoned");
+        err.into_inner()
+    });
+    if let Some(existing_task) = refresher_guard.replace(refresh_task) {
+        existing_task.abort();
+    }
+    CloudConfigBundleLoader::new(async move {
+        task.await.map_err(|err| {
+            tracing::error!(error = %err, "Cloud config bundle task failed");
+            CloudConfigBundleLoadError::new(
+                CloudConfigBundleLoadErrorCode::Internal,
+                /*status_code*/ None,
+                format!("cloud config bundle load failed: {err}"),
+            )
+        })?
     })
 }
 

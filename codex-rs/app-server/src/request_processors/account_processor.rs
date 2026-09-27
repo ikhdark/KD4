@@ -3,6 +3,7 @@ use crate::external_auth::ExternalAuthBridge;
 use chrono::DateTime;
 
 mod rate_limit_resets;
+mod workspace_routing;
 
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1040,10 +1041,16 @@ impl AccountRequestProcessor {
             Err(err) => return Err(invalid_request(err.to_string())),
         };
         let account = account_state.account.map(Account::from);
+        let workspace_routing = if matches!(account, Some(Account::Chatgpt { .. })) {
+            self.workspace_routing().await
+        } else {
+            None
+        };
 
         Ok(GetAccountResponse {
             account,
             requires_openai_auth: account_state.requires_openai_auth,
+            workspace_routing,
         })
     }
 

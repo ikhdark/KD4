@@ -29,20 +29,25 @@ where
     }
 
     /// Returns a clone of the cached value for `key`, or computes and inserts it.
+    /// Computation runs without the cache lock, so unrelated lookups and reentrant
+    /// access can proceed. Concurrent misses may compute more than once; an entry
+    /// inserted during computation wins over the computed value.
     pub fn get_or_insert_with(&self, key: K, value: impl FnOnce() -> V) -> V
     where
         V: Clone,
     {
+        if let Some(v) = self.get(&key) {
+            return v;
+        }
+        let v = value();
         if let Some(mut guard) = lock_if_runtime(&self.inner) {
             if let Some(v) = guard.get(&key) {
                 return v.clone();
             }
-            let v = value();
             // Insert and return a clone to keep ownership in the cache.
             guard.put(key, v.clone());
-            return v;
         }
-        value()
+        v
     }
 
     /// Returns a clone of the cached value corresponding to `key`, if present.
@@ -183,6 +188,49 @@ mod tests {
         assert!(cache.get(&"b").is_none());
         assert_eq!(cache.get(&"a"), Some(1));
         assert_eq!(cache.get(&"c"), Some(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn computation_can_reenter_the_cache_and_preserves_a_competing_insert() {
+        let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
+        cache.insert("existing", 1);
+
+        let value = cache.get_or_insert_with("new", || {
+            // Fail before reentering if a regression would deadlock this runtime.
+            assert!(cache.inner.try_lock().is_ok());
+            assert_eq!(cache.get(&"existing"), Some(1));
+            assert_eq!(cache.insert("new", 2), None);
+            3
+        });
+
+        assert_eq!(value, 2);
+        assert_eq!(cache.get(&"new"), Some(2));
+        assert_eq!(cache.get_or_insert_with("new", || panic!("cache hit")), 2);
+    }
+
+    #[test]
+    fn slow_computation_does_not_hide_unrelated_cached_values() {
+        let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
+        cache.insert("existing", 1);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let worker = scope.spawn(move || {
+                cache.get_or_insert_with("new", || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    2
+                })
+            });
+            started_rx.recv().unwrap();
+            let existing = cache.get(&"existing");
+            release_tx.send(()).unwrap();
+            assert_eq!(worker.join().unwrap(), 2);
+            assert_eq!(existing, Some(1));
+        });
+        assert_eq!(cache.get(&"new"), Some(2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

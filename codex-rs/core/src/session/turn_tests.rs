@@ -1979,9 +1979,9 @@ fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata(
 }
 
 #[test]
-fn logical_generation_budget_allows_128_regular_and_one_terminal_generation() {
+fn logical_generation_budget_allows_64_regular_and_one_terminal_generation() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..128 {
+    for _ in 0..64 {
         assert_eq!(
             budget.admit(/*terminal_requested*/ false),
             LogicalGenerationAdmission::Regular
@@ -2000,7 +2000,7 @@ fn logical_generation_budget_allows_128_regular_and_one_terminal_generation() {
 #[test]
 fn productive_work_and_owned_polling_preserve_generation_capacity() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..128 {
+    for _ in 0..64 {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
     }
     budget.observe_progress(true, false);
@@ -2008,7 +2008,7 @@ fn productive_work_and_owned_polling_preserve_generation_capacity() {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
         budget.observe_progress(false, true);
     }
-    for _ in 0..128 {
+    for _ in 0..64 {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
         budget.observe_progress(false, false);
     }
@@ -2029,7 +2029,7 @@ fn validation_failure_at_generation_limit_keeps_repair_tools_available() -> Resu
 async fn validation_failure_at_generation_limit_keeps_repair_tools_available_impl() -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
-    let mut sequence = (0..127)
+    let mut sequence = (0..63)
         .map(|index| {
             let mut completed = responses::ev_completed(&format!("thinking-{index}"));
             completed["response"]["end_turn"] = serde_json::json!(false);
@@ -2084,20 +2084,20 @@ async fn validation_failure_at_generation_limit_keeps_repair_tools_available_imp
         Some("Repair validated.")
     );
     let sent = requests.requests();
-    assert_eq!(sent.len(), 131);
+    assert_eq!(sent.len(), 67);
     assert!(
-        sent[128]
+        sent[64]
             .function_call_output_text("validation-failed")
             .unwrap()
             .contains("repair-required")
     );
     assert!(
-        sent[130]
+        sent[66]
             .function_call_output_text("validated")
             .unwrap()
             .contains("validation-passed")
     );
-    for request in &sent[128..] {
+    for request in &sent[64..] {
         assert!(!request.body_json()["tools"].as_array().unwrap().is_empty());
         assert!(!request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE));
     }
@@ -2129,7 +2129,7 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     .expect("forced-terminal boundary emits a warning");
     assert_eq!(
         warning.message,
-        "This turn reached 128 generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."
+        "This turn reached 64 generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."
     );
 }
 
@@ -2517,7 +2517,7 @@ async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
     };
     assert_eq!(
         error.message,
-        "This turn exhausted its allowance of 128 generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume."
+        "This turn exhausted its allowance of 64 generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume."
     );
     assert!(error.affects_turn_status());
     assert_eq!(
@@ -3362,7 +3362,7 @@ async fn generation_budget_survives_reentry_and_terminal_directive_is_request_lo
 -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
-    let mut sequence = (0..126)
+    let mut sequence = (0..62)
         .map(|i| {
             let id = format!("regular-{i}");
             let mut completed = responses::ev_completed(&id);
@@ -3468,8 +3468,8 @@ else:
     .await?;
     assert_eq!(
         requests.requests().len(),
-        127,
-        "reentry follows 127 generations"
+        63,
+        "reentry follows 63 generations"
     );
     // Queue input while Stop holds the first run_turn at its completion boundary.
     // The hook ends that invocation, so RegularTask must drain and reenter it.
@@ -3499,24 +3499,24 @@ else:
     );
     assert_eq!(
         requests.requests().len(),
-        129,
-        "one task admits 128 regular requests and one terminal request across reentry"
+        65,
+        "one task admits 64 regular requests and one terminal request across reentry"
     );
-    assert!(requests.requests()[127].body_contains_text("queued reentry input"));
+    assert!(requests.requests()[63].body_contains_text("queued reentry input"));
 
     test.submit_turn("start a fresh turn").await?;
     let sent = requests.requests();
     assert_eq!(
         sent.len(),
-        130,
+        66,
         "the terminal request cannot trigger another generation"
     );
     for (index, request) in sent.iter().enumerate() {
-        let terminal = index == 128;
+        let terminal = index == 64;
         assert_eq!(
             request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
             terminal,
-            "the terminal instruction must appear only in request 128, observed request {index}"
+            "the terminal instruction must appear only in request 64, observed request {index}"
         );
         assert_eq!(
             request.body_json()["tools"]

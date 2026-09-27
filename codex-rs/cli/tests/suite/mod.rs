@@ -4,6 +4,7 @@ use anyhow::Result;
 
 mod app;
 mod app_server;
+mod apply;
 mod debug_models;
 mod delete;
 mod exec_server;

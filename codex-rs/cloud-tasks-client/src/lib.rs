@@ -18,7 +18,3 @@ pub use api::TurnAttempt;
 
 mod http;
 pub use http::HttpClient;
-
-mod logging;
-pub use logging::append_error_log;
-pub use logging::set_error_log_dir;

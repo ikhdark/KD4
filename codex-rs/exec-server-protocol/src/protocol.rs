@@ -175,8 +175,12 @@ pub struct ExecResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ReadParams {
     pub process_id: ProcessId,
+    /// Last observed sequence, exclusive; omitted or zero starts from the beginning.
+    /// A cursor beyond the process's last available sequence is invalid.
     pub after_seq: Option<u64>,
+    /// Soft output budget: the first available chunk is returned whole even if larger.
     pub max_bytes: Option<usize>,
+    /// Maximum wait in milliseconds; omitted or zero returns immediately.
     pub wait_ms: Option<u64>,
 }
 

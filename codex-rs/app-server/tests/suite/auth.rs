@@ -248,6 +248,7 @@ async fn personal_access_token_without_email_supports_auth_status_and_account_re
     assert_eq!(
         to_response::<GetAccountResponse>(response)?,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::Chatgpt {
                 email: None,
                 plan_type: AccountPlanType::Pro,

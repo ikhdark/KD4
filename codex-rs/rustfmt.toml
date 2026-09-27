@@ -2,5 +2,5 @@ edition = "2024"
 # scripts/format.py uses the pinned nightly in scripts/tool_versions.py.
 imports_granularity = "Item"
 
-# These exact upstream mirrors are updated only by an explicit upstream sync.
-ignore = ["backend-client", "codex-backend-openapi-models", "login"]
+# Protected crates follow the instructions in their respective directories.
+ignore = ["../DO-NOT-CHANGE"]

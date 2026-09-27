@@ -57,6 +57,9 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+#[path = "account_workspace_routing.rs"]
+mod workspace_routing;
+
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const LOGIN_ISSUER_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 const LOGIN_OPEN_APP_URL_ENV_VAR: &str = "CODEX_APP_SERVER_DEV_OPEN_APP_URL";
@@ -354,6 +357,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     assert_eq!(
         account,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::Chatgpt {
                 email: Some("embedded@example.com".to_string()),
                 plan_type: AccountPlanType::Pro,
@@ -447,6 +451,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
     assert_eq!(
         account,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::Chatgpt {
                 email: Some("embedded@example.com".to_string()),
                 plan_type: AccountPlanType::Pro,
@@ -1858,6 +1863,7 @@ async fn get_account_with_api_key() -> Result<()> {
     let received: GetAccountResponse = to_response(resp)?;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: Some(Account::ApiKey {}),
         requires_openai_auth: true,
     };
@@ -1896,6 +1902,7 @@ async fn get_account_when_auth_not_required() -> Result<()> {
     let received: GetAccountResponse = to_response(resp)?;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: None,
         requires_openai_auth: false,
     };
@@ -1941,6 +1948,7 @@ region = "us-west-2"
     let received: GetAccountResponse = to_response(resp)?;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: Some(Account::AmazonBedrock {
             credential_source: AmazonBedrockCredentialSource::AwsManaged,
         }),
@@ -1990,6 +1998,7 @@ async fn get_account_with_managed_bedrock_provider() -> Result<()> {
     assert_eq!(
         received,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::AmazonBedrock {
                 credential_source: AmazonBedrockCredentialSource::CodexManaged,
             }),
@@ -2047,6 +2056,7 @@ async fn assert_get_account_with_chatgpt(raw_plan: &str, plan_type: AccountPlanT
     let received: GetAccountResponse = to_response(resp)?;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: Some(Account::Chatgpt {
             email: Some("user@example.com".to_string()),
             plan_type,
@@ -2096,6 +2106,7 @@ async fn get_account_with_chatgpt_without_email() -> Result<()> {
     assert_eq!(
         received,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::Chatgpt {
                 email: None,
                 plan_type: AccountPlanType::Pro,
@@ -2246,6 +2257,7 @@ async fn get_account_omits_chatgpt_after_permanent_refresh_failure() -> Result<(
     assert_eq!(
         received,
         GetAccountResponse {
+            workspace_routing: None,
             account: None,
             requires_openai_auth: true,
         }
@@ -2291,6 +2303,7 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
     let received: GetAccountResponse = to_response(resp)?;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: Some(Account::Chatgpt {
             email: Some("user@example.com".to_string()),
             plan_type: AccountPlanType::Unknown,

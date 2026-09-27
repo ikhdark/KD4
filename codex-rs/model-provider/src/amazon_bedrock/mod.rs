@@ -9,7 +9,6 @@ use std::sync::Arc;
 use codex_api::ApiError;
 use codex_api::Provider;
 use codex_api::SharedAuthProvider;
-use codex_aws_auth::AwsCredentialsCache;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::BedrockApiKeyAuth;
@@ -42,9 +41,6 @@ pub(crate) struct AmazonBedrockModelProvider {
     pub(crate) info: ModelProviderInfo,
     pub(crate) aws: ModelProviderAwsAuthInfo,
     auth_manager: Option<Arc<AuthManager>>,
-    /// Shared by the AWS context each request loads, so expiring credentials
-    /// are not resolved again for every request.
-    aws_credentials: AwsCredentialsCache,
 }
 
 impl AmazonBedrockModelProvider {
@@ -63,7 +59,6 @@ impl AmazonBedrockModelProvider {
             info: provider_info,
             aws,
             auth_manager,
-            aws_credentials: AwsCredentialsCache::default(),
         }
     }
 
@@ -90,20 +85,20 @@ impl AmazonBedrockModelProvider {
         let managed_auth = self.managed_auth();
         let mut api_provider_info = self.info.clone();
         api_provider_info.base_url =
-            Some(runtime_base_url(managed_auth.as_ref(), &self.aws, &self.aws_credentials).await?);
+            Some(runtime_base_url(managed_auth.as_ref(), &self.aws).await?);
         api_provider_info.to_api_provider(/*auth_mode*/ None)
     }
 
     async fn runtime_base_url(&self) -> Result<Option<String>> {
         let managed_auth = self.managed_auth();
         Ok(Some(
-            runtime_base_url(managed_auth.as_ref(), &self.aws, &self.aws_credentials).await?,
+            runtime_base_url(managed_auth.as_ref(), &self.aws).await?,
         ))
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
         let managed_auth = self.managed_auth();
-        resolve_provider_auth(managed_auth.as_ref(), &self.aws, &self.aws_credentials).await
+        resolve_provider_auth(managed_auth.as_ref(), &self.aws).await
     }
 }
 
@@ -164,7 +159,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
         Box::pin(async move {
             let managed_auth = self.managed_auth();
             let method =
-                auth::resolve_auth_method(managed_auth.as_ref(), &self.aws, &self.aws_credentials)
+                auth::resolve_auth_method(managed_auth.as_ref(), &self.aws)
                     .await?;
             let mut info = self.info.clone();
             info.base_url = Some(mantle::base_url(method.region())?);

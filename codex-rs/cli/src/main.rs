@@ -1,5 +1,6 @@
 use clap::Args;
 use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
 use clap_complete::Shell;
 use clap_complete::generate;
@@ -925,22 +926,27 @@ fn validate_root_shared_options(shared: &SharedCliOptions) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Parses the command line, keeping `-c` values given before and after a
-/// subcommand.
+/// Parses the command line, keeping config overrides and sandbox selections
+/// at their original command levels before applying precedence.
 ///
-/// Plain clap parsing gives the root, and every subcommand struct that reads
-/// `-c`, only the values of the deepest level that received it. The root list
-/// is replaced with every level's values in order; subcommand structs still
-/// hold the deepest level's values, which already end that list, so appending
-/// them again does not change the effective configuration.
+/// The root override list includes every level in order. Subcommand structs
+/// retain clap's deepest-level config values, which already end that list, so
+/// appending them again does not change the effective configuration.
 fn parse_multitool_cli(args: impl IntoIterator<Item = std::ffi::OsString>) -> MultitoolCli {
     let args: Vec<std::ffi::OsString> = args.into_iter().collect();
-    let mut cli = MultitoolCli::parse_from(&args);
+    let command = SharedCliOptions::scope_sandbox_selection(MultitoolCli::command());
+    let matches = command.get_matches_from(&args);
+    let mut cli = MultitoolCli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     if cli.subcommand.is_some()
-        && let Some(config_overrides) =
-            CliConfigOverrides::from_every_command_level(MultitoolCli::command(), args)
+        && let Some(config_overrides) = CliConfigOverrides::from_every_command_level(
+            SharedCliOptions::scope_sandbox_selection(MultitoolCli::command()),
+            args,
+        )
     {
         cli.config_overrides = config_overrides;
+    }
+    if let Some(Subcommand::Exec(exec)) = &mut cli.subcommand {
+        exec.shared.apply_sandbox_selection(&matches);
     }
     cli
 }
@@ -1310,7 +1316,7 @@ async fn cli_main(
                 &mut cloud_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            codex_cloud_tasks::run_main(cloud_cli).await?;
+            codex_cloud_tasks::run_main(cloud_cli, None).await?;
         }
         Some(Subcommand::Sandbox(mut sandbox_cli)) => {
             if let Some(setup_cli) = sandbox_setup::parse_setup_command(&sandbox_cli.command)? {
@@ -1356,7 +1362,7 @@ async fn cli_main(
                 &mut apply_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_apply_command(apply_cli, /*cwd*/ None).await?;
+            run_apply_command(apply_cli, interactive.shared.cwd.clone()).await?;
         }
         Some(Subcommand::ResponsesApiProxy(args)) => {
             // The standalone proxy binary applies these mitigations before main;
