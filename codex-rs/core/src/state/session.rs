@@ -222,16 +222,8 @@ impl SessionState {
         &mut self,
         usage: &TokenUsage,
     ) {
-        let history = &self.history;
         self.auto_compact_window
-            .ensure_server_observed_prefill_from_usage(usage, || {
-                history.sampling_unretired_tool_output_ids()
-            });
-    }
-
-    pub(crate) fn checkpoint_preserves_prefill(&self) -> bool {
-        self.auto_compact_window
-            .checkpoint_preserves_prefill(&self.history.checkpointed_call_ids())
+            .ensure_server_observed_prefill_from_usage(usage);
     }
 
     pub(crate) fn set_auto_compact_window_estimated_prefill(&mut self, tokens: i64) {

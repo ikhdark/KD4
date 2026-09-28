@@ -42,7 +42,6 @@ use self::driver::DriverLifecycle;
 pub(super) use self::driver::RemoteSession;
 pub(super) use self::driver::SessionCleanup;
 use self::reader::drive_reader;
-use crate::delivery::Delivery;
 
 mod driver;
 mod reader;
@@ -351,7 +350,7 @@ impl Connection {
         .await?;
         let result = self.receive(response_rx).await;
         cancellation.disarm();
-        result.map(Delivery::claim)
+        result
     }
 
     pub(super) async fn terminate(
@@ -366,7 +365,7 @@ impl Connection {
             response_tx,
         })
         .await?;
-        self.receive(response_rx).await.map(Delivery::claim)
+        self.receive(response_rx).await
     }
 
     pub(super) async fn shutdown_session(&self, session: RemoteSession) -> Result<(), String> {

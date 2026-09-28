@@ -675,12 +675,11 @@ pub(crate) fn resolve_multi_agent_version(
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
-pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 128;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
 fn event_channel() -> (async_channel::Sender<Event>, async_channel::Receiver<Event>) {
-    async_channel::bounded(EVENT_CHANNEL_CAPACITY)
+    async_channel::unbounded()
 }
 
 impl Codex {
@@ -2390,7 +2389,6 @@ impl Session {
         let environments = self.services.turn_environments.snapshot().await;
         let hooks = build_hooks_for_config(
             config.as_ref(),
-            self.thread_id(),
             self.services.plugins_manager.as_ref(),
             environments.single_local_environment(),
         )
@@ -4204,26 +4202,19 @@ impl Session {
                 )
             },
         );
-        // Desired state can be unchanged while a budget-rejected section still
-        // needs delivery. Diff against what is represented in retained history,
-        // including staged updates not yet accepted by a physical attempt.
+        if world_state.snapshot() == previous_world_state.snapshot() {
+            return Ok(world_state);
+        }
+        // Diff against the realized state without advancing it until the next
+        // exact physical attempt accepts this update.
         let (fragments, world_state_item, world_state_snapshot) = {
-            let (mut history, pending) = {
-                let state = self.state.lock().await;
-                (state.clone_history(), state.pending_context_baseline())
-            };
-            if let Some(candidate) = pending.as_ref() {
-                history.set_world_state_baseline(candidate.world_state_snapshot.clone());
-            }
-            let (fragments, mut world_state_item) =
-                history.update_world_state(world_state.as_ref());
-            let snapshot = history.world_state_baseline().unwrap_or_default();
-            if pending.is_some() && (world_state_item.is_some() || !fragments.is_empty()) {
-                // Acceptance must persist all staged sections, not just a patch
-                // against a baseline the provider has not accepted yet.
-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
-            }
-            (fragments, world_state_item, snapshot)
+            let mut history = self.clone_history().await;
+            let (fragments, world_state_item) = history.update_world_state(world_state.as_ref());
+            (
+                fragments,
+                world_state_item,
+                history.world_state_baseline().unwrap_or_default(),
+            )
         };
         let items = crate::context_manager::updates::merge_contextual_fragments(fragments);
         if world_state_item.is_some() || !items.is_empty() {
@@ -5009,8 +5000,10 @@ impl Session {
                 &mut separate_developer_sections,
             );
         }
-        let multi_agent_v2_usage_hint_text =
-            multi_agents::usage_hint_text(turn_context, &session_source);
+        let multi_agent_v2_usage_hint_text = (turn::agent_surface_stage(self, turn_context)
+            != crate::tools::exposure::AgentSurfaceStage::Prohibited)
+            .then(|| multi_agents::usage_hint_text(turn_context, &session_source))
+            .flatten();
         let multi_agent_v2_usage_hint_sections =
             (turn_context.multi_agent_version == MultiAgentVersion::V2).then(|| {
                 crate::stable_context::multi_agent_usage_hint_sections(
@@ -6261,7 +6254,6 @@ impl Session {
         // Validation launch lifecycles retain authorization readers until spawn finishes. Do
         // not block task interruption on active_turn while waiting for that reader.
         drop(active);
-        #[cfg(test)]
         let mut authorization = active_turn_context.validation_authorization.write().await;
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
@@ -6279,32 +6271,9 @@ impl Session {
         }
         // Acquire context guards without changing live state. Rejection or a
         // dropped caller while waiting for queue admission must have no effects.
-        let state = self.state.lock().await;
-        let mut staged_additional_context = state.additional_context.clone();
-        let additional_context_input = staged_additional_context.prepare_merge(additional_context);
-        drop(state);
-        drop(active);
-        // Disk retention must not hold active_turn or session state: interruption
-        // remains available while the authorization guard serializes steering.
-        let (additional_context_input, artifacts) = additional_context_input
-            .retain_originals(
-                &active_turn_context.config.codex_home,
-                &self.thread_id.to_string(),
-            )
-            .await;
-        let mut active = self.active_turn.lock().await;
-        let Some(active_turn) = active.as_mut() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
-        let Some(active_task) = active_turn.task.as_ref() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
-        if !Arc::ptr_eq(&task_identity, &active_task.worker_done)
-            || !Arc::ptr_eq(&turn_state_identity, &active_turn.turn_state)
-        {
-            return Err(SteerInputError::NoActiveTurn(input));
-        }
         let mut state = self.state.lock().await;
+        let mut staged_additional_context = state.additional_context.clone();
+        let additional_context_input = staged_additional_context.merge(additional_context);
 
         let mut pending_input = additional_context_input
             .into_iter()
@@ -6320,7 +6289,6 @@ impl Session {
                 active_turn.turn_state.as_ref(),
                 &pending_input,
                 || {
-                    #[cfg(test)]
                     for item in &input_for_telemetry {
                         if let UserInput::Text { text, .. } = item {
                             authorization.update_from_user_input(text);
@@ -6342,18 +6310,8 @@ impl Session {
                 max_bytes: err.max_bytes,
             })?;
         drop(state);
-        #[cfg(test)]
         drop(authorization);
         drop(active);
-        for (id, bytes, sha256) in artifacts {
-            self.register_tool_artifact_origin(
-                id.clone(),
-                format!("additional_context:{id}"),
-                bytes,
-                sha256,
-            )
-            .await;
-        }
         active_turn_context
             .session_telemetry
             .user_prompt(&input_for_telemetry);
@@ -6488,7 +6446,6 @@ pub(crate) fn emit_subagent_session_started(
 )]
 async fn build_hooks_for_config(
     config: &Config,
-    thread_id: ThreadId,
     plugins_manager: &PluginsManager,
     environment: Option<&TurnEnvironment>,
 ) -> Hooks {
@@ -6507,10 +6464,9 @@ async fn build_hooks_for_config(
     let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
     let hooks_config = HooksConfig {
         legacy_notify_argv: config.notify.clone(),
-        mutating_finalizer: config.after_agent_policy.is_mutating_finalizer(),
-        mutating_finalizer_stdin: matches!(
+        mutating_finalizer: matches!(
             config.after_agent_policy,
-            codex_config::config_toml::AfterAgentPolicy::MutatingFinalizerStdinV1
+            codex_config::config_toml::AfterAgentPolicy::MutatingFinalizer
         ),
         feature_enabled: config.features.enabled(Feature::CodexHooks),
         bypass_hook_trust: config.bypass_hook_trust,
@@ -6520,13 +6476,9 @@ async fn build_hooks_for_config(
         shell_program: hook_shell_program,
         shell_args: hook_shell_argv,
     };
-    let output_directory = AbsolutePathBuf::from_absolute_path(config.codex_home.join("tool-output"))
-        .expect("CODEX_HOME is absolute");
-    tokio::task::spawn_blocking(move || {
-        Hooks::new(hooks_config).with_output_directory(output_directory, thread_id)
-    })
-    .await
-    .expect("hook discovery worker should complete")
+    tokio::task::spawn_blocking(move || Hooks::new(hooks_config))
+        .await
+        .expect("hook discovery worker should complete")
 }
 
 #[cfg(test)]

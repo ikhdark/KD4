@@ -64,7 +64,6 @@ impl SkillToolContext {
             .continue_orchestrator_catalog(
                 &self.providers,
                 SkillListQuery {
-                    discovery_timeout: crate::provider::TOOL_DISCOVERY_TIMEOUT,
                     continuation: None,
                     turn_id: turn_id.to_string(),
                     executor_roots: Vec::new(),
@@ -86,7 +85,6 @@ impl SkillToolContext {
                     .orchestrator_catalog_snapshot(
                         self.mcp_resources.as_deref(),
                         self.providers.list_orchestrator_for_turn(SkillListQuery {
-                            discovery_timeout: crate::provider::TOOL_DISCOVERY_TIMEOUT,
                             continuation: None,
                             turn_id: turn_id.to_string(),
                             executor_roots: Vec::new(),

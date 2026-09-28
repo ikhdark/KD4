@@ -107,23 +107,20 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
     let clause = clause.trim().to_ascii_lowercase();
     // Apostrophes inside words are not quotation delimiters: contractions can revoke
     // authorization, and possessives can appear in otherwise direct requests.
-    let first_quote = clause
+    let contains_quote = clause
         .char_indices()
-        .find(|(index, character)| match character {
+        .any(|(index, character)| match character {
             '\'' => {
-                !clause[..*index].ends_with(char::is_alphanumeric)
-                    || !clause[*index + 1..].starts_with(char::is_alphanumeric)
+                !clause[..index].ends_with(char::is_alphanumeric)
+                    || !clause[index + 1..].starts_with(char::is_alphanumeric)
             }
             '"' | '`' => true,
             _ => false,
         });
-    // Quoted data after a complete directive is not itself authority. Only
-    // the unquoted prefix may grant or revoke permission.
-    let clause = first_quote.map_or(clause.as_str(), |(index, _)| &clause[..index]);
-    if clause.is_empty() {
+    if clause.is_empty() || contains_quote {
         return None;
     }
-    let normalized = clause.strip_prefix("please ").unwrap_or(clause).trim();
+    let normalized = clause.strip_prefix("please ").unwrap_or(&clause).trim();
     // Only direct requests are permission directives. Incidental discussion of
     // delegation (including negated explanations) must never grant authority.
     let normalized = normalized
@@ -232,8 +229,6 @@ mod tests {
             "Parallelize with multiple agents",
             "Use subagents to inspect the user's code",
             "Can you use subagents?",
-            "Use subagents to inspect `core`",
-            "Use subagents to inspect \"core/src\"",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),
@@ -288,8 +283,6 @@ mod tests {
             "Do not use subagents for this task",
             "Don't use subagents for this task",
             "Please don't use subagents for the user's task",
-            "Do not use subagents while changing `core`",
-            "Don't use subagents while changing \"core/src\"",
             "I do not want you to use subagents",
         ] {
             assert_eq!(

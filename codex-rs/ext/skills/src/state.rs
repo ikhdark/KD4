@@ -65,8 +65,8 @@ impl SkillsThreadState {
 
     /// Returns catalogs for stable selected roots.
     ///
-    /// The first catalog without I/O failures remains cached until this thread state is dropped.
-    /// Failed or partial I/O observations are retained for the current turn, then retried next turn.
+    /// The first successful catalog for a root remains cached until this thread state is dropped.
+    /// Failures are retained for the current turn, then retried on the next real observation.
     /// Environment availability only controls whether the root is projected into the current
     /// step; it never invalidates the cache. There is intentionally no filesystem watcher or
     /// content-based invalidation because selected environment roots are treated as stable.
@@ -160,9 +160,6 @@ impl SkillsThreadState {
         let Some(continuation) = catalog.continuation.clone() else {
             return catalog.clone();
         };
-        if continuation.blocked {
-            return catalog.clone();
-        }
         query.continuation = Some(continuation);
         match providers.list_orchestrator_for_turn(query).await {
             Ok(next) => {
@@ -310,7 +307,7 @@ impl SkillsThreadState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = cache.iter().find(|cached| {
                 cached.root == root
-                    && (matches!(cached.catalog.get(), Some(Ok(catalog)) if !catalog.retryable_errors)
+                    && (matches!(cached.catalog.get(), Some(Ok(_)))
                         || cached.turn_id == query.turn_id)
             }) {
                 Arc::clone(&cached.catalog)
@@ -345,8 +342,7 @@ impl SkillsThreadState {
             .iter()
             .find(|cached| {
                 &cached.root == root
-                    && (matches!(cached.catalog.get(), Some(Ok(catalog)) if !catalog.retryable_errors)
-                        || cached.turn_id == turn_id)
+                    && (matches!(cached.catalog.get(), Some(Ok(_))) || cached.turn_id == turn_id)
             })
             .and_then(|cached| cached.catalog.get().cloned())
             .map(catalog_or_warning)
@@ -515,7 +511,6 @@ mod tests {
 
     fn executor_query(turn_id: &str, root: &str) -> SkillListQuery {
         SkillListQuery {
-            discovery_timeout: crate::provider::CONTEXT_DISCOVERY_TIMEOUT,
             continuation: None,
             turn_id: turn_id.to_string(),
             executor_roots: vec![SelectedCapabilityRoot {

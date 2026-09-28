@@ -86,9 +86,7 @@ impl ToolExecutor<ToolCall> for ReadTool {
             });
             if !package_is_available {
                 return Err(FunctionCallError::RespondToModel(
-                    if catalog.discovery_blocked() {
-                        "skill package has not been discovered; discovery is blocked by repeated provider pagination. Repair the provider and refresh its MCP connection before retrying; do not repeat unchanged list calls"
-                    } else if catalog.continuation.is_some() {
+                    if catalog.continuation.is_some() {
                         "skill package has not been discovered yet; use skills.list and follow next_cursor to continue incomplete discovery"
                     } else {
                         "skill package is not available from the requested authority"

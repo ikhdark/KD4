@@ -6,7 +6,6 @@ pub(crate) mod status;
 pub(crate) mod task_capabilities;
 pub(crate) mod task_coordinator;
 pub(crate) mod task_metrics;
-pub(crate) mod task_validation;
 
 pub(crate) use codex_protocol::protocol::AgentStatus;
 pub(crate) use control::AgentControl;

@@ -208,7 +208,6 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
     let list_calls = Arc::new(AtomicUsize::new(0));
     let executor_provider = Arc::new(StaticSkillProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries: vec![test_entry(
                 SkillSourceKind::Executor,
@@ -452,7 +451,6 @@ async fn default_context_truncates_catalog_descriptions() -> TestResult {
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
-                retryable_errors: false,
                 continuation: None,
                 entries: vec![entry],
                 warnings: Vec::new(),
@@ -504,7 +502,6 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
-                retryable_errors: false,
                 continuation: None,
                 entries: vec![entry],
                 warnings: Vec::new(),
@@ -578,7 +575,6 @@ async fn skills_read_honors_response_budgets_without_rereading_cached_contents()
     let read_calls = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(ReadContentsProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries: vec![test_entry(
                 SkillSourceKind::Orchestrator,
@@ -783,7 +779,6 @@ async fn estimate_thread_context_does_not_populate_orchestrator_cache() -> TestR
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
-                retryable_errors: false,
                 continuation: None,
                 entries: vec![test_entry(
                     SkillSourceKind::Orchestrator,
@@ -850,7 +845,6 @@ async fn orchestrator_failure_is_retried_only_by_explicit_discovery() -> TestRes
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
-                retryable_errors: false,
                 continuation: None,
                 entries: vec![test_entry(
                     SkillSourceKind::Orchestrator,
@@ -948,7 +942,6 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
     let root_b_locator = "skill://root-b/shared/lint-fix/SKILL.md";
     let executor_provider = Arc::new(StaticSkillProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries: [("root-a", root_a_locator), ("root-b", root_b_locator)]
                 .into_iter()
@@ -1049,7 +1042,6 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
     let read_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(StaticSkillProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries: vec![
                 test_entry(
@@ -1142,16 +1134,11 @@ struct ReadContentsProvider {
 
 #[tokio::test]
 async fn undiscovered_package_reports_incomplete_discovery_without_reading() -> TestResult {
-    for (incomplete, blocked) in [(false, false), (true, false), (true, true)] {
+    for incomplete in [false, true] {
         let read_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReadContentsProvider {
             catalog: SkillCatalog {
-                continuation: incomplete.then(|| {
-                    codex_skills_extension::catalog::SkillDiscoveryContinuation {
-                        blocked,
-                        ..Default::default()
-                    }
-                }),
+                continuation: incomplete.then(Default::default),
                 ..Default::default()
             },
             contents: "must not be read".to_string(),
@@ -1182,9 +1169,8 @@ async fn undiscovered_package_reports_incomplete_discovery_without_reading() -> 
         let Err(FunctionCallError::RespondToModel(message)) = result else {
             panic!("unknown packages must not bypass discovery");
         };
-        assert_eq!(message.contains("skills.list"), incomplete && !blocked);
-        assert_eq!(message.contains("next_cursor"), incomplete && !blocked);
-        assert_eq!(message.contains("discovery is blocked"), blocked);
+        assert_eq!(message.contains("skills.list"), incomplete);
+        assert_eq!(message.contains("next_cursor"), incomplete);
         assert_eq!(message.contains("not available"), !incomplete);
         assert_eq!(read_calls.load(Ordering::Relaxed), 0);
     }
@@ -1260,7 +1246,6 @@ async fn skills_list_reports_warnings_omitted_by_count_and_output_budget() -> Te
     {
         let provider = StaticSkillProvider {
             catalog: SkillCatalog {
-                retryable_errors: false,
                 continuation: None,
                 entries: Vec::new(),
                 warnings: (0..warning_count)
@@ -1329,7 +1314,6 @@ async fn skills_list_pages_preserve_handles_and_respect_serialized_budget() -> T
         .collect();
     let provider = StaticSkillProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries,
             warnings: vec!["warning".repeat(100)],
@@ -1401,7 +1385,6 @@ async fn executor_failure_retries_next_turn_and_real_input_populates_snapshot() 
     let calls = Arc::new(AtomicUsize::new(0));
     let provider = StaticSkillProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries: vec![test_entry(
                 SkillSourceKind::Executor,
@@ -1501,7 +1484,6 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
     let original_contents = format!("<body>{}OMITTED_TAIL", "🚀".repeat(12_000));
     let provider = ReadContentsProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries: vec![entry],
             warnings: Vec::new(),
@@ -1614,7 +1596,6 @@ async fn omitted_selected_instructions_warn_the_user() -> TestResult {
     let resource = format!("skill://orchestrator/{}/SKILL.md", "x".repeat(20_000));
     let provider = ReadContentsProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries: vec![test_entry(
                 SkillSourceKind::Orchestrator,
@@ -1700,7 +1681,6 @@ async fn mismatched_resources_are_rejected_for_injection_and_tools() -> TestResu
         };
         let provider = ReadContentsProvider {
             catalog: SkillCatalog {
-                retryable_errors: false,
                 continuation: None,
                 entries: vec![test_entry(
                     kind.clone(),
@@ -1793,7 +1773,6 @@ async fn oversized_catalog_entries_report_omission_and_leave_room_for_later_entr
         }
         let provider = StaticSkillProvider {
             catalog: SkillCatalog {
-                retryable_errors: false,
                 continuation: None,
                 entries,
                 warnings: Vec::new(),
@@ -1831,7 +1810,6 @@ fn batch_catalog_merge_preserves_order_authority_and_first_entry() {
     let mut catalog = SkillCatalog::default();
     catalog.extend_entries([first.clone(), duplicate.clone(), other.clone()]);
     catalog.extend(SkillCatalog {
-        retryable_errors: false,
         continuation: None,
         entries: vec![duplicate],
         warnings: vec!["warning".to_string()],
@@ -1856,7 +1834,6 @@ async fn omitted_catalog_entries_are_recoverable_through_advertised_list_route()
         .collect();
     let provider = ReadContentsProvider {
         catalog: SkillCatalog {
-            retryable_errors: false,
             continuation: None,
             entries,
             warnings: Vec::new(),
@@ -2052,7 +2029,6 @@ async fn partial_discovery_cursor_recovers_a_previously_unavailable_skill() -> T
                 assert_eq!(query.continuation.is_some(), call != 0);
                 let name = if call == 0 { "first" } else { "recovered" };
                 Ok(SkillCatalog {
-                    retryable_errors: false,
                     continuation: (call == 0).then(Default::default),
                     entries: vec![test_entry(
                         SkillSourceKind::Orchestrator,

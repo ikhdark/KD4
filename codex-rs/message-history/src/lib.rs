@@ -13,7 +13,6 @@
 //! Retention publishes a complete replacement; locked handles are checked against
 //! the current path before use. Appends do not promise a disk sync per message.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::BufRead;
@@ -25,10 +24,6 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::time::SystemTime;
 
 use memchr::memchr_iter;
 use serde::Deserialize;
@@ -48,76 +43,6 @@ const HISTORY_SOFT_CAP_RATIO: f64 = 0.8;
 
 const MAX_RETRIES: usize = 10;
 const RETRY_SLEEP: Duration = Duration::from_millis(100);
-
-const HISTORY_INDEX_STRIDE: usize = 128;
-const MAX_HISTORY_INDEXES: usize = 8;
-type HistoryIndexes = VecDeque<(PathBuf, Arc<HistoryIndex>)>;
-static HISTORY_INDEXES: OnceLock<Mutex<HistoryIndexes>> = OnceLock::new();
-
-struct HistoryIndex {
-    log_id: u64,
-    len: u64,
-    modified: SystemTime,
-    count: usize,
-    offsets: Vec<u64>,
-}
-
-// Sparse byte offsets share the metadata scan without retaining prompt text.
-// The caller holds the file's shared lock through both indexing and lookup.
-fn history_index(path: &Path, file: &mut File) -> Result<Arc<HistoryIndex>> {
-    let metadata = file.metadata()?;
-    let log_id = log_identity(file)?;
-    let modified = metadata.modified()?;
-    let indexes = HISTORY_INDEXES.get_or_init(|| Mutex::new(VecDeque::new()));
-    {
-        let mut indexes = indexes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(position) = indexes.iter().position(|(cached_path, index)| {
-            cached_path == path
-                && index.log_id == log_id
-                && index.len == metadata.len()
-                && index.modified == modified
-        }) && let Some(entry) = indexes.remove(position) {
-            let index = Arc::clone(&entry.1);
-            indexes.push_back(entry);
-            return Ok(index);
-        }
-    }
-    file.seek(SeekFrom::Start(0))?;
-    let mut index = HistoryIndex {
-        log_id,
-        len: metadata.len(),
-        modified,
-        count: 0,
-        offsets: vec![0],
-    };
-    let mut buffer = [0; HISTORY_READ_BUFFER_SIZE];
-    let mut position = 0;
-    loop {
-        let len = file.read(&mut buffer)?;
-        if len == 0 {
-            break;
-        }
-        for newline in memchr_iter(b'\n', &buffer[..len]) {
-            index.count += 1;
-            if index.count.is_multiple_of(HISTORY_INDEX_STRIDE) {
-                index.offsets.push(position + newline as u64 + 1);
-            }
-        }
-        position += len as u64;
-    }
-    let index = Arc::new(index);
-    let mut indexes = indexes
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    indexes.retain(|(cached_path, _)| cached_path != path);
-    if indexes.len() == MAX_HISTORY_INDEXES {
-        indexes.pop_front();
-    }
-    indexes.push_back((path.to_path_buf(), Arc::clone(&index)));
-    Ok(index)
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct HistoryEntry {
@@ -360,10 +285,15 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
     tokio::task::spawn_blocking(move || -> Result<(u64, usize)> {
         let mut file = open_locked_history(&path, false)?;
         let log_id = log_identity(&file)?;
-        Ok((
-            log_id,
-            history_index(&path, &mut file).map_or(0, |index| index.count),
-        ))
+        let mut buffer = [0; HISTORY_READ_BUFFER_SIZE];
+        let mut count = 0;
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => return Ok((log_id, count)),
+                Ok(len) => count += memchr_iter(b'\n', &buffer[..len]).count(),
+                Err(_) => return Ok((log_id, 0)),
+            }
+        }
     })
     .await
     .ok()
@@ -373,19 +303,12 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
 
 fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<HistoryEntry> {
     let result = (|| -> Result<Option<HistoryEntry>> {
-        let mut file = open_locked_history(path, false)?;
+        let file = open_locked_history(path, false)?;
         if log_id != 0 && log_identity(&file)? != log_id {
             return Ok(None);
         }
-        let index = history_index(path, &mut file)?;
-        if offset >= index.count {
-            return Ok(None);
-        }
-        file.seek(SeekFrom::Start(
-            index.offsets[offset / HISTORY_INDEX_STRIDE],
-        ))?;
         let mut reader = BufReader::new(file);
-        for _ in 0..offset % HISTORY_INDEX_STRIDE {
+        for _ in 0..offset {
             if reader.skip_until(b'\n')? == 0 {
                 return Ok(None);
             }

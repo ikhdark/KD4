@@ -1518,31 +1518,7 @@ impl OutgoingMessageSender {
         notification: ServerNotification,
         cancellation: &CancellationToken,
     ) -> bool {
-        match tokio::time::timeout(
-            RESOURCE_DELIVERY_TIMEOUT,
-            self.send_server_notification_to_connection_cancellable(
-                connection_id, notification, cancellation,
-            ),
-        )
-        .await
-        {
-            Ok(sent) => sent,
-            Err(_) => {
-                warn!(?connection_id, timeout_ms = RESOURCE_DELIVERY_TIMEOUT.as_millis(),
-                    "timed out enqueueing resource notification");
-                false
-            }
-        }
-    }
-
-    /// Waits for delivery while permitting resource or transport shutdown.
-    pub(crate) async fn send_server_notification_to_connection_cancellable(
-        &self,
-        connection_id: ConnectionId,
-        notification: ServerNotification,
-        cancellation: &CancellationToken,
-    ) -> bool {
-        tracing::trace!(?connection_id, "app-server resource event: {notification}");
+        tracing::trace!(?connection_id, "app-server bounded event: {notification}");
         let send = self
             .notification_sender()
             .send(OutgoingEnvelope::ToConnection {
@@ -1554,14 +1530,22 @@ impl OutgoingMessageSender {
             biased;
             _ = cancellation.cancelled() => return false,
             _ = self.delivery_shutdown.cancelled() => return false,
-            result = send => result,
+            result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, send) => result,
         };
         match result {
-            Ok(()) => true,
-            Err(err) => {
+            Ok(Ok(())) => true,
+            Ok(Err(err)) => {
                 warn!(
                     ?connection_id,
                     "failed to enqueue resource notification: {err:?}"
+                );
+                false
+            }
+            Err(_) => {
+                warn!(
+                    ?connection_id,
+                    timeout_ms = RESOURCE_DELIVERY_TIMEOUT.as_millis(),
+                    "timed out enqueueing resource notification"
                 );
                 false
             }

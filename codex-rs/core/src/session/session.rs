@@ -1766,7 +1766,6 @@ impl Session {
             }
             let hooks = build_hooks_for_config(
                 &config,
-                thread_id,
                 plugins_manager.as_ref(),
                 resolved_environments.single_local_environment(),
             )

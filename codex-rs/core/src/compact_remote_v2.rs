@@ -292,8 +292,7 @@ async fn run_remote_compact_task_inner_impl(
     };
     let RemoteCompactV2Attempt {
         trace_input_history,
-        retained_input,
-        retained_images,
+        prompt_input,
         compaction_output,
         token_usage,
         owned_client_session: _owned_client_session,
@@ -303,6 +302,7 @@ async fn run_remote_compact_task_inner_impl(
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
     }
+    let (retained_input, retained_images) = prepare_v2_retained_input(sess, &prompt_input).await?;
     analytics_details.retained_image_count = Some(retained_images);
     let (new_history, world_state_baseline, fragment_digests) =
         process_compacted_history_with_retained_input(
@@ -1488,6 +1488,4 @@ mod tests {
         );
         assert_eq!(profile.milestones.first_visible_output_ms, None);
     }
-
-    include!("compact_remote_v2_benchmark_tests.rs");
 }

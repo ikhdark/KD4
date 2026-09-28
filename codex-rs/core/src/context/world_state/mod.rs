@@ -2,6 +2,7 @@ mod agents_md;
 mod apps_instructions;
 mod environment;
 mod plugins_instructions;
+mod subagents;
 
 use crate::context::ContextualUserFragment;
 use codex_context_fragments::ModelContextBudget;
@@ -26,6 +27,7 @@ pub(crate) use agents_md::AgentsMdState;
 pub(crate) use apps_instructions::AppsInstructionsState;
 pub(crate) use environment::EnvironmentsState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
+pub(crate) use subagents::SubagentsState;
 
 trait ErasedWorldStateSection: Send + Sync {
     fn snapshot(&self) -> Option<Value>;
@@ -415,7 +417,6 @@ impl WorldState {
         );
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> WorldStateSnapshot {
         WorldStateSnapshot {
             sections: self

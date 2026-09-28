@@ -93,7 +93,7 @@ pub fn render_code_mode_sample(
 ) -> String {
     let declaration = format!(
         "declare const tools: {{ {} }};",
-        render_code_mode_tool_declaration(tool_name, input_name, input_type, output_type)
+        render_code_mode_tool_declaration(tool_name, input_name, input_type, output_type, false)
     );
     format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```")
 }
@@ -184,13 +184,14 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
                 input_name,
                 input_type,
                 "CodeModeToolSearchResult".to_string(),
+                false,
             )
         );
         return format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```");
     }
     let declaration = format!(
         "{preamble}declare const tools: {{ {} }};",
-        render_code_mode_tool_declaration(&definition.name, input_name, input_type, output_type)
+        render_code_mode_tool_declaration(&definition.name, input_name, input_type, output_type, false)
     );
     format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```")
 }
@@ -247,7 +248,11 @@ pub fn render_code_mode_tool_bundle(definitions: &[ToolDefinition]) -> String {
             input_name,
             input_type,
             output_type,
+            definitions.len() > 1,
         ));
+    }
+    if declarations.len() > 1 {
+        output.push_str("type ToolCallOptions = { timeout_ms?: number };\n");
     }
     output.push_str("declare const tools: {\n");
     for declaration in declarations {
@@ -263,10 +268,16 @@ fn render_code_mode_tool_declaration(
     input_name: &str,
     input_type: String,
     output_type: String,
+    shared_options: bool,
 ) -> String {
     let tool_name = normalize_code_mode_identifier(tool_name);
+    let options_type = if shared_options {
+        "ToolCallOptions"
+    } else {
+        "{ timeout_ms?: number }"
+    };
     format!(
-        "{tool_name}({input_name}: {input_type}, options?: {{ timeout_ms?: number }}): Promise<{output_type}>;"
+        "{tool_name}({input_name}: {input_type}, options?: {options_type}): Promise<{output_type}>;"
     )
 }
 
@@ -286,6 +297,39 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn bundle_shares_numeric_bounds_and_call_options_without_widening_inputs() {
+        let definitions = (0..12).map(|index| ToolDefinition {
+            name: format!("sample_{index}"),
+            tool_name: ToolName::plain(format!("sample_{index}")),
+            description: String::new(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "marker": {"const": index},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 9007199254740991_u64},
+                    "line": {"type": "integer", "minimum": 1, "maximum": 9007199254740991_u64}
+                },
+                "required": ["offset", "line"],
+                "additionalProperties": false
+            })),
+            output_schema: None,
+            default_timeout_ms: None,
+        }).collect::<Vec<_>>();
+        let bundle = render_code_mode_tool_bundle(&definitions);
+        assert_eq!(bundle.matches("minimum: 0").count(), 1);
+        assert_eq!(bundle.matches("minimum: 1").count(), 1);
+        assert_eq!(bundle.matches("timeout_ms?: number").count(), 1);
+        assert_eq!(bundle.matches("options?: ToolCallOptions").count(), 12);
+        assert_eq!(bundle.matches("Promise<unknown>").count(), 12);
+
+        let mut with_literal = definitions;
+        with_literal[0].input_schema = Some(json!({"const": "options?: { timeout_ms?: number }"}));
+        let bundle = render_code_mode_tool_bundle(&with_literal);
+        assert!(bundle.contains(r#"args: "options?: { timeout_ms?: number }""#));
+    }
 
     fn referenced_tool(name: &str, marker: &str) -> ToolDefinition {
         let schema = json!({

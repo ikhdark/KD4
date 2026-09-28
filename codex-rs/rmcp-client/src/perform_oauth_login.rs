@@ -27,8 +27,7 @@ use sha2::Sha256;
 use tiny_http::Response;
 use tiny_http::Server;
 use tokio::sync::oneshot;
-use tokio::time::Instant;
-use tokio::time::timeout_at;
+use tokio::time::timeout;
 use url::Url;
 
 use crate::StoredOAuthTokens;
@@ -435,7 +434,7 @@ struct OauthLoginFlow {
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     launch_browser: bool,
-    deadline: Instant,
+    timeout: Duration,
 }
 
 fn resolve_callback_port(callback_port: Option<u16>) -> Result<Option<u16>> {
@@ -535,8 +534,6 @@ impl OauthLoginFlow {
         timeout_secs: Option<i64>,
     ) -> Result<Self> {
         const DEFAULT_OAUTH_TIMEOUT_SECS: i64 = 300;
-        let timeout_secs = timeout_secs.unwrap_or(DEFAULT_OAUTH_TIMEOUT_SECS).max(1);
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
         let bind_host = callback_bind_host(callback_url);
         let callback_port = resolve_callback_port(callback_port)?;
@@ -562,22 +559,16 @@ impl OauthLoginFlow {
         let oauth_http_client = Arc::new(OAuthHttpClientAdapter::new(http_client, default_headers));
 
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        let oauth_state = timeout_at(
-            deadline,
-            start_authorization(
-                server_url,
-                oauth_http_client,
-                &scope_refs,
-                &redirect_uri,
-                oauth_client_id,
-            ),
+        let oauth_state = start_authorization(
+            server_url,
+            oauth_http_client,
+            &scope_refs,
+            &redirect_uri,
+            oauth_client_id,
         )
-        .await
-        .context("timed out discovering OAuth authorization metadata")??;
+        .await?;
         let auth_url = append_query_param(
-            &timeout_at(deadline, oauth_state.get_authorization_url())
-                .await
-                .context("timed out preparing OAuth authorization URL")??,
+            &oauth_state.get_authorization_url().await?,
             "resource",
             oauth_resource,
         );
@@ -592,6 +583,8 @@ impl OauthLoginFlow {
             callback_path,
             expected_csrf_state.clone(),
         );
+        let timeout_secs = timeout_secs.unwrap_or(DEFAULT_OAUTH_TIMEOUT_SECS).max(1);
+        let timeout = Duration::from_secs(timeout_secs as u64);
 
         Ok(Self {
             auth_url,
@@ -605,7 +598,7 @@ impl OauthLoginFlow {
             store_mode,
             keyring_backend_kind,
             launch_browser,
-            deadline,
+            timeout,
         })
     }
 
@@ -633,9 +626,10 @@ impl OauthLoginFlow {
             }
         }
 
-        let result = timeout_at(self.deadline, async {
-            let callback = (&mut self.rx)
+        let result = async {
+            let callback = timeout(self.timeout, &mut self.rx)
                 .await
+                .context("timed out waiting for OAuth callback")?
                 .context("OAuth callback was cancelled")?;
             let OauthCallbackResult {
                 code,
@@ -686,9 +680,8 @@ impl OauthLoginFlow {
             .await??;
 
             Ok(())
-        })
-        .await
-        .context("timed out completing OAuth login")?;
+        }
+        .await;
 
         drop(self.guard);
         result
@@ -696,13 +689,10 @@ impl OauthLoginFlow {
 
     fn spawn(self) -> oneshot::Receiver<Result<()>> {
         let server_name_for_logging = self.server_name.clone();
-        let (mut tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
 
         tokio::spawn(async move {
-            let result = tokio::select! {
-                _ = tx.closed() => return,
-                result = self.finish(/*emit_browser_url*/ false) => result,
-            };
+            let result = self.finish(/*emit_browser_url*/ false).await;
 
             if let Err(err) = &result {
                 eprintln!(

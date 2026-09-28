@@ -2975,11 +2975,7 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
     let anchor_before_compaction = history.sampling_projection_anchor_len();
     let _ = history
         .clone()
-        .for_compaction_prompt_with_completed_tool_projection(
-            &default_input_modalities(),
-            None,
-            &workspace,
-        );
+        .for_compaction_prompt_with_completed_tool_projection(&default_input_modalities(), None);
     assert_eq!(
         history.sampling_projection_anchor_len(),
         anchor_before_compaction
@@ -3644,7 +3640,7 @@ fn tool_history_budget_compacts_unread_local_shell_pairs() {
                 continue;
             }
             let mut output_tokens = 0;
-            for (pair, call_id) in items.as_chunks::<2>().0.iter().zip(["older-shell", "newer-shell"]) {
+            for (pair, call_id) in items.chunks_exact(2).zip(["older-shell", "newer-shell"]) {
                 assert!(
                     matches!(&pair[0], ResponseItem::LocalShellCall { call_id: Some(id), .. } if id == call_id)
                 );
@@ -3802,17 +3798,12 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
         .shared_items();
     assert!(Arc::ptr_eq(&cached_after_delta_consumption, &prepared_base));
 
-    let workspace = crate::git_workspace::GitWorkspaceCache::new();
-    let projected = delta_history.for_compaction_prompt_with_completed_tool_projection(
-        &default_input_modalities(),
-        None,
-        &workspace,
-    );
+    let projected = delta_history
+        .for_compaction_prompt_with_completed_tool_projection(&default_input_modalities(), None);
     assert_eq!(
         history.for_compaction_prompt_with_completed_tool_projection(
             &default_input_modalities(),
-            None,
-            &workspace,
+            None
         ),
         projected,
         "production mutations and direct consumption must refresh the same receipt projection",
@@ -4694,25 +4685,4 @@ fn tokenizer_bounded_cell_output_is_not_truncated_again_by_history() {
     let prepared = history
         .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
     assert_eq!(prepared.items()[1], output);
-}
-
-#[test]
-fn pending_checkpoint_detection_ignores_normalized_prefix_differences() {
-    let checkpoint = developer_msg("<completed_phase_checkpoint>\n{\"receipts\":{\"done\":{}}}\n</completed_phase_checkpoint>");
-    let mut history = create_history_with_items(vec![ResponseItem::Message {
-        id: None, role: "user".into(), content: vec![ContentItem::InputImage {
-            image_url: "data:image/png;base64,AAA".into(), detail: None,
-        }], phase: None, internal_chat_message_metadata_passthrough: None,
-    }, checkpoint]);
-    assert!(history.has_pending_phase_checkpoint());
-    let workspace = crate::git_workspace::GitWorkspaceCache::new();
-    let prepared = history.clone().prepare_for_sampling_prompt_with_workspace_freshness(
-        &[InputModality::Text], StableContextTarget::Sampling, None, &workspace,
-    );
-    assert_ne!(history.raw_items()[0], prepared.items()[0]);
-    assert!(!history.has_pending_phase_checkpoint());
-    history.record_items([&assistant_msg("continue")], TruncationPolicy::Tokens(10_000));
-    assert!(!history.has_pending_phase_checkpoint());
-    history.record_items([&developer_msg("<completed_phase_checkpoint>\n{\"receipts\":{\"next\":{}}}\n</completed_phase_checkpoint>")], TruncationPolicy::Tokens(10_000));
-    assert!(history.has_pending_phase_checkpoint());
 }

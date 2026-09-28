@@ -973,8 +973,6 @@ mod request_setting_tests {
         logical.model = "other-model".to_string();
         let mut fourth = measured_after_dispatch(logical, false).await;
         fourth.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), digests);
-        assert!(!fourth.fixed_prefix_reuse_eligible);
-        assert_eq!(fourth.reusable_prompt_estimated_tokens, None);
         assert!(
             !fourth
                 .request_token_categories()
@@ -982,9 +980,6 @@ mod request_setting_tests {
                 .iter()
                 .any(|category| category.starts_with("request."))
         );
-        let mut fifth = measured_after_dispatch(history_test_request(vec![]), true).await;
-        fifth.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), digests);
-        assert!(!fifth.fixed_prefix_reuse_eligible);
     }
 }
 
@@ -4061,49 +4056,5 @@ async fn startup_claim_rebuilds_changed_inputs_and_warmup_never_records_model_di
                 .is_none_or(serde_json::Value::is_null)
         );
         server.shutdown().await;
-    }
-}
-#[test]
-fn fixed_prefix_reuse_requires_comparable_setting_digests() {
-    let request = history_test_request(vec![history_test_item("fixed", None)]);
-    let provenance = PromptProvenanceSidecar::default();
-    let measured = ModelRequestMeasurements::for_responses_request(&request, &provenance, "").unwrap();
-    for (previous_known, current_known) in [(false, false), (false, true), (true, false), (true, true)] {
-        let mut previous = measured.clone();
-        let mut current = measured.clone();
-        if !previous_known { previous.request_setting_digests = None; }
-        if !current_known { current.request_setting_digests = None; }
-        let mut baseline = None;
-        previous.compare_and_remember_prompt_context(&mut baseline, Some("cache"), Default::default());
-        current.compare_and_remember_prompt_context(&mut baseline, Some("cache"), Default::default());
-        assert_eq!(current.fixed_prefix_reuse_eligible, previous_known && current_known);
-    }
-}
-
-#[test]
-fn encoded_setting_digests_preserve_null_omission_and_incremental_transport() {
-    use super::REQUEST_SETTING_FIELDS;
-    use sha2::Digest;
-    use sha2::Sha256;
-
-    let request = history_test_request(vec![history_test_item("logical", None)]);
-    let provenance = PromptProvenanceSidecar::default();
-    let mut body = serde_json::to_value(&request).unwrap();
-    // A shorter transport body takes the logical-input fallback, not a second parse.
-    body["input"] = serde_json::json!([]);
-    for field in REQUEST_SETTING_FIELDS {
-        body.as_object_mut().unwrap().remove(field);
-    }
-    for present in [false, true] {
-        if present {
-            for field in REQUEST_SETTING_FIELDS { body[field] = serde_json::Value::Null; }
-        }
-        let encoded = serde_json::to_vec(&body).unwrap();
-        let measured = ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
-            &request, &provenance, "", None, &encoded, encoded.len() as u64,
-        ).unwrap();
-        let digests = measured.request_setting_digests.unwrap();
-        assert_eq!(digests, [present.then(|| Sha256::digest(b"null").into()); 6]);
-        assert_eq!(measured.input_item_digests.len(), 1);
     }
 }

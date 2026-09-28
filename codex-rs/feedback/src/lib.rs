@@ -3,8 +3,6 @@ use std::collections::VecDeque;
 use std::collections::btree_map::Entry;
 use std::fs;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::io::{self};
 use std::path::Path;
@@ -593,7 +591,7 @@ impl FeedbackSnapshot {
         tags
     }
 
-    /// Returns attachments and descriptions of omitted or truncated content.
+    /// Returns the attachments to upload and a description of each one that was skipped.
     fn feedback_attachments(
         &self,
         include_logs: bool,
@@ -656,7 +654,7 @@ impl FeedbackSnapshot {
         }
 
         for attachment_path in extra_attachment_paths {
-            let mut filename = attachment_path
+            let filename = attachment_path
                 .attachment_filename_override
                 .clone()
                 .unwrap_or_else(|| {
@@ -667,7 +665,11 @@ impl FeedbackSnapshot {
                         .unwrap_or_else(|| "extra-log.log".to_string())
                 });
             let limit = remaining.min(MAX_ATTACHMENT_BYTES);
-            let (data, truncated) = match read_attachment(&attachment_path.path, limit) {
+            let data = match fs::File::open(&attachment_path.path).and_then(|file| {
+                let mut data = Vec::new();
+                file.take(limit as u64 + 1).read_to_end(&mut data)?;
+                Ok(data)
+            }) {
                 Ok(data) => data,
                 Err(err) => {
                     tracing::warn!(
@@ -681,19 +683,6 @@ impl FeedbackSnapshot {
             };
             if !reserve_attachment_bytes(&filename, data.len(), &mut remaining, &mut omitted) {
                 continue;
-            }
-            if truncated {
-                let tail_name = format!(
-                    "{}.tail.jsonl",
-                    Path::new(&filename)
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                );
-                omitted.push(format!(
-                    "{filename}: truncated to recent complete JSONL records in {tail_name}"
-                ));
-                filename = tail_name;
             }
             let content_type = match Path::new(&filename)
                 .extension()
@@ -717,43 +706,6 @@ impl FeedbackSnapshot {
 
         (attachments, omitted)
     }
-}
-
-fn read_attachment(path: &Path, limit: usize) -> io::Result<(Vec<u8>, bool)> {
-    let mut file = fs::File::open(path)?;
-    let length = file.metadata()?.len();
-    let jsonl = path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
-    if jsonl && length > limit as u64 && limit > 0 {
-        // Include the byte before the budget window to recognize a whole first
-        // record. The captured length bounds reads even if the rollout grows.
-        file.seek(SeekFrom::Start(length - limit as u64 - 1))?;
-        let mut data = Vec::new();
-        file.take(limit as u64 + 1).read_to_end(&mut data)?;
-        let start = data
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| index + 1);
-        let end = data
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map(|index| index + 1);
-        if let (Some(start), Some(end)) = (start, end)
-            && start < end
-        {
-            data.truncate(end);
-            data.drain(..start);
-            return Ok((data, true));
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "no complete JSONL records fit the remaining attachment budget",
-        ));
-    }
-    let mut data = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut data)?;
-    Ok((data, false))
 }
 
 fn reserve_attachment_bytes(
@@ -1207,67 +1159,6 @@ mod tests {
         );
         assert!(attachments[0].buffer.iter().all(|byte| *byte == 1));
         assert!(attachments[1].buffer.iter().all(|byte| *byte == 2));
-    }
-
-    #[test]
-    fn jsonl_tail_keeps_whole_recent_records_without_changing_small_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
-        let recent = "{\"failure\":\"échec\"}\n";
-        let contents = format!(
-            "{{\"old\":\"{}\"}}\n{recent}{{\"unfinished\":",
-            "x".repeat(100)
-        );
-        fs::write(&path, &contents).unwrap();
-        let (tail, truncated) = read_attachment(&path, recent.len() + 22).unwrap();
-        assert!(truncated);
-        assert_eq!(tail, recent.as_bytes());
-        let (whole, truncated) = read_attachment(&path, contents.len()).unwrap();
-        assert!(!truncated);
-        assert_eq!(whole, contents.as_bytes());
-        assert!(read_attachment(&path, 2).is_err());
-    }
-
-    #[test]
-    fn oversized_jsonl_tail_is_labelled_and_respects_the_aggregate_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
-        let mut file = fs::File::create(&path).unwrap();
-        file.set_len(MAX_ATTACHMENT_BYTES as u64 + 100).unwrap();
-        file.seek(SeekFrom::End(0)).unwrap();
-        let recent = b"{\"failure\":\"latest\"}\n";
-        file.write_all(b"\n").unwrap();
-        file.write_all(recent).unwrap();
-        drop(file);
-        let paths = [FeedbackAttachmentPath {
-            path,
-            attachment_filename_override: None,
-        }];
-        let extras =
-            [MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_BYTES - 64].map(|size| FeedbackAttachment {
-                filename: "existing.bin".into(),
-                content_type: None,
-                buffer: vec![0; size],
-            });
-        let snapshot = CodexFeedback::new().snapshot(None);
-        let (attachments, omitted) = snapshot.feedback_attachments(false, &extras, &paths, None);
-        assert_eq!(attachments.len(), 3);
-        assert_eq!(attachments[2].filename, "rollout.tail.jsonl");
-        assert_eq!(attachments[2].buffer, recent);
-        assert!(
-            attachments
-                .iter()
-                .map(|attachment| attachment.buffer.len())
-                .sum::<usize>()
-                <= MAX_TOTAL_ATTACHMENT_BYTES
-        );
-        assert_eq!(
-            omitted,
-            ["rollout.jsonl: truncated to recent complete JSONL records in rollout.tail.jsonl"]
-        );
-        let (attachments, omitted) = snapshot.feedback_attachments(false, &[], &[], None);
-        assert!(attachments.is_empty());
-        assert!(omitted.is_empty());
     }
 
     #[test]

@@ -128,7 +128,6 @@ impl CodeModeWaitHandler {
                 let exec = ExecContext { session, turn };
                 let started_at = Instant::now();
                 let cell_id = codex_code_mode::CellId::new(args.cell_id);
-                let mut host_control_yield = false;
                 let (wait_response, drained_observations) = if args.terminate {
                     exec.session
                         .services
@@ -184,13 +183,11 @@ impl CodeModeWaitHandler {
                     let response = match held.exit {
                         OwnerHeldCodeModeExit::Runtime(response) => response,
                         OwnerHeldCodeModeExit::InputActivity(activity) => {
-                            host_control_yield = true;
                             codex_code_mode::WaitOutcome::LiveCell(input_activity_response(
                                 &cell_id, activity,
                             ))
                         }
                         OwnerHeldCodeModeExit::IdleTimeout => {
-                            host_control_yield = true;
                             codex_code_mode::WaitOutcome::LiveCell(idle_timeout_response(&cell_id))
                         }
                     };
@@ -273,7 +270,6 @@ impl CodeModeWaitHandler {
                     wait_response.into(),
                     args.max_tokens,
                     started_at,
-                    host_control_yield,
                 )
                 .map_err(FunctionCallError::RespondToModel)?;
                 output =

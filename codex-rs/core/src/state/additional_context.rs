@@ -1,79 +1,15 @@
 use crate::context::AdditionalContextDeveloperFragment;
 use crate::context::AdditionalContextUserFragment;
 use crate::context::ContextualUserFragment;
-use crate::tools::command_output_artifact::create_canonical_output_artifact;
-use codex_context_fragments::additional_context_value_is_truncated;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
-use codex_tools::CanonicalToolResult;
-use futures::StreamExt;
 use indexmap::IndexMap;
-use std::path::Path;
 
 const ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET: usize = 160_000;
 const ADDITIONAL_CONTEXT_MAX_ITEMS: usize = 256;
 const ADDITIONAL_CONTEXT_RESET_SOURCE: &str = "__codex_additional_context_reset__";
 const ADDITIONAL_CONTEXT_RESET: &str = "Additional context snapshot replaced. All previously supplied additional context values are obsolete (previous_value_obsolete=\"true\"). Only additional-context entries following this reset in the current update remain available. Do not infer omitted values from earlier messages.";
-const RECOVERY_UNAVAILABLE: &str = "Original context recovery is unavailable because its snapshot could not be retained. This excerpt is incomplete; request missing information from the source.";
-
-fn recovery_notice(artifact_id: &str) -> String {
-    format!(
-        "Original context retained with source and trust kind. Recover missing content with read_tool_output: {{\"artifact_id\":\"{artifact_id}\",\"selectors\":[{{\"kind\":\"json_pointer\",\"pointer\":\"/value\"}}]}}. Use bounded search or ranges for large originals; do not reread unchanged excerpts."
-    )
-}
-
-#[derive(Default)]
-pub(crate) struct AdditionalContextUpdate {
-    items: Vec<ResponseInputItem>,
-    originals: Vec<OriginalContext>,
-}
-
-struct OriginalContext {
-    index: usize,
-    key: String,
-    entry: AdditionalContextEntry,
-    failure_item: ResponseInputItem,
-}
-
-impl AdditionalContextUpdate {
-    /// Persist only the originals selected by the pure admission pass. Recovery
-    /// failures keep the bounded excerpt, but never advertise an unusable handle.
-    pub(crate) async fn retain_originals(
-        mut self,
-        codex_home: &Path,
-        thread_id: &str,
-    ) -> (Vec<ResponseInputItem>, Vec<(String, u64, String)>) {
-        let mut artifacts = Vec::new();
-        let mut pending = futures::stream::iter(self.originals)
-            .map(|original| async move {
-                let kind = match original.entry.kind {
-                    AdditionalContextKind::Untrusted => "untrusted",
-                    AdditionalContextKind::Application => "application",
-                };
-                let canonical = CanonicalToolResult::json(serde_json::json!({
-                    "source": original.key,
-                    "kind": kind,
-                    "value": original.entry.value,
-                }));
-                let artifact = create_canonical_output_artifact(codex_home, thread_id, &canonical).await;
-                let id = artifact.complete.then(|| artifact.artifact_id()).flatten();
-                if let Some(id) = id {
-                    let item = render_entry(&original.key, &original.entry, Some(&recovery_notice(&id)));
-                    (original.index, item, Some((id, canonical.exact_bytes, canonical.sha256)))
-                } else {
-                    tracing::warn!(error = ?artifact.error, "failed to retain original additional context");
-                    (original.index, original.failure_item, None)
-                }
-            })
-            .buffered(4);
-        while let Some((index, item, artifact)) = pending.next().await {
-            self.items[index] = item;
-            artifacts.extend(artifact);
-        }
-        (self.items, artifacts)
-    }
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AdditionalContextStore {
@@ -82,14 +18,14 @@ pub(crate) struct AdditionalContextStore {
 }
 
 impl AdditionalContextStore {
-    pub(crate) fn prepare_merge(
+    pub(crate) fn merge(
         &mut self,
         values: IndexMap<String, AdditionalContextEntry>,
-    ) -> AdditionalContextUpdate {
+    ) -> Vec<ResponseInputItem> {
         if self.values == values {
-            return AdditionalContextUpdate::default();
+            return Vec::new();
         }
-        let mut update = AdditionalContextUpdate::default();
+        let mut fragments = Vec::new();
         // Include the JSON array brackets and each message's serialized envelope.
         let mut retained_bytes = 2;
         let mut overflowed = self
@@ -104,7 +40,11 @@ impl AdditionalContextStore {
             if self.delivered.get(key) == Some(entry) {
                 continue;
             }
-            if !push_bounded_item(&mut update, &mut retained_bytes, key, entry) {
+            if !push_bounded_item(
+                &mut fragments,
+                &mut retained_bytes,
+                render_entry(key, entry),
+            ) {
                 overflowed = true;
                 break;
             }
@@ -132,20 +72,22 @@ impl AdditionalContextStore {
                     value: ADDITIONAL_CONTEXT_RESET.to_string(),
                     kind,
                 },
-                None,
             );
-            update.items.clear();
-            update.originals.clear();
+            fragments.clear();
             delivered.clear();
             retained_bytes = 2 + serialized_item_bytes(&reset) + 1;
-            update.items.push(reset);
+            fragments.push(reset);
             for (key, entry) in &values {
-                if update.items.len() == ADDITIONAL_CONTEXT_MAX_ITEMS {
+                if fragments.len() == ADDITIONAL_CONTEXT_MAX_ITEMS {
                     break;
                 }
                 // An oversized entry does not consume the remaining budget: a
                 // later, smaller entry may still fit the replacement snapshot.
-                if push_bounded_item(&mut update, &mut retained_bytes, key, entry) {
+                if push_bounded_item(
+                    &mut fragments,
+                    &mut retained_bytes,
+                    render_entry(key, entry),
+                ) {
                     delivered.insert(key.clone(), entry.clone());
                 }
             }
@@ -155,39 +97,19 @@ impl AdditionalContextStore {
         // An unchanged remerge must not restore or repeatedly emit older values.
         self.values = values;
         self.delivered = delivered;
-        update
-    }
-
-    #[cfg(test)]
-    fn merge(
-        &mut self,
-        values: IndexMap<String, AdditionalContextEntry>,
-    ) -> Vec<ResponseInputItem> {
-        self.prepare_merge(values).items
+        fragments
     }
 }
 
-fn render_entry(
-    key: &str,
-    entry: &AdditionalContextEntry,
-    notice: Option<&str>,
-) -> ResponseInputItem {
+fn render_entry(key: &str, entry: &AdditionalContextEntry) -> ResponseInputItem {
     match entry.kind {
         AdditionalContextKind::Untrusted => {
-            let mut fragment =
-                AdditionalContextUserFragment::new(key.to_string(), entry.value.clone());
-            if let Some(notice) = notice {
-                fragment = fragment.with_recovery_notice(notice.to_string());
-            }
-            fragment.into_response_input_item()
+            AdditionalContextUserFragment::new(key.to_string(), entry.value.clone())
+                .into_response_input_item()
         }
         AdditionalContextKind::Application => {
-            let mut fragment =
-                AdditionalContextDeveloperFragment::new(key.to_string(), entry.value.clone());
-            if let Some(notice) = notice {
-                fragment = fragment.with_recovery_notice(notice.to_string());
-            }
-            fragment.into_response_input_item()
+            AdditionalContextDeveloperFragment::new(key.to_string(), entry.value.clone())
+                .into_response_input_item()
         }
     }
 }
@@ -219,39 +141,18 @@ fn serialized_item_bytes(item: &ResponseInputItem) -> usize {
 }
 
 fn push_bounded_item(
-    update: &mut AdditionalContextUpdate,
+    fragments: &mut Vec<ResponseInputItem>,
     retained_bytes: &mut usize,
-    key: &str,
-    entry: &AdditionalContextEntry,
+    item: ResponseInputItem,
 ) -> bool {
-    let needs_recovery = additional_context_value_is_truncated(&entry.value);
-    // UUIDs have a fixed serialized size. Admit the larger success/failure
-    // envelope before any I/O, including replay after an aggregate reset.
-    let placeholder =
-        needs_recovery.then(|| recovery_notice("00000000-0000-0000-0000-000000000000"));
-    let item = render_entry(key, entry, placeholder.as_deref());
-    let failure_item = needs_recovery.then(|| render_entry(key, entry, Some(RECOVERY_UNAVAILABLE)));
-    let item_bytes = serialized_item_bytes(&item).max(
-        failure_item
-            .as_ref()
-            .map(serialized_item_bytes)
-            .unwrap_or_default(),
-    ) + 1;
-    if update.items.len() == ADDITIONAL_CONTEXT_MAX_ITEMS
+    let item_bytes = serialized_item_bytes(&item) + 1;
+    if fragments.len() == ADDITIONAL_CONTEXT_MAX_ITEMS
         || item_bytes > ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET.saturating_sub(*retained_bytes)
     {
         return false;
     }
     *retained_bytes += item_bytes;
-    if let Some(failure_item) = failure_item {
-        update.originals.push(OriginalContext {
-            index: update.items.len(),
-            key: key.to_string(),
-            entry: entry.clone(),
-            failure_item,
-        });
-    }
-    update.items.push(item);
+    fragments.push(item);
     true
 }
 
@@ -259,178 +160,6 @@ fn push_bounded_item(
 mod tests {
     use super::*;
     use codex_protocol::models::ContentItem;
-
-    #[tokio::test]
-    async fn originals_are_recoverable_immutable_and_thread_scoped() {
-        use crate::tools::command_output_artifact::ToolOutputSelector;
-        use crate::tools::command_output_artifact::read_tool_output_selectors;
-        use crate::tools::command_output_artifact::remint_tool_history_artifact_for_thread;
-
-        let home = tempfile::tempdir().unwrap();
-        for (index, kind) in [
-            AdditionalContextKind::Untrusted,
-            AdditionalContextKind::Application,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let source = format!("source-{index}<&\"");
-            let old = format!(
-                "{}MIDDLE_REQUIREMENT=old{}",
-                "é<&>".repeat(500),
-                "😀tail".repeat(500)
-            );
-            let new = old.replace("=old", "=new");
-            let values = |value: String| {
-                IndexMap::from([(source.clone(), AdditionalContextEntry { value, kind })])
-            };
-            let mut store = AdditionalContextStore::default();
-            let (initial, artifacts) = store
-                .prepare_merge(values(old.clone()))
-                .retain_originals(home.path(), "parent")
-                .await;
-            let [(id, bytes, sha)] = artifacts.as_slice() else {
-                panic!("one retained original")
-            };
-            assert_eq!(initial.len(), 1);
-            assert!(input_text(&initial[0]).contains(id));
-            assert!(!input_text(&initial[0]).contains("MIDDLE_REQUIREMENT"));
-            match kind {
-                AdditionalContextKind::Untrusted => assert!(
-                    AdditionalContextUserFragment::matches_text(input_text(&initial[0]))
-                ),
-                AdditionalContextKind::Application => assert!(
-                    AdditionalContextDeveloperFragment::matches_text(input_text(&initial[0]))
-                ),
-            }
-            let (unchanged, no_artifacts) = store
-                .prepare_merge(values(old.clone()))
-                .retain_originals(home.path(), "parent")
-                .await;
-            assert!(unchanged.is_empty());
-            assert!(no_artifacts.is_empty());
-            let (changed, next_artifacts) = store
-                .prepare_merge(values(new.clone()))
-                .retain_originals(home.path(), "parent")
-                .await;
-            assert_eq!(next_artifacts.len(), 1);
-            assert_ne!(id, &next_artifacts[0].0);
-            assert!(input_text(&changed[0]).contains(&next_artifacts[0].0));
-            let selectors = || {
-                vec![ToolOutputSelector::JsonPointer {
-                    pointer: String::new(),
-                }]
-            };
-            for (artifact_id, value) in [(id, &old), (&next_artifacts[0].0, &new)] {
-                let recovered =
-                    read_tool_output_selectors(home.path(), "parent", artifact_id, selectors())
-                        .await
-                        .unwrap();
-                assert!(recovered.complete);
-                assert_eq!(
-                    recovered.results[0].value,
-                    Some(serde_json::json!({
-                        "source": source, "kind": if kind == AdditionalContextKind::Untrusted { "untrusted" } else { "application" }, "value": value,
-                    }))
-                );
-            }
-            assert!(
-                read_tool_output_selectors(home.path(), "unrelated", id, selectors())
-                    .await
-                    .is_err()
-            );
-            let copied = remint_tool_history_artifact_for_thread(
-                home.path(),
-                "parent",
-                "fork",
-                id,
-                *bytes,
-                sha,
-            )
-            .await
-            .unwrap();
-            assert_eq!(&copied, id);
-            let recovered = read_tool_output_selectors(home.path(), "fork", id, selectors())
-                .await
-                .unwrap();
-            assert_eq!(recovered.results[0].value.as_ref().unwrap()["value"], old);
-        }
-    }
-
-    #[tokio::test]
-    async fn retention_failure_is_explicit_and_small_values_do_not_touch_storage() {
-        let home = tempfile::tempdir().unwrap();
-        let blocked = home.path().join("not-a-directory");
-        std::fs::write(&blocked, "unchanged file").unwrap();
-        let mut store = AdditionalContextStore::default();
-        let (small, artifacts) = store
-            .prepare_merge(IndexMap::from([(
-                "source".to_string(),
-                AdditionalContextEntry {
-                    value: "small".to_string(),
-                    kind: AdditionalContextKind::Untrusted,
-                },
-            )]))
-            .retain_originals(&blocked, "thread")
-            .await;
-        assert_eq!(
-            input_text(&small[0]),
-            "<external_context source=\"source\" kind=\"untrusted\">\nsmall\n</external_context>"
-        );
-        assert!(artifacts.is_empty());
-        let (large, artifacts) = store
-            .prepare_merge(IndexMap::from([(
-                "source".to_string(),
-                AdditionalContextEntry {
-                    value: "&".repeat(5_000),
-                    kind: AdditionalContextKind::Untrusted,
-                },
-            )]))
-            .retain_originals(&blocked, "thread")
-            .await;
-        assert!(artifacts.is_empty());
-        assert!(input_text(&large[0]).contains(RECOVERY_UNAVAILABLE));
-        assert!(!input_text(&large[0]).contains("artifact_id"));
-        assert!(AdditionalContextUserFragment::matches_text(input_text(
-            &large[0]
-        )));
-        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "unchanged file");
-    }
-
-    #[tokio::test]
-    async fn aggregate_admission_retains_only_the_final_selected_originals() {
-        let home = tempfile::tempdir().unwrap();
-        let values = (0..64)
-            .map(|index| {
-                (
-                    format!("source-{index}"),
-                    AdditionalContextEntry {
-                        value: "\"\\&".repeat(2_000),
-                        kind: AdditionalContextKind::Application,
-                    },
-                )
-            })
-            .collect();
-        let update = AdditionalContextStore::default().prepare_merge(values);
-        let originals = update.originals.len();
-        assert!(originals > 0 && originals < 64);
-        assert_eq!(
-            originals,
-            update.items.len() - 1,
-            "the reset does not need an artifact"
-        );
-        let (items, artifacts) = update.retain_originals(home.path(), "thread").await;
-        assert_eq!(artifacts.len(), originals);
-        assert!(
-            serde_json::to_vec(&items).unwrap().len() <= ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET
-        );
-        let metadata_count = std::fs::read_dir(home.path().join("tool-output/thread"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".meta.json"))
-            .count();
-        assert_eq!(metadata_count, originals);
-    }
 
     #[test]
     fn preserves_source_insertion_order() {

@@ -348,29 +348,6 @@ async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()
         .codex
         .set_openai_form_elicitation_support(/*supported*/ true)
         .await?;
-    // Refresh is applied on the next turn; tool discovery remains nonblocking.
-    mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_assistant_message("refresh", "refreshing capabilities"),
-            responses::ev_completed("refresh"),
-        ]),
-    )
-    .await;
-    fixture
-        .codex
-        .submit(read_only_user_turn(&fixture, "refresh capabilities"))
-        .await?;
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    assert!(
-        fixture
-            .codex
-            .current_mcp_runtime()
-            .await
-            .manager()
-            .wait_for_server_ready(server_name, Duration::from_secs(10))
-            .await
-    );
     let supported = call_structured_tool(
         &server,
         &fixture,

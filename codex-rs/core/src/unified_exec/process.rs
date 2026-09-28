@@ -75,6 +75,9 @@ impl RawOutputArtifactTask {
                     writer.write_chunk(Some(&task_state), &output).await;
                 }
             }
+            if let Some(writer) = writer.as_mut() {
+                writer.flush_pending(Some(&task_state)).await;
+            }
             ready.cancel();
             drop(ready_on_exit);
             if let Some(writer) = writer.as_mut() {

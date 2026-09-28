@@ -333,7 +333,7 @@ mod tests {
         assert!(description.contains("Stable built-in tool contracts may be included below"));
         assert!(description.contains("external and omitted contracts remain lazy"));
         assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
-        assert!(description.contains("Filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
         assert!(description.contains("callable with `.name`/`.description`"));
         assert!(description.contains("Search only if local discovery fails"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
@@ -372,39 +372,40 @@ mod tests {
         assert!(description.contains("`console.log(...)` aliases `text(...)`"));
         assert!(description.contains("Only `ALL_TOOL_NAMES` entries are callable"));
         assert!(description.contains("never pipe a patch through a shell wrapper"));
-        assert!(description.contains("host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions"));
+        assert!(description.contains("host retains up to two nested-tool results, each capped at 1024 bytes, and reports omissions"));
         assert!(!description.contains("yield_time_ms"));
         assert!(description.contains("max_output_tokens"));
         assert!(description.contains("type: \"image\""));
         assert!(description.contains("type: \"audio\""));
-        assert!(description.contains("Unawaited work is discarded"));
-        assert!(description.contains(
-            "Parallelize only independent locks, outputs, and services when tools permit"
-        ));
-        assert!(description.contains("Process results in JavaScript"));
+        assert!(description.contains("unawaited work is discarded"));
+        assert!(description.contains("prefer `text(result.output)`"));
+        assert!(description.contains("inspect `result.exit_code`"));
         assert!(description.contains("Await `Promise.allSettled` for independent known calls"));
         assert!(description.contains("Reuse current schemas and results"));
         assert!(description.contains("resolve missing/stale schemas before calls"));
-        assert!(description.contains("Reuse current schemas and results"));
+        assert!(description.contains("Nested tools: use a present schema"));
         assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
-        assert!(description.contains("Filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
         assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
         assert!(!description.contains("do not substitute a search or second shell"));
         assert!(description.contains("host-configured default deadline"));
-        assert!(description.contains("Expiry cancels the call, possibly without a live handle."));
-        assert!(description.contains("Resume only returned live session/cell IDs"));
-        assert!(description.contains("check uncertain effects before retrying"));
+        assert!(description.contains(
+            "Expiry cancels the nested call and may return only an error, without a live handle."
+        ));
+        assert!(description.contains("Resume only an actually returned live session/cell ID"));
+        assert!(description.contains("check the outcome before retrying uncertain effects"));
         assert!(description.contains(
             "Retry only if unstarted, safely repeatable after stopping, or tool-approved"
         ));
         assert!(description.contains("inspect every result"));
-        assert!(description.contains("Check prerequisites before dependent calls"));
-        assert!(description.contains("buffers output during awaited work"));
-        assert!(description.contains("continue polling in this evaluation"));
-        assert!(description.contains("Without a new model decision"));
-        assert!(description.contains(
-            "Parallelize only independent locks, outputs, and services when tools permit"
-        ));
+        assert!(
+            description
+                .contains("Sequence dependent calls only after checking prerequisite results")
+        );
+        assert!(description.contains("buffers output while awaited work continues"));
+        assert!(description.contains("same awaited evaluation"));
+        assert!(description.contains("only for a new model decision"));
+        assert!(!description.contains("Parallelize only when tools permit"));
         assert!(description.contains("Propagate failures with `&&` or exit-code checks"));
         assert!(description.contains("never mask them with `|| true`"));
         assert!(!description.contains("never repeat the same call/poll"));
@@ -412,10 +413,10 @@ mod tests {
         assert!(description.contains("retained-artifact selectors after truncation"));
         assert_eq!(
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            crate::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+            4_000,
         );
         assert!(description.contains(&format!(
-            "Output defaults to the {}-token hard cap",
+            "Output defaults to {} tokens",
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
         assert!(description.contains(&format!(
@@ -484,7 +485,7 @@ mod tests {
 
         assert!(description.contains("Some deferred nested tools may be omitted"));
         assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
-        assert!(description.contains("Filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
         assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
         assert!(!description.contains("Nested tool schemas are discovered lazily at runtime"));
@@ -541,7 +542,7 @@ mod tests {
         let wait = build_wait_tool_description();
 
         assert!(!exec.contains("yield_time_ms"));
-        assert!(exec.contains("override with `{ timeout_ms }`"));
+        assert!(exec.contains("documented `{ timeout_ms }` option"));
         assert!(!wait.contains("yield_time_ms"));
     }
 
@@ -728,7 +729,7 @@ mod tests {
     #[test]
     fn direct_only_patch_routing_and_output_pragma_are_usable() {
         let description = build_exec_tool_description(false, false, &["apply_patch".to_string()]);
-        assert!(description.contains("nested if registered, otherwise direct"));
+        assert!(description.contains("nested when registered, otherwise direct"));
         assert!(description.contains("Direct-only tools omitted from `ALL_TOOLS`: `apply_patch`"));
         let directive = description
             .split("first-line `")

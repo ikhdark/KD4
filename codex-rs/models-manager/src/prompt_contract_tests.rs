@@ -9,15 +9,11 @@ use crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS;
 
 #[derive(Clone, Copy)]
 enum PromptScope {
-    FallbackAndBundled,
     LocalPolicyAndFallback,
-    LocalPolicy,
-    FallbackAndGpt52,
 }
 
 #[derive(Clone, Copy)]
 enum AnchorExpectation {
-    Any,
     All,
     None,
 }
@@ -31,271 +27,14 @@ struct PromptContract {
 
 const PROMPT_CONTRACTS: &[PromptContract] = &[
     PromptContract {
-        id: "rollout-evidence-and-handoff-regressions",
+        id: "instruction-discovery",
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "parsing, counting, or sampling is not reading fully",
-            "Track unread ranges and unavailable sources",
-            "recover required omitted content from retained artifacts before conclusions",
-            "report any remaining gap instead of claiming full coverage",
-            "Recover missing ranges from retained evidence rather than rerunning its producer",
-            "Prefer completed discovery before implementation",
-            "a completed plan, partial implementation, or passing check alone is not completion",
-            "including staged and unstaged changes and new untracked file contents",
-            "a diff stat or truncated patch is insufficient",
-            "do not describe a supported subset as general support",
-        ],
-    },
-    PromptContract {
-        id: "omit-redundant-tool-arguments",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Supply required arguments and optional values that affect behavior",
-            "omit equivalent defaults, empty collections, and nulls",
-        ],
-    },
-    PromptContract {
-        id: "requirement-fidelity-and-runtime-grounding",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "explicit constraints, prohibitions, and out-of-scope work until superseded",
-            "Delegated objectives and write scopes bound a worker's task",
-            "Read the complete enclosing function, type, or configuration unit before changing it",
-            "Current file content overrides summaries, plans, and stale reads",
-            "entrypoint through registration, dispatch, feature flags or config defaults to consumers",
-            "Partial wiring of implemented code is forbidden. End-to-end wiring is mandatory.",
-            "Resolve contradictions by runtime reachability, ownership, and freshness.",
-            "Cargo commands sharing a target directory",
-            "do not evade denials",
-            "combine compatible behavior against the requested contract. Verify the combined runtime path",
-            "Cancellation need not roll back effects",
-            "without weakening required invariants or assertions",
-            "match every explicit requirement, prohibition, and preserved invariant to current evidence",
-            "a completed plan, partial implementation, or passing check alone is not completion",
-            "Distinguish missing capability, failure to follow existing guidance, and interface friction",
-            "Check the supported reuse path",
-            "Incomplete discovery or an output receipt never proves absence or omitted content",
-            "Measure progress by resolved requirements and validated outcomes",
-            "finish missing coverage without restarting discovery",
-            "using the original request and corrections, not just a checklist",
-            "repair omissions with targeted follow-up",
-            "report partial, blocked, or unverified results",
-        ],
-    },
-    PromptContract {
-        id: "concise-progress-updates",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Give one brief initial update before tools.",
-            "Later updates should report material results, decisions, or blockers, usually in one sentence.",
-            "Skip routine edit/test narration and repeated plans",
-            "preserve required updates and disclosures",
-            "without recapping",
-            "Use final for a self-contained handoff:",
-            "Do not claim actions or tests that did not occur.",
-        ],
-    },
-    PromptContract {
-        id: "complete-substance-with-concise-wording",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Conciseness limits wording, not substance.",
-            "Include all requested material content now; do not defer it behind follow-up offers or length targets.",
-            "Explain each material point once.",
-        ],
-    },
-    PromptContract {
-        id: "no-deferred-answer-expansion",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::None,
-        anchors: &["expand when the user requests it"],
-    },
-    PromptContract {
-        id: "avoid-overengineering",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Implement the smallest coherent change that fully satisfies the requested behavior.",
-            "Before adding a mechanism, establish from relevant source evidence the concrete missing capability and why existing abstractions are insufficient.",
-            "avoid unrelated refactors, renames, file moves, and dependencies.",
-            "Scope configuration and side effects to the requested behavior; change shared, global, or user-wide settings only when the requirement is global.",
-            "An option or setting must change reachable behavior; one that is only parsed, validated, or forced is dead code.",
-        ],
-    },
-    PromptContract {
-        id: "complete-request-before-finalizing",
-        scope: PromptScope::FallbackAndBundled,
-        expectation: AnchorExpectation::Any,
-        anchors: &[
-            "Once the task and validation are complete, deliver the result without repeating passing checks.",
-        ],
-    },
-    PromptContract {
-        id: "user-work-protection",
-        scope: PromptScope::FallbackAndBundled,
-        expectation: AnchorExpectation::Any,
-        anchors: &[
-            "first protect user work",
-            "Existing and newly observed changes belong to the user",
-        ],
-    },
-    PromptContract {
-        id: "patch-is-not-validation",
-        scope: PromptScope::FallbackAndBundled,
-        expectation: AnchorExpectation::Any,
-        anchors: &[
-            "Patch success means the patch applied",
-            "Patch success proves only that the patch applied",
-        ],
-    },
-    PromptContract {
-        id: "concurrent-edit-convergence",
-        scope: PromptScope::FallbackAndBundled,
-        expectation: AnchorExpectation::Any,
-        anchors: &["Concurrent Edit Convergence", "concurrent changes"],
-    },
-    PromptContract {
-        id: "implementation-self-repair",
-        scope: PromptScope::FallbackAndBundled,
-        expectation: AnchorExpectation::Any,
-        anchors: &[
-            "implementation self-repair is mandatory",
-            "Implementation self-repair is required",
-        ],
-    },
-    PromptContract {
-        id: "complete-required-validation",
-        scope: PromptScope::FallbackAndBundled,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Run all validation required by the user or repository.",
-            "Finish the entire requested task and required validation; a completed plan, partial implementation, or passing check alone is not completion.",
-            "Preserve progress across context windows and resume unfinished work rather than finalizing because of difficulty, time spent, or context pressure.",
-            "A blocker requires evidence that further progress needs user input, unavailable authorization, or an external change; complete all permitted independent work before reporting it.",
-            "Honor user cancellation and host-imposed limits",
-            "as incomplete, with the precise condition needed to resume",
-        ],
-    },
-    PromptContract {
-        id: "no-premature-completion-shortcuts",
-        scope: PromptScope::FallbackAndBundled,
-        expectation: AnchorExpectation::None,
-        anchors: &[
-            "nearest sufficient",
-            "or report the remaining uncertainty",
-            "or a genuine blocker prevents further progress",
-            "without an automatic review loop",
-            "Wrap up this turn soon",
-        ],
-    },
-    PromptContract {
-        id: "risk-based-validation-and-tool-fallbacks",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "choose the least costly check that proves the changed contract against plausible failure modes, not a check for every touched file or layer.",
-            "Use inspection or a direct assertion when sufficient; when correctness requires execution, use targeted behavior tests",
-            "including consumer or integration tests for distinct uncovered risks.",
-            "Account for compilation, helper binaries, setup, and execution cost; a narrow test filter does not imply a cheap check.",
-            "Reuse existing coverage; add or repair tests only for a concrete changed-behavior gap",
-            "Run a full suite only when explicitly required by the user or repository.",
-            "Broaden validation only when required or when a concrete unresolved risk makes existing evidence insufficient; state the risk and how the added check addresses it.",
-            "Respect explicit scope limits; reduce cost with an equally valid proof, never by skipping required validation or leaving required outcomes unverified.",
-            "Continue independent work while long commands run.",
-            "Checkpoint completed, consumed work only when it materially reduces context or preserves needed continuation state",
-            "following the live tool's eligibility and savings requirements.",
-            "If unavailable, use a concise continuation summary without claiming outputs were retired.",
-            "do not checkpoint just for phase boundaries or final handoff.",
-            "Preserve source needed for edits, unresolved failures, active work, constraints, and essential validation evidence.",
-            "Triage all reported issues together before repair edits.",
-            "Fully diagnose issues caused by the requested changes or necessary to complete required validation; report unrelated issues and their validation impact without expanding the investigation.",
-            "render identifiers and counts from retained records, using an inventory/report tool when available",
-        ],
-    },
-    PromptContract {
-        id: "no-unconditional-validation-or-tool-requirements",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::None,
-        anchors: &[
-            "Run those checks only when required",
-            "At a completed phase, use `context_checkpoint` for",
-            "use `context_checkpoint` when available",
-            "diagnose all reported issues before making repair edits",
-            "with the available inventory/report tool and link its report",
-            "Every validation test must assert",
-            "Repair weak tests covering the changed behavior or blocking its validation.",
-            "identify the concrete missing capability and explain",
-            "Prefer existing code mode",
-            "Host-owned waits may hold for up to five minutes",
-            "For changed behavior and mechanical refactors, run the tests that exercise the new or preserved contract and its affected consumers.",
-            "Do not substitute compilation, formatting, linting, static analysis, inspection, or unrelated tests for behavior validation.",
-        ],
-    },
-    PromptContract {
-        id: "validation-reuse-and-authorized-publishing",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "A required broader check may replace a redundant narrower one unless independently required",
-            "clippy is required, it can replace cargo check only for identical packages, targets, features, toolchain, environment, and revision",
-            "only if cargo check is not independently required",
-            "They do not expire merely because of a new turn, handoff, or unrelated edit.",
-            "Refresh only evidence affected by changed inputs, contradictions, incompleteness, or explicit freshness requirements.",
-            "When evidence is invalidated, retain portions still identified as current",
-            "revalidate only if current evidence is essential, using the cheapest scoped check",
-            "not an automatic test or build rerun.",
-            "Otherwise report the affected claim as unverified and disclose unresolved staleness.",
-            "Retry a failed operation only when changed inputs, new evidence, a documented retry policy, or an explicit task requirement justify it",
-            "When publishing is authorized, publish only after the source state is fixed and required validation is complete.",
-        ],
-    },
-    PromptContract {
-        id: "economical-tool-use",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Match discovery to the request",
-            "start with the smallest likely owner",
-            "Before optional discovery, planning, or validation, identify the material uncertainty and how the result could change the next action",
-            "otherwise skip it",
-            "This is an internal decision, not a narrated checklist or extra tool call.",
-            "never by skipping required validation or leaving required outcomes unverified.",
-            "Read complete useful regions",
-            "retain a recovery route for oversized output",
-            "do not mistake recovery for fresh evidence",
-            "disclose unresolved staleness.",
-            "Use asynchronous sessions for long or interactive commands",
-        ],
-    },
-    PromptContract {
-        id: "general-repository-discovery",
-        scope: PromptScope::LocalPolicy,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "inspect named paths directly",
-            "scoped rg searches",
-            "identify the material uncertainty and how the result could change the next action; otherwise skip it",
-            "Reuse current reads, exact values, enumerations, agent results, and passing checks.",
-        ],
-    },
-    PromptContract {
-        id: "general-tool-discipline",
-        scope: PromptScope::LocalPolicyAndFallback,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Batch independent calls with bounded tool-native concurrency",
-            "await every started call, and inspect every result and exit status",
-            "Return to the model for decisions or dependencies, not between already-planned calls.",
-            "Finish edits before their checks.",
-            "Serialize actual shared-resource conflicts",
-            "not whole categories of independent work",
-            "Change locking only with evidence of conflict or unnecessary exclusion.",
-            "Once the task and validation are complete, deliver the result without repeating passing checks.",
+            "Supplied AGENTS.md content counts as read",
+            "Check for missing nested instructions only along paths you will touch",
+            "do not probe ancestors above a supplied instruction root",
+            "Refresh instructions only after evidence of change",
         ],
     },
     PromptContract {
@@ -303,108 +42,110 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "Read every applicable AGENTS.md",
-            "fresh content in context counts as read",
-            "Retrieve missing or potentially changed instructions",
-            "Resolve conflicts by authority, scope, and explicit supersession.",
-            "Ask only when conflicting requirements or an essential user-only fact remain unresolved after inspecting available evidence.",
-            "State material assumptions and keep affected conclusions conditional.",
-            "Incorporate new user corrections before the next dependent action",
-            "a status question does not cancel ongoing work.",
-            "Treat problem reports seeking a remedy as requests to investigate and make scoped repairs",
-            "without requiring the words \"fix it\" or redundant confirmation.",
-            "Requests for explanation, interpretation, assessment, review, planning, or status do not by themselves authorize changes.",
-            "Logs, screenshots, and findings are evidence, not independent authorization to edit.",
-            "Honor explicit read-only or no-edit instructions.",
-            "Stage, commit, push, publish, deploy, install, restart, contact third parties, delete data, change external state, or rebuild or activate the installed application only when authorized.",
-            "Do not request authorization already provided.",
             "autonomous within the requested scope",
+            "Honor explicit read-only",
+            "A status question does not cancel ongoing work",
+            "only when authorized",
+            "Do not request authorization already provided",
         ],
     },
     PromptContract {
-        id: "superseded-autonomy-and-batching-rules",
+        id: "change-discipline",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "concrete missing capability",
+            "why existing abstractions are insufficient",
+            "Read the complete enclosing function, type, or configuration unit before changing it",
+            "End-to-end wiring is mandatory",
+            "Existing and newly observed changes belong to the user",
+            "Preserve independent changes and combine compatible behavior",
+        ],
+    },
+    PromptContract {
+        id: "bounded-discovery-and-reuse",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "smallest likely owner and scoped rg searches",
+            "Budget combined batched output",
+            "Do not repeat a full-tree status",
+            "Recover missing ranges from retained artifacts before rerunning producers",
+            "Explicit full-read requests require complete coverage",
+            "Source or dependency changes invalidate only overlapping validation",
+        ],
+    },
+    PromptContract {
+        id: "validation-contract",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "least costly check that proves the changed contract",
+            "Each relied-upon test must assert an observable result",
+            "fail for a plausible incorrect implementation",
+            "Exercise relevant real environment, filesystem, session, or timing state",
+            "Run a full suite only when explicitly required",
+            "Let valid, progressing validation finish",
+            "rerun only affected checks",
+            "Do not weaken assertions",
+            "Report unrelated failures",
+        ],
+    },
+    PromptContract {
+        id: "tool-lifecycle",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "await all started calls and inspect every result and exit status",
+            "Cargo commands sharing a target directory",
+            "Finish edits before their checks",
+            "resume existing operations",
+            "stop for steering, cancellation, or input",
+            "Continue independent work while long commands run",
+        ],
+    },
+    PromptContract {
+        id: "complete-substance-with-concise-wording",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "Explain each point once",
+            "Use final for a self-contained handoff",
+            "Include requested substance now rather than deferring it behind an offer",
+            "Do not claim unperformed actions",
+        ],
+    },
+    PromptContract {
+        id: "completion-and-evidence",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "inspect the complete affected diff",
+            "match the original request and corrections against current evidence",
+            "Continue until all requested work and required validation are complete",
+            "Preserve progress across context windows",
+            "finish independent authorized work first",
+            "Prompt tests prove guidance delivery, not model compliance",
+            "Distinguish observations, inferences, stale evidence, and unavailable evidence",
+        ],
+    },
+    PromptContract {
+        id: "no-deferred-answer-expansion",
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::None,
         anchors: &[
-            "Treat user-sent issues, errors, logs, screenshots, and findings as requests to investigate and fix",
-            "Get permission to publish",
-            "stop on incompatible equal-authority requirements",
-            "Batch known independent reads and final checks in one tool round",
+            "expand when the user requests it",
         ],
     },
     PromptContract {
-        id: "general-change-discipline",
-        scope: PromptScope::LocalPolicy,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Before editing, identify the behavior's owner, intended observable change, preserved invariants, affected files and contracts, and focused validation.",
-            "Revise this prediction as evidence changes.",
-            "Update affected callers, schemas, generated representations, persistence/migrations, compatibility paths, and tests.",
-            "identify the material uncertainty and how the result could change the next action; otherwise skip it",
-            "Run all validation required by the user or repository.",
-            "Every test relied upon as evidence for the changed behavior must assert an expected observable result and fail for at least one plausible incorrect implementation of that behavior.",
-            "Exercise the intended path, including required rejection and absent-side-effect cases.",
-            "including required rejection and absent-side-effect cases",
-            "exercise it at least once against that real state rather than only through tests that substitute it",
-            "derive inputs from what the behavior actually reads; irrelevant inputs cause false invalidation and missing ones cause stale results",
-            "Test quality requirements do not authorize expanding coverage beyond that gap.",
-            "Report unrelated weaknesses encountered without starting a broader test audit.",
-            "Validate the final relevant source state",
-            "using the evidence lifecycle rules above, including for dependency, lockfile, configuration, and feature changes",
-            "when correctness requires execution, use targeted behavior tests rather than compilation, formatting, linting, static analysis, or unrelated tests.",
-            "Verify documentation claims against implementation or referenced sources.",
-            "choose the least costly check that proves the changed contract against plausible failure modes",
-            "distinguish mechanism proof from model-driven outcomes",
-            "Replaying valid evidence without its producer saves execution",
-            "does not save that model request",
-            "Measure complete-turn time, model handoffs, output/recovery cost, cancellation responsiveness, and task success",
-            "Prompt contract tests establish guidance delivery, not model compliance.",
-            "validation and what it proved, failures, unvalidated behavior",
-            "rerun only affected checks that failed or whose prior results were invalidated by relevant changes",
-            "report partial, blocked, or unverified results",
-        ],
-    },
-    PromptContract {
-        id: "workspace-ownership",
-        scope: PromptScope::LocalPolicy,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Existing and newly observed changes belong to the user",
-            "When edits overlap, preserve independent changes",
-            "When edits overlap, preserve independent changes and combine compatible behavior against the requested contract.",
-            "do not discard unrelated changes",
-            "Do not hard-code machine-specific paths.",
-        ],
-    },
-    PromptContract {
-        id: "general-global-prompt",
-        scope: PromptScope::LocalPolicy,
-        expectation: AnchorExpectation::None,
-        anchors: &["KD4", "repository source map", "official session roots"],
-    },
-    PromptContract {
-        id: "environment-neutral-global-prompt",
-        scope: PromptScope::LocalPolicy,
-        expectation: AnchorExpectation::None,
-        anchors: &[r"C:\Users\", "/Users/", "/home/"],
-    },
-    PromptContract {
-        id: "live-tool-contract-ownership",
-        scope: PromptScope::FallbackAndGpt52,
+        id: "environment-neutral-prompt",
+        scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::None,
         anchors: &[
-            r#"{"command":["apply_patch""#,
-            "## apply_patch",
-            "This is a FREEFORM tool",
-            "## `update_plan`",
-            "(`pending`, `in_progress`, or `completed`)",
-            "Do not jump an item from pending to completed",
-            "stale_workspace_evidence",
-            "current_nested_results",
-            "force_fresh",
-            "`context_checkpoint`",
-            "yield_time_ms",
-            "Host-owned waits may hold for up to",
+            "C:\\Users\\",
+            "/Users/",
+            "/home/",
+            "Read every applicable AGENTS.md from root",
         ],
     },
 ];
@@ -418,23 +159,6 @@ fn prompts_for_scope(scope: PromptScope, response: &ModelsResponse) -> Vec<(Stri
             .unwrap_or_else(|| panic!("bundled models.json should contain {slug}"))
     };
     match scope {
-        PromptScope::FallbackAndBundled => {
-            let mut prompts = vec![("fallback".to_string(), BASE_INSTRUCTIONS_DEFAULT)];
-            for model in &response.models {
-                prompts.push((
-                    format!("{}.base_instructions", model.slug),
-                    &model.base_instructions,
-                ));
-                if let Some(template) = model
-                    .model_messages
-                    .as_ref()
-                    .and_then(|messages| messages.instructions_template.as_deref())
-                {
-                    prompts.push((format!("{}.instructions_template", model.slug), template));
-                }
-            }
-            prompts
-        }
         PromptScope::LocalPolicyAndFallback => {
             std::iter::once(("fallback".to_string(), BASE_INSTRUCTIONS_DEFAULT))
                 .chain(
@@ -444,17 +168,7 @@ fn prompts_for_scope(scope: PromptScope, response: &ModelsResponse) -> Vec<(Stri
                 )
                 .collect()
         }
-        PromptScope::LocalPolicy => LOCAL_PROMPT_POLICY_SLUGS
-            .iter()
-            .map(|slug| ((*slug).to_string(), model(slug).base_instructions.as_str()))
-            .collect(),
-        PromptScope::FallbackAndGpt52 => vec![
-            ("fallback".to_string(), BASE_INSTRUCTIONS_DEFAULT),
-            (
-                "gpt-5.2".to_string(),
-                model("gpt-5.2").base_instructions.as_str(),
-            ),
-        ],
+
     }
 }
 
@@ -472,7 +186,6 @@ fn resolved_prompts_satisfy_named_contract_registry() {
                 .map(|anchor| prompt.contains(anchor))
                 .collect::<Vec<_>>();
             let passed = match contract.expectation {
-                AnchorExpectation::Any => matches.iter().any(|matched| *matched),
                 AnchorExpectation::All => matches.iter().all(|matched| *matched),
                 AnchorExpectation::None => matches.iter().all(|matched| !*matched),
             };
@@ -486,7 +199,7 @@ fn resolved_prompts_satisfy_named_contract_registry() {
                     .zip(&matches)
                     .filter_map(|(anchor, matched)| {
                         let relevant = match contract.expectation {
-                            AnchorExpectation::Any | AnchorExpectation::All => !matched,
+                            AnchorExpectation::All => !matched,
                             AnchorExpectation::None => *matched,
                         };
                         relevant.then_some(anchor)
@@ -515,7 +228,6 @@ fn resolved_prompts_prioritize_complete_answers() {
                 let expected = match contract.expectation {
                     AnchorExpectation::All => true,
                     AnchorExpectation::None => false,
-                    AnchorExpectation::Any => panic!("completeness requires every anchor"),
                 };
                 assert_eq!(
                     prompt.contains(anchor),
@@ -532,13 +244,12 @@ fn resolved_prompts_keep_live_tool_mechanics_owned_and_discovery_bounded() {
     let response = crate::bundled_models_response().expect("bundled models should parse");
     for (label, prompt) in prompts_for_scope(PromptScope::LocalPolicyAndFallback, &response) {
         for anchor in [
-            "Follow live tool instructions, schemas, and advertised discovery routes",
-            "they own argument formats, session handles, polling and wait limits, cancellation, and recovery mechanics.",
-            "Keep mechanical waits within the supported awaited execution instead of creating model handoffs solely to poll.",
-            "stop waiting for steering, cancellation, input, or explicit yield.",
-            "Budget the combined output of batched reads",
-            "Keep potentially large status inventories separate from source reads",
-            "retain complete recoverable evidence when broader coverage is required",
+            "Use live schemas and advertised discovery routes",
+            "Follow the tool's lifecycle and polling contract",
+            "stop for steering, cancellation, or input",
+            "Budget combined batched output",
+            "Use path-scoped git status",
+            "retain a broad inventory once only when needed",
         ] {
             assert!(
                 prompt.contains(anchor),

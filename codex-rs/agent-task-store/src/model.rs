@@ -823,13 +823,6 @@ pub struct ValidationCall {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationEvidence {
-    /// Host-selected repository-relative validation inputs. Absent on legacy epoch proofs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_paths: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_manifest_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_manifest_hash: Option<String>,
     #[serde(default)]
     pub start_epoch: u64,
     #[serde(default)]

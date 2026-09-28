@@ -21,7 +21,6 @@ use super::types::DeliveredExecute;
 use super::types::DriverCommand;
 use super::types::PendingRequest;
 use super::types::RemoteSession;
-use crate::delivery::Delivery;
 
 impl ConnectionDriver {
     pub(super) fn handle_command(&mut self, command: DriverCommand) -> bool {
@@ -116,7 +115,7 @@ impl ConnectionDriver {
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
     ) -> bool {
-        if let Err(err) = self.sessions.require_receipt_capacity(&session) {
+        if let Err(err) = self.sessions.require_ready(&session) {
             let _ = response_tx.send(Err(err));
             return true;
         }
@@ -173,7 +172,7 @@ impl ConnectionDriver {
         session: RemoteSession,
         request: WaitRequest,
         caller_cancellation: CancellationToken,
-        response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
         if let Err(err) = self.sessions.require_ready(&session) {
             let _ = response_tx.send(Err(err));
@@ -203,19 +202,8 @@ impl ConnectionDriver {
         session: RemoteSession,
         request: WireWaitRequest,
         caller_cancellation: CancellationToken,
-        response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
-        match self.sessions.recover_response(&session, &request.cell_id) {
-            Ok(Some(response)) => {
-                let _ = response_tx.send(Ok(response));
-                return true;
-            }
-            Err(error) => {
-                let _ = response_tx.send(Err(error));
-                return true;
-            }
-            Ok(None) => {}
-        }
         let cell_id = request.cell_id.clone();
         self.send_request(
             HostRequest::Wait {
@@ -235,7 +223,7 @@ impl ConnectionDriver {
         &mut self,
         session: RemoteSession,
         cell_id: CellId,
-        response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
         if let Err(err) = self.sessions.require_ready(&session) {
             let _ = response_tx.send(Err(err));

@@ -12,15 +12,11 @@ use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
 use http::header::IF_NONE_MATCH;
-use std::time::Duration;
 use tracing::Level;
 use tracing::enabled;
 use tracing::trace;
 
 pub type ByteStream = BoxStream<'static, Result<Bytes, TransportError>>;
-
-const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_millis(250);
-const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 pub struct StreamResponse {
     pub status: StatusCode,
@@ -117,36 +113,6 @@ fn request_body_for_trace(req: &Request) -> String {
     }
 }
 
-async fn read_error_body(response: reqwest::Response) -> Option<String> {
-    // Status and Retry-After are already authoritative. Diagnostics must not
-    // hold an otherwise actionable failure hostage to a stalled/oversized body.
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-    let read = tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.ok()?;
-            let remaining = MAX_ERROR_BODY_BYTES - bytes.len();
-            bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-            if bytes.len() == MAX_ERROR_BODY_BYTES {
-                return Some(false);
-            }
-        }
-        Some(true)
-    })
-    .await;
-    match read {
-        Ok(None) => None,
-        Err(_) if bytes.is_empty() => None,
-        result => {
-            let mut body = String::from_utf8_lossy(&bytes).into_owned();
-            if !matches!(result, Ok(Some(true))) {
-                body.push_str("\n[HTTP error body truncated]");
-            }
-            Some(body)
-        }
-    }
-}
-
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, req: Request) -> Result<Response, TransportError> {
         self.trace_request(&req);
@@ -159,7 +125,11 @@ impl HttpTransport for ReqwestTransport {
         let headers = resp.headers().clone();
         if !(status.is_success() || status == StatusCode::NOT_MODIFIED && accepts_not_modified) {
             let retry_after = RetryAfter::from_headers(&headers);
-            let body = read_error_body(resp).await;
+            let body = resp
+                .bytes()
+                .await
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
@@ -186,7 +156,7 @@ impl HttpTransport for ReqwestTransport {
         let headers = resp.headers().clone();
         if !status.is_success() {
             let retry_after = RetryAfter::from_headers(&headers);
-            let body = read_error_body(resp).await;
+            let body = resp.text().await.ok();
             return Err(TransportError::Http {
                 status,
                 url: Some(url),

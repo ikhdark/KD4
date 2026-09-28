@@ -331,29 +331,6 @@ def _derive_downscale_path(path: Path, suffix: str) -> Path:
     return path.with_name(f"{path.stem}{suffix}{path.suffix}")
 
 
-def _preflight_outputs(outputs: List[Path], args: argparse.Namespace) -> None:
-    paths = list(outputs)
-    if args.downscale_max_dim is not None:
-        if args.downscale_max_dim < 1:
-            _die("--downscale-max-dim must be >= 1")
-        paths.extend(_derive_downscale_path(p, args.downscale_suffix) for p in outputs)
-    seen = set()
-    for path in paths:
-        key = os.path.normcase(str(path.resolve()))
-        if key in seen:
-            _die(f"Output paths collide: {path}")
-        seen.add(key)
-        if path.is_dir() or (os.path.lexists(path) and not args.force):
-            _die(f"Output already exists: {path} (use --force to overwrite)")
-        if any(parent.exists() and not parent.is_dir() for parent in path.parents):
-            _die(f"Output parent is not a directory: {path}")
-    if args.downscale_max_dim is not None:
-        try:
-            from PIL import Image  # noqa: F401
-        except ImportError:
-            _die(f"Downscaling requires Pillow. {_dependency_hint('pillow')}")
-
-
 def _downscale_image_bytes(
     image_bytes: bytes, *, max_dim: int, output_format: str
 ) -> bytes:
@@ -620,37 +597,47 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
         "moderation": args.moderation,
     }
 
-    prepared = []
-    for i, job in enumerate(jobs, start=1):
-        prompt = str(job["prompt"]).strip()
-        fields = _merge_non_null(base_fields, job.get("fields", {}))
-        # Allow flat job keys as well (use_case, scene, etc.)
-        fields = _merge_non_null(fields, {k: job.get(k) for k in base_fields.keys()})
-        augmented = _augment_prompt_fields(args.augment, prompt, fields)
+    if args.dry_run:
+        for i, job in enumerate(jobs, start=1):
+            prompt = str(job["prompt"]).strip()
+            fields = _merge_non_null(base_fields, job.get("fields", {}))
+            # Allow flat job keys as well (use_case, scene, etc.)
+            fields = _merge_non_null(
+                fields, {k: job.get(k) for k in base_fields.keys()}
+            )
+            augmented = _augment_prompt_fields(args.augment, prompt, fields)
 
-        job_payload = dict(base_payload)
-        job_payload["prompt"] = augmented
-        job_payload = _merge_non_null(
-            job_payload, {k: job.get(k) for k in base_payload.keys()}
-        )
-        job_payload = {k: v for k, v in job_payload.items() if v is not None}
-        _validate_generate_payload(job_payload)
-        effective_output_format = _normalize_output_format(job_payload.get("output_format"))
-        _validate_transparency(job_payload.get("background"), effective_output_format)
-        job_payload["output_format"] = effective_output_format
-        outputs = _job_output_paths(
-            out_dir=out_dir,
-            output_format=effective_output_format,
-            idx=i,
-            prompt=prompt,
-            n=int(job_payload.get("n", 1)),
-            explicit_out=job.get("out"),
-        )
-        prepared.append((job_payload, outputs, effective_output_format))
-        if args.dry_run:
+            job_payload = dict(base_payload)
+            job_payload["prompt"] = augmented
+            job_payload = _merge_non_null(
+                job_payload, {k: job.get(k) for k in base_payload.keys()}
+            )
+            job_payload = {k: v for k, v in job_payload.items() if v is not None}
+
+            _validate_generate_payload(job_payload)
+            effective_output_format = _normalize_output_format(
+                job_payload.get("output_format")
+            )
+            _validate_transparency(
+                job_payload.get("background"), effective_output_format
+            )
+            job_payload["output_format"] = effective_output_format
+
+            n = int(job_payload.get("n", 1))
+            outputs = _job_output_paths(
+                out_dir=out_dir,
+                output_format=effective_output_format,
+                idx=i,
+                prompt=prompt,
+                n=n,
+                explicit_out=job.get("out"),
+            )
             downscaled = None
             if args.downscale_max_dim is not None:
-                downscaled = [str(_derive_downscale_path(p, args.downscale_suffix)) for p in outputs]
+                downscaled = [
+                    str(_derive_downscale_path(p, args.downscale_suffix))
+                    for p in outputs
+                ]
             _print_request(
                 {
                     "endpoint": "/v1/images/generations",
@@ -660,19 +647,40 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
                     **job_payload,
                 }
             )
-    if args.dry_run:
         return 0
 
-    _preflight_outputs([p for _, outputs, _ in prepared for p in outputs], args)
     client = _create_async_client()
     sem = asyncio.Semaphore(args.concurrency)
 
     any_failed = False
 
-    async def run_job(i: int, prepared_job: tuple) -> Tuple[int, Optional[str]]:
+    async def run_job(i: int, job: Dict[str, Any]) -> Tuple[int, Optional[str]]:
         nonlocal any_failed
+        prompt = str(job["prompt"]).strip()
         job_label = f"[job {i}/{len(jobs)}]"
-        payload, outputs, effective_output_format = prepared_job
+
+        fields = _merge_non_null(base_fields, job.get("fields", {}))
+        fields = _merge_non_null(fields, {k: job.get(k) for k in base_fields.keys()})
+        augmented = _augment_prompt_fields(args.augment, prompt, fields)
+
+        payload = dict(base_payload)
+        payload["prompt"] = augmented
+        payload = _merge_non_null(payload, {k: job.get(k) for k in base_payload.keys()})
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        n = int(payload.get("n", 1))
+        _validate_generate_payload(payload)
+        effective_output_format = _normalize_output_format(payload.get("output_format"))
+        _validate_transparency(payload.get("background"), effective_output_format)
+        payload["output_format"] = effective_output_format
+        outputs = _job_output_paths(
+            out_dir=out_dir,
+            output_format=effective_output_format,
+            idx=i,
+            prompt=prompt,
+            n=n,
+            explicit_out=job.get("out"),
+        )
         try:
             async with sem:
                 print(f"{job_label} starting", file=sys.stderr)
@@ -703,7 +711,7 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
             return i, str(exc)
 
     tasks = [
-        asyncio.create_task(run_job(i, job)) for i, job in enumerate(prepared, start=1)
+        asyncio.create_task(run_job(i, job)) for i, job in enumerate(jobs, start=1)
     ]
 
     try:
@@ -765,7 +773,6 @@ def _generate(args: argparse.Namespace) -> None:
         "Calling Image API (generation). This can take up to a couple of minutes.",
         file=sys.stderr,
     )
-    _preflight_outputs(output_paths, args)
     started = time.time()
     client = _create_client()
     result = client.images.generate(**payload)
@@ -841,7 +848,6 @@ def _edit(args: argparse.Namespace) -> None:
         f"Calling Image API (edit) with {len(image_paths)} image(s).",
         file=sys.stderr,
     )
-    _preflight_outputs(output_paths, args)
     started = time.time()
     client = _create_client()
 

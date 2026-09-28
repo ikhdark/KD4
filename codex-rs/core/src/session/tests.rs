@@ -1,7 +1,4 @@
 use super::turn_context::TurnEnvironment;
-#[path = "context_review_benchmarks.rs"]
-mod context_review_benchmarks;
-
 use super::*;
 use crate::FunctionCallError;
 use crate::agents_md_manager::AgentsMdManager;
@@ -78,44 +75,20 @@ use codex_utils_path_uri::PathUri;
 use tracing::Span;
 
 #[tokio::test]
-async fn session_event_channel_applies_ordered_backpressure() {
+async fn session_event_channel_preserves_order_without_waiting_for_the_ui() {
     let (tx, rx) = event_channel();
-    for index in 0..EVENT_CHANNEL_CAPACITY {
+    for index in 0..1_024 {
         tx.try_send(Event {
             id: index.to_string(),
             msg: EventMsg::Warning(WarningEvent {
                 message: index.to_string(),
             }),
         })
-        .expect("event channel should accept events up to its capacity");
+        .expect("an idle UI must not block the model or tool producer");
     }
-
-    let blocked_sender = tokio::spawn(async move {
-        tx.send(Event {
-            id: "overflow".to_string(),
-            msg: EventMsg::Warning(WarningEvent {
-                message: "overflow".to_string(),
-            }),
-        })
-        .await
-    });
-    tokio::task::yield_now().await;
-    assert!(
-        !blocked_sender.is_finished(),
-        "producer should wait once the finite event channel is full"
-    );
-
-    assert_eq!(rx.recv().await.expect("first event").id, "0");
-    blocked_sender
-        .await
-        .expect("blocked sender task")
-        .expect("event receiver should remain open");
-
-    let mut last_id = String::new();
-    for _ in 0..EVENT_CHANNEL_CAPACITY {
-        last_id = rx.recv().await.expect("queued event").id;
+    for index in 0..1_024 {
+        assert_eq!(rx.recv().await.expect("queued event").id, index.to_string());
     }
-    assert_eq!(last_id, "overflow");
 }
 
 #[tokio::test]
@@ -11391,6 +11364,9 @@ async fn make_multi_agent_v2_usage_hint_test_session(
         },
     )
     .await;
+    turn_context
+        .multi_agent_spawn_authorized
+        .store(true, std::sync::atomic::Ordering::Release);
     (session, turn_context)
 }
 
@@ -12737,6 +12713,16 @@ async fn build_initial_context_omits_prompt_fragments_without_extension_state() 
             .any(|text| *text == "prompt extension enabled"),
         "did not expect prompt extension developer text, got {developer_messages:?}"
     );
+}
+
+#[tokio::test]
+async fn build_initial_context_omits_multi_agent_usage_hint_when_prohibited() {
+    let (session, turn_context) = make_multi_agent_v2_usage_hint_test_session(true).await;
+    turn_context
+        .multi_agent_spawn_authorized
+        .store(false, std::sync::atomic::Ordering::Release);
+    let initial = build_initial_context(&session, &turn_context).await;
+    assert!(multi_agent_usage_hint_payloads(&initial).is_empty());
 }
 
 #[tokio::test]
@@ -20047,96 +20033,4 @@ async fn audit_missing_usage_estimates_context_without_fabricating_billed_tokens
     let info = session.state.lock().await.token_info().unwrap();
     assert_eq!(info.last_token_usage.total_tokens, expected);
     assert_eq!(info.total_token_usage, billed);
-}
-
-#[tokio::test]
-async fn steer_additional_context_retains_original_and_registers_recovery() {
-    use crate::tools::command_output_artifact::ToolOutputSelector;
-    use crate::tools::command_output_artifact::read_tool_output_selectors;
-    use codex_protocol::protocol::AdditionalContextEntry;
-    use codex_protocol::protocol::AdditionalContextKind;
-    use indexmap::IndexMap;
-
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: true,
-        },
-    )
-    .await;
-    let original = format!(
-        "{}MIDDLE_STEERING_REQUIREMENT{}",
-        "head\n".repeat(600),
-        "tail\n".repeat(600)
-    );
-    sess.steer_input(
-        vec![UserInput::Text {
-            text: "Use the updated client context.".to_string(),
-            text_elements: Vec::new(),
-        }],
-        IndexMap::from([(
-            "client-source".to_string(),
-            AdditionalContextEntry {
-                value: original.clone(),
-                kind: AdditionalContextKind::Untrusted,
-            },
-        )]),
-        Some(&tc.sub_id),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let pending = sess.input_queue.get_pending_input(&sess.active_turn).await;
-    let [TurnInput::ResponseItem(item), TurnInput::UserInput { .. }] = pending.as_slice() else {
-        panic!("context must precede the steering input: {pending:?}");
-    };
-    let ResponseItem::Message { role, content, .. } = item else {
-        panic!("message")
-    };
-    assert_eq!(role, "user");
-    let ContentItem::InputText { text } = &content[0] else {
-        panic!("text")
-    };
-    assert!(crate::event_mapping::is_contextual_user_message_content(
-        content
-    ));
-    assert!(!text.contains("MIDDLE_STEERING_REQUIREMENT"));
-    let id = text
-        .split_once("\"artifact_id\":\"")
-        .unwrap()
-        .1
-        .split('"')
-        .next()
-        .unwrap();
-    let history = sess
-        .lock_history_state_for_test()
-        .await
-        .tool_history_state();
-    assert!(history.artifact_references().contains_key(id));
-    assert!(
-        history
-            .artifact_pin_payload_for_items(std::slice::from_ref(item))
-            .unwrap()
-            .contains(id)
-    );
-    let recovered = read_tool_output_selectors(
-        &tc.config.codex_home,
-        &sess.thread_id.to_string(),
-        id,
-        vec![ToolOutputSelector::JsonPointer {
-            pointer: "/value".to_string(),
-        }],
-    )
-    .await
-    .unwrap();
-    assert!(recovered.complete);
-    assert_eq!(
-        recovered.results[0].value,
-        Some(serde_json::json!(original))
-    );
-    sess.interrupt_task().await;
 }

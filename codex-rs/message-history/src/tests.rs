@@ -107,46 +107,6 @@ async fn lookup_reads_history_entries() {
 }
 
 #[tokio::test]
-async fn sparse_history_index_reuses_scan_and_invalidates_same_size_rewrites() {
-    let home = TempDir::new().unwrap();
-    let path = home.path().join(HISTORY_FILENAME);
-    let lines: String = (0..400)
-        .map(|i| format!("{{\"session_id\":\"s\",\"ts\":{i},\"text\":\"old-{i}\"}}\n"))
-        .collect();
-    std::fs::write(&path, &lines).unwrap();
-    let (id, count) = history_metadata_for_file(&path).await;
-    assert_eq!(count, 400);
-    let index = {
-        let mut file = open_locked_history(&path, false).unwrap();
-        history_index(&path, &mut file).unwrap()
-    };
-    for offset in [0, 127, 128, 255, 256, 399] {
-        assert_eq!(
-            lookup_history_entry(&path, id, offset).unwrap().text,
-            format!("old-{offset}")
-        );
-    }
-    let again = {
-        let mut file = open_locked_history(&path, false).unwrap();
-        history_index(&path, &mut file).unwrap()
-    };
-    assert!(
-        Arc::ptr_eq(&index, &again),
-        "unchanged lookups must reuse the scan"
-    );
-    assert_eq!(lookup_history_entry(&path, id, 400), None);
-    std::fs::write(&path, lines.replace("old-", "new-")).unwrap();
-    let file = OpenOptions::new().write(true).open(&path).unwrap();
-    file.set_modified(index.modified + Duration::from_secs(2))
-        .unwrap();
-    drop(file);
-    assert_eq!(
-        lookup_history_entry(&path, id, 399).unwrap().text,
-        "new-399"
-    );
-}
-
-#[tokio::test]
 async fn history_metadata_counts_newlines_across_read_boundaries() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let history_path = temp_dir.path().join(HISTORY_FILENAME);

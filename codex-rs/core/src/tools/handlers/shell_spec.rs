@@ -124,7 +124,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget. Source reads and searches default to 25000 tokens; other commands use the standard output policy. Larger requests may be capped by policy. Zero returns only execution controls.".to_string(),
+                "Output token budget, capped at 10000 tokens (8000 inside exec). Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
     ]);
@@ -479,17 +479,6 @@ fn unified_exec_output_schema() -> Value {
                 "type": "string",
                 "description": "One pre-execution read-only equivalent repair applied to the command."
             },
-            "replay": {
-                "type": "object",
-                "description": "An unchanged search miss was reused; no process was launched for this call.",
-                "properties": {
-                    "kind": {"const": "search_miss"},
-                    "fingerprint": {"type": "string"},
-                    "message": {"type": "string"}
-                },
-                "required": ["kind", "fingerprint", "message"],
-                "additionalProperties": false
-            },
             "output": {
                 "type": "string",
                 "description": "Command output text, possibly truncated."
@@ -533,6 +522,9 @@ fn create_approval_parameters(
     exec_permission_approvals_enabled: bool,
     allow_escalated_sandbox_permissions: bool,
 ) -> BTreeMap<String, JsonSchema> {
+    if !exec_permission_approvals_enabled && !allow_escalated_sandbox_permissions {
+        return BTreeMap::new();
+    }
     let mut sandbox_permission_values = vec![json!("use_default")];
     if exec_permission_approvals_enabled {
         sandbox_permission_values.push(json!("with_additional_permissions"));

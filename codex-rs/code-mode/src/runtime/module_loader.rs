@@ -140,16 +140,14 @@ pub(super) extern "C" fn promise_rejected(message: v8::PromiseRejectMessage) {
     let Some(state) = scope.get_slot_mut::<RuntimeState>() else { return; };
     match message.get_event() {
         v8::PromiseRejectEvent::PromiseRejectWithNoHandler => {
-            state.unhandled_rejection_count = state.unhandled_rejection_count.saturating_add(1);
             if state.unhandled_rejections.len() < super::MAX_OUTSTANDING_CALLBACKS_PER_CELL {
                 state.unhandled_rejections.push(promise);
+            } else {
+                state.rejection_tracking_overflow = true;
             }
         }
         v8::PromiseRejectEvent::PromiseHandlerAddedAfterReject => {
-            state.unhandled_rejection_count = state.unhandled_rejection_count.saturating_sub(1);
-            state
-                .unhandled_rejections
-                .retain(|pending| pending != &promise);
+            state.unhandled_rejections.retain(|pending| pending != &promise);
         }
         _ => {}
     }
@@ -162,51 +160,25 @@ pub(super) fn completion_state(
     scope: &mut v8::PinScope<'_, '_>,
     pending_promise: Option<&v8::Global<v8::Promise>>,
 ) -> CompletionState {
-    let (unhandled, unhandled_count) = scope
-        .get_slot::<RuntimeState>()
-        .map(|state| {
-            (
-                state
-                    .unhandled_rejections
-                    .iter()
-                    .find(|promise| Some(*promise) != pending_promise)
-                    .cloned(),
-                state.unhandled_rejection_count,
-            )
-        })
-        .unwrap_or_default();
+    let unhandled = scope.get_slot::<RuntimeState>().and_then(|state| {
+        state.unhandled_rejections.iter().find(|promise| Some(*promise) != pending_promise).cloned()
+    });
     let async_error = if let Some(unhandled) = unhandled {
         let promise = v8::Local::new(scope, &unhandled);
         let reason = promise.result(scope);
         if is_exit_exception(scope, reason) { None } else {
             Some(format!("Unhandled promise rejection: {}", value_to_error_text(scope, reason)))
         }
-    } else if unhandled_count > 0 {
-        // The module's own rejection is handled below, even if its handle
-        // could not fit in the bounded diagnostic set.
-        let main_unhandled = pending_promise.is_some_and(|promise| {
-            let promise = v8::Local::new(scope, promise);
-            promise.state() == v8::PromiseState::Rejected && !promise.has_handler()
-        });
-        (unhandled_count > usize::from(main_unhandled)).then(|| {
-            "code mode cell exceeded its unhandled promise rejection tracking limit".to_string()
-        })
-    } else {
-        None
-    };
+    } else if scope.get_slot::<RuntimeState>().is_some_and(|state| state.rejection_tracking_overflow) {
+        Some("code mode cell exceeded its unhandled promise rejection tracking limit".to_string())
+    } else { None };
     let error_text = if async_error.is_some() {
         async_error
     } else if let Some(pending_promise) = pending_promise {
         let promise = v8::Local::new(scope, pending_promise);
         match promise.state() {
-            v8::PromiseState::Pending
-                if !scope
-                    .get_slot::<RuntimeState>()
-                    .is_some_and(|state| state.exit_requested) =>
-            {
-                return CompletionState::Pending;
-            }
-            v8::PromiseState::Pending | v8::PromiseState::Fulfilled => None,
+            v8::PromiseState::Pending => return CompletionState::Pending,
+            v8::PromiseState::Fulfilled => None,
             v8::PromiseState::Rejected => {
                 let result = promise.result(scope);
                 if is_exit_exception(scope, result) {
@@ -224,21 +196,19 @@ pub(super) fn completion_state(
     if error_text.is_none() && scope.get_slot::<RuntimeState>().is_some_and(|state| !state.exit_requested && !state.pending_notifications.is_empty()) {
         return CompletionState::Pending;
     }
-    let error_text = error_text.or_else(|| {
-        scope.get_slot::<RuntimeState>().and_then(|state| {
-            (!state.exit_requested && !state.pending_tool_calls.is_empty()).then(|| format!(
+    let error_text = error_text.or_else(|| scope.get_slot::<RuntimeState>().and_then(|state| {
+        (!state.exit_requested && !state.pending_tool_calls.is_empty()).then(|| format!(
             "cell completed with {} unawaited tool call(s); outstanding tool work is cancelled",
             state.pending_tool_calls.len()
         ))
-        })
-    });
-    let stored_value_writes = scope
+    }));
+    let (stored_value_writes, stored_value_limit_error) = scope
         .get_slot_mut::<RuntimeState>()
         .map(RuntimeState::stored_value_completion)
         .unwrap_or_default();
     CompletionState::Completed {
         stored_value_writes,
-        error_text,
+        error_text: stored_value_limit_error.or(error_text),
     }
 }
 

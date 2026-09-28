@@ -203,14 +203,15 @@ impl AgentsMdManager {
             }
         };
         let refresh = Box::pin(async {
-            if let Some(_permit) = permit
-                && let Ok(observation) = tokio::time::timeout_at(
+            if let Some(_permit) = permit {
+                if let Ok(observation) = tokio::time::timeout_at(
                     deadline,
                     self.refresh_with_gate_held(Arc::clone(config), &snapshot),
                 )
                 .await
-            {
-                return observation;
+                {
+                    return observation;
+                }
             }
             // Preparation already uses this snapshot; even a timeout must not switch scopes.
             self.scoped_fallback(config, &snapshot)

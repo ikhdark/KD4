@@ -9,90 +9,12 @@ use std::collections::HashMap;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::OwnedHandle;
-use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::time::Duration;
 
 const READY_MARKER: &str = "__CODEX_CHILD_READY__";
 const VALUE_MARKER: &str = "__CODEX_CHILD_VALUE__";
 const REQUIRE_PROCESS_TESTS_ENV: &str = "CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS";
-
-#[tokio::test]
-async fn piped_children_have_no_console_and_keep_stdio() -> anyhow::Result<()> {
-    const PROBE: &str = "CODEX_PTY_DETACHED_CONSOLE_PROBE";
-    if std::env::var_os(PROBE).is_none() {
-        // A console-attached test runner can hide accidental console allocation.
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "tests::windows_tests::piped_children_have_no_console_and_keep_stdio",
-                "--nocapture",
-            ])
-            .env(PROBE, "1")
-            .creation_flags(winapi::um::winbase::DETACHED_PROCESS)
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "detached probe failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        return Ok(());
-    }
-
-    let python =
-        find_python().ok_or_else(|| anyhow::anyhow!("Python required for console probe"))?;
-    let env = std::env::vars().collect();
-    for piped_stdin in [true, false] {
-        let args = vec![
-            "-u".to_string(),
-            "-c".to_string(),
-            "import ctypes,sys; print(ctypes.windll.kernel32.GetConsoleWindow()); print(repr(sys.stdin.readline())); print('stderr works', file=sys.stderr)".to_string(),
-        ];
-        let spawned = if piped_stdin {
-            crate::spawn_pipe_process(&python, &args, Path::new("."), &env, &None).await?
-        } else {
-            spawn_pipe_process_no_stdin(&python, &args, Path::new("."), &env, &None).await?
-        };
-        let crate::SpawnedProcess {
-            session,
-            mut stdout_rx,
-            mut stderr_rx,
-            exit_rx,
-        } = spawned;
-        if piped_stdin {
-            session
-                .writer_sender()
-                .send(b"stdin works\n".to_vec())
-                .await?;
-        }
-        let (code, stdout, stderr) = tokio::time::timeout(Duration::from_secs(10), async {
-            let code = exit_rx.await?;
-            let mut stdout = Vec::new();
-            while let Some(chunk) = stdout_rx.recv().await {
-                stdout.extend(chunk);
-            }
-            let mut stderr = Vec::new();
-            while let Some(chunk) = stderr_rx.recv().await {
-                stderr.extend(chunk);
-            }
-            Ok::<_, anyhow::Error>((code, stdout, stderr))
-        })
-        .await??;
-        assert_eq!(code, 0);
-        assert_eq!(
-            String::from_utf8(stdout)?.replace("\r\n", "\n"),
-            if piped_stdin {
-                "0\n'stdin works\\n'\n"
-            } else {
-                "0\n''\n"
-            },
-        );
-        assert_eq!(String::from_utf8(stderr)?.trim(), "stderr works");
-    }
-    Ok(())
-}
 
 struct WindowsShell {
     name: &'static str,

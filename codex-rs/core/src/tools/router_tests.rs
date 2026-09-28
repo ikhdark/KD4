@@ -51,6 +51,127 @@ fn admitted_tool_dispatch_state() -> Arc<ToolDispatchState> {
     state
 }
 
+#[tokio::test]
+async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Result<()> {
+    use codex_features::Feature;
+    use codex_protocol::openai_models::ToolMode;
+    for (token_budget, mode) in [
+        (false, ToolMode::Direct),
+        (true, ToolMode::Direct),
+        (true, ToolMode::CodeMode),
+        (true, ToolMode::CodeModeOnly),
+    ] {
+        let (session, mut turn) = make_session_and_context().await;
+        let config = Arc::make_mut(&mut turn.config);
+        config.features.enable(Feature::Kd4Runtime)?;
+        if token_budget {
+            config.features.enable(Feature::TokenBudget)?;
+        } else {
+            config.features.disable(Feature::TokenBudget)?;
+        }
+        turn.model_info.tool_mode = Some(mode);
+        let turn = Arc::new(turn);
+        let step = StepContext::for_test(Arc::clone(&turn));
+        let router = ToolRouter::from_context(
+            &step,
+            ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        );
+        let specs = router.model_visible_specs();
+        let mut names = HashSet::new();
+        for name in specs.iter().flat_map(ToolSpec::callable_tool_names) {
+            assert!(
+                names.insert(name.clone()),
+                "duplicate visible handler: {name:?}"
+            );
+            assert!(
+                router.has_registered_tool(&name),
+                "missing handler: {name:?}"
+            );
+        }
+        assert_eq!(
+            router.has_registered_tool(&ToolName::plain("get_context_remaining")),
+            token_budget
+        );
+        assert_eq!(
+            router.has_registered_tool(&ToolName::plain("new_context")),
+            token_budget
+        );
+        for name in ["get_context_remaining", "new_context"] {
+            assert_eq!(
+                names.contains(&ToolName::plain(name)),
+                token_budget && mode != ToolMode::CodeModeOnly,
+                "unexpected exposure for {name} in {mode:?}"
+            );
+        }
+        let bytes = serde_json::to_vec(&specs)?.len();
+        eprintln!("tool schema bytes: token_budget={token_budget}, mode={mode:?}, bytes={bytes}");
+        assert!(
+            bytes < 160 * 1024,
+            "material schema growth beyond the 128 KiB warning baseline: {bytes}"
+        );
+        if mode != ToolMode::Direct {
+            continue;
+        }
+        let session = Arc::new(session);
+        let mut calls = vec![(
+            "context_checkpoint",
+            json!({"completed_call_ids":[],"summary":" \n", "active_work":"\t", "retained_evidence":[]}),
+        )];
+        if token_budget {
+            calls.push(("get_context_remaining", json!({})));
+        }
+        let before = session.clone_history().await.raw_items().len();
+        for (name, args) in calls {
+            let result = router
+                .dispatch_tool_call_with_terminal_outcome(
+                    Arc::clone(&session),
+                    Arc::clone(&step),
+                    CancellationToken::new(),
+                    Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                    ToolCall {
+                        tool_name: ToolName::plain(name),
+                        call_id: format!("smoke-{name}"),
+                        payload: ToolPayload::Function {
+                            arguments: args.to_string(),
+                        },
+                    },
+                    ToolCallSource::Direct,
+                    admitted_tool_dispatch_state(),
+                )
+                .await?
+                .into_response();
+            let ResponseInputItem::FunctionCallOutput { output, .. } = result else {
+                panic!("expected function result");
+            };
+            let FunctionCallOutputBody::Text(text) = output.body else {
+                panic!("expected JSON text");
+            };
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            if name == "context_checkpoint" {
+                assert_eq!(value["changed"], false);
+                assert_eq!(value["checkpoint_item_persisted"], false);
+            } else {
+                assert_eq!(value.as_object().unwrap().len(), 1);
+                assert!(value["tokens_left"].is_i64() || value["tokens_left"].is_null());
+            }
+        }
+        assert_eq!(
+            session.clone_history().await.raw_items().len(),
+            before,
+            "empty checkpoint must not persist notes"
+        );
+    }
+    Ok(())
+}
+
 use super::ExternalMutationIntent;
 use super::ToolCall;
 use super::ToolCallBuildError;
@@ -2653,65 +2774,4 @@ async fn code_mode_activation_keeps_provider_schemas_but_registers_dispatch_tool
             .to_string()
             .contains("deferred_reader")
     );
-}
-
-#[tokio::test]
-async fn code_mode_exclusions_only_activate_direct_namespace_schemas() {
-    let (_, mut turn) = make_session_and_context().await;
-    turn.model_info.supports_search_tool = true;
-    turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
-    Arc::make_mut(&mut turn.config)
-        .code_mode
-        .excluded_tool_namespaces = vec!["direct".into()];
-    let turn = Arc::new(turn);
-    let step = StepContext::for_test(Arc::clone(&turn));
-    let dynamic_tools = ["direct", "nested"].map(|namespace| {
-        DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
-            name: namespace.into(),
-            description: "Test namespace".into(),
-            tools: vec![DynamicToolNamespaceTool::Function(
-                DynamicToolFunctionSpec {
-                    name: "reader".into(),
-                    description: "Read a resource".into(),
-                    input_schema: json!({"type": "object", "properties": {}}),
-                    defer_loading: true,
-                },
-            )],
-        })
-    });
-    let router = ToolRouter::from_context(
-        step.as_ref(),
-        ToolRouterParams {
-            tool_suggest_candidates: None,
-            deferred_mcp_tools: None,
-            mcp_tools: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: &dynamic_tools,
-            exposure_identity: Default::default(),
-        },
-        &Default::default(),
-    );
-    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
-    let before = router.model_visible_schemas_for_turn(&turn);
-    let nested = ToolName::namespaced("nested", "reader");
-    turn.activate_deferred_tools([nested.clone()]);
-    assert!(turn.deferred_tool_is_activated(&nested));
-    assert!(router.has_registered_tool(&nested));
-    let after_nested = router.model_visible_schemas_for_turn(&turn);
-    assert!(Arc::ptr_eq(&before, &after_nested));
-    assert_eq!(before.digest(), after_nested.digest());
-    let manifest = router.tool_manifest(&turn).manifest.unwrap();
-    assert!(manifest["activated_schemas"].to_string().contains("nested"));
-    turn.activate_deferred_tools([ToolName::namespaced("direct", "reader")]);
-    let after_direct = router.model_visible_schemas_for_turn(&turn);
-    assert_eq!(
-        namespace_function_names(after_direct.specs(), "direct"),
-        vec!["reader"]
-    );
-    assert!(namespace_function_names(after_direct.specs(), "nested").is_empty());
-    assert_ne!(after_nested.digest(), after_direct.digest());
-    assert!(Arc::ptr_eq(
-        &after_direct,
-        &router.model_visible_schemas_for_turn(&turn)
-    ));
 }

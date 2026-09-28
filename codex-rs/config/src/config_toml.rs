@@ -212,16 +212,6 @@ pub enum AfterAgentPolicy {
     #[default]
     Legacy,
     MutatingFinalizer,
-    /// Wait for `notify` as a finalizer, sending the agent-turn-complete JSON on
-    /// stdin instead of appending it to argv. The v1 payload has the same fields
-    /// as legacy notifications and supports inputs beyond OS command-line limits.
-    MutatingFinalizerStdinV1,
-}
-
-impl AfterAgentPolicy {
-    pub fn is_mutating_finalizer(self) -> bool {
-        matches!(self, Self::MutatingFinalizer | Self::MutatingFinalizerStdinV1)
-    }
 }
 
 /// Base config deserialized from ~/.codex/config.toml.

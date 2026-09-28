@@ -212,7 +212,7 @@ async fn automatic_compaction_stops_when_replacement_still_exceeds_limit() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oversized_pending_input_stops_without_compaction_or_sampling() -> Result<()> {
+async fn oversized_pending_input_stops_after_one_compaction_without_sampling() -> Result<()> {
     require_network!();
     let harness = TestCodexHarness::with_builder(
         test_codex()
@@ -226,6 +226,16 @@ async fn oversized_pending_input_stops_without_compaction_or_sampling() -> Resul
             }),
     )
     .await?;
+    let requests = responses::mount_sse_once(
+        harness.server(),
+        responses::sse(vec![
+            json!({"type": "response.output_item.done", "item": {
+                "type": "compaction", "encrypted_content": "small replacement",
+            }}),
+            responses::ev_completed("compact"),
+        ]),
+    )
+    .await;
     let codex = &harness.test().codex;
     codex
         .submit(Op::UserInput {
@@ -255,12 +265,22 @@ async fn oversized_pending_input_stops_without_compaction_or_sampling() -> Resul
     assert!(
         error
             .as_ref()
-            .is_some_and(|message| message.contains("pending input alone exceeds")),
+            .is_some_and(|message| message.contains("prompt still exceeds")),
         "{error:?}"
     );
+    let request = requests.single_request();
     assert!(
-        harness.request_bodies().await.is_empty(),
-        "no compaction or sampling request may be dispatched"
+        request
+            .body_json()
+            .to_string()
+            .contains("compaction_trigger")
+    );
+    assert!(
+        !request
+            .body_json()
+            .to_string()
+            .contains("oversized pending input"),
+        "rejected pending input must not be dispatched"
     );
     Ok(())
 }

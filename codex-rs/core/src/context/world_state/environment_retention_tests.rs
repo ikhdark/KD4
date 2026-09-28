@@ -19,6 +19,37 @@ fn items(fragments: Vec<Box<dyn ContextualUserFragment>>) -> Vec<ResponseItem> {
 }
 
 #[test]
+fn subagent_changes_do_not_resend_environment_and_replay_after_loss() {
+    use crate::context::world_state::SubagentsState;
+    let build = |agent: &str| {
+        let mut state = WorldState::default();
+        state.add_section(EnvironmentsState {
+            current_date: Some("2026-09-28".into()),
+            ..Default::default()
+        });
+        state.add_section(SubagentsState::new(agent.into()));
+        state
+    };
+    let initial = build("worker running");
+    let (fragments, baseline) = initial.render_full_with_snapshot();
+    let mut retained = items(fragments);
+    let changed = build("worker finished");
+    let (delta, next) = changed.render_history_diff_with_snapshot(Some(&baseline), &retained);
+    assert_eq!(delta.len(), 1);
+    let text = delta[0].render();
+    assert!(text.contains("worker finished"));
+    assert!(!text.contains("2026-09-28"));
+    assert!(!text.contains("<environment_context>"));
+    retained.extend(items(delta));
+    assert!(changed.render_history_diff(Some(&next), &retained).is_empty());
+    assert_eq!(changed.render_history_diff(Some(&next), &[]).len(), 2);
+    let removed = build("");
+    let delta = removed.render_history_diff(Some(&next), &retained);
+    assert_eq!(delta.len(), 1);
+    assert!(delta[0].render().contains("none"));
+}
+
+#[test]
 fn only_latest_delivered_environment_proves_shell_status_clear_and_removal() {
     let environment = EnvironmentState {
         cwd: PathUri::parse("file:///repo").unwrap(),

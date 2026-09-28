@@ -508,11 +508,7 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
         .with_config(|config| config.include_environment_context = false)
         .build(&server)
         .await?;
-    let long_browser_value = format!(
-        "browser-head-{}MIDDLE_BROWSER_REQUIREMENT{}browser-tail",
-        "b".repeat(20_000),
-        "b".repeat(20_000)
-    );
+    let long_browser_value = format!("browser-head-{}browser-tail", "b".repeat(40_000));
     let long_automation_value = format!("automation-head-{}automation-tail", "a".repeat(40_000));
     let untruncated_browser_fragment = external_context("browser_info", &long_browser_value);
     let untruncated_automation_fragment =
@@ -591,56 +587,6 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
         "untrusted additional context was not capped before model input: {} bytes",
         external_text.len()
     );
-
-    assert!(!external_text.contains("MIDDLE_BROWSER_REQUIREMENT"));
-    let artifact_id = external_text
-        .split_once("\"artifact_id\":\"")
-        .unwrap()
-        .1
-        .split('"')
-        .next()
-        .unwrap();
-    assert!(automation_text.contains("read_tool_output"));
-    let canonical = codex_tools::CanonicalToolResult::json(serde_json::json!({
-        "source": "browser_info", "kind": "untrusted", "value": long_browser_value,
-    }));
-    let needle = b"MIDDLE_BROWSER_REQUIREMENT";
-    let start = canonical
-        .bytes
-        .windows(needle.len())
-        .position(|bytes| bytes == needle)
-        .unwrap();
-    let arguments = serde_json::json!({"artifact_id": artifact_id, "selectors": [{
-        "kind": "bytes", "start": start, "end": start + needle.len(),
-    }]})
-    .to_string();
-    let _tool_request = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-recover"),
-            responses::ev_function_call("recover-original", "read_tool_output", &arguments),
-            ev_completed("resp-recover"),
-        ]),
-    )
-    .await;
-    let recovered_request = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-recovered"),
-            ev_completed("resp-recovered"),
-        ]),
-    )
-    .await;
-    submit_plain_user_text(
-        &test,
-        "Recover the missing bytes from the earlier context snapshot.",
-    )
-    .await?;
-    let output = recovered_request
-        .single_request()
-        .function_call_output_text("recover-original")
-        .expect("the recovery tool must return model-visible original content");
-    assert!(output.contains("MIDDLE_BROWSER_REQUIREMENT"), "{output}");
 
     Ok(())
 }

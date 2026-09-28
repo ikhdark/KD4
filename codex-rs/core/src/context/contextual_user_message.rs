@@ -122,6 +122,8 @@ static USER_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<UserInstruction
     FragmentRegistrationProxy::new();
 static ENVIRONMENT_CONTEXT_REGISTRATION: FragmentRegistrationProxy<EnvironmentsState> =
     FragmentRegistrationProxy::new();
+static SUBAGENTS_CONTEXT_REGISTRATION: FragmentRegistrationProxy<super::world_state::SubagentsState> =
+    FragmentRegistrationProxy::new();
 static ADDITIONAL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<AdditionalContextUserFragment> =
     FragmentRegistrationProxy::new();
 static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInjection> =
@@ -154,6 +156,7 @@ static TASK_MODEL_GUIDANCE_REGISTRATION: FragmentRegistrationProxy<TaskModelGuid
 static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_INSTRUCTIONS_REGISTRATION,
     &ENVIRONMENT_CONTEXT_REGISTRATION,
+    &SUBAGENTS_CONTEXT_REGISTRATION,
     &ADDITIONAL_CONTEXT_REGISTRATION,
     &SKILL_INSTRUCTIONS_REGISTRATION,
     &USER_SHELL_COMMAND_REGISTRATION,
@@ -171,6 +174,7 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
 static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_INSTRUCTIONS_REGISTRATION,
     &ENVIRONMENT_CONTEXT_REGISTRATION,
+    &SUBAGENTS_CONTEXT_REGISTRATION,
     &SKILL_INSTRUCTIONS_REGISTRATION,
     &RECOMMENDED_PLUGINS_REGISTRATION,
     &TASK_MODEL_GUIDANCE_REGISTRATION,

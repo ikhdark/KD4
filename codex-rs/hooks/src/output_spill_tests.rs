@@ -2,7 +2,6 @@ use super::*;
 use anyhow::Context;
 use anyhow::Result;
 use std::fs::FileTimes;
-use std::path::Path;
 use std::time::SystemTime;
 use tempfile::tempdir;
 
@@ -16,22 +15,34 @@ fn write_spill(path: &Path, text: &str, modified: SystemTime) -> Result<()> {
     Ok(())
 }
 
-fn spill_path(output: &str) -> Result<&Path> {
-    output
-        .lines()
-        .find_map(|line| line.strip_prefix("Full hook output saved to: "))
-        .map(Path::new)
-        .context("spill path")
+fn test_policy(
+    max_age: Duration,
+    active_grace: Duration,
+    max_files: usize,
+    max_bytes: u64,
+) -> SpillRetentionPolicy {
+    SpillRetentionPolicy {
+        max_age,
+        active_grace,
+        max_files,
+        max_bytes,
+    }
 }
 
 #[tokio::test]
 async fn small_hook_output_remains_inline() -> Result<()> {
     let dir = tempdir()?;
     let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?.join(HOOK_OUTPUTS_DIR);
-    let spiller = HookOutputSpiller::with_directory(output_dir.clone());
+    let thread_id = ThreadId::new();
+    let spiller = HookOutputSpiller {
+        output_dir: output_dir.clone(),
+        last_prune: Arc::default(),
+    };
+
     let output = spiller
-        .maybe_spill_text(ThreadId::new(), "short".to_string())
+        .maybe_spill_text(thread_id, "short".to_string())
         .await;
+
     assert_eq!(output, "short");
     assert!(!output_dir.exists());
     Ok(())
@@ -41,67 +52,184 @@ async fn small_hook_output_remains_inline() -> Result<()> {
 async fn large_hook_output_spills_to_file() -> Result<()> {
     let dir = tempdir()?;
     let text = "hook output ".repeat(1_000);
-    let root = AbsolutePathBuf::from_absolute_path(dir.path())?;
-    let spiller = HookOutputSpiller::with_directory(root.clone());
-    let thread = ThreadId::new();
-    let output = spiller.maybe_spill_text(thread, text.clone()).await;
+    let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?.join(HOOK_OUTPUTS_DIR);
+    let spiller = HookOutputSpiller {
+        output_dir,
+        last_prune: Arc::default(),
+    };
+
+    let output = spiller
+        .maybe_spill_text(ThreadId::new(), text.clone())
+        .await;
+
     assert!(output.contains("[omitted before retained middle]"));
     assert!(output.contains("[omitted after retained middle]"));
     assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
-    let path = spill_path(&output)?;
-    assert!(path.starts_with(root.join(thread.to_string()).join("hooks").as_path()));
+    let path = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Full hook output saved to: "))
+        .context("spill path")?;
     assert_eq!(fs::read_to_string(path).await?, text);
     Ok(())
 }
 
 #[tokio::test]
-async fn child_outputs_belong_to_the_child_not_the_shared_session() -> Result<()> {
+async fn spill_batches_throttle_cleanup_and_keep_writer_directories() -> Result<()> {
     let dir = tempdir()?;
-    let root = AbsolutePathBuf::from_absolute_path(dir.path())?;
-    let child = ThreadId::new();
-    let shared_session = ThreadId::new();
-    let output = HookOutputSpiller::for_thread(root.clone(), child)
-        .maybe_spill_text(shared_session, "child evidence ".repeat(2_000))
+    let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?.join(HOOK_OUTPUTS_DIR);
+    let spiller = HookOutputSpiller {
+        output_dir: output_dir.clone(),
+        last_prune: Arc::default(),
+    };
+    let thread_id = ThreadId::new();
+    let expired = output_dir.join(thread_id.to_string()).join("expired.txt");
+    write_spill(expired.as_ref(), "old", SystemTime::UNIX_EPOCH)?;
+    let text = "output ".repeat(2000);
+    let outputs = spiller
+        .maybe_spill_texts(thread_id, vec![text.clone(), text.clone()])
         .await;
-    assert!(spill_path(&output)?.starts_with(root.join(child.to_string()).join("hooks").as_path()));
-    assert!(!root.join(shared_session.to_string()).exists());
+    assert!(!expired.exists());
+    assert!(expired.parent().context("parent")?.exists());
+    for output in outputs {
+        let path = output
+            .lines()
+            .find_map(|line| line.strip_prefix("Full hook output saved to: "))
+            .context("spill path")?;
+        assert_eq!(fs::read_to_string(path).await?, text);
+        assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
+    }
+    write_spill(expired.as_ref(), "old", SystemTime::UNIX_EPOCH)?;
+    let output = spiller.clone().maybe_spill_text(thread_id, text).await;
+    assert!(output.contains("Full hook output saved to:"));
+    assert!(
+        expired.exists(),
+        "a second sweep ran inside the throttle interval"
+    );
+    *spiller.last_prune.lock().await = Some(Instant::now() - Duration::from_secs(61));
+    spiller.prune_crash_leftovers(None).await;
+    assert!(
+        !expired.exists(),
+        "cleanup did not resume after the throttle interval"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn spilling_in_another_session_and_after_resume_preserves_referenced_outputs() -> Result<()> {
+async fn cleanup_keeps_empty_directories_available_to_writers() -> Result<()> {
     let dir = tempdir()?;
-    let root = AbsolutePathBuf::from_absolute_path(dir.path())?;
-    let thread = ThreadId::new();
-    let text = "important evidence ".repeat(2_000);
-    let preview = HookOutputSpiller::with_directory(root.clone())
-        .maybe_spill_text(thread, text.clone())
-        .await;
-    let referenced = spill_path(&preview)?;
-    write_spill(referenced, &text, SystemTime::UNIX_EPOCH)?;
-    // Include legacy flat paths: a new writer must not reclaim another chat's
-    // old references merely because the former age/count/byte quotas are exceeded.
-    for index in 0..513 {
-        write_spill(
-            &root
-                .join(ThreadId::new().to_string())
-                .join(format!("{index}.txt")),
-            "other evidence",
-            SystemTime::UNIX_EPOCH,
-        )?;
-    }
-    let oversized = root.join("old-output.txt");
-    std::fs::File::create(&oversized)?.set_len(65 * 1024 * 1024)?;
-    let resumed = HookOutputSpiller::with_directory(root);
-    let outputs = resumed
-        .maybe_spill_texts(ThreadId::new(), vec![text.clone(), text.clone()])
-        .await;
-    for output in outputs {
-        assert_eq!(fs::read_to_string(spill_path(&output)?).await?, text);
-        assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
-    }
-    resumed.maybe_spill_text(thread, text.clone()).await;
-    assert_eq!(fs::read_to_string(referenced).await?, text);
-    assert!(oversized.exists());
+    let thread_dir = dir.path().join("thread");
+    let expired = thread_dir.join("expired.txt");
+    write_spill(&expired, "old", SystemTime::UNIX_EPOCH)?;
+    prune_crash_leftovers_at(dir.path(), None, SPILL_RETENTION_POLICY, SystemTime::now()).await?;
+    assert!(!expired.exists());
+    let pending_write = thread_dir.join("new.txt");
+    fs::write(&pending_write, "full output").await?;
+    assert_eq!(fs::read_to_string(pending_write).await?, "full output");
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_spill_prunes_expired_crash_leftovers() -> Result<()> {
+    let dir = tempdir()?;
+    let output_dir = dir.path().join(HOOK_OUTPUTS_DIR);
+    let thread_dir = output_dir.join(ThreadId::new().to_string());
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+    let expired = thread_dir.join("expired.txt");
+    let current = thread_dir.join("current.txt");
+    write_spill(
+        &expired,
+        "expired",
+        now.checked_sub(Duration::from_secs(2 * 24 * 60 * 60))
+            .context("expired time")?,
+    )?;
+    write_spill(&current, "current", now)?;
+
+    prune_crash_leftovers_at(
+        &output_dir,
+        None,
+        test_policy(
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(60 * 60),
+            usize::MAX,
+            u64::MAX,
+        ),
+        now,
+    )
+    .await?;
+
+    assert!(!expired.exists());
+    assert!(current.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_spill_preserves_current_files_inside_active_grace() -> Result<()> {
+    let dir = tempdir()?;
+    let output_dir = dir.path().join(HOOK_OUTPUTS_DIR);
+    let current = output_dir
+        .join(ThreadId::new().to_string())
+        .join("current.txt");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+    write_spill(&current, "current", now)?;
+
+    prune_crash_leftovers_at(
+        &output_dir,
+        None,
+        test_policy(
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(60 * 60),
+            0,
+            0,
+        ),
+        now,
+    )
+    .await?;
+
+    assert!(current.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_spill_quota_prunes_oldest_crash_leftovers_by_count_and_bytes() -> Result<()> {
+    let dir = tempdir()?;
+    let output_dir = dir.path().join(HOOK_OUTPUTS_DIR);
+    let thread_dir = output_dir.join(ThreadId::new().to_string());
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+    let ages = [5_u64, 4, 3, 2];
+    let old_files = ages
+        .iter()
+        .enumerate()
+        .map(|(index, age_hours)| {
+            let path = thread_dir.join(format!("old-{index}.txt"));
+            write_spill(
+                &path,
+                "12345678",
+                now.checked_sub(Duration::from_secs(age_hours * 60 * 60))
+                    .context("old time")?,
+            )?;
+            Ok(path)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let current = thread_dir.join("current.txt");
+    write_spill(&current, "12345678", now)?;
+
+    prune_crash_leftovers_at(
+        &output_dir,
+        Some(&current),
+        test_policy(
+            Duration::from_secs(30 * 24 * 60 * 60),
+            Duration::from_secs(60 * 60),
+            3,
+            16,
+        ),
+        now,
+    )
+    .await?;
+
+    assert!(!old_files[0].exists());
+    assert!(!old_files[1].exists());
+    assert!(!old_files[2].exists());
+    assert!(old_files[3].exists());
+    assert!(current.exists());
     Ok(())
 }

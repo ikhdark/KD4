@@ -35,7 +35,7 @@ fn windows_wrapper_args_round_trip() {
         AbsolutePathBuf::from_absolute_path(Path::new(r"D:\other-workspace"))
             .expect("absolute workspace root"),
     ];
-    let mut env = HashMap::from([("Path".to_string(), r"C:\Windows\System32".to_string())]);
+    let env = HashMap::from([("Path".to_string(), r"C:\Windows\System32".to_string())]);
     let permission_profile = PermissionProfile::External {
         network: NetworkSandboxPolicy::Restricted,
     };
@@ -57,7 +57,7 @@ fn windows_wrapper_args_round_trip() {
         ],
         &command_cwd,
         workspace_roots.as_slice(),
-        &mut env,
+        &env,
         &permission_profile,
         WindowsSandboxLevel::Elevated,
         /*windows_sandbox_private_desktop*/ true,
@@ -69,8 +69,7 @@ fn windows_wrapper_args_round_trip() {
         deny_read_paths_override.as_slice(),
         deny_write_paths_override.as_slice(),
         Path::new(r"C:\Users\me\.codex"),
-    )
-    .expect("prepare wrapper args");
+    );
 
     assert_eq!(args[0], CODEX_WINDOWS_SANDBOX_ARG1);
     assert!(args.contains(&CODEX_HOME_FLAG.to_string()));
@@ -111,96 +110,4 @@ fn windows_wrapper_args_round_trip() {
     assert_eq!(parsed.write_roots_override, Some(write_roots_override));
     assert_eq!(parsed.deny_read_paths_override, deny_read_paths_override);
     assert_eq!(parsed.deny_write_paths_override, deny_write_paths_override);
-}
-
-#[test]
-fn large_wrapper_payload_uses_child_environment_without_changing_inner_env() {
-    use std::os::windows::process::CommandExt;
-    let cwd = AbsolutePathBuf::from_absolute_path(Path::new(r"C:\fixture")).unwrap();
-    let mut env = HashMap::from([("Path".to_string(), "selected-toolchain".to_string())]);
-    let denied: Vec<_> = (0..1000)
-        .map(|i| {
-            AbsolutePathBuf::from_absolute_path(PathBuf::from(format!(
-                "C:\\fixture\\project-{i}\\配置.secret"
-            )))
-            .unwrap()
-        })
-        .collect();
-    let args = create_windows_sandbox_command_args_for_permission_profile(
-        vec!["cmd.exe".into(), "/c".into(), "echo hello".into()],
-        &cwd,
-        &[],
-        &mut env,
-        &PermissionProfile::External {
-            network: NetworkSandboxPolicy::Restricted,
-        },
-        WindowsSandboxLevel::Elevated,
-        false,
-        false,
-        crate::WindowsSandboxProxySettingsMode::Preserve,
-        None,
-        false,
-        None,
-        &denied,
-        &[],
-        Path::new(r"C:\fixture\home"),
-    )
-    .unwrap();
-    assert!(args.iter().map(String::len).sum::<usize>() < 1000);
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "wrapper::tests::large_wrapper_payload_child",
-            "--nocapture",
-        ])
-        .envs(&env)
-        .env(
-            "CODEX_TEST_WRAPPER_ARGS",
-            serde_json::to_string(&args[1..]).unwrap(),
-        )
-        .creation_flags(0x08000000)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("verified wrapper policy and isolated inner env")
-    );
-    assert!(super::decode_wrapper_args(args[1..].to_vec(), |_| None).is_err());
-    assert!(
-        super::decode_wrapper_args(
-            vec![
-                super::ARGS_ENV_FLAG.into(),
-                super::ARGS_ENV_PREFIX.into(),
-                usize::MAX.to_string()
-            ],
-            |_| None
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn large_wrapper_payload_child() {
-    let Ok(args) = std::env::var("CODEX_TEST_WRAPPER_ARGS") else {
-        return;
-    };
-    let parsed = parse_windows_sandbox_wrapper_args(serde_json::from_str(&args).unwrap()).unwrap();
-    assert_eq!(
-        parsed.env_map,
-        HashMap::from([("Path".to_string(), "selected-toolchain".to_string())])
-    );
-    assert_eq!(parsed.command, vec!["cmd.exe", "/c", "echo hello"]);
-    assert_eq!(parsed.deny_read_paths_override.len(), 1000);
-    for (i, path) in parsed.deny_read_paths_override.iter().enumerate() {
-        assert_eq!(
-            path.as_path(),
-            Path::new(&format!("C:\\fixture\\project-{i}\\配置.secret"))
-        );
-    }
-    println!("verified wrapper policy and isolated inner env");
 }

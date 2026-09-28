@@ -52,6 +52,7 @@ const ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION: &str = "active-tool-history";
 const ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES: &[u8] = b"KD4_ACTIVE_TOOL_HISTORY_ARTIFACT_V1\n";
 pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 4 * 1024;
+const STREAMING_ARTIFACT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RETENTION_INDEX_ROOTS: usize = 4;
@@ -1272,48 +1273,38 @@ impl RawOutputArtifactWriter {
             }
             return;
         }
-        let (Some(state), Some(id), Some(path)) = (state, self.id, self.path.as_ref()) else {
+        let (Some(state), Some(id), Some(path)) = (state, self.id, self.path.clone()) else {
             return;
         };
-        let Some(file) = self.file.as_mut() else {
+        if self.file.is_none() {
             return;
-        };
+        }
         let remaining = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(self.bytes as usize);
         let retained = &output[..output.len().min(remaining)];
         self.truncated |= retained.len() != output.len();
-        if let Err(err) = async {
-            file.write_all(retained).await?;
-            file.flush().await
-        }
-        .await
-        {
-            if let Some(file) = self.file.take() {
-                let _ = unlock_output_file(file).await;
-            }
-            *state.lock().await = failed_with_owned_path(
-                path.clone(),
-                self.bytes,
-                format!("failed to stream `{}`: {err}", path.display()),
-                self.retention_token.as_ref(),
-            )
-            .await;
-            self.lifecycle_completed = true;
-            return;
-        }
+        self.pending_output.extend_from_slice(retained);
         self.bytes = self.bytes.saturating_add(retained.len() as u64);
-        match file.metadata().await.and_then(|metadata| {
-            metadata
-                .modified()
-                .map(|modified| (metadata.len(), modified))
-        }) {
-            Ok((bytes, modified)) => {
-                if let Some(token) = self.retention_token.as_ref() {
-                    publish_streaming_size_async(token, path, bytes, modified, false).await;
+        // Readers reject a locked, incomplete artifact. Batch small chunks and
+        // retention metadata publication; finish always flushes the remainder.
+        if self.pending_output.len() >= STREAMING_ARTIFACT_BUFFER_BYTES {
+            self.flush_pending(Some(state)).await;
+            let Some(file) = self.file.as_mut() else {
+                return;
+            };
+            match file.metadata().await.and_then(|metadata| {
+                metadata
+                    .modified()
+                    .map(|modified| (metadata.len(), modified))
+            }) {
+                Ok((bytes, modified)) => {
+                    if let Some(token) = self.retention_token.as_ref() {
+                        publish_streaming_size_async(token, &path, bytes, modified, false).await;
+                    }
                 }
-            }
-            Err(_) => {
-                if let Some(token) = self.retention_token.as_ref() {
-                    reject_stale_delta(token);
+                Err(_) => {
+                    if let Some(token) = self.retention_token.as_ref() {
+                        reject_stale_delta(token);
+                    }
                 }
             }
         }
@@ -1342,6 +1333,38 @@ impl RawOutputArtifactWriter {
         };
     }
 
+    /// Makes buffered bytes visible before the process's artifact-ready signal.
+    /// Durability and retention publication remain owned by finish.
+    pub(crate) async fn flush_pending(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
+        if self.pending_target.is_some() || self.pending_output.is_empty() {
+            return;
+        }
+        let (Some(state), Some(path), Some(file)) = (state, self.path.as_ref(), self.file.as_mut())
+        else {
+            return;
+        };
+        let result = async {
+            file.write_all(&self.pending_output).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(err) = result {
+            if let Some(file) = self.file.take() {
+                let _ = unlock_output_file(file).await;
+            }
+            *state.lock().await = failed_with_owned_path(
+                path.clone(),
+                self.bytes,
+                format!("failed to stream `{}`: {err}", path.display()),
+                self.retention_token.as_ref(),
+            )
+            .await;
+            self.lifecycle_completed = true;
+        } else {
+            self.pending_output.clear();
+        }
+    }
+
     pub(crate) async fn finish(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
         if self.pending_target.take().is_some() {
             // The complete output fits inline. Keep the target unmaterialized;
@@ -1350,6 +1373,7 @@ impl RawOutputArtifactWriter {
             self.lifecycle_completed = true;
             return;
         }
+        self.flush_pending(state).await;
         let (Some(state), Some(path), Some(mut file)) =
             (state, self.path.clone(), self.file.take())
         else {
@@ -1641,6 +1665,14 @@ impl RawOutputArtifact {
         })
         .await
         .ok()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Pending { .. } => None,
+            Self::Stored { bytes, .. } => Some(*bytes),
+            Self::Failed { .. } => None,
+        }
     }
 
     pub(crate) fn retention_limit_hit(&self) -> bool {
@@ -3272,33 +3304,13 @@ pub(crate) async fn protect_active_tool_history_artifact(
         let path = directory.join(format!("{id}.log"));
         let marker = active_tool_history_protection_path(&path);
         let result = (|| {
-            match std::fs::symlink_metadata(logical_metadata_path(&path)) {
-                Ok(_) => {
-                    let metadata = load_logical_metadata(&path, id)
-                        .map_err(|error| error.for_model())?;
-                    if !metadata.complete
-                        || metadata.canonical_bytes != expected_bytes
-                        || metadata.retained_bytes != expected_bytes
-                        || metadata.canonical_sha256 != expected_sha256
-                        || metadata.retained_sha256.as_ref().is_some_and(|sha| sha != &expected_sha256)
-                    {
-                        return Err("artifact identity does not match receipt metadata".to_string());
-                    }
-                    // Validate the logical family, not just its first physical segment.
-                    load_validated_logical_snapshot(&path, &metadata)
-                        .map_err(|error| error.for_model())?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let (file, artifact_bytes) = open_regular_artifact(&path)
-                        .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
-                    if artifact_bytes != expected_bytes {
-                        return Err("artifact byte count does not match receipt metadata".to_string());
-                    }
-                    if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
-                        return Err("artifact digest does not match receipt metadata".to_string());
-                    }
-                }
-                Err(error) => return Err(format!("failed to inspect artifact metadata: {error}")),
+            let (file, artifact_bytes) = open_regular_artifact(&path)
+                .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
+            if artifact_bytes != expected_bytes {
+                return Err("artifact byte count does not match receipt metadata".to_string());
+            }
+            if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
+                return Err("artifact digest does not match receipt metadata".to_string());
             }
             match std::fs::symlink_metadata(&marker) {
                 Ok(_) => {
@@ -6729,7 +6741,21 @@ fn advance_retention_interprocess_generation(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 1, false),
         Err(err) => return Err(err),
     };
-    write_bytes_atomically(lock_target, next.to_string().as_bytes())?;
+    // This counter invalidates in-memory indexes in other live processes; it
+    // is not artifact recovery data. Atomic replacement under the existing OS
+    // lock is required, but syncing it on every admission buys no durability:
+    // after a machine restart every process rebuilds its index from disk.
+    let parent = lock_target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "retention generation has no parent",
+        )
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(next.to_string().as_bytes())?;
+    let (_file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
+    let temporary_path = tempfile::TempPath::try_from_path(temporary_path)?;
+    std::fs::rename(&temporary_path, lock_target)?;
     let root = normalized_tool_output_root(root);
     let mut states = retention_interprocess_states()
         .lock()

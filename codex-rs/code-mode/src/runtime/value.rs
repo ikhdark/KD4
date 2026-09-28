@@ -191,75 +191,47 @@ fn parse_mcp_output_image(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> Result<(String, Option<String>), String> {
-    let object = v8::Local::<v8::Object>::try_from(value)
-        .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
-    let item_type = image_property(scope, object, "type")?;
-    let item_type = v8::Local::<v8::String>::try_from(item_type)
-        .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
-    let item_type = bounded_string(scope, item_type, MAX_PAYLOAD_BYTES)?;
+    let Some(result) = v8_value_to_json(scope, value)? else {
+        return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
+    };
+    let JsonValue::Object(result) = result else {
+        return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
+    };
+    let Some(item_type) = result.get("type").and_then(JsonValue::as_str) else {
+        return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
+    };
     if item_type != "image" {
         return Err(format!(
             "image only accepts MCP image blocks, got \"{item_type}\""
         ));
     }
-    let data = image_property(scope, object, "data")?;
-    let data = v8::Local::<v8::String>::try_from(data)
-        .map_err(|_| "image expected MCP image data".to_string())?;
-    // Image payloads use the output budget, not the smaller text/tool-input
-    // JSON budget. Read only image fields, without a JSON round trip over base64.
-    let data = bounded_string(scope, data, super::MAX_BUFFERED_OUTPUT_BYTES)?;
+    let data = result
+        .get("data")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "image expected MCP image data".to_string())?;
     if data.is_empty() {
         return Err("image expected MCP image data".to_string());
     }
 
-    let image_url = if data
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
-    {
-        data
+    let image_url = if data.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:")) {
+        data.to_string()
     } else {
-        let mut mime_type = image_property(scope, object, "mimeType")?;
-        if mime_type.is_undefined() {
-            mime_type = image_property(scope, object, "mime_type")?;
-        }
-        let mime_type = match v8::Local::<v8::String>::try_from(mime_type) {
-            Ok(mime_type) => bounded_string(scope, mime_type, MAX_PAYLOAD_BYTES)?,
-            Err(_) => String::new(),
-        };
-        let mime_type = if mime_type.is_empty() {
-            "application/octet-stream"
-        } else {
-            &mime_type
-        };
+        let mime_type = result
+            .get("mimeType")
+            .or_else(|| result.get("mime_type"))
+            .and_then(JsonValue::as_str)
+            .filter(|mime_type| !mime_type.is_empty())
+            .unwrap_or("application/octet-stream");
         format!("data:{mime_type};base64,{data}")
     };
-    let meta = image_property(scope, object, "_meta")?;
-    let detail = if meta.is_object() && !meta.is_array() {
-        let meta = v8::Local::<v8::Object>::try_from(meta)
-            .map_err(|_| "invalid image metadata".to_string())?;
-        let detail = image_property(scope, meta, CODEX_IMAGE_DETAIL_META_KEY)?;
-        match v8::Local::<v8::String>::try_from(detail) {
-            Ok(detail) => Some(bounded_string(scope, detail, MAX_PAYLOAD_BYTES)?),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    let detail =
-        detail.filter(|detail| matches!(detail.as_str(), "auto" | "low" | "high" | "original"));
+    let detail = result
+        .get("_meta")
+        .and_then(JsonValue::as_object)
+        .and_then(|meta| meta.get(CODEX_IMAGE_DETAIL_META_KEY))
+        .and_then(JsonValue::as_str)
+        .filter(|detail| matches!(*detail, "auto" | "low" | "high" | "original"))
+        .map(str::to_string);
     Ok((image_url, detail))
-}
-
-fn image_property<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'_, v8::Object>,
-    name: &str,
-) -> Result<v8::Local<'s, v8::Value>, String> {
-    let key = v8::String::new(scope, name)
-        .ok_or_else(|| "failed to allocate image helper keys".to_string())?;
-    object
-        .get(scope, key.into())
-        .ok_or_else(|| format!("failed to read image {name}"))
 }
 
 fn parse_image_detail_value<'s>(
@@ -279,9 +251,7 @@ pub(super) fn v8_value_to_json(
     value: v8::Local<'_, v8::Value>,
 ) -> Result<Option<JsonValue>, String> {
     v8_value_to_json_with_limit(scope, value, MAX_PAYLOAD_BYTES).map_err(|error| match error {
-        JsonConversionError::TooLarge => {
-            format!("payload exceeds its limit of {MAX_PAYLOAD_BYTES} bytes")
-        }
+        JsonConversionError::TooLarge => format!("payload exceeds its limit of {MAX_PAYLOAD_BYTES} bytes"),
         JsonConversionError::Invalid(message) => message,
     })
 }
@@ -300,11 +270,10 @@ pub(super) fn v8_value_to_json_with_limit(
     let mut tc = tc.init();
     let Some(stringified) = v8::json::stringify(&tc, value) else {
         if tc.has_caught() {
-            return Err(JsonConversionError::Invalid(
-                tc.exception()
-                    .map(|exception| value_to_error_text(&mut tc, exception))
-                    .unwrap_or_else(|| "unknown code mode exception".to_string()),
-            ));
+            return Err(JsonConversionError::Invalid(tc
+                .exception()
+                .map(|exception| value_to_error_text(&mut tc, exception))
+                .unwrap_or_else(|| "unknown code mode exception".to_string())));
         }
         return Ok(None);
     };
@@ -313,9 +282,7 @@ pub(super) fn v8_value_to_json_with_limit(
     }
     serde_json::from_str(&copy_string(&mut tc, stringified))
         .map(Some)
-        .map_err(|err| {
-            JsonConversionError::Invalid(format!("failed to serialize JavaScript value: {err}"))
-        })
+        .map_err(|err| JsonConversionError::Invalid(format!("failed to serialize JavaScript value: {err}")))
 }
 
 pub(super) fn json_to_v8<'s>(
@@ -349,10 +316,7 @@ pub(super) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
     }
 }
 
-pub(super) fn error_value<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    message: &str,
-) -> v8::Local<'s, v8::Value> {
+pub(super) fn error_value<'s>(scope: &mut v8::PinScope<'s, '_>, message: &str) -> v8::Local<'s, v8::Value> {
     match v8::String::new(scope, message) {
         Some(message) => v8::Exception::error(scope, message),
         None => v8::undefined(scope).into(),
@@ -364,19 +328,8 @@ fn valid_image_data_uri(uri: &str) -> bool {
     let Some((mime, encoding)) = header.get(5..).and_then(|header| header.split_once(';')) else { return false; };
     // view_image and MCP blocks without a MIME type return opaque source bytes.
     // The history insertion path decodes and validates those bytes as an image.
-    if ![
-        "image/png",
-        "image/jpeg",
-        "image/webp",
-        "image/gif",
-        "application/octet-stream",
-    ]
-    .iter()
-    .any(|supported| mime.eq_ignore_ascii_case(supported))
-        || !encoding.eq_ignore_ascii_case("base64")
-        || payload.is_empty()
-        || payload.len() % 4 != 0
-    {
+    if !["image/png", "image/jpeg", "image/webp", "image/gif", "application/octet-stream"].iter().any(|supported| mime.eq_ignore_ascii_case(supported))
+        || !encoding.eq_ignore_ascii_case("base64") || payload.is_empty() || payload.len() % 4 != 0 {
         return false;
     }
     // Validate canonical base64 in place; decoding would allocate another image.
@@ -393,9 +346,5 @@ fn valid_image_data_uri(uri: &str) -> bool {
         Some(b'/') => 63,
         _ => return false,
     };
-    match padding {
-        1 => last & 3 == 0,
-        2 => last & 15 == 0,
-        _ => true,
-    }
+    match padding { 1 => last & 3 == 0, 2 => last & 15 == 0, _ => true }
 }

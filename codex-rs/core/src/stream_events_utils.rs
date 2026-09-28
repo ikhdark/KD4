@@ -167,29 +167,6 @@ impl InFlightToolCall {
         }
     }
 
-    /// Retires a deferred call that must never reach its handler.
-    ///
-    /// A deferred tool is admitted only after the provider response tail closes
-    /// successfully. When the tail ends in a terminal stream error or a cancellation, the
-    /// call is retired with a model-visible failure output instead of being executed, so the
-    /// history still pairs every call with an output while no side effect is performed.
-    pub(crate) fn into_unexecuted_result(self, message: String) -> InFlightToolResult {
-        let response = crate::tools::parallel::ToolCallRuntime::failure_response_for_message(
-            &self.call, message,
-        );
-        self.timing.mark_relay_enqueue();
-        if let Some(turn_timing_state) = self.timing.turn_timing_state() {
-            reconcile_turn_progress_event(&turn_timing_state, 1, "relay enqueue");
-        }
-        InFlightToolResult {
-            call: self.call,
-            call_id: self.call_id,
-            execution_id: self.execution_id,
-            timing: self.timing,
-            result: Ok(ToolCallCompletion::nonterminal(response)),
-        }
-    }
-
     pub(crate) async fn into_future(self) -> InFlightToolResult {
         let result = self.future.await;
         self.timing.mark_relay_enqueue();
@@ -511,7 +488,7 @@ pub(crate) async fn handle_output_item_done(
                 "ToolCall"
             );
 
-            let persistence_barrier = ctx
+            let _persistence_barrier = ctx
                 .response_item_recorder
                 .enqueue(
                     Arc::clone(&ctx.sess),
@@ -526,12 +503,9 @@ pub(crate) async fn handle_output_item_done(
             let tool_runtime = ctx.tool_runtime.clone();
             let accepted_call = call.clone();
             let future_timing = Arc::clone(&timing);
-            // Keep deferred dispatch genuinely lazy. Eager callers poll this
-            // future after its ordered persistence barrier; deferred callers
-            // do not construct the runtime dispatch task until the response
-            // tail has completed.
+            // Recording runs in provider order on the recorder's owned task.
+            // Join it before relaying outputs, without delaying tool execution.
             let completion = async move {
-                persistence_barrier.await.map_err(CodexErr::Fatal)?;
                 tool_runtime
                     .handle_model_tool_call_with_trace(call, cancellation_token, future_timing)
                     .await

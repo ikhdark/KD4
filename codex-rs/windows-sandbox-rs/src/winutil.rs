@@ -27,18 +27,8 @@ pub use codex_shell_command::quote_windows_arg;
 
 /// Build a Windows command line for CreateProcess-style APIs.
 pub fn argv_to_command_line(argv: &[String]) -> String {
-    let payload_index = argv.split_first().and_then(|(program, args)| {
-        codex_utils_pty::windows_cmd_payload_index(OsStr::new(program), args).map(|index| index + 1)
-    });
     argv.iter()
-        .enumerate()
-        .map(|(index, arg)| {
-            if Some(index) == payload_index {
-                format!("\"{arg}\"")
-            } else {
-                quote_windows_arg(arg)
-            }
-        })
+        .map(|arg| quote_windows_arg(arg))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -216,28 +206,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn argv_to_command_line_preserves_cmd_script_quotes() {
-        use std::os::windows::process::CommandExt;
-
+    fn argv_to_command_line_quotes_each_argument_independently() {
         let argv = vec![
             "cmd.exe".to_string(),
-            "/d".to_string(),
-            "/v:on".to_string(),
             "/c".to_string(),
-            "set \"VALUE=two words\" & echo [!VALUE!]".to_string(),
+            "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoProfile -EncodedCommand abc=="
+                .to_string(),
         ];
-        let command_line = argv_to_command_line(&argv);
-        let output = std::process::Command::new("cmd.exe")
-            .raw_arg(command_line.strip_prefix("cmd.exe ").unwrap())
-            .creation_flags(0x08000000)
-            .output()
-            .expect("run cmd script");
-        assert!(output.status.success());
+
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            "[two words]"
+            argv_to_command_line(&argv),
+            "cmd.exe /c \"\\\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\\\" -NoProfile -EncodedCommand abc==\""
         );
-        assert!(output.stderr.is_empty());
     }
 
     #[test]

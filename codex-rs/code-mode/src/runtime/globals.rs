@@ -11,7 +11,6 @@ use super::callbacks::generated_image_callback;
 use super::callbacks::image_callback;
 use super::callbacks::load_callback;
 use super::callbacks::notify_callback;
-use super::callbacks::remove_store_callback;
 use super::callbacks::set_timeout_callback;
 use super::callbacks::store_callback;
 use super::callbacks::text_callback;
@@ -58,7 +57,6 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let generated_image = helper_function(scope, "generatedImage", generated_image_callback)?;
     let store = helper_function(scope, "store", store_callback)?;
     let load = helper_function(scope, "load", load_callback)?;
-    let remove_store = helper_function(scope, "remove_store", remove_store_callback)?;
     let notify = helper_function(scope, "notify", notify_callback)?;
     let yield_control = helper_function(scope, "yield_control", yield_control_callback)?;
     let exit = helper_function(scope, "exit", exit_callback)?;
@@ -74,7 +72,6 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "generatedImage", generated_image.into())?;
     set_global(scope, global, "store", store.into())?;
     set_global(scope, global, "load", load.into())?;
-    set_global(scope, global, "remove_store", remove_store.into())?;
     set_global(scope, global, "notify", notify.into())?;
     set_global(scope, global, "yield_control", yield_control.into())?;
     set_global(scope, global, "exit", exit.into())?;

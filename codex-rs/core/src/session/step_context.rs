@@ -21,22 +21,6 @@ pub(crate) struct McpToolSnapshot {
     pub(crate) revision: u64,
     pub(crate) tools: Arc<Vec<ToolInfo>>,
     pub(crate) resources_available: bool,
-    pub(crate) pending_servers: Vec<String>,
-}
-
-impl McpToolSnapshot {
-    pub(super) fn availability_notice(&self) -> Option<String> {
-        if self.temporarily_unavailable {
-            Some("The MCP tool catalog is temporarily unavailable for this request. This does not mean that no MCP tools are configured. Continue independent local work; if this task requires MCP, retry discovery on a subsequent step or report the unavailable capability.".to_string())
-        } else if !self.pending_servers.is_empty() {
-            Some(format!(
-                "MCP catalogs are still starting for {:?}. Their tools are not advertised in this request. Other advertised capabilities remain usable. Continue independent work; if a pending capability is required, retry discovery on a subsequent step or report it as unavailable.",
-                self.pending_servers,
-            ))
-        } else {
-            None
-        }
-    }
 }
 
 const MCP_SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -56,7 +40,6 @@ async fn bounded_mcp_snapshot(
                 revision: u64::MAX,
                 tools: Arc::new(Vec::new()),
                 resources_available: false,
-                pending_servers: Vec::new(),
             }
         }
     }
@@ -146,19 +129,16 @@ impl StepContext {
                 bounded_mcp_snapshot(async {
                     loop {
                         let revision = self.mcp.manager().tool_catalog_revision();
-                        let (catalog, resources_available) = tokio::join!(
-                            self.mcp.manager().list_ready_tools_snapshot(),
+                        let (tools, resources_available) = tokio::join!(
+                            self.mcp.manager().list_all_tools_snapshot(),
                             self.mcp.manager().has_ready_server_with_resources(),
                         );
-                        if revision == catalog.revision
-                            && revision == self.mcp.manager().tool_catalog_revision()
-                        {
+                        if revision == self.mcp.manager().tool_catalog_revision() {
                             return McpToolSnapshot {
                                 temporarily_unavailable: false,
                                 revision,
-                                tools: catalog.tools,
+                                tools,
                                 resources_available,
-                                pending_servers: catalog.pending_servers,
                             };
                         }
                         tokio::task::yield_now().await;
@@ -203,7 +183,6 @@ impl StepContext {
                 revision,
                 tools: Arc::new(tools),
                 resources_available,
-                pending_servers: Vec::new(),
             })
             .expect("test MCP tool snapshot should be unset");
     }
@@ -269,12 +248,6 @@ mod snapshot_deadline_tests {
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(snapshot.tools.is_empty());
         assert!(snapshot.temporarily_unavailable);
-        assert!(
-            snapshot
-                .availability_notice()
-                .unwrap()
-                .contains("temporarily unavailable")
-        );
         assert!(!snapshot.resources_available);
         assert_eq!(snapshot.revision, u64::MAX);
     }
@@ -287,13 +260,11 @@ mod snapshot_deadline_tests {
                 revision: 17,
                 tools: Arc::new(Vec::new()),
                 resources_available: true,
-                pending_servers: Vec::new(),
             }
         })
         .await;
         assert_eq!(snapshot.revision, 17);
         assert!(!snapshot.temporarily_unavailable);
         assert!(snapshot.resources_available);
-        assert!(snapshot.availability_notice().is_none());
     }
 }

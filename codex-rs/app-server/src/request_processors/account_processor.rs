@@ -91,7 +91,6 @@ pub(crate) struct AccountRequestProcessor {
     config_manager: ConfigManager,
     backend_client: BackendClient,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
-    workspace_routing_cache: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
     #[cfg(test)]
     device_code_test_control: Arc<std::sync::Mutex<Option<DeviceCodeLoginTestControl>>>,
 }
@@ -116,7 +115,6 @@ impl AccountRequestProcessor {
             config_manager,
             backend_client,
             active_login: Arc::new(Mutex::new(None)),
-            workspace_routing_cache: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             device_code_test_control: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -895,7 +893,6 @@ impl AccountRequestProcessor {
                 return Err(internal_error(format!("logout failed: {err}")));
             }
         }
-        *self.workspace_routing_cache.lock().await = None;
 
         Self::maybe_refresh_plugin_caches_for_current_config(
             &self.config_manager,
@@ -1045,7 +1042,7 @@ impl AccountRequestProcessor {
         };
         let account = account_state.account.map(Account::from);
         let workspace_routing = if matches!(account, Some(Account::Chatgpt { .. })) {
-            self.workspace_routing(do_refresh).await
+            self.workspace_routing().await
         } else {
             None
         };

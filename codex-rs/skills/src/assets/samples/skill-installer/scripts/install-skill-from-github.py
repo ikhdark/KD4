@@ -281,31 +281,30 @@ def main(argv: list[str]) -> int:
         for path in source.paths:
             _validate_relative_path(path)
         dest_root = args.dest or _default_dest()
-        destinations = []
-        seen = set()
-        for path in source.paths:
-            skill_name = args.name if len(source.paths) == 1 else None
-            skill_name = skill_name or os.path.basename(path.rstrip("/"))
-            _validate_skill_name(skill_name)
-            dest_dir = os.path.join(dest_root, skill_name)
-            key = os.path.normcase(os.path.realpath(dest_dir))
-            if os.path.lexists(dest_dir) or key in seen:
-                raise InstallError(f"Destination already exists or is duplicated: {dest_dir}")
-            seen.add(key)
-            destinations.append((path, skill_name, dest_dir))
         tmp_dir = tempfile.mkdtemp(prefix="skill-install-", dir=_tmp_root())
         try:
             repo_root = _prepare_repo(source, args.method, tmp_dir)
-            for path, _, _ in destinations:
-                _validate_skill(os.path.join(repo_root, path))
-            for path, skill_name, dest_dir in destinations:
-                _copy_skill(os.path.join(repo_root, path), dest_dir)
-                print(f"Installed {skill_name} to {dest_dir}", flush=True)
+            installed = []
+            for path in source.paths:
+                skill_name = args.name if len(source.paths) == 1 else None
+                skill_name = skill_name or os.path.basename(path.rstrip("/"))
+                _validate_skill_name(skill_name)
+                if not skill_name:
+                    raise InstallError("Unable to derive skill name.")
+                dest_dir = os.path.join(dest_root, skill_name)
+                if os.path.exists(dest_dir):
+                    raise InstallError(f"Destination already exists: {dest_dir}")
+                skill_src = os.path.join(repo_root, path)
+                _validate_skill(skill_src)
+                _copy_skill(skill_src, dest_dir)
+                installed.append((skill_name, dest_dir))
         finally:
             if os.path.isdir(tmp_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+        for skill_name, dest_dir in installed:
+            print(f"Installed {skill_name} to {dest_dir}")
         return 0
-    except (InstallError, OSError) as exc:
+    except InstallError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

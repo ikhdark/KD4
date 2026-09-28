@@ -1,6 +1,5 @@
 use super::session::Session;
 use super::turn_context::TurnContext;
-use crate::client_common::Prompt;
 use crate::config::TokenBudgetConfig;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 
@@ -20,89 +19,6 @@ pub(crate) struct ContextWindowTokenStatus {
 struct BodyAfterPrefixWindowStatus {
     full_context_window_limit: Option<i64>,
     auto_compact_window_prefill_tokens: Option<i64>,
-}
-
-/// A checkpoint invalidates the old server usage as a next-request pressure
-/// estimate. Count the prepared request, including every possible transport
-/// fallback, without rewriting actual usage or the window's prefill baseline.
-pub(super) async fn checkpoint_prompt_requires_compaction(
-    sess: &Session,
-    turn: &TurnContext,
-    prompt: &Prompt,
-) -> bool {
-    if turn
-        .config
-        .features
-        .enabled(codex_features::Feature::TokenBudget)
-        && sess.new_context_window_requested().await
-    {
-        return true;
-    }
-    // Retiring a prefill result invalidates body-after-prefix credit. Unknown
-    // resume baselines must also conservatively compact rather than undercount.
-    if matches!(
-        turn.config.model_auto_compact_token_limit_scope,
-        AutoCompactTokenLimitScope::BodyAfterPrefix
-    ) && !sess.state.lock().await.checkpoint_preserves_prefill()
-    {
-        return true;
-    }
-    let pressure = checkpoint_prompt_token_pressure(prompt);
-    let scope_pressure = match turn.config.model_auto_compact_token_limit_scope {
-        AutoCompactTokenLimitScope::Total => pressure,
-        AutoCompactTokenLimitScope::BodyAfterPrefix => pressure
-            .saturating_sub(
-                sess.auto_compact_window_snapshot()
-                    .await
-                    .prefill_input_tokens
-                    .unwrap_or(0),
-            )
-            .max(0),
-    };
-    turn.model_context_window()
-        .is_some_and(|limit| pressure >= limit)
-        || projected_context_window_token_status(sess, turn, pressure, scope_pressure)
-            .await
-            .token_limit_reached
-}
-
-fn checkpoint_prompt_token_pressure(prompt: &Prompt) -> i64 {
-    let bytes_to_tokens = |bytes: usize| i64::try_from(bytes.div_ceil(4)).unwrap_or(i64::MAX);
-    let mut inputs = Vec::new();
-    let mut input_tokens = 0;
-    for input in [
-        &prompt.input,
-        &prompt.stable_context_fallback_input,
-        &prompt.tool_history_fallback_input,
-        &prompt.stable_context_tool_history_fallback_input,
-    ] {
-        if inputs
-            .iter()
-            .any(|prior| std::sync::Arc::ptr_eq(prior, input))
-        {
-            continue;
-        }
-        inputs.push(std::sync::Arc::clone(input));
-        // Reuse the history estimator, including its image cache. Count all
-        // reasoning still present in this request, including all-turns models.
-        let tokens = input
-            .iter()
-            .map(crate::context_manager::estimate_item_token_count)
-            .fold(0i64, i64::saturating_add);
-        input_tokens = input_tokens.max(tokens);
-    }
-    let measured = input_tokens
-        .saturating_add(bytes_to_tokens(prompt.base_instructions.text.len()))
-        .saturating_add(bytes_to_tokens(prompt.tools.serialized().len()))
-        .saturating_add(
-            prompt
-                .output_schema
-                .as_ref()
-                .map_or(0, |schema| bytes_to_tokens(schema.to_string().len())),
-        );
-    // The heuristic needs framing/error headroom; genuine provider overflows
-    // still follow the existing bounded recovery path.
-    measured.saturating_add((measured / 10).max(1024))
 }
 
 pub(crate) async fn context_window_token_status(
@@ -220,36 +136,5 @@ fn remaining_tokens(soft: Option<i64>, physical: Option<i64>) -> Option<i64> {
         (Some(soft), Some(physical)) => Some(soft.min(physical).max(0)),
         (Some(tokens), None) | (None, Some(tokens)) => Some(tokens.max(0)),
         (None, None) => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ResponseItem;
-
-    #[test]
-    fn checkpoint_pressure_counts_fallbacks_and_non_history_content() {
-        let mut prompt = Prompt::default();
-        let without_content = checkpoint_prompt_token_pressure(&prompt);
-        prompt.base_instructions.text.push_str(&"i".repeat(4000));
-        prompt.output_schema = Some(serde_json::json!({"description": "s".repeat(4000)}));
-        assert!(checkpoint_prompt_token_pressure(&prompt) >= without_content + 2000);
-        prompt.tool_history_fallback_input = vec![ResponseItem::Message {
-            id: None,
-            role: "assistant".into(),
-            content: vec![ContentItem::OutputText {
-                text: "e".repeat(400_000),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        }]
-        .into();
-        assert!(checkpoint_prompt_token_pressure(&prompt) >= 110_000);
-        assert!(
-            prompt.input.is_empty(),
-            "the distinct fallback, not primary input, creates pressure"
-        );
     }
 }

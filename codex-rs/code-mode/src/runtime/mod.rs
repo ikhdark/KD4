@@ -49,26 +49,13 @@ const TEXT_ITEM_ENCODING_OVERHEAD: usize = r#"{"type":"input_text","text":""}"#.
 
 #[derive(Debug)]
 pub(crate) enum RuntimeCommand {
-    ToolResponse {
-        id: String,
-        result: JsonValue,
-    },
-    ToolError {
-        id: String,
-        error_text: String,
-    },
-    NotificationResponse {
-        id: String,
-    },
-    NotificationError {
-        id: String,
-        error_text: String,
-    },
+    ToolResponse { id: String, result: JsonValue },
+    ToolError { id: String, error_text: String },
+    NotificationResponse { id: String },
+    NotificationError { id: String, error_text: String },
     TimersReady,
     #[cfg(test)]
-    InspectForTest {
-        response: tokio::sync::oneshot::Sender<RuntimeInspection>,
-    },
+    InspectForTest { response: tokio::sync::oneshot::Sender<RuntimeInspection> },
     Terminate,
 }
 
@@ -103,7 +90,7 @@ pub(crate) enum RuntimeEvent {
         text: String,
     },
     Result {
-        stored_value_writes: HashMap<String, StoredValueWrite>,
+        stored_value_writes: HashMap<String, StoredValue>,
         error_text: Option<String>,
         output_loss: Option<codex_code_mode_protocol::OutputLoss>,
     },
@@ -126,12 +113,6 @@ impl StoredValue {
             value: Arc::new(value),
         }
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct StoredValueWrite {
-    pub(crate) expected: Option<Arc<JsonValue>>,
-    pub(crate) value: Option<StoredValue>,
 }
 
 pub(crate) struct OutputAdmission {
@@ -192,10 +173,7 @@ impl OutputAdmission {
 
     fn record_loss(state: &mut OutputAdmissionState, bytes: usize) -> Option<RuntimeEvent> {
         state.output_loss.discarded_items = state.output_loss.discarded_items.saturating_add(1);
-        state.output_loss.discarded_bytes_lower_bound = state
-            .output_loss
-            .discarded_bytes_lower_bound
-            .saturating_add(bytes as u64);
+        state.output_loss.discarded_bytes_lower_bound = state.output_loss.discarded_bytes_lower_bound.saturating_add(bytes as u64);
         if !state.overflow_reported {
             state.overflow_reported = true;
             return Some(RuntimeEvent::ContentItem {
@@ -211,22 +189,14 @@ impl OutputAdmission {
     /// Rejects text whose raw bytes alone cannot fit, before copying it out of
     /// V8. Admission still charges the full encoded size after conversion.
     pub(super) fn reject_before_conversion(&self, bytes: usize) -> Option<Option<RuntimeEvent>> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let required = bytes.saturating_add(TEXT_ITEM_ENCODING_OVERHEAD);
-        if required <= self.max_bytes.saturating_sub(state.admitted_bytes) {
-            return None;
-        }
+        if required <= self.max_bytes.saturating_sub(state.admitted_bytes) { return None; }
         Some(Self::record_loss(&mut state, bytes))
     }
 
     fn output_loss(&self) -> Option<codex_code_mode_protocol::OutputLoss> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.output_loss.discarded_items > 0).then(|| state.output_loss.clone())
     }
 
@@ -484,12 +454,11 @@ pub(super) struct RuntimeState {
     pending_notifications: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     unhandled_rejections: Vec<v8::Global<v8::Promise>>,
-    // Count even promises beyond the retained-handle budget so later handlers
-    // can resolve an overflow without hiding rejections that remain unhandled.
-    unhandled_rejection_count: usize,
+    rejection_tracking_overflow: bool,
     stored_values: HashMap<String, StoredValue>,
     total_stored_value_bytes: usize,
-    stored_value_writes: HashMap<String, StoredValueWrite>,
+    stored_value_writes: HashMap<String, StoredValue>,
+    stored_value_limit_error: Option<String>,
     #[cfg(test)]
     completion_collections: usize,
     #[cfg(test)]
@@ -538,19 +507,24 @@ fn stored_value_entry_bytes(key: &str, value: &JsonValue) -> usize {
 
 pub(crate) fn stored_values_with_writes_within_limits(
     current: &HashMap<String, StoredValue>,
-    writes: &HashMap<String, StoredValueWrite>,
+    writes: &HashMap<String, StoredValue>,
 ) -> bool {
+    let entry_count = current.len().saturating_add(
+        writes
+            .keys()
+            .filter(|key| !current.contains_key(*key))
+            .count(),
+    );
+    if entry_count > MAX_SESSION_STORED_VALUES {
+        return false;
+    }
+
     current
         .iter()
         .filter(|(key, _)| !writes.contains_key(*key))
-        .map(|(_, stored)| stored)
-        .chain(writes.values().filter_map(|write| write.value.as_ref()))
-        .try_fold((0usize, 0usize), |(count, bytes), stored| {
-            Some((count.checked_add(1)?, bytes.checked_add(stored.bytes)?))
-        })
-        .is_some_and(|(count, bytes)| {
-            count <= MAX_SESSION_STORED_VALUES && bytes <= MAX_SESSION_STORED_VALUE_BYTES
-        })
+        .chain(writes.iter())
+        .try_fold(0usize, |total, (_, stored)| total.checked_add(stored.bytes))
+        .is_some_and(|bytes| bytes <= MAX_SESSION_STORED_VALUE_BYTES)
 }
 
 pub(crate) fn stored_value_limit_message() -> String {
@@ -560,28 +534,6 @@ pub(crate) fn stored_value_limit_message() -> String {
 }
 
 impl RuntimeState {
-    pub(super) fn write_stored_value(&mut self, key: String, value: Option<StoredValue>) {
-        let previous = self.stored_values.remove(&key);
-        self.total_stored_value_bytes -= previous.as_ref().map_or(0, |stored| stored.bytes);
-        if let Some(stored) = value.as_ref() {
-            self.total_stored_value_bytes += stored.bytes;
-            self.stored_values.insert(key.clone(), stored.clone());
-        }
-        let write = self
-            .stored_value_writes
-            .entry(key.clone())
-            .or_insert_with(|| StoredValueWrite {
-                expected: previous.map(|stored| stored.value),
-                value: None,
-            });
-        write.value = value;
-        // Creating then removing a new key has no net effect. Do not accumulate
-        // an unbounded journal of transient keys in an otherwise bounded store.
-        if write.expected.is_none() && write.value.is_none() {
-            self.stored_value_writes.remove(&key);
-        }
-    }
-
     pub(super) fn can_admit_callback(&self) -> bool {
         self.pending_tool_calls.len() + self.pending_notifications.len()
             < MAX_OUTSTANDING_CALLBACKS_PER_CELL
@@ -593,19 +545,20 @@ impl RuntimeState {
         }
     }
 
-    pub(super) fn stored_value_completion(&mut self) -> HashMap<String, StoredValueWrite> {
+    pub(super) fn stored_value_completion(&mut self) -> (HashMap<String, StoredValue>, Option<String>) {
         #[cfg(test)]
-        {
-            self.completion_collections += 1;
+        { self.completion_collections += 1; }
+        match self.stored_value_limit_error.as_ref() {
+            Some(error) => (HashMap::new(), Some(error.clone())),
+            None => (std::mem::take(&mut self.stored_value_writes), None),
         }
-        std::mem::take(&mut self.stored_value_writes)
     }
 }
 
 pub(super) enum CompletionState {
     Pending,
     Completed {
-        stored_value_writes: HashMap<String, StoredValueWrite>,
+        stored_value_writes: HashMap<String, StoredValue>,
         error_text: Option<String>,
     },
 }
@@ -649,10 +602,11 @@ fn run_runtime(
         pending_notifications: HashMap::new(),
         pending_timeouts: HashMap::new(),
         unhandled_rejections: Vec::new(),
-        unhandled_rejection_count: 0,
+        rejection_tracking_overflow: false,
         stored_values: config.stored_values,
         total_stored_value_bytes,
         stored_value_writes: HashMap::new(),
+        stored_value_limit_error: None,
         #[cfg(test)]
         completion_collections: 0,
         #[cfg(test)]
@@ -675,11 +629,10 @@ fn run_runtime(
 
     let _ = event_tx.send(RuntimeEvent::Started);
 
-    let evaluation = {
+    let pending_promise = match {
         v8::scope!(let scope, scope);
         module_loader::evaluate_main_module(scope, &config.source)
-    };
-    let pending_promise = match evaluation {
+    } {
         Ok(pending_promise) => pending_promise,
         Err(error_text) => {
             capture_scope_send_error(scope, &event_tx, Some(error_text));
@@ -712,17 +665,9 @@ fn run_runtime(
                     heap_bytes,
                     completion_collections: state.completion_collections,
                     rust_conversion_bytes: state.rust_conversion_bytes,
-                    stored_payload_address: state
-                        .stored_value_writes
-                        .get("payload")
-                        .and_then(|write| write.value.as_ref())
-                        .and_then(|stored| stored.value.as_str())
-                        .map(|value| value.as_ptr() as usize)
-                        .unwrap_or(0),
-                    stored_payload_shared: state
-                        .stored_value_writes
-                        .get("payload")
-                        .and_then(|write| write.value.as_ref())
+                    stored_payload_address: state.stored_value_writes.get("payload")
+                        .and_then(|stored| stored.value.as_str()).map(|value| value.as_ptr() as usize).unwrap_or(0),
+                    stored_payload_shared: state.stored_value_writes.get("payload")
                         .zip(state.stored_values.get("payload"))
                         .is_some_and(|(writes, local)| Arc::ptr_eq(&writes.value, &local.value)),
                 });
@@ -760,10 +705,8 @@ fn run_runtime(
                 }
             }
             RuntimeCommand::TimersReady => {
-                let fired = scope
-                    .get_slot::<RuntimeState>()
-                    .map(|state| state.timer_scheduler.take_fired())
-                    .unwrap_or_default();
+                let fired = scope.get_slot::<RuntimeState>()
+                    .map(|state| state.timer_scheduler.take_fired()).unwrap_or_default();
                 for id in fired {
                     match timers::invoke_timeout_callback(scope, id) {
                         Ok(ControlFlow::Continue(())) => {}
@@ -807,25 +750,28 @@ fn capture_scope_send_error(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     error_text: Option<String>,
 ) {
-    let stored_value_writes = scope
+    let (stored_value_writes, stored_value_limit_error) = scope
         .get_slot_mut::<RuntimeState>()
         .map(RuntimeState::stored_value_completion)
         .unwrap_or_default();
 
-    send_result(scope, event_tx, stored_value_writes, error_text);
+    send_result(
+        scope,
+        event_tx,
+        stored_value_writes,
+        stored_value_limit_error.or(error_text),
+    );
 }
 
 fn send_result(
     scope: &v8::PinScope<'_, '_>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    stored_value_writes: HashMap<String, StoredValueWrite>,
+    stored_value_writes: HashMap<String, StoredValue>,
     error_text: Option<String>,
 ) {
     let _ = event_tx.send(RuntimeEvent::Result {
         stored_value_writes,
-        output_loss: scope
-            .get_slot::<RuntimeState>()
-            .and_then(|state| state.output_admission.output_loss()),
+        output_loss: scope.get_slot::<RuntimeState>().and_then(|state| state.output_admission.output_loss()),
         error_text: error_text.map(|mut text| {
             if text.len() > MAX_ERROR_TEXT_BYTES {
                 let mut end = MAX_ERROR_TEXT_BYTES - ERROR_TRUNCATION_SUFFIX.len();
@@ -1138,17 +1084,10 @@ mod tests {
                         overflow_count += 1;
                     }
                 }
-                RuntimeEvent::Result {
-                    error_text,
-                    output_loss,
-                    ..
-                } => {
+                RuntimeEvent::Result { error_text, output_loss, .. } => {
                     assert_eq!(error_text, None);
                     let loss = output_loss.expect("discarded output must be reported structurally");
-                    assert_eq!(
-                        loss.discarded_items,
-                        (1_000 - (content_count - overflow_count)) as u64
-                    );
+                    assert_eq!(loss.discarded_items, (1_000 - (content_count - overflow_count)) as u64);
                     assert_eq!(loss.discarded_bytes_lower_bound, loss.discarded_items * 32);
                     break;
                 }

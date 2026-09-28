@@ -41,6 +41,7 @@ impl EnvironmentsState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_subagents(mut self, subagents: String) -> Self {
         if !subagents.is_empty() {
             let mut budget = codex_context_fragments::ModelContextBudget::new(1024);

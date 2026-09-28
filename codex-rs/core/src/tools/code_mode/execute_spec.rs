@@ -82,17 +82,17 @@ SOURCE: /[\s\S]+/
     }
 
     #[test]
-    fn code_mode_defaults_to_the_hard_cap_without_forcing_a_recovery_call() {
+    fn code_mode_defaults_below_the_explicit_hard_cap() {
         let exec_description = codex_code_mode::build_exec_tool_description(true, false, &[]);
 
-        assert!(exec_description.contains("defaults to the 10000-token hard cap"));
+        assert!(exec_description.contains("defaults to 4000 tokens"));
         assert!(
             codex_code_mode::build_wait_tool_description()
-                .contains("default to the 10000-token hard cap")
+                .contains("default to 4000 tokens")
         );
         assert_eq!(
             codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+            4_000
         );
         assert_eq!(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL, 10_000);
     }

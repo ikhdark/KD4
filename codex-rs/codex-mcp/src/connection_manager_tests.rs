@@ -1622,7 +1622,7 @@ async fn list_all_tools_applies_legacy_mcp_prefix_by_default() {
 }
 
 #[tokio::test]
-async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
+async fn list_all_tools_skips_pending_clients_without_cached_tools() {
     let pending_client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
         .boxed()
         .shared();
@@ -1651,11 +1651,15 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
 
     let timeout_result =
         tokio::time::timeout(Duration::from_millis(10), manager.list_all_tools()).await;
-    assert!(timeout_result.is_err());
+    assert!(
+        timeout_result
+            .expect("pending startup must not delay catalog listing")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
-async fn shutdown_cancels_pending_tool_listing() {
+async fn shutdown_cancels_pending_startup_without_blocking_tool_listing() {
     let cancel_token = CancellationToken::new();
     let cancel_token_for_startup = cancel_token.clone();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1666,6 +1670,8 @@ async fn shutdown_cancels_pending_tool_listing() {
     }
     .boxed()
     .shared();
+    // Production starts servers independently of catalog readers.
+    let startup_task = tokio::spawn(pending_client.clone());
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
     let mut manager = McpConnectionManager::new_uninitialized(
@@ -1698,6 +1704,7 @@ async fn shutdown_cancels_pending_tool_listing() {
         .expect("shutdown should cancel speculative tool listing");
     let tools = list_task.await.expect("tool listing task should not panic");
     assert!(tools.is_empty());
+    assert!(startup_task.await.unwrap().is_err());
 }
 
 #[tokio::test]
@@ -2666,4 +2673,44 @@ fn unrelated_namespace_name_pairs_do_not_gain_hash_suffixes() {
             ToolName::namespaced("mcp__ab", "c")
         ])
     );
+}
+
+#[tokio::test]
+async fn tool_snapshot_keeps_ready_servers_while_another_starts() {
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager =
+        McpConnectionManager::new_uninitialized(&approval_policy, &permission_profile, true);
+    manager.clients.insert(
+        "ready".to_string(),
+        create_ready_async_managed_client(vec![create_test_tool("ready", "read")]).await,
+    );
+    let mut pending =
+        create_ready_async_managed_client(vec![create_test_tool("starting", "later")]).await;
+    let ready_client = pending.client.clone();
+    pending.client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
+        .boxed()
+        .shared();
+    pending.startup_complete.store(false, Ordering::Release);
+    manager.clients.insert("starting".to_string(), pending);
+    let initial = tokio::time::timeout(
+        Duration::from_millis(250),
+        manager.list_all_tools_snapshot(),
+    )
+    .await
+    .expect("pending server must not block ready tools");
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].server_name, "ready");
+    assert!(Arc::ptr_eq(
+        &initial,
+        &manager.list_all_tools_snapshot().await
+    ));
+    let revision = manager.tool_catalog_revision();
+    let pending = manager.clients.get_mut("starting").unwrap();
+    pending.client = ready_client;
+    pending.startup_complete.store(true, Ordering::Release);
+    assert!(manager.tool_catalog_revision() > revision);
+    let ready = manager.list_all_tools_snapshot().await;
+    assert_eq!(ready.len(), 2);
+    assert!(!Arc::ptr_eq(&initial, &ready));
 }

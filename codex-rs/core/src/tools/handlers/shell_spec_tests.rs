@@ -46,6 +46,9 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(!description.contains("then `rg -n"));
         assert!(!description.contains("is rejected"));
         assert!(!description.contains("read the complete enclosing"));
+        assert!(codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.contains(
+            "Read the complete enclosing function, type, or configuration unit before changing it."
+        ));
         assert!(
             description.contains(
                 "apply when executing in a Windows environment, regardless of the host OS"
@@ -289,10 +292,8 @@ fn command_tools_only_advertise_escalation_when_the_policy_can_request_it() {
     for tool in unavailable {
         let tool = serde_json::to_value(tool).expect("serialize command tool");
         let properties = &tool["parameters"]["properties"];
-        assert_eq!(
-            properties["sandbox_permissions"]["enum"],
-            json!(["use_default"])
-        );
+        assert!(properties.get("sandbox_permissions").is_none());
+        assert!(properties.get("additional_permissions").is_none());
         assert!(properties.get("justification").is_none());
         assert!(properties.get("prefix_rule").is_none());
     }
@@ -733,7 +734,6 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
             original_token_count: Some(2),
             hook_command: None,
             raw_output_artifact: None,
-            raw_output_truncated: false,
             raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),

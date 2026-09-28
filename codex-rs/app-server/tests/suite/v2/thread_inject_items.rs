@@ -18,6 +18,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
 use core_test_support::responses;
 use serde_json::Value;
+use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
 

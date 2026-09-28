@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use codex_api::SharedAuthProvider;
@@ -21,7 +20,6 @@ use codex_exec_server::HttpHeader;
 use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestParams;
 use codex_exec_server::HttpResponseBodyStream;
-use codex_http_client::RetryAfter;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
@@ -74,7 +72,6 @@ pub(crate) enum StreamableHttpClientAdapterError {
     UnexpectedHttpStatus {
         status: StatusCode,
         body_preview: String,
-        retry_after: Option<RetryAfter>,
     },
     #[error("invalid HTTP header: {0}")]
     Header(String),
@@ -202,8 +199,6 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         let content_type = response_header(&response.headers, CONTENT_TYPE);
         let session_id = response_header(&response.headers, HEADER_SESSION_ID);
         if !status_is_success(response.status) {
-            let retry_after = response_header(&response.headers, "retry-after")
-                .and_then(|value| RetryAfter::from_header(&value));
             let parse_error =
                 !retryable_post_response_status(mcp_method.as_deref(), response.status)
                     && content_type
@@ -214,18 +209,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             } else {
                 NON_JSON_RESPONSE_BODY_PREVIEW_BYTES
             };
-            let (body, truncated) =
-                if retryable_post_response_status(mcp_method.as_deref(), response.status) {
-                    // Diagnostic bytes must not consume the time available for recovery.
-                    tokio::time::timeout(
-                        Duration::from_millis(250),
-                        collect_body_prefix(&mut body_stream, limit),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Ok((Vec::new(), true)))?
-                } else {
-                    collect_body_prefix(&mut body_stream, limit).await?
-                };
+            let (body, truncated) = collect_body_prefix(&mut body_stream, limit).await?;
             if parse_error
                 && !truncated
                 && let Some(message) = parse_json_rpc_error(&body)
@@ -238,20 +222,10 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             if truncated {
                 let _ = write!(
                     preview,
-                    "... (HTTP error body collection truncated at {limit} bytes or timed out)"
+                    "... (HTTP error body exceeds {limit}-byte collection limit)"
                 );
             }
-            let mut error = unexpected_http_status_error(response.status, preview);
-            if let StreamableHttpError::Client(
-                StreamableHttpClientAdapterError::UnexpectedHttpStatus {
-                    retry_after: advice,
-                    ..
-                },
-            ) = &mut error
-            {
-                *advice = retry_after;
-            }
-            return Err(error);
+            return Err(unexpected_http_status_error(response.status, preview));
         }
         match content_type.as_deref() {
             Some(content_type) if has_media_type(content_type, EVENT_STREAM_MIME_TYPE) => {
@@ -600,7 +574,6 @@ fn unexpected_http_status_error(
             StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
                 status,
                 body_preview,
-                retry_after: None,
             })
         }
         Err(_) => StreamableHttpError::UnexpectedServerResponse(
@@ -683,8 +656,6 @@ mod tests {
                 "rpc-error" => (StatusCode::BAD_REQUEST, JSON_MIME_TYPE, Body::from_stream(
                     stream::once(async { Ok::<_, io::Error>(vec![b'x'; MAX_JSON_RPC_ERROR_BODY_BYTES + 1]) })
                         .chain(stream::pending()))),
-                "stalled-error" => (StatusCode::SERVICE_UNAVAILABLE, "text/plain", Body::from_stream(
-                    stream::once(async { Ok::<_, io::Error>(b"busy".to_vec()) }).chain(stream::pending()))),
                 "invalid-type" => (StatusCode::OK, "application/json-invalid", Body::from("{}")),
                 "json-get" => (StatusCode::OK, JSON_MIME_TYPE, Body::from("{}")),
                 "rpc" => (StatusCode::BAD_REQUEST, "Application/JSON; charset=utf-8", Body::from(
@@ -693,7 +664,7 @@ mod tests {
                     "jsonrpc": "2.0", "id": 1, "result": {"payload": "x".repeat(MAX_JSON_RPC_ERROR_BODY_BYTES + 1)}
                 }).to_string())),
             };
-            (status, [(CONTENT_TYPE, content_type), (http::header::RETRY_AFTER, "2")], body)
+            (status, [(CONTENT_TYPE, content_type)], body)
         }));
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -703,14 +674,7 @@ mod tests {
             HeaderMap::new(),
             None,
         );
-        for case in [
-            "error",
-            "stalled-error",
-            "rpc-error",
-            "invalid-type",
-            "rpc",
-            "success",
-        ] {
+        for case in ["error", "rpc-error", "invalid-type", "rpc", "success"] {
             let message = serde_json::from_value(
                 serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"}),
             )
@@ -729,21 +693,15 @@ mod tests {
             .expect("response processing must finish without EOF for oversized errors");
             match (case, result) {
                 (
-                    "error" | "stalled-error" | "rpc-error",
+                    "error" | "rpc-error",
                     Err(StreamableHttpError::Client(
                         StreamableHttpClientAdapterError::UnexpectedHttpStatus {
-                            body_preview,
-                            retry_after,
-                            ..
+                            body_preview, ..
                         },
                     )),
                 ) => {
                     assert!(body_preview.len() < NON_JSON_RESPONSE_BODY_PREVIEW_BYTES + 200);
-                    assert!(body_preview.contains("collection truncated"));
-                    let remaining = retry_after
-                        .expect("retry advice survives body collection")
-                        .remaining_delay();
-                    assert!(remaining > Duration::ZERO && remaining <= Duration::from_secs(2));
+                    assert!(body_preview.contains("collection limit"));
                 }
                 ("invalid-type", Err(StreamableHttpError::UnexpectedContentType(_))) => {}
                 ("rpc", Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(error), _))) => {

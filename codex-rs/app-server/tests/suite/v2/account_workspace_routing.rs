@@ -1,5 +1,4 @@
 use super::*;
-use pretty_assertions::assert_eq;
 use wiremock::matchers::header;
 
 #[tokio::test]
@@ -51,7 +50,7 @@ async fn account_read_workspace_routing_is_authoritative_and_optional() -> Resul
         "workspace_backend_origin": "https://other.example",
         "account_routing_override": "us"
     });
-    for (index, (status, accounts, expected_routing)) in [
+    for (status, accounts, expected_routing) in [
         (
             200,
             json!([other_route.clone(), route]),
@@ -68,18 +67,7 @@ async fn account_read_workspace_routing_is_authoritative_and_optional() -> Resul
             serde_json::Value::Null,
         ),
         (503, json!([]), serde_json::Value::Null),
-    ].into_iter().enumerate() {
-        if index > 0 {
-            // Each response shape gets a cold cache; repeated reads below verify
-            // that unchanged account state does not repeat optional discovery.
-            drop(mcp);
-            mcp = TestAppServer::builder()
-                .with_codex_home(codex_home.path())
-                .without_auto_env()
-                .with_env_overrides(&[("OPENAI_API_KEY", None)])
-                .build().await?;
-            timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-        }
+    ] {
         server.reset().await;
         Mock::given(method("GET"))
             .and(path("/backend-api/wham/accounts/check"))
@@ -109,10 +97,6 @@ async fn account_read_workspace_routing_is_authoritative_and_optional() -> Resul
                 "workspaceRouting": expected_routing
             })
         );
-        let cached_id = mcp.send_get_account_request(GetAccountParams { refresh_token: false }).await?;
-        let cached = timeout(DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(cached_id))).await??;
-        assert_eq!(cached.result, response.result);
         server.verify().await;
     }
     assert_eq!(std::fs::read(auth_path)?, original_auth);

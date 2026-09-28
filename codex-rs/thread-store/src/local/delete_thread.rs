@@ -10,7 +10,7 @@ use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::SESSIONS_SUBDIR;
 use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_path_by_id_str;
-use codex_rollout::remove_thread_names_for_ids;
+use codex_rollout::remove_thread_name_entries;
 
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
@@ -65,13 +65,14 @@ impl StagedThreadDelete<'_> {
 
     pub async fn commit(mut self) {
         self.files.committed = true;
-        if let Err(err) =
-            remove_thread_names_for_ids(self.store.config.codex_home.as_path(), &self.thread_ids)
-                .await
-        {
-            tracing::warn!(
-                "failed to delete thread name index entries after committing thread deletion: {err}"
-            );
+        for thread_id in &self.thread_ids {
+            if let Err(err) =
+                remove_thread_name_entries(self.store.config.codex_home.as_path(), *thread_id).await
+            {
+                tracing::warn!(
+                    "failed to delete thread name index entries for {thread_id} after committing thread deletion: {err}"
+                );
+            }
         }
 
         {

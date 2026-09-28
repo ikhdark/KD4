@@ -23,7 +23,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(120);
-const AUDIT_SCHEMA_VERSION: u64 = 21;
+const AUDIT_SCHEMA_VERSION: u64 = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -423,7 +423,6 @@ mod tests {
             "kd4_timing_analysis.py",
             "kd4_first_useful_action_analysis.py",
             "rollout_snapshot.py",
-            "atomic_json.py",
         ] {
             let target = frozen.join(name);
             fs::copy(root.join("scripts").join(name), &target).unwrap();

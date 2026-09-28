@@ -207,7 +207,6 @@ struct SessionInner {
     delegate: Arc<dyn CodeModeSessionDelegate>,
     state: StdMutex<SessionState>,
     next_generation: AtomicU64,
-    reset_notice_pending: AtomicBool,
     shutdown_requested: AtomicBool,
     shutdown_result: StdMutex<Option<ShutdownResultReceiver>>,
     retired_cleanups: StdMutex<Vec<SessionCleanup>>,
@@ -239,7 +238,6 @@ impl ProcessOwnedCodeModeSession {
                 delegate,
                 state: StdMutex::new(SessionState::New),
                 next_generation: AtomicU64::new(1),
-                reset_notice_pending: AtomicBool::new(false),
                 shutdown_requested: AtomicBool::new(false),
                 shutdown_result: StdMutex::new(None),
                 retired_cleanups: StdMutex::new(Vec::new()),
@@ -253,19 +251,16 @@ impl ProcessOwnedCodeModeSession {
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
         let binding = self.connection().await?;
-        self.inner.check_reset_notice()?;
         binding.connection.execute(binding.remote, request).await
     }
 
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
-        self.inner.check_reset_notice()?;
         binding.connection.wait(binding.remote, request).await
     }
 
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
-        self.inner.check_reset_notice()?;
         binding.connection.terminate(binding.remote, cell_id).await
     }
 
@@ -275,17 +270,6 @@ impl ProcessOwnedCodeModeSession {
 }
 
 impl SessionInner {
-    fn check_reset_notice(&self) -> Result<(), String> {
-        if self.reset_notice_pending.swap(false, Ordering::AcqRel) {
-            return Err(serde_json::json!({"code_mode_session_reset": {
-                "request_executed": false,
-                "lost": ["stored_values", "previous_cells"],
-                "message": "The code-mode host restarted. This request was not executed. Recover needed session evidence from retained outputs; unchanged files and prior validation are not invalidated. Do not replay external side effects from earlier cells."
-            }}).to_string());
-        }
-        Ok(())
-    }
-
     async fn connection(self: &Arc<Self>) -> Result<SessionBinding, String> {
         self.runtime.get_or_init(tokio::runtime::Handle::current);
         loop {
@@ -317,7 +301,6 @@ impl SessionInner {
                     }
                     SessionState::Open(binding) => {
                         self.retain_cleanup(binding.cleanup.clone());
-                        self.reset_notice_pending.store(true, Ordering::Release);
                         *state = SessionState::New;
                         continue;
                     }

@@ -3,6 +3,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -23,11 +24,11 @@ use std::sync::PoisonError;
 use std::sync::TryLockError;
 use std::sync::mpsc;
 use std::time::Duration;
-use std::time::Instant;
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
 const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CACHED_SYNTAX_BYTES: usize = 64 * 1024;
+const MAX_CACHED_SYNTAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum PowershellFlavor {
@@ -37,13 +38,14 @@ enum PowershellFlavor {
 
 type CachedParser = Arc<Mutex<Option<PowershellParserProcess>>>;
 
-static TEMPORARY_PARSER_SLOT: Mutex<()> = Mutex::new(());
+type SpareParsers = HashMap<PowershellFlavor, Option<PowershellParserProcess>>;
+static SPARE_PARSERS: LazyLock<Mutex<SpareParsers>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static PARSER_PROCESSES: LazyLock<Mutex<HashMap<PowershellFlavor, CachedParser>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Warm the same trusted host used by command analysis. Speculation never
-/// waits for an occupied parser or consumes the temporary foreground slot.
+/// waits for an occupied parser or consumes the spare foreground parser.
 pub fn prewarm_powershell_parser(executable: &str) {
     let Some(flavor) = PowershellFlavor::from_requested_executable(executable) else {
         return;
@@ -159,16 +161,15 @@ fn parse_with_powershell_ast_request(
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     };
-    match acquire_cached_parser(&parser, &TEMPORARY_PARSER_SLOT) {
+    match acquire_cached_parser(&parser, &SPARE_PARSERS) {
         CachedParserAccess::Shared(mut parser) => {
             parse_with_cached_process(&mut parser, executable, script, resolution)
         }
-        CachedParserAccess::Temporary(_slot) => {
-            // The shared child has one stdin/stdout protocol stream, but independent parser
-            // requests do not depend on one another. Use a short-lived host instead of queuing
-            // every classification behind a slow or stalled request.
-            let mut parser = None;
-            parse_with_cached_process(&mut parser, executable, script, resolution)
+        CachedParserAccess::Spare(mut parsers) => {
+            // Retain the overflow host and its syntax cache across bursts instead
+            // of paying PowerShell startup on every concurrent classification.
+            let parser = parsers.entry(flavor).or_default();
+            parse_with_cached_process(parser, executable, script, resolution)
         }
         CachedParserAccess::Saturated => PowershellParseOutcome::Failed,
     }
@@ -176,36 +177,21 @@ fn parse_with_powershell_ast_request(
 
 enum CachedParserAccess<'a> {
     Shared(MutexGuard<'a, Option<PowershellParserProcess>>),
-    Temporary(MutexGuard<'a, ()>),
+    Spare(MutexGuard<'a, SpareParsers>),
     Saturated,
 }
 
 fn acquire_cached_parser<'a>(
     parser: &'a CachedParser,
-    temporary_slot: &'a Mutex<()>,
+    spare_parsers: &'a Mutex<SpareParsers>,
 ) -> CachedParserAccess<'a> {
-    // Ordinary analyses finish quickly. Give the warm host a bounded opportunity
-    // to drain a burst before starting another host or failing closed on saturation.
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        match parser.try_lock() {
-            Ok(parser) => return CachedParserAccess::Shared(parser),
-            Err(TryLockError::Poisoned(poisoned)) => {
-                return CachedParserAccess::Shared(poisoned.into_inner());
-            }
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(TryLockError::WouldBlock) => break,
-        }
-    }
     match parser.try_lock() {
         Ok(parser) => CachedParserAccess::Shared(parser),
         Err(TryLockError::Poisoned(poisoned)) => CachedParserAccess::Shared(poisoned.into_inner()),
-        Err(TryLockError::WouldBlock) => match temporary_slot.try_lock() {
-            Ok(slot) => CachedParserAccess::Temporary(slot),
+        Err(TryLockError::WouldBlock) => match spare_parsers.try_lock() {
+            Ok(slot) => CachedParserAccess::Spare(slot),
             Err(TryLockError::Poisoned(poisoned)) => {
-                CachedParserAccess::Temporary(poisoned.into_inner())
+                CachedParserAccess::Spare(poisoned.into_inner())
             }
             Err(TryLockError::WouldBlock) => CachedParserAccess::Saturated,
         },
@@ -346,7 +332,7 @@ struct PowershellParserProcess {
     requests: mpsc::Sender<ParserIoRequest>,
     // Syntax is deterministic within this host. Keep just the latest bounded result so
     // consecutive safety consumers do not repeat the same AST parse and IPC round trip.
-    last_syntax: Option<(String, PowershellParseOutcome)>,
+    syntax_cache: VecDeque<(String, PowershellParseOutcome, usize)>,
     // Request ids are monotonic within one child process so the caller can detect protocol
     // desynchronization if stdout is contaminated or the child is unexpectedly replaced.
     next_request_id: u64,
@@ -429,7 +415,7 @@ impl PowershellParserProcess {
         Ok(Self {
             child,
             requests,
-            last_syntax: None,
+            syntax_cache: VecDeque::new(),
             next_request_id: 0,
         })
     }
@@ -445,18 +431,23 @@ impl PowershellParserProcess {
         resolution: Option<&PowershellResolutionState>,
     ) -> std::io::Result<PowershellParseOutcome> {
         if resolution.is_none()
-            && let Some((cached_script, outcome)) = &self.last_syntax
-            && cached_script == script
+            && let Some(index) = self
+                .syntax_cache
+                .iter()
+                .position(|(cached, _, _)| cached == script)
         {
-            return Ok(outcome.clone());
+            let entry = self
+                .syntax_cache
+                .remove(index)
+                .expect("cached syntax index");
+            let outcome = entry.1.clone();
+            self.syntax_cache.push_back(entry);
+            return Ok(outcome);
         }
         // Resolution depends on the current filesystem, cwd, PATH and PATHEXT. It must
         // always reach the host, and no result from that request can enter this cache.
         // The resolution script restores cwd/PATH/PATHEXT and does not change
         // syntax or native argument mode. Keep syntax proof across those requests.
-        if resolution.is_none() {
-            self.last_syntax = None;
-        }
         let request = PowershellParserRequest {
             id: self.next_request_id,
             payload: encode_powershell_base64(script),
@@ -511,7 +502,20 @@ impl PowershellParserProcess {
             && (syntax_error || !matches!(outcome, PowershellParseOutcome::Failed))
             && script.len().saturating_add(response_line.len()) <= MAX_CACHED_SYNTAX_BYTES
         {
-            self.last_syntax = Some((script.to_string(), outcome.clone()));
+            let size = script.len().saturating_add(response_line.len());
+            while self.syntax_cache.len() >= MAX_CACHED_SYNTAX_ENTRIES
+                || self
+                    .syntax_cache
+                    .iter()
+                    .map(|(_, _, size)| size)
+                    .sum::<usize>()
+                    + size
+                    > MAX_CACHED_SYNTAX_BYTES
+            {
+                self.syntax_cache.pop_front();
+            }
+            self.syntax_cache
+                .push_back((script.to_string(), outcome.clone(), size));
         }
         Ok(outcome)
     }
@@ -885,52 +889,12 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_literal_reads_reuse_the_healthy_parser() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
-        let executable = powershell.as_path().to_str().unwrap().to_owned();
-        assert!(matches!(
-            parse_with_powershell_ast(&executable, "Get-Content -LiteralPath 'warm.txt'"),
-            PowershellParseOutcome::Analysis(_)
-        ));
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        #[expect(clippy::needless_collect, reason = "spawn all barrier participants before joining any thread")]
-        let handles = (0..8)
-            .map(|n| {
-                let executable = executable.clone();
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    parse_with_powershell_ast(
-                        &executable,
-                        &format!("Get-Content -LiteralPath 'read-{n}.txt'"),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        for (n, handle) in handles.into_iter().enumerate() {
-            let PowershellParseOutcome::Analysis(analysis) = handle.join().unwrap() else {
-                panic!("literal read rejected");
-            };
-            assert_eq!(
-                analysis.commands,
-                vec![vec![
-                    "Get-Content".to_string(),
-                    "-LiteralPath".to_string(),
-                    format!("read-{n}.txt")
-                ]]
-            );
-        }
-    }
-
-    #[test]
     fn cached_parser_contention_bounds_temporary_hosts() {
         let parser: CachedParser = Arc::new(Mutex::new(None));
-        let temporary_slot = Mutex::new(());
+        let temporary_slot = Mutex::new(HashMap::new());
         let held = parser.lock().unwrap_or_else(PoisonError::into_inner);
         let temporary = acquire_cached_parser(&parser, &temporary_slot);
-        assert!(matches!(temporary, CachedParserAccess::Temporary(_)));
+        assert!(matches!(temporary, CachedParserAccess::Spare(_)));
         assert!(matches!(
             acquire_cached_parser(&parser, &temporary_slot),
             CachedParserAccess::Saturated
@@ -938,7 +902,7 @@ mod tests {
         drop(temporary);
         assert!(matches!(
             acquire_cached_parser(&parser, &temporary_slot),
-            CachedParserAccess::Temporary(_)
+            CachedParserAccess::Spare(_)
         ));
         drop(held);
         assert!(matches!(
@@ -1015,7 +979,10 @@ mod tests {
             third.commands,
             vec![vec!["Get-Content".to_string(), "foo bar".to_string()]],
         );
-        assert_eq!(parser.next_request_id, 3, "retain only the latest syntax");
+        assert_eq!(
+            parser.next_request_id, 2,
+            "interleaved syntax must reuse its cached parse"
+        );
     }
 
     #[test]
@@ -1133,9 +1100,7 @@ mod tests {
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
         let primary = parser.lock().unwrap_or_else(PoisonError::into_inner);
-        let temporary = TEMPORARY_PARSER_SLOT
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let temporary = SPARE_PARSERS.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(
             parse_with_powershell_ast(executable, "Get-Content Cargo.toml"),
             PowershellParseOutcome::Failed,

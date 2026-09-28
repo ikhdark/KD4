@@ -238,14 +238,6 @@ impl ClaudeHooksEngine {
         }
     }
 
-    pub(crate) fn set_output_directory(
-        &mut self,
-        directory: codex_utils_absolute_path::AbsolutePathBuf,
-        thread_id: ThreadId,
-    ) {
-        self.output_spiller = HookOutputSpiller::for_thread(directory, thread_id);
-    }
-
     /// Shares `once_per` run history with the engine this one replaces.
     pub(crate) fn inherit_scoped_runs(&mut self, previous: &Self) {
         self.scoped_runs = Arc::clone(&previous.scoped_runs);

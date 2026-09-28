@@ -338,9 +338,10 @@ impl ThreadWatchManager {
         // an older snapshot can never be published after a newer transition.
         if let Some(notification) = &notification
             && let Some(publications) = &self.publications
-            && publications.try_send(notification.clone()).is_err()
         {
-            self.publication_failure.cancel();
+            if publications.try_send(notification.clone()).is_err() {
+                self.publication_failure.cancel();
+            }
         }
         notification
     }
@@ -1246,7 +1247,7 @@ mod tests {
             .await
             .expect("status subscription");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while outgoing_rx.is_empty() {
+            while outgoing_rx.len() == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1305,7 +1306,7 @@ mod tests {
             .await
             .expect("status subscription");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while outgoing_rx.is_empty() {
+            while outgoing_rx.len() == 0 {
                 tokio::task::yield_now().await;
             }
         })

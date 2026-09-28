@@ -811,7 +811,7 @@ mod tests {
                 fs::write(&path, pem.replace('\n', newline)).unwrap();
                 let certs = read_ca_certificates(&path).unwrap();
                 assert_eq!(
-                    certs.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                    certs.iter().map(|cert| cert.as_ref()).collect::<Vec<_>>(),
                     expected
                 );
             }

@@ -53,6 +53,8 @@ use super::list::get_threads;
 use super::list::get_threads_ascending;
 use super::list::get_threads_in_root;
 use super::list::get_threads_in_root_ascending;
+use super::list::thread_item_sort_key;
+use super::session_index::find_thread_names_by_ids;
 use crate::config::RolloutConfigView;
 use crate::state_integration;
 use crate::state_integration::StateDbHandle;
@@ -1057,26 +1059,9 @@ impl RolloutRecorder {
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
-        let guard = crate::metadata::extraction_cache_guard(path, "").await;
-        let mut manifests = crate::ToolManifestDictionary::default();
         let mut items = Vec::new();
-        let (thread_id, parse_errors) = Self::for_each_rollout_item(path, |item| {
-            if let RolloutItem::ToolManifest(manifest) = &item
-                && let Err(err) = manifests.apply(manifest)
-            {
-                tracing::warn!(%err, "failed to reconstruct persisted tool manifest");
-            }
-            items.push(item);
-        })
-        .await?;
-        crate::metadata::cache_rollout_read(
-            guard,
-            crate::metadata::CachedRolloutRead {
-                manifests: Some(manifests),
-                ..Default::default()
-            },
-        )
-        .await;
+        let (thread_id, parse_errors) =
+            Self::for_each_rollout_item(path, |item| items.push(item)).await?;
         tracing::debug!(
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
             items.len(),
@@ -1162,7 +1147,7 @@ impl RolloutRecorder {
             }
         }
         if !saw_non_empty_line {
-            return Err(IoError::new(ErrorKind::InvalidData, "empty session file"));
+            return Err(IoError::other("empty session file"));
         }
 
         Ok((thread_id, parse_errors))
@@ -1171,9 +1156,6 @@ impl RolloutRecorder {
     async fn existing_tool_manifests(
         path: &Path,
     ) -> std::io::Result<crate::ToolManifestDictionary> {
-        if let Some(manifests) = crate::metadata::take_cached_manifests(path).await {
-            return Ok(manifests);
-        }
         let (_, manifests) = Self::existing_rollout_state(path).await?;
         Ok(manifests)
     }
@@ -1306,14 +1288,6 @@ fn is_legacy_ghost_snapshot_response_item(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("ghost_snapshot")
 }
 
-fn cursor_from_thread_item(item: &ThreadItem, sort_key: ThreadSortKey) -> Option<Cursor> {
-    let (timestamp, id) = super::list::thread_item_sort_key(item, sort_key)?;
-    Some(Cursor::with_thread_id(
-        timestamp,
-        ThreadId::from_string(&id.to_string()).ok()?,
-    ))
-}
-
 fn truncate_fs_page(
     mut page: ThreadsPage,
     page_size: usize,
@@ -1442,20 +1416,53 @@ async fn list_threads_from_files_desc(
     search_term: Option<&str>,
 ) -> std::io::Result<ThreadsPage> {
     if let Some(search_term) = search_term {
-        return list_threads_from_files_matching(
-            codex_home,
-            page_size,
-            cursor,
-            sort_key,
-            allowed_sources,
-            model_providers,
-            cwd_filters,
-            default_provider,
-            archived,
-            search_term,
-            false,
-        )
-        .await;
+        let mut matching_items = Vec::new();
+        let mut scanned_files = 0usize;
+        let mut reached_scan_cap = false;
+        let mut page_cursor = cursor.cloned();
+        let scan_page_size = page_size.saturating_mul(8).clamp(256, 2048);
+
+        loop {
+            let mut page = list_threads_from_files_desc_unfiltered(
+                codex_home,
+                scan_page_size,
+                page_cursor.as_ref(),
+                sort_key,
+                allowed_sources,
+                model_providers,
+                cwd_filters,
+                default_provider,
+                archived,
+            )
+            .await?;
+            scanned_files = scanned_files.saturating_add(page.num_scanned_files);
+            reached_scan_cap |= page.reached_scan_cap;
+            filter_thread_items_by_search_term(codex_home, &mut page.items, Some(search_term))
+                .await?;
+            matching_items.extend(page.items);
+            page_cursor = page.next_cursor;
+            if matching_items.len() > page_size || page_cursor.is_none() {
+                break;
+            }
+        }
+
+        let more_matches_available =
+            matching_items.len() > page_size || page_cursor.is_some() || reached_scan_cap;
+        matching_items.truncate(page_size);
+        let next_cursor = if more_matches_available {
+            matching_items
+                .last()
+                .and_then(|item| cursor_from_thread_item(item, sort_key))
+        } else {
+            None
+        };
+
+        return Ok(ThreadsPage {
+            items: matching_items,
+            next_cursor,
+            num_scanned_files: scanned_files,
+            reached_scan_cap,
+        });
     }
 
     list_threads_from_files_desc_unfiltered(
@@ -1528,26 +1535,11 @@ async fn list_threads_from_files_asc(
     archived: bool,
     search_term: Option<&str>,
 ) -> std::io::Result<ThreadsPage> {
-    if let Some(search_term) = search_term {
-        return list_threads_from_files_matching(
-            codex_home,
-            page_size,
-            cursor,
-            sort_key,
-            allowed_sources,
-            model_providers,
-            cwd_filters,
-            default_provider,
-            archived,
-            search_term,
-            true,
-        )
-        .await;
-    }
-    if archived {
+    let scan_page_size = search_term.map_or(page_size, |_| usize::MAX);
+    let mut page = if archived {
         get_threads_in_root_ascending(
             codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
-            page_size,
+            scan_page_size,
             cursor,
             sort_key,
             ThreadListConfig {
@@ -1558,11 +1550,11 @@ async fn list_threads_from_files_asc(
                 layout: ThreadListLayout::Flat,
             },
         )
-        .await
+        .await?
     } else {
         get_threads_ascending(
             codex_home,
-            page_size,
+            scan_page_size,
             cursor,
             sort_key,
             allowed_sources,
@@ -1570,52 +1562,54 @@ async fn list_threads_from_files_asc(
             cwd_filters,
             default_provider,
         )
-        .await
-    }
+        .await?
+    };
+
+    filter_thread_items_by_search_term(codex_home, &mut page.items, search_term).await?;
+    let more_matches_available =
+        page.next_cursor.is_some() || page.items.len() > page_size || page.reached_scan_cap;
+    page.items.truncate(page_size);
+    page.next_cursor = if more_matches_available {
+        page.items
+            .last()
+            .and_then(|item| cursor_from_thread_item(item, sort_key))
+    } else {
+        None
+    };
+    Ok(page)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Shares the listing pagination and filter contract"
-)]
-async fn list_threads_from_files_matching(
+async fn filter_thread_items_by_search_term(
     codex_home: &Path,
-    page_size: usize,
-    cursor: Option<&Cursor>,
-    sort_key: ThreadSortKey,
-    allowed_sources: &[SessionSource],
-    model_providers: Option<&[String]>,
-    cwd_filters: Option<&[PathBuf]>,
-    default_provider: &str,
-    archived: bool,
-    search_term: &str,
-    ascending: bool,
-) -> std::io::Result<ThreadsPage> {
-    let matching = super::session_index::find_thread_ids_by_title(codex_home, search_term).await?;
-    super::list::get_threads_in_root_by_summary(
-        codex_home.join(if archived {
-            ARCHIVED_SESSIONS_SUBDIR
-        } else {
-            SESSIONS_SUBDIR
-        }),
-        page_size,
-        cursor,
-        sort_key,
-        ThreadListConfig {
-            allowed_sources,
-            model_providers,
-            cwd_filters,
-            default_provider,
-            layout: if archived {
-                ThreadListLayout::Flat
-            } else {
-                ThreadListLayout::NestedByDate
-            },
-        },
-        ascending,
-        Some(&matching),
-    )
-    .await
+    items: &mut Vec<ThreadItem>,
+    search_term: Option<&str>,
+) -> std::io::Result<()> {
+    let Some(search_term) = search_term else {
+        return Ok(());
+    };
+
+    // The file-backed fallback only has the thread title in the sidecar session index.
+    // Match the SQLite path's title substring filter so search pagination behaves the same
+    // whether the state DB is available or not.
+    let thread_ids = items
+        .iter()
+        .filter_map(|item| item.thread_id)
+        .collect::<HashSet<_>>();
+    let thread_names = find_thread_names_by_ids(codex_home, &thread_ids).await?;
+    items.retain(|item| {
+        item.thread_id
+            .and_then(|thread_id| thread_names.get(&thread_id))
+            .is_some_and(|title| title.contains(search_term))
+    });
+    Ok(())
+}
+
+fn cursor_from_thread_item(item: &ThreadItem, sort_key: ThreadSortKey) -> Option<Cursor> {
+    let (timestamp, id) = thread_item_sort_key(item, sort_key)?;
+    Some(Cursor::with_thread_id(
+        timestamp,
+        ThreadId::from_string(&id.to_string()).ok()?,
+    ))
 }
 
 struct LogFileInfo {

@@ -2182,16 +2182,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "provenAvoidedModelRequests": {
-          "default": null,
-          "description": "Model handoffs suppressed at an instrumented runtime decision, not inferred from wait observations or receipts. Null denotes older telemetry.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
         "provenLoopActivationCount": {
           "default": 0,
           "format": "uint32",

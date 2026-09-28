@@ -7,9 +7,9 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # Report a flaky or hanging test on its first attempt. A retry would turn a
 # flake into a pass and double the time until a deterministic hang fails.
 retries = 0
-# Local 2/4/6-thread comparison favored six workers; retain narrower groups below.
+# Bound local test fanout; retain narrower groups below.
 # NEXTEST_TEST_THREADS or --test-threads can opt into a different limit.
-test-threads = 6
+test-threads = 2
 
 [scripts.setup.windows-test-stack]
 command = ["python", "scripts/nextest_windows_stack.py"]
@@ -52,7 +52,7 @@ max-threads = 2
 max-threads = 1
 
 [test-groups.windows_core]
-max-threads = 4
+max-threads = 2
 
 [[profile.default.overrides]]
 # These tests start the real login server on its fixed callback ports. Keep

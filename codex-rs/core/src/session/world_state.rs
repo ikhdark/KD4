@@ -6,6 +6,7 @@ use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
 use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::PluginsInstructionsState;
+use crate::context::world_state::SubagentsState;
 use crate::context::world_state::WorldState;
 use codex_extension_api::WorldStateContributionInput;
 use futures::StreamExt;
@@ -48,6 +49,7 @@ impl Session {
             String::new()
         };
 
+        let previous_world_state = self.state.lock().await.history.world_state_baseline();
         let mut world_state = WorldState::default();
         if turn_context.config.features.enabled(codex_features::Feature::TokenBudget) {
             let ids = self.state.lock().await.auto_compact_window_ids();
@@ -72,9 +74,13 @@ impl Session {
                 EnvironmentsState::from_turn_context_with_environments(
                     turn_context,
                     &step_context.environments,
-                )
-                .with_subagents(environment_subagents),
+                ),
             );
+            if !environment_subagents.is_empty()
+                || previous_world_state.as_ref().is_some_and(|state| state.section("subagents").is_some())
+            {
+                world_state.add_section(SubagentsState::new(environment_subagents));
+            }
         }
         let apps_available =
             if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
@@ -98,7 +104,6 @@ impl Session {
             .iter()
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
-        let previous_world_state = self.state.lock().await.history.world_state_baseline();
         // World-state contributors are independent. Poll them concurrently while preserving
         // registration order, and do not let an optional contributor block the model request.
         let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;

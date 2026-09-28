@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 
 /// A local destination explicitly authorized by the request's host policy.
 /// The socket check still restricts the actual resolved address to this destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum LocalTarget {
     Ip(std::net::IpAddr),
     Loopback,

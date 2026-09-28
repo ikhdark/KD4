@@ -54,48 +54,6 @@ fn atomically_replaces_existing_contents() {
 }
 
 #[test]
-fn symlink_alias_writers_share_the_destination_lock() {
-    use codex_file_system::acquire_atomic_write_lock;
-    use codex_file_system::atomic_write_lock_path;
-    use codex_file_system::resolve_symlink_write_paths;
-    use codex_file_system::write_atomically;
-    use std::fs::OpenOptions;
-
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("shared.toml");
-    let alias = temp.path().join("config.toml");
-    std::os::windows::fs::symlink_file(&target, &alias).unwrap();
-    // Even a dangling alias must use the lock future direct writers will use.
-    let first = acquire_atomic_write_lock(&alias).unwrap();
-    let probe = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(atomic_write_lock_path(&target).unwrap())
-        .unwrap();
-    assert!(fs2::FileExt::try_lock_exclusive(&probe).is_err());
-    let other_target = target.clone();
-    let writer = std::thread::spawn(move || {
-        let _lock = acquire_atomic_write_lock(&other_target).unwrap();
-        let paths = resolve_symlink_write_paths(&other_target).unwrap();
-        let previous = std::fs::read_to_string(paths.read_path.unwrap()).unwrap();
-        write_atomically(&paths.write_path, &(previous + "second = true\n")).unwrap();
-    });
-    write_atomically(&target, "first = true\n").unwrap();
-    drop(first);
-    writer.join().unwrap();
-    assert!(
-        std::fs::symlink_metadata(alias)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(
-        std::fs::read_to_string(target).unwrap(),
-        "first = true\nsecond = true\n"
-    );
-}
-
-#[test]
 fn atomically_replaces_existing_contents_with_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("state.bin");

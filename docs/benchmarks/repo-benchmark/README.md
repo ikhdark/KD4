@@ -592,7 +592,7 @@ Summed thread durations are not elapsed task time.
 
 ## Focused validation
 
-Use `cargo test -p repo-benchmark --jobs 6`, the affected feature/core gates, the Python
+Use `cargo test -p repo-benchmark --jobs 2`, the affected feature/core gates, the Python
 audit/timing tests, and `just check-kd4-features --static-only`. Do not run the full repository suite. Completion
 requires a full-mode execution covering scripted work and all nine live attempts with preserved
 evidence; fast selection is checked without another paid matrix.

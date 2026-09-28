@@ -1,57 +1,371 @@
 use super::*;
 
-#[path = "tool_history_benchmarks.rs"]
-mod benchmarks;
+/// Deterministic projection/recovery workload, not a model-latency benchmark.
+#[tokio::test]
+async fn long_session_prompt_pressure_comparison() {
+    use crate::tools::command_output_artifact::ToolOutputSelector;
 
-#[path = "handler_efficiency_benchmarks.rs"]
-mod handler_efficiency;
+    let home = tempfile::tempdir().unwrap();
+    let mut original = ToolHistoryState::default();
+    let mut items = Vec::new();
+    let source = bounded_output();
+    for index in 0..18 {
+        let id = format!("completed-{index}");
+        let canonical = CanonicalToolResult::text(source.clone());
+        let artifact = create_canonical_output_artifact(home.path(), "pressure", &canonical).await;
+        let mut entry = candidate(&id, source.clone());
+        entry.artifact_id = artifact.artifact_id().unwrap();
+        entry.artifact_bytes = canonical.exact_bytes;
+        entry.artifact_sha256 = canonical.sha256;
+        entry.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "pressure".into(),
+            ordinal: index,
+        });
+        original.register(entry);
+        original.register_non_workspace_code_mode_call(id.clone());
+        items.extend([function_call(&id), text_output(&id, source.clone())]);
+    }
+    let active = "unresolved failure: preserve this active diagnostic\n".repeat(20);
+    let mut entry = candidate("active", active.clone());
+    entry.successful = false;
+    original.register(entry);
+    items.extend([
+        function_call("active"),
+        text_output("active", active.clone()),
+    ]);
+    let receipts = original
+        .phase_checkpoint_receipts(&["completed-0".into()])
+        .unwrap();
+    items.push(ResponseItem::Message {
+        id: None,
+        role: "developer".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!(
+                "<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts":receipts})
+            ),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let items: Arc<[ResponseItem]> = items.into();
+    let mut reports = Vec::new();
+    for budget in [129_000, 96_000, 75_000, 4_000] {
+        let started = std::time::Instant::now();
+        let mut state = original.clone();
+        state.set_model_visible_tool_result_token_budget(Some(budget));
+        let projection = state.project(Arc::clone(&items));
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+        let sampling =
+            state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
+        let tokens = |items: &[ResponseItem]| {
+            items
+                .iter()
+                .filter_map(canonical_textual_output_identity)
+                .map(|(_, text)| approx_token_count(&text))
+                .sum::<usize>()
+        };
+        let mut session_input_tool_tokens = 0;
+        for count in 1..=18 {
+            let mut request = items[..count * 2].to_vec();
+            request.extend_from_slice(&items[36..]);
+            let request = state.project_sampling_with_workspace_cache(request.into(), None, &cache);
+            session_input_tool_tokens += tokens(&request.items);
+        }
+        assert!(
+            projection
+                .items
+                .contains(&text_output("active", active.clone())),
+            "budget={budget}"
+        );
+        let mut compact_receipt_tokens = 0;
+        let mut recovery_calls = 0;
+        for item in projection.items.iter() {
+            let Some((id, text)) = canonical_textual_output_identity(item) else {
+                continue;
+            };
+            if id == "active" || text == source {
+                continue;
+            }
+            compact_receipt_tokens += approx_token_count(&text);
+        }
+        // Revisit a fixed working set, recovering omitted evidence from the
+        // artifact owner instead of executing any producer again.
+        for index in 1..18 {
+            let id = format!("completed-{index}");
+            if projection.items.contains(&text_output(&id, source.clone())) {
+                continue;
+            }
+            let artifact = &state.candidates[&id].artifact_id;
+            let (recovered, _) = crate::tools::handlers::execute_recovery_transaction(
+                home.path(),
+                "pressure",
+                artifact,
+                vec![ToolOutputSelector::Lines { start: 1, end: 2 }],
+                false,
+            )
+            .await
+            .unwrap();
+            recovery_calls += 1;
+            assert!(recovered.complete);
+            assert_eq!(
+                recovered.results[0]
+                    .text
+                    .as_deref()
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                source.lines().take(2).collect::<Vec<_>>()
+            );
+        }
+        assert!(tokens(&projection.items) <= budget);
+        let report = serde_json::json!({
+            "budget": budget,
+            "model_input_tool_tokens": tokens(&sampling.items),
+            "session_input_tool_tokens": session_input_tool_tokens,
+            "compaction_input_tool_tokens": tokens(&projection.items),
+            "compact_receipt_tokens": compact_receipt_tokens,
+            "read_tool_output_recovery_calls": recovery_calls,
+            "producer_results": original.candidates.len() - 1,
+            "completion_ms": started.elapsed().as_secs_f64() * 1000.0,
+        });
+        eprintln!("tool-history-pressure {report}");
+        reports.push(report);
+    }
+    assert!(
+        reports[3]["read_tool_output_recovery_calls"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    // Ordinary sampling preserves evidence until explicit checkpointing;
+    // changing the compaction working set alone is not a sampling speedup.
+    assert_eq!(
+        reports[0]["model_input_tool_tokens"],
+        reports[2]["model_input_tool_tokens"]
+    );
+    assert!(
+        reports[0]["read_tool_output_recovery_calls"]
+            .as_u64()
+            .unwrap()
+            <= reports[2]["read_tool_output_recovery_calls"]
+                .as_u64()
+                .unwrap()
+    );
+}
 
-#[path = "tool_history_pressure_tests.rs"]
-mod pressure;
+#[test]
+fn phase_checkpoint_leaves_tiny_results_inline() {
+    let mut state = ToolHistoryState::default();
+    for text in ["ok".to_string(), "x".repeat(900), " ".repeat(2_000)] {
+        let mut tiny = candidate("tiny", text);
+        tiny.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "turn".into(),
+            ordinal: 0,
+        });
+        state.register(tiny);
+        assert_eq!(
+            state.phase_checkpoint_receipts(&["tiny".into()]).unwrap(),
+            serde_json::json!({})
+        );
+    }
+}
 
 #[tokio::test]
-async fn phase_checkpoint_retention_survives_compaction_and_reports_overflow() {
-    let home = tempfile::tempdir().unwrap();
-    let thread = "checkpoint-retention";
-    let mut state = ToolHistoryState::default();
-    let mut items = Vec::new();
-    let mut critical = String::new();
-    let mut critical_bytes = Vec::new();
-    for i in 0..40 {
-        let id = format!("source-{i:02}");
-        let source = format!("verified source {i}\n").repeat(200);
-        let (entry, exact) = stored_candidate(home.path(), thread, &id, source.clone()).await;
-        if i == 0 { critical = entry.artifact_id.clone(); critical_bytes = exact; }
-        state.register(entry);
-        items.extend([function_call(&id), text_output(&id, source)]);
+async fn checkpoint_handler_boundaries_and_retained_artifacts() {
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::handlers::ContextCheckpointHandler;
+    use crate::tools::registry::ToolExecutor;
+    use crate::tools::router::ToolCallSource;
+    use codex_tools::ToolName;
+    use serde_json::json;
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let mut active_artifact = String::new();
+    let mut completed_artifact = String::new();
+    for (id, successful, consumed) in [
+        ("done", true, true),
+        ("active", false, false),
+        ("tiny", true, true),
+        ("invalid-artifact", true, true),
+    ] {
+        let output = if id == "tiny" {
+            "ok".into()
+        } else {
+            bounded_output()
+        };
+        let canonical = CanonicalToolResult::text(output.clone());
+        let artifact = create_canonical_output_artifact(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+            &canonical,
+        )
+        .await;
+        let mut entry = candidate(id, output.clone());
+        entry.artifact_id = artifact.artifact_id().unwrap();
+        entry.artifact_bytes = canonical.exact_bytes;
+        entry.artifact_sha256 = canonical.sha256;
+        if id == "invalid-artifact" {
+            entry.artifact_sha256 = "0".repeat(64);
+        }
+        entry.successful = successful;
+        if consumed {
+            entry.consumed_by_generation = Some(ModelGenerationId {
+                turn_id: "turn".into(),
+                ordinal: 0,
+            });
+        }
+        if id == "active" {
+            active_artifact = entry.artifact_id.clone();
+        }
+        if id == "done" {
+            completed_artifact = entry.artifact_id.clone();
+        }
+        session.register_tool_history_candidate(entry).await;
+        session
+            .record_conversation_items(&turn, &[function_call(id), text_output(id, output)])
+            .await
+            .unwrap();
     }
-    state.mark_consumed(&items, ModelGenerationId {turn_id:"read".into(),ordinal:0});
-    let checkpoint = |retained: Vec<String>| ResponseItem::Message {
-        id:None,role:"developer".into(), content:vec![codex_protocol::models::ContentItem::InputText {
-            text:format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
-                serde_json::json!({"receipts":state.phase_checkpoint_receipts(&["source-39".into()]).unwrap(),"retained_evidence":retained}))
-        }],phase:None,internal_chat_message_metadata_passthrough:None,
-    };
-    let mut overflow_items = items.clone();
-    overflow_items.push(checkpoint((0..39).map(|i| format!("source-{i:02}")).collect()));
-    let overflow = state.artifact_pin_payload_for_items(&overflow_items).unwrap();
-    let overflow_value: serde_json::Value = serde_json::from_str(&overflow).unwrap();
-    assert!(overflow_value["omitted_retained_evidence_count"].as_u64().unwrap() > 0);
-    assert!(approx_token_count(&overflow) <= COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET);
-    items.push(checkpoint(vec!["source-00".into()]));
-    let pins = state.artifact_pin_payload_for_items(&items).unwrap();
-    let payload: serde_json::Value = serde_json::from_str(&pins).unwrap();
-    assert_eq!(payload["artifacts"][0]["artifact_id"], critical);
-    assert_eq!(payload["omitted_retained_evidence_count"], 0);
-    let replacement = vec![text_output("compacted", pins)];
-    state.retain_for_history(&replacement);
-    persist_tool_history_state(home.path(), thread, &state).await.unwrap();
-    let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), thread).await);
-    let next_pins = restored.artifact_pin_payload_for_items(&replacement).unwrap();
-    let next: serde_json::Value = serde_json::from_str(&next_pins).unwrap();
-    assert_eq!(next["artifacts"][0]["artifact_id"], critical);
-    assert_eq!(next["omitted_retained_evidence_count"], 0);
-    assert_eq!(read_exact_tool_output_artifact(home.path(), thread, &critical).await.unwrap(), critical_bytes);
+    for (name, completed, retained, summary, expected) in [
+        (
+            "unknown",
+            vec![String::from("unknown")],
+            vec![],
+            "".into(),
+            None,
+        ),
+        (
+            "unread-failure",
+            vec!["active".into()],
+            vec![],
+            "".into(),
+            None,
+        ),
+        (
+            "overlap",
+            vec!["done".into()],
+            vec!["done".into()],
+            "".into(),
+            None,
+        ),
+        (
+            "artifact-alias-overlap",
+            vec!["done".into()],
+            vec![completed_artifact],
+            "".into(),
+            None,
+        ),
+        (
+            "unknown-retained",
+            vec!["done".into()],
+            vec!["missing".into()],
+            "".into(),
+            None,
+        ),
+        (
+            "unrecoverable-retained",
+            vec!["done".into()],
+            vec!["invalid-artifact".into()],
+            "".into(),
+            None,
+        ),
+        (
+            "oversized",
+            vec!["done".into()],
+            vec![],
+            "x".repeat(8193),
+            None,
+        ),
+        (
+            "too-many-retained",
+            vec!["done".into()],
+            vec!["active".into(); 33],
+            "".into(),
+            None,
+        ),
+        (
+            "long-reference",
+            vec!["done".into()],
+            vec!["x".repeat(257)],
+            "".into(),
+            None,
+        ),
+        ("empty", vec![], vec![], " \n\t".into(), Some(false)),
+        ("tiny", vec!["tiny".into()], vec![], "".into(), Some(false)),
+        (
+            "valid",
+            vec!["done".into()],
+            vec![active_artifact.clone()],
+            "done, active failure remains".into(),
+            Some(true),
+        ),
+        (
+            "repeat",
+            vec!["done".into()],
+            vec!["active".into()],
+            "duplicate".into(),
+            Some(false),
+        ),
+    ] {
+        let before = session.clone_history().await.raw_items().len();
+        let payload = ToolPayload::Function { arguments:json!({"completed_call_ids":completed,"retained_evidence":retained,"summary":summary,"active_work":""}).to_string() };
+        let result = ContextCheckpointHandler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(Arc::clone(
+                    &turn,
+                )),
+                cancellation_token: Default::default(),
+                tracker: Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: name.into(),
+                tool_name: ToolName::plain("context_checkpoint"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await;
+        match expected {
+            None => assert!(result.is_err(), "{name}"),
+            Some(changed) => {
+                let value = result.unwrap().code_mode_result(&payload);
+                assert_eq!(value["changed"], changed, "{name}");
+                assert_eq!(value["checkpoint_item_persisted"], changed, "{name}");
+                assert_eq!(value["checkpointed_call_count"], usize::from(changed));
+                assert!(value.get("checkpointed_call_ids").is_none());
+            }
+        }
+        assert_eq!(
+            session.clone_history().await.raw_items().len(),
+            before + usize::from(expected == Some(true)),
+            "{name}"
+        );
+    }
+    let history = session.clone_history().await;
+    let mut state = history.tool_history_state();
+    let checkpoints = history
+        .raw_items()
+        .iter()
+        .filter(|item| phase_checkpoint_ids(item).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    state.retain_for_history(&checkpoints);
+    assert!(
+        state.checkpoint_evidence(&active_artifact).is_ok(),
+        "checkpoint pins survive canonical output removal"
+    );
+    assert_eq!(
+        read_exact_tool_output_artifact(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+            &active_artifact
+        )
+        .await
+        .unwrap(),
+        bounded_output().as_bytes()
+    );
 }
 
 #[test]
@@ -135,45 +449,6 @@ fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
     );
     assert!(projection.items.contains(&checkpoint));
     assert!(items.contains(&text_output("done", source)));
-}
-
-#[test]
-fn phase_checkpoint_never_expands_a_tiny_selected_result() {
-    // Whitespace is large in bytes but cheap in model tokens.
-    for source in ["ok".to_owned(), " ".repeat(2_000)] {
-        let mut state = ToolHistoryState::default();
-        let mut tiny = candidate("tiny", source.clone());
-        tiny.consumed_by_generation = Some(ModelGenerationId {
-            turn_id: "read".into(),
-            ordinal: 0,
-        });
-        let pin = tiny.artifact_pin_value().unwrap();
-        state.register(tiny);
-        state.register_non_workspace_code_mode_call("tiny".into());
-        if source == "ok" {
-            assert_eq!(state.phase_checkpoint_receipts(&["tiny".into()]).unwrap(), serde_json::json!({}));
-        }
-        // Replay an older checkpoint that selected a result without a savings check.
-        let checkpoint = ResponseItem::Message {
-            id: None,
-            role: "developer".into(),
-            content: vec![codex_protocol::models::ContentItem::InputText {
-                text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
-                    serde_json::json!({"receipts": {"tiny": pin}})),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let items: Arc<[ResponseItem]> = Arc::from([
-            function_call("tiny"), text_output("tiny", source), checkpoint,
-        ]);
-        assert_eq!(state.project_inner(Arc::clone(&items), None, None).items, items);
-        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-        assert_eq!(
-            state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache).items,
-            items,
-        );
-    }
 }
 
 #[test]
@@ -464,6 +739,19 @@ fn identity_projection_reuses_shared_response_items() {
 
     assert!(Arc::ptr_eq(&projection.items, &canonical));
     assert!(Arc::ptr_eq(&projection.unreplaced_items, &canonical));
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&canonical),
+        projection,
+    };
+    let continued = ToolHistoryState::default()
+        .project_continuation_with_workspace_cache(&anchor, Arc::clone(&canonical), None, &cache)
+        .expect("unchanged history is a continuation");
+    assert!(Arc::ptr_eq(&continued.items, &canonical));
+    assert!(Arc::ptr_eq(
+        &continued.substitutions,
+        &anchor.projection.substitutions
+    ));
 }
 
 #[test]
@@ -1675,9 +1963,13 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
         })
         .to_string(),
     };
-    let dependencies = source_dependencies_for_tool_call("exec_command", &explicit_pattern, cwd);
-    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join("codex-rs/core"), true)));
-    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join(".ignore"), false)));
+    assert_eq!(
+        source_dependencies_for_tool_call("exec_command", &explicit_pattern, cwd),
+        BTreeSet::from([SourceDependencyV1::new(
+            Path::new("/repo/codex-rs/core"),
+            true,
+        )])
+    );
 
     let compound = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -1687,9 +1979,13 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
         })
         .to_string(),
     };
-    let dependencies = source_dependencies_for_tool_call("exec_command", &compound, cwd);
-    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join("codex-rs/tui"), true)));
-    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join(".ignore"), false)));
+    assert_eq!(
+        source_dependencies_for_tool_call("exec_command", &compound, cwd),
+        BTreeSet::from([SourceDependencyV1::new(
+            Path::new("/repo/codex-rs/tui"),
+            true,
+        )])
+    );
 }
 
 /// Regression for the recorded sessions where `Get-Content x | Select-Object
@@ -1799,18 +2095,6 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
             "Get-Content work.log | Select-String 'FAILED'",
             BTreeSet::from([SourceDependencyV1::new(&cwd.join("work.log"), false)]),
         ));
-        for command in [
-            "Get-Content src/work.rs; Select-String -Pattern FAILED work.log",
-            "Get-Content src/work.rs; Select-String -Pattern:FAILED work.log",
-            "Get-Content src/work.rs; Select-String work.log -Pattern FAILED",
-            "Get-Content src/work.rs; Select-String FAILED work.log",
-        ] {
-            cases.push((
-                "powershell",
-                command,
-                BTreeSet::from([work.clone(), SourceDependencyV1::new(&cwd.join("work.log"), false)]),
-            ));
-        }
         cases.push((
             "powershell",
             "git diff --stat; Get-Content src/work.rs",
@@ -1840,7 +2124,6 @@ fn commands_that_may_read_anywhere_still_make_the_batch_opaque() {
     ];
     if cfg!(windows) {
         commands.push(("powershell", "Get-Content src/work.rs; cargo check --tests"));
-        commands.push(("powershell", "Get-Content src/work.rs; Select-String -Pattern -Path work.log"));
     }
     for (shell, command) in commands {
         let payload = ToolPayload::Function {
@@ -1856,7 +2139,9 @@ fn commands_that_may_read_anywhere_still_make_the_batch_opaque() {
 }
 
 #[test]
-fn tool_result_budget_scales_with_the_model_context_window() {
+fn tool_result_budget_caps_large_model_context_windows() {
+    assert_eq!(model_visible_tool_result_token_budget_for_context_window(Some(760_000)), 75_000);
+    assert_eq!(model_visible_tool_result_token_budget_for_context_window(Some(32_000)), 16_000);
     assert_eq!(
         model_visible_tool_result_token_budget_for_context_window(None),
         model_visible_tool_result_token_budget()
@@ -1867,7 +2152,7 @@ fn tool_result_budget_scales_with_the_model_context_window() {
     );
     assert_eq!(
         model_visible_tool_result_token_budget_for_context_window(Some(258_400)),
-        129_200
+        75_000
     );
 
     // A configured window budget replaces the fixed default for projection.
@@ -5019,7 +5304,7 @@ fn untracked_exposure_preserves_fresh_failures_and_late_artifact_registration() 
         ordinal: 1,
     };
     let old = text_output("seen", "old detail ".repeat(220));
-    assert!(state.mark_consumed(std::slice::from_ref(&old), generation.clone()));
+    assert!(state.mark_consumed(&[old.clone()], generation.clone()));
     let detail = format!(
         "{}\nwrite failed: permission denied",
         "diagnostic ".repeat(160)
@@ -5050,7 +5335,7 @@ fn budget_receipts_distinguish_observed_and_unread_untracked_outputs() {
     let mut state = ToolHistoryState::default();
     let old = text_output("seen", "previous observation ".repeat(2_000));
     state.mark_consumed(
-        std::slice::from_ref(&old),
+        &[old.clone()],
         ModelGenerationId {
             turn_id: "turn".into(),
             ordinal: 1,

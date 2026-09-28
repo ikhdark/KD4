@@ -8,9 +8,9 @@ rust_min_stack := "8388608" # 8 MiB
 rust_parallelism := "2" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
 cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
 export CARGO_BUILD_JOBS := cargo_build_jobs
-rust_test_threads := env_var_or_default("RUST_TEST_THREADS", "6") # Measured libtest default, independent of compiler jobs.
+rust_test_threads := env_var_or_default("RUST_TEST_THREADS", "2") # Match Cargo's libtest default.
 export RUST_TEST_THREADS := rust_test_threads
-nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", "6") # Match nextest.toml; keep compiler/libtest limits independent.
+nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", "2") # Match nextest.toml.
 export NEXTEST_TEST_THREADS := nextest_test_threads
 python := "python"
 # One reserved Cargo lane shared by every named core test target and gate, so
@@ -36,7 +36,7 @@ repo-benchmark *args:
     env.update(CARGO_PROFILE_RELEASE_OPT_LEVEL="3", CARGO_PROFILE_RELEASE_LTO="thin", CARGO_PROFILE_RELEASE_CODEGEN_UNITS="4", CARGO_PROFILE_RELEASE_INCREMENTAL="false", CARGO_INCREMENTAL="0")
     if shutil.which("sccache"):
         env["RUSTC_WRAPPER"] = shutil.which("sccache")
-    command = ["cargo", "build", "--release", "--jobs", "6", "--message-format=json-render-diagnostics", "--target-dir", "target/repo-benchmark/harness", "-p", "repo-benchmark", "--bin", "repo-benchmark"]
+    command = ["cargo", "build", "--release", "--jobs", "2", "--message-format=json-render-diagnostics", "--target-dir", "target/repo-benchmark/harness", "-p", "repo-benchmark", "--bin", "repo-benchmark"]
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True)
     executable = None
     for line in process.stdout:

@@ -401,15 +401,10 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         codex_apps_tools_cache,
         detail,
         None,
-        None,
     )
     .await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "extends the existing snapshot API with selection and reusable manager inputs"
-)]
 pub async fn collect_mcp_server_status_snapshot_for_servers_with_detail(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
@@ -418,7 +413,6 @@ pub async fn collect_mcp_server_status_snapshot_for_servers_with_detail(
     codex_apps_tools_cache: CodexAppsToolsCache,
     detail: McpSnapshotDetail,
     selected_server_names: &[String],
-    existing_manager: Option<&McpConnectionManager>,
 ) -> McpServerStatusSnapshot {
     collect_mcp_server_status_snapshot_impl(
         config,
@@ -428,15 +422,10 @@ pub async fn collect_mcp_server_status_snapshot_for_servers_with_detail(
         codex_apps_tools_cache,
         detail,
         Some(selected_server_names),
-        existing_manager,
     )
     .await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shared implementation of the snapshot API's explicit inputs"
-)]
 async fn collect_mcp_server_status_snapshot_impl(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
@@ -445,7 +434,6 @@ async fn collect_mcp_server_status_snapshot_impl(
     codex_apps_tools_cache: CodexAppsToolsCache,
     detail: McpSnapshotDetail,
     selected_server_names: Option<&[String]>,
-    existing_manager: Option<&McpConnectionManager>,
 ) -> McpServerStatusSnapshot {
     let mut mcp_servers = effective_mcp_servers(config, auth);
     if let Some(selected_server_names) = selected_server_names {
@@ -468,38 +456,17 @@ async fn collect_mcp_server_status_snapshot_impl(
         };
     }
 
-    let reusable_manager = match existing_manager {
-        Some(manager)
-            if manager
-                .can_reuse_for_status(config, auth, &runtime_context, &mcp_servers)
-                .await =>
-        {
-            Some(manager)
-        }
-        _ => None,
-    };
-    let auth_status_entries = auth::compute_auth_statuses_with_cache(
+    let auth_status_entries = compute_auth_statuses(
         mcp_servers.iter(),
         &config.codex_home,
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind,
         auth,
         &runtime_context,
-        reusable_manager.map(|manager| &manager.auth_discovery_cache),
     )
     .await;
 
     let server_names = mcp_servers.keys().cloned().collect();
-
-    if let Some(manager) = reusable_manager {
-        return collect_mcp_server_status_snapshot_from_manager(
-            manager,
-            auth_status_entries,
-            server_names,
-            detail,
-        )
-        .await;
-    }
 
     let (tx_event, rx_event) = unbounded();
     drop(rx_event);
@@ -742,17 +709,11 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     server_names: Vec<String>,
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
-    let selected = server_names
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
     let (tools, resources, resource_templates) = tokio::join!(
-        mcp_connection_manager.list_tools_for_servers(&selected),
+        mcp_connection_manager.list_all_tools(),
         async {
             if detail.include_resources() {
-                mcp_connection_manager
-                    .list_all_resources(|server| selected.contains(server))
-                    .await
+                mcp_connection_manager.list_all_resources(|_| true).await
             } else {
                 crate::McpServerCollection::default()
             }
@@ -760,21 +721,17 @@ async fn collect_mcp_server_status_snapshot_from_manager(
         async {
             if detail.include_resources() {
                 mcp_connection_manager
-                    .list_all_resource_templates(|server| selected.contains(server))
+                    .list_all_resource_templates(|_| true)
                     .await
             } else {
                 crate::McpServerCollection::default()
             }
         },
     );
-    let mut server_infos = mcp_connection_manager.list_available_server_infos().await;
-    server_infos.retain(|name, _| selected.contains(name.as_str()));
+    let server_infos = mcp_connection_manager.list_available_server_infos().await;
 
     let mut tools_by_server = HashMap::<String, HashMap<String, Tool>>::new();
     for tool_info in tools {
-        if !selected.contains(tool_info.server_name.as_str()) {
-            continue;
-        }
         let raw_tool_name = tool_info.tool.name.to_string();
         let Some(tool) = protocol_tool_from_rmcp_tool(&raw_tool_name, &tool_info.tool) else {
             continue;

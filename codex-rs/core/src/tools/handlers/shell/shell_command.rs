@@ -53,7 +53,6 @@ use super::RunExecLikeArgs;
 use super::parse_shell_command_hook_invocation;
 use super::run_exec_like;
 use super::validation_environment_hash;
-#[cfg(test)]
 use super::validation_structured_output;
 
 pub(super) fn effective_stall_timeout_ms(
@@ -382,7 +381,6 @@ impl ShellCommandHandler {
         )
         .await;
         let validation_launch = match validation_admission {
-            #[cfg(test)]
             ValidationAdmission::Skip(skipped) => {
                 if matches!(
                     skipped.skip_disposition,
@@ -396,17 +394,12 @@ impl ShellCommandHandler {
                 )));
             }
             ValidationAdmission::Execute {
-                #[cfg(test)]
                 authorization_revision,
                 is_validation,
-                #[cfg(test)]
                 classification,
-            } => is_validation.then_some(ValidationLaunchPlan {
-                #[cfg(test)]
+            } => is_validation.then(|| ValidationLaunchPlan {
                 classification,
-                #[cfg(test)]
                 authorization_revision,
-                #[cfg(test)]
                 explicitly_tagged: params.validation.is_some(),
             }),
         };
@@ -511,7 +504,6 @@ impl ShellCommandHandler {
                 observe_rg_search_scope_state_with_freshness(
                     search,
                     params.force_fresh.unwrap_or(false),
-                    &exec_params.env,
                 )
                 .await;
             }

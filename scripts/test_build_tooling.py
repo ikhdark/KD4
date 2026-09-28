@@ -731,7 +731,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             justfile,
         )
         profiles = nextest["profile"]
-        self.assertEqual(profiles["default"]["test-threads"], 6)
+        self.assertEqual(profiles["default"]["test-threads"], 2)
         self.assertEqual(profiles["local"]["inherits"], "default")
         self.assertEqual(profiles["fast"]["inherits"], "local")
 
@@ -843,21 +843,21 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(cargo_config["build"]["jobs"], 2)
         self.assertEqual(
             cargo_config["env"]["RUST_TEST_THREADS"],
-            {"value": "6", "force": False},
+            {"value": "2", "force": False},
         )
         nextest_config = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
-        self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 6)
+        self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 2)
         self.assertIn('rust_parallelism := "2"', justfile)
         self.assertIn(
             'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
             justfile,
         )
         self.assertIn(
-            'env_var_or_default("RUST_TEST_THREADS", "6")',
+            'env_var_or_default("RUST_TEST_THREADS", "2")',
             justfile,
         )
         self.assertIn(
-            'env_var_or_default("NEXTEST_TEST_THREADS", "6")',
+            'env_var_or_default("NEXTEST_TEST_THREADS", "2")',
             justfile,
         )
         self.assertIn("export CARGO_BUILD_JOBS := cargo_build_jobs", justfile)

@@ -48,7 +48,7 @@ pub struct BuildIdentity {
 /// the reported statistics -- so this is preparation cost, not a measured
 /// variable. Keep it below the host thread count so the final ThinLTO link
 /// still has memory headroom.
-const CARGO_BUILD_JOBS: &str = "12";
+const CARGO_BUILD_JOBS: &str = "2";
 
 pub fn settings(environment: &Environment) -> BTreeMap<String, String> {
     let mut settings = BTreeMap::from([

@@ -298,7 +298,7 @@ pub(crate) fn source_read_output_budget(command: &str) -> Option<usize> {
                     | "dir"
             )
         });
-    (has_source_reader && is_read_only_command(command)).then_some(25_000)
+    (has_source_reader && is_read_only_command(command)).then_some(10_000)
 }
 
 pub(crate) fn is_read_only_command(command: &str) -> bool {

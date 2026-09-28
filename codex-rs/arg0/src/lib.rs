@@ -211,12 +211,14 @@ where
     }
 }
 
-/// Creates a temporary directory with native helpers that dispatch by executable name.
+/// Creates a temporary directory with `apply_patch.bat` helpers that re-invoke
+/// this executable with the hidden `--codex-run-as-apply-patch` flag.
 ///
 /// Returns the temporary directory guard and the PATH value that prepends the
 /// temporary directory so `apply_patch` can be on the PATH without requiring the
 /// user to install a separate executable, simplifying the deployment of Codex
 /// CLI.
+/// Note: In debug builds the temp-dir guard is disabled to ease local testing.
 ///
 /// IMPORTANT: Callers must update PATH before multiple threads are spawned.
 fn prepare_path_entry_for_codex_aliases(
@@ -253,14 +255,18 @@ fn prepare_path_entry_for_codex_aliases(
 
     let lock_file = lock_session_dir(path)?;
 
-    let mut source = std::env::current_exe()?;
+    let exe = std::env::current_exe()?;
+    let exe = exe.display();
     for filename in &[APPLY_PATCH_ARG0, MISSPELLED_APPLY_PATCH_ARG0] {
-        let alias = path.join(format!("{filename}.exe"));
-        // Avoid cmd.exe reparsing Unicode paths and multiline patch arguments.
-        // Linking the next alias to the first also avoids a second cross-volume copy.
-        std::fs::hard_link(&source, &alias)
-            .or_else(|_| std::fs::copy(&source, &alias).map(|_| ()))?;
-        source = alias;
+        let batch_script = path.join(format!("{filename}.bat"));
+        std::fs::write(
+            &batch_script,
+            format!(
+                r#"@echo off
+"{exe}" {CODEX_CORE_APPLY_PATCH_ARG1} %*
+"#,
+            ),
+        )?;
     }
 
     let updated_path_env_var = path_env_with_entry(path, existing_path)?;

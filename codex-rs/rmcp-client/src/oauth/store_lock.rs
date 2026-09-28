@@ -14,8 +14,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
-use sha2::Digest;
-use sha2::Sha256;
 
 const OAUTH_LOCK_DIR: &str = "mcp-oauth-locks";
 const STORE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -27,7 +25,6 @@ const LOCK_CONTENTION_EVENT_TARGET: &str = "codex_rmcp_client::oauth::store_lock
 pub(super) enum OAuthStore {
     File,
     Secrets,
-    Refresh,
 }
 
 impl OAuthStore {
@@ -35,7 +32,6 @@ impl OAuthStore {
         match self {
             Self::File => "file-store.lock",
             Self::Secrets => "secrets-store.lock",
-            Self::Refresh => "refresh.lock",
         }
     }
 }
@@ -45,7 +41,6 @@ impl std::fmt::Display for OAuthStore {
         match self {
             Self::File => f.write_str("fallback file"),
             Self::Secrets => f.write_str("encrypted secrets"),
-            Self::Refresh => f.write_str("credential refresh"),
         }
     }
 }
@@ -66,22 +61,6 @@ impl OAuthStoreLock {
         acquire_timeout: Duration,
     ) -> Result<Self> {
         let path = oauth_store_lock_path(codex_home, store);
-        Self::acquire_path(path, store, acquire_timeout)
-    }
-
-    pub(super) fn acquire_refresh(codex_home: &Path, key: &str) -> Result<Self> {
-        // Store keys include the server name, which is not a portable filename.
-        let key = format!("{:x}", Sha256::digest(key.as_bytes()));
-        Self::acquire_path(
-            codex_home
-                .join(OAUTH_LOCK_DIR)
-                .join(format!("refresh-{key}.lock")),
-            OAuthStore::Refresh,
-            STORE_LOCK_ACQUIRE_TIMEOUT,
-        )
-    }
-
-    fn acquire_path(path: PathBuf, store: OAuthStore, acquire_timeout: Duration) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| OAuthStoreLockFailure::CreateDir {
                 store,

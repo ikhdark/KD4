@@ -34,7 +34,7 @@ pub(crate) enum UnifiedExecError {
     #[error("Command denied by sandbox: {message}")]
     SandboxDenied {
         message: String,
-        output: Box<ExecToolCallOutput>,
+        output: ExecToolCallOutput,
         raw_output_artifact: Option<RawOutputArtifact>,
     },
     #[error("{path} is not valid on {}", std::env::consts::OS)]
@@ -53,7 +53,7 @@ impl UnifiedExecError {
     pub(crate) fn sandbox_denied(message: String, output: ExecToolCallOutput) -> Self {
         Self::SandboxDenied {
             message,
-            output: Box::new(output),
+            output,
             raw_output_artifact: None,
         }
     }
@@ -65,7 +65,7 @@ impl UnifiedExecError {
     ) -> Self {
         Self::SandboxDenied {
             message,
-            output: Box::new(output),
+            output,
             raw_output_artifact,
         }
     }

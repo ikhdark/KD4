@@ -214,14 +214,16 @@ pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, s
 pub(crate) fn parse_owned_tool_input_schema(
     input_schema: JsonValue,
 ) -> Result<JsonSchema, serde_json::Error> {
-    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)
+    let mut schema = deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)?;
+    compact_large_tool_schema(&mut schema);
+    Ok(schema)
 }
 
-/// Compatibility alias: all tool schemas preserve argument-use descriptions.
+/// Parse a trusted tool `input_schema` without running large-schema compaction.
 pub fn parse_tool_input_schema_without_compaction(
     input_schema: &JsonValue,
 ) -> Result<JsonSchema, serde_json::Error> {
-    parse_tool_input_schema(input_schema)
+    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema.clone())?)
 }
 
 fn prepare_tool_input_schema(mut input_schema: JsonValue) -> Result<JsonValue, serde_json::Error> {
@@ -292,6 +294,64 @@ fn deserialize_tool_input_schema(input_schema: JsonValue) -> Result<JsonSchema, 
     Ok(schema)
 }
 
+// Use compact normalized JSON bytes as a cheap local proxy for the 1k-token
+// schema budget.
+const MAX_COMPACT_TOOL_SCHEMA_BYTES: usize = 5_000;
+
+/// Shrink unusually large tool schemas while preserving the top-level argument
+/// surface. Compaction is best-effort rather than a hard cap: it runs only
+/// after schema sanitization/pruning and removes only non-validation metadata.
+/// It is deliberately best-effort: validation keywords and reachable schema
+/// structure take precedence over the compact byte target.
+fn compact_large_tool_schema(value: &mut JsonSchema) {
+    let mut compact_bytes = compact_schema_bytes(value);
+    for pass in LARGE_SCHEMA_COMPACTION_PASSES {
+        if compact_bytes.is_some_and(|bytes| bytes <= MAX_COMPACT_TOOL_SCHEMA_BYTES) {
+            return;
+        }
+        pass(value);
+        compact_bytes = compact_schema_bytes(value);
+    }
+    if let Some(bytes) = compact_bytes
+        && bytes > MAX_COMPACT_TOOL_SCHEMA_BYTES
+    {
+        tracing::debug!(
+            compact_bytes = bytes,
+            budget_bytes = MAX_COMPACT_TOOL_SCHEMA_BYTES,
+            "tool schema exceeds best-effort compaction budget; preserving validation constraints"
+        );
+    }
+}
+
+type LargeSchemaCompactionPass = fn(&mut JsonSchema);
+
+const MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES: usize = 512;
+const SCHEMA_DESCRIPTION_TRUNCATION_MARKER: &str = " [... truncated ...]";
+const LARGE_SCHEMA_COMPACTION_PASSES: &[LargeSchemaCompactionPass] = &[
+    strip_root_schema_description,
+    truncate_long_schema_descriptions,
+];
+
+fn compact_schema_bytes(value: &JsonSchema) -> Option<usize> {
+    #[derive(Default)]
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefinitionTraversal {
     Include,
@@ -333,6 +393,47 @@ fn for_each_schema_child(
                 }
             }
         }
+    }
+}
+
+fn strip_root_schema_description(value: &mut JsonSchema) {
+    value.description = None;
+}
+
+fn truncate_long_schema_descriptions(schema: &mut JsonSchema) {
+    if let Some(description) = &mut schema.description
+        && description.len() > MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
+    {
+        let prefix_budget = MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
+            .saturating_sub(SCHEMA_DESCRIPTION_TRUNCATION_MARKER.len());
+        description.truncate(description.floor_char_boundary(prefix_budget));
+        description.push_str(SCHEMA_DESCRIPTION_TRUNCATION_MARKER);
+    }
+    for table in [
+        &mut schema.properties,
+        &mut schema.defs,
+        &mut schema.definitions,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for child in table.values_mut() {
+            truncate_long_schema_descriptions(child);
+        }
+    }
+    for variants in [&mut schema.any_of, &mut schema.one_of, &mut schema.all_of]
+        .into_iter()
+        .flatten()
+    {
+        for child in variants {
+            truncate_long_schema_descriptions(child);
+        }
+    }
+    if let Some(items) = &mut schema.items {
+        truncate_long_schema_descriptions(items);
+    }
+    if let Some(AdditionalProperties::Schema(child)) = &mut schema.additional_properties {
+        truncate_long_schema_descriptions(child);
     }
 }
 

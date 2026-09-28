@@ -15,7 +15,6 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ToolPayload;
 use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::model_token_count;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use serde::Deserialize;
 use serde::Serialize;
@@ -58,17 +57,17 @@ pub(crate) fn model_visible_tool_result_token_budget() -> usize {
     DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
 }
 
-/// Raw tool results may keep about half of the model context window. The
-/// fixed default applies only while the window is unknown; a 75k working set
-/// inside a 258k window evicted evidence read a few generations earlier while
-/// most of the window stayed empty, so the model re-read the same files.
+/// Retain a useful working set without scaling replay cost indefinitely with
+/// larger model windows. Small windows still reserve half for other context.
 pub(crate) fn model_visible_tool_result_token_budget_for_context_window(
     context_window: Option<i64>,
 ) -> usize {
     context_window
         .and_then(|window| usize::try_from(window).ok())
         .filter(|window| *window > 0)
-        .map_or_else(model_visible_tool_result_token_budget, |window| window / 2)
+        .map_or_else(model_visible_tool_result_token_budget, |window| {
+            (window / 2).min(model_visible_tool_result_token_budget())
+        })
 }
 
 /// Restores the previous test budget when dropped.
@@ -346,6 +345,14 @@ impl ToolHistoryCandidate {
         let rendered = serde_json::to_string(&self.artifact_pin_value()?).ok()?;
         let tokens = approx_token_count(&rendered);
         Some((rendered, tokens))
+    }
+
+    fn checkpoint_pin(&self) -> Option<(String, usize)> {
+        self.render_receipt(true, true)?;
+        let pin = self.artifact_pin()?;
+        let original = codex_utils_output_truncation::model_token_count(&self.bounded_model_output);
+        let replacement = codex_utils_output_truncation::model_token_count(&pin.0);
+        (original > replacement).then_some(pin)
     }
 
     #[cfg(test)]
@@ -848,16 +855,7 @@ impl ToolHistoryMutation {
     }
 }
 
-fn smaller_checkpoint_output(item: &ResponseItem, pin: &str) -> Option<ResponseItem> {
-    let mut replacement = item.clone();
-    let (_, body) = textual_output_body_mut(&mut replacement)?;
-    replace_model_visible_output_text(body, pin.to_owned());
-    let original = serde_json::to_string(item).ok()?;
-    let projected = serde_json::to_string(&replacement).ok()?;
-    (model_token_count(&projected) < model_token_count(&original)).then_some(replacement)
-}
-
-fn phase_checkpoint_value(item: &ResponseItem) -> Option<serde_json::Value> {
+pub(crate) fn phase_checkpoint_ids(item: &ResponseItem) -> Option<Vec<String>> {
     let ResponseItem::Message { role, content, .. } = item else {
         return None;
     };
@@ -872,171 +870,66 @@ fn phase_checkpoint_value(item: &ResponseItem) -> Option<serde_json::Value> {
             .strip_prefix("<completed_phase_checkpoint>\n")?
             .strip_suffix("\n</completed_phase_checkpoint>")?;
         let value: serde_json::Value = serde_json::from_str(body).ok()?;
-        value["receipts"].as_object()?;
-        Some(value)
-    })
-}
-
-fn phase_checkpoint_ids(item: &ResponseItem) -> Option<Vec<String>> {
-    Some(
-        phase_checkpoint_value(item)?["receipts"]
-            .as_object()?
-            .keys()
-            .cloned()
-            .collect(),
-    )
-}
-
-pub(crate) struct PhaseCheckpointSelection {
-    pub(crate) call_ids: Vec<String>,
-    pub(crate) receipts: serde_json::Value,
-    pub(crate) retained_artifacts: Vec<(String, u64, String)>,
-    original_tokens: usize,
-    replacement_tokens: usize,
-}
-
-impl PhaseCheckpointSelection {
-    pub(crate) fn saves_tokens(&self, overhead_tokens: usize) -> bool {
-        let saved = self
-            .original_tokens
-            .saturating_sub(self.replacement_tokens.saturating_add(overhead_tokens));
-        saved >= MINIMUM_SAVED_TOKENS as usize
-            && saved.saturating_mul(100)
-                >= self
-                    .original_tokens
-                    .saturating_mul(MINIMUM_RELATIVE_SAVINGS_PERCENT as usize)
-    }
-}
-
-fn workspace_invalidation_key(notice: &serde_json::Value) -> Option<(String, String)> {
-    if !notice.get("stale_workspace_evidence")?.as_bool()? {
-        return None;
-    }
-    let call_id = notice.get("call_id")?.as_str()?;
-    // Freshness explanations can change after unrelated edits. Authentication
-    // failures and the surviving nested evidence are materially different facts.
-    let reason = notice.get("reason_code")?.as_str()?;
-    let authentication = match reason {
-        "source_dependencies_invalidated"
-        | "workspace_identity_unavailable"
-        | "workspace_identity_changed"
-        | "workspace_freshness_unverified" => "captured_output",
-        _ => reason,
-    };
-    Some((
-        call_id.to_string(),
-        serde_json::json!({
-            "authentication": authentication,
-            "valid_for_current_workspace": notice.get("valid_for_current_workspace")?,
-            "current_nested_results": notice.get("current_nested_results"),
-        })
-        .to_string(),
-    ))
-}
-
-fn workspace_invalidation_key_from_item(item: &ResponseItem) -> Option<(String, String)> {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return None;
-    };
-    if role != "developer" {
-        return None;
-    }
-    content.iter().find_map(|part| {
-        let codex_protocol::models::ContentItem::InputText { text } = part else {
-            return None;
-        };
-        let body = text
-            .strip_prefix("<workspace_evidence_invalidation>\n")?
-            .strip_suffix("\n</workspace_evidence_invalidation>")?;
-        let (_, json) = body.rsplit_once('\n')?;
-        workspace_invalidation_key(&serde_json::from_str::<serde_json::Value>(json).ok()?)
+        Some(value["receipts"].as_object()?.keys().cloned().collect())
     })
 }
 
 impl ToolHistoryState {
-    pub(crate) fn select_phase_checkpoint(
+    pub(crate) fn retained_checkpoint_reference(
         &self,
-        items: &[ResponseItem],
-        requested: &[String],
-        retained: &[String],
-    ) -> Result<PhaseCheckpointSelection, String> {
-        let mut retained_artifacts = Vec::new();
-        if !retained.is_empty() {
-            let references = self.artifact_reference_positions(items);
-            for id in retained {
-                if !references.contains_key(id)
-                    || self
-                        .candidates
-                        .get(id)
-                        .and_then(ToolHistoryCandidate::artifact_pin_value)
-                        .is_none()
-                {
-                    return Err(format!(
-                        "retained evidence {id} has no complete recovery artifact in current history"
-                    ));
-                }
-                let candidate = &self.candidates[id];
-                retained_artifacts.push((
-                    candidate.artifact_id.clone(),
-                    candidate.artifact_bytes,
-                    candidate.artifact_sha256.clone(),
-                ));
-            }
-        }
-        let retired = items
-            .iter()
-            .filter_map(phase_checkpoint_ids)
-            .flatten()
-            .collect::<BTreeSet<_>>();
-        let mut seen = BTreeSet::new();
-        let mut call_ids = requested
-            .iter()
-            .filter(|id| !retired.contains(*id) && seen.insert((*id).clone()))
-            .cloned()
-            .collect::<Vec<_>>();
-        let receipts = self.phase_checkpoint_receipts(&call_ids)?;
-        call_ids.retain(|id| receipts.get(id).is_some());
-        let outputs = items
-            .iter()
-            .filter_map(|item| output_call_id(item).map(|id| (id, item)))
-            .collect::<BTreeMap<_, _>>();
-        let mut original_tokens = 0usize;
-        let mut replacement_tokens = 0usize;
-        for id in &call_ids {
-            let candidate = &self.candidates[id];
-            let item = outputs
-                .get(id.as_str())
-                .ok_or_else(|| format!("{id} is not a visible tool result"))?;
-            let (_, text) = canonical_textual_output_identity(item)
-                .ok_or_else(|| format!("{id} is not a textual tool result"))?;
-            if non_text_output_token_cost(item) != 0
-                || sha256(text.as_bytes()) != candidate.derived.bounded_model_output_sha256
-            {
-                return Err(format!(
-                    "{id} is not a retireable textual result; retain its current representation"
-                ));
-            }
-            let mut replacement = (*item).clone();
-            let (_, body) = textual_output_body_mut(&mut replacement)
-                .ok_or_else(|| format!("{id} is not a textual tool result"))?;
-            let pin = candidate
-                .artifact_pin()
-                .ok_or_else(|| format!("{id} has no complete recovery artifact"))?;
-            replace_model_visible_output_text(body, pin.0);
-            original_tokens = original_tokens.saturating_add(model_token_count(
-                &serde_json::to_string(item).map_err(|e| e.to_string())?,
-            ));
-            replacement_tokens = replacement_tokens.saturating_add(model_token_count(
-                &serde_json::to_string(&replacement).map_err(|e| e.to_string())?,
+        reference: &str,
+    ) -> Result<(String, serde_json::Value), String> {
+        if let Some((call_id, bytes, sha256)) = self.internal_artifact_origins.get(reference) {
+            return Ok((
+                call_id.clone(),
+                serde_json::json!({
+                    "version": 1, "kind": "tool_history_artifact_pin",
+                    "artifact_id": reference, "bytes": bytes, "sha256": sha256,
+                }),
             ));
         }
-        Ok(PhaseCheckpointSelection {
-            call_ids,
-            receipts,
-            retained_artifacts,
-            original_tokens,
-            replacement_tokens,
-        })
+        let candidate = self.checkpoint_evidence(reference)?;
+        Ok((
+            candidate.call_id.clone(),
+            serde_json::json!({
+                "version": 1, "kind": "tool_history_artifact_pin",
+                "artifact_id": candidate.artifact_id, "bytes": candidate.artifact_bytes, "sha256": candidate.artifact_sha256,
+            }),
+        ))
+    }
+
+    pub(crate) fn checkpoint_evidence(
+        &self,
+        reference: &str,
+    ) -> Result<&ToolHistoryCandidate, String> {
+        let candidate = self
+            .candidates
+            .get(reference)
+            .or_else(|| {
+                self.artifact_call_ids
+                    .get(reference)
+                    .and_then(|id| self.candidates.get(id))
+            })
+            .ok_or_else(|| format!("unknown tool evidence {reference}"))?;
+        if !candidate.complete || !candidate.projection_eligible {
+            return Err(format!("{reference} has no complete recovery artifact"));
+        }
+        Ok(candidate)
+    }
+
+    pub(crate) fn checkpoint_savings(&self, receipts: &serde_json::Value) -> usize {
+        receipts
+            .as_object()
+            .into_iter()
+            .flat_map(|receipts| receipts.keys())
+            .filter_map(|id| self.candidates.get(id))
+            .filter_map(|candidate| {
+                candidate.checkpoint_pin().map(|(pin, _)| {
+                    codex_utils_output_truncation::model_token_count(&candidate.bounded_model_output)
+                        .saturating_sub(codex_utils_output_truncation::model_token_count(&pin))
+                })
+            })
+            .sum()
     }
 
     pub(crate) fn phase_checkpoint_receipts(
@@ -1057,17 +950,11 @@ impl ToolHistoryState {
             let mut receipt = candidate
                 .artifact_pin_value()
                 .ok_or_else(|| format!("{id} has no complete recovery artifact"))?;
-            // Apply ordinary receipt admission before charging checkpoint-wide
-            // overhead. A large neighbor must not subsidize a growing tiny result.
-            if candidate.render_receipt(true, true).is_none()
-                || candidate.artifact_pin().is_none_or(|(_, tokens)| {
-                    tokens as u64 >= candidate.derived.bounded_model_output_tokens
-                })
-            {
-                continue;
-            }
             if let Some(fields) = receipt.as_object_mut() {
                 fields.remove("digest");
+            }
+            if candidate.checkpoint_pin().is_none() {
+                continue;
             }
             receipts.insert(id.clone(), receipt);
         }
@@ -1078,14 +965,6 @@ impl ToolHistoryState {
         items
             .iter()
             .any(|item| phase_checkpoint_ids(item).is_some())
-    }
-
-    pub(crate) fn checkpointed_call_ids(items: &[ResponseItem]) -> BTreeSet<String> {
-        items
-            .iter()
-            .filter_map(phase_checkpoint_ids)
-            .flatten()
-            .collect()
     }
 
     fn is_persisted_empty(&self) -> bool {
@@ -1435,6 +1314,7 @@ impl ToolHistoryState {
         self.project_inner(items, Some(workspace_identity), None)
     }
 
+    #[cfg(test)]
     pub(crate) fn project_with_workspace_cache(
         &self,
         items: Arc<[ResponseItem]>,
@@ -1499,11 +1379,11 @@ impl ToolHistoryState {
             {
                 continue;
             }
-            let Some((pin, _)) = candidate.artifact_pin() else {
+            let Some((pin, _)) = candidate.checkpoint_pin() else {
                 continue;
             };
-            if let Some(replacement) = smaller_checkpoint_output(item, &pin) {
-                checkpointed.make_owned()[index] = replacement;
+            if let Some((_, body)) = textual_output_body_mut(&mut checkpointed.make_owned()[index]) {
+                replace_model_visible_output_text(body, pin);
             }
         }
         let checkpointed = checkpointed.into_shared();
@@ -1545,10 +1425,10 @@ impl ToolHistoryState {
             workspace_identity,
             Some(git_workspace),
         );
-        let mut invalidations = base
-            .iter()
-            .filter_map(workspace_invalidation_key_from_item)
-            .collect::<BTreeMap<_, _>>();
+        let checked = checked.into_shared();
+        if Arc::ptr_eq(canonical, &checked) {
+            return base;
+        }
         let mut result = ProjectedResponseItems::Shared(base);
         for (original, checked) in canonical.iter().zip(checked.iter()) {
             if original == checked {
@@ -1580,13 +1460,6 @@ impl ToolHistoryState {
                     }
                 }
             }
-            if let Some((call_id, key)) = workspace_invalidation_key(&notice)
-                && invalidations
-                    .insert(call_id, key.clone())
-                    .is_some_and(|previous| previous == key)
-            {
-                continue;
-            }
             let notice = ResponseItem::Message {
                 id: None,
                 role: "developer".to_string(),
@@ -1598,7 +1471,9 @@ impl ToolHistoryState {
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
             };
-            result.make_owned().push(notice);
+            if !result.iter().any(|item| item == &notice) {
+                result.make_owned().push(notice);
+            }
         }
         result.into_shared()
     }
@@ -1624,8 +1499,9 @@ impl ToolHistoryState {
         git_workspace: &GitWorkspaceCache,
     ) -> Option<ToolHistoryProjection> {
         let anchored_len = anchor.prepared_items.len();
-        if prepared_items.len() < anchored_len
-            || prepared_items[..anchored_len] != anchor.prepared_items[..]
+        if !Arc::ptr_eq(&prepared_items, &anchor.prepared_items)
+            && (prepared_items.len() < anchored_len
+                || prepared_items[..anchored_len] != anchor.prepared_items[..])
         {
             return None;
         }
@@ -1634,11 +1510,16 @@ impl ToolHistoryState {
             return None;
         }
         let extend = |base: &Arc<[ResponseItem]>| -> Arc<[ResponseItem]> {
-            let mut items = Vec::with_capacity(base.len().saturating_add(tail.len()));
-            items.extend(base.iter().cloned());
-            items.extend(tail.iter().cloned());
+            let items = if tail.is_empty() {
+                Arc::clone(base)
+            } else {
+                let mut items = Vec::with_capacity(base.len().saturating_add(tail.len()));
+                items.extend(base.iter().cloned());
+                items.extend(tail.iter().cloned());
+                items.into()
+            };
             self.append_workspace_freshness_notices(
-                items.into(),
+                items,
                 &prepared_items,
                 workspace_identity,
                 git_workspace,
@@ -1653,27 +1534,12 @@ impl ToolHistoryState {
         } else {
             extend(&anchor.projection.unreplaced_items)
         };
-        // Indices are stable because nothing before the tail was removed; a
-        // substitution only lapses when a freshness notice replaced its receipt.
-        let substitutions = anchor
-            .projection
-            .substitutions
-            .iter()
-            .filter(|substitution| {
-                items
-                    .get(substitution.item_index)
-                    .and_then(canonical_textual_output_identity)
-                    .is_some_and(|(call_id, output)| {
-                        call_id == substitution.call_id
-                            && sha256(output.as_bytes()) == substitution.substituted_output_sha256
-                    })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        // This path only appends items and freshness notices. The anchored
+        // receipts and their indices are unchanged, so retain their proven hashes.
         Some(ToolHistoryProjection {
             items,
             unreplaced_items,
-            substitutions: Arc::from(substitutions),
+            substitutions: Arc::clone(&anchor.projection.substitutions),
             // No budget ran, so the attribution of the anchored request carries
             // forward unchanged, as it does for cached prepared-history appends.
             items_budget_drops: anchor.projection.items_budget_drops,
@@ -1682,7 +1548,15 @@ impl ToolHistoryState {
     }
 
     pub(crate) fn requires_workspace_evidence_validation(&self, items: &[ResponseItem]) -> bool {
-        !self.workspace_evidence_requirements(items).is_empty()
+        // Registered evidence already proves that a scan is needed. Avoid parsing
+        // every historical shell command merely to rediscover that fact.
+        items.iter().any(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => {
+                self.workspace_evidence.contains_key(call_id)
+            }
+            _ => false,
+        }) || !self.workspace_evidence_requirements(items).is_empty()
     }
 
     fn project_inner(
@@ -1717,6 +1591,11 @@ impl ToolHistoryState {
             .collect::<BTreeMap<_, _>>();
         let exposed_output_sha256 = projected
             .iter()
+            // Only registered candidates participate in substitution/supersession.
+            // Leave unrelated outputs untouched without copying and hashing them.
+            .filter(|item| {
+                item_call_id(item).is_some_and(|call_id| self.candidates.contains_key(call_id))
+            })
             .filter_map(canonical_textual_output_identity)
             .map(|(call_id, output)| (call_id.to_string(), sha256(output.as_bytes())))
             .collect::<BTreeMap<_, _>>();
@@ -2053,10 +1932,8 @@ impl ToolHistoryState {
                 && candidate.successful
                 && candidate.consumed_by_generation.is_some()
                 && let Some((text, tokens)) = artifact_pin
-                && *tokens < raw_tokens
                 && *tokens <= remaining_tokens
                 && non_text_tokens == 0
-                && smaller_checkpoint_output(&projected[item_index], text).is_some()
             {
                 remaining_tokens = remaining_tokens.saturating_sub(*tokens);
                 AdmissionDecision {
@@ -2436,14 +2313,15 @@ impl ToolHistoryState {
                 *reserved = reserved.saturating_sub(minimum_cost);
             }
             let available = remaining.saturating_sub(reserved.unwrap_or(0));
-            if cost > available
-                && newest_unconsumed_image.as_ref() != Some(&call_id)
-                && let Some((receipt, receipt_cost)) = receipt
-                && receipt_cost <= available
-                && let Some((_, body)) = textual_output_body_mut(&mut items.make_owned()[index.0])
-            {
-                replace_model_visible_output_text(body, receipt);
-                cost = receipt_cost;
+            if cost > available && newest_unconsumed_image.as_ref() != Some(&call_id) {
+                if let Some((receipt, receipt_cost)) = receipt
+                    && receipt_cost <= available
+                    && let Some((_, body)) =
+                        textual_output_body_mut(&mut items.make_owned()[index.0])
+                {
+                    replace_model_visible_output_text(body, receipt);
+                    cost = receipt_cost;
+                }
             }
             if cost <= remaining || newest_unconsumed_image.as_ref() == Some(&call_id) {
                 remaining = remaining.saturating_sub(cost);
@@ -2720,7 +2598,7 @@ impl ToolHistoryState {
         // A missing observation in an older ledger does not prove that an
         // artifact was independent of workspace contents. Retained original
         // arguments can still prove the current known-writer/history cases.
-        let non_workspace_command_origins = items
+        let calls = items
             .iter()
             .filter_map(|item| match item {
                 ResponseItem::FunctionCall {
@@ -2734,31 +2612,23 @@ impl ToolHistoryState {
                     input: arguments,
                     call_id,
                     ..
-                } if tool_observes_workspace(name)
-                    && !tool_call_observes_workspace_parts(name, arguments) =>
-                {
-                    Some(call_id.as_str())
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let mut requirements = BTreeMap::<String, String>::new();
-        for item in items.iter() {
-            let (name, arguments, call_id) = match item {
-                ResponseItem::FunctionCall {
+                } => Some((
                     name,
                     arguments,
                     call_id,
-                    ..
-                } => (name, arguments, call_id),
-                ResponseItem::CustomToolCall {
-                    name,
-                    input,
-                    call_id,
-                    ..
-                } => (name, input, call_id),
-                _ => continue,
-            };
+                    self.workspace_evidence.contains_key(call_id)
+                        || tool_call_observes_workspace_parts(name, arguments),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let non_workspace_command_origins = calls
+            .iter()
+            .filter(|(name, _, _, observes)| tool_observes_workspace(name) && !observes)
+            .map(|(_, _, call_id, _)| call_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut requirements = BTreeMap::<String, String>::new();
+        for &(name, arguments, call_id, observes_workspace) in &calls {
             // Code-mode's `functions.exec` carrier can contain repository
             // reads even though the carrier itself is not a host executable.
             // Explicitly registered evidence is authoritative for any other
@@ -2766,8 +2636,7 @@ impl ToolHistoryState {
             let code_mode_workspace_state_unknown = name == "functions.exec"
                 && !self.non_workspace_code_mode_calls.contains(call_id)
                 && !self.workspace_evidence.contains_key(call_id);
-            let call_observes_workspace = code_mode_workspace_state_unknown
-                || tool_call_observes_workspace_parts(name, arguments);
+            let call_observes_workspace = code_mode_workspace_state_unknown || observes_workspace;
             if call_observes_workspace || self.workspace_evidence.contains_key(call_id) {
                 requirements.insert(call_id.clone(), call_id.clone());
                 continue;
@@ -2938,40 +2807,13 @@ impl ToolHistoryState {
     /// prompt. Compaction appends this separately from model-authored prose so retention does not
     /// depend on the model copying a receipt byte-for-byte into its summary.
     pub(crate) fn artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<String> {
-        let mut retained = BTreeSet::new();
-        for item in items {
-            if let Some(checkpoint) = phase_checkpoint_value(item) {
-                if let Some(ids) = checkpoint["retained_evidence"].as_array() {
-                    retained.extend(ids.iter().filter_map(|id| id.as_str().map(str::to_owned)));
-                }
-                for id in checkpoint["receipts"].as_object()?.keys() {
-                    retained.remove(id);
-                }
-            }
-            // Carry priority through compaction using the existing authenticated
-            // artifact pins, rather than relying on a model copying working notes.
-            if let Ok(value) = serde_json::to_value(item) {
-                visit_artifact_reference_objects(&value, &mut |value, object| {
-                    if object.get("retained_evidence") == Some(&serde_json::Value::Bool(true))
-                        && let Some(id) = object.get("call_id").and_then(serde_json::Value::as_str)
-                        && let Some(candidate) = self.candidates.get(id)
-                        && json_object_matches_artifact_reference(value, object, candidate)
-                    {
-                        retained.insert(id.to_string());
-                    }
-                });
-            }
-        }
         let mut candidates = self
             .artifact_reference_positions(items)
             .into_iter()
             .filter_map(|(call_id, index)| {
-                self.candidates.get(&call_id).map(|candidate| {
-                    (
-                        (!retained.contains(&call_id), std::cmp::Reverse(index)),
-                        candidate,
-                    )
-                })
+                self.candidates
+                    .get(&call_id)
+                    .map(|candidate| (std::cmp::Reverse(index), candidate))
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(index, _)| *index);
@@ -2979,14 +2821,7 @@ impl ToolHistoryState {
         let mut pins = candidates
             .into_iter()
             .filter(|(_, candidate)| seen.insert(candidate.artifact_id.clone()))
-            .filter_map(|(_, candidate)| {
-                let mut pin = candidate.artifact_pin_value()?;
-                if retained.contains(&candidate.call_id) {
-                    pin["retained_evidence"] = serde_json::Value::Bool(true);
-                    pin["call_id"] = serde_json::Value::String(candidate.call_id.clone());
-                }
-                Some(pin)
-            })
+            .filter_map(|(_, candidate)| candidate.artifact_pin_value())
             .collect::<Vec<_>>();
         let serialized = serde_json::to_string(items).ok()?;
         pins.extend(
@@ -3000,7 +2835,7 @@ impl ToolHistoryState {
                 }),
         );
         let total = pins.len();
-        if total == 0 && retained.is_empty() {
+        if total == 0 {
             return None;
         }
         let mut payload = serde_json::json!({
@@ -3010,9 +2845,6 @@ impl ToolHistoryState {
             "omitted_artifact_count": total,
             "artifacts": [],
         });
-        if !retained.is_empty() {
-            payload["omitted_retained_evidence_count"] = serde_json::json!(retained.len());
-        }
         // Charge the serialized envelope as well as the pins. Do not truncate JSON or a
         // recovery handle, and prefer the newest references rather than call-id ordering.
         for mut pin in pins.into_iter().take(COMPACTION_ARTIFACT_PIN_MAX_ITEMS) {
@@ -3029,17 +2861,6 @@ impl ToolHistoryState {
         }
         payload["omitted_artifact_count"] =
             serde_json::json!(total - payload["artifacts"].as_array()?.len());
-        if !retained.is_empty() {
-            payload["omitted_retained_evidence_count"] = serde_json::json!(
-                retained.len().saturating_sub(
-                    payload["artifacts"]
-                        .as_array()?
-                        .iter()
-                        .filter(|pin| pin["retained_evidence"] == true)
-                        .count(),
-                )
-            );
-        }
         serde_json::to_string(&payload).ok()
     }
 
@@ -4007,6 +3828,9 @@ fn visit_artifact_reference_objects(
 ) {
     match value {
         serde_json::Value::String(text) => {
+            let text = text.strip_prefix("<completed_phase_checkpoint>\n")
+                .and_then(|text| text.strip_suffix("\n</completed_phase_checkpoint>"))
+                .unwrap_or(text);
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
                 visit_artifact_reference_objects(&value, visit);
             }
@@ -4262,12 +4086,12 @@ fn receipt_id_for(
 fn admission_priority(candidate: &ToolHistoryCandidate, output: &str) -> u8 {
     if !candidate.successful {
         0
-    } else if candidate.semantic_class.contains("validation")
-        || matches!(
-            candidate.semantic_class.as_str(),
-            "tool_failure" | "tool_timeout"
-        )
-        || output.contains("\"outcome\":\"failure\"")
+    } else if candidate.semantic_class.contains("validation") {
+        1
+    } else if matches!(
+        candidate.semantic_class.as_str(),
+        "tool_failure" | "tool_timeout"
+    ) || output.contains("\"outcome\":\"failure\"")
         || output.contains("\"outcome\":\"timeout\"")
         || output.contains("\"outcome\":\"timed_out\"")
     {
@@ -4550,37 +4374,10 @@ pub(crate) struct WorkspaceCallClassification {
     pub(crate) source_dependencies: BTreeSet<SourceDependencyV1>,
 }
 
-#[cfg(test)]
 pub(crate) fn classify_workspace_tool_call(
     tool_identity: &str,
     payload: &ToolPayload,
     default_cwd: &Path,
-) -> WorkspaceCallClassification {
-    classify_workspace_arguments(
-        tool_identity,
-        workspace_call_arguments(payload).as_ref(),
-        default_cwd,
-        None,
-    )
-}
-
-pub(crate) fn classify_workspace_tool_call_in_environments(
-    tool_identity: &str,
-    payload: &ToolPayload,
-    default_cwd: &Path,
-    environments: Option<&crate::environment_selection::TurnEnvironmentSnapshot>,
-) -> WorkspaceCallClassification {
-    let arguments = tool_observes_workspace(tool_identity)
-        .then(|| workspace_call_arguments(payload))
-        .flatten();
-    classify_workspace_arguments(tool_identity, arguments.as_ref(), default_cwd, environments)
-}
-
-fn classify_workspace_arguments(
-    tool_identity: &str,
-    arguments: Option<&serde_json::Value>,
-    default_cwd: &Path,
-    environments: Option<&crate::environment_selection::TurnEnvironmentSnapshot>,
 ) -> WorkspaceCallClassification {
     if !tool_observes_workspace(tool_identity) {
         return WorkspaceCallClassification {
@@ -4589,56 +4386,15 @@ fn classify_workspace_arguments(
             source_dependencies: BTreeSet::new(),
         };
     }
-    let observes_workspace = workspace_call_observes_from_arguments(tool_identity, arguments);
-    let mut workspace_cwd = arguments.map_or_else(
+    let arguments = workspace_call_arguments(payload);
+    let observes_workspace =
+        workspace_call_observes_from_arguments(tool_identity, arguments.as_ref());
+    let workspace_cwd = arguments.as_ref().map_or_else(
         || default_cwd.to_path_buf(),
         |arguments| workspace_cwd_from_arguments(arguments, default_cwd),
     );
-    let mut file_environment_resolved = false;
-    if observes_workspace
-        && matches!(tool_identity, "read_file" | "list_files")
-        && let Some(environments) = environments
-    {
-        // Resolve before baseline capture, using the same selection as the handler.
-        // A remote, starting, or unknown environment cannot supply local watcher proof.
-        let resolved_cwd = arguments.and_then(|arguments| {
-            let environment_id = match arguments.get("environment_id") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(id)) => Some(id.as_str()),
-                _ => return None,
-            };
-            let environment =
-                crate::tools::handlers::resolve_tool_environment(environments, environment_id)
-                    .ok()??;
-            if environment.environment.is_remote()
-                || environment.cwd().infer_path_convention()
-                    != Some(codex_utils_path_uri::PathConvention::native())
-            {
-                return None;
-            }
-            environment
-                .cwd()
-                .to_abs_path()
-                .ok()
-                .map(|cwd| cwd.to_path_buf())
-        });
-        let Some(resolved_cwd) = resolved_cwd else {
-            return WorkspaceCallClassification {
-                observes_workspace,
-                workspace_cwd,
-                source_dependencies: BTreeSet::new(),
-            };
-        };
-        workspace_cwd = resolved_cwd;
-        file_environment_resolved = true;
-    }
-    let source_dependencies = arguments.map_or_else(BTreeSet::new, |arguments| {
-        source_dependencies_from_arguments(
-            tool_identity,
-            arguments,
-            &workspace_cwd,
-            file_environment_resolved,
-        )
+    let source_dependencies = arguments.as_ref().map_or_else(BTreeSet::new, |arguments| {
+        source_dependencies_from_arguments(tool_identity, arguments, &workspace_cwd)
     });
     WorkspaceCallClassification {
         observes_workspace,
@@ -4708,7 +4464,6 @@ pub(crate) fn source_dependencies_for_tool_call(
         payload,
         None,
         default_cwd,
-        None,
     )
 }
 
@@ -4717,7 +4472,6 @@ pub(crate) fn source_dependencies_for_tool_call_with_parsed_arguments(
     payload: &ToolPayload,
     parsed_arguments: Option<&serde_json::Value>,
     default_cwd: &Path,
-    environments: Option<&crate::environment_selection::TurnEnvironmentSnapshot>,
 ) -> BTreeSet<SourceDependencyV1> {
     if !tool_observes_workspace(tool_identity) {
         return BTreeSet::new();
@@ -4730,15 +4484,14 @@ pub(crate) fn source_dependencies_for_tool_call_with_parsed_arguments(
     let Some(arguments) = arguments else {
         return BTreeSet::new();
     };
-    classify_workspace_arguments(tool_identity, Some(arguments), default_cwd, environments)
-        .source_dependencies
+    let cwd = workspace_cwd_from_arguments(arguments, default_cwd);
+    source_dependencies_from_arguments(tool_identity, arguments, &cwd)
 }
 
 fn source_dependencies_from_arguments(
     tool_identity: &str,
     arguments: &serde_json::Value,
     cwd: &Path,
-    file_environment_resolved: bool,
 ) -> BTreeSet<SourceDependencyV1> {
     if matches!(tool_identity, "read_file" | "list_files") {
         let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
@@ -4747,11 +4500,11 @@ fn source_dependencies_from_arguments(
         if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX) {
             return BTreeSet::new();
         }
-        // Context-free callers cannot prove which filesystem an explicit ID selects.
-        if !file_environment_resolved
-            && arguments
-                .get("environment_id")
-                .is_some_and(|id| !id.is_null())
+        // A selected environment can have a different cwd or path convention.
+        // Keep its evidence conservative until classification has that context.
+        if arguments
+            .get("environment_id")
+            .is_some_and(|id| !id.is_null())
         {
             return BTreeSet::new();
         }
@@ -5606,13 +5359,12 @@ fn plain_command_source_dependencies(
     let arguments = &command[1..];
     let powershell = matches!(shell_type, Some(crate::shell::ShellType::PowerShell));
     if matches!(program.as_str(), "rg" | "rga" | "ripgrep") {
-        return match crate::tools::handlers::command_search::rg_search_source_paths(command, cwd) {
-            Some(paths) => PlainCommandDependencies::Scoped(
-                paths
-                    .into_iter()
-                    .map(|(path, recursive)| SourceDependencyV1::new(&path, recursive))
-                    .collect(),
-            ),
+        return match crate::tools::handlers::command_search::rg_search_path_operands(
+            &commands[index..=index],
+        ) {
+            Some(scopes) => {
+                PlainCommandDependencies::Scoped(dependencies_for_search_scopes(scopes, cwd))
+            }
             // `rg --version` and other non-search invocations read nothing.
             None => PlainCommandDependencies::Transparent,
         };
@@ -5862,10 +5614,7 @@ fn powershell_path_operands(
     ];
     let mut paths = Vec::new();
     let mut expecting = None::<bool>;
-    let mut positional_skipped = positional_pattern
-        && arguments
-            .iter()
-            .any(|arg| arg.eq_ignore_ascii_case("-pattern"));
+    let mut positional_skipped = false;
     for argument in arguments {
         if let Some(is_path) = expecting.take() {
             if is_path {
@@ -5878,12 +5627,6 @@ fn powershell_path_operands(
         }
         let lower = argument.to_ascii_lowercase();
         if argument.starts_with('-') && !argument.starts_with("--") {
-            if lower.starts_with("-pattern:")
-                || lower.starts_with("-path:")
-                || lower.starts_with("-literalpath:")
-            {
-                return None;
-            }
             if matches!(lower.as_str(), "-path" | "-literalpath" | "-lp") {
                 expecting = Some(true);
             } else if value_parameters.contains(&lower.as_str())
@@ -5912,9 +5655,7 @@ fn literal_path_dependencies(
     paths: Option<Vec<String>>,
     cwd: &Path,
 ) -> Option<PlainCommandDependencies> {
-    let Some(paths) = paths else {
-        return Some(PlainCommandDependencies::Unknown);
-    };
+    let paths = paths?;
     if paths.is_empty() {
         return None;
     }

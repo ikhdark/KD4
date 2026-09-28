@@ -189,28 +189,3 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
 
     assert_eq!(error, "code mode session is shutting down");
 }
-
-#[test]
-fn reset_notice_reports_loss_once_without_invalidating_workspace_evidence() {
-    let session = ProcessOwnedCodeModeSession::new();
-    assert_eq!(session.inner.check_reset_notice(), Ok(()));
-    session
-        .inner
-        .reset_notice_pending
-        .store(true, std::sync::atomic::Ordering::Release);
-    let error = session.inner.check_reset_notice().unwrap_err();
-    let receipt: serde_json::Value = serde_json::from_str(&error).unwrap();
-    let reset = &receipt["code_mode_session_reset"];
-    assert_eq!(reset["request_executed"], false);
-    assert_eq!(
-        reset["lost"],
-        serde_json::json!(["stored_values", "previous_cells"])
-    );
-    assert!(
-        reset["message"]
-            .as_str()
-            .unwrap()
-            .contains("unchanged files and prior validation are not invalidated")
-    );
-    assert_eq!(session.inner.check_reset_notice(), Ok(()));
-}

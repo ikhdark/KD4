@@ -39,23 +39,10 @@ pub(crate) fn available_skills_fragment(
             SkillSourceKind::Orchestrator => "orchestrator resource",
             SkillSourceKind::Custom(_) => "custom resource",
         };
-        let (locator_kind, locator) = match entry.main_prompt.environment_path() {
-            Some((environment_id, path)) if entry.authority.kind == SkillSourceKind::Executor => (
-                "read_file",
-                Cow::Owned(
-                    serde_json::json!({
-                        "environment_id": environment_id,
-                        "path": path.inferred_native_path_string(),
-                    })
-                    .to_string(),
-                ),
-            ),
-            _ => (locator_kind, Cow::Borrowed(entry.rendered_path())),
-        };
         let line_bytes = entry
             .name
             .len()
-            .saturating_add(locator.len())
+            .saturating_add(entry.rendered_path().len())
             .saturating_add(locator_kind.len())
             .saturating_add(description.len())
             .saturating_add(if description.is_empty() { 8 } else { 9 });
@@ -65,21 +52,14 @@ pub(crate) fn available_skills_fragment(
             continue;
         }
         total_bytes = next_bytes;
-        skill_lines.push(render_skill_line(
-            &entry.name,
-            description.as_ref(),
-            locator_kind,
-            &locator,
-        ));
+        skill_lines.push(render_skill_line(entry, description.as_ref(), locator_kind));
     }
 
     let incomplete = catalog.continuation.is_some();
     if skill_lines.is_empty() && omitted == 0 && !incomplete {
         return None;
     }
-    if catalog.discovery_blocked() {
-        skill_lines.push("- Orchestrator skill discovery is blocked by repeated provider pagination. Retained skills are usable, but coverage is incomplete. Repair the provider and refresh its MCP connection before retrying discovery.".to_string());
-    } else if incomplete {
+    if incomplete {
         skill_lines.push("- Orchestrator skill discovery is incomplete; undiscovered skills may still be available. Continue discovery only if needed for this task.".to_string());
     }
     if omitted > 0 {
@@ -137,7 +117,9 @@ pub(crate) fn truncate_catalog_skill_description(description: &str) -> Cow<'_, s
     Cow::Owned(truncated)
 }
 
-fn render_skill_line(name: &str, description: &str, locator_kind: &str, path: &str) -> String {
+fn render_skill_line(entry: &SkillCatalogEntry, description: &str, locator_kind: &str) -> String {
+    let name = entry.name.as_str();
+    let path = entry.rendered_path();
     if description.is_empty() {
         format!("- {name}: ({locator_kind}: {path})")
     } else {

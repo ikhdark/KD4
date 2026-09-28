@@ -52,12 +52,10 @@ fn retryable_streamable_http_error_includes_remote_body_stream_failure() {
         StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
             status: StatusCode::BAD_GATEWAY,
             body_preview: "localized upstream failure".to_string(),
-            retry_after: None,
         }),
         StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
             status: StatusCode::BAD_REQUEST,
             body_preview: "localized bad request".to_string(),
-            retry_after: None,
         }),
     ];
 

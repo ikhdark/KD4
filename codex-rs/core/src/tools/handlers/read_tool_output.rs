@@ -1530,7 +1530,8 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
-        .expect_err("new calls must authenticate disk contents again");
+        .err()
+        .expect("new calls must authenticate disk contents again");
         assert_eq!(
             error,
             ReadToolOutputError::Io("artifact SHA identity does not match metadata".to_string())
@@ -1559,14 +1560,9 @@ mod tests {
         let ToolSpec::Function(spec) = spec else {
             panic!("recovery uses a function spec");
         };
-        let validator = jsonschema::validator_for(
-            &spec
-                .output_schema
-                .as_ref()
-                .expect("output schema")
-                .to_value(),
-        )
-        .expect("valid output schema");
+        let validator =
+            jsonschema::validator_for(&spec.output_schema.as_ref().expect("output schema").to_value())
+                .expect("valid output schema");
         for (selector, expected_status, expected_reason) in [
             (
                 serde_json::json!({"kind": "json_pointer", "pointer": "invalid"}),

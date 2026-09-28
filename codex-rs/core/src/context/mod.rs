@@ -26,7 +26,7 @@ mod turn_aborted;
 mod token_budget_context;
 pub(crate) use token_budget_context::{
     AutoCompactFallbackPrompt, ContextWindowGuidance, TokenBudgetContext,
-    TokenBudgetRemainingContext, TokenBudgetReminder,
+    TokenBudgetReminder,
 };
 mod user_instructions;
 mod user_shell_command;

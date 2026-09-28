@@ -36,9 +36,6 @@ use crate::local::with_test_snapshot_capture_pause;
 use crate::workspace::TestWorkspaceCapturePause;
 use crate::workspace::with_test_workspace_capture_pause;
 
-#[path = "tests_actionable.rs"]
-mod actionable;
-
 #[test]
 fn editing_and_tool_calls_are_meaningful_progress() {
     assert!(ObservationKind::Editing.is_meaningful_progress());
@@ -743,11 +740,8 @@ async fn audit_workspace_actor_reset_clears_binding_and_lease() {
 }
 
 #[tokio::test]
-async fn audit_workspace_capture_does_not_block_writers_or_publish_an_obsolete_scan() {
+async fn audit_workspace_capture_publish_order_matches_scan_order() {
     let fixture = Fixture::new().await;
-    let second_store = LocalAgentTaskStore::initialize(&fixture.state)
-        .await
-        .expect("independent store");
     let path = fixture.repo.path().join("ordered.txt");
     std::fs::write(&path, "old").expect("initial file");
     fixture
@@ -774,25 +768,24 @@ async fn audit_workspace_capture_does_not_block_writers_or_publish_an_obsolete_s
         .expect("pause remains open");
     started.forget();
     std::fs::write(&path, "new").expect("file changes between captures");
+    let second_store = fixture.store.clone();
     let second_root = fixture.repo.path().to_path_buf();
     let second = tokio::spawn(async move {
         second_store
             .capture_workspace_revision(&second_root, vec!["ordered.txt".to_string()])
             .await
     });
-    let second = tokio::time::timeout(std::time::Duration::from_secs(2), second)
-        .await
-        .expect("a paused scan must not hold the home-wide SQLite writer")
-        .expect("second task joins")
-        .expect("second capture");
     pause.release.add_permits(1);
     let first = first
         .await
         .expect("first task joins")
-        .expect("first capture retries");
-    assert_eq!(first.epoch, second.epoch);
-    assert_eq!(first.manifest_hash, second.manifest_hash);
-    assert_eq!(first.files, second.files);
+        .expect("first capture");
+    let second = second
+        .await
+        .expect("second task joins")
+        .expect("second capture");
+    assert!(second.epoch > first.epoch);
+    assert_ne!(second.manifest_hash, first.manifest_hash);
 }
 
 #[tokio::test]
@@ -4032,9 +4025,9 @@ async fn validation_calls_allow_only_running_to_terminal_transitions() {
             .record_validation_call(ValidationCall {
                 call_id: "after-seal".to_string(),
                 attempt_id: attempt.attempt_id,
-                command_summary: "focused test".to_string(),
+                command_summary: "too late".to_string(),
                 evidence: ValidationEvidence::default(),
-                status: ValidationCallStatus::Running,
+                status: ValidationCallStatus::Succeeded,
                 recorded_at: Utc::now(),
             })
             .await,
@@ -5083,9 +5076,7 @@ async fn wake_wait_rejects_invalid_cursor_even_without_a_stream() {
     for cursor in [cursor, WakeEventId::new()] {
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            fixture
-                .store
-                .wait_for_wake_events("missing-root".into(), Some(cursor)),
+            fixture.store.wait_for_wake_events("missing-root".into(), Some(cursor)),
         )
         .await
         .expect("invalid cursor must fail without waiting for a commit")
@@ -8000,134 +7991,28 @@ async fn automatic_wake_delivery_is_atomic_with_cursor_and_survives_losing_publi
     let fixture = Fixture::new().await;
     let root = "delivery-root".to_string();
     let consumer = "/root/consumer".to_string();
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft(&root, "src"))
-        .await
-        .unwrap();
-    let cursor = fixture
-        .store
-        .automatic_wake_cursor(root.clone(), consumer.clone())
-        .await
-        .unwrap();
-    fixture
-        .store
-        .append_observation(
-            attempt.attempt_id,
-            ObservationKind::Reading,
-            "ready".to_string(),
-            None,
-        )
-        .await
-        .unwrap();
-    let batch = fixture
-        .store
-        .read_wake_events(root.clone(), cursor)
-        .await
-        .unwrap();
+    let (_, attempt) = fixture.store.create_assignment(fixture.repo.path(), worker_draft(&root, "src")).await.unwrap();
+    let cursor = fixture.store.automatic_wake_cursor(root.clone(), consumer.clone()).await.unwrap();
+    fixture.store.append_observation(attempt.attempt_id, ObservationKind::Reading, "ready".to_string(), None).await.unwrap();
+    let batch = fixture.store.read_wake_events(root.clone(), cursor).await.unwrap();
     let next = batch.latest_event_id.unwrap();
-    assert!(
-        fixture
-            .store
-            .automatic_wake_delivery(root.clone(), consumer.clone())
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(fixture.store.automatic_wake_delivery(root.clone(), consumer.clone()).await.unwrap().is_none());
     let receipt = r#"{"artifact_id":"retained-output","cursor":1}"#.to_string();
-    assert!(
-        fixture
-            .store
-            .publish_automatic_wake_delivery(
-                root.clone(),
-                consumer.clone(),
-                cursor,
-                next,
-                receipt.clone()
-            )
-            .await
-            .unwrap()
-    );
-    assert!(
-        !fixture
-            .store
-            .publish_automatic_wake_delivery(
-                root.clone(),
-                consumer.clone(),
-                cursor,
-                next,
-                "losing-output".to_string()
-            )
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        fixture
-            .store
-            .automatic_wake_cursor(root.clone(), consumer.clone())
-            .await
-            .unwrap(),
-        Some(next)
-    );
-    assert_eq!(
-        fixture
-            .store
-            .automatic_wake_delivery(root, consumer)
-            .await
-            .unwrap(),
-        Some(receipt)
-    );
+    assert!(fixture.store.publish_automatic_wake_delivery(root.clone(), consumer.clone(), cursor, next, receipt.clone()).await.unwrap());
+    assert!(!fixture.store.publish_automatic_wake_delivery(root.clone(), consumer.clone(), cursor, next, "losing-output".to_string()).await.unwrap());
+    assert_eq!(fixture.store.automatic_wake_cursor(root.clone(), consumer.clone()).await.unwrap(), Some(next));
+    assert_eq!(fixture.store.automatic_wake_delivery(root, consumer).await.unwrap(), Some(receipt));
 }
 
 #[tokio::test]
 async fn reusable_explorer_lookup_matches_admission_without_creating_work() {
     let fixture = Fixture::new().await;
     let draft = explorer_draft("early-reuse-root", "src/file.rs", "trace parser ownership");
-    assert!(
-        fixture
-            .store
-            .reusable_explorer_assignment(fixture.repo.path(), draft.clone())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let admitted = fixture
-        .store
-        .create_admitted_assignment(fixture.repo.path(), draft.clone(), true)
-        .await
-        .unwrap();
-    assert_eq!(
-        fixture
-            .store
-            .reusable_explorer_assignment(fixture.repo.path(), draft.clone())
-            .await
-            .unwrap(),
-        Some(admitted.assignment.assignment_id)
-    );
-    let distinct = explorer_draft(
-        "early-reuse-root",
-        "src/file.rs",
-        "trace serializer ownership",
-    );
-    assert!(
-        fixture
-            .store
-            .reusable_explorer_assignment(fixture.repo.path(), distinct)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    fixture
-        .store
-        .submit_agent_receipt(admitted.attempt.attempt_id, completed_receipt(Vec::new()))
-        .await
-        .unwrap();
-    assert!(
-        fixture
-            .store
-            .reusable_explorer_assignment(fixture.repo.path(), draft)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft.clone()).await.unwrap().is_none());
+    let admitted = fixture.store.create_admitted_assignment(fixture.repo.path(), draft.clone(), true).await.unwrap();
+    assert_eq!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft.clone()).await.unwrap(), Some(admitted.assignment.assignment_id));
+    let distinct = explorer_draft("early-reuse-root", "src/file.rs", "trace serializer ownership");
+    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), distinct).await.unwrap().is_none());
+    fixture.store.submit_agent_receipt(admitted.attempt.attempt_id, completed_receipt(Vec::new())).await.unwrap();
+    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft).await.unwrap().is_none());
 }

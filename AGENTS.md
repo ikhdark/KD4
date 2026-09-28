@@ -11,9 +11,8 @@
 
 ## Scope and workspace
 
-* A no-change result is valid and preferred when the requested capability already exists adequately. Before adding a mechanism, identify the concrete missing capability and explain, using relevant source evidence, why existing abstractions are insufficient. Prefer reuse, consolidation, or deletion over adding parallel machinery.
-* When edits overlap, preserve independent changes and combine compatible behavior against the requested contract. Verify the combined runtime path; ask only when conflicting intended behavior cannot be resolved from current evidence.
-* Tasks must be finished, end to end.
-* Wire changes through registration, dispatch, configuration, and consumers; parsed-only options and half-wired implementations are not complete.
-* Use the smallest check that proves the changed contract; run full suites only when requested or required by repository guidance.
-* Finish valid, progressing checks and reuse still-current passing evidence; rerun only checks affected by changed inputs or diagnosed failures.
+* Prefer existing owners and abstractions; identify a verified missing capability before adding machinery. Preserve overlapping user work and verify the combined runtime path end to end.
+
+## Validation
+
+* Use the smallest check that proves the changed contract; a full suite requires an explicit request. Reuse passing evidence until relevant inputs change. Let progressing checks finish, batch relevant repairs, and rerun only affected checks. Report unrelated failures without expanding scope.

@@ -1,5 +1,6 @@
 use crate::attribution::BindConnectionAttribution;
 use crate::config::NetworkMode;
+use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
@@ -28,7 +29,8 @@ use crate::runtime::unix_socket_permissions_supported;
 use crate::state::BlockedRequest;
 use crate::state::BlockedRequestArgs;
 use crate::state::NetworkProxyState;
-use crate::upstream::connect_tunnel;
+use crate::upstream::UpstreamClient;
+use crate::upstream::proxy_for_connect;
 use anyhow::Context as _;
 use anyhow::Result;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
@@ -52,9 +54,12 @@ use rama_http::headers::HeaderMapExt;
 use rama_http::headers::Host;
 use rama_http::layer::remove_header::RemoveResponseHeaderLayer;
 use rama_http::matcher::MethodMatcher;
+use rama_http_backend::client::proxy::layer::HttpProxyConnector;
 use rama_http_backend::server::HttpServer;
 use rama_http_backend::server::layer::upgrade::UpgradeLayer;
 use rama_http_backend::server::layer::upgrade::Upgraded;
+use rama_net::Protocol;
+use rama_net::client::ConnectorService;
 use rama_net::client::EstablishedClientConnection;
 use rama_net::http::RequestContext;
 use rama_net::proxy::ProxyRequest;
@@ -63,6 +68,8 @@ use rama_net::proxy::StreamForwardService;
 use rama_net::stream::SocketInfo;
 use rama_tcp::client::Request as TcpRequest;
 use rama_tcp::server::TcpListener;
+use rama_tls_rustls::client::TlsConnectorDataBuilder;
+use rama_tls_rustls::client::TlsConnectorLayer;
 use serde::Serialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -408,16 +415,41 @@ where
         .get::<ConnectDialPolicy>()
         .copied()
         .ok_or_else(|| OpaqueError::from_display("missing CONNECT dial policy"))?;
-    let req = TcpRequest::new_with_extensions(authority.clone(), upgraded.extensions().clone());
+    let proxy = if dial_policy.allow_upstream_proxy {
+        proxy_for_connect()
+    } else {
+        None
+    };
+    match proxy.as_ref() {
+        Some(proxy) => info!(
+            "CONNECT route selected (host={}, port={}, route=upstream_proxy, proxy={})",
+            authority.host, authority.port, proxy.address
+        ),
+        None => info!(
+            "CONNECT route selected (host={}, port={}, route=direct)",
+            authority.host, authority.port
+        ),
+    }
+
+    let mut extensions = upgraded.extensions().clone();
+    if let Some(proxy) = proxy {
+        extensions.insert(proxy);
+    }
+
+    let req = TcpRequest::new_with_extensions(authority.clone(), extensions)
+        .with_protocol(Protocol::HTTPS);
+    let proxy_connector = HttpProxyConnector::optional(
+        TargetCheckedTcpConnector::from_allow_local_binding(dial_policy.allow_local_binding),
+    );
+    let tls_config = TlsConnectorDataBuilder::new()
+        .with_alpn_protocols_http_auto()
+        .build();
+    let connector = TlsConnectorLayer::tunnel(None)
+        .with_connector_data(tls_config)
+        .into_layer(proxy_connector);
     info!("CONNECT upstream dial started (target={authority})");
     let connect_started_at = Instant::now();
-    let EstablishedClientConnection { conn: target, .. } = match connect_tunnel(
-        req,
-        dial_policy.allow_upstream_proxy,
-        dial_policy.allow_local_binding,
-    )
-    .await
-    {
+    let EstablishedClientConnection { conn: target, .. } = match connector.connect(req).await {
         Ok(connection) => {
             info!(
                 "CONNECT upstream dial established (target={authority}, elapsed_ms={})",
@@ -747,8 +779,11 @@ async fn http_plain_proxy(
     let method = req.method();
     info!("request allowed (client={client}, host={host}, method={method})");
 
-    let client =
-        app_state.upstream_client(policy.allow_upstream_proxy(), policy.allow_local_binding());
+    let client = if policy.allow_upstream_proxy() {
+        UpstreamClient::from_env_proxy_with_current_roots(policy.allow_local_binding())
+    } else {
+        UpstreamClient::direct_with_current_roots(policy.allow_local_binding())
+    };
 
     if let Some(target) = policy.local_target(&host) {
         req.extensions_mut().insert(target);

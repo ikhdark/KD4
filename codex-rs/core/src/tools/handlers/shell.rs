@@ -603,7 +603,7 @@ async fn run_exec_like_with_exit_code_inner(
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         max_output_tokens,
-        validation,
+        validation: _,
         tool_name,
         exec_params,
         stall_timeout_ms,
@@ -919,21 +919,6 @@ async fn run_exec_like_with_exit_code_inner(
 
     let workspace_operation_root =
         workspace_operation_root_if_needed(is_validation, inspection_command, repository_root);
-    let task_validation = if known_delta_hit {
-        None
-    } else {
-        crate::agent::task_validation::TaskValidation::start(
-            &session,
-            &turn,
-            &call_id,
-            &hook_command,
-            &exec_params.command,
-            (!turn_environment.environment.is_remote()).then_some(exec_params.cwd.as_path()),
-            validation.as_ref(),
-        )
-        .await
-        .map_err(FunctionCallError::RespondToModel)?
-    };
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
@@ -1001,17 +986,6 @@ async fn run_exec_like_with_exit_code_inner(
         retained_validation_attempt.as_ref(),
     );
     let out = restore_retained_validation_attempt(out, retained_validation_attempt.as_ref());
-    if let Some(validation) = task_validation {
-        validation
-            .finish(
-                out.as_ref()
-                    .ok()
-                    .filter(|output| !output.timed_out)
-                    .map(|output| output.exit_code),
-            )
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-    }
     if validation_attempt_started {
         let duration = shell_validation_execution_output(&out, None)
             .map(|output| output.duration)

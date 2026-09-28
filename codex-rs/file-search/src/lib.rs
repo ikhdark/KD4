@@ -447,15 +447,12 @@ fn walker_worker(
     // Walk each distinct root once. A root nested in another root is walked as
     // its own root and skipped by the enclosing walk, so no path is indexed twice.
     let mut walk_roots = Vec::<&PathBuf>::new();
-    let mut root_identities = Vec::new();
     for root in &inner.search_directories {
-        let identity = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        if !root_identities.contains(&identity) {
+        if !walk_roots.contains(&root) {
             walk_roots.push(root);
-            root_identities.push(identity);
         }
     }
-    let mut nested_roots = walk_roots
+    let nested_roots = walk_roots
         .iter()
         .filter(|root| {
             walk_roots
@@ -464,17 +461,6 @@ fn walker_worker(
         })
         .map(|root| (*root).clone())
         .collect::<Vec<_>>();
-    // A nested root may use another spelling of its enclosing root. Prune it
-    // in the enclosing walk's namespace while keeping its own display spelling.
-    for identity in &root_identities {
-        for (root, enclosing) in walk_roots.iter().zip(&root_identities) {
-            if identity != enclosing
-                && let Ok(suffix) = identity.strip_prefix(enclosing)
-            {
-                nested_roots.push(root.join(suffix));
-            }
-        }
-    }
     let Some((first_root, other_roots)) = walk_roots.split_first() else {
         let _ = inner
             .work_tx
@@ -486,7 +472,11 @@ fn walker_worker(
     for root in other_roots {
         walk_builder.add(root);
     }
-    let canonical_search_directories = root_identities;
+    let canonical_search_directories = inner
+        .search_directories
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect::<Vec<_>>();
     let entries_seen = Arc::new(AtomicUsize::new(0));
     let directories_seen = Arc::new(AtomicUsize::new(0));
     let walk_limit_hit = Arc::new(AtomicBool::new(false));
@@ -1255,54 +1245,6 @@ mod tests {
         expected.sort();
         assert_eq!(found, expected);
         assert_eq!(results.total_match_count, 2);
-        assert!(results.walk_complete);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn case_alias_roots_keep_one_result_and_the_first_display_spelling() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("MyProject");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("needle.rs"), "contents").unwrap();
-        let alias = temp.path().join("myproject");
-        assert_eq!(
-            fs::canonicalize(&root).unwrap(),
-            fs::canonicalize(&alias).unwrap()
-        );
-        let results = run(
-            "needle",
-            vec![root.clone(), alias],
-            FileSearchOptions::default(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(results.total_match_count, 1);
-        assert_eq!(results.matches.len(), 1);
-        assert_eq!(results.matches[0].root, root);
-        assert_eq!(results.matches[0].path, PathBuf::from("needle.rs"));
-        assert!(results.walk_complete);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn nested_case_alias_root_keeps_deepest_root_without_duplicates() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("MyProject");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/needle.rs"), "contents").unwrap();
-        let nested = temp.path().join("myproject/src");
-        let results = run(
-            "needle",
-            vec![root, nested.clone()],
-            FileSearchOptions::default(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(results.total_match_count, 1);
-        assert_eq!(results.matches.len(), 1);
-        assert_eq!(results.matches[0].root, nested);
-        assert_eq!(results.matches[0].path, PathBuf::from("needle.rs"));
         assert!(results.walk_complete);
     }
 

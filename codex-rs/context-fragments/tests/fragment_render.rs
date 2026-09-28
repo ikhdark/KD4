@@ -246,51 +246,6 @@ fn additional_context_caps_entity_heavy_values_after_escaping() {
 }
 
 #[test]
-fn recovery_notices_preserve_bounds_markers_and_escaping() {
-    use codex_context_fragments::MAX_ADDITIONAL_CONTEXT_VALUE_BYTES;
-    use codex_context_fragments::additional_context_value_is_truncated;
-
-    assert!(!additional_context_value_is_truncated(&"&".repeat(800)));
-    assert!(additional_context_value_is_truncated(&"&".repeat(801)));
-    assert!(!additional_context_value_is_truncated(&"😀".repeat(1_000)));
-    assert!(additional_context_value_is_truncated(&"😀".repeat(1_001)));
-    for notice in [
-        "read_tool_output: recovery-id <&>".to_string(),
-        "notice<&>".repeat(1_000),
-    ] {
-        let value = "&😀".repeat(2_000);
-        let user = AdditionalContextUserFragment::new("source".to_string(), value.clone())
-            .with_recovery_notice(notice.clone())
-            .render();
-        let developer = AdditionalContextDeveloperFragment::new("source".to_string(), value)
-            .with_recovery_notice(notice)
-            .render();
-        assert!(AdditionalContextUserFragment::matches_text(&user));
-        assert!(AdditionalContextDeveloperFragment::matches_text(&developer));
-        for text in [user, developer] {
-            let body = text
-                .split_once('\n')
-                .unwrap()
-                .1
-                .rsplit_once('\n')
-                .unwrap()
-                .0;
-            assert!(body.len() <= MAX_ADDITIONAL_CONTEXT_VALUE_BYTES);
-            assert!(body.contains("tokens truncated"));
-            assert!(body.contains("&lt;&amp;&gt;"));
-        }
-    }
-    let small = AdditionalContextUserFragment::new("source".to_string(), "small".to_string());
-    assert_eq!(
-        small
-            .clone()
-            .with_recovery_notice("unused notice".to_string())
-            .render(),
-        small.render()
-    );
-}
-
-#[test]
 fn additional_context_caps_oversized_source_labels_after_escaping() {
     let fragment = AdditionalContextUserFragment::new("&".repeat(1_000), "value".to_string());
 

@@ -2,32 +2,6 @@ use super::*;
 use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
-#[tokio::test]
-async fn active_history_protection_validates_segmented_artifacts() {
-    let home = tempfile::tempdir().unwrap();
-    let canonical = CanonicalToolResult::text("a".repeat(MAX_RAW_OUTPUT_ARTIFACT_BYTES) + "tail");
-    let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
-    assert!(artifact.complete);
-    let id = artifact.artifact_id().unwrap();
-    let path = home.path().join("tool-output/thread").join(format!("{id}.log"));
-    let marker = active_tool_history_protection_path(&path);
-    assert!(protect_active_tool_history_artifact(
-        home.path(), "thread", &id, canonical.exact_bytes, "wrong digest"
-    ).await.is_err());
-    assert!(!marker.exists());
-    protect_active_tool_history_artifact(
-        home.path(), "thread", &id, canonical.exact_bytes, &canonical.sha256
-    ).await.unwrap();
-    assert!(marker.exists());
-    assert_eq!(read_complete_canonical_snapshot(
-        home.path(), "thread", &id, canonical.bytes.len()
-    ).await.unwrap(), canonical.bytes);
-    std::fs::write(logical_segment_path(&path, 1), b"fail").unwrap();
-    assert!(protect_active_tool_history_artifact(
-        home.path(), "thread", &id, canonical.exact_bytes, &canonical.sha256
-    ).await.is_err());
-}
-
 /// Loads an artifact's metadata and validated bytes the way a read does.
 async fn logical_artifact_for_test(
     codex_home: &Path,
@@ -2264,7 +2238,7 @@ async fn inline_streaming_output_creates_no_artifact() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
+async fn streaming_chunks_batch_disk_updates_and_preserve_exact_output() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
     let state = Arc::new(Mutex::new(artifact));
@@ -2275,14 +2249,29 @@ async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
         .expect("streaming writer");
 
     for _ in 0..200 {
-        writer.write_chunk(Some(&state), b"x").await;
+        writer.write_chunk(Some(&state), &[b'x'; 1024]).await;
     }
+    let streaming_path = writer
+        .path
+        .as_ref()
+        .expect("streaming artifact path")
+        .clone();
+    assert_eq!(
+        tokio::fs::metadata(&streaming_path).await.unwrap().len(),
+        192 * 1024
+    );
+    writer.flush_pending(Some(&state)).await;
+    assert_eq!(
+        tokio::fs::metadata(&streaming_path).await.unwrap().len(),
+        200 * 1024,
+        "artifact readiness requires every buffered byte before final fsync"
+    );
     writer.finish(Some(&state)).await;
 
     let after = retention_diagnostics_for_test(&root);
     assert_eq!(
         after.streaming_size_updates - before.streaming_size_updates,
-        201
+        4
     );
     assert_eq!(after.logical_mutations - before.logical_mutations, 1);
     assert_eq!(after.scans, before.scans);
@@ -2292,16 +2281,16 @@ async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
         let RawOutputArtifact::Stored { path, bytes, .. } = &*artifact else {
             panic!("expected stored streaming artifact");
         };
-        assert_eq!(*bytes, 200);
+        assert_eq!(*bytes, 200 * 1024);
         path.clone()
     };
     assert_eq!(
         tokio::fs::read(&path).await.expect("retained output"),
-        vec![b'x'; 200]
+        vec![b'x'; 200 * 1024]
     );
     let usage = retention_usage_locked_blocking(path.parent().expect("artifact directory"));
-    assert_eq!(usage.thread_bytes, 200);
-    assert_eq!(usage.global_bytes, 200);
+    assert_eq!(usage.thread_bytes, 200 * 1024);
+    assert_eq!(usage.global_bytes, 200 * 1024);
 }
 
 #[tokio::test]
@@ -2394,6 +2383,7 @@ async fn stale_streaming_writer_cannot_update_a_rebuilt_generation() {
         Some(writer_generation)
     );
     writer.write_chunk(Some(&state), b"late").await;
+    writer.finish(Some(&state)).await;
 
     let dirty_generation = retention_generation_for_test(&root).expect("dirty generation");
     assert_ne!(dirty_generation, writer_generation);
@@ -2402,7 +2392,6 @@ async fn stale_streaming_writer_cannot_update_a_rebuilt_generation() {
     assert_eq!(diagnostics.stale_delta_rejections, 1);
     assert_eq!(diagnostics.dirty_transitions, 1);
 
-    writer.finish(Some(&state)).await;
     let path = {
         let artifact = state.lock().await;
         let RawOutputArtifact::Stored { path, .. } = &*artifact else {
@@ -4011,9 +4000,6 @@ async fn reclaim_releases_idle_directories_of_threads_without_rollouts_only() {
             thread_id.clone(),
             protected_artifact_for_thread(home, thread_id).await,
         );
-        let hook_dir = root.join(thread_id).join("hooks");
-        std::fs::create_dir_all(&hook_dir).expect("hook directory");
-        std::fs::write(hook_dir.join("evidence.txt"), "retained hook evidence").expect("hook output");
     }
     let shared_store = root.join("known-delta");
     std::fs::create_dir_all(&shared_store).expect("shared store");
@@ -4054,10 +4040,6 @@ async fn reclaim_releases_idle_directories_of_threads_without_rollouts_only() {
     assert!(!root.join(&unresumable).exists());
     for kept in [&active, &resumable, &lookup_failed] {
         assert!(artifacts[kept].exists(), "{kept} must keep its artifacts");
-        assert_eq!(
-            std::fs::read_to_string(root.join(kept).join("hooks/evidence.txt")).unwrap(),
-            "retained hook evidence"
-        );
     }
     assert!(shared_store.exists());
     // The index still counts the removed records until it reconciles.

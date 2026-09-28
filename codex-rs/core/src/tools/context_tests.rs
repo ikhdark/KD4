@@ -1045,7 +1045,6 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         original_token_count: Some(100),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1098,7 +1097,6 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1148,7 +1146,6 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1189,7 +1186,6 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1229,6 +1225,15 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
         b"invalid: \xff"
     );
 
+    output.raw_output = b"first\r\nsecond\r\n".to_vec();
+    assert_eq!(output.code_mode_result(&payload)["output"], "first\nsecond\n");
+    assert_eq!(output.projection_metadata().unwrap().spillable_text, ["first\nsecond\n"]);
+    assert_eq!(output.canonical_result(&payload).unwrap().bytes, b"first\r\nsecond\r\n");
+    output.raw_output = "word ".repeat(30_000).into_bytes();
+    output.max_output_tokens = Some(25_000);
+    assert_eq!(output.model_output_limits("", None).applied_limit, 10_000);
+    assert_eq!(output.model_output_limits("", Some(8_000)).applied_limit, 8_000);
+
     // A literal replacement character in valid UTF-8 is not evidence of loss.
     output.raw_output = "valid: \u{fffd}".as_bytes().to_vec();
     assert!(
@@ -1265,7 +1270,6 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
         original_token_count: Some(2),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1305,7 +1309,6 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         original_token_count: Some(300),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1355,7 +1358,6 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
         original_token_count: Some(100),
         hook_command: Some("echo ok".to_string()),
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1365,11 +1367,12 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
     let projected = output.projected_model_output(raw_output.as_ref(), None);
     assert!(projected.reduced);
     assert_eq!(
-        projected.text.matches("[...]").count(),
+        projected.text.matches('…').count(),
         1,
         "{}",
         projected.text
     );
+    assert!(codex_utils_string::approx_token_count(&projected.text) <= 5);
     assert!(!projected.text.contains("tokens truncated"));
 }
 
@@ -1391,7 +1394,6 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
         original_token_count: Some(10),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1426,7 +1428,6 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         original_token_count: Some(codex_utils_string::approx_token_count(&raw_output)),
         hook_command: Some("enumerate evidence".to_string()),
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1516,7 +1517,6 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1568,7 +1568,6 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
             truncated: false,
             handle: std::sync::Arc::new(tempfile::tempfile().expect("artifact handle")),
         }),
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: Some("Command preflight applied one repair".to_string()),
         pending_deferred_completions: Vec::new(),
@@ -1667,7 +1666,6 @@ async fn artifact_backed_exec_output(
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: Some(artifact),
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -1791,9 +1789,11 @@ async fn code_mode_command_result_fits_its_cell_when_printed() {
     let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
     assert!(
         codex_utils_string::approx_token_count(direct["output"].as_str().unwrap())
-            > codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-        "the direct response keeps the requested budget"
+            <= 10_000,
+        "the direct response must cap oversized requests"
     );
+    assert_eq!(output.model_output_limits(&raw_output, None).applied_limit, 10_000);
+    assert_eq!(direct["artifact_id"], artifact_id.to_string());
 }
 
 #[tokio::test]

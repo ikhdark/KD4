@@ -823,12 +823,32 @@ pub(crate) async fn begin_uncertain_command_baseline(
     {
         return;
     }
-    let baseline = ctx
-        .session
-        .services
-        .git_workspace
-        .workspace_evidence_for_uri(ctx.turn, cwd, environment_id)
-        .await;
+    let admitted_baseline =
+        if let (Some(tracker), Ok(local_cwd)) = (ctx.turn_diff_tracker, cwd.to_abs_path()) {
+            let (batch, revision) = {
+                let tracker = tracker.lock().await;
+                (
+                    tracker.workspace_evidence_generation_batch_for_call(ctx.call_id),
+                    tracker.current_mutation_revision(),
+                )
+            };
+            match batch {
+                Some(batch) => batch.captured_identity(local_cwd.as_path(), revision).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+    let baseline = match admitted_baseline {
+        Some(identity) => identity,
+        None => {
+            ctx.session
+                .services
+                .git_workspace
+                .workspace_evidence_for_uri(ctx.turn, cwd, environment_id)
+                .await
+        }
+    };
     ctx.session
         .services
         .command_execution
@@ -969,7 +989,14 @@ async fn emit_exec_end(
         native_cwd.as_ref().map(AbsolutePathBuf::as_path),
     )
     .await?;
+    // A background command can finish after its dispatch lease was released.
+    // Do not label a scan with a later revision if another mutation races it.
+    let capture_revision = match ctx.turn_diff_tracker {
+        Some(tracker) => Some(tracker.lock().await.current_mutation_revision()),
+        None => None,
+    };
     let mut observed_workspace_identity = None;
+    let mut captured_workspace_identity = false;
     if matches!(
         mutation,
         crate::turn_diff_tracker::CommandMutation::Uncertain
@@ -989,6 +1016,7 @@ async fn emit_exec_end(
                 .git_workspace
                 .workspace_evidence_for_uri(ctx.turn, exec_input.cwd, exec_input.environment_id)
                 .await;
+            captured_workspace_identity = true;
             let workspace_changed =
                 observed_workspace_identity_changed(baseline.as_ref(), current.as_ref());
             observed_workspace_identity = current;
@@ -1020,6 +1048,7 @@ async fn emit_exec_end(
             workspace_identity_required,
             observed_workspace_identity.as_ref(),
         ) {
+        captured_workspace_identity = true;
         ctx.session
             .services
             .git_workspace
@@ -1064,6 +1093,8 @@ async fn emit_exec_end(
         && let Some(tracker) = ctx.turn_diff_tracker
     {
         let mut tracker = tracker.lock().await;
+        captured_workspace_identity &=
+            capture_revision == Some(tracker.current_mutation_revision());
         tracker.record_exec_command_end_with_mutation_at(
             exec_input.command,
             exec_result.exit_code,
@@ -1076,6 +1107,27 @@ async fn emit_exec_end(
     } else {
         None
     };
+    if captured_workspace_identity
+        && let (Some(tracker), Some(cwd), Some(revision)) = (
+            ctx.turn_diff_tracker,
+            native_cwd.as_ref(),
+            observed_mutation_revision,
+        )
+    {
+        let batch = tracker
+            .lock()
+            .await
+            .workspace_evidence_generation_batch_for_call(ctx.call_id);
+        if let Some(batch) = batch {
+            batch
+                .record_captured_identity(
+                    cwd.as_path(),
+                    revision,
+                    current_workspace_identity.clone(),
+                )
+                .await;
+        }
+    }
     let mutation_deferred = generation_batch.is_some_and(|batch| {
         batch.record_mutation(
             ctx.call_id,
@@ -2099,6 +2151,19 @@ mod tests {
             codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
         );
         let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
+        assert!(batch.register_call("uncertain-call"));
+        tracker
+            .lock()
+            .await
+            .activate_workspace_evidence_generation_batch(&batch);
+        // The normal dispatcher captures this baseline under the workspace lease.
+        let admitted = session
+            .services
+            .git_workspace
+            .workspace_evidence_identity(&repo)
+            .await;
+        batch.record_captured_identity(&repo, 0, admitted).await;
         let capture_count_before = session
             .services
             .git_workspace
@@ -2113,6 +2178,14 @@ mod tests {
             ))
             .await
             .expect("begin event should publish");
+        assert_eq!(
+            session
+                .services
+                .git_workspace
+                .workspace_evidence_capture_count(),
+            capture_count_before,
+            "command begin must share the dispatch baseline"
+        );
         tokio::fs::write(repo.join("changed.txt"), b"changed")
             .await
             .expect("mutate repository");
@@ -2136,8 +2209,8 @@ mod tests {
                 .git_workspace
                 .workspace_evidence_capture_count()
                 - capture_count_before,
-            2,
-            "baseline and one post-command capture should serve all consumers"
+            1,
+            "one post-command capture should serve all remaining consumers"
         );
         let after_hash = session
             .services
@@ -2146,6 +2219,15 @@ mod tests {
             .await
             .expect("refreshed workspace identity");
         assert_ne!(before_hash, after_hash);
+        let revision = tracker.lock().await.current_mutation_revision();
+        assert!(
+            batch
+                .captured_identity(&repo, revision)
+                .await
+                .flatten()
+                .is_some(),
+            "command completion must publish its capture for subsequent readers"
+        );
     }
 
     #[tokio::test]

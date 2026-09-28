@@ -10,7 +10,7 @@ use tokio::time::timeout;
 const TEST_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
 
 #[test]
-fn compression_preserves_coverage_and_roots() {
+fn compression_processes_complete_depth_rounds_and_preserves_roots() {
     let mut paths = ["a/b/c", "a/b/d", "a/b", "x/y", "z"]
         .map(PathBuf::from)
         .into_iter()
@@ -912,32 +912,6 @@ async fn rescan_moves_a_stable_watch_whose_root_disappeared() {
 }
 
 #[tokio::test]
-async fn named_backend_errors_rescan_only_overlapping_subscribers() {
-    let temp = tempfile::tempdir().unwrap();
-    let a = temp.path().join("a");
-    let b = temp.path().join("b");
-    std::fs::create_dir(&a).unwrap();
-    std::fs::create_dir(&b).unwrap();
-    let watcher = Arc::new(FileWatcher::noop());
-    let (first, mut first_rx) = watcher.add_subscriber();
-    let (second, mut second_rx) = watcher.add_subscriber();
-    let _first = first.register_path(a.clone(), true);
-    let _second = second.register_path(b, true);
-    let mut changes = ObservedChanges::default();
-    changes.record(Err(notify::Error::generic("stopped").add_path(a)));
-    FileWatcher::reconcile_changes(&watcher.state, None, None, changes).await;
-    assert!(first_rx.recv().await.unwrap().rescan_required);
-    assert!(!second_rx.inner.rescan_required.load(Ordering::Acquire));
-    assert!(second_rx.inner.changed_paths.lock().await.is_empty());
-
-    let mut changes = ObservedChanges::default();
-    changes.record(Err(notify::Error::generic("unscoped")));
-    FileWatcher::reconcile_changes(&watcher.state, None, None, changes).await;
-    assert!(first_rx.recv().await.unwrap().rescan_required);
-    assert!(second_rx.recv().await.unwrap().rescan_required);
-}
-
-#[tokio::test]
 async fn overflow_rearms_a_lost_backend_watch_before_delivering_rescan() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path().join("watched-dir");
@@ -1677,7 +1651,7 @@ fn overflowing_paths_collapse_into_ancestor_prefixes() {
     );
 }
 
-/// Dense siblings must not broaden an unrelated singleton's evidence.
+/// Compression must never widen past what actually changed.
 #[test]
 fn compression_keeps_unrelated_subtrees_separate() {
     // Compression stops as soon as the set fits, so a single collapse round leaves the two
@@ -1695,7 +1669,7 @@ fn compression_keeps_unrelated_subtrees_separate() {
         changed_paths,
         BTreeSet::from([
             PathBuf::from("repo").join("a"),
-            PathBuf::from("repo").join("b").join("three.rs"),
+            PathBuf::from("repo").join("b"),
         ]),
         "sibling subtrees must stay distinct while a shallower representation still fits"
     );

@@ -91,8 +91,7 @@ pub fn configure_windows_command_args<S>(
 }
 
 #[cfg(windows)]
-/// Identifies a final `cmd /c` script that must not receive CRT argument escaping.
-pub fn windows_cmd_payload_index<S>(program: &std::ffi::OsStr, args: &[S]) -> Option<usize>
+pub(crate) fn windows_cmd_payload_index<S>(program: &std::ffi::OsStr, args: &[S]) -> Option<usize>
 where
     S: AsRef<std::ffi::OsStr>,
 {

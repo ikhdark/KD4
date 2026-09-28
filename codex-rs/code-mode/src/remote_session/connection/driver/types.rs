@@ -19,7 +19,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::cleanup::SessionCleanup;
-use crate::delivery::Delivery;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::remote_session) struct RemoteSession {
@@ -45,12 +44,12 @@ pub(in crate::remote_session::connection) enum DriverCommand {
         session: RemoteSession,
         request: WaitRequest,
         caller_cancellation: CancellationToken,
-        response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     Terminate {
         session: RemoteSession,
         cell_id: CellId,
-        response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     ShutdownSession {
         session: RemoteSession,
@@ -116,9 +115,9 @@ impl Drop for CancellableRequest {
 }
 
 pub(super) struct InitialResponse {
-    pub(super) session: RemoteSession,
+    pub(super) generation: u64,
     pub(super) cell_id: WireCellId,
-    pub(super) response_tx: oneshot::Sender<Result<Delivery<RuntimeResponse>, String>>,
+    pub(super) response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
 }
 
 pub(in crate::remote_session::connection) struct DeliveredExecute {
@@ -143,20 +142,20 @@ pub(super) enum PendingRequest {
     Execute {
         session: RemoteSession,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
-        initial_response_tx: oneshot::Sender<Result<Delivery<RuntimeResponse>, String>>,
-        initial_response_rx: oneshot::Receiver<Result<Delivery<RuntimeResponse>, String>>,
+        initial_response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
+        initial_response_rx: oneshot::Receiver<Result<RuntimeResponse, String>>,
         cancellation: CancellableRequest,
     },
     Wait {
         session: RemoteSession,
         cell_id: WireCellId,
         cancellation: CancellableRequest,
-        response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     Terminate {
         session: RemoteSession,
         cell_id: WireCellId,
-        response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     ShutdownSession {
         session: RemoteSession,
@@ -168,7 +167,7 @@ pub(super) struct DeferredWait {
     pub(super) session: RemoteSession,
     pub(super) request: WireWaitRequest,
     pub(super) caller_cancellation: CancellationToken,
-    pub(super) response_tx: oneshot::Sender<Result<Delivery<WaitOutcome>, String>>,
+    pub(super) response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
 }
 
 impl PendingRequest {

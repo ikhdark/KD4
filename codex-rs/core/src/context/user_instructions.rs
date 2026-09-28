@@ -29,6 +29,7 @@ impl UserInstructions {
     pub(crate) const OPEN_MARKER: &str = "# AGENTS.md instructions";
     pub(crate) const CLOSE_MARKER: &str = "</INSTRUCTIONS>";
 
+    #[cfg(test)]
     pub(crate) fn with_observation(
         &self,
         observation: &str,

@@ -8,22 +8,11 @@
     },
     "AfterAgentPolicy": {
       "description": "Ordering policy for the AfterAgent hook at turn completion.",
-      "oneOf": [
-        {
-          "enum": [
-            "legacy",
-            "mutating_finalizer"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Wait for `notify` as a finalizer, sending the agent-turn-complete JSON on stdin instead of appending it to argv. The v1 payload has the same fields as legacy notifications and supports inputs beyond OS command-line limits.",
-          "enum": [
-            "mutating_finalizer_stdin_v1"
-          ],
-          "type": "string"
-        }
-      ]
+      "enum": [
+        "legacy",
+        "mutating_finalizer"
+      ],
+      "type": "string"
     },
     "AgentRoleToml": {
       "additionalProperties": false,

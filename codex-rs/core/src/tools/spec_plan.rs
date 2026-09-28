@@ -717,6 +717,11 @@ fn build_code_mode_executors(
                 {
                     definition.description.clear();
                 }
+                // Recovery payloads are inspected in JavaScript. Keep their full
+                // result schemas available through resolve_tool, not every prompt.
+                if matches!(definition.name.as_str(), "read_file" | "read_tool_output") {
+                    definition.output_schema = None;
+                }
                 eager_nested_tool_definitions.push(definition);
             }
             code_mode_nested_tool_specs.push(spec);
@@ -888,7 +893,8 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
     let allow_login_shell = turn_context.config.permissions.allow_login_shell;
     let allow_escalated_sandbox_permissions =
         allows_inline_sandbox_approval(turn_context.approval_policy.value());
-    let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
+    let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals)
+        && !matches!(turn_context.approval_policy.value(), AskForApproval::Never);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let shell_command_options = ShellCommandHandlerOptions {
         foreign_environment: primary_environment_uses_foreign_cwd(context.step_context),
@@ -1297,21 +1303,26 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     )
 )]
 fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
-    for (tools, exposure) in [
-        (context.mcp_tools, ToolExposure::Direct),
-        (context.deferred_mcp_tools, ToolExposure::Deferred),
-    ] {
-        for tool in tools.into_iter().flatten() {
+    if let Some(mcp_tools) = context.mcp_tools {
+        for tool in mcp_tools {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_mcp_runtime(handler, exposure),
-                Err(err) => {
-                    let warning = format!(
-                        "MCP tool `{}` is unavailable: failed to build tool spec: {err}. Update the MCP server's tool schema to a supported equivalent without removing its constraints.",
-                        tool.canonical_tool_name()
-                    );
-                    warn!("{warning}");
-                    planned_tools.warnings.push(warning);
-                }
+                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Direct),
+                Err(err) => warn!(
+                    "Skipping MCP tool `{}`: failed to build tool spec: {err}",
+                    tool.canonical_tool_name()
+                ),
+            }
+        }
+    }
+
+    if let Some(deferred_mcp_tools) = context.deferred_mcp_tools {
+        for tool in deferred_mcp_tools {
+            match McpHandler::new(tool.clone()) {
+                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Deferred),
+                Err(err) => warn!(
+                    "Skipping deferred MCP tool `{}`: failed to build tool spec: {err}",
+                    tool.canonical_tool_name()
+                ),
             }
         }
     }

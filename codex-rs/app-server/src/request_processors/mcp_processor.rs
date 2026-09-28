@@ -245,11 +245,11 @@ impl McpRequestProcessor {
         let mcp_manager = self.thread_manager.mcp_manager();
         let codex_apps_tools_cache = mcp_manager.codex_apps_tools_cache();
         let auth = self.auth_manager.auth().await;
-        let (mcp_config, runtime_context, runtime) = match thread {
+        let (mcp_config, runtime_context) = match thread {
             Some(thread) => {
                 let mcp_config = thread.runtime_mcp_config(&config).await;
                 let runtime = thread.current_mcp_runtime().await;
-                (mcp_config, runtime.runtime_context().clone(), Some(runtime))
+                (mcp_config, runtime.runtime_context().clone())
             }
             None => {
                 let mcp_config = mcp_manager.runtime_config(&config).await;
@@ -257,7 +257,7 @@ impl McpRequestProcessor {
                     self.thread_manager.environment_manager(),
                     config.cwd.to_path_buf(),
                 );
-                (mcp_config, runtime_context, None)
+                (mcp_config, runtime_context)
             }
         };
 
@@ -268,7 +268,6 @@ impl McpRequestProcessor {
             auth,
             runtime_context,
             codex_apps_tools_cache,
-            runtime.as_ref().map(|runtime| runtime.manager()),
         )
         .await
     }
@@ -280,7 +279,6 @@ impl McpRequestProcessor {
         auth: Option<CodexAuth>,
         runtime_context: McpRuntimeContext,
         codex_apps_tools_cache: codex_mcp::CodexAppsToolsCache,
-        existing_manager: Option<&codex_mcp::McpConnectionManager>,
     ) -> Result<ListMcpServerStatusResponse, JSONRPCErrorError> {
         let detail = match params.detail.unwrap_or(McpServerStatusDetail::Full) {
             McpServerStatusDetail::Full => McpSnapshotDetail::Full,
@@ -319,7 +317,6 @@ impl McpRequestProcessor {
             codex_apps_tools_cache,
             detail,
             &selected_server_names,
-            existing_manager,
         )
         .await;
 

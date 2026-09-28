@@ -395,7 +395,6 @@ pub(crate) fn spawn_exit_watcher(
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
     network_approval: Option<crate::tools::network_approval::DeferredNetworkApproval>,
     validation_started_at: Option<Instant>,
-    task_validation: Option<crate::agent::task_validation::TaskValidation>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
@@ -407,14 +406,14 @@ pub(crate) fn spawn_exit_watcher(
         let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         wait_for_sticky_lifecycle_signal(&exit_token).await;
         // An observation-channel failure wakes cleanup but is not exit evidence.
-        if !process.has_exited()
-            && let Err(error) = process.terminate_confirmed().await
-        {
-            terminal_completion.send_replace(Some(Err(format!(
-                "process observation failed and termination was not confirmed: {error}"
-            ))));
-            // The manager retains the process owner for subsequent cleanup.
-            return;
+        if !process.has_exited() {
+            if let Err(error) = process.terminate_confirmed().await {
+                terminal_completion.send_replace(Some(Err(format!(
+                    "process observation failed and termination was not confirmed: {error}"
+                ))));
+                // The manager retains the process owner for subsequent cleanup.
+                return;
+            }
         }
         let exit_observed_at = Instant::now();
         let duration = exit_observed_at.saturating_duration_since(started_at);
@@ -505,13 +504,6 @@ pub(crate) fn spawn_exit_watcher(
 
         let mut delivered_at = None;
         let mut terminal_result = Ok(());
-        let validation_result = if let Some(validation) = task_validation {
-            validation
-                .finish((!process.termination_was_requested()).then_some(exit_code))
-                .await
-        } else {
-            Ok(())
-        };
         if direct_runtime {
             terminal_result = emit_process_terminal_event(
                 &process,
@@ -633,11 +625,6 @@ pub(crate) fn spawn_exit_watcher(
                 .command_execution
                 .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
                 .await;
-        }
-        if let Err(error) = validation_result {
-            terminal_result = Err(format!(
-                "validation evidence could not be finalized: {error}"
-            ));
         }
         if terminal_result.is_err() {
             // Fatal completion cannot return an output acknowledgement to the

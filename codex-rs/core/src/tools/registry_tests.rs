@@ -3,32 +3,6 @@ use crate::session::step_context::StepContext;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
-#[tokio::test]
-async fn checkpoint_candidate_rejects_nested_failure_without_changing_script_outcome() {
-    for nested_failure in [false, true] {
-        let (session, turn) = crate::session::tests::make_session_and_context().await;
-        let invocation = ToolInvocation {
-            payload: ToolPayload::Custom {input:"text(await tools.exec_command({cmd:'test'}));".into()},
-            ..test_invocation(Arc::new(session), Arc::new(turn), "cell", ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME))
-        };
-        let mut output = crate::tools::context::FunctionToolOutput::from_text("diagnostic detail ".repeat(1000),Some(true));
-        if nested_failure {
-            output.essential_inline.insert("contains_nested_failure".into(), Value::Bool(true));
-        }
-        let mut result = AnyToolResult {call_id:"cell".into(),payload:invocation.payload.clone(),result:Box::new(output),
-            model_projection:None,source_dependencies:None,code_mode_feedback:Vec::new()};
-        let input = prepare_model_projection(&invocation, &mut result, None, None, false, true).await.unwrap();
-        let projection = project_model_output(input).await.unwrap();
-        let response = ResponseItem::from(projection.response());
-        assert_eq!(result.outcome_for_logging(), ToolOutputOutcome::Success);
-        let mut state = crate::tool_history::ToolHistoryState::default();
-        state.register(projection.candidate.unwrap());
-        state.mark_consumed(std::slice::from_ref(&response), crate::tool_history::ModelGenerationId {turn_id:"turn".into(),ordinal:0});
-        assert_eq!(state.phase_checkpoint_receipts(&["cell".into()]).is_ok(), !nested_failure);
-        assert!(serde_json::to_string(&response).unwrap().contains("diagnostic detail"));
-    }
-}
-
 fn admitted_tool_dispatch_state() -> Arc<ToolDispatchState> {
     let state = Arc::new(ToolDispatchState::new());
     assert!(state.try_admit());
@@ -208,7 +182,6 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -341,7 +314,6 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
                 "cargo test".to_string()
             }),
             raw_output_artifact: None,
-            raw_output_truncated: false,
             raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
@@ -803,118 +775,6 @@ fn complete_projection_envelope_respects_applied_limit() {
             .expect("internal selected text")
     );
     assert_eq!(projected.value()["canonical_sha256"], "hash");
-}
-
-#[tokio::test]
-async fn json_row_controls_stay_bounded_and_omitted_rows_are_recoverable() {
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let invocation = test_invocation(
-        Arc::new(session),
-        Arc::new(turn),
-        "query-rows",
-        ToolName::plain("query_rows"),
-    );
-    let rows = (0..1_000)
-        .map(|id| {
-            serde_json::json!({
-                "id": id, "status": "available", "state": {"text": format!("Exact record {id}")}
-            })
-        })
-        .collect::<Vec<_>>();
-    let value = serde_json::json!({"rows": rows, "complete": false, "nextCursor": "page-2"});
-    let mut result = AnyToolResult {
-        call_id: invocation.call_id.clone(),
-        payload: invocation.payload.clone(),
-        result: Box::new(codex_tools::JsonToolOutput::new(value.clone())),
-        model_projection: None,
-        source_dependencies: None,
-        code_mode_feedback: Vec::new(),
-    };
-    let input = prepare_model_projection(&invocation, &mut result, None, None, false, true)
-        .await
-        .unwrap();
-    let limit = input.applied_token_limit;
-    assert!(input.canonical_artifact_required);
-    let projection = project_model_output(input).await.unwrap();
-    let rendered = history_output_text(&projection.response()).unwrap();
-    assert!(approx_token_count(&rendered) <= limit);
-    let (header, selected_text) = model_projection_parts(&rendered);
-    assert_eq!(header["complete"], false);
-    assert_eq!(header["nextCursor"], "page-2");
-    assert!(header.get("rows").is_none());
-    assert!(
-        !selected_text.is_empty(),
-        "row metadata must not crowd out the evidence"
-    );
-    let candidate = projection.candidate.as_ref().unwrap();
-    let recovered = crate::tools::handlers::execute_recovery_transaction_with_continuations(
-        &invocation.step_context.turn.config.codex_home,
-        &invocation.session.thread_id.to_string(),
-        &candidate.artifact_id,
-        vec![ToolOutputSelector::JsonPointer {
-            pointer: "/rows/999".into(),
-        }],
-        false,
-        &invocation.cancellation_token,
-    )
-    .await
-    .unwrap();
-    assert!(recovered.output.complete);
-    assert_eq!(
-        recovered.output.results[0].value.as_ref(),
-        Some(&value["rows"][999])
-    );
-}
-
-#[tokio::test]
-async fn mirrored_mcp_text_does_not_force_artifact_recovery() {
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let invocation = test_invocation(
-        Arc::new(session),
-        Arc::new(turn),
-        "mirrored-query",
-        ToolName::namespaced("mcp__test", "query"),
-    );
-    let limit = resolve_projected_output_limits(
-        None,
-        OutputOutcome::Success,
-        OutputDiagnosticClass::Normal,
-        DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
-    )
-    .applied_limit;
-    let structured = serde_json::json!({"text": "evidence ".repeat(limit / 3)});
-    let mcp = codex_protocol::mcp::CallToolResult {
-        content: vec![serde_json::json!({"type": "text", "text": structured.to_string()})],
-        structured_content: Some(structured.clone()),
-        is_error: Some(false),
-        meta: None,
-    };
-    assert!(approx_token_count(&structured.to_string()) < limit);
-    assert!(approx_token_count(&serde_json::to_string(&mcp).unwrap()) > limit);
-    let output = crate::tools::context::McpToolOutput::new(
-        mcp,
-        serde_json::json!({}),
-        Duration::ZERO,
-        false,
-        codex_protocol::protocol::TruncationPolicy::Tokens(limit * 2),
-    );
-    let mut result = AnyToolResult {
-        call_id: invocation.call_id.clone(),
-        payload: invocation.payload.clone(),
-        result: Box::new(output),
-        model_projection: None,
-        source_dependencies: None,
-        code_mode_feedback: Vec::new(),
-    };
-    // No history tracking: a fitting provider view needs neither projection nor
-    // a durable artifact, even when the raw MCP envelope is twice as large.
-    assert!(
-        prepare_model_projection(&invocation, &mut result, None, None, false, false)
-            .await
-            .is_none()
-    );
-    let rendered = history_output_text(&result.response()).unwrap();
-    assert_eq!(rendered.matches("evidence ").count(), limit / 3);
 }
 
 #[test]
@@ -2714,7 +2574,6 @@ fn blocking_post_tool_hook_preserves_completed_result_and_discards_context() {
         codex_hooks::PostToolUseOutcome {
             hook_events: Vec::new(),
             should_block: true,
-            stop_reason: None,
             additional_contexts: vec!["must not be injected".to_string()],
             feedback_message: Some("reject completed mutation".to_string()),
         },
@@ -2726,29 +2585,6 @@ fn blocking_post_tool_hook_preserves_completed_result_and_discards_context() {
         result.result.to_response_item("call-1", &payload),
         FunctionToolOutput::from_text("mutation completed".to_string(), Some(true))
             .to_response_item("call-1", &payload)
-    );
-}
-
-#[tokio::test]
-async fn post_tool_stop_rejects_subsequent_tool_admission() {
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
-    turn.post_tool_stop_reason.set("stop now".into()).unwrap();
-    let invocation = test_invocation(
-        Arc::new(session),
-        Arc::new(turn),
-        "later",
-        ToolName::plain("never-run"),
-    );
-    let registry = ToolRegistry::from_tools(std::iter::empty::<Arc<dyn CoreToolRuntime>>());
-    let prepared = registry.prepare_hook_input(invocation.clone()).await;
-    assert!(
-        matches!(prepared, Err(FunctionCallError::RespondToModel(ref text)) if text.contains("stop now"))
-    );
-    let dispatched = registry
-        .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
-        .await;
-    assert!(
-        matches!(dispatched, Err(FunctionCallError::RespondToModel(ref text)) if text.contains("Tool not run") && text.contains("stop now"))
     );
 }
 

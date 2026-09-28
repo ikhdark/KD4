@@ -154,7 +154,9 @@ pub(super) fn console_log_callback(
         }
     }
     if let Some(state) = scope.get_slot::<RuntimeState>() {
-        state.emit_output(FunctionCallOutputContentItem::InputText { text: output });
+        state.emit_output(FunctionCallOutputContentItem::InputText {
+            text: output,
+        });
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -261,22 +263,13 @@ pub(super) fn store_callback(
         }
     };
     let admission = scope.get_slot::<RuntimeState>().and_then(|state| {
-        if !state.stored_values.contains_key(&key)
-            && state.stored_values.len() >= MAX_SESSION_STORED_VALUES
-        {
+        if state.stored_value_limit_error.is_some()
+            || (!state.stored_values.contains_key(&key) && state.stored_values.len() >= MAX_SESSION_STORED_VALUES) {
             return None;
         }
         let key_bytes = stored_value_entry_bytes(&key, &serde_json::Value::Null).saturating_sub(4);
-        MAX_SESSION_STORED_VALUE_BYTES
-            .checked_sub(state.total_stored_value_bytes)
-            .and_then(|available| {
-                available.checked_add(
-                    state
-                        .stored_values
-                        .get(&key)
-                        .map_or(0, |stored| stored.bytes),
-                )
-            })
+        MAX_SESSION_STORED_VALUE_BYTES.checked_sub(state.total_stored_value_bytes)
+            .and_then(|available| available.checked_add(state.stored_values.get(&key).map_or(0, |stored| stored.bytes)))
             .and_then(|available| available.checked_sub(key_bytes))
     });
     let Some(max_bytes) = admission else {
@@ -303,6 +296,10 @@ pub(super) fn store_callback(
         }
     };
     let limit_error = scope.get_slot_mut::<RuntimeState>().and_then(|state| {
+        if let Some(error) = state.stored_value_limit_error.as_ref() {
+            return Some(error.clone());
+        }
+
         let stored = StoredValue::new(&key, serialized);
         let previous_bytes = state.stored_values.get(&key).map(|previous| previous.bytes);
         let total_bytes = state
@@ -314,15 +311,16 @@ pub(super) fn store_callback(
             && let Some(total_bytes) =
                 total_bytes.filter(|total| *total <= MAX_SESSION_STORED_VALUE_BYTES)
         {
-            debug_assert_eq!(
-                total_bytes,
-                state.total_stored_value_bytes - previous_bytes.unwrap_or(0) + stored.bytes
-            );
-            state.write_stored_value(key, Some(stored));
+            state.total_stored_value_bytes = total_bytes;
+            state.stored_values.insert(key.clone(), stored.clone());
+            state.stored_value_writes.insert(key, stored);
             return None;
         }
 
-        Some(stored_value_limit_message())
+        state.stored_value_writes.clear();
+        let error = stored_value_limit_message();
+        state.stored_value_limit_error = Some(error.clone());
+        Some(error)
     });
     if let Some(error) = limit_error {
         throw_type_error(scope, &error);
@@ -330,31 +328,12 @@ pub(super) fn store_callback(
 }
 
 fn reject_storage_limit(scope: &mut v8::PinScope<'_, '_>) {
-    throw_type_error(scope, &stored_value_limit_message());
-}
-
-pub(super) fn remove_store_callback(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue<v8::Value>,
-) {
-    let Some(key) = args.get(0).to_string(scope) else {
-        throw_type_error(scope, "store key must be a string");
-        return;
-    };
-    let key = match super::value::bounded_string(scope, key, MAX_SESSION_STORED_VALUE_BYTES) {
-        Ok(key) => key,
-        Err(_) => {
-            reject_storage_limit(scope);
-            return;
-        }
-    };
-    let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
-        return;
-    };
-    let removed = state.stored_values.contains_key(&key);
-    state.write_stored_value(key, None);
-    retval.set_bool(removed);
+    let error = stored_value_limit_message();
+    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+        state.stored_value_writes.clear();
+        state.stored_value_limit_error = Some(error.clone());
+    }
+    throw_type_error(scope, &error);
 }
 
 pub(super) fn load_callback(
@@ -397,11 +376,7 @@ pub(super) fn notify_callback(
     } else {
         args.get(0)
     };
-    let text = match super::value::serialize_output_text_with_limit(
-        scope,
-        value,
-        super::value::MAX_NOTIFICATION_BYTES,
-    ) {
+    let text = match super::value::serialize_output_text_with_limit(scope, value, super::value::MAX_NOTIFICATION_BYTES) {
         Ok(text) => text,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
@@ -443,19 +418,10 @@ pub(super) fn notify_callback(
     retval.set(promise.into());
 }
 
-fn skip_output_conversion(
-    scope: &mut v8::PinScope<'_, '_>,
-    value: v8::Local<'_, v8::Value>,
-) -> bool {
-    let bytes = v8::Local::<v8::String>::try_from(value)
-        .map(|value| value.utf8_length(scope))
-        .unwrap_or(0);
-    let Some(state) = scope.get_slot::<RuntimeState>() else {
-        return false;
-    };
-    let Some(event) = state.output_admission.reject_before_conversion(bytes) else {
-        return false;
-    };
+fn skip_output_conversion(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> bool {
+    let bytes = v8::Local::<v8::String>::try_from(value).map(|value| value.utf8_length(scope)).unwrap_or(0);
+    let Some(state) = scope.get_slot::<RuntimeState>() else { return false; };
+    let Some(event) = state.output_admission.reject_before_conversion(bytes) else { return false; };
     if let Some(event) = event {
         let _ = state.event_tx.send(event);
     }

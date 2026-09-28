@@ -38,20 +38,6 @@ const LOCAL_SECRETS_FILENAME: &str = "local.age";
 const CODEX_AUTH_SECRETS_FILENAME: &str = "codex_auth.age";
 const MCP_OAUTH_SECRETS_FILENAME: &str = "mcp_oauth.age";
 
-/// Reuses decryption only within an explicitly owned batch of credential reads.
-/// Callers must drop the cache when that operation finishes. SecretString zeroizes
-/// the cached key and plaintext; no process-global credential cache is retained.
-#[derive(Debug, Default)]
-pub struct LocalSecretsReadCache(std::sync::Mutex<Option<CachedSecrets>>);
-
-#[derive(Debug)]
-struct CachedSecrets {
-    path: PathBuf,
-    ciphertext: Vec<u8>,
-    passphrase: SecretString,
-    plaintext: SecretString,
-}
-
 /// Selects the local encrypted file used by a `LocalSecretsBackend`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LocalSecretsNamespace {
@@ -121,16 +107,6 @@ impl LocalSecretsBackend {
         Ok(file.secrets.get(&canonical_key).cloned())
     }
 
-    pub fn get_with_read_cache(
-        &self,
-        scope: &SecretScope,
-        name: &SecretName,
-        cache: &LocalSecretsReadCache,
-    ) -> Result<Option<String>> {
-        let file = self.load_file_with_cache(Some(cache))?;
-        Ok(file.secrets.get(&scope.canonical_key(name)).cloned())
-    }
-
     pub fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
         let canonical_key = scope.canonical_key(name);
         let mut file = self.load_file()?;
@@ -173,10 +149,6 @@ impl LocalSecretsBackend {
     }
 
     fn load_file(&self) -> Result<SecretsFile> {
-        self.load_file_with_cache(None)
-    }
-
-    fn load_file_with_cache(&self, cache: Option<&LocalSecretsReadCache>) -> Result<SecretsFile> {
         let path = self.secrets_path();
         if !path.exists() {
             return Ok(SecretsFile::new_empty());
@@ -185,39 +157,13 @@ impl LocalSecretsBackend {
         let ciphertext = fs::read(&path)
             .with_context(|| format!("failed to read secrets file at {}", path.display()))?;
         let passphrase = self.load_or_create_passphrase()?;
-        let mut cached = cache.map(|cache| {
-            cache
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
-        // Validate actual bytes and the current keyring authority, not timestamps.
-        let hit = cached
-            .as_ref()
-            .and_then(|entry| entry.as_ref())
-            .filter(|entry| {
-                entry.path == path
-                    && entry.ciphertext == ciphertext
-                    && entry.passphrase.expose_secret() == passphrase.expose_secret()
-            });
-        let plaintext = if let Some(hit) = hit {
-            hit.plaintext.clone()
-        } else {
-            if let Some(cached) = cached.as_mut() {
-                **cached = None;
-            }
-            SecretString::from(
-                String::from_utf8(decrypt_with_passphrase(&ciphertext, &passphrase)?)
-                    .context("decrypted secrets are not UTF-8")?,
+        let plaintext = decrypt_with_passphrase(&ciphertext, &passphrase)?;
+        let mut parsed: SecretsFile = serde_json::from_slice(&plaintext).with_context(|| {
+            format!(
+                "failed to deserialize decrypted secrets file at {}",
+                path.display()
             )
-        };
-        let mut parsed: SecretsFile = serde_json::from_str(plaintext.expose_secret())
-            .with_context(|| {
-                format!(
-                    "failed to deserialize decrypted secrets file at {}",
-                    path.display()
-                )
-            })?;
+        })?;
         if parsed.version == 0 {
             parsed.version = SECRETS_VERSION;
         }
@@ -227,16 +173,6 @@ impl LocalSecretsBackend {
             parsed.version,
             SECRETS_VERSION
         );
-        if let Some(cached) = cached.as_mut()
-            && cached.is_none()
-        {
-            **cached = Some(CachedSecrets {
-                path,
-                ciphertext,
-                passphrase,
-                plaintext,
-            });
-        }
         Ok(parsed)
     }
 

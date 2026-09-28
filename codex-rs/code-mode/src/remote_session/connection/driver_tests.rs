@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::NestedCancellation;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
@@ -27,6 +26,7 @@ use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::ConnectionDriver;
@@ -442,10 +442,7 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest {
-                id: request_id,
-                cause: None,
-            },
+            HostToClient::CancelDelegateRequest { id: request_id, cause: None },
         ))
         .await
         .expect("delegate cancel");
@@ -504,10 +501,7 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest {
-                id: delegate_id,
-                cause: None,
-            },
+            HostToClient::CancelDelegateRequest { id: delegate_id, cause: None },
         ))
         .await
         .expect("delegate cancel");
@@ -542,10 +536,7 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
     assert!(closure_events.contains(&HeldDelegateEvent::Cancelled));
     assert!(closure_events.contains(&HeldDelegateEvent::CellClosed(CellId::new("1".to_string()))));
     assert_eq!(
-        response_rx
-            .await
-            .expect("terminate reply")
-            .map(crate::delivery::Delivery::claim),
+        response_rx.await.expect("terminate reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Terminated {
                 cell_id: CellId::new("1".to_string()),
@@ -603,10 +594,7 @@ async fn shutdown_closes_cell_without_waiting_for_delegate_cleanup() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest {
-                id: delegate_id,
-                cause: None,
-            },
+            HostToClient::CancelDelegateRequest { id: delegate_id, cause: None },
         ))
         .await
         .expect("delegate cancel");
@@ -1033,10 +1021,7 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
         .expect("wait response");
 
     assert_eq!(
-        response_rx
-            .await
-            .expect("wait reply")
-            .map(crate::delivery::Delivery::claim),
+        response_rx.await.expect("wait reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Yielded {
                 cell_id: CellId::new("1".to_string()),
@@ -1127,10 +1112,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         .expect("second wait response");
 
     assert_eq!(
-        second_rx
-            .await
-            .expect("second wait reply")
-            .map(crate::delivery::Delivery::claim),
+        second_rx.await.expect("second wait reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Yielded {
                 cell_id: CellId::new("1".to_string()),
@@ -1138,126 +1120,6 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
             }
         ))
     );
-}
-
-#[tokio::test]
-async fn delivered_but_unconsumed_remote_output_survives_wait_or_termination() {
-    for terminate in [false, true] {
-        let mut harness = DriverHarness::start();
-        let session = remote_session();
-        harness
-            .open(session.clone(), Arc::new(RecordingDelegate::default()))
-            .await;
-        let _started = harness.start_cell(session.clone(), 2, "1").await;
-        let (response_tx, response_rx) = oneshot::channel();
-        let request = WaitRequest {
-            cell_id: CellId::new("1".to_string()),
-            yield_time_ms: 60_000,
-        };
-        harness
-            .command_tx
-            .send(DriverCommand::Wait {
-                session: session.clone(),
-                request: request.clone(),
-                caller_cancellation: CancellationToken::new(),
-                response_tx,
-            })
-            .await
-            .unwrap();
-        harness.outgoing_rx.recv().await.unwrap();
-        let content_items = vec![
-            codex_code_mode_protocol::FunctionCallOutputContentItem::InputText {
-                text: "expensive tool evidence".to_string(),
-            },
-        ];
-        harness
-            .event_tx
-            .send(DriverEvent::HostMessage(HostToClient::Response {
-                id: RequestId::new(3),
-                result: WireResult::Ok {
-                    value: HostResponse::WaitCompleted {
-                        outcome: WireWaitOutcome::LiveCell(
-                            codex_code_mode_protocol::RuntimeResponse::ExplicitYield {
-                                cell_id: request.cell_id.clone(),
-                                content_items: content_items.clone(),
-                            }
-                            .into(),
-                        ),
-                    },
-                },
-            }))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while response_rx.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("response sent before receiver cancellation");
-        drop(response_rx);
-        let (response_tx, response_rx) = oneshot::channel();
-        let command = if terminate {
-            DriverCommand::Terminate {
-                session,
-                cell_id: request.cell_id.clone(),
-                response_tx,
-            }
-        } else {
-            DriverCommand::Wait {
-                session,
-                request: request.clone(),
-                caller_cancellation: CancellationToken::new(),
-                response_tx,
-            }
-        };
-        harness.command_tx.send(command).await.unwrap();
-        if terminate {
-            harness.outgoing_rx.recv().await.unwrap();
-            harness
-                .event_tx
-                .send(DriverEvent::HostMessage(HostToClient::Response {
-                    id: RequestId::new(4),
-                    result: WireResult::Ok {
-                        value: HostResponse::WaitCompleted {
-                            outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
-                                cell_id: request.cell_id.clone().into(),
-                                content_items: Vec::new(),
-                            }),
-                        },
-                    },
-                }))
-                .await
-                .unwrap();
-        }
-        let recovered = tokio::time::timeout(Duration::from_secs(1), response_rx)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-            .claim();
-        let expected = if terminate {
-            codex_code_mode_protocol::RuntimeResponse::Terminated {
-                cell_id: request.cell_id,
-                content_items,
-            }
-        } else {
-            codex_code_mode_protocol::RuntimeResponse::ExplicitYield {
-                cell_id: request.cell_id,
-                content_items,
-            }
-        };
-        assert_eq!(
-            recovered,
-            codex_code_mode_protocol::WaitOutcome::LiveCell(expected)
-        );
-        assert!(matches!(
-            harness.outgoing_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        harness.cancellation.cancel();
-        (&mut harness.driver_task).await.unwrap();
-    }
 }
 
 #[tokio::test]

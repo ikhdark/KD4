@@ -11,15 +11,12 @@ use serde_json::json;
 
 use crate::FunctionCallError;
 use crate::tools::command_output_artifact::CanonicalOutputArtifact;
-use crate::tools::command_output_artifact::ReadToolOutputResult;
 use crate::tools::command_output_artifact::ToolOutputSelector;
-use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::select_file_snapshot;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::context::semantic_evidence_sampling_signal;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS;
 use crate::tools::handlers::read_tool_output_spec::file_selector_schema;
@@ -121,17 +118,13 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // The catalog advertises `skill:<id>` locators, so this tool has to
             // resolve them. Without it the model can see every skill listed and
             // load none of them.
-            let skill_locator = args
+            let (contents, resolved_path) = if args
                 .path
                 .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
-                .then(|| args.path.clone());
-            let (contents, resolved_path, environment_id) = if skill_locator.is_some() {
-                let (contents, path) = read_skill_locator(&invocation, &args).await?;
-                (contents, path, None)
+            {
+                read_skill_locator(&invocation, &args).await?
             } else {
-                let (contents, path, environment_id) =
-                    read_environment_file(&invocation, &args).await?;
-                (contents, path, Some(environment_id))
+                read_environment_file(&invocation, &args).await?
             };
             if invocation.cancellation_token.is_cancelled() {
                 return Err(FunctionCallError::RespondToModel(
@@ -155,12 +148,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 })?
                 .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
             let file_complete = !explicit_selection && continuation.is_none();
-            let signal = file_read_sampling_signal(
-                &result,
-                &resolved_path,
-                environment_id.as_deref(),
-                skill_locator.as_deref(),
-            );
             // Explicit selections retain the existing immutable-snapshot contract.
             // Complete default reads stay inline; omitted bytes need one durable
             // snapshot, but selecting them never rereads the file just written.
@@ -226,50 +213,16 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             if let Some(error) = snapshot_error {
                 output["snapshot_error"] = json!(error);
             }
-            let mut output = JsonToolOutput::new(output);
-            if let Some(signal) = signal {
-                output = output.with_sampling_request_signal(signal);
-            }
-            Ok(boxed_tool_output(output))
+            Ok(boxed_tool_output(JsonToolOutput::new(output)))
         })
     }
-}
-
-fn file_read_sampling_signal(
-    result: &ReadToolOutputResult,
-    path: &str,
-    environment_id: Option<&str>,
-    skill_locator: Option<&str>,
-) -> Option<serde_json::Value> {
-    let observed = result
-        .results
-        .iter()
-        .filter(|selected| {
-            selected.status == ToolOutputSelectorStatus::Ok
-                && (selected.text.is_some()
-                    || selected.value.is_some()
-                    || selected.data_base64.is_some())
-        })
-        .collect::<Vec<_>>();
-    if observed.is_empty() {
-        return None;
-    }
-    // Only delivered selections are evidence. Neither a new snapshot ID nor
-    // changes elsewhere in the full file renew the no-progress allowance.
-    let identity = crate::tool_history::sha256(&serde_json::to_vec(&observed).ok()?);
-    Some(semantic_evidence_sampling_signal(json!({
-        "source": path,
-        "scope": {"environment_id": environment_id, "skill_locator": skill_locator,
-            "selectors": observed.iter().map(|selected| &selected.selector).collect::<Vec<_>>()},
-        "identity": identity,
-    })))
 }
 
 /// Reads an ordinary path through the selected environment's filesystem.
 async fn read_environment_file(
     invocation: &ToolInvocation,
     args: &ReadFileArgs,
-) -> Result<(String, String, String), FunctionCallError> {
+) -> Result<(String, String), FunctionCallError> {
     let environment = resolve_tool_environment(
         &invocation.step_context.environments,
         args.environment_id.as_deref(),
@@ -322,11 +275,7 @@ async fn read_environment_file(
     let contents = String::from_utf8(contents).map_err(|_| {
         FunctionCallError::RespondToModel("read_file requires UTF-8 text".to_string())
     })?;
-    Ok((
-        contents,
-        path.inferred_native_path_string(),
-        environment.environment_id.clone(),
-    ))
+    Ok((contents, path.inferred_native_path_string()))
 }
 
 /// Reads a `skill:<catalog-id>` locator through the provider that discovered
@@ -414,30 +363,6 @@ mod tests {
                 arguments: json!({"path": path, "selectors": selectors}).to_string(),
             },
         }
-    }
-
-    #[test]
-    fn file_evidence_requires_delivered_selections_and_preserves_scope() {
-        let canonical = CanonicalToolResult::text("observed\n".to_string());
-        let (mut result, _) = select_file_snapshot(&canonical, None).unwrap();
-        let complete = file_read_sampling_signal(&result, "source", Some("local"), None).unwrap();
-        assert_ne!(
-            file_read_sampling_signal(&result, "source", Some("remote"), None),
-            Some(complete.clone())
-        );
-        assert_ne!(
-            file_read_sampling_signal(&result, "other-source", Some("local"), None),
-            Some(complete.clone())
-        );
-        result.results[0].complete = false;
-        assert_ne!(
-            file_read_sampling_signal(&result, "source", Some("local"), None),
-            Some(complete)
-        );
-        result.results[0].status = ToolOutputSelectorStatus::Invalid;
-        assert!(file_read_sampling_signal(&result, "source", Some("local"), None).is_none());
-        result.results[0].status = ToolOutputSelectorStatus::AggregateOmitted;
-        assert!(file_read_sampling_signal(&result, "source", Some("local"), None).is_none());
     }
 
     #[tokio::test]

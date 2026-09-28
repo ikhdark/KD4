@@ -2052,7 +2052,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
     let backwards_cursor = backwards_cursor.expect("expected backwardsCursor on first page");
     assert_eq!(
         backwards_cursor,
-        format!("thread-list-v1:state-db:2025-02-03T00:00:00.000Z|{id_watermark}")
+        "thread-list-v1:state-db:2025-02-02T23:59:59.999Z"
     );
 
     let id_new = create_fake_rollout(
@@ -2117,7 +2117,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
         to_response::<ThreadListResponse>(resp)?
     };
     let ids_delta: Vec<_> = delta_page.iter().map(|thread| thread.id.as_str()).collect();
-    assert_eq!(ids_delta, vec![id_new.as_str()]);
+    assert_eq!(ids_delta, vec![id_watermark.as_str(), id_new.as_str()]);
 
     Ok(())
 }

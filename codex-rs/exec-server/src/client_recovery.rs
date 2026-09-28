@@ -22,13 +22,13 @@ use super::fail_all_in_flight_work;
 use super::handle_server_notification;
 use super::is_transport_closed_error;
 use crate::client_transport::ExecServerReconnectStrategy;
-use crate::client_transport::is_noise_bundle_refresh_error;
 use crate::process::ExecProcessEvent;
 use crate::protocol::EXEC_READ_METHOD;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::rpc::RpcClient;
 use crate::rpc::RpcClientEvent;
+use crate::rpc::SESSION_ALREADY_ATTACHED_ERROR_CODE;
 
 #[cfg(test)]
 const SESSION_RECOVERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -405,7 +405,7 @@ impl Inner {
                         return;
                     }
                 }
-                Ok(Err(error)) if !is_retryable_recovery_error(&error, uses_registry_backoff) => {
+                Ok(Err(error)) if !is_retryable_recovery_error(&error) => {
                     break error.to_string();
                 }
                 Ok(Err(_)) => {}
@@ -606,19 +606,21 @@ impl ExecServerClient {
     }
 }
 
-pub(super) fn is_retryable_recovery_error(
-    mut error: &ExecServerError,
-    refresh_noise_bundle: bool,
-) -> bool {
-    while let ExecServerError::ConnectionAttempt(source) = error {
-        error = source;
-    }
+pub(super) fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
     is_transport_closed_error(error)
-        || error.is_retryable_preparation_error()
-        || matches!(error, ExecServerError::EnvironmentInfoTimedOut { .. })
-        // Only Noise can change the rejected credentials by obtaining a fresh,
-        // single-use bundle. Retrying an unchanged plain WebSocket URL cannot.
-        || (refresh_noise_bundle && is_noise_bundle_refresh_error(error))
+        || matches!(
+            error,
+            ExecServerError::WebSocketConnectTimeout { .. }
+                | ExecServerError::WebSocketConnect { .. }
+                | ExecServerError::InitializeTimedOut { .. }
+                | ExecServerError::EnvironmentInfoTimedOut { .. }
+        )
+        || is_retryable_registry_error(error)
+        || matches!(
+            error,
+            ExecServerError::Server { code, .. }
+                if *code == SESSION_ALREADY_ATTACHED_ERROR_CODE
+        )
 }
 
 pub(crate) fn is_retryable_registry_error(error: &ExecServerError) -> bool {

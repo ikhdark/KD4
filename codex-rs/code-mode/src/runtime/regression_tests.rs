@@ -12,13 +12,7 @@ use tokio::sync::mpsc;
 
 use super::*;
 
-async fn start(
-    source: &str,
-) -> (
-    std_mpsc::Sender<RuntimeCommand>,
-    RuntimeTerminationHandle,
-    mpsc::UnboundedReceiver<RuntimeEvent>,
-) {
+async fn start(source: &str) -> (std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle, mpsc::UnboundedReceiver<RuntimeEvent>) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let request = ExecuteRequest {
         tool_call_id: "regression".to_string(),
@@ -36,16 +30,8 @@ async fn start(
         max_output_tokens: None,
         default_tool_timeout_ms: None,
     };
-    let (tx, termination) = spawn_runtime(
-        HashMap::new(),
-        request,
-        60_000,
-        event_tx,
-        Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
-        None,
-    )
-    .await
-    .unwrap();
+    let (tx, termination) = spawn_runtime(HashMap::new(), request, 60_000, event_tx,
+        Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
     assert!(matches!(next(&mut event_rx).await, RuntimeEvent::Started));
     (tx, termination, event_rx)
 }
@@ -76,60 +62,28 @@ async fn pending_checks_do_not_collect_writes_and_response_heap_does_not_accumul
     let (tx, _termination, mut rx) = start(r#"
         store("payload", "x".repeat(1_000_000));
         for (let i = 0; i < 65; i++) await tools.sample_tool({});
-    "#,
-    )
-    .await;
-    let RuntimeEvent::ToolCall { mut id, .. } = next(&mut rx).await else {
-        panic!("tool call");
-    };
+    "#).await;
+    let RuntimeEvent::ToolCall { mut id, .. } = next(&mut rx).await else { panic!("tool call"); };
     let baseline = inspect(&tx).await;
     assert_ne!(baseline.stored_payload_address, 0);
     assert!(baseline.stored_payload_shared, "store must share its immutable payload");
     assert_eq!(baseline.completion_collections, 0);
     for _ in 0..64 {
-        tx.send(RuntimeCommand::ToolResponse {
-            id,
-            result: json!({"data": "r".repeat(1_000_000)}),
-        })
-        .unwrap();
-        let RuntimeEvent::ToolCall { id: next_id, .. } = next(&mut rx).await else {
-            panic!("next tool call");
-        };
+        tx.send(RuntimeCommand::ToolResponse { id, result: json!({"data": "r".repeat(1_000_000)}) }).unwrap();
+        let RuntimeEvent::ToolCall { id: next_id, .. } = next(&mut rx).await else { panic!("next tool call"); };
         id = next_id;
     }
     let after = inspect(&tx).await;
     assert_eq!(after.completion_collections, 0);
-    assert_eq!(
-        after.stored_payload_address,
-        baseline.stored_payload_address
-    );
-    assert!(
-        after.heap_bytes < baseline.heap_bytes + 4 * 1024 * 1024,
-        "discarded responses survived GC: {baseline:?} -> {after:?}"
-    );
-    tx.send(RuntimeCommand::ToolResponse {
-        id,
-        result: json!(null),
-    })
-    .unwrap();
-    let RuntimeEvent::Result {
-        stored_value_writes,
-        error_text,
-        output_loss,
-    } = next(&mut rx).await
-    else {
-        panic!("result");
-    };
+    assert_eq!(after.stored_payload_address, baseline.stored_payload_address);
+    assert!(after.heap_bytes < baseline.heap_bytes + 4 * 1024 * 1024,
+        "discarded responses survived GC: {baseline:?} -> {after:?}");
+    tx.send(RuntimeCommand::ToolResponse { id, result: json!(null) }).unwrap();
+    let RuntimeEvent::Result { stored_value_writes, error_text, output_loss } = next(&mut rx).await else { panic!("result"); };
     assert_eq!(error_text, None);
     assert_eq!(output_loss, None);
     assert_eq!(stored_value_writes.len(), 1);
-    let payload = stored_value_writes["payload"]
-        .value
-        .as_ref()
-        .unwrap()
-        .value
-        .as_str()
-        .unwrap();
+    let payload = stored_value_writes["payload"].value.as_str().unwrap();
     assert_eq!(payload, "x".repeat(1_000_000));
     assert_eq!(payload.as_ptr() as usize, baseline.stored_payload_address, "finalization must move, not clone");
     closed(&mut rx).await;
@@ -137,10 +91,7 @@ async fn pending_checks_do_not_collect_writes_and_response_heap_does_not_accumul
 
 #[tokio::test]
 async fn cancellation_exits_cpu_idle_and_unclaimed_startup_threads() {
-    for source in [
-        "text('entered'); while (true) {}",
-        "text('entered'); await new Promise(() => {});",
-    ] {
+    for source in ["text('entered'); while (true) {}", "text('entered'); await new Promise(() => {});"] {
         for unclaimed in [false, true] {
             let (release_tx, release_rx) = std_mpsc::channel();
             release_tx.send(()).unwrap();
@@ -179,14 +130,8 @@ async fn disconnected_host_stops_new_tool_and_notification_requests() {
         let (tx, _termination, mut rx) = STARTUP_TEST_GATE.scope(Arc::clone(&gate), start(&source)).await;
         let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else { panic!("tool call"); };
         drop(rx);
-        tx.send(RuntimeCommand::ToolResponse {
-            id,
-            result: json!(null),
-        })
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), gate.exited.notified())
-            .await
-            .expect("disconnected host must not strand runtime");
+        tx.send(RuntimeCommand::ToolResponse { id, result: json!(null) }).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.exited.notified()).await.expect("disconnected host must not strand runtime");
     }
 }
 
@@ -208,23 +153,9 @@ async fn payload_limits_reject_without_queueing_large_values() {
     assert_eq!(text(next(&mut rx).await), "[true,true,true]");
     let RuntimeEvent::ToolCall { id, input, .. } = next(&mut rx).await else { panic!("admitted barrier call"); };
     assert_eq!(input, Some(json!({})));
-    assert!(
-        inspect(&tx).await.rust_conversion_bytes < 1024,
-        "rejected payloads must not be copied into Rust"
-    );
-    tx.send(RuntimeCommand::ToolResponse {
-        id,
-        result: json!(null),
-    })
-    .unwrap();
-    assert!(matches!(
-        next(&mut rx).await,
-        RuntimeEvent::Result {
-            error_text: None,
-            output_loss: None,
-            ..
-        }
-    ));
+    assert!(inspect(&tx).await.rust_conversion_bytes < 1024, "rejected payloads must not be copied into Rust");
+    tx.send(RuntimeCommand::ToolResponse { id, result: json!(null) }).unwrap();
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text: None, output_loss: None, .. }));
     closed(&mut rx).await;
 }
 
@@ -248,24 +179,9 @@ async fn full_callback_capacity_does_not_run_json_conversion() {
         assert_eq!(input, Some(json!({})));
         ids.push(id);
     }
-    assert_eq!(
-        text(next(&mut rx).await),
-        r#"{"conversions":0,"failures":[true,true]}"#
-    );
-    for id in ids {
-        tx.send(RuntimeCommand::ToolResponse {
-            id,
-            result: json!(null),
-        })
-        .unwrap();
-    }
-    assert!(matches!(
-        next(&mut rx).await,
-        RuntimeEvent::Result {
-            error_text: None,
-            ..
-        }
-    ));
+    assert_eq!(text(next(&mut rx).await), r#"{"conversions":0,"failures":[true,true]}"#);
+    for id in ids { tx.send(RuntimeCommand::ToolResponse { id, result: json!(null) }).unwrap(); }
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text: None, .. }));
     closed(&mut rx).await;
 }
 
@@ -278,30 +194,13 @@ async fn standard_errors_and_console_diagnostics_survive_recovery() {
         const circular = {}; circular.self = circular;
         console.error(new Error('diagnostic'), circular);
         text('recovered');
-    "#,
-    )
-    .await;
-    assert_eq!(
-        text(next(&mut rx).await),
-        r#"[true,"setTimeout expects a function callback"]"#
-    );
-    let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else {
-        panic!("tool call");
-    };
-    tx.send(RuntimeCommand::ToolError {
-        id,
-        error_text: "tool failed".to_string(),
-    })
-    .unwrap();
+    "#).await;
+    assert_eq!(text(next(&mut rx).await), r#"[true,"setTimeout expects a function callback"]"#);
+    let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else { panic!("tool call"); };
+    tx.send(RuntimeCommand::ToolError { id, error_text: "tool failed".to_string() }).unwrap();
     assert_eq!(text(next(&mut rx).await), r#"[true,"tool failed"]"#);
-    let RuntimeEvent::Notify { id: Some(id), .. } = next(&mut rx).await else {
-        panic!("notification");
-    };
-    tx.send(RuntimeCommand::NotificationError {
-        id,
-        error_text: "notification failed".to_string(),
-    })
-    .unwrap();
+    let RuntimeEvent::Notify { id: Some(id), .. } = next(&mut rx).await else { panic!("notification"); };
+    tx.send(RuntimeCommand::NotificationError { id, error_text: "notification failed".to_string() }).unwrap();
     assert_eq!(text(next(&mut rx).await), r#"[true,"notification failed"]"#);
     let diagnostic = text(next(&mut rx).await);
     assert!(diagnostic.contains("Error: diagnostic"), "{diagnostic}");
@@ -316,22 +215,10 @@ async fn standard_errors_and_console_diagnostics_survive_recovery() {
 async fn async_rejections_are_reported_unless_a_handler_is_attached() {
     for (source, expected_error) in [
         ("await Promise.resolve();", None),
-        (
-            "await Promise.reject(new Error('awaited failure'));",
-            Some("awaited failure"),
-        ),
-        (
-            "const p = Promise.reject(new Error('handled')); await Promise.resolve(); p.catch(() => {});",
-            None,
-        ),
-        (
-            "Promise.reject(new Error('unhandled failure')); await new Promise(() => {});",
-            Some("Unhandled promise rejection: Error: unhandled failure"),
-        ),
-        (
-            "setTimeout(async () => { throw new Error('callback failed'); }, 0); await new Promise(resolve => setTimeout(resolve, 20));",
-            Some("Unhandled promise rejection: Error: callback failed"),
-        ),
+        ("await Promise.reject(new Error('awaited failure'));", Some("awaited failure")),
+        ("const p = Promise.reject(new Error('handled')); await Promise.resolve(); p.catch(() => {});", None),
+        ("Promise.reject(new Error('unhandled failure')); await new Promise(() => {});", Some("Unhandled promise rejection: Error: unhandled failure")),
+        ("setTimeout(async () => { throw new Error('callback failed'); }, 0); await new Promise(resolve => setTimeout(resolve, 20));", Some("Unhandled promise rejection: Error: callback failed")),
     ] {
         let (_tx, _termination, mut rx) = start(source).await;
         let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else { panic!("terminal result for {source}"); };
@@ -351,180 +238,7 @@ async fn images_require_a_supported_base64_payload() {
         image('DATA:image/png;base64,AAAA');
     "#).await;
     assert_eq!(text(next(&mut rx).await), "[true,true,true,true,true]");
-    assert!(
-        matches!(next(&mut rx).await, RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputImage { image_url, .. }, .. } if image_url == "DATA:image/png;base64,AAAA")
-    );
-    assert!(matches!(
-        next(&mut rx).await,
-        RuntimeEvent::Result {
-            error_text: None,
-            ..
-        }
-    ));
-    closed(&mut rx).await;
-}
-
-#[tokio::test]
-async fn handled_rejection_overflow_preserves_awaited_tool_work() {
-    for count in [
-        MAX_OUTSTANDING_CALLBACKS_PER_CELL,
-        MAX_OUTSTANDING_CALLBACKS_PER_CELL + 1,
-        1024,
-    ] {
-        let source = format!(
-            r#"
-            for (let batch = 0; batch < 2; batch++) {{
-                const results = await Promise.allSettled(Array.from({{length: {count}}},
-                    () => Promise.reject(new Error('handled'))));
-                text(results.length === {count} && results.every(result =>
-                    result.status === 'rejected' && result.reason.message === 'handled'));
-            }}
-            text(await tools.sample_tool({{}}));
-        "#
-        );
-        let (tx, _termination, mut rx) = start(&source).await;
-        assert_eq!(text(next(&mut rx).await), "true");
-        assert_eq!(text(next(&mut rx).await), "true");
-        let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else {
-            panic!("handled rejections must not cancel the awaited tool");
-        };
-        tx.send(RuntimeCommand::ToolResponse {
-            id,
-            result: json!("tool completed"),
-        })
-        .unwrap();
-        assert_eq!(text(next(&mut rx).await), "tool completed");
-        assert!(matches!(
-            next(&mut rx).await,
-            RuntimeEvent::Result {
-                error_text: None,
-                output_loss: None,
-                ..
-            }
-        ));
-        closed(&mut rx).await;
-    }
-}
-
-#[tokio::test]
-async fn rejection_overflow_preserves_unhandled_errors_and_root_diagnostics() {
-    let rejected = format!(
-        "const jobs = Array.from({{length: {}}}, (_, i) => Promise.reject(new Error('failure-' + i)));",
-        MAX_OUTSTANDING_CALLBACKS_PER_CELL + 1,
-    );
-    for (tail, expected) in [
-        (
-            "await Promise.allSettled(jobs.slice(0, -1));",
-            "unhandled promise rejection tracking limit",
-        ),
-        (
-            "await Promise.allSettled(jobs.slice(1));",
-            "Unhandled promise rejection: Error: failure-0",
-        ),
-        (
-            "await Promise.allSettled(jobs); throw new Error('root after overflow');",
-            "Error: root after overflow",
-        ),
-        (
-            "Promise.resolve().then(() => Promise.allSettled(jobs)); throw new Error('root before handlers');",
-            "Error: root before handlers",
-        ),
-    ] {
-        let source = format!("{rejected}\n{tail}");
-        let (_tx, _termination, mut rx) = start(&source).await;
-        let RuntimeEvent::Result {
-            error_text: Some(error),
-            ..
-        } = next(&mut rx).await
-        else {
-            panic!("expected a genuine rejection for {tail}");
-        };
-        assert!(error.contains(expected), "{tail}: {error}");
-        closed(&mut rx).await;
-    }
-}
-
-#[tokio::test]
-async fn mcp_images_use_the_image_budget_and_ignore_unrelated_fields() {
-    let data_bytes = value::MAX_PAYLOAD_BYTES + 4;
-    let source = format!(
-        r#"
-        const data = 'AAAA'.repeat({data_bytes} / 4);
-        const block = {{
-            type: 'image', data, mime_type: 'image/png',
-            _meta: {{'codex/imageDetail': 'original'}},
-            unused: {{toJSON() {{ throw new Error('unrelated field was serialized'); }}}},
-        }};
-        image(block);
-        image({{...block, data: 'data:image/png;base64,' + data}}, 'low');
-    "#
-    );
-    let (_tx, _termination, mut rx) = start(&source).await;
-    let expected_url = format!("data:image/png;base64,{}", "AAAA".repeat(data_bytes / 4));
-    for expected_detail in [
-        codex_code_mode_protocol::ImageDetail::Original,
-        codex_code_mode_protocol::ImageDetail::Low,
-    ] {
-        let RuntimeEvent::ContentItem {
-            item: FunctionCallOutputContentItem::InputImage { image_url, detail },
-            ..
-        } = next(&mut rx).await
-        else {
-            panic!("large MCP image must be emitted");
-        };
-        assert_eq!(image_url, expected_url);
-        assert_eq!(detail, Some(expected_detail));
-    }
-    assert!(matches!(
-        next(&mut rx).await,
-        RuntimeEvent::Result {
-            error_text: None,
-            output_loss: None,
-            ..
-        }
-    ));
-    closed(&mut rx).await;
-}
-
-#[tokio::test]
-async fn mcp_images_reject_invalid_fields_and_oversized_data_before_copying() {
-    let source = format!(
-        r#"
-        const invalid = [
-            {{type: 'text', data: 'AAAA'}},
-            {{type: 'image', data: ''}},
-            {{type: 'image', data: 7}},
-            {{type: 'image', mimeType: 'text/plain', data: 'AAAA'}},
-            {{type: 'image', mimeType: 'image/png', data: '!!!!'}},
-            {{type: 'image', data: 'A'.repeat({MAX_BUFFERED_OUTPUT_BYTES} + 4)}},
-        ];
-        text(invalid.map(block => {{
-            try {{ image(block); return false; }} catch (error) {{ return error instanceof TypeError; }}
-        }}));
-        await tools.sample_tool({{}});
-    "#
-    );
-    let (tx, _termination, mut rx) = start(&source).await;
-    assert_eq!(text(next(&mut rx).await), "[true,true,true,true,true,true]");
-    let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else {
-        panic!("barrier tool call");
-    };
-    assert!(
-        inspect(&tx).await.rust_conversion_bytes < 1024,
-        "oversized image data must not be copied into Rust"
-    );
-    tx.send(RuntimeCommand::ToolResponse {
-        id,
-        result: json!(null),
-    })
-    .unwrap();
-    assert!(matches!(
-        next(&mut rx).await,
-        RuntimeEvent::Result {
-            error_text: None,
-            output_loss: None,
-            ..
-        }
-    ));
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputImage { image_url, .. }, .. } if image_url == "DATA:image/png;base64,AAAA"));
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text: None, .. }));
     closed(&mut rx).await;
 }

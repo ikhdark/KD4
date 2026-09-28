@@ -64,7 +64,6 @@ impl SkillProvider for ExecutorSkillProvider {
                     self.restriction_product,
                 )
                 .await;
-                catalog.retryable_errors |= outcome.retryable_errors;
                 catalog.warnings.extend(outcome.warnings);
                 catalog.extend_entries(outcome.skills.iter().map(|skill| {
                     catalog_entry_from_skill(

@@ -133,22 +133,11 @@ impl WorldStateSection for AgentsMdState {
         previous: PreviousSectionState<'_, Self::Snapshot>,
     ) -> Option<Box<dyn ContextualUserFragment>> {
         let current = self.snapshot();
-        if matches!(previous, PreviousSectionState::Known(previous) if previous == &current) {
+        if matches!(previous, PreviousSectionState::Known(previous)
+            if previous.directory == current.directory
+                && previous.text.is_none() == current.text.is_none()
+                && instruction_body(previous) == instruction_body(&current)) {
             return None;
-        }
-        if let PreviousSectionState::Known(previous) = previous
-            && current.directory == previous.directory
-            && current.freshness != previous.freshness
-            && let Some(current_body) = instruction_body(&current)
-            && instruction_body(previous) == Some(current_body)
-        {
-            let instructions = UserInstructions {
-                directory: current.directory,
-                text: "The previously provided instruction body is unchanged.".to_string(),
-            };
-            return Some(Box::new(
-                instructions.with_observation(current.freshness.model_visible_description()),
-            ));
         }
 
         let previous_may_contain_instructions = match previous {
@@ -168,9 +157,7 @@ impl WorldStateSection for AgentsMdState {
             },
             (None, false) => return None,
         };
-        Some(Box::new(instructions.with_observation(
-            self.freshness.model_visible_description(),
-        )))
+        Some(Box::new(instructions))
     }
 }
 

@@ -4,10 +4,10 @@ use std::collections::HashSet;
 use codex_install_context::InstallContext;
 use codex_protocol::ThreadId;
 use codex_rollout::RolloutConfig;
-use codex_rollout::RolloutSearchCache;
 use codex_rollout::find_thread_names_by_ids;
 use codex_rollout::first_rollout_content_match_snippet;
 use codex_rollout::parse_cursor;
+use codex_rollout::search_rollout_matches;
 
 use super::LocalThreadStore;
 use super::helpers::distinct_thread_metadata_title;
@@ -64,21 +64,13 @@ pub(super) async fn search_threads(
         model_provider_id: store.config.default_model_provider_id.clone(),
     };
     let rg_command = InstallContext::current().rg_command();
-    let matching_rollouts = {
-        // Cache reuse must not queue a new query behind an unrelated corpus scan.
-        let mut fallback = RolloutSearchCache::default();
-        let mut shared = store.search_cache.try_lock().ok();
-        shared
-            .as_deref_mut()
-            .unwrap_or(&mut fallback)
-            .search(
-                rg_command.as_path(),
-                store.config.codex_home.as_path(),
-                params.archived,
-                search_term,
-            )
-            .await
-    }
+    let matching_rollouts = search_rollout_matches(
+        rg_command.as_path(),
+        store.config.codex_home.as_path(),
+        params.archived,
+        search_term,
+    )
+    .await
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to search rollout contents: {err}"),
     })?;

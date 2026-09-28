@@ -76,7 +76,6 @@ pub struct LocalThreadStore {
     pub(super) config: LocalThreadStoreConfig,
     live_recorders: Arc<Mutex<HashMap<ThreadId, LiveRecorderEntry>>>,
     projections: Arc<Mutex<HashMap<ThreadId, projection::SharedLocalThreadProjection>>>,
-    search_cache: Arc<Mutex<codex_rollout::RolloutSearchCache>>,
     state_db: Option<StateDbHandle>,
 }
 
@@ -125,7 +124,6 @@ impl LocalThreadStore {
             config,
             live_recorders: Arc::new(Mutex::new(HashMap::new())),
             projections: Arc::new(Mutex::new(HashMap::new())),
-            search_cache: Arc::new(Mutex::new(codex_rollout::RolloutSearchCache::default())),
             state_db,
         }
     }

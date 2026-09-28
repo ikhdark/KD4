@@ -3,25 +3,27 @@ const DEFERRED_NESTED_TOOLS_GUIDANCE: &str =
 const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in tool contracts may be included below. Use those declarations directly; external and omitted contracts remain lazy. When `tool_search` is advertised, use it to activate tools that are not yet listed."#;
 pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no Node/filesystem/network.
 - Nested tools live on the global `tools` object: `await tools.exec_command({cmd:"..."})`, `await tools.apply_patch(patchText)` if registered. Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`; `console.log(...)` aliases `text(...)`. Only `ALL_TOOL_NAMES` entries are callable.
-- Edit with `apply_patch`: nested if registered, otherwise direct (`*** Begin Patch`); never pipe a patch through a shell wrapper.
-- `text(...)` emits values. On failure/no output, the host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions. Emit needed results.
-- Reuse current schemas and results; resolve missing/stale schemas before calls. Filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally; use `resolve_tool(name)` to obtain a missing schema and callable with `.name`/`.description`. Search only if local discovery fails.
-- Await `Promise.allSettled` for independent known calls in one exec; inspect every result. Do not split known batches into one-call execs. For early results use `await notify(...)`; still await the batch. Unawaited work is discarded. Check prerequisites before dependent calls.
-- Nested calls use a host-configured default deadline; override with `{ timeout_ms }`. Expiry cancels the call, possibly without a live handle. Resume only returned live session/cell IDs; check uncertain effects before retrying. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
-- `text(...)` buffers output during awaited work. `yield_control()` signals delivery, not JavaScript suspension; put decision-dependent actions in a later cell. Input and host deadlines can yield.
-- Cells and commands have separate lifecycles: resolved `exec_command` may return a running session. Resume cells with `wait(cell_id)`, commands with `write_stdin(session_id)`. Without a new model decision, continue polling in this evaluation using default waits, not one-second loops. Cell completion does not prove command completion. Lifecycle/recovery metadata survive text-only and zero-token output.
-- Parallelize only independent locks, outputs, and services when tools permit. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
-- Output defaults to the 10000-token hard cap; override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, fitting one cell. Read useful regions; use retained-artifact selectors after truncation.
-- Process results in JavaScript; continue independent work.
+- Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
+- `text(...)` emits values; on failure/no output, the host retains up to two nested-tool results, each capped at 1024 bytes, and reports omissions. Emit needed results explicitly.
+- Reuse current schemas and results; resolve missing/stale schemas before calls.
+- Nested tools: use a present schema; filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally; use `resolve_tool(name)` to obtain a missing schema and callable with `.name`/`.description`. Search only if local discovery fails.
+- Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results.
+- For command output, prefer `text(result.output)` and inspect `result.exit_code`; live-session and recovery controls are preserved by the host. Use `text(result)` only when the complete object is needed.
+- Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
+- `text(...)` buffers output while awaited work continues in the same awaited evaluation; `yield_control()` is only for a new model decision. Input and host deadlines can yield.
+- An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
+- Empty `write_stdin` polls: use default waits; avoid one-second loops.
+- Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
+- Output defaults to 4000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, bounded by the cell hard cap; request a larger cell budget when needed. Read whole useful regions; use retained-artifact selectors after truncation.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
 - `notify(value): Promise<void>` queues a model-visible message without yielding.
-- JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values (256 keys / 8 MiB). `remove_store(key)` deletes and returns whether present; `null` is not deletion. Writes/removals commit at completion; termination discards pending writes. Oversized writes reject only themselves. After storage errors, inspect completion and retained values before assuming durability. Finish checkpoints before interruptible work. Same-key conflicts reject the storage transaction: reload/recompute without replaying external effects. `code_mode_session_reset` means storage lost and that request unexecuted, not invalid files/prior validation.
+- JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values for later cells.
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awaited continuation runs. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()`, input interruption, or bounded host wait; a completed cell never needs `wait`.
 - `cell_id` identifies the running `exec` cell to resume.
-- `max_tokens` limits how much new output this wait call returns. Model projections default to the 10000-token hard cap; an explicit request can select a smaller budget.
+- `max_tokens` limits how much new output this wait call returns. Model projections default to 4000 tokens; explicit requests are capped at 10000 tokens.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` buffers output until an explicit yield, input activity, the host's bounded wait, or the final completion or termination result for that cell.
 - New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
@@ -94,7 +96,9 @@ mod tests {
                     let parsed = parse_exec_source(&source).unwrap();
                     assert_eq!(parsed.max_output_tokens, Some(10000));
                     assert_eq!(parsed.code, "text('budget applied');");
-                    assert!(description.contains("override with `{ timeout_ms }`."));
+                    assert!(description.contains(
+                        "override it with the documented `{ timeout_ms }` option when needed."
+                    ));
                 }
             }
         }
@@ -110,7 +114,7 @@ mod tests {
             "Direct-only tools omitted from `ALL_TOOLS`: `apply_patch`. Call these through their direct model tool interface using the schema advertised there, not through `exec`."
         );
         for description in [nested, direct] {
-            assert!(description.contains("Edit with `apply_patch`: nested if registered, otherwise direct (`*** Begin Patch`); never pipe a patch through a shell wrapper."));
+            assert!(description.contains("Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper."));
         }
     }
 
@@ -121,32 +125,21 @@ mod tests {
                 let description =
                     build_exec_tool_description(code_mode_only, has_deferred_tools, &[]);
                 for required in [
-                    "Check prerequisites before dependent calls.",
+                    "Sequence dependent calls only after checking prerequisite results.",
                     "Await `Promise.allSettled`",
-                    "for independent known calls in one exec; inspect every result.",
-                    "Do not split known batches into one-call execs.",
-                    "buffers output during awaited work.",
-                    "`yield_control()` signals delivery, not JavaScript suspension;",
-                    "put decision-dependent actions in a later cell.",
-                    "`remove_store(key)` deletes",
-                    "`null` is not deletion.",
-                    "Writes/removals commit at completion;",
-                    "termination discards pending writes.",
-                    "Oversized writes reject only themselves.",
-                    "After storage errors, inspect completion and retained values",
-                    "Finish checkpoints before interruptible work.",
-                    "without replaying external effects.",
-                    "not invalid files/prior validation.",
-                    "still await the batch. Unawaited work is discarded.",
-                    "Parallelize only independent locks, outputs, and services when tools permit.",
+                    "for independent known calls in the same exec and inspect every result.",
+                    "Do not split a known independent batch into one-call execs.",
+                    "buffers output while awaited work continues in the same awaited evaluation;",
+                    "`yield_control()` is only for a new model decision.",
+                    "still await the batch. At evaluation end, unawaited work is discarded.",
                     "Reuse current schemas and results;",
-                    "resolved `exec_command` may return a running session.",
-                    "continue polling in this evaluation using default waits",
-                    "fitting one cell.",
+                    "A resolved `exec_command` call may still return a running command session.",
+                    "continue that session within the current evaluation.",
+                    "bounded by the cell hard cap; request a larger cell budget when needed.",
                     "host-configured default deadline",
-                    "Expiry cancels the call, possibly without a live handle.",
-                    "Resume only returned live session/cell IDs;",
-                    "check uncertain effects before retrying.",
+                    "Expiry cancels the nested call and may return only an error, without a live handle.",
+                    "Resume only an actually returned live session/cell ID;",
+                    "check the outcome before retrying uncertain effects.",
                     "Retry only if unstarted, safely repeatable after stopping, or tool-approved.",
                 ] {
                     assert!(

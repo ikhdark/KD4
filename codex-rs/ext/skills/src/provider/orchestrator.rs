@@ -20,6 +20,7 @@ use crate::provider::SkillProviderFuture;
 use crate::provider::SkillReadRequest;
 
 const ORCHESTRATOR_SKILL_MIME_TYPE: &str = "mcp/skill";
+const ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const ORCHESTRATOR_SKILL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESOURCE_PAGES: usize = 10;
 const MAX_ORCHESTRATOR_SKILLS: usize = 100;
@@ -52,12 +53,10 @@ impl SkillProvider for OrchestratorSkillProvider {
                 return Ok(SkillCatalog::default());
             }
 
-            Ok(
-                discover(query.continuation, query.discovery_timeout, |cursor| {
-                    client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor)
-                })
-                .await,
-            )
+            Ok(discover(query.continuation, |cursor| {
+                client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor)
+            })
+            .await)
         })
     }
 
@@ -135,20 +134,15 @@ impl SkillProvider for OrchestratorSkillProvider {
 
 async fn discover<F, Fut, E>(
     continuation: Option<crate::catalog::SkillDiscoveryContinuation>,
-    timeout: Duration,
     mut list_page: F,
 ) -> SkillCatalog
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<codex_mcp::McpResourcePage, E>>,
 {
-    let discovery_deadline = tokio::time::Instant::now() + timeout;
+    let discovery_deadline = tokio::time::Instant::now() + ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT;
     let mut catalog = SkillCatalog::default();
     let mut progress = continuation.unwrap_or_default();
-    if progress.blocked {
-        catalog.continuation = Some(progress);
-        return catalog;
-    }
     let mut skill_resources_seen = 0usize;
     let mut skipped_resources = 0usize;
     for page_index in 0..MAX_RESOURCE_PAGES {
@@ -202,8 +196,7 @@ where
             break;
         };
         if !progress.seen_cursors.insert(next_cursor.clone()) {
-            catalog.warnings.push("Orchestrator skill pagination repeated a cursor. Discovery is blocked; repair the provider and refresh its MCP connection before retrying. Previously discovered skills remain available.".to_string());
-            progress.blocked = true;
+            catalog.warnings.push("Orchestrator skill pagination repeated a cursor; discovery cannot advance on this provider response.".to_string());
             catalog.continuation = Some(progress);
             break;
         }
@@ -214,7 +207,7 @@ where
             break;
         }
     }
-    if catalog.continuation.is_some() && !catalog.discovery_blocked() {
+    if catalog.continuation.is_some() {
         catalog.warnings.push("Orchestrator skill discovery is incomplete. Follow skills.list next_cursor to continue discovery.".to_string());
     }
     if skipped_resources > 0 {
@@ -387,7 +380,6 @@ fn main_prompt_uri(package_uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::TOOL_DISCOVERY_TIMEOUT;
 
     fn page(start: usize, count: usize, next: Option<&str>) -> codex_mcp::McpResourcePage {
         codex_mcp::McpResourcePage {
@@ -402,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_resumes_after_page_failure_and_mid_page_limit() {
         let mut calls = 0;
-        let prefix = discover(None, TOOL_DISCOVERY_TIMEOUT, |cursor| {
+        let prefix = discover(None, |cursor| {
             calls += 1;
             std::future::ready(if cursor.is_none() {
                 Ok(page(0, 1, Some("page-two")))
@@ -413,7 +405,7 @@ mod tests {
         .await;
         assert_eq!(calls, 2);
         assert_eq!(prefix.entries.len(), 1);
-        let resumed = discover(prefix.continuation, TOOL_DISCOVERY_TIMEOUT, |cursor| {
+        let resumed = discover(prefix.continuation, |cursor| {
             assert_eq!(cursor.as_deref(), Some("page-two"));
             std::future::ready(Ok::<_, ()>(page(1, 1, None)))
         })
@@ -421,14 +413,14 @@ mod tests {
         assert_eq!(resumed.entries[0].name, "skill-1");
         assert!(resumed.continuation.is_none());
 
-        let first = discover(None, TOOL_DISCOVERY_TIMEOUT, |_| {
+        let first = discover(None, |_| {
             std::future::ready(Ok::<_, ()>(page(0, 101, None)))
         })
         .await;
         assert_eq!(first.entries.len(), 100);
         let continuation = first.continuation.expect("remaining resource");
         assert_eq!(continuation.resource_offset, 100);
-        let last = discover(Some(continuation), TOOL_DISCOVERY_TIMEOUT, |_| {
+        let last = discover(Some(continuation), |_| {
             std::future::ready(Ok::<_, ()>(page(0, 101, None)))
         })
         .await;
@@ -440,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn page_budget_and_duplicate_cursors_remain_bounded_and_recoverable() {
         let mut calls = 0;
-        let first = discover(None, TOOL_DISCOVERY_TIMEOUT, |_| {
+        let first = discover(None, |_| {
             let index = calls;
             calls += 1;
             std::future::ready(Ok::<_, ()>(page(index, 1, Some(&calls.to_string()))))
@@ -448,7 +440,7 @@ mod tests {
         .await;
         assert_eq!(calls, MAX_RESOURCE_PAGES);
         assert_eq!(first.entries.len(), MAX_RESOURCE_PAGES);
-        let last = discover(first.continuation, TOOL_DISCOVERY_TIMEOUT, |cursor| {
+        let last = discover(first.continuation, |cursor| {
             assert_eq!(cursor.as_deref(), Some("10"));
             std::future::ready(Ok::<_, ()>(page(10, 1, None)))
         })
@@ -456,26 +448,19 @@ mod tests {
         assert_eq!(last.entries[0].name, "skill-10");
         assert!(last.continuation.is_none());
         let mut calls = 0;
-        let repeated = discover(None, TOOL_DISCOVERY_TIMEOUT, |_| {
+        let repeated = discover(None, |_| {
             calls += 1;
             std::future::ready(Ok::<_, ()>(page(0, 1, Some("same"))))
         })
         .await;
         assert_eq!(calls, 2);
-        assert!(repeated.discovery_blocked());
+        assert!(repeated.continuation.is_some());
         assert!(
             repeated
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("repeated a cursor"))
         );
-        let blocked = discover(repeated.continuation, TOOL_DISCOVERY_TIMEOUT, |_| {
-            calls += 1;
-            std::future::ready(Ok::<_, ()>(page(0, 1, Some("same"))))
-        })
-        .await;
-        assert_eq!(calls, 2, "blocked discovery must not issue another request");
-        assert!(blocked.discovery_blocked());
     }
 
     #[test]
@@ -495,33 +480,5 @@ mod tests {
         resource.meta =
             Some(serde_json::json!({"skill_name": "x".repeat(100_000), "source": "user"}));
         assert!(catalog_entry_from_resource(&resource).is_none());
-    }
-
-    #[tokio::test]
-    async fn discovery_timeout_preserves_completed_pages_and_resumes_at_the_failed_page() {
-        let prefix = discover(None, Duration::from_millis(20), |cursor| async move {
-            if cursor.is_none() {
-                Ok::<_, ()>(page(0, 1, Some("second")))
-            } else {
-                std::future::pending().await
-            }
-        })
-        .await;
-        assert_eq!(prefix.entries[0].name, "skill-0");
-        assert_eq!(prefix.entries.len(), 1);
-        assert!(!prefix.discovery_blocked());
-        assert!(
-            prefix
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("timed out"))
-        );
-        let recovered = discover(prefix.continuation, TOOL_DISCOVERY_TIMEOUT, |cursor| {
-            assert_eq!(cursor.as_deref(), Some("second"));
-            std::future::ready(Ok::<_, ()>(page(1, 1, None)))
-        })
-        .await;
-        assert_eq!(recovered.entries[0].name, "skill-1");
-        assert!(recovered.continuation.is_none());
     }
 }

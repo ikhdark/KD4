@@ -69,55 +69,6 @@ fn missing_stabilized_context_update_returns_a_fatal_error() {
     };
     assert!(message.contains("did not carry its context candidate"));
 }
-
-#[tokio::test]
-async fn registered_new_context_resets_the_next_sampling_request() {
-    let server = responses::start_mock_server().await;
-    let home = tempfile::tempdir().unwrap();
-    let mut provider = built_in_model_providers(None)["openai"].clone();
-    provider.base_url = Some(format!("{}/v1", server.uri()));
-    provider.supports_websockets = false;
-    provider.request_max_retries = Some(0);
-    let (session, turn, _) = crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-        CodexAuth::from_api_key("test-key"), vec![], home.path(), |config| {
-            config.model_provider = provider;
-            config.features.enable(Feature::TokenBudget).unwrap();
-            config.token_budget = Some(crate::config::TokenBudgetConfig::default());
-            for feature in [Feature::CodeMode, Feature::CodeModeHost, Feature::EnableRequestCompression] {
-                config.features.disable(feature).unwrap();
-            }
-            config.model_context_window = Some(1_000_000);
-            config.model_auto_compact_token_limit = Some(900_000);
-            config.developer_instructions = Some("PERSISTENT_WORLD_CONSTRAINT".into());
-        },
-    ).await;
-    let before = session.state.lock().await.auto_compact_window_ids();
-    let requests = responses::mount_sse_sequence(&server, vec![
-        responses::sse(vec![responses::ev_function_call("reset", "new_context", "{}"), responses::ev_completed("first")]),
-        responses::sse(vec![responses::ev_assistant_message("final", "fresh window ready"), responses::ev_completed("second")]),
-    ]).await;
-    let result = run_turn(
-        Arc::clone(&session), Arc::clone(&turn), Arc::new(ExtensionData::new("fresh-window")),
-        vec![TurnInput::UserInput {content: vec![UserInput::Text {text: "OLD_CONVERSATION_SENTINEL".into(), text_elements: vec![]}], client_id: None}],
-        None, &mut LogicalGenerationBudget::default(), CancellationToken::new(),
-    ).await.unwrap();
-    assert_eq!(result.last_agent_message.as_deref(), Some("fresh window ready"));
-    let captured = requests.requests();
-    assert_eq!(captured.len(), 2);
-    assert!(captured[0].body_contains_text("OLD_CONVERSATION_SENTINEL"));
-    assert!(!captured[1].body_contains_text("OLD_CONVERSATION_SENTINEL"));
-    assert!(captured[1].function_call_output_text("reset").is_none());
-    assert!(captured[1].body_contains_text("PERSISTENT_WORLD_CONSTRAINT"));
-    assert!(captured[1].body_contains_text(&turn.cwd().to_string_lossy()));
-    let after = session.state.lock().await.auto_compact_window_ids();
-    assert_ne!(before.window_id, after.window_id);
-    assert_eq!(after.first_window_id, before.first_window_id);
-    assert_eq!(after.previous_window_id, Some(before.window_id));
-    assert!(!session.new_context_window_requested().await);
-    assert!(captured[1].body_contains_text(&format!("Current context window id: {}", after.window_id)));
-    assert!(captured[1].body_contains_text(&format!("Previous context window id: {}", before.window_id)));
-    session.services.code_mode_service.shutdown().await.unwrap();
-}
 use wiremock::Mock;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
@@ -1908,10 +1859,10 @@ fn named_recommended_plugin_is_the_only_injected_candidate() {
 }
 
 #[test]
-fn generic_plugin_recommendation_request_injects_the_catalog() {
+fn generic_plugin_mention_does_not_pin_the_catalog() {
     let selected = task_relevant_recommended_plugins(
         &[ContentItem::InputText {
-            text: "suggest a plugin".to_string(),
+            text: "add a plugin field to the Rust parser".to_string(),
         }],
         vec![
             recommended_plugin_candidate("figma", "Figma"),
@@ -1919,7 +1870,7 @@ fn generic_plugin_recommendation_request_injects_the_catalog() {
         ],
     );
 
-    assert_eq!(selected.len(), 2);
+    assert!(selected.is_empty());
 }
 
 #[test]
@@ -2028,7 +1979,7 @@ fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata(
 }
 
 #[test]
-fn logical_generation_budget_allows_regular_limit_and_one_terminal_generation() {
+fn logical_generation_budget_allows_bounded_regular_and_one_terminal_generation() {
     let mut budget = LogicalGenerationBudget::default();
     for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(
@@ -2049,13 +2000,6 @@ fn logical_generation_budget_allows_regular_limit_and_one_terminal_generation() 
 #[test]
 fn productive_work_and_owned_polling_preserve_generation_capacity() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..8 {
-        for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
-            assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-        }
-        budget.observe_progress(true, false);
-        assert!(budget.has_regular_generation_capacity());
-    }
     for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
     }
@@ -2085,8 +2029,7 @@ fn validation_failure_at_generation_limit_keeps_repair_tools_available() -> Resu
 async fn validation_failure_at_generation_limit_keeps_repair_tools_available_impl() -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
-    let limit = MAX_REGULAR_LOGICAL_GENERATIONS as usize;
-    let mut sequence = (0..limit - 1)
+    let mut sequence = (0..MAX_REGULAR_LOGICAL_GENERATIONS - 1)
         .map(|index| {
             let mut completed = responses::ev_completed(&format!("thinking-{index}"));
             completed["response"]["end_turn"] = serde_json::json!(false);
@@ -2141,6 +2084,7 @@ async fn validation_failure_at_generation_limit_keeps_repair_tools_available_imp
         Some("Repair validated.")
     );
     let sent = requests.requests();
+    let limit = MAX_REGULAR_LOGICAL_GENERATIONS as usize;
     assert_eq!(sent.len(), limit + 3);
     assert!(
         sent[limit]
@@ -3178,50 +3122,18 @@ fn turn_execution_resets_for_every_accepted_context_change() {
     assert!(resets_turn_execution(&mailbox_item));
 }
 
-#[tokio::test]
-async fn skill_context_recovery_is_lazy_and_fails_closed() {
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let fragment = RenderedContextFragment::new("user", "small skill".into());
-    let (items, recovery) = build_bounded_skill_context_items([&fragment]);
-    assert_eq!(response_input_texts(&items), ["small skill"]);
-    assert!(recovery.is_none());
-    let fragment = RenderedContextFragment::new("user", "large skill ".repeat(10_000));
-    let (_, recovery) = build_bounded_skill_context_items([&fragment]);
-    std::fs::create_dir_all(&turn.config.codex_home).unwrap();
-    std::fs::write(turn.config.codex_home.join("tool-output"), "blocked").unwrap();
-    let original = session.clone_history().await.raw_items().to_vec();
-    assert!(matches!(persist_skill_context_recovery(&session, recovery.unwrap()).await,
-        Err(CodexErr::Fatal(message)) if message.contains("could not preserve complete selected skill")));
-    assert_eq!(session.clone_history().await.raw_items(), original);
-}
-
-#[tokio::test]
-async fn legacy_explicit_skill_items_share_one_hard_budget() {
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
+#[test]
+fn legacy_explicit_skill_items_share_one_hard_budget() {
     let max_bytes = codex_utils_string::approx_bytes_for_tokens(
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
-    let fragments = [
+    let items = build_bounded_skill_context_items(&[
         RenderedContextFragment::new(
             "user",
             format!("legacy-skill-budget-first:{}", "x".repeat(max_bytes)),
         ),
         RenderedContextFragment::new("user", "legacy-skill-budget-second".to_string()),
-    ];
-    let (mut items, recovery) = build_bounded_skill_context_items(&fragments);
-    assert!(!turn.config.codex_home.join("tool-output").exists(), "planning must not persist artifacts");
-    let receipt = persist_skill_context_recovery(&session, recovery.unwrap()).await.unwrap();
-    let receipt_text = response_input_texts(std::slice::from_ref(&receipt))[0];
-    let metadata: serde_json::Value = serde_json::from_str(&receipt_text[receipt_text.find('{').unwrap()..=receipt_text.rfind('}').unwrap()]).unwrap();
-    let bytes = crate::tools::command_output_artifact::read_complete_canonical_snapshot(
-        &turn.config.codex_home, &session.thread_id.to_string(), metadata["artifact_id"].as_str().unwrap(), 1024 * 1024,
-    ).await.unwrap();
-    let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    for (index, fragment) in fragments.iter().enumerate() {
-        assert_eq!(recovered["items"][index]["text"], fragment.render());
-        assert_eq!(recovered["items"][index]["role"], fragment.role());
-    }
-    items.push(receipt);
+    ]);
     let texts = response_input_texts(&items);
 
     assert!(texts.iter().map(|text| text.len()).sum::<usize>() <= max_bytes);
@@ -3237,9 +3149,8 @@ async fn legacy_explicit_skill_items_share_one_hard_budget() {
     );
 }
 
-#[tokio::test]
-async fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
-    let (session, _) = crate::session::tests::make_session_and_context().await;
+#[test]
+fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
     let max_bytes = codex_utils_string::approx_bytes_for_tokens(
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
@@ -3254,8 +3165,7 @@ async fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
     let first = skill("first", "x".repeat(max_bytes - first_overhead - 20));
     let second = skill("second", "second skill instructions".to_string());
 
-    let (mut items, recovery) = build_bounded_skill_context_items([&first, &second]);
-    items.push(persist_skill_context_recovery(&session, recovery.unwrap()).await.unwrap());
+    let items = build_bounded_skill_context_items([&first, &second]);
 
     assert_eq!(items.len(), 2);
     assert!(
@@ -3442,6 +3352,476 @@ fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo
 }
 
 #[test]
+fn new_context_tool_installs_fresh_window_before_next_generation() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "new_context_tool_installs_fresh_window_before_next_generation",
+        || async {
+            let server = responses::start_mock_server().await;
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![
+                    responses::sse(vec![
+                        responses::ev_function_call("fresh-window", "new_context", "{}"),
+                        responses::ev_completed("reset"),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_assistant_message("answer", "Fresh window installed."),
+                        responses::ev_completed("done"),
+                    ]),
+                ],
+            )
+            .await;
+            let test = test_codex()
+                .with_config(|config| {
+                    config.features.enable(Feature::TokenBudget).unwrap();
+                    config.features.disable(Feature::CodeModeHost).unwrap();
+                    config.model_auto_compact_token_limit = Some(i64::MAX);
+                })
+                .build(&server)
+                .await?;
+            fs::write(test.workspace_path("world-state.txt"), "persistent world")?;
+            let completion = test
+                .submit_turn_and_capture_completion("old-conversation-sentinel")
+                .await?;
+            assert!(completion.error.is_none(), "{completion:?}");
+            assert_eq!(
+                completion.last_agent_message.as_deref(),
+                Some("Fresh window installed.")
+            );
+            let sent = requests.requests();
+            assert_eq!(
+                sent.len(),
+                2,
+                "request flag is consumed once, without a compaction generation"
+            );
+            assert!(sent[0].body_contains_text("old-conversation-sentinel"));
+            assert!(!sent[1].body_contains_text("old-conversation-sentinel"));
+            let context = |index: usize| {
+                [
+                    sent[index].message_input_texts("user"),
+                    sent[index].message_input_texts("developer"),
+                ]
+                .concat()
+                .join("\n")
+            };
+            let before = context(0);
+            let after = context(1);
+            let window = |text: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("Current context window id: "))
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_ne!(window(&before), window(&after));
+            assert!(after.contains(&format!("Previous context window id: {}", window(&before))));
+            assert!(after.contains("environment_context"));
+            assert!(after.contains(&test.cwd_path().to_string_lossy().to_string()));
+            assert_eq!(
+                fs::read_to_string(test.workspace_path("world-state.txt"))?,
+                "persistent world"
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn first_turn_dispatch_aborts_never_completing_prewarm() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "first_turn_dispatch_aborts_never_completing_prewarm",
+        || async {
+            let server = responses::start_mock_server().await;
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![responses::sse(vec![
+                    responses::ev_assistant_message("answer", "ordinary dispatch"),
+                    responses::ev_completed("done"),
+                ])],
+            )
+            .await;
+            let home = tempfile::tempdir()?;
+            let provider = non_openai_model_provider(&server);
+            let (session, turn, _events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    CodexAuth::from_api_key("test key"),
+                    Vec::new(),
+                    home.path(),
+                    move |config| {
+                        config.model_provider = provider;
+                        config.features.disable(Feature::CodeModeHost).unwrap();
+                    },
+                )
+                .await;
+            let task = tokio::spawn(std::future::pending());
+            let abort = task.abort_handle();
+            session
+                .set_session_startup_prewarm(
+                    crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+                        task,
+                        std::time::Instant::now(),
+                    ),
+                )
+                .await;
+            let mut budget = LogicalGenerationBudget::default();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                run_turn(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    Arc::new(ExtensionData::new(turn.sub_id.clone())),
+                    vec![TurnInput::UserInput {
+                        content: vec![UserInput::Text {
+                            text: "dispatch now".into(),
+                            text_elements: Vec::new(),
+                        }],
+                        client_id: None,
+                    }],
+                    None,
+                    &mut budget,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("first model request must not wait for speculative work")?;
+            assert_eq!(requests.requests().len(), 1);
+            assert!(requests.requests()[0].body_contains_text("dispatch now"));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert!(session.take_session_startup_prewarm().await.is_none());
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn checkpoint_lifecycle_reaches_next_model_request_without_reexecution() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "checkpoint_lifecycle_reaches_next_model_request_without_reexecution",
+        || async {
+            let server = responses::start_mock_server().await;
+            let requests = responses::mount_sse_sequence(&server, vec![
+            responses::sse(vec![
+                responses::ev_function_call("completed-source", "read_file", r#"{"path":"completed.txt"}"#),
+                responses::ev_function_call("active-source", "read_file", r#"{"path":"active.txt"}"#),
+                responses::ev_completed("read"),
+            ]),
+            responses::sse(vec![responses::ev_function_call("checkpoint", "context_checkpoint", r#"{"completed_call_ids":["completed-source"],"retained_evidence":["active-source"],"summary":"Completed source consumed; active source still needed.","active_work":"Use active evidence."}"#),responses::ev_completed("checkpoint")]),
+            responses::sse(vec![responses::ev_assistant_message("answer","Evidence retained."),responses::ev_completed("done")]),
+        ]).await;
+            let test = test_codex()
+                .with_config(|config| {
+                    config.features.enable(Feature::Kd4Runtime).unwrap();
+                    config.features.disable(Feature::CodeModeHost).unwrap();
+                    config.model_auto_compact_token_limit = Some(i64::MAX);
+                })
+                .build(&server)
+                .await?;
+            let source = "completed source evidence\n".repeat(500);
+            let active = "active unresolved evidence\n".repeat(500);
+            fs::write(test.workspace_path("completed.txt"), &source)?;
+            fs::write(test.workspace_path("active.txt"), &active)?;
+            let completion = test
+                .submit_turn_and_capture_completion(
+                    "Read both sources and checkpoint only the completed source.",
+                )
+                .await?;
+            assert!(completion.error.is_none(), "{completion:?}");
+            let sent = requests.requests();
+            assert_eq!(sent.len(), 3);
+            let result: serde_json::Value =
+                serde_json::from_str(&sent[2].function_call_output_text("checkpoint").unwrap())?;
+            assert_eq!(result["checkpointed_call_count"], 1);
+            let pin: serde_json::Value = serde_json::from_str(
+                &sent[2]
+                    .function_call_output_text("completed-source")
+                    .unwrap(),
+            )?;
+            assert_eq!(pin["kind"], "tool_history_artifact_pin");
+            assert_eq!(
+                sent[1].function_call_output_text("active-source"),
+                sent[2].function_call_output_text("active-source")
+            );
+            assert!(
+                sent[2]
+                    .function_call_output_text("completed-source")
+                    .unwrap()
+                    .len()
+                    < sent[1]
+                        .function_call_output_text("completed-source")
+                        .unwrap()
+                        .len()
+            );
+            let rollout_path = test.codex.rollout_path().expect("physical rollout");
+            let initial =
+                crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
+                    .await?;
+            let persisted = serde_json::to_string(initial.get_rollout_items())?;
+            assert!(persisted.contains("completed_phase_checkpoint"));
+            let calls = initial.get_rollout_items().iter().filter(|item| matches!(item,
+            codex_protocol::protocol::RolloutItem::ResponseItem(ResponseItem::FunctionCall {name, ..}) if name == "read_file")).count();
+            assert_eq!(calls, 2, "checkpoint must not re-run either producer");
+            let recovered = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+                test.codex_home_path(),
+                &test.session_configured.session_id.to_string(),
+                pin["artifact_id"].as_str().unwrap(),
+            )
+            .await
+            .expect("checkpoint artifact remains recoverable");
+            assert!(String::from_utf8(recovered)?.contains("completed source evidence"));
+            let checkpoint = sent[2]
+                .message_input_texts("developer")
+                .into_iter()
+                .find_map(|text| {
+                    let body = text
+                        .strip_prefix("<completed_phase_checkpoint>\n")?
+                        .strip_suffix("\n</completed_phase_checkpoint>")?;
+                    serde_json::from_str::<serde_json::Value>(body).ok()
+                })
+                .expect("next request contains the persisted checkpoint");
+            let retained = &checkpoint["retained_evidence"]["active-source"];
+            let recovered = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+                test.codex_home_path(),
+                &test.session_configured.session_id.to_string(),
+                retained["artifact_id"].as_str().unwrap(),
+            )
+            .await
+            .expect("unresolved retained evidence remains recoverable");
+            assert!(String::from_utf8(recovered)?.contains("active unresolved evidence"));
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn final_prompt_injects_evidence_guidance_once_for_bundled_and_catalog_bases() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "final_prompt_injects_evidence_guidance_once_for_bundled_and_catalog_bases",
+        || async {
+            for base in [
+                include_str!("../../../protocol/src/prompts/base_instructions/default.md"),
+                "Catalog base instructions.",
+            ] {
+                let server = responses::start_mock_server().await;
+                let requests = responses::mount_sse_sequence(
+                    &server,
+                    vec![responses::sse(vec![
+                        responses::ev_assistant_message("answer", "done"),
+                        responses::ev_completed("done"),
+                    ])],
+                )
+                .await;
+                let test = test_codex()
+                    .with_config(move |config| {
+                        config.base_instructions = Some(base.into());
+                        config.features.enable(Feature::Kd4Runtime).unwrap();
+                        config.features.disable(Feature::CodeModeHost).unwrap();
+                    })
+                    .build(&server)
+                    .await?;
+                test.submit_turn("inspect guidance").await?;
+                let request = requests.single_request();
+                let prompt = format!(
+                    "{}\n{}\n{}",
+                    request.instructions_text(),
+                    request.message_input_texts("user").join("\n"),
+                    request.message_input_texts("developer").join("\n")
+                );
+                assert_eq!(
+                    prompt
+                        .matches("Storage or repetition never upgrades evidence strength.")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    prompt
+                        .matches("A no-change result is valid and preferred")
+                        .count(),
+                    1
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "ordinary_exec_validation_repair_and_inflight_source_freshness",
+        || async {
+            let server = responses::start_mock_server().await;
+            let command = serde_json::json!({
+                "program":"cargo", "args":["test","--offline","--target-dir","target"],
+                "yield_time_ms":300000, "max_output_tokens":2000,
+            })
+            .to_string();
+            let patch = |before| {
+                format!(
+                    "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-fn value() -> u8 {{ {before} }}\n+fn value() -> u8 {{ 2 }}\n*** End Patch"
+                )
+            };
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![
+                    responses::sse(vec![
+                        responses::ev_function_call("validation-failed", "exec_command", &command),
+                        responses::ev_completed("failed"),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_apply_patch_custom_tool_call("repair-initial", &patch(1)),
+                        responses::ev_completed("repair"),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_function_call("validation-stale", "exec_command", &command),
+                        responses::ev_completed("stale-pass"),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_apply_patch_custom_tool_call("repair-race", &patch(3)),
+                        responses::ev_completed("repair-race"),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_function_call("validation-current", "exec_command", &command),
+                        responses::ev_completed("current-pass"),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_assistant_message("answer", "Current repair passed."),
+                        responses::ev_completed("done"),
+                    ]),
+                ],
+            )
+            .await;
+            let test = test_codex()
+                .with_config(|config| {
+                    config.features.enable(Feature::Kd4Runtime).unwrap();
+                    config.features.enable(Feature::UnifiedExec).unwrap();
+                    config.features.disable(Feature::CodeModeHost).unwrap();
+                    config.model_auto_compact_token_limit = Some(i64::MAX);
+                })
+                .build(&server)
+                .await?;
+            fs::create_dir_all(test.workspace_path("src"))?;
+            fs::write(
+                test.workspace_path("Cargo.toml"),
+                "[package]\nname = \"freshness_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+            )?;
+            fs::write(
+                test.workspace_path(".gitignore"),
+                "/target\n/ready\n/release\n",
+            )?;
+            let source = concat!(
+                "fn value() -> u8 { 1 }\n",
+                "#[test] fn validates_current_source() {\n",
+                "    assert_eq!(value(), 2);\n",
+                "    std::fs::write(\"ready\", \"running\").unwrap();\n",
+                "    let start = std::time::Instant::now();\n",
+                "    while !std::path::Path::new(\"release\").exists() {\n",
+                "        assert!(start.elapsed().as_secs() < 20);\n",
+                "        std::thread::sleep(std::time::Duration::from_millis(10));\n",
+                "    }\n}\n",
+            );
+            fs::write(test.workspace_path("src/lib.rs"), source)?;
+            for args in [
+                vec!["init", "--quiet"],
+                vec!["add", "."],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+            ] {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(test.cwd_path())
+                        .status()?
+                        .success()
+                );
+            }
+            let cwd = test.cwd_path().to_owned();
+            let mutation = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !cwd.join("ready").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the repaired Cargo test must be running before mutation");
+                let path = cwd.join("src/lib.rs");
+                let before = fs::read_to_string(&path).unwrap();
+                assert!(before.contains("fn value() -> u8 { 2 }"));
+                fs::write(
+                    path,
+                    before.replace("fn value() -> u8 { 2 }", "fn value() -> u8 { 3 }"),
+                )
+                .unwrap();
+                fs::write(cwd.join("release"), "release").unwrap();
+            });
+            let completion = test
+                .submit_turn_and_capture_completion(
+                    "Run the tiny Cargo test, repair failures, and establish a current pass.",
+                )
+                .await;
+            mutation.await?;
+            let completion = completion?;
+            assert!(completion.error.is_none(), "{completion:?}");
+            let sent = requests.requests();
+            assert_eq!(sent.len(), 6);
+            let output = |index: usize, id: &str| -> serde_json::Value {
+                serde_json::from_str(&sent[index].function_call_output_text(id).unwrap()).unwrap()
+            };
+            assert_ne!(output(1, "validation-failed")["exit_code"], 0);
+            assert_eq!(output(3, "validation-stale")["exit_code"], 0);
+            let stale_notices = sent[3].message_input_texts("developer");
+            assert!(
+                stale_notices
+                    .iter()
+                    .any(|text| text.contains("workspace_evidence_invalidation")
+                        && text.contains("validation-stale")),
+                "a pass for the pre-mutation source must not prove the changed checkout"
+            );
+            assert_eq!(output(5, "validation-current")["exit_code"], 0);
+            assert!(
+                !sent[5]
+                    .message_input_texts("developer")
+                    .iter()
+                    .any(|text| text.contains("workspace_evidence_invalidation")
+                        && text.contains("validation-current"))
+            );
+            assert!(
+                fs::read_to_string(test.workspace_path("src/lib.rs"))?
+                    .contains("fn value() -> u8 { 2 }")
+            );
+            for request in &sent {
+                let manifest = request.body_json()["tools"].to_string();
+                for retired in [
+                    "validation_snapshot",
+                    "validation_run",
+                    "validation_status",
+                    "workspace_transaction",
+                ] {
+                    assert!(
+                        !manifest.contains(retired),
+                        "retired tool exposed: {retired}"
+                    );
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+#[test]
 fn generation_budget_survives_reentry_and_terminal_directive_is_request_local() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "generation_budget_survives_reentry_and_terminal_directive_is_request_local",
@@ -3561,7 +3941,7 @@ else:
     assert_eq!(
         requests.requests().len(),
         limit - 1,
-        "reentry precedes the regular generation limit"
+        "reentry follows all but one regular generation"
     );
     // Queue input while Stop holds the first run_turn at its completion boundary.
     // The hook ends that invocation, so RegularTask must drain and reenter it.
@@ -3592,7 +3972,7 @@ else:
     assert_eq!(
         requests.requests().len(),
         limit + 1,
-        "one task admits the regular limit and one terminal request across reentry"
+        "one task admits bounded regular requests and one terminal request across reentry"
     );
     assert!(requests.requests()[limit - 1].body_contains_text("queued reentry input"));
 
@@ -3608,7 +3988,7 @@ else:
         assert_eq!(
             request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
             terminal,
-            "the terminal instruction must appear only at the limit, observed request {index}"
+            "the terminal instruction must appear only in request {limit}, observed request {index}"
         );
         assert_eq!(
             request.body_json()["tools"]
@@ -3891,8 +4271,8 @@ async fn repeated_failed_read_preserves_a_different_required_action_impl() -> Re
     // Missing-artifact errors do not claim to be permanent, so they remain
     // retryable. Their repeated cycle still exercises convergence without
     // permission to disable a different required action.
-    for (index, request) in requests.iter().enumerate().take(4).skip(1) {
-        let failure = request
+    for index in 1..=3 {
+        let failure = requests[index]
             .function_call_output_text(&format!("repeat-{index}"))
             .expect("repeated artifact lookup failure");
         assert!(
@@ -6685,70 +7065,25 @@ fn controlled_tool_call(
 }
 
 #[tokio::test]
-async fn non_eager_tool_future_waits_for_the_response_tail_to_close() {
-    let response_tail = ResponseTailSignal::new();
-    let (first_poll_tx, mut first_poll_rx) = tokio::sync::oneshot::channel();
+async fn accepted_tool_future_starts_without_waiting_for_the_response_tail() {
+    let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
-    in_flight.push_back(defer_tool_future_until_response_tail(
-        controlled_tool_call("deferred", first_poll_tx, release_rx),
-        response_tail.clone(),
-    ));
-
-    let result_task = tokio::spawn(async move {
-        in_flight
-            .next()
-            .await
-            .expect("deferred tool result should exist")
-    });
-    tokio::task::yield_now().await;
-    assert!(matches!(
-        first_poll_rx.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-
-    response_tail.close(ResponseTailOutcome::SuccessfulTail);
-    first_poll_rx
+    in_flight.push_back(
+        controlled_tool_call("streamed", first_poll_tx, release_rx)
+            .into_future()
+            .boxed(),
+    );
+    let result_task = tokio::spawn(async move { in_flight.next().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(5), first_poll_rx)
         .await
-        .expect("tool execution should start after the response tail closes");
-    release_tx
-        .send(())
-        .expect("deferred tool should still be attached");
-    let result = result_task
-        .await
-        .expect("deferred tool task should finish")
-        .result
-        .expect("deferred tool should succeed")
-        .response;
-    assert_eq!(result, synthetic_tool_result("deferred"));
-}
-
-#[tokio::test]
-async fn non_eager_tool_future_is_retired_when_the_response_tail_fails() {
-    let response_tail = ResponseTailSignal::new();
-    let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let deferred = defer_tool_future_until_response_tail(
-        controlled_tool_call("not-admitted", first_poll_tx, release_rx),
-        response_tail.clone(),
-    );
-    let result_task = tokio::spawn(deferred);
-
-    response_tail.close(ResponseTailOutcome::TerminalError);
-
-    let result = result_task.await.expect("retired tool task should finish");
-    assert!(
-        result.result.is_ok(),
-        "retirement should be model-visible output"
-    );
-    assert!(
-        first_poll_rx.await.is_err(),
-        "a failed response tail must not poll the tool handler"
-    );
-    assert!(
-        release_tx.send(()).is_err(),
-        "retiring the tool must drop its unstarted future"
+        .expect("accepted call must start while the response is still open")
+        .expect("tool handler started");
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        result_task.await.unwrap().result.unwrap().response,
+        synthetic_tool_result("streamed"),
     );
 }
 
@@ -8020,7 +8355,7 @@ fn oversized_required_instructions_stop_after_bounded_compaction() -> Result<()>
 }
 
 #[tokio::test]
-async fn audit_reports_17_19_failed_prefix_does_not_admit_deferred_tools() {
+async fn failed_response_recording_is_reported_at_the_relay_boundary() {
     let (mut session, turn) = crate::session::tests::make_session_and_context().await;
     crate::session::tests::attach_thread_persistence(&mut session).await;
     session.live_thread().unwrap().shutdown().await.unwrap();
@@ -8036,137 +8371,8 @@ async fn audit_reports_17_19_failed_prefix_does_not_admit_deferred_tools() {
             None,
         )
         .await;
-    let tail = ResponseTailSignal::new();
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let call = tokio::spawn(defer_tool_future_until_response_tail(
-        controlled_tool_call("must-not-run", started_tx, release_rx),
-        tail.clone(),
-    ));
     assert!(
-        close_response_tail_after_persistence(
-            &recorder,
-            &tail,
-            ResponseTailOutcome::SuccessfulTail
-        )
-        .await
-        .is_err()
+        recorder.flush().await.is_err(),
+        "failed response recording must be reported before publishing tool outputs"
     );
-    let result = tokio::time::timeout(Duration::from_secs(5), call)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(result.result.is_ok());
-    assert!(
-        started_rx.await.is_err(),
-        "failed persistence must never poll the handler"
-    );
-    assert!(release_tx.send(()).is_err());
-}
-#[test]
-fn audit_post_tool_stop_preserves_result_without_followup_and_resets_next_turn() -> Result<()> {
-    run_turn_multi_thread_test_with_stack("audit_post_tool_stop", || async {
-        core_test_support::require_network!();
-        for direct in [false, true] {
-            let server = responses::start_mock_server().await;
-            let tool_response = |id: &str| {
-                responses::sse(vec![
-                    responses::ev_response_created(id),
-                    responses::ev_function_call(
-                        id,
-                        "shell_command",
-                        &serde_json::json!({
-                            "command": "echo completed-evidence", "timeout_ms": 10000
-                        })
-                        .to_string(),
-                    ),
-                    responses::ev_completed(id),
-                ])
-            };
-            let requests = responses::mount_sse_sequence(
-                &server,
-                vec![tool_response("first"), tool_response("second")],
-            )
-            .await;
-            let test = test_codex().with_pre_build_hook(|home| {
-                let script = home.join("stop_after_tool.py");
-                fs::write(&script, "import json,sys,pathlib\njson.load(sys.stdin)\nwith pathlib.Path(__file__).with_name('post-hook-runs').open('a') as log: log.write('ran\\n')\nprint(json.dumps({'continue':False,'stopReason':'inspection complete'}))\n").unwrap();
-                fs::write(home.join("hooks.json"), serde_json::json!({"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{
-                    "type":"command", "command":format!("python3 \"{}\"", script.display()),
-                    "commandWindows":format!("python \"{}\"", script.display())
-                }]}]}}).to_string()).unwrap();
-            }).with_config(move |config| {
-                config.features.disable(Feature::UnifiedExec).unwrap();
-                config.features.set_enabled(Feature::DirectRuntime, direct).unwrap();
-                trust_discovered_hooks(config);
-            }).build(&server).await?;
-            let first = test
-                .submit_turn_and_capture_completion("Run the command, then obey the hook")
-                .await?;
-            assert!(first.error.is_none(), "{first:?}");
-            assert_eq!(
-                requests.requests().len(),
-                1,
-                "a stop must not generate a repair turn"
-            );
-            let second = test
-                .submit_turn_and_capture_completion("Run a new command in a new turn")
-                .await?;
-            assert!(second.error.is_none(), "{second:?}");
-            let requests = requests.requests();
-            assert_eq!(requests.len(), 2, "the next user turn is independent");
-            assert_eq!(
-                fs::read_to_string(test.codex_home_path().join("post-hook-runs"))?
-                    .lines()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-                vec!["ran".to_string(), "ran".to_string()],
-                "both turns must execute the tool and its post hook"
-            );
-            let preserved = requests[1]
-                .function_call_output_text("first")
-                .expect("completed output survives into the next turn");
-            assert!(preserved.contains("completed-evidence"), "{preserved}");
-            assert!(
-                !preserved.contains("inspection complete"),
-                "the stop must not replace tool evidence"
-            );
-        }
-        Ok(())
-    })
-}
-
-#[test]
-fn audit_stdin_finalizer_policy_delivers_large_response() -> Result<()> {
-    run_turn_multi_thread_test_with_stack("audit_stdin_finalizer_policy", || async {
-        core_test_support::require_network!();
-        let server = responses::start_mock_server().await;
-        let answer = "finished result ".repeat(4_000);
-        let requests = responses::mount_sse_sequence(
-            &server,
-            vec![responses::sse(vec![
-                responses::ev_assistant_message("answer", &answer),
-                responses::ev_completed("done"),
-            ])],
-        )
-        .await;
-        let test = test_codex().with_config(|config| {
-            let policy: codex_config::config_toml::ConfigToml = toml::from_str("after_agent_policy = 'mutating_finalizer_stdin_v1'").unwrap();
-            config.after_agent_policy = policy.after_agent_policy;
-            let path = config.codex_home.join("received.json");
-            config.notify = Some(vec![if cfg!(windows) { "python" } else { "python3" }.into(), "-c".into(),
-                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.stdin.read(),encoding='utf-8')".into(), path.to_string_lossy().into_owned()]);
-        }).build(&server).await?;
-        let completion = test
-            .submit_turn_and_capture_completion("Finish the response")
-            .await?;
-        assert!(completion.error.is_none(), "{completion:?}");
-        assert_eq!(requests.requests().len(), 1);
-        let payload: serde_json::Value = serde_json::from_str(&fs::read_to_string(
-            test.codex_home_path().join("received.json"),
-        )?)?;
-        assert_eq!(payload["last-assistant-message"], answer);
-        assert_eq!(payload["type"], "agent-turn-complete");
-        Ok(())
-    })
 }

@@ -1,1 +1,0 @@
-{"baseline_would_compact":true,"before_tokens":64879,"estimate_before_projection":65791,"prepare_from_canonical":{"iterations":50,"p50_us":18406.1,"p95_us":20077.8},"pressure_after_checkpoint":65723,"projected_policy_would_compact":false,"projected_tokens":2399,"threshold":60000}

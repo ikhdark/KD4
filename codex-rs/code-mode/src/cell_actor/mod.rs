@@ -32,8 +32,6 @@ pub(crate) use self::types::CellToolCall;
 pub(crate) use self::types::CompletionCommit;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;
-use self::types::ResponseSender;
-use self::types::response_event;
 use crate::TaskFailureHandler;
 use crate::runtime::MAX_BUFFERED_OUTPUT_BYTES;
 use crate::runtime::OutputAdmission;
@@ -98,7 +96,8 @@ impl CellActor {
             },
             task_failure_handler,
         );
-        let initial_response = response_event(initial_response_rx);
+        let initial_response =
+            Box::pin(async move { initial_response_rx.await.unwrap_or(Err(CellError::Closed)) });
         Ok((handle, initial_response, task))
     }
 }
@@ -112,7 +111,7 @@ struct CellContext {
 
 struct Observer {
     mode: ObserveMode,
-    response_tx: ResponseSender,
+    response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
 }
 
 async fn run_cell<H: CellHost>(
@@ -212,21 +211,19 @@ async fn run_cell<H: CellHost>(
                 if let Some((item_count, byte_count)) = pending_explicit_yield.take() {
                     let later_items = content_items.split_off(item_count);
                     let delivery = send_observer_event(
-                        &cell_state,
                         observer.take(),
                         CellEvent::ExplicitYield {
                             content_items: std::mem::replace(&mut content_items, later_items),
                         },
-                        Arc::clone(&output_admission),
-                        byte_count,
                     );
                     let mut delivered_bytes = byte_count;
                     if delivery.is_ok() {
+                        output_admission.release_yield();
                         admitted_output_bytes = admitted_output_bytes.saturating_sub(byte_count);
                     } else {
                         pending_explicit_yield = Some((item_count, byte_count));
                     }
-                    finish_yield_delivery(delivery, &mut content_items, &mut delivered_bytes);
+                    finish_yield_delivery(delivery, &mut content_items, &mut delivered_bytes, output_admission.as_ref());
                 }
                 yield_timer = observer
                     .as_ref()
@@ -242,16 +239,14 @@ async fn run_cell<H: CellHost>(
                 yield_timer = None;
                 finish_yield_delivery(
                     send_observer_event(
-                        &cell_state,
                         observer.take(),
                         CellEvent::Yielded {
                             content_items: std::mem::take(&mut content_items),
                         },
-                        Arc::clone(&output_admission),
-                        admitted_output_bytes,
                     ),
                     &mut content_items,
                     &mut admitted_output_bytes,
+                    output_admission.as_ref(),
                 );
             }
             maybe_event = async {
@@ -363,16 +358,16 @@ async fn run_cell<H: CellHost>(
                         yield_timer = None;
                         let boundary = (content_items.len(), admitted_output_bytes);
                         let delivery = send_observer_event(
-                            &cell_state,
                             observer.take(),
                             CellEvent::ExplicitYield {
                                 content_items: std::mem::take(&mut content_items),
                             },
-                            Arc::clone(&output_admission),
-                            admitted_output_bytes,
                         );
                         pending_explicit_yield = delivery.is_err().then_some(boundary);
-                        finish_yield_delivery(delivery, &mut content_items, &mut admitted_output_bytes);
+                        if pending_explicit_yield.is_none() {
+                            output_admission.release_yield();
+                        }
+                        finish_yield_delivery(delivery, &mut content_items, &mut admitted_output_bytes, output_admission.as_ref());
                     }
                     RuntimeEvent::Notify { id, call_id, text } => {
                         spawn_notification(
@@ -512,27 +507,32 @@ async fn run_cell<H: CellHost>(
     host.closed(cell_state.terminal_event()).await;
 }
 
-fn send_observer_event(
-    state: &Arc<CellState>,
-    observer: Option<Observer>,
-    event: CellEvent,
-    admission: Arc<OutputAdmission>,
-    bytes: usize,
-) -> Result<(), CellEvent> {
+fn send_observer_event(observer: Option<Observer>, event: CellEvent) -> Result<(), CellEvent> {
     let Some(observer) = observer else {
         return Err(event);
     };
-    state.send_yield(observer.response_tx, event, admission, bytes);
-    Ok(())
+    send_cell_event(observer.response_tx, event)
+}
+
+fn send_cell_event(
+    response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
+    event: CellEvent,
+) -> Result<(), CellEvent> {
+    match response_tx.send(Ok(event)) {
+        Ok(()) => Ok(()),
+        Err(Ok(event)) => Err(event),
+        Err(Err(error)) => panic!("cell event delivery returned an actor error: {error:?}"),
+    }
 }
 
 fn finish_yield_delivery(
     delivery: Result<(), CellEvent>,
     content_items: &mut Vec<OutputItem>,
     admitted_output_bytes: &mut usize,
+    output_admission: &OutputAdmission,
 ) {
     match delivery {
-        Ok(()) => *admitted_output_bytes = 0,
+        Ok(()) => output_admission.release(std::mem::take(admitted_output_bytes)),
         Err(
             CellEvent::Yielded {
                 content_items: mut undelivered_items,
@@ -557,14 +557,14 @@ fn rejected_completion_content(event: Option<CellEvent>) -> Vec<OutputItem> {
 }
 
 fn finish_termination(
-    cell_state: &Arc<CellState>,
-    observer_tx: Option<ResponseSender>,
+    cell_state: &CellState,
+    observer_tx: Option<oneshot::Sender<Result<CellEvent, CellError>>>,
     event: CellEvent,
 ) {
     if let Some(event) = cell_state.finish_termination(event)
         && let Some(observer_tx) = observer_tx
     {
-        let _ = cell_state.send_event(observer_tx, event);
+        let _ = observer_tx.send(Ok(event));
     }
 }
 

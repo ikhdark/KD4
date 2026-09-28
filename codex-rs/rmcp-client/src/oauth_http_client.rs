@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -26,8 +25,6 @@ pub(crate) struct OAuthHttpClientAdapter {
     default_headers: HeaderMap,
     buffered_responses: bool,
     timeout_cap: Option<Duration>,
-    refresh: Option<crate::oauth::refresh::RefreshContext>,
-    discovery_error: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl OAuthHttpClientAdapter {
@@ -37,26 +34,11 @@ impl OAuthHttpClientAdapter {
             default_headers,
             buffered_responses: false,
             timeout_cap: None,
-            refresh: None,
-            discovery_error: None,
         }
     }
 
     pub(crate) fn with_buffered_responses(mut self) -> Self {
         self.buffered_responses = true;
-        self
-    }
-
-    pub(crate) fn with_discovery_error(mut self, error: Arc<Mutex<Option<String>>>) -> Self {
-        self.discovery_error = Some(error);
-        self
-    }
-
-    pub(crate) fn with_refresh_context(
-        mut self,
-        refresh: crate::oauth::refresh::RefreshContext,
-    ) -> Self {
-        self.refresh = Some(refresh);
         self
     }
 
@@ -165,19 +147,6 @@ impl OAuthHttpClientAdapter {
 
 impl OAuthHttpClient for OAuthHttpClientAdapter {
     fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
-        Box::pin(async move {
-            let send =
-                |message| self.execute_request(message, request.redirect_policy, request.timeout);
-            let result = match &self.refresh {
-                Some(refresh) => refresh.execute(request.request, send).await,
-                None => send(request.request).await,
-            };
-            if let (Err(error), Some(capture)) = (&result, &self.discovery_error) {
-                *capture
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
-            }
-            result
-        })
+        Box::pin(self.execute_request(request.request, request.redirect_policy, request.timeout))
     }
 }

@@ -50,7 +50,10 @@ pub fn hoist_shared_fragments(
     let mut hints: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     for fragment in fragments {
         for (hint, rendered) in &fragment.candidates {
-            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES {
+            // Repeated numeric bounds can pay for an alias even when short.
+            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES
+                && !rendered.starts_with("number /*")
+            {
                 continue;
             }
             let slot = hints.entry(rendered.as_str()).or_default();
@@ -352,7 +355,7 @@ fn render_json_schema_to_typescript_inner(
     budget.depth -= 1;
     let rendered = rendered?;
     budget.spend(rendered.len())?;
-    if rendered.len() >= FRAGMENT_HOIST_MIN_BYTES {
+    if rendered.len() >= FRAGMENT_HOIST_MIN_BYTES || rendered.starts_with("number /*") {
         budget.fragments.push((None, rendered.clone()));
     }
     Ok(rendered)

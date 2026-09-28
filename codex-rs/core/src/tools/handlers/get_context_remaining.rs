@@ -1,60 +1,15 @@
 use crate::FunctionCallError;
-use crate::context::ContextualUserFragment;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::get_context_remaining_spec::GET_CONTEXT_REMAINING_TOOL_NAME;
 use crate::tools::handlers::get_context_remaining_spec::create_get_context_remaining_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_protocol::models::ResponseInputItem;
-use codex_tools::ToolName;
 use codex_tools::JsonToolOutput;
+use codex_tools::ToolName;
 use codex_tools::ToolSpec;
-use serde_json::Value as JsonValue;
 use serde_json::json;
-
-#[derive(Debug, Clone)]
-struct GetContextRemainingOutput {
-    tokens_left: Option<i64>,
-}
-
-impl GetContextRemainingOutput {
-    fn new(tokens_left: Option<i64>) -> Self {
-        Self { tokens_left }
-    }
-
-    fn fragment(&self) -> String {
-        match self.tokens_left {
-            Some(tokens_left) => {
-                crate::context::TokenBudgetRemainingContext::new(tokens_left).render()
-            }
-            None => crate::context::TokenBudgetRemainingContext::unknown().render(),
-        }
-    }
-}
-
-impl ToolOutput for GetContextRemainingOutput {
-    fn log_preview(&self) -> String {
-        self.fragment()
-    }
-
-    fn success_for_logging(&self) -> bool {
-        true
-    }
-
-    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        JsonToolOutput::new(self.code_mode_result(payload))
-            .to_response_item(call_id, payload)
-    }
-
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        json!({
-            "tokens_left": self.tokens_left,
-        })
-    }
-}
 
 pub struct GetContextRemainingHandler;
 
@@ -81,8 +36,8 @@ impl ToolExecutor<ToolInvocation> for GetContextRemainingHandler {
             )
             .await;
 
-            Ok(boxed_tool_output(GetContextRemainingOutput::new(
-                token_status.base_window_tokens_remaining,
+            Ok(boxed_tool_output(JsonToolOutput::new(
+                json!({"tokens_left": token_status.base_window_tokens_remaining}),
             )))
         })
     }
@@ -93,19 +48,45 @@ impl CoreToolRuntime for GetContextRemainingHandler {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::ResponseInputItem;
+    use std::sync::Arc;
 
-    #[test]
-    fn direct_and_code_mode_results_obey_the_same_schema() {
-        let payload = ToolPayload::Function { arguments: "{}".into() };
-        let ToolSpec::Function(spec) = create_get_context_remaining_tool() else { panic!("function tool") };
-        let schema = spec.output_schema.unwrap().into_value();
-        let validator = jsonschema::validator_for(&schema).unwrap();
-        for tokens in [None, Some(0), Some(42)] {
-            let output = GetContextRemainingOutput::new(tokens);
-            let direct = serde_json::to_value(output.to_response_item("call", &payload)).unwrap();
-            let value: JsonValue = serde_json::from_str(direct["output"].as_str().unwrap()).unwrap();
-            assert_eq!(value, output.code_mode_result(&payload));
-            validator.validate(&value).unwrap();
-        }
+    #[tokio::test]
+    async fn direct_and_code_mode_results_obey_the_same_schema() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let payload = ToolPayload::Function {
+            arguments: "{}".into(),
+        };
+        let output = GetContextRemainingHandler
+            .handle(ToolInvocation {
+                session: Arc::new(session),
+                step_context: crate::session::step_context::StepContext::for_test(Arc::new(turn)),
+                cancellation_token: Default::default(),
+                tracker: Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "remaining".into(),
+                tool_name: ToolName::plain(GET_CONTEXT_REMAINING_TOOL_NAME),
+                source: crate::tools::router::ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap();
+        let ResponseInputItem::FunctionCallOutput { output: direct, .. } =
+            output.to_response_item("remaining", &payload)
+        else {
+            panic!("expected function output");
+        };
+        let FunctionCallOutputBody::Text(text) = direct.body else {
+            panic!("expected structured JSON text, not rendered content fragments");
+        };
+        let direct: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(direct, output.code_mode_result(&payload));
+        let ToolSpec::Function(spec) = GetContextRemainingHandler.spec() else {
+            panic!("expected function spec");
+        };
+        let validator = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+        assert!(validator.is_valid(&direct), "{direct}");
     }
 }

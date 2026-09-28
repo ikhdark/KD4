@@ -51,15 +51,9 @@ pub fn resolve_windows_deny_read_paths(
         return Ok(paths);
     };
 
-    let mut seen_scan_plans = HashSet::new();
     for pattern in unreadable_globs {
-        let scan_plan = glob_scan_plan(&pattern, file_system_sandbox_policy.glob_scan_max_depth);
-        // The matcher already includes every pattern. Only identical root/depth
-        // plans can share a walk; a shallower visit must not suppress a deeper one.
-        if !seen_scan_plans.insert((scan_plan.root.clone(), scan_plan.max_depth)) {
-            continue;
-        }
         let mut seen_scan_dirs = HashSet::new();
+        let scan_plan = glob_scan_plan(&pattern, file_system_sandbox_policy.glob_scan_max_depth);
         collect_existing_glob_matches(
             &scan_plan.root,
             &matcher,

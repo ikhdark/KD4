@@ -138,8 +138,6 @@ struct CodeModeNestedResultEvidence {
     tool_name: String,
     output: String,
     output_truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recovery: Option<JsonValue>,
 }
 
 struct CodeModePacketReceipt {
@@ -213,8 +211,8 @@ fn bounded_serialized_json(value: &JsonValue) -> (String, bool, usize) {
     writer.finish()
 }
 
-const MAX_RETAINED_NESTED_RESULTS: usize = 8;
-const MAX_RETAINED_NESTED_RESULT_BYTES: usize = 4_096;
+const MAX_RETAINED_NESTED_RESULTS: usize = 2;
+const MAX_RETAINED_NESTED_RESULT_BYTES: usize = 1_024;
 const MAX_FAILED_CELL_ERROR_BYTES: usize = 4_096;
 const FAILED_CELL_ERROR_TRUNCATION_MARKER: &str = "\n… [truncated]";
 const APPLY_PATCH_ENVELOPE_MARKER: &str = "*** Begin Patch";
@@ -557,7 +555,6 @@ pub(super) fn handle_runtime_response(
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
     started_at: std::time::Instant,
-    host_control_yield: bool,
 ) -> Result<FunctionToolOutput, String> {
     // Nested tool results have already crossed their owning tool boundary. Keep
     // one coherent, model-safe exec packet here instead of applying the much
@@ -589,12 +586,8 @@ pub(super) fn handle_runtime_response(
         omitted_nested_result_count = packet.omitted_nested_result_count,
         "code-mode packet admission receipt"
     );
-    let has_nested_failures = packet.nested_results.iter().any(|result| result.failed);
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
-    // A host interruption notice is not evidence that JavaScript printed its
-    // completed results. Deliver those results before draining the packet.
-    let nested_results = if host_control_yield || response_needs_retained_nested_results(&response)
-    {
+    let nested_results = if response_needs_retained_nested_results(&response) {
         if packet.omitted_nested_result_count > 0 {
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: format!(
@@ -620,10 +613,6 @@ pub(super) fn handle_runtime_response(
         nested_results,
         packet.first_required_terminal,
     );
-    if has_nested_failures {
-        // Printed results skip fallback rendering, not failure provenance.
-        output.essential_inline.insert("contains_nested_failure".into(), JsonValue::Bool(true));
-    }
     // A zero text budget must not erase the only handle for still-owned work.
     for state in &canonical_states {
         if state["process_exited"] == false && !state["session_id"].is_null() {
@@ -642,8 +631,7 @@ pub(super) fn handle_runtime_response(
                     "output_truncated": true,
                     "artifact_id": artifact_id,
                     "recovery_tool": "read_tool_output",
-                })
-                .to_string(),
+                }).to_string(),
             });
         }
     }
@@ -826,7 +814,6 @@ fn format_runtime_response(
     nested_results: Vec<CodeModeNestedResultEvidence>,
     required_terminal: Option<CodeModeNestedTerminal>,
 ) -> FunctionToolOutput {
-    let has_nested_failures = nested_results.iter().any(|result| result.failed);
     let continuation_owner_key = match &response {
         RuntimeResponse::Yielded { cell_id, .. }
         | RuntimeResponse::ExplicitYield { cell_id, .. }
@@ -834,19 +821,6 @@ fn format_runtime_response(
         | RuntimeResponse::Result { cell_id, .. } => cell_id.to_string(),
     };
     let script_status = format_script_status(&response);
-    // Lifecycle identity belongs in the visible status, not the semantic hash.
-    let semantic_status = match &response {
-        RuntimeResponse::Yielded { .. } => "running",
-        RuntimeResponse::ExplicitYield { .. } => "explicit_yield",
-        RuntimeResponse::Terminated { .. } => "terminated",
-        RuntimeResponse::Result {
-            error_text: Some(_),
-            ..
-        } => "failed",
-        RuntimeResponse::Result {
-            error_text: None, ..
-        } => "completed",
-    };
     let output_loss = match &response {
         RuntimeResponse::Result { output_loss, .. } => output_loss.clone(),
         _ => None,
@@ -902,42 +876,13 @@ fn format_runtime_response(
         .into_iter()
         .filter(|result| {
             !(result.failed
-                && !result.output_truncated
                 && script_error
                     .as_deref()
                     .is_some_and(|error| error.contains(result.output.as_str())))
         })
         .filter(|result| !nested_result_already_emitted(result, &emitted))
-        .map(|mut result| {
-            // Printing only result.output establishes the text, not its exit
-            // status. Keep that status without repeating a proven full payload.
-            if !result.output_truncated
-                && let Some((status, payload)) = retained_command_parts(&result)
-                && complete_text_emitted(payload, &emitted)
-            {
-                result.output = status.to_string();
-            }
-            result
-        })
-        .collect::<Vec<_>>();
-    let recovery_receipts = nested_results
-        .iter()
-        .filter(|result| result.output_truncated)
-        .map(|result| {
-            result.recovery.clone().unwrap_or_else(|| {
-                serde_json::json!({
-                    "output_truncated": true,
-                    "recovery_unavailable": true,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
+        .collect();
     content_items.extend(nested_result_content_items(nested_results));
-    content_items.extend(recovery_receipts.iter().map(|receipt| {
-        FunctionCallOutputContentItem::InputText {
-            text: receipt.to_string(),
-        }
-    }));
     content_items.extend(post_tool_use_feedback);
     let mut diagnostic = required_terminal.as_ref().map(|terminal| {
         success = false;
@@ -973,7 +918,7 @@ fn format_runtime_response(
         diagnostic_index,
     );
     let semantic_evidence = serde_json::json!({
-        "status": semantic_status,
+        "status": &script_status,
         "content_items": &content_items,
         "output_loss": &output_loss,
     });
@@ -988,15 +933,6 @@ fn format_runtime_response(
         };
         content_items.insert(0, metadata.clone());
         canonical_content_items.insert(0, metadata);
-    }
-    // Like live command handles, recovery metadata must survive a zero text
-    // budget. There are at most MAX_RETAINED_NESTED_RESULTS receipts per packet.
-    let visible = code_mode_text_content(&content_items);
-    for receipt in recovery_receipts {
-        let text = receipt.to_string();
-        if !visible.contains(&text) {
-            content_items.push(FunctionCallOutputContentItem::InputText { text });
-        }
     }
     let elapsed = started_at.elapsed();
     if yielded || !success {
@@ -1030,13 +966,6 @@ fn format_runtime_response(
             VISIBLE_OUTPUT_TRUNCATED_KEY.to_string(),
             JsonValue::Bool(true),
         );
-    }
-    if has_nested_failures {
-        // A handled command failure must not make JavaScript throw, but its
-        // evidence is still unsafe to retire as a successful completed phase.
-        output
-            .essential_inline
-            .insert("contains_nested_failure".into(), JsonValue::Bool(true));
     }
     match required_terminal {
         Some(terminal) => fold_nested_required_terminal(output, terminal),
@@ -1226,8 +1155,6 @@ async fn call_nested_tool(
                 None,
                 nested_failure_fingerprint(&tool_name, &error),
             );
-            let (output, output_truncated, recovery) =
-                retain_nested_error(&exec, &nested_call_id, &error).await;
             exec.session
                 .services
                 .code_mode_service
@@ -1246,9 +1173,11 @@ async fn call_nested_tool(
                         parent_cell_id: cell_id.to_string(),
                         runtime_tool_call_id,
                         tool_name: tool_name.to_string(),
-                        output,
-                        output_truncated,
-                        recovery,
+                        output: error
+                            .chars()
+                            .take(MAX_RETAINED_NESTED_RESULT_BYTES / 4)
+                            .collect(),
+                        output_truncated: error.len() > MAX_RETAINED_NESTED_RESULT_BYTES / 4,
                     }),
                     None,
                 );
@@ -1314,8 +1243,6 @@ async fn call_nested_tool(
                 Some(&payload),
                 nested_failure_fingerprint(&tool_name, &message),
             );
-            let (output, output_truncated, recovery) =
-                retain_nested_error(&exec, &nested_call_id, &message).await;
             exec.session
                 .services
                 .code_mode_service
@@ -1334,9 +1261,11 @@ async fn call_nested_tool(
                         parent_cell_id: cell_id.to_string(),
                         runtime_tool_call_id,
                         tool_name: tool_name.to_string(),
-                        output,
-                        output_truncated,
-                        recovery,
+                        output: message
+                            .chars()
+                            .take(MAX_RETAINED_NESTED_RESULT_BYTES / 4)
+                            .collect(),
+                        output_truncated: message.len() > MAX_RETAINED_NESTED_RESULT_BYTES / 4,
                     }),
                     terminal_cause.map(|cause| (cause, message)),
                 );
@@ -1359,53 +1288,48 @@ async fn call_nested_tool(
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let failure_is_error = result.code_mode_failure_is_error();
-    let existing_snapshot = result.retained_canonical_artifact();
     let result_value = result.code_mode_result();
-    let (retained_json, json_truncated, result_bytes) = bounded_serialized_json(&result_value);
-    let (retained_output, output_truncated) = retained_nested_output(
-        &tool_name,
-        &result_value,
-        retained_json.clone(),
-        json_truncated,
-    );
-    let source_evidence_required = parent_tool_call_id.is_some()
+    let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
+    if let Some(parent_call_id) = parent_tool_call_id.as_ref()
         && source_dependencies
             .as_ref()
-            .is_some_and(|dependencies| !dependencies.is_empty());
-    let command_state = nested_command_state(&tool_name, &nested_call_id, &payload, &result_value);
-    let raw_recovery = output_truncated.then(|| {
-        command_state.as_ref()?.get("raw_output_artifact_id")?.as_str().map(|id| {
-            serde_json::json!({"output_truncated": true, "artifact_id": id, "recovery_tool": "read_tool_output"})
-        })
-    }).flatten();
-    // Reuse source-evidence storage and the command owner's raw artifact. Only
-    // otherwise-unrecoverable clipped results need a new snapshot.
-    let snapshot = if source_evidence_required && json_truncated
-        || output_truncated && raw_recovery.is_none()
+            .is_some_and(|dependencies| !dependencies.is_empty())
     {
-        Some(
-            nested_result_snapshot(
-                &exec,
-                &nested_call_id,
-                &result_value,
-                existing_snapshot.as_ref(),
-            )
-            .await,
-        )
-    } else {
-        None
-    };
-    if let Some(parent_call_id) = parent_tool_call_id
-        .as_ref()
-        .filter(|_| source_evidence_required)
-    {
-        let evidence_output = if !json_truncated {
-            Some(retained_json)
+        let evidence_output = if !output_truncated && retained_output.len() <= 4_096 {
+            Some(retained_output.clone())
         } else {
-            snapshot
-                .as_ref()
-                .filter(|snapshot| snapshot["artifact_id"].is_string())
-                .map(JsonValue::to_string)
+            let canonical = codex_tools::CanonicalToolResult::json(result_value.clone());
+            let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+                &exec.turn.config.codex_home,
+                &exec.session.thread_id.to_string(),
+                &canonical,
+            )
+            .await;
+            if artifact.complete {
+                if let Some(artifact_id) = artifact.artifact_id() {
+                    exec.session
+                        .register_tool_artifact_origin(
+                            artifact_id.clone(),
+                            nested_call_id.clone(),
+                            canonical.exact_bytes,
+                            canonical.sha256,
+                        )
+                        .await;
+                    Some(
+                        serde_json::json!({
+                            "artifact_id": artifact_id,
+                            "historical_source": true,
+                            "recovery_tool": "read_tool_output",
+                            "selectors": [{"kind": "json_pointer", "pointer": ""}]
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
         if let Some(output) = evidence_output {
             exec.session
@@ -1422,20 +1346,15 @@ async fn call_nested_tool(
             outcome_context.outcome,
             codex_tools::ToolOutputOutcome::Success | codex_tools::ToolOutputOutcome::Yielded
         ),
-        command_state,
+        command_state: nested_command_state(&tool_name, &nested_call_id, &payload, &result_value),
         ordinal: packet_ordinal,
         call_id: nested_call_id,
         parent_call_id: parent_tool_call_id,
         parent_cell_id: cell_id.to_string(),
         runtime_tool_call_id,
         tool_name: tool_name.to_string(),
-        output: retained_output,
+        output: retained_nested_output(&tool_name, &result_value, retained_output),
         output_truncated,
-        recovery: if output_truncated {
-            raw_recovery.or(snapshot)
-        } else {
-            None
-        },
     };
     let required_terminal = required_nested_tool_terminal_cause(outcome_context, signal.as_ref())
         .filter(|cause| failure_is_error || matches!(cause, RequiredToolTerminalCause::Blocked))
@@ -1490,76 +1409,13 @@ async fn call_nested_tool(
     Ok(result_value)
 }
 
-async fn nested_result_snapshot(
-    exec: &ExecContext,
-    call_id: &str,
-    value: &JsonValue,
-    existing: Option<&(String, String)>,
-) -> JsonValue {
-    let canonical = codex_tools::CanonicalToolResult::json(value.clone());
-    let artifact_id = if let Some((id, _)) = existing.filter(|(_, hash)| *hash == canonical.sha256)
-    {
-        id.clone()
-    } else {
-        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-            &exec.turn.config.codex_home,
-            &exec.session.thread_id.to_string(),
-            &canonical,
-        )
-        .await;
-        match artifact.artifact_id().filter(|_| artifact.complete) {
-            Some(id) => id,
-            None => {
-                return serde_json::json!({
-                    "output_truncated": true,
-                    "recovery_unavailable": true,
-                    "recovery_error": artifact.error.unwrap_or_else(|| "nested result snapshot is incomplete".to_string()),
-                });
-            }
-        }
-    };
-    exec.session
-        .register_tool_artifact_origin(
-            artifact_id.clone(),
-            call_id.to_string(),
-            canonical.exact_bytes,
-            canonical.sha256,
-        )
-        .await;
-    serde_json::json!({
-        "output_truncated": true,
-        "artifact_id": artifact_id,
-        "historical_source": true,
-        "recovery_tool": "read_tool_output",
-        "selectors": [{"kind": "json_pointer", "pointer": ""}],
-    })
-}
-
-async fn retain_nested_error(
-    exec: &ExecContext,
-    call_id: &str,
-    error: &str,
-) -> (String, bool, Option<JsonValue>) {
-    let truncated = error.len() > MAX_FAILED_CELL_ERROR_BYTES;
-    let recovery = if truncated {
-        Some(
-            nested_result_snapshot(exec, call_id, &JsonValue::String(error.to_string()), None)
-                .await,
-        )
-    } else {
-        None
-    };
-    (bounded_failed_cell_error(error), truncated, recovery)
-}
-
 /// Retained evidence of a completed nested call: a command's exit code and
 /// output, otherwise the bounded result JSON.
 fn retained_nested_output(
     tool_name: &ToolName,
     result_value: &JsonValue,
     retained_json: String,
-    json_truncated: bool,
-) -> (String, bool) {
+) -> String {
     if tool_name.namespace.is_none()
         && matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
         && let Some(text) = result_value["output"].as_str()
@@ -1569,54 +1425,40 @@ fn retained_nested_output(
             rendered.push('\n');
             rendered.push_str(repair);
         }
-        let retained = codex_utils_string::truncate_middle_chars(
-            &rendered,
-            MAX_RETAINED_NESTED_RESULT_BYTES - 128,
-        );
-        let truncated = retained != rendered;
-        (retained, truncated)
+        codex_utils_string::truncate_middle_chars(&rendered, MAX_RETAINED_NESTED_RESULT_BYTES - 128)
     } else {
-        (retained_json, json_truncated)
+        retained_json
     }
 }
 
-fn retained_command_parts(result: &CodeModeNestedResultEvidence) -> Option<(&str, &str)> {
-    if !matches!(result.tool_name.as_str(), "exec_command" | "write_stdin") {
-        return None;
-    }
-    let (status, payload) = result.output.split_once('\n')?;
-    status
-        .starts_with("exit_code: ")
-        .then_some((status, payload))
-}
-
-fn complete_text_emitted(payload: &str, emitted: &str) -> bool {
-    // Tiny matching strings are weak evidence of a deliberately printed result.
-    payload.len() >= 32
-        && (emitted.contains(payload)
-            || serde_json::to_string(payload)
-                .is_ok_and(|escaped| emitted.contains(&escaped[1..escaped.len() - 1])))
-}
-
-/// Only complete evidence establishes duplication. Matching the ends of a
-/// clipped result says nothing about its missing middle or its exit status.
+/// Whether the script already printed this retained result before the cell
+/// ended. `text(result)` shows it JSON-escaped and `text(result.output)`
+/// verbatim. Both ends of the retained copy must appear, so a different result
+/// that only shares a prefix, such as build progress, stays visible.
 fn nested_result_already_emitted(result: &CodeModeNestedResultEvidence, emitted: &str) -> bool {
-    if result.output_truncated {
+    const PROBE_BYTES: usize = 256;
+    // A short result costs little to repeat and is weak evidence of printing.
+    const MIN_PAYLOAD_BYTES: usize = 32;
+    let payload = match result
+        .output
+        .strip_prefix("exit_code: ")
+        .and_then(|rest| rest.split_once('\n'))
+    {
+        Some((_, output)) => output,
+        // A script may spread a result object into another, so its opening
+        // brace is not evidence.
+        None => result.output.strip_prefix('{').unwrap_or(&result.output),
+    };
+    if payload.len() < MIN_PAYLOAD_BYTES {
         return false;
     }
-    if let Some((status, payload)) = retained_command_parts(result) {
-        return complete_text_emitted(&result.output, emitted)
-            || emitted
-                .lines()
-                .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
-                .any(|value| {
-                    value["output"].as_str() == Some(payload)
-                        && value
-                            .get("exit_code")
-                            .is_some_and(|exit| status == format!("exit_code: {exit}"))
-                });
-    }
-    complete_text_emitted(&result.output, emitted)
+    let head = &payload[..payload.floor_char_boundary(PROBE_BYTES)];
+    let tail = &payload[payload.ceil_char_boundary(payload.len().saturating_sub(PROBE_BYTES))..];
+    [head, tail].into_iter().all(|probe| {
+        emitted.contains(probe)
+            || serde_json::to_string(probe)
+                .is_ok_and(|escaped| emitted.contains(&escaped[1..escaped.len() - 1]))
+    })
 }
 
 // Presentation only: never use this projection for a JavaScript tool return.
@@ -2019,9 +1861,6 @@ fn build_freeform_tool_payload(
 mod response_tests;
 
 #[cfg(test)]
-mod context_checkpoint_benchmarks;
-
-#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -2113,8 +1952,8 @@ mod tests {
         let (retained, truncated, bytes) = bounded_serialized_json(&value);
 
         assert!(truncated);
-        assert_eq!(retained, format!("{{\"body\":\"{}", "🙂".repeat(1_021)));
-        assert_eq!(bytes, 16_395);
+        assert_eq!(retained, format!("{{\"body\":\"{}", "🙂".repeat(253)));
+        assert_eq!(bytes, 4_107);
     }
 
     #[test]
@@ -2643,14 +2482,13 @@ mod tests {
                     }
                     .into(),
                     output_truncated: false,
-                    recovery: None,
                 }),
                 None,
             );
         }
         let packet = service.finish_packet("late-failure-cell", false);
-        assert_eq!(packet.nested_results.len(), 8);
-        assert_eq!(packet.omitted_nested_result_count, 2);
+        assert_eq!(packet.nested_results.len(), 2);
+        assert_eq!(packet.omitted_nested_result_count, 8);
         assert!(packet.nested_results.iter().any(|result| result.failed
             && result.call_id == "call-9"
             && result.output == "late failure"));
@@ -3234,15 +3072,20 @@ mod tests {
     }
 
     #[test]
-    fn default_outer_success_budget_preserves_output_above_the_old_cap() {
-        let text = "x".repeat(24_000);
-        let original_tokens = codex_utils_string::approx_token_count(&text);
+    fn default_outer_budget_is_smaller_than_the_explicit_budget() {
+        let text = "source line test\n".repeat(1_300);
+        let original_tokens = codex_utils_output_truncation::model_token_count(&text);
         assert!(original_tokens > 4_000);
         assert!(original_tokens < codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
         let items = vec![FunctionCallOutputContentItem::InputText { text: text.clone() }];
 
+        let (default_projection, omitted) =
+            truncate_code_mode_result(items.clone(), None, OutputOutcome::Success, 10_000, None);
+        assert!(omitted);
+        let default_text = super::code_mode_text_content(&default_projection);
+        assert!(codex_utils_output_truncation::model_token_count(&default_text) <= 4_000);
         let (projected, omitted) =
-            truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX, None);
+            truncate_code_mode_result(items, Some(10_000), OutputOutcome::Success, 10_000, None);
 
         let [
             FunctionCallOutputContentItem::InputText {

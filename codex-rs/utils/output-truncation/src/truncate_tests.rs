@@ -451,7 +451,7 @@ fn byte_count_conversion_clamps_non_positive_values() {
 fn optimization_priority_coherent_packet_defaults_precede_trimming() {
     assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
-    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 16_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 8_000);
     assert_eq!(
         resolve_output_limits(None, OutputOutcome::Success, Some("echo ok"), "ok", 20_000),
         OutputLimitResolution {
@@ -627,7 +627,7 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
     );
     // Outcome no longer changes the budget: successful discovery output is the
     // evidence a turn is built on, so it gets the same room as a failure. The
-    // diagnostic class is the distinction that still has to be observable.
+    // diagnostic class uses the nested-command ceiling.
     for outcome in [
         OutputOutcome::Success,
         OutputOutcome::Failure,
@@ -645,10 +645,8 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
         )
         .applied_limit;
         assert_eq!(normal, DEFAULT_SUCCESS_OUTPUT_TOKENS, "{outcome:?}");
-        assert!(
-            high_signal > normal,
-            "high-signal diagnostics must keep more room than ordinary output: {outcome:?}"
-        );
+        assert_eq!(high_signal, DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, "{outcome:?}");
+        assert!(high_signal <= 8_000, "diagnostics must fit the nested command ceiling");
     }
     assert_eq!(
         resolve_projected_output_limits(
@@ -802,7 +800,7 @@ fn diagnostic_output_receives_budget_without_command_metadata() {
         "project.csproj: error MSB1009: Project file does not exist.",
     ] {
         let limits = resolve_output_limits(None, OutputOutcome::Success, None, diagnostic, 20_000);
-        assert_eq!(limits.applied_limit, 16_000, "{diagnostic}");
+        assert_eq!(limits.applied_limit, 8_000, "{diagnostic}");
     }
 }
 
@@ -993,7 +991,7 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000)
                 .applied_limit,
-            16_000,
+            8_000,
             "{command}"
         );
     }
@@ -1026,7 +1024,7 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
     ] {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, None, output, 20_000).applied_limit,
-            16_000,
+            8_000,
             "{output}"
         );
     }

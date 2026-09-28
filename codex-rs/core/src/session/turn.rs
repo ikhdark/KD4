@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
@@ -374,7 +375,6 @@ pub(crate) async fn run_turn(
     let mut last_stop_repair = None;
     let mut completion_evidence = None;
     let mut provider_overflow_recovery_attempted = false;
-    let mut checkpoint_preflight = false;
     if run_pending_session_start_hooks(&sess, &turn_context).await {
         return Ok(finish_stopped_session_start(&sess, input).await);
     }
@@ -413,12 +413,6 @@ pub(crate) async fn run_turn(
         };
         let prepared_context_update =
             take_stabilized_context_update(&mut pending_turn_plan.prepared_context_update)?;
-        if let Some(canonical) = pending_turn_plan.skill_recovery.take() {
-            match persist_skill_context_recovery(&sess, canonical).await {
-                Ok(item) => pending_turn_plan.injection_items.push(item),
-                Err(error) => break Err(error),
-            }
-        }
         let (world_state, display_roots) = tokio::join!(
             sess.compare_and_record_context_updates(
                 prepared_context_update,
@@ -621,7 +615,6 @@ pub(crate) async fn run_turn(
                 request_baselines.relevant_state_fingerprint(),
             );
         }
-        let budget_before_admission = *logical_generation_budget;
         let generation_budget_admission =
             logical_generation_budget.admit(generation_request.terminal_completion_only);
         let budget_forced_terminal = match generation_budget_admission {
@@ -686,12 +679,14 @@ pub(crate) async fn run_turn(
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::HistorySnapshot);
                 let mut history = sess.clone_history().await;
-                if let Some(notice) = step_context.mcp_tool_snapshot().await.availability_notice() {
+                if step_context.mcp_tool_snapshot().await.temporarily_unavailable {
                     history.record_items(
                         &[ResponseItem::Message {
                             id: None,
                             role: "developer".to_string(),
-                            content: vec![ContentItem::InputText { text: notice }],
+                            content: vec![ContentItem::InputText {
+                                text: "The MCP tool catalog is temporarily unavailable for this request. This does not mean that no MCP tools are configured. Continue independent local work; if this task requires MCP, retry discovery on a subsequent step or report the unavailable capability.".to_string(),
+                            }],
                             phase: None,
                             internal_chat_message_metadata_passthrough: None,
                         }],
@@ -735,12 +730,8 @@ pub(crate) async fn run_turn(
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
-            responses_metadata.history_ingest_requested = turn_context
-                .config
-                .token_budget
-                .as_ref()
-                .is_some_and(|config| config.use_history_notes_extension)
-                .then_some(true);
+            responses_metadata.history_ingest_requested = turn_context.config.token_budget
+                .as_ref().is_some_and(|config| config.use_history_notes_extension).then_some(true);
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
@@ -758,7 +749,6 @@ pub(crate) async fn run_turn(
                 request_signals.clone(),
                 &mut pending_continuation_cause,
                 cancellation_token.child_token(),
-                std::mem::take(&mut checkpoint_preflight),
             )
             .await
         }
@@ -770,10 +760,7 @@ pub(crate) async fn run_turn(
             .turn_timing_state
             .finish_request_preparation(&mut preparation_timing_guard);
         match sampling_request_result {
-            Ok(SamplingRequestOutcome::Completed(
-                sampling_request_output,
-                sampling_request_input,
-            )) => {
+            Ok((sampling_request_output, sampling_request_input)) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -806,12 +793,6 @@ pub(crate) async fn run_turn(
                     });
                 }
                 turn_execution.settle(&request_baselines, &request_signals, &settled_state);
-                if let Some(reason) = turn_context.post_tool_stop_reason.get() {
-                    emit_hook_stop_reason(&sess, &turn_context, "PostToolUse", Some(reason)).await;
-                    last_agent_message = sampling_request_last_agent_message;
-                    defer_pending_input = true;
-                    break 'sampling_loop;
-                }
                 logical_generation_budget.observe_progress(
                     turn_execution.observe_budget_progress(
                         &request_baselines,
@@ -875,11 +856,6 @@ pub(crate) async fn run_turn(
                         decision.continuation == ContinuationDisposition::TerminalCompletionRequired
                     });
                 if authoritative_wait_terminal_surface.is_some() {
-                    if needs_follow_up {
-                        turn_context
-                            .turn_timing_state
-                            .record_suppressed_model_handoff();
-                    }
                     needs_follow_up = false;
                 }
                 let mut next_generation_request = needs_follow_up.then(|| {
@@ -924,32 +900,14 @@ pub(crate) async fn run_turn(
                     turn_context.turn_timing_state.record_wait_only_generation();
                 }
                 let token_limit_reached = token_status.token_limit_reached;
-                let new_context_requested =
-                    turn_context.config.features.enabled(Feature::TokenBudget)
-                        && sess.new_context_window_requested().await;
-                let token_limit_reached = if !new_context_requested
-                    && needs_follow_up
-                    && token_limit_reached
-                    && sess.clone_history().await.has_pending_phase_checkpoint()
-                {
-                    checkpoint_preflight = true;
-                    false
-                } else {
-                    token_limit_reached
-                };
+                let new_context_requested = turn_context.config.features.enabled(Feature::TokenBudget)
+                    && sess.new_context_window_requested().await;
                 super::token_budget::maybe_record(
                     &sess,
                     &turn_context,
-                    // The old usage is not the checkpointed next request's
-                    // pressure. Do not emit a stale fallback/reminder for it.
-                    if checkpoint_preflight {
-                        None
-                    } else {
-                        token_status.base_window_tokens_remaining
-                    },
+                    token_status.base_window_tokens_remaining,
                     needs_follow_up && !new_context_requested,
-                )
-                .await?;
+                ).await?;
 
                 trace!(
                     turn_id = %turn_context.sub_id,
@@ -1030,11 +988,10 @@ pub(crate) async fn run_turn(
                     // C1: the direct runtime shares this completion path. It must not skip
                     // the after-agent and completion-stop hooks, because those are the
                     // authoritative, user-configured control over whether a turn may finish.
-                    let mutating_finalizer_aborted = if turn_context
-                        .config
-                        .after_agent_policy
-                        .is_mutating_finalizer()
-                    {
+                    let mutating_finalizer_aborted = if matches!(
+                        turn_context.config.after_agent_policy,
+                        AfterAgentPolicy::MutatingFinalizer
+                    ) {
                         if finalized_mutation_revision
                             .is_some_and(|revision| revision != settled_state.mutation_revision)
                         {
@@ -1201,32 +1158,6 @@ pub(crate) async fn run_turn(
                 )
                 .await?;
                 debug_assert!(pending_continuation_cause.is_some());
-                continue;
-            }
-            Ok(SamplingRequestOutcome::RequiresCompaction {
-                step_context,
-                request_dispatched,
-            }) => {
-                // A rejected initial preflight used no generation. A retry with
-                // accepted output did: it must not refund that generation.
-                if !request_dispatched {
-                    *logical_generation_budget = budget_before_admission;
-                    logical_generation_ordinal = logical_generation_ordinal.saturating_sub(1);
-                }
-                pending_generation_request = Some(generation_request);
-                run_auto_compact(
-                    &sess,
-                    Arc::clone(&step_context),
-                    None,
-                    &mut client_session,
-                    prefetched_workspace_identity.as_ref(),
-                    Some(Arc::clone(&world_state)),
-                    CompactionReason::ContextLimit,
-                    CompactionPhase::MidTurn,
-                    &cancellation_token,
-                )
-                .await?;
-                pending_continuation_cause = Some(ContinuationCause::Compaction);
                 continue;
             }
             Err(err @ CodexErr::TurnAborted) => {
@@ -1876,7 +1807,6 @@ struct PendingTurnPlan {
     prepared_context_update: Option<PreparedContextUpdate>,
     first_router: Arc<ToolRouter>,
     injection_items: Vec<ResponseItem>,
-    skill_recovery: Option<codex_tools::CanonicalToolResult>,
     explicitly_enabled_connectors: HashSet<String>,
     projected_prompt_pressure: ProjectedPromptPressure,
     mcp_dependency_effect: Option<PlannedMcpDependencyEffect>,
@@ -1970,29 +1900,8 @@ fn task_relevant_recommended_plugins(
         return Vec::new();
     }
 
-    let names_a_plugin_category = ["plugin", "plugins", "integration", "integrations"]
-        .iter()
-        .any(|term| contains_task_term(&task, term));
-    let requests_recommendations = [
-        "add",
-        "available",
-        "connect",
-        "find",
-        "install",
-        "list",
-        "recommend",
-        "show",
-        "suggest",
-        "use",
-        "what",
-        "which",
-    ]
-    .iter()
-    .any(|term| contains_task_term(&task, term));
-    if names_a_plugin_category && requests_recommendations {
-        return candidates;
-    }
-
+    // Only named candidates belong in stable context. Broad discovery belongs
+    // to tool_search; incidental words in coding tasks must not pin the catalog.
     candidates
         .into_iter()
         .filter(|candidate| {
@@ -2179,7 +2088,7 @@ async fn build_pure_pending_turn_plan(
     let injected_host_skill_prompts = turn_context
         .extension_data
         .get::<InjectedHostSkillPrompts>();
-    let (mut injection_items, skill_recovery) =
+    let mut injection_items =
         build_bounded_skill_context_items(skill_plan.injections.items.iter().filter(|skill| {
             injected_host_skill_prompts
                 .as_ref()
@@ -2234,18 +2143,13 @@ async fn build_pure_pending_turn_plan(
     warnings.extend(first_router.planning_warnings().iter().cloned());
     warnings.extend(skill_plan.injections.warnings.iter().cloned());
     let initial_context = !sess.has_reference_context_item().await;
-    let mut pending_token_estimate = estimate_pending_tokens(
+    let pending_token_estimate = estimate_pending_tokens(
         input,
         &injection_items,
         prepared_context_update.context_items(),
         first_router.as_ref(),
         initial_context,
     );
-    if skill_recovery.is_some() {
-        // Reserve the full receipt allowance without writing an artifact in the pure plan.
-        pending_token_estimate.total_tokens += SKILL_RECOVERY_RESERVED_TOKENS as i64;
-        pending_token_estimate.body_growth_tokens += SKILL_RECOVERY_RESERVED_TOKENS as i64;
-    }
     let projected_prompt_pressure =
         projected_prompt_pressure(sess, turn_context, pending_token_estimate).await;
     Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
@@ -2255,7 +2159,6 @@ async fn build_pure_pending_turn_plan(
         first_router,
         projected_prompt_pressure,
         injection_items,
-        skill_recovery,
         explicitly_enabled_connectors,
         mcp_dependency_effect: planned_mcp.effect,
         warnings,
@@ -2553,7 +2456,6 @@ fn planning_failure_with_timing(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingTokenEstimate {
-    input_tokens: i64,
     total_tokens: i64,
     body_growth_tokens: i64,
     resolves_active_reasoning: bool,
@@ -2619,7 +2521,6 @@ fn estimate_pending_tokens(
     )
     .unwrap_or(i64::MAX);
     PendingTokenEstimate {
-        input_tokens,
         total_tokens: input_tokens
             .saturating_add(injection_tokens)
             .saturating_add(context_update_tokens)
@@ -2641,7 +2542,6 @@ fn estimate_pending_tokens(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProjectedPromptPressure {
-    pending_input_tokens: i64,
     total_tokens: i64,
     auto_compact_scope_tokens: i64,
 }
@@ -2694,7 +2594,6 @@ async fn projected_prompt_pressure(
         }
     };
     ProjectedPromptPressure {
-        pending_input_tokens: pending_token_estimate.input_tokens,
         total_tokens,
         auto_compact_scope_tokens,
     }
@@ -2712,88 +2611,21 @@ fn projected_prompt_tokens_from_estimates(
     locally_estimated_prompt.max(server_usage_with_pending_body)
 }
 
-const SKILL_RECOVERY_RESERVED_TOKENS: usize = 512;
-
 fn build_bounded_skill_context_items<'a, F>(
     skill_fragments: impl IntoIterator<Item = &'a F>,
-) -> (Vec<ResponseItem>, Option<codex_tools::CanonicalToolResult>)
+) -> Vec<ResponseItem>
 where
     F: ContextualUserFragment + 'a,
 {
     let mut budget = ModelContextBudget::default();
-    let fragments = skill_fragments.into_iter().collect::<Vec<_>>();
-    let mut total_bytes = 0usize;
-    let rendered = fragments
-        .iter()
-        .map(|fragment| {
-            let text = fragment.render();
-            total_bytes = total_bytes.saturating_add(text.len());
-            serde_json::json!({"role": fragment.role(), "text": text})
-        })
-        .collect::<Vec<_>>();
-    let recovery = (total_bytes > budget.remaining_bytes()).then(|| {
-        assert!(
-            budget.try_take_bytes(codex_utils_string::approx_bytes_for_tokens(
-                SKILL_RECOVERY_RESERVED_TOKENS
-            ))
-        );
-        codex_tools::CanonicalToolResult::json(serde_json::json!({"items": rendered}))
-    });
-    let items = fragments
+    skill_fragments
         .into_iter()
         .filter_map(|fragment| {
             budget.take_fragment(fragment).map(|text| {
                 ContextualUserFragment::into(RenderedContextFragment::new(fragment.role(), text))
             })
         })
-        .collect();
-    (items, recovery)
-}
-
-async fn persist_skill_context_recovery(
-    sess: &Session,
-    canonical: codex_tools::CanonicalToolResult,
-) -> CodexResult<ResponseItem> {
-    use crate::context::InternalContextSource;
-    use crate::context::InternalModelContextFragment;
-    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-        &sess.codex_home().await,
-        &sess.thread_id().to_string(),
-        &canonical,
-    )
-    .await;
-    let artifact_id = artifact
-        .artifact_id()
-        .filter(|_| artifact.complete)
-        .ok_or_else(|| {
-            planning_failure("could not preserve complete selected skill instructions")
-        })?;
-    let receipt = serde_json::json!({
-        "kind": "selected_skill_context_recovery",
-        "artifact_id": artifact_id,
-        "canonical_sha256": canonical.sha256,
-        "canonical_bytes": canonical.exact_bytes,
-        "instruction": "Selected skill excerpts are incomplete and some selected skills are omitted. Before using them, recover ALL complete selected skill instructions with read_tool_output and json_pointer selectors under /items; follow continuations. Each record retains the instruction role and rendered source."
-    });
-    let fragment = InternalModelContextFragment::new(
-        InternalContextSource::from_static("selected_skill_recovery"),
-        receipt.to_string(),
-    );
-    if fragment.render().len()
-        > codex_utils_string::approx_bytes_for_tokens(SKILL_RECOVERY_RESERVED_TOKENS)
-    {
-        return Err(planning_failure(
-            "selected skill recovery receipt exceeds its reserved budget",
-        ));
-    }
-    sess.register_tool_artifact_origin(
-        artifact_id.clone(),
-        format!("skill-context:{artifact_id}"),
-        canonical.exact_bytes,
-        canonical.sha256,
-    )
-    .await;
-    Ok(ContextualUserFragment::into(fragment))
+        .collect()
 }
 
 #[tracing::instrument(
@@ -2999,19 +2831,6 @@ async fn run_pending_input_pre_sampling_compact(
     if !token_status.token_limit_reached {
         return Ok(None);
     }
-    let pending_status = super::context_window::projected_context_window_token_status(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        projected_prompt_pressure.pending_input_tokens,
-        projected_prompt_pressure.pending_input_tokens,
-    )
-    .await;
-    if pending_status.token_limit_reached {
-        return Err(planning_failure_with_timing(
-            turn_context,
-            "pending input alone exceeds its configured token limit; stopping without compaction or another model request. Reduce attached context",
-        ));
-    }
     if !allow_pending_input_compaction {
         return Err(planning_failure_with_timing(
             turn_context,
@@ -3200,12 +3019,8 @@ async fn run_auto_compact(
     let initial_context_injection = InitialContextInjection::AtStart(world_state);
     if turn_context.config.features.enabled(Feature::TokenBudget) {
         crate::compact_token_budget::run_inline_auto_compact_task(
-            Arc::clone(sess),
-            step_context,
-            initial_context_injection,
-            cancellation_token,
-        )
-        .await?;
+            Arc::clone(sess), step_context, initial_context_injection, cancellation_token,
+        ).await?;
         client_session.invalidate_provider_history_inheritance("installed fresh context window");
     } else if should_use_remote_compact_task(
         turn_context.provider.info(),
@@ -3834,35 +3649,6 @@ fn build_projected_prompt_from_scaffold(
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the common completed outcome stays inline rather than allocating on every model request"
-)]
-enum SamplingRequestOutcome {
-    Completed(SamplingRequestResult, Arc<[ResponseItem]>),
-    RequiresCompaction {
-        step_context: Arc<StepContext>,
-        request_dispatched: bool,
-    },
-}
-
-async fn checkpoint_preflight_requires_compaction(
-    sess: &Session,
-    turn: &TurnContext,
-    prompt: &Prompt,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<bool> {
-    if cancellation_token.is_cancelled() {
-        return Err(CodexErr::TurnAborted);
-    }
-    let requires_compaction =
-        super::context_window::checkpoint_prompt_requires_compaction(sess, turn, prompt).await;
-    if cancellation_token.is_cancelled() {
-        return Err(CodexErr::TurnAborted);
-    }
-    Ok(requires_compaction)
-}
-
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -3889,8 +3675,7 @@ async fn run_sampling_request(
     request_signals: SamplingRequestSignalCollector,
     pending_continuation_cause: &mut Option<ContinuationCause>,
     cancellation_token: CancellationToken,
-    checkpoint_preflight: bool,
-) -> CodexResult<SamplingRequestOutcome> {
+) -> CodexResult<(SamplingRequestResult, Arc<[ResponseItem]>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let terminal_completion_only = generation_request.terminal_completion_only;
     // Record the deferred schemas advertised by this request. Settling the guard preserves them
@@ -4016,20 +3801,6 @@ async fn run_sampling_request(
     );
     enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
     drop(prompt_construction_guard);
-    if checkpoint_preflight
-        && checkpoint_preflight_requires_compaction(
-            &sess,
-            &turn_context,
-            &prompt,
-            &cancellation_token,
-        )
-        .await?
-    {
-        return Ok(SamplingRequestOutcome::RequiresCompaction {
-            step_context,
-            request_dispatched: false,
-        });
-    }
     turn_context
         .turn_timing_state
         .begin_model_generation_with_failure_metadata(
@@ -4060,10 +3831,7 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
-                return Ok(SamplingRequestOutcome::Completed(
-                    output,
-                    accepted_attempt_input,
-                ));
+                return Ok((output, accepted_attempt_input));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -4160,20 +3928,6 @@ async fn run_sampling_request(
                 &request_scaffold,
             );
             enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
-            if checkpoint_preflight
-                && checkpoint_preflight_requires_compaction(
-                    &sess,
-                    &turn_context,
-                    &prompt,
-                    &cancellation_token,
-                )
-                .await?
-            {
-                return Ok(SamplingRequestOutcome::RequiresCompaction {
-                    step_context,
-                    request_dispatched: true,
-                });
-            }
         } else {
             // Even a stream with no completed output seals its evidence batch
             // during cleanup. Reusing the prompt must not reuse that retired batch.
@@ -4591,7 +4345,7 @@ fn request_user_input_eligible(turn_context: &TurnContext) -> bool {
         && available_modes.contains(&turn_context.collaboration_mode.mode)
 }
 
-fn agent_surface_stage(sess: &Session, turn_context: &TurnContext) -> AgentSurfaceStage {
+pub(super) fn agent_surface_stage(sess: &Session, turn_context: &TurnContext) -> AgentSurfaceStage {
     let spawn_eligible = match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => false,
         MultiAgentVersion::V1 => !crate::agent::exceeds_thread_spawn_depth_limit(
@@ -5533,80 +5287,6 @@ fn start_eager_tool_future(future: InFlightToolCall) -> BoxFuture<'static, InFli
     })
 }
 
-/// How the provider response tail ended.
-///
-/// Deferred tools are admitted only on [`ResponseTailOutcome::SuccessfulTail`]. A terminal
-/// stream error or a cancellation retires them without invoking their handlers, so a
-/// response the provider never completed cannot produce a side effect.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResponseTailOutcome {
-    SuccessfulTail,
-    TerminalError,
-    Cancelled,
-}
-
-impl ResponseTailOutcome {
-    fn unexecuted_message(self) -> Option<&'static str> {
-        match self {
-            Self::SuccessfulTail => None,
-            Self::TerminalError => Some(
-                "This tool was not executed: the model response stream failed before it closed.",
-            ),
-            Self::Cancelled => {
-                Some("This tool was not executed: the turn was interrupted before it started.")
-            }
-        }
-    }
-}
-
-/// Wakes deferred tool calls once and tells them whether they may run.
-#[derive(Clone)]
-pub(crate) struct ResponseTailSignal {
-    closed: CancellationToken,
-    outcome: Arc<OnceLock<ResponseTailOutcome>>,
-}
-
-impl ResponseTailSignal {
-    fn new() -> Self {
-        Self {
-            closed: CancellationToken::new(),
-            outcome: Arc::new(OnceLock::new()),
-        }
-    }
-
-    /// Publishes the tail outcome, then wakes every deferred call.
-    ///
-    /// The outcome is written before the wake so a woken call always observes it. Only the
-    /// first close is authoritative.
-    fn close(&self, outcome: ResponseTailOutcome) {
-        let _ = self.outcome.set(outcome);
-        self.closed.cancel();
-    }
-
-    async fn wait(&self) -> ResponseTailOutcome {
-        self.closed.cancelled().await;
-        self.outcome
-            .get()
-            .copied()
-            // A wake without a published outcome can only come from teardown.
-            .unwrap_or(ResponseTailOutcome::Cancelled)
-    }
-}
-
-fn defer_tool_future_until_response_tail(
-    future: InFlightToolCall,
-    response_tail: ResponseTailSignal,
-) -> BoxFuture<'static, InFlightToolResult> {
-    Box::pin(async move {
-        match response_tail.wait().await.unexecuted_message() {
-            // The tail never closed successfully, so this call was never admitted. Retire it
-            // with a model-visible output instead of running its handler.
-            Some(message) => future.into_unexecuted_result(message.to_string()),
-            None => future.into_future().await,
-        }
-    })
-}
-
 fn tool_argument_diff_target(item: &ResponseItem) -> Option<(String, ToolName)> {
     match item {
         ResponseItem::CustomToolCall {
@@ -5641,20 +5321,6 @@ fn assign_missing_streamed_response_item_id(
         .filter(|item_id| !item_id.is_empty());
     item.set_id(active_item_id);
     Session::assign_missing_response_item_id(item);
-}
-
-async fn close_response_tail_after_persistence(
-    recorder: &OrderedResponseItemRecorder,
-    tail: &ResponseTailSignal,
-    outcome: ResponseTailOutcome,
-) -> CodexResult<()> {
-    let persistence = recorder.flush().await;
-    tail.close(if persistence.is_ok() {
-        outcome
-    } else {
-        ResponseTailOutcome::TerminalError
-    });
-    persistence
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5960,7 +5626,6 @@ async fn try_run_sampling_request(
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
     let mut completed_in_flight = VecDeque::new();
-    let response_tail = ResponseTailSignal::new();
     let response_item_recorder = OrderedResponseItemRecorder::default();
     let mut earlier_tool_calls_eligible = true;
     let mut all_tool_calls_eager_read_eligible = true;
@@ -6195,13 +5860,13 @@ async fn try_run_sampling_request(
                 };
                 if let Some(tool_future) = output_result.tool_future {
                     all_tool_calls_eager_read_eligible &= output_result.eager_read_eligible;
+                    // Poll every accepted call while the response is streaming. The
+                    // runtime still owns repository gates, approvals and cancellation;
+                    // FuturesOrdered preserves provider order when relaying results.
                     if output_result.eager_read_eligible {
                         in_flight.push_back(start_eager_tool_future(tool_future));
                     } else {
-                        in_flight.push_back(defer_tool_future_until_response_tail(
-                            tool_future,
-                            response_tail.clone(),
-                        ));
+                        in_flight.push_back(tool_future.into_future().boxed());
                     }
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
@@ -6561,16 +6226,6 @@ async fn try_run_sampling_request(
             }
         }
     };
-    // FuturesOrdered polls every inserted slot while streaming. Open deferred slots only
-    // after the provider response closes so non-eager tools cannot begin execution during the
-    // response tail, and only when that close was successful: a terminal stream error or a
-    // cancellation retires them unexecuted rather than running a handler for a response the
-    // provider never completed. Tools already admitted before the error are not undone.
-    let tail_outcome = match &outcome {
-        Ok(_) => ResponseTailOutcome::SuccessfulTail,
-        Err(CodexErr::TurnAborted | CodexErr::Interrupted) => ResponseTailOutcome::Cancelled,
-        Err(_) => ResponseTailOutcome::TerminalError,
-    };
     drop(sampling_timing_guard);
 
     let remaining_deltas = flush_assistant_text_segments_all(
@@ -6598,12 +6253,14 @@ async fn try_run_sampling_request(
     {
         sess.emit_turn_item_completed(&turn_context, item).await;
     }
-    let response_persistence = close_response_tail_after_persistence(
-        &response_item_recorder,
-        &response_tail,
-        tail_outcome,
-    )
-    .await;
+    // Join ordered response recording before publishing tool outputs. Execution
+    // already overlaps the stream and does not wait for this response-wide flush.
+    if let Err(error) = response_item_recorder.flush().await {
+        // Execution may already have started, but outputs must not be relayed
+        // without their recorded call prefix. Cancel remaining owned work.
+        cancellation_token.cancel();
+        return Err(error);
+    }
 
     let tool_blocking_timing_guard = if in_flight.is_empty() && completed_in_flight.is_empty() {
         None
@@ -6618,7 +6275,6 @@ async fn try_run_sampling_request(
     )
     .await;
     drop(tool_blocking_timing_guard);
-    response_persistence?;
     let generation_workspace_evidence = tool_runtime.flush_workspace_evidence_generation().await?;
     let required_tool_terminal = required_tool_terminal?;
 
@@ -6743,19 +6399,3 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
 #[cfg(test)]
 #[path = "turn_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "context_checkpoint_tests.rs"]
-mod context_checkpoint_tests;
-
-#[cfg(test)]
-#[path = "context_lifecycle_tests.rs"]
-mod context_lifecycle_tests;
-
-#[cfg(test)]
-#[path = "turn_review_benchmarks.rs"]
-mod review_benchmarks;
-
-#[cfg(test)]
-#[path = "efficiency_benchmarks.rs"]
-mod efficiency_benchmarks;

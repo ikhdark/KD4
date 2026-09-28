@@ -285,7 +285,6 @@ impl CodeModeExecuteHandler {
             }
             _ => Vec::new(),
         };
-        let mut host_control_yield = false;
         let (mut response, live_cell, drained_observations) = if initial_is_automatic_yield {
             let held = hold_until_state_change(
                 || {
@@ -319,16 +318,12 @@ impl CodeModeExecuteHandler {
                 OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::MissingCell(
                     response,
                 )) => (response, false, drained_observations),
-                OwnerHeldCodeModeExit::InputActivity(activity) => {
-                    host_control_yield = true;
-                    (
-                        input_activity_response(&cell_id, activity),
-                        true,
-                        drained_observations,
-                    )
-                }
+                OwnerHeldCodeModeExit::InputActivity(activity) => (
+                    input_activity_response(&cell_id, activity),
+                    true,
+                    drained_observations,
+                ),
                 OwnerHeldCodeModeExit::IdleTimeout => {
-                    host_control_yield = true;
                     (idle_timeout_response(&cell_id), true, drained_observations)
                 }
             }
@@ -365,14 +360,8 @@ impl CodeModeExecuteHandler {
         }
         exec.session.services.elicitations.wait_until_clear().await;
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
-        let output = handle_runtime_response(
-            &exec,
-            response,
-            args.max_output_tokens,
-            started_at,
-            host_control_yield,
-        )
-        .map_err(FunctionCallError::RespondToModel)?;
+        let output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+            .map_err(FunctionCallError::RespondToModel)?;
         if keep_dispatch_open {
             dispatch_lease.keep_open();
         }

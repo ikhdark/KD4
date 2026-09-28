@@ -23,28 +23,14 @@ fn default_mode_instructions_keep_only_the_compact_execution_contract() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(!default_instructions.contains("{{KNOWN_MODE_NAMES}}"));
-    assert!(!default_instructions.contains("Known mode names"));
-    assert!(default_instructions.contains("`request_user_input` is available"));
-    assert!(normalized_instructions.contains("meaningful options allowed by its schema"));
-    assert!(!default_instructions.contains("For example"));
-    assert!(default_instructions.contains("requests are read-only"));
-    assert!(default_instructions.contains("scoped implementation"));
-    assert!(default_instructions.contains("Resolve discoverable facts"));
+    assert!(default_instructions.len() < 400);
+    assert!(normalized_instructions.contains("Only a later developer message can change the active mode"));
+    assert!(default_instructions.contains("`request_user_input` if available"));
+    assert!(normalized_instructions.contains("structured choice fits its schema"));
     assert!(normalized_instructions.contains("one concise direct question"));
-    assert!(default_instructions.contains("external-action"));
-    assert!(
-        normalized_instructions.contains(
-            "Complete the entire requested task and required validation before finalizing."
-        )
-    );
-    assert!(normalized_instructions.contains("A blocker requires evidence that further progress needs user input, unavailable authorization, or an external change"));
-    assert!(
-        normalized_instructions
-            .contains("complete all permitted independent work before reporting it")
-    );
-    assert!(normalized_instructions.contains("Cancellation and host limits still apply."));
-    assert!(!default_instructions.contains("nearest sufficient proof"));
+    for duplicated in ["scoped implementation", "Complete the entire requested task", "requests are read-only"] {
+        assert!(!default_instructions.contains(duplicated));
+    }
 }
 
 #[test]

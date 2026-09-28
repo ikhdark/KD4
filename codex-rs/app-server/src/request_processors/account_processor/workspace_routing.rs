@@ -3,79 +3,32 @@ use codex_app_server_protocol::AccountRoutingOverride;
 use codex_app_server_protocol::WorkspaceRouting;
 use codex_backend_client::AccountEntry;
 use codex_config::ResidencyRequirement;
-use codex_login::CodexAuth;
-use sha2::Digest;
-use sha2::Sha256;
 use std::time::Duration;
-use tokio::time::Instant;
 
-const ROUTING_TIMEOUT: Duration = Duration::from_secs(1);
-const ROUTING_CACHE_TTL: Duration = Duration::from_secs(30);
-const ROUTING_FAILURE_TTL: Duration = Duration::from_secs(5);
-
-#[derive(PartialEq, Eq)]
-struct RoutingPrincipal {
-    account_id: String,
-    user_id: Option<String>,
-    token_hash: [u8; 32],
-    fedramp: bool,
-}
-
-impl RoutingPrincipal {
-    fn for_auth(auth: &CodexAuth) -> Option<Self> {
+impl AccountRequestProcessor {
+    pub(super) async fn workspace_routing(&self) -> Option<WorkspaceRouting> {
+        let auth = self.auth_manager.auth_cached()?;
         if !auth.is_chatgpt_auth() {
             return None;
         }
-        Some(Self {
-            account_id: auth.get_account_id().filter(|id| !id.is_empty())?,
-            user_id: auth.get_chatgpt_user_id(),
-            token_hash: Sha256::digest(auth.get_token().ok()?.as_bytes()).into(),
-            fedramp: auth.is_fedramp_account(),
-        })
-    }
-}
-
-pub(super) struct CachedWorkspaceRouting {
-    principal: RoutingPrincipal,
-    expires: Instant,
-    routing: Option<WorkspaceRouting>,
-}
-
-impl AccountRequestProcessor {
-    #[expect(clippy::await_holding_invalid_type, reason = "serialize bounded routing lookups to coalesce cache misses")]
-    pub(super) async fn workspace_routing(&self, force_refresh: bool) -> Option<WorkspaceRouting> {
-        let auth = self.auth_manager.auth_cached()?;
-        let principal = RoutingPrincipal::for_auth(&auth)?;
-        if self.auth_manager.refresh_failure_for_auth(&auth).is_some() {
-            return None;
-        }
-        // One entry per processor: backend/residency are immutable here. The
-        // mutex coalesces concurrent misses rather than spawning duplicate HTTP.
-        let mut cached = self.workspace_routing_cache.lock().await;
-        let current = self.auth_manager.auth_cached()?;
-        if RoutingPrincipal::for_auth(&current).as_ref() != Some(&principal)
-            || self.auth_manager.refresh_failure_for_auth(&current).is_some()
-        {
-            return None;
-        }
-        if !force_refresh
-            && let Some(entry) = cached.as_ref()
-            && entry.principal == principal
-            && entry.expires > Instant::now()
-        {
-            return entry.routing.clone();
-        }
+        let account_id = auth.get_account_id().filter(|id| !id.is_empty())?;
         let client = self.backend_client_for_auth(&auth);
-        let accounts = match tokio::time::timeout(ROUTING_TIMEOUT, client.get_accounts_check()).await {
-            Ok(Ok(accounts)) => Some(accounts),
+        let accounts = match tokio::time::timeout(
+            Duration::from_secs(10),
+            client.get_accounts_check(),
+        )
+        .await
+        {
+            Ok(Ok(accounts)) => accounts,
             _ => {
                 tracing::warn!("workspace routing discovery failed; preserving account status");
-                None
+                return None;
             }
         };
         // Never publish routing discovered for a principal that has since signed out or changed.
         let current = self.auth_manager.auth_cached()?;
-        if RoutingPrincipal::for_auth(&current).as_ref() != Some(&principal)
+        if current.get_account_id() != Some(account_id.clone())
+            || current.get_chatgpt_user_id() != auth.get_chatgpt_user_id()
             || self
                 .auth_manager
                 .refresh_failure_for_auth(&current)
@@ -83,24 +36,15 @@ impl AccountRequestProcessor {
         {
             return None;
         }
-        let routing = accounts
-            .and_then(|accounts| {
-                accounts.accounts.into_iter().find(|account| account.id == principal.account_id)
-            })
-            .and_then(|account| {
-                routing_from_account(account, self.config.enforce_residency.value(), principal.fedramp)
-            });
-        let ttl = if routing.is_some() {
-            ROUTING_CACHE_TTL
-        } else {
-            ROUTING_FAILURE_TTL
-        };
-        *cached = Some(CachedWorkspaceRouting {
-            principal,
-            expires: Instant::now() + ttl,
-            routing: routing.clone(),
-        });
-        routing
+        let account = accounts
+            .accounts
+            .into_iter()
+            .find(|account| account.id == account_id)?;
+        routing_from_account(
+            account,
+            self.config.enforce_residency.value(),
+            auth.is_fedramp_account(),
+        )
     }
 }
 

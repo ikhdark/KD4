@@ -161,29 +161,15 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
     if overrides is None:
         return None
 
-    output_path = Path(skill_dir) / "agents" / "openai.yaml"
-    metadata = {}
-    if output_path.exists():
-        import yaml
-
-        try:
-            metadata = yaml.safe_load(output_path.read_text(encoding="utf-8"))
-        except yaml.YAMLError as exc:
-            print(f"[ERROR] Invalid existing metadata: {exc}")
-            return None
-        if not isinstance(metadata, dict) or not isinstance(metadata.get("interface", {}), dict):
-            print("[ERROR] Existing metadata and interface must be YAML dictionaries.")
-            return None
-    interface = dict(metadata.get("interface", {}))
-    interface.update(overrides)
-    display_name = interface.get("display_name") or format_display_name(skill_name)
-    short_description = interface.get(
+    display_name = overrides.get("display_name") or format_display_name(skill_name)
+    short_description = overrides.get(
         "short_description"
     ) or generate_short_description(display_name)
 
-    if not isinstance(short_description, str) or not (25 <= len(short_description) <= 64):
+    if not (25 <= len(short_description) <= 64):
         print(
-            "[ERROR] short_description must be a string of 25-64 characters."
+            "[ERROR] short_description must be 25-64 characters "
+            f"(got {len(short_description)})."
         )
         return None
 
@@ -201,14 +187,8 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
     agents_dir = Path(skill_dir) / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     output_path = agents_dir / "openai.yaml"
-    if metadata:
-        interface.update(display_name=display_name, short_description=short_description)
-        metadata["interface"] = interface
-        content = yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True)
-    else:
-        content = "\n".join(interface_lines) + "\n"
     # Codex reads skill metadata as UTF-8 regardless of the platform locale.
-    output_path.write_text(content, encoding="utf-8")
+    output_path.write_text("\n".join(interface_lines) + "\n", encoding="utf-8")
     print("[OK] Created agents/openai.yaml")
     return output_path
 

@@ -180,7 +180,6 @@ impl TraceReducer {
                         inference_call_id: inference_call_id.clone(),
                     }],
                     candidates: Vec::new(),
-                    rewrite_outputs: false,
                 },
             )?
         } else {
@@ -239,12 +238,7 @@ impl TraceReducer {
         for (offset, item) in items.into_iter().enumerate() {
             let index = context.start_index + offset;
             let tool_link_item = item.clone();
-            self.ensure_call_id_consistency(
-                &call_items,
-                &item,
-                matches!(context.mode, ReconcileMode::FullSnapshot),
-                &used_item_ids,
-            )?;
+            self.ensure_call_id_consistency(&call_items, &item)?;
             let item_id = if let Some(previous_item_id) = previous_snapshot.get(index) {
                 if !used_item_ids.contains(previous_item_id)
                     && self.item_matches(previous_item_id, &item)
@@ -355,7 +349,6 @@ impl TraceReducer {
                 wall_time_unix_ms,
                 produced_by: Vec::new(),
                 candidates: input_candidates,
-                rewrite_outputs: true,
             },
         )?;
         // A compaction checkpoint has two transcript effects. First, record the structural
@@ -394,7 +387,6 @@ impl TraceReducer {
                 // text that matches old history, the installed item is a new post-compaction
                 // conversation item and should not reuse a pre-compaction ID.
                 candidates: Vec::new(),
-                rewrite_outputs: true,
             },
         )?;
         self.append_thread_conversation_items(thread_id, &input_item_ids)?;
@@ -418,12 +410,7 @@ impl TraceReducer {
 
         for item in items {
             let tool_link_item = item.clone();
-            self.ensure_call_id_consistency(
-                &call_items,
-                &item,
-                context.rewrite_outputs,
-                &used_item_ids,
-            )?;
+            self.ensure_call_id_consistency(&call_items, &item)?;
             let item_id = self
                 .find_matching_snapshot_item(&context.candidates, &used_item_ids, &item)
                 .unwrap_or_else(|| {
@@ -568,27 +555,12 @@ impl TraceReducer {
         &self,
         call_items: &HashMap<String, Vec<String>>,
         normalized: &NormalizedConversationItem,
-        rewrite_outputs: bool,
-        current_item_ids: &HashSet<String>,
     ) -> Result<()> {
         let Some(call_id) = normalized.call_id.as_deref() else {
             return Ok(());
         };
         for item_id in call_items.get(call_id).into_iter().flatten() {
             let item = &self.rollout.conversation_items[item_id];
-            // Full requests and compaction checkpoints may project an old result to a
-            // receipt. Keep both sightings; invocation identity and conflicts within
-            // the same snapshot remain strict.
-            if rewrite_outputs
-                && !current_item_ids.contains(item_id)
-                && matches!(
-                    normalized.kind,
-                    ConversationItemKind::FunctionCallOutput
-                        | ConversationItemKind::CustomToolCallOutput
-                )
-            {
-                continue;
-            }
             if item.kind == normalized.kind && !self.item_matches(item_id, normalized) {
                 bail!("model-visible call id {call_id} was reused with different content");
             }
@@ -639,7 +611,6 @@ struct DetachedReconcileItems<'a> {
     wall_time_unix_ms: i64,
     produced_by: Vec<ProducerRef>,
     candidates: Vec<String>,
-    rewrite_outputs: bool,
 }
 
 /// Conversation ids produced when a compaction checkpoint is installed.

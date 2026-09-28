@@ -14,20 +14,16 @@ mod utils;
 
 pub use auth_status::McpAuthState;
 pub use auth_status::McpLoginRequirement;
-pub use auth_status::OAuthDiscoveryCache;
 pub use auth_status::StreamableHttpOAuthDiscovery;
 pub use auth_status::determine_streamable_http_auth_status;
-pub use auth_status::determine_streamable_http_auth_status_with_cache;
 pub use auth_status::determine_streamable_http_auth_status_with_http_client;
 pub use auth_status::discover_streamable_http_oauth;
 pub use auth_status::discover_streamable_http_oauth_with_http_client;
 pub use auth_status::supports_oauth_login;
 pub use codex_protocol::protocol::McpAuthStatus;
-pub use codex_secrets::LocalSecretsReadCache;
 pub use oauth::StoredOAuthTokens;
 pub use oauth::WrappedOAuthTokenResponse;
 pub use oauth::delete_oauth_tokens;
-#[cfg(test)]
 pub(crate) use oauth::load_oauth_tokens;
 pub use oauth::save_oauth_tokens;
 pub use perform_oauth_login::OAuthProviderError;

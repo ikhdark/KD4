@@ -450,52 +450,12 @@ pub(crate) struct ContextManager {
 }
 
 impl ContextManager {
-    pub(crate) fn select_phase_checkpoint(
+    pub(crate) fn phase_checkpoint_receipts(
         &self,
-        requested: &[String],
-        retained: &[String],
-    ) -> Result<crate::tool_history::PhaseCheckpointSelection, String> {
-        self.tool_history.select_phase_checkpoint(self.raw_items(), requested, retained)
+        call_ids: &[String],
+    ) -> Result<serde_json::Value, String> {
+        self.tool_history.phase_checkpoint_receipts(call_ids)
     }
-
-    pub(crate) fn has_pending_phase_checkpoint(&self) -> bool {
-        let anchor = self.sampling_projection_anchor.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Normalization can insert outputs or strip images, so raw positions and
-        // the prepared prefix need not match. Checkpoint messages remain intact.
-        self.raw_items().iter().rev()
-            .find(|item| ToolHistoryState::has_phase_checkpoint(std::slice::from_ref(item)))
-            .is_some_and(|checkpoint| anchor.as_ref().is_none_or(|anchor| {
-                !anchor.prepared_items.contains(checkpoint)
-            }))
-    }
-
-    pub(crate) fn checkpoint_retention_fits(&self, checkpoint: &ResponseItem) -> bool {
-        let mut items = self.raw_items().to_vec();
-        items.push(checkpoint.clone());
-        self.tool_history.artifact_pin_payload_for_items(&items)
-            .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
-            .is_some_and(|payload| payload["omitted_retained_evidence_count"] == 0)
-    }
-
-    pub(crate) fn checkpointed_call_ids(&self) -> BTreeSet<String> {
-        ToolHistoryState::checkpointed_call_ids(self.raw_items())
-    }
-
-    /// Only IDs are retained, not another copy of the prefill's output payloads.
-    pub(crate) fn sampling_unretired_tool_output_ids(&self) -> Option<BTreeSet<String>> {
-        let anchor = self.sampling_projection_anchor.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let anchor = anchor.as_ref()?;
-        let retired = ToolHistoryState::checkpointed_call_ids(&anchor.prepared_items);
-        Some(anchor.projection.items.iter().filter_map(|item| match item {
-            ResponseItem::FunctionCallOutput { call_id, .. }
-            | ResponseItem::CustomToolCallOutput { call_id, .. }
-                if !retired.contains(call_id) => Some(call_id.clone()),
-            _ => None,
-        }).collect())
-    }
-
     pub(crate) fn new() -> Self {
         Self {
             items: Arc::new(Vec::new()),
@@ -855,13 +815,12 @@ impl ContextManager {
         self,
         input_modalities: &[InputModality],
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-        git_workspace: &crate::git_workspace::GitWorkspaceCache,
     ) -> Arc<[ResponseItem]> {
         self.prepare_for_prompt_with_completed_tool_projection_target(
             input_modalities,
             StableContextTarget::FailOpen,
             workspace_identity,
-            Some(git_workspace),
+            None,
             true,
         )
         .shared_items()
@@ -914,9 +873,6 @@ impl ContextManager {
             }
         }
         let project = |items: Arc<[ResponseItem]>| match git_workspace {
-            Some(cache) if target != StableContextTarget::Sampling => {
-                tool_history.project_with_workspace_cache(items, workspace_identity, cache)
-            }
             Some(cache)
                 if completed_tool_projection || ToolHistoryState::has_phase_checkpoint(&items) =>
             {

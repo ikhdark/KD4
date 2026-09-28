@@ -32,14 +32,12 @@ pub fn ensure_non_interactive_pager(env_map: &mut HashMap<String, String>) {
 
 // Keep PATH and PATHEXT stable for callers that rely on inheriting the parent process env.
 pub fn inherit_path_env(env_map: &mut HashMap<String, String>) {
-    if !env_map.keys().any(|key| key.eq_ignore_ascii_case("PATH"))
+    if !env_map.contains_key("PATH")
         && let Ok(path) = env::var("PATH")
     {
         env_map.insert("PATH".into(), path);
     }
-    if !env_map
-        .keys()
-        .any(|key| key.eq_ignore_ascii_case("PATHEXT"))
+    if !env_map.contains_key("PATHEXT")
         && let Ok(pathext) = env::var("PATHEXT")
     {
         env_map.insert("PATHEXT".into(), pathext);
@@ -48,8 +46,7 @@ pub fn inherit_path_env(env_map: &mut HashMap<String, String>) {
 
 fn prepend_path(env_map: &mut HashMap<String, String>, prefix: &str) {
     let existing = env_map
-        .iter()
-        .find_map(|(key, value)| key.eq_ignore_ascii_case("PATH").then_some(value))
+        .get("PATH")
         .cloned()
         .or_else(|| env::var("PATH").ok())
         .unwrap_or_default();
@@ -67,14 +64,12 @@ fn prepend_path(env_map: &mut HashMap<String, String>, prefix: &str) {
         new_path.push(';');
         new_path.push_str(&existing);
     }
-    env_map.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
     env_map.insert("PATH".into(), new_path);
 }
 
 fn reorder_pathext_for_stubs(env_map: &mut HashMap<String, String>) {
     let default = env_map
-        .iter()
-        .find_map(|(key, value)| key.eq_ignore_ascii_case("PATHEXT").then_some(value))
+        .get("PATHEXT")
         .cloned()
         .or_else(|| env::var("PATHEXT").ok())
         .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
@@ -103,7 +98,6 @@ fn reorder_pathext_for_stubs(env_map: &mut HashMap<String, String>) {
     let mut combined = Vec::new();
     combined.extend(front);
     combined.extend(rest);
-    env_map.retain(|key, _| !key.eq_ignore_ascii_case("PATHEXT"));
     env_map.insert("PATHEXT".into(), combined.join(";"));
 }
 
@@ -197,21 +191,6 @@ pub fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::ensure_denybin_with_home;
-
-    #[test]
-    fn path_aliases_preserve_caller_values_through_preparation() {
-        let mut env = std::collections::HashMap::from([
-            ("Path".to_string(), "selected-toolchain".to_string()),
-            ("PathExt".to_string(), ".CUSTOM;.EXE;.CMD;.BAT".to_string()),
-        ]);
-        super::inherit_path_env(&mut env);
-        assert_eq!(env.len(), 2);
-        super::prepend_path(&mut env, "denybin");
-        super::reorder_pathext_for_stubs(&mut env);
-        assert_eq!(env.len(), 2);
-        assert_eq!(env["PATH"], "denybin;selected-toolchain");
-        assert_eq!(env["PATHEXT"], ".BAT;.CMD;.CUSTOM;.EXE");
-    }
 
     #[test]
     fn ensure_denybin_uses_home_fallback() -> anyhow::Result<()> {

@@ -186,8 +186,6 @@ impl SkillCatalogEntry {
 /// Merged catalog for one turn.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SkillCatalog {
-    /// Executor I/O failures make this snapshot reusable only within its observing turn.
-    pub retryable_errors: bool,
     /// Work remaining in bounded orchestrator discovery, distinct from warnings.
     pub continuation: Option<SkillDiscoveryContinuation>,
     pub entries: Vec<SkillCatalogEntry>,
@@ -196,8 +194,6 @@ pub struct SkillCatalog {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SkillDiscoveryContinuation {
-    /// The provider repeated a cursor. Retain incomplete coverage without offering a retry loop.
-    pub blocked: bool,
     pub cursor: Option<String>,
     pub resource_offset: usize,
     pub seen_cursors: HashSet<String>,
@@ -205,17 +201,11 @@ pub struct SkillDiscoveryContinuation {
 
 impl SkillCatalog {
     pub fn extend(&mut self, other: SkillCatalog) {
-        self.retryable_errors |= other.retryable_errors;
         self.extend_entries(other.entries);
         self.warnings.extend(other.warnings);
         if other.continuation.is_some() {
             self.continuation = other.continuation;
         }
-    }
-
-    /// Whether coverage is incomplete but provider pagination cannot currently advance.
-    pub fn discovery_blocked(&self) -> bool {
-        self.continuation.as_ref().is_some_and(|next| next.blocked)
     }
 
     /// Append a batch in order, retaining the first entry for each authority/package.

@@ -40,7 +40,6 @@ use crate::cell_actor::CellState;
 use crate::cell_actor::CellToolCall;
 use crate::cell_actor::CompletionCommit;
 use crate::runtime::StoredValue;
-use crate::runtime::StoredValueWrite;
 use crate::runtime::stored_value_limit_message;
 use crate::runtime::stored_values_with_writes_within_limits;
 
@@ -84,14 +83,7 @@ impl TerminalCellCache {
     }
 }
 
-pub(crate) fn output_item_bytes(item: &OutputItem) -> usize {
-    match item {
-        OutputItem::Text { text } => text.len(),
-        OutputItem::Image { image_url, .. } => image_url.len(),
-    }
-}
-
-pub(crate) fn cell_event_bytes(event: &CellEvent) -> usize {
+fn cell_event_bytes(event: &CellEvent) -> usize {
     let (content_items, error_text) = match event {
         CellEvent::Yielded { content_items }
         | CellEvent::ExplicitYield { content_items }
@@ -104,7 +96,10 @@ pub(crate) fn cell_event_bytes(event: &CellEvent) -> usize {
     };
     content_items
         .iter()
-        .map(output_item_bytes)
+        .map(|item| match item {
+            OutputItem::Text { text } => text.len(),
+            OutputItem::Image { image_url, .. } => image_url.len(),
+        })
         .fold(error_text.map_or(0, str::len), usize::saturating_add)
 }
 
@@ -261,30 +256,6 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         if cells.contains_key(&cell_id) {
             return Err(Error::DuplicateCell(cell_id));
         }
-        // Finished cells no longer consume execution permits. Keep their existing
-        // actors/output until observed, with separate backpressure rather than eviction.
-        let mut pending = Vec::new();
-        let mut pending_bytes = 0usize;
-        for (id, cell) in cells.iter() {
-            if let Some(bytes) = cell.buffered_completion_bytes() {
-                pending.push(id);
-                pending_bytes = pending_bytes.saturating_add(bytes);
-            }
-        }
-        if pending.len() >= TERMINAL_CELL_CACHE_CAPACITY
-            || pending_bytes >= TERMINAL_CELL_CACHE_MAX_BYTES
-        {
-            pending.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-            let ids = pending
-                .into_iter()
-                .take(MAX_ACTIVE_CELLS)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Error::Runtime(format!(
-                "code mode has reached its unobserved result limit; wait for completed cells {ids} before starting another exec; their output is still retained"
-            )));
-        }
         let cell_state = Arc::new(CellState::new(self.inner.shutdown_token.child_token()));
         let (handle, initial_event, task) = tokio::select! {
             biased;
@@ -393,64 +364,31 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
 
     async fn commit_completion(
         &self,
-        stored_value_writes: HashMap<String, StoredValueWrite>,
+        stored_value_writes: HashMap<String, StoredValue>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
         let cancellation_token = cell_state.cancellation_token();
-        let completion = {
-            let mut stored_values = tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
-                    return CompletionCommit::Rejected(event);
-                }
-                stored_values = self.inner.stored_values.lock() => stored_values,
-            };
-            let conflict = stored_value_writes.iter().any(|(key, write)| {
-                match (stored_values.get(key), write.expected.as_ref()) {
-                    (None, None) => false,
-                    (Some(current), Some(expected)) => !Arc::ptr_eq(&current.value, expected),
-                    _ => true,
-                }
-            });
-            let rejection = if conflict {
-                Some("code mode session storage conflict: another cell changed a written key; this cell's storage writes were discarded. Load current values and recompute storage updates in a new cell; do not replay external side effects".to_string())
-            } else if !stored_values_with_writes_within_limits(&stored_values, &stored_value_writes)
-            {
-                Some(format!(
-                    "{}; this cell's storage writes were discarded at commit; prior stored values are unchanged",
-                    stored_value_limit_message()
-                ))
-            } else {
-                None
-            };
-            let writes_fit = rejection.is_none();
-            let event = match rejection {
-                Some(error) => storage_rejected_event(event, error),
-                None => event,
-            };
-            cell_state.commit_completion(event, pending_initial_yield_items, || {
-                    if writes_fit {
-                        for (key, write) in stored_value_writes {
-                            match write.value {
-                                Some(value) => {
-                                    stored_values.insert(key, value);
-                                }
-                                None => {
-                                    stored_values.remove(&key);
-                                }
-                            }
-                        }
-                    }
-                })
+        let mut stored_values = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                return CompletionCommit::Rejected(event);
+            }
+            stored_values = self.inner.stored_values.lock() => stored_values,
         };
-        if completion == CompletionCommit::Committed {
-            // The actor drains callbacks before committing completion. Output
-            // acknowledgement is not part of the active-execution budget.
-            self.cell_permit.lock().await.take();
-        }
-        completion
+        let writes_fit =
+            stored_values_with_writes_within_limits(&stored_values, &stored_value_writes);
+        let event = if writes_fit {
+            event
+        } else {
+            storage_rejected_event(event)
+        };
+        cell_state.commit_completion(event, pending_initial_yield_items, || {
+            if writes_fit {
+                stored_values.extend(stored_value_writes);
+            }
+        })
     }
 
     async fn closed(&self, event: Option<CellEvent>) {
@@ -473,16 +411,17 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
     }
 }
 
-fn storage_rejected_event(event: CellEvent, storage_error: String) -> CellEvent {
+fn storage_rejected_event(event: CellEvent) -> CellEvent {
     match event {
         CellEvent::Completed {
             content_items,
             error_text,
             output_loss,
         } => {
+            let limit_error = stored_value_limit_message();
             let error_text = Some(match error_text {
-                Some(error) => format!("{error}\n{storage_error}"),
-                None => storage_error,
+                Some(error) => format!("{error}\n{limit_error}"),
+                None => limit_error,
             });
             CellEvent::Completed {
                 content_items,

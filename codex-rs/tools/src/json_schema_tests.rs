@@ -6,7 +6,7 @@ use super::parse_tool_input_schema;
 use super::parse_tool_input_schema_without_compaction;
 
 #[test]
-fn schema_descriptions_preserve_utf8_and_escapes() {
+fn compact_schema_byte_count_matches_serialized_utf8_and_escapes() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object", "properties": {
             "quoted\"field": {"type": "string", "description": "Unicode: 界\n\t\\"}
@@ -14,10 +14,8 @@ fn schema_descriptions_preserve_utf8_and_escapes() {
     }))
     .unwrap();
     assert_eq!(
-        schema.properties.unwrap()["quoted\"field"]
-            .description
-            .as_deref(),
-        Some("Unicode: 界\n\t\\")
+        super::compact_schema_bytes(&schema),
+        Some(serde_json::to_vec(&schema).unwrap().len())
     );
 }
 use pretty_assertions::assert_eq;
@@ -972,7 +970,7 @@ fn many_string_properties(count: usize) -> serde_json::Map<String, serde_json::V
 }
 
 #[test]
-fn parse_large_tool_input_schema_preserves_descriptions_on_both_paths() {
+fn parse_large_tool_input_schema_compacts_descriptions_only_on_default_path() {
     let input_schema = serde_json::json!({
         "type": "object",
         "description": "x".repeat(5_500),
@@ -994,7 +992,6 @@ fn parse_large_tool_input_schema_preserves_descriptions_on_both_paths() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
-            "description": "x".repeat(5_500),
             "properties": {
                 "metadata": {
                     "$ref": "#/$defs/metadata"
@@ -1083,7 +1080,6 @@ fn parse_large_tool_input_schema_preserves_reachable_definitions_over_budget() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
-            "description": "x".repeat(5_500),
             "properties": {
                 "event": {
                     "type": "object",
@@ -1172,7 +1168,6 @@ fn parse_large_tool_input_schema_preserves_field_descriptions_and_description_pr
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
-            "description": "x".repeat(5_500),
             "properties": {
                 "choice": {
                     "description": "Choice value",
@@ -1223,15 +1218,13 @@ fn parse_large_tool_input_schema_preserves_field_descriptions_and_description_pr
 }
 
 #[test]
-fn parse_large_tool_input_schema_preserves_rules_at_the_end_of_long_descriptions() {
-    let description = format!("{} Omit payload when mode is preview.", "界 ".repeat(2_000));
+fn parse_large_tool_input_schema_truncates_only_oversized_field_descriptions() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
-        "description": "Never submit preview data as a committed write.",
         "properties": {
             "payload": {
                 "type": "string",
-                "description": description
+                "description": "x".repeat(5_500)
             },
             "mode": {
                 "type": "string",
@@ -1241,16 +1234,13 @@ fn parse_large_tool_input_schema_preserves_rules_at_the_end_of_long_descriptions
     }))
     .expect("parse schema");
 
-    assert_eq!(
-        schema.description.as_deref(),
-        Some("Never submit preview data as a committed write.")
-    );
     let properties = schema.properties.expect("object properties");
     let payload_description = properties["payload"]
         .description
         .as_deref()
-        .expect("payload guidance");
-    assert_eq!(payload_description, description);
+        .expect("truncated payload description");
+    assert!(payload_description.len() <= 512);
+    assert!(payload_description.ends_with(" [... truncated ...]"));
     assert_eq!(
         properties["mode"].description.as_deref(),
         Some("Select the processing mode.")
@@ -1336,7 +1326,7 @@ fn parse_large_tool_input_schema_preserves_single_composition_variant_over_budge
 }
 
 #[test]
-fn parse_large_tool_input_schema_preserves_validation_keywords() {
+fn parse_large_tool_input_schema_compaction_preserves_validation_keywords() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "description": "x".repeat(5_500),
@@ -1363,7 +1353,6 @@ fn parse_large_tool_input_schema_preserves_validation_keywords() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
-            "description": "x".repeat(5_500),
             "properties": {
                 "count": {
                     "type": "integer",
@@ -1410,7 +1399,6 @@ fn parse_large_tool_input_schema_preserves_object_enum_literal_descriptions() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
-            "description": "x".repeat(5_500),
             "properties": {
                 "choice": {
                     "enum": [
@@ -2092,14 +2080,14 @@ fn parse_tool_input_schema_does_not_follow_literal_refs_in_definitions() {
 }
 
 #[test]
-fn parse_large_tool_input_schema_preserves_string_assertions() {
+fn parse_tool_input_schema_preserves_string_assertions_through_compaction() {
     let input = serde_json::json!({
         "type":"object", "description":"x".repeat(5_500),
         "properties":{"code":{"type":"string", "pattern":"^[0-9]{6}$", "minLength":6, "maxLength":6}}
     });
     assert_eq!(
         serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap(),
-        serde_json::json!({"type":"object", "description":"x".repeat(5_500), "properties":{"code":{"type":"string", "pattern":"^[0-9]{6}$", "minLength":6, "maxLength":6}}})
+        serde_json::json!({"type":"object", "properties":{"code":{"type":"string", "pattern":"^[0-9]{6}$", "minLength":6, "maxLength":6}}})
     );
 }
 

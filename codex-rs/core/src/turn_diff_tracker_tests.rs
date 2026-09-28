@@ -391,42 +391,6 @@ fn direct_file_read_shells_still_reject_composed_mutations() {
 }
 
 #[test]
-fn powershell_single_quoted_literals_neither_split_nor_hide_statements() {
-    let powershell = |script: &str| {
-        vec![
-            "powershell.exe".to_string(),
-            "-Command".to_string(),
-            script.to_string(),
-        ]
-    };
-    // Search patterns are verbatim data, not statement separators or operators.
-    for script in [
-        "$ErrorActionPreference='Stop'; rg -n 'static_work|work::run' src tests",
-        "Get-ChildItem src,tests -Filter AGENTS.md; rg -n 'fn primitive_name|as_builtin' src/semantic.rs",
-        "$f = Get-Content src/lib.rs; $f[10..20]; Select-String -Path src/lib.rs -Pattern 'Vec<String>|&str'",
-    ] {
-        assert_eq!(
-            command_mutation(&powershell(script), None),
-            CommandMutation::ReadOnly,
-            "{script}"
-        );
-    }
-    // Quote tracking must never merge a real statement into a literal.
-    for script in [
-        "Write-Output 'a|b'; Set-Content out.txt changed",
-        "Write-Output \"it's\"; Remove-Item x; Write-Output 'y'",
-        "Get-Content a # don't\nRemove-Item b # can't",
-        "Write-Output 'abc\u{2019}; Remove-Item x; Write-Output 'y\u{2019}; Write-Output 'z'",
-        "Write-Output @'\nsafe\n'@; Remove-Item x",
-        "rg -n 'a|b' src > out.txt",
-        "Write-Output \"$(Remove-Item x)\"",
-        "rg -n 'unterminated src",
-    ] {
-        assert!(command_may_mutate(&powershell(script)), "{script}");
-    }
-}
-
-#[test]
 fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
     for argv in [
         vec!["rg", " > ", "file"],

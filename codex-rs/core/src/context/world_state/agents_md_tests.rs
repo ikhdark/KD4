@@ -36,7 +36,7 @@ fn cached_state_consumes_the_stable_rendering() {
     assert_eq!(
         render_fragments(world_state.render_full()),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\ndistinct supplied rendering\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\ndistinct supplied rendering\n</INSTRUCTIONS>"
         )]
     );
 }
@@ -49,7 +49,7 @@ fn renders_full_state_and_omits_unchanged_state() {
 
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nuse the project formatter\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nuse the project formatter\n</INSTRUCTIONS>",
         )],
         render_fragments(state.render_full()),
     );
@@ -79,7 +79,7 @@ fn renders_instruction_markup_as_text_without_changing_snapshot() {
     assert_eq!(
         render_fragments(state.render_full()),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nQuote &lt;/INSTRUCTIONS&gt; & <example>.\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nQuote &lt;/INSTRUCTIONS&gt; & <example>.\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(
@@ -105,7 +105,7 @@ fn renders_command_templates_and_code_without_xml_encoding() {
     assert_eq!(
         messages,
         vec![user_message(&format!(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{source}\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{source}\n</INSTRUCTIONS>"
         ))]
     );
 }
@@ -121,7 +121,7 @@ fn changed_and_removed_state_supersedes_previous_instructions() {
     current.add_section(AgentsMdState::new(Some(&current_loaded)));
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew instructions\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew instructions\n</INSTRUCTIONS>",
         )],
         render_fragments(current.render_diff(&previous.snapshot())),
     );
@@ -130,7 +130,7 @@ fn changed_and_removed_state_supersedes_previous_instructions() {
     removed.add_section(AgentsMdState::default());
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
         )],
         render_fragments(removed.render_diff(&current.snapshot())),
     );
@@ -142,7 +142,7 @@ fn unknown_previous_state_is_explicitly_superseded() {
     let current = AgentsMdState::new(Some(&loaded));
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ncurrent instructions\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ncurrent instructions\n</INSTRUCTIONS>",
         )],
         render_fragments(vec![
             WorldStateSection::render_diff(&current, PreviousSectionState::Unknown)
@@ -152,7 +152,7 @@ fn unknown_previous_state_is_explicitly_superseded() {
 
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
         )],
         render_fragments(vec![
             WorldStateSection::render_diff(
@@ -250,8 +250,7 @@ fn freshness_notice_alone_does_not_prove_instruction_body_retention() {
         AgentsMdFreshness::CachedFallback,
     ));
     let (notice, accepted) = cached.render_diff_with_snapshot(&initial);
-    assert_eq!(notice.len(), 1);
-    assert!(!notice[0].render().contains("binding instruction"));
+    assert!(notice.is_empty());
     let mut retained = render_fragments(body);
     let notice = render_fragments(notice);
     retained.extend(notice.clone());
@@ -280,9 +279,7 @@ fn oversized_freshness_updates_do_not_repeat_body_and_middle_changes_do() {
     ));
     let retained = render_fragments(fragments);
     let (notice, next) = cached.render_history_diff_with_snapshot(Some(&accepted), &retained);
-    assert_eq!(notice.len(), 1);
-    assert!(notice[0].render().len() < 1000);
-    assert!(!notice[0].render().contains(&body));
+    assert!(notice.is_empty());
     let mut changed = WorldState::default();
     let body = format!("{}CHANGED{}", "b".repeat(25_000), "b".repeat(25_000));
     changed.add_section(AgentsMdState::new(Some(
@@ -349,22 +346,12 @@ fn freshness_only_update_does_not_repeat_the_instruction_body() {
         AgentsMdFreshness::CachedFallback,
     ));
     let (fragments, next) = current.render_diff_with_snapshot(&accepted);
-    assert_eq!(
-        render_fragments(fragments),
-        vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
-        )]
-    );
+    assert!(fragments.is_empty());
     assert_eq!(next, current.snapshot());
     assert!(current.render_diff(&next).is_empty());
 
     let (fragments, refreshed) = previous.render_diff_with_snapshot(&next);
-    assert_eq!(
-        render_fragments(fragments),
-        vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
-        )]
-    );
+    assert!(fragments.is_empty());
     assert_eq!(refreshed, accepted);
     assert!(previous.render_diff(&refreshed).is_empty());
 }
@@ -385,7 +372,7 @@ fn freshness_change_with_new_instructions_delivers_the_replacement_body() {
     assert_eq!(
         render_fragments(fragments),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew body\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew body\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(accepted, current.snapshot());
@@ -400,6 +387,11 @@ fn legacy_snapshot_without_freshness_deserializes_as_cached() {
     .expect("legacy AGENTS.md snapshot");
 
     assert_eq!(snapshot.freshness, AgentsMdFreshness::CachedFallback);
+    let removal = WorldStateSection::render_diff(
+        &AgentsMdState::default(),
+        PreviousSectionState::Known(&snapshot),
+    ).expect("an undecodable legacy body must not be mistaken for absent instructions");
+    assert!(removal.render().contains(AgentsMdState::REMOVAL_NOTICE));
 }
 
 fn render_fragments(fragments: Vec<Box<dyn ContextualUserFragment>>) -> Vec<ResponseItem> {

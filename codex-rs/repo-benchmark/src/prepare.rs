@@ -620,7 +620,6 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         "kd4_timing_analysis.py",
         "kd4_first_useful_action_analysis.py",
         "rollout_snapshot.py",
-        "atomic_json.py",
     ] {
         let destination = analyzer_root.join(name);
         fs::copy(repo.join("scripts").join(name), &destination)?;

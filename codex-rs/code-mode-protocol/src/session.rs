@@ -61,18 +61,6 @@ pub struct StartedCell {
 }
 
 impl StartedCell {
-    /// Maps an observation without eagerly consuming its delivery receipt in a
-    /// background task. Cancellation remains owned by the receiving future.
-    pub fn from_response_future(
-        cell_id: CellId,
-        initial_response: CodeModeSessionResultFuture<'static, RuntimeResponse>,
-    ) -> Self {
-        Self {
-            cell_id,
-            initial_response,
-        }
-    }
-
     pub fn new(cell_id: CellId, initial_response_rx: oneshot::Receiver<RuntimeResponse>) -> Self {
         Self {
             cell_id,

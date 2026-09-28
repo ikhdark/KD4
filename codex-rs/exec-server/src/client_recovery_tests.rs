@@ -40,7 +40,7 @@ fn recovery_retries_transient_registry_errors() {
     let error = registry_error(http::StatusCode::TOO_MANY_REQUESTS, /*code*/ None);
 
     assert!(is_retryable_registry_error(&error));
-    assert!(is_retryable_recovery_error(&error, false));
+    assert!(is_retryable_recovery_error(&error));
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn recovery_retries_environment_offline_conflicts() {
     let error = registry_error(http::StatusCode::CONFLICT, Some("environment_offline"));
 
     assert!(is_retryable_registry_error(&error));
-    assert!(is_retryable_recovery_error(&error, false));
+    assert!(is_retryable_recovery_error(&error));
 }
 
 #[test]
@@ -56,68 +56,7 @@ fn recovery_does_not_retry_other_registry_conflicts() {
     let error = registry_error(http::StatusCode::CONFLICT, Some("registration_conflict"));
 
     assert!(!is_retryable_registry_error(&error));
-    assert!(!is_retryable_recovery_error(&error, false));
-}
-
-#[test]
-fn recovery_classifies_websocket_failures_without_retrying_permanent_errors() {
-    use tokio_tungstenite::tungstenite::Error;
-    use tokio_tungstenite::tungstenite::error::TlsError;
-    use tokio_tungstenite::tungstenite::error::UrlError;
-
-    let mut cases = Vec::new();
-    for (status, retry) in [
-        (401, false),
-        (403, false),
-        (404, false),
-        (408, true),
-        (409, true),
-        (429, true),
-        (500, true),
-        (503, true),
-    ] {
-        cases.push((
-            Error::Http(Box::new(
-                http::Response::builder().status(status).body(None).unwrap(),
-            )),
-            retry,
-            status == 401,
-        ));
-    }
-    cases.extend([
-        (Error::Tls(TlsError::InvalidDnsName), false, false),
-        (Error::Url(UrlError::NoHostName), false, false),
-        (
-            Error::Io(std::io::ErrorKind::PermissionDenied.into()),
-            false,
-            false,
-        ),
-        (
-            Error::Io(std::io::ErrorKind::ConnectionRefused.into()),
-            true,
-            false,
-        ),
-    ]);
-    for (source, retry, refreshable) in cases {
-        let error = ExecServerError::WebSocketConnect {
-            url: "wss://executor.invalid".into(),
-            source,
-        };
-        assert_eq!(is_retryable_recovery_error(&error, false), retry, "{error}");
-        assert_eq!(
-            is_retryable_recovery_error(&error, true),
-            retry || refreshable,
-            "{error}"
-        );
-        let wrapped = ExecServerError::ConnectionAttempt(std::sync::Arc::new(error));
-        assert_eq!(is_retryable_recovery_error(&wrapped, false), retry);
-    }
-    assert!(is_retryable_recovery_error(
-        &ExecServerError::EnvironmentInfoTimedOut {
-            timeout: Duration::from_secs(30),
-        },
-        false
-    ));
+    assert!(!is_retryable_recovery_error(&error));
 }
 
 #[test]

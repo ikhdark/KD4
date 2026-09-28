@@ -88,13 +88,6 @@ async fn registered_listing_tracks_directory_evidence_and_bounds_traversal() {
             .await
             .unwrap();
         let dependencies = result.projected_source_dependencies().cloned();
-        let signal = result
-            .sampling_request_signal()
-            .expect("native listing evidence");
-        assert_eq!(
-            signal["semantic_evidence"]["scope"]["environment_id"],
-            codex_exec_server::LOCAL_ENVIRONMENT_ID
-        );
         let output = result.code_mode_result();
         assert_eq!(output["entries"].as_array().unwrap().len(), expected_count);
         assert_eq!(output["truncated"], truncated);
@@ -247,21 +240,14 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
         source: ToolCallSource::Direct,
         payload: payload.clone(),
     };
-    let result = tokio::time::timeout(
+    let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         ListFilesHandler.handle(call),
     )
     .await
     .unwrap()
-    .unwrap();
-    let signal = result
-        .sampling_request_signal()
-        .expect("partial entries are evidence");
-    assert_eq!(
-        signal["semantic_evidence"]["scope"]["environment_id"],
-        "remote-listing"
-    );
-    let output = result.code_mode_result(&payload);
+    .unwrap()
+    .code_mode_result(&payload);
     stop_tx.send(()).unwrap();
     let walks = server.await.unwrap();
     assert_eq!(walks.len(), 1);
@@ -276,50 +262,4 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
         "permission denied for a descendant"
     );
     assert!(!root.path().join("remote-only.txt").exists());
-}
-
-#[test]
-fn listing_evidence_ignores_order_but_preserves_coverage() {
-    use codex_file_system::WalkEntry;
-    use codex_file_system::WalkEntryKind;
-    use codex_file_system::WalkError;
-    use codex_file_system::WalkOutcome;
-    let root = tempfile::tempdir().unwrap();
-    let path = PathUri::from_host_native_path(root.path()).unwrap();
-    let mut outcome = WalkOutcome {
-        entries: vec![
-            WalkEntry {
-                path: path.join("a").unwrap(),
-                kind: WalkEntryKind::File,
-            },
-            WalkEntry {
-                path: path.join("b").unwrap(),
-                kind: WalkEntryKind::File,
-            },
-        ],
-        ..Default::default()
-    };
-    let signal = |value: &WalkOutcome| {
-        listing_sampling_signal("source", json!({"environment_id":"local"}), value)
-    };
-    let complete = signal(&outcome).unwrap();
-    outcome.entries.reverse();
-    assert_eq!(signal(&outcome), Some(complete.clone()));
-    outcome.truncated = true;
-    assert_ne!(signal(&outcome), Some(complete));
-    let partial = signal(&outcome).unwrap();
-    outcome.errors.push(WalkError {
-        path,
-        message: "permission denied".into(),
-    });
-    assert_ne!(signal(&outcome), Some(partial));
-    outcome.entries.clear();
-    assert!(
-        signal(&outcome).is_none(),
-        "an unavailable listing proves no coverage"
-    );
-    assert!(
-        signal(&WalkOutcome::default()).is_some(),
-        "a complete empty listing is evidence"
-    );
 }

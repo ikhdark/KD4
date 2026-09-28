@@ -421,7 +421,7 @@ async fn unstreamed_contributed_assistant_item_replays_finalized_text_between_li
 }
 
 #[tokio::test]
-async fn completed_tool_call_required_persistence_does_not_block_stream_and_precedes_dispatch() {
+async fn completed_tool_call_dispatch_overlaps_required_persistence() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
@@ -492,30 +492,24 @@ async fn completed_tool_call_required_persistence_does_not_block_stream_and_prec
         "model emission must be counted before the deferred executor future is polled"
     );
     assert!(session.clone_history().await.raw_items().is_empty());
-    let mut tool_future = Box::pin(
-        output
-            .tool_future
-            .expect("accepted tool call should retain its lazy future")
-            .into_future(),
-    );
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), tool_future.as_mut())
-            .await
-            .is_err(),
-        "dispatch must remain blocked behind ordered persistence"
-    );
-    assert!(!started.load(Ordering::SeqCst));
-
-    release_persistence
-        .send(())
-        .expect("persistence blocker should still be active");
-    tool_future
+    let tool_future = output
+        .tool_future
+        .expect("accepted tool call")
+        .into_future();
+    tokio::time::timeout(std::time::Duration::from_secs(5), tool_future)
         .await
+        .expect("dispatch must not wait for ordered persistence")
         .result
         .expect("persistence probe handler should succeed");
+    assert!(started.load(Ordering::SeqCst));
+    assert!(session.clone_history().await.raw_items().is_empty());
+    release_persistence
+        .send(())
+        .expect("persistence blocker still active");
+    ctx.response_item_recorder.flush().await.unwrap();
     let history = session.clone_history().await;
     let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
-        panic!("completed tool call must be persisted before dispatch")
+        panic!("completed tool call must be persisted before relaying results")
     };
     assert_eq!(call_id, "persisted-read");
     assert!(started.load(Ordering::SeqCst));
@@ -595,12 +589,6 @@ async fn completed_tool_call_auxiliary_persistence_does_not_block_dispatch() {
         .expect("auxiliary persistence must not delay tool dispatch");
 
     assert!(started.load(Ordering::SeqCst));
-    let history = session.clone_history().await;
-    let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
-        panic!("completed tool call must be model-visible before dispatch")
-    };
-    assert_eq!(call_id, "auxiliary-read");
-
     let mut flush = Box::pin(recorder_for_flush.flush());
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(25), flush.as_mut())
@@ -612,10 +600,15 @@ async fn completed_tool_call_auxiliary_persistence_does_not_block_dispatch() {
         .send(())
         .expect("auxiliary persistence blocker should still be active");
     flush.await.unwrap();
+    let history = session.clone_history().await;
+    let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
+        panic!("completed tool call must be model-visible before relaying results")
+    };
+    assert_eq!(call_id, "auxiliary-read");
 }
 
 #[tokio::test]
-async fn failed_required_publication_prevents_tool_execution() {
+async fn failed_required_publication_is_reported_before_tool_relay() {
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -657,19 +650,14 @@ async fn failed_required_publication_prevents_tool_execution() {
     )
     .await
     .unwrap();
-    let result = output
+    output
         .tool_future
         .expect("tool future")
         .into_future()
         .await
-        .result;
-    assert!(
-        matches!(result, Err(CodexErr::Fatal(message)) if message.contains("commit gate is closed"))
-    );
-    assert!(
-        !started.load(Ordering::SeqCst),
-        "history rejection must prevent the actual handler from running"
-    );
+        .result
+        .expect("dispatch runs independently of rollout recording");
+    assert!(started.load(Ordering::SeqCst));
     assert!(session.clone_history().await.raw_items().is_empty());
     assert!(ctx.response_item_recorder.flush().await.is_err());
 }

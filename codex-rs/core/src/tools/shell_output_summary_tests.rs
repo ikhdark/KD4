@@ -961,7 +961,7 @@ fn source_reads_get_room_without_expanding_noisy_command_defaults() {
     ] {
         assert_eq!(
             super::source_read_output_budget(command),
-            Some(25_000),
+            Some(10_000),
             "{command}"
         );
     }

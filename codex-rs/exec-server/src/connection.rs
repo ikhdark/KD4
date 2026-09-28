@@ -26,10 +26,6 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::debug;
 use tracing::warn;
 
-use crate::websocket_pong_watchdog::WEBSOCKET_PONG_TIMEOUT;
-use crate::websocket_pong_watchdog::WEBSOCKET_PONG_TIMEOUT_REASON;
-use crate::websocket_pong_watchdog::WebSocketPongWatchdog;
-
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -499,7 +495,7 @@ impl JsonRpcConnection {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        Self::from_websocket_stream(stream, connection_label, Some(WEBSOCKET_KEEPALIVE_INTERVAL))
+        Self::from_websocket_stream(stream, connection_label, /*ping_interval*/ None)
     }
 
     pub(crate) fn from_axum_websocket(stream: AxumWebSocket, connection_label: String) -> Self {
@@ -522,7 +518,6 @@ impl JsonRpcConnection {
 
         let websocket_task = tokio::spawn(async move {
             let (mut writer, mut reader) = websocket.split();
-            let (pong_tx, mut pong_rx) = mpsc::channel(1);
             let read = async {
                 while let Some(message) = reader.next().await {
                     match message {
@@ -537,9 +532,6 @@ impl JsonRpcConnection {
                                 }
                             }
                             Ok(JsonRpcWebSocketFrame::Close) => return None,
-                            Ok(JsonRpcWebSocketFrame::Pong) => {
-                                let _ = pong_tx.try_send(());
-                            }
                             Ok(JsonRpcWebSocketFrame::Ignore) => {}
                             Err(err) => {
                                 send_malformed_message(&incoming_tx, Some(format!(
@@ -565,28 +557,14 @@ impl JsonRpcConnection {
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     interval
                 });
-                let mut watchdog = WebSocketPongWatchdog::new(WEBSOCKET_PONG_TIMEOUT);
                 loop {
-                    let (message, ping) = tokio::select! {
-                        pong = pong_rx.recv() => {
-                            pong?;
-                            watchdog.received_pong();
-                            continue;
-                        }
-                        _ = wait_for_pong_deadline(watchdog.deadline()) => {
-                            if pong_rx.try_recv().is_ok() {
-                                watchdog.received_pong();
-                                continue;
-                            }
-                            return Some(WEBSOCKET_PONG_TIMEOUT_REASON.to_string());
-                        }
+                    tokio::select! {
                         message = outgoing_rx.recv() => {
                             let message = message?;
-                            match serialize_jsonrpc_message(&message) {
-                                Ok(encoded) => (M::from_text(encoded), false),
-                                Err(err) => return Some(format!(
-                                    "failed to serialize JSON-RPC message for {connection_label}: {err}"
-                                )),
+                            if let Err(reason) = send_websocket_jsonrpc_message(
+                                &mut writer, &connection_label, &message,
+                            ).await {
+                                return Some(reason);
                             }
                         }
                         _ = async {
@@ -594,46 +572,13 @@ impl JsonRpcConnection {
                                 Some(interval) => interval.tick().await,
                                 None => std::future::pending().await,
                             }
-                        }, if watchdog.deadline().is_none() => (M::ping(), true),
-                    };
-                    // Keep Pong processing alive during a backpressured send. The
-                    // independent write deadline still bounds peers that send Pongs
-                    // without ever reading our bytes. Never retry a partial frame.
-                    let send = timeout(WEBSOCKET_PONG_TIMEOUT, writer.send(message));
-                    tokio::pin!(send);
-                    let mut pong_during_ping = false;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            result = &mut send => {
-                                match result {
-                                    Ok(Ok(())) => break,
-                                    Ok(Err(err)) => return Some(format!(
-                                        "failed to write websocket message to {connection_label}: {err}"
-                                    )),
-                                    Err(_) => return Some(format!(
-                                        "websocket write timed out to {connection_label} after {WEBSOCKET_PONG_TIMEOUT:?}"
-                                    )),
-                                }
-                            }
-                            pong = pong_rx.recv() => {
-                                pong?;
-                                watchdog.received_pong();
-                                pong_during_ping |= ping;
-                            }
-                            _ = wait_for_pong_deadline(watchdog.deadline()) => {
-                                if pong_rx.try_recv().is_ok() {
-                                    watchdog.received_pong();
-                                    pong_during_ping |= ping;
-                                    continue;
-                                }
-                                return Some(WEBSOCKET_PONG_TIMEOUT_REASON.to_string());
+                        } => {
+                            if let Err(err) = writer.send(M::ping()).await {
+                                return Some(format!(
+                                    "failed to write websocket ping to {connection_label}: {err}"
+                                ));
                             }
                         }
-                    }
-                    if ping && !pong_during_ping {
-                        // Start the peer's response budget only after the Ping flushes.
-                        watchdog.ping_sent(tokio::time::Instant::now());
                     }
                 }
             };
@@ -674,7 +619,6 @@ impl JsonRpcConnection {
 enum JsonRpcWebSocketFrame {
     Message(JSONRPCMessage),
     Close,
-    Pong,
     Ignore,
 }
 
@@ -694,8 +638,7 @@ impl JsonRpcWebSocketMessage for Message {
                 serde_json::from_slice(bytes.as_ref()).map(JsonRpcWebSocketFrame::Message)
             }
             Message::Close(_) => Ok(JsonRpcWebSocketFrame::Close),
-            Message::Pong(_) => Ok(JsonRpcWebSocketFrame::Pong),
-            Message::Ping(_) | Message::Frame(_) => {
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
                 Ok(JsonRpcWebSocketFrame::Ignore)
             }
         }
@@ -720,8 +663,7 @@ impl JsonRpcWebSocketMessage for AxumWebSocketMessage {
                 serde_json::from_slice(bytes.as_ref()).map(JsonRpcWebSocketFrame::Message)
             }
             AxumWebSocketMessage::Close(_) => Ok(JsonRpcWebSocketFrame::Close),
-            AxumWebSocketMessage::Pong(_) => Ok(JsonRpcWebSocketFrame::Pong),
-            AxumWebSocketMessage::Ping(_) => {
+            AxumWebSocketMessage::Ping(_) | AxumWebSocketMessage::Pong(_) => {
                 Ok(JsonRpcWebSocketFrame::Ignore)
             }
         }
@@ -772,10 +714,26 @@ where
     writer.flush().await
 }
 
-async fn wait_for_pong_deadline(deadline: Option<tokio::time::Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
+async fn send_websocket_jsonrpc_message<W, M, E>(
+    websocket_writer: &mut W,
+    connection_label: &str,
+    message: &JSONRPCMessage,
+) -> Result<(), String>
+where
+    W: Sink<M, Error = E> + Unpin,
+    M: JsonRpcWebSocketMessage,
+    E: std::fmt::Display,
+{
+    match serialize_jsonrpc_message(message) {
+        Ok(encoded) => websocket_writer
+            .send(M::from_text(encoded))
+            .await
+            .map_err(|err| {
+                format!("failed to write websocket JSON-RPC message to {connection_label}: {err}")
+            }),
+        Err(err) => Err(format!(
+            "failed to serialize JSON-RPC message for {connection_label}: {err}"
+        )),
     }
 }
 
@@ -1131,126 +1089,6 @@ mod tests {
         ));
         assert!(*connection.disconnected_rx.borrow());
         drop(connection);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn websocket_pongs_preserve_pending_rpc_then_silence_disconnects() -> anyhow::Result<()> {
-        let (client_websocket, mut peer) = websocket_pair().await?;
-        let (client, mut events) = crate::rpc::RpcClient::new(JsonRpcConnection::from_websocket(
-            client_websocket,
-            "watchdog test".into(),
-        ));
-        let client = Arc::new(client);
-        let waiting_client = Arc::clone(&client);
-        let call = tokio::spawn(async move {
-            waiting_client
-                .call::<_, serde_json::Value>("long-running", &())
-                .await
-        });
-        let mut request_id = None;
-        let mut pings = 0;
-        while pings < 6 {
-            match timeout(Duration::from_secs(1), peer.next())
-                .await?
-                .unwrap()?
-            {
-                Message::Text(text) => {
-                    let JSONRPCMessage::Request(request) = serde_json::from_str(text.as_ref())?
-                    else {
-                        anyhow::bail!("expected RPC request");
-                    };
-                    assert_eq!(request.method, "long-running");
-                    request_id = Some(request.id);
-                }
-                Message::Ping(payload) => {
-                    peer.send(Message::Pong(payload)).await?;
-                    pings += 1;
-                }
-                other => anyhow::bail!("unexpected frame: {other:?}"),
-            }
-        }
-        assert!(
-            !call.is_finished(),
-            "live transport must not impose an RPC deadline"
-        );
-        peer.send(Message::Text(
-            serde_json::to_string(&JSONRPCMessage::Response(
-                codex_exec_server_protocol::JSONRPCResponse {
-                    id: request_id.expect("RPC request received"),
-                    result: serde_json::json!({"completed": true}),
-                },
-            ))?
-            .into(),
-        ))
-        .await?;
-        assert_eq!(
-            timeout(Duration::from_secs(1), call).await??.unwrap(),
-            serde_json::json!({"completed": true})
-        );
-
-        // Retain the real socket but stop polling it, so it cannot auto-Pong or emit EOF.
-        let event = timeout(Duration::from_secs(1), events.recv()).await?;
-        assert!(
-            matches!(event, Some(crate::rpc::RpcClientEvent::Disconnected { reason: Some(reason) })
-            if reason == WEBSOCKET_PONG_TIMEOUT_REASON)
-        );
-        assert!(client.is_disconnected());
-        assert!(matches!(
-            AxumWebSocketMessage::Pong(Vec::new().into()).parse_jsonrpc_frame()?,
-            JsonRpcWebSocketFrame::Pong
-        ));
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn websocket_stalled_write_times_out_without_late_delivery() -> anyhow::Result<()> {
-        let (websocket, control, mut outbound) = ControlledWebSocket::new(false);
-        let mut connection =
-            JsonRpcConnection::from_websocket_stream(websocket, "stalled".into(), None);
-        connection.outgoing_tx.send(test_jsonrpc_message()).await?;
-        control.wait_for_blocked_write().await?;
-        tokio::time::advance(WEBSOCKET_PONG_TIMEOUT + Duration::from_millis(1)).await;
-        let event = timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?;
-        assert!(
-            matches!(event, Some(JsonRpcConnectionEvent::Disconnected { reason: Some(reason) })
-            if reason.contains("websocket write timed out"))
-        );
-        control.set_write_ready();
-        assert!(
-            outbound.next().await.is_none(),
-            "expired frame must not be retried"
-        );
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn websocket_consumes_pong_while_write_is_blocked() -> anyhow::Result<()> {
-        let (websocket, control, mut outbound) = ControlledWebSocket::new(true);
-        let mut connection = JsonRpcConnection::from_websocket_stream(
-            websocket,
-            "backpressured pong".into(),
-            Some(WEBSOCKET_KEEPALIVE_INTERVAL),
-        );
-        assert!(matches!(outbound.next().await, Some(Message::Ping(_))));
-        tokio::time::advance(Duration::from_millis(80)).await;
-        control.write_ready.store(false, Ordering::Release);
-        let message = test_jsonrpc_message();
-        connection.outgoing_tx.send(message.clone()).await?;
-        control.wait_for_blocked_write().await?;
-        control.send_inbound(Message::Pong(Vec::new().into()))?;
-        control.send_inbound(Message::Text(serde_json::to_string(&message)?.into()))?;
-        assert!(matches!(
-            connection.incoming_rx.recv().await,
-            Some(JsonRpcConnectionEvent::Message(_))
-        ));
-        // Cross the old Pong deadline, but not this write's own deadline.
-        tokio::time::advance(Duration::from_millis(30)).await;
-        tokio::task::yield_now().await;
-        assert!(!*connection.disconnected_rx.borrow());
-        control.set_write_ready();
-        assert!(matches!(outbound.next().await, Some(Message::Text(text))
-            if serde_json::from_str::<JSONRPCMessage>(&text)? == message));
         Ok(())
     }
 

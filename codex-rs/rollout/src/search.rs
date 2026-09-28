@@ -32,38 +32,6 @@ const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
 /// Search matches keyed by the canonical `.jsonl` path for each rollout.
 pub type RolloutSearchMatches = HashMap<PathBuf, Option<String>>;
 
-const MAX_SEARCH_CACHE_FILES: usize = 4096;
-
-#[cfg(test)]
-#[path = "search_cache_tests.rs"]
-mod cache_tests;
-
-#[derive(Clone, PartialEq, Eq)]
-struct SearchFileStamp {
-    len: u64,
-    modified: std::time::SystemTime,
-    created: Option<std::time::SystemTime>,
-}
-
-async fn search_file_stamp(path: &Path) -> Option<SearchFileStamp> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    Some(SearchFileStamp {
-        len: metadata.len(),
-        modified: metadata.modified().ok()?,
-        created: metadata.created().ok(),
-    })
-}
-
-/// Bounded reuse of decoded rollout matches for one root/query. Directory discovery
-/// and physical file versions are checked on every call, including cached misses.
-#[derive(Default)]
-pub struct RolloutSearchCache {
-    key: Option<(PathBuf, String)>,
-    files: HashMap<PathBuf, (SearchFileStamp, (bool, Option<String>))>,
-    #[cfg(test)]
-    decoded_files: usize,
-}
-
 pub async fn search_rollout_paths(
     rg_command: &Path,
     codex_home: &Path,
@@ -84,61 +52,30 @@ pub async fn search_rollout_matches(
     archived: bool,
     search_term: &str,
 ) -> io::Result<RolloutSearchMatches> {
-    RolloutSearchCache::default()
-        .search(rg_command, codex_home, archived, search_term)
-        .await
-}
-
-impl RolloutSearchCache {
-    pub async fn search(
-        &mut self,
-        rg_command: &Path,
-        codex_home: &Path,
-        archived: bool,
-        search_term: &str,
-    ) -> io::Result<RolloutSearchMatches> {
-        let root = std::path::absolute(codex_home)?.join(if archived {
-            ARCHIVED_SESSIONS_SUBDIR
-        } else {
-            SESSIONS_SUBDIR
-        });
-        let key = (root.clone(), search_term.to_owned());
-        if self.key.as_ref() != Some(&key) {
-            self.files.clear();
-            self.key = Some(key);
-        }
-        let json_search_term = json_escaped_search_term(search_term)?;
-        let Some(plain_matches) = ripgrep_rollout_paths(
-            rg_command,
-            root.as_path(),
-            json_search_term.as_str(),
-            search_term,
-        )
-        .await?
-        else {
-            return scan_rollout_matches(
-                root.as_path(),
-                json_search_term.as_str(),
-                search_term,
-                false,
-                self,
-            )
-            .await;
-        };
-        let mut matches = plain_matches;
-        for (path, snippet) in scan_rollout_matches(
-            root.as_path(),
-            json_search_term.as_str(),
-            search_term,
-            true,
-            self,
-        )
-        .await?
-        {
-            insert_rollout_match(&mut matches, path, snippet);
-        }
-        Ok(matches)
+    let root = std::path::absolute(codex_home)?.join(if archived {
+        ARCHIVED_SESSIONS_SUBDIR
+    } else {
+        SESSIONS_SUBDIR
+    });
+    let json_search_term = json_escaped_search_term(search_term)?;
+    let Some(plain_matches) = ripgrep_rollout_paths(
+        rg_command,
+        root.as_path(),
+        json_search_term.as_str(),
+        search_term,
+    )
+    .await?
+    else {
+        return scan_rollout_matches(root.as_path(), json_search_term.as_str(), search_term).await;
+    };
+    let mut matches = plain_matches;
+    for (path, snippet) in
+        scan_compressed_rollout_matches(root.as_path(), json_search_term.as_str(), search_term)
+            .await?
+    {
+        insert_rollout_match(&mut matches, path, snippet);
     }
+    Ok(matches)
 }
 
 async fn ripgrep_rollout_paths(
@@ -275,11 +212,8 @@ async fn scan_rollout_matches(
     root: &Path,
     json_search_term: &str,
     search_term: &str,
-    compressed_only: bool,
-    cache: &mut RolloutSearchCache,
 ) -> io::Result<RolloutSearchMatches> {
     let mut matches = HashMap::new();
-    let mut seen = HashSet::new();
     let mut dirs = vec![root.to_path_buf()];
     let json_search_term = case_insensitive_literal_regex(json_search_term)?;
     let search_term = case_insensitive_literal_regex(search_term)?;
@@ -303,37 +237,8 @@ async fn scan_rollout_matches(
             let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
                 continue;
             };
-            if compressed_only && !rollout_file.is_compressed() {
-                continue;
-            }
-            let path = rollout_file.path();
-            seen.insert(path.to_path_buf());
-            let stamp = search_file_stamp(path).await;
-            let cached = cache
-                .files
-                .get(path)
-                .filter(|(previous, _)| stamp.as_ref() == Some(previous));
-            let (matched, snippet) = if let Some((_, result)) = cached {
-                result.clone()
-            } else {
-                cache.files.remove(path);
-                #[cfg(test)]
-                {
-                    cache.decoded_files += 1;
-                }
-                let result = inspect_rollout_match(path, &json_search_term, &search_term).await?;
-                // An append or replacement during the read must not acquire the new
-                // version stamp while retaining results from the old bytes.
-                if let Some(stamp) = stamp
-                    && search_file_stamp(path).await.as_ref() == Some(&stamp)
-                    && cache.files.len() < MAX_SEARCH_CACHE_FILES
-                {
-                    cache
-                        .files
-                        .insert(path.to_path_buf(), (stamp, result.clone()));
-                }
-                result
-            };
+            let (matched, snippet) =
+                inspect_rollout_match(rollout_file.path(), &json_search_term, &search_term).await?;
             if matched {
                 insert_rollout_match(
                     &mut matches,
@@ -344,7 +249,6 @@ async fn scan_rollout_matches(
         }
     }
 
-    cache.files.retain(|path, _| seen.contains(path));
     Ok(matches)
 }
 
@@ -375,6 +279,53 @@ pub async fn first_rollout_content_match_snippet(
     let search_term = case_insensitive_literal_regex(search_term)?;
     let (_, snippet) = inspect_rollout_match(path, &json_search_term, &search_term).await?;
     Ok(snippet)
+}
+
+async fn scan_compressed_rollout_matches(
+    root: &Path,
+    json_search_term: &str,
+    search_term: &str,
+) -> io::Result<RolloutSearchMatches> {
+    let mut matches = HashMap::new();
+    let mut dirs = vec![root.to_path_buf()];
+    let json_search_term = case_insensitive_literal_regex(json_search_term)?;
+    let search_term = case_insensitive_literal_regex(search_term)?;
+
+    while let Some(dir) = dirs.pop() {
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
+                continue;
+            };
+            if !rollout_file.is_compressed() {
+                continue;
+            }
+            let (matched, snippet) =
+                inspect_rollout_match(rollout_file.path(), &json_search_term, &search_term).await?;
+            if matched {
+                insert_rollout_match(
+                    &mut matches,
+                    compression::plain_rollout_path(rollout_file.path()),
+                    snippet,
+                );
+            }
+        }
+    }
+
+    Ok(matches)
 }
 
 fn json_escaped_search_term(search_term: &str) -> io::Result<String> {
@@ -595,15 +546,9 @@ mod tests {
         .expect("write compressed rollout");
         encoder.finish().expect("finish compressed rollout");
 
-        let matches = scan_rollout_matches(
-            &root,
-            "needle",
-            "needle",
-            true,
-            &mut RolloutSearchCache::default(),
-        )
-        .await
-        .expect("scan compressed rollouts");
+        let matches = scan_compressed_rollout_matches(&root, "needle", "needle")
+            .await
+            .expect("scan compressed rollouts");
 
         assert_eq!(matches.get(&rollout_path), Some(&None));
     }

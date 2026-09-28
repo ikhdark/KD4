@@ -24,9 +24,8 @@ pub use codex_protocol::protocol::TruncationPolicy;
 /// trace is not worth more room than the search results that answer the task.
 pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
 pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
-/// High-signal diagnostics stay above the ordinary budget: a compiler or test
-/// dump is the one class whose useful part is reliably larger than a packet.
-pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 16_000;
+/// Diagnostics fit inside a nested command's output ceiling.
+pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 8_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputOutcome {

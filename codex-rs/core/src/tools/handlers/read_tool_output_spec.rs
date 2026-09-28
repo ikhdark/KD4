@@ -133,76 +133,21 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
         selector_schema.clone(),
         1,
         READ_TOOL_OUTPUT_MAX_SELECTORS as u64,
-        "Preferred selector list; exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string(),
+        "Exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string(),
     );
-    let legacy_start_line = bounded_integer(
-        1,
-        usize::MAX as u64,
-        "Legacy first 1-based line.".to_string(),
-    );
-    let legacy_end_line = bounded_integer(
-        1,
-        usize::MAX as u64,
-        "Legacy inclusive last line.".to_string(),
-    );
-    let legacy_ranges = bounded_array(
-        JsonSchema::object(
-            BTreeMap::from([
-                (
-                    "start_line".to_string(),
-                    bounded_integer(1, usize::MAX as u64, "One-based first line.".to_string()),
-                ),
-                (
-                    "end_line".to_string(),
-                    bounded_integer(1, usize::MAX as u64, "Inclusive last line.".to_string()),
-                ),
-            ]),
-            Some(vec!["start_line".to_string(), "end_line".to_string()]),
-            Some(false.into()),
-        ),
-        1,
-        READ_TOOL_OUTPUT_MAX_LEGACY_RANGES as u64,
-        format!(
-            "Up to {READ_TOOL_OUTPUT_MAX_LEGACY_RANGES} legacy line ranges normalized into selectors."
-        ),
-    );
-    let input_variant = |variant_properties: Vec<(String, JsonSchema)>, required: Vec<&str>| {
-        let mut properties = BTreeMap::from([("artifact_id".to_string(), artifact_id.clone())]);
-        properties.extend(variant_properties);
-        JsonSchema::object(
-            properties,
-            Some(required.into_iter().map(str::to_string).collect()),
-            Some(false.into()),
-        )
-    };
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
         description: "Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Selected values are returned intact; oversized selections return smaller child_selectors or a continuation selector to retry. complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.".to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::one_of(
-            vec![
-                input_variant(
-                    vec![("selectors".to_string(), selectors)],
-                    vec!["artifact_id", "selectors"],
-                ),
-                input_variant(
-                    vec![("ranges".to_string(), legacy_ranges)],
-                    vec!["artifact_id", "ranges"],
-                ),
-                input_variant(
-                    vec![
-                        ("start_line".to_string(), legacy_start_line),
-                        ("end_line".to_string(), legacy_end_line),
-                    ],
-                    vec!["artifact_id"],
-                ),
-            ],
-            Some(
-                "Use selectors, legacy ranges, or the legacy single-line range form; do not mix forms."
-                    .to_string(),
-            ),
+        parameters: JsonSchema::object(
+            BTreeMap::from([
+                ("artifact_id".to_string(), artifact_id),
+                ("selectors".to_string(), selectors),
+            ]),
+            Some(vec!["artifact_id".to_string(), "selectors".to_string()]),
+            Some(false.into()),
         ),
         output_schema: Some(read_tool_output_output_schema(selector_schema).into()),
     })
@@ -421,7 +366,7 @@ mod tests {
         let tool = serde_json::to_value(create_read_tool_output_tool())
             .expect("serialize read_tool_output spec");
         let selectors = tool
-            .pointer("/parameters/oneOf/0/properties/selectors/items/oneOf")
+            .pointer("/parameters/properties/selectors/items/oneOf")
             .and_then(serde_json::Value::as_array)
             .expect("selector variants");
         let kinds = selectors
@@ -435,7 +380,7 @@ mod tests {
         );
         assert_eq!(
             tool.pointer(
-                "/parameters/oneOf/0/properties/selectors/items/oneOf/4/properties/max_results/maximum"
+                "/parameters/properties/selectors/items/oneOf/4/properties/max_results/maximum"
             ),
             Some(&serde_json::json!(ARTIFACT_SEARCH_MAX_RESULTS)),
         );
@@ -477,44 +422,18 @@ mod tests {
     }
 
     #[test]
-    fn artifact_recovery_schema_keeps_canonical_and_legacy_forms_exclusive() {
-        let tool = serde_json::to_value(create_read_tool_output_tool())
-            .expect("serialize read_tool_output spec");
-        let branches = tool["parameters"]["oneOf"]
-            .as_array()
-            .expect("input form branches");
-        assert_eq!(branches.len(), 3);
-        assert!(
-            branches
-                .iter()
-                .all(|branch| branch["additionalProperties"] == false)
-        );
-        assert!(
-            branches[0]["required"]
-                .as_array()
-                .is_some_and(|required| required.contains(&serde_json::json!("selectors")))
-        );
-        assert!(
-            branches[1]["required"]
-                .as_array()
-                .is_some_and(|required| required.contains(&serde_json::json!("ranges")))
-        );
-        assert!(branches[2]["properties"].get("selectors").is_none());
-        assert!(branches[2]["properties"].get("ranges").is_none());
-        assert_eq!(branches[2]["properties"]["start_line"]["minimum"], 1);
-        assert!(
-            branches
-                .iter()
-                .all(|branch| branch["properties"].get("max_bytes").is_none())
-        );
+    fn artifact_recovery_advertises_only_canonical_selectors() {
+        let tool = serde_json::to_value(create_read_tool_output_tool()).expect("tool spec");
         let validator = jsonschema::validator_for(&tool["parameters"]).expect("artifact schema");
-        let args = serde_json::json!({"artifact_id": "artifact", "start_line": 1, "end_line": 10});
-        assert!(validator.is_valid(&args));
-        let mut obsolete_budget = args.clone();
-        obsolete_budget["max_bytes"] = serde_json::json!(100);
-        assert!(!validator.is_valid(&obsolete_budget));
-        let mut unsafe_number = args;
-        unsafe_number["start_line"] = serde_json::json!(9_007_199_254_740_992_u64);
-        assert!(!validator.is_valid(&unsafe_number));
+        assert!(validator.is_valid(&serde_json::json!({
+            "artifact_id": "artifact", "selectors": [{"kind": "lines", "start": 1, "end": 10}]
+        })));
+        for legacy in [
+            serde_json::json!({"artifact_id": "artifact", "start_line": 1, "end_line": 10}),
+            serde_json::json!({"artifact_id": "artifact", "ranges": [{"start_line": 1, "end_line": 10}]}),
+            serde_json::json!({"artifact_id": "artifact"}),
+        ] {
+            assert!(!validator.is_valid(&legacy));
+        }
     }
 }

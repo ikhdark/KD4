@@ -56,9 +56,6 @@ std::thread_local! {
     static EXEC_COMMAND_RESPONSE_MATERIALIZATIONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
-    static BENCH_REPORT_OMISSION: std::cell::Cell<Option<bool>> = const {
-        std::cell::Cell::new(None)
-    };
 }
 
 pub use codex_tools::ToolOutput;
@@ -966,8 +963,6 @@ pub struct ExecCommandToolOutput {
     pub wall_time: Duration,
     /// Raw bytes returned for this unified exec call before any truncation.
     pub raw_output: Vec<u8>,
-    /// Loss while collecting this report, excluding output delivered by earlier polls.
-    pub raw_output_truncated: bool,
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<u32>,
@@ -1569,7 +1564,7 @@ impl ExecCommandToolOutput {
         fragments.push(
             ToolOutputProjectionFragment::new(
                 ToolOutputProjectionFragmentKind::ContextualSpillableText,
-                raw_output.to_owned(),
+                raw_output.replace("\r\n", "\n"),
             )
             .with_id("output"),
         );
@@ -1588,7 +1583,7 @@ impl ExecCommandToolOutput {
             // it applies the model budget exactly once. The process status is
             // already preserved below as essential inline metadata, and the
             // existing artifact ID lets the boundary reuse the raw artifact.
-            spillable_text: vec![raw_output.to_owned()],
+            spillable_text: vec![raw_output.replace("\r\n", "\n")],
             essential_inline: {
                 let mut metadata = serde_json::json!({
                 "chunk_id": &self.chunk_id,
@@ -1647,7 +1642,7 @@ impl ExecCommandToolOutput {
             ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
             ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
         };
-        let hard_limit = self.truncation_policy.token_budget().max(25_000);
+        let hard_limit = self.truncation_policy.token_budget().min(10_000);
         resolve_projected_output_limits(
             self.requested_model_output_tokens(),
             outcome,
@@ -1671,6 +1666,14 @@ impl ExecCommandToolOutput {
         raw_output: &str,
         hard_limit_cap: Option<usize>,
     ) -> ProjectedModelOutput {
+        // Normalize only the model projection; canonical artifacts retain exact bytes.
+        let normalized;
+        let raw_output = if raw_output.contains("\r\n") {
+            normalized = raw_output.replace("\r\n", "\n");
+            normalized.as_str()
+        } else {
+            raw_output
+        };
         let limits = self.model_output_limits(raw_output, hard_limit_cap);
         let summarized =
             if codex_utils_string::approx_token_count(raw_output) <= limits.applied_limit {
@@ -1707,10 +1710,11 @@ impl ExecCommandToolOutput {
                 projected_text = candidate;
             }
         }
-        let artifact_has_more_bytes = self.raw_output_truncated;
-        #[cfg(test)]
-        let artifact_has_more_bytes =
-            BENCH_REPORT_OMISSION.with(|value| value.get().unwrap_or(artifact_has_more_bytes));
+        let artifact_has_more_bytes = self
+            .raw_output_artifact
+            .as_ref()
+            .and_then(RawOutputArtifact::retained_bytes)
+            .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
         ProjectedModelOutput {
             reduced: summarized.is_some() || was_truncated || artifact_has_more_bytes,
             text: projected_text,
@@ -1846,7 +1850,3 @@ fn function_tool_response(
 #[cfg(test)]
 #[path = "context_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "context_benchmark_tests.rs"]
-mod benchmark_tests;

@@ -23,7 +23,6 @@ async fn removing_thread_names_preserves_other_entries_and_cleans_replacement() 
     let home = TempDir::new().expect("tempdir");
     let removed = ThreadId::new();
     let retained = ThreadId::new();
-    let also_removed = ThreadId::new();
     append_thread_name(home.path(), removed, "old name")
         .await
         .expect("first name");
@@ -33,9 +32,6 @@ async fn removing_thread_names_preserves_other_entries_and_cleans_replacement() 
     append_thread_name(home.path(), removed, "new name")
         .await
         .expect("second name");
-    append_thread_name(home.path(), also_removed, "another thread")
-        .await
-        .expect("another name");
     let path = session_index_path(home.path());
     std::fs::OpenOptions::new()
         .append(true)
@@ -43,7 +39,7 @@ async fn removing_thread_names_preserves_other_entries_and_cleans_replacement() 
         .expect("open index")
         .write_all(b"malformed but retained\n")
         .expect("write malformed line");
-    remove_thread_names_for_ids(home.path(), &[removed, also_removed, removed])
+    remove_thread_name_entries(home.path(), removed)
         .await
         .expect("remove names");
     let contents = std::fs::read_to_string(path).expect("read replaced index");

@@ -361,10 +361,11 @@ impl MetricsClientInner {
     }
 
     fn shutdown(&self) -> Result<()> {
-        // PeriodicReader performs its final collection/export during shutdown.
-        // A preceding force_flush would collect observable gauges twice.
-        self.meter_provider
-            .shutdown()
+        debug!("flushing OTEL metrics");
+        let flushed = self.meter_provider.force_flush();
+        let stopped = self.meter_provider.shutdown();
+        flushed
+            .and(stopped)
             .map_err(|source| MetricsError::ProviderShutdown { source })
     }
 }
@@ -690,22 +691,22 @@ mod counter_cache_tests {
     use opentelemetry_sdk::metrics::data::MetricData;
 
     #[derive(Debug)]
-    struct FailingShutdownReader(Arc<Mutex<Vec<&'static str>>>);
+    struct FailingFlushReader(Arc<Mutex<Vec<&'static str>>>);
 
-    impl MetricReader for FailingShutdownReader {
+    impl MetricReader for FailingFlushReader {
         fn register_pipeline(&self, _: Weak<Pipeline>) {}
         fn collect(&self, _: &mut ResourceMetrics) -> opentelemetry_sdk::error::OTelSdkResult {
             Ok(())
         }
         fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
             self.0.lock().unwrap().push("flush");
-            Ok(())
+            Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                "flush failed".to_string(),
+            ))
         }
         fn shutdown_with_timeout(&self, _: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
             self.0.lock().unwrap().push("shutdown");
-            Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
-                "shutdown export failed".to_string(),
-            ))
+            Ok(())
         }
         fn temporality(&self, _: InstrumentKind) -> Temporality {
             Temporality::Cumulative
@@ -713,10 +714,10 @@ mod counter_cache_tests {
     }
 
     #[test]
-    fn shutdown_reports_final_export_failure_without_preliminary_flush() {
+    fn shutdown_still_stops_provider_after_flush_failure() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let provider = SdkMeterProvider::builder()
-            .with_reader(FailingShutdownReader(Arc::clone(&calls)))
+            .with_reader(FailingFlushReader(Arc::clone(&calls)))
             .build();
         let metrics = MetricsClient(Arc::new(MetricsClientInner {
             meter: provider.meter(METER_NAME),
@@ -733,59 +734,8 @@ mod counter_cache_tests {
         let MetricsError::ProviderShutdown { source } = error else {
             panic!("expected provider shutdown error: {error}");
         };
-        assert!(source.to_string().contains("shutdown export failed"));
-        assert_eq!(*calls.lock().unwrap(), vec!["shutdown"]);
-    }
-
-    #[test]
-    fn shutdown_exports_final_counter_and_observable_gauge_once() {
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::atomic::Ordering;
-
-        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
-        let metrics = MetricsClient::new(
-            MetricsConfig::in_memory("test", "codex", "1", exporter.clone())
-                .with_export_interval(Duration::from_secs(3600)),
-        )
-        .unwrap();
-        let collections = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&collections);
-        metrics
-            .register_observable_gauge_with_description(
-                "codex.active",
-                "active",
-                move || {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    7
-                },
-                &[],
-            )
-            .unwrap();
-        metrics.counter("codex.completed", 3, &[]).unwrap();
-        metrics.shutdown().unwrap();
-        let exports = exporter.get_finished_metrics().unwrap();
-        assert_eq!(exports.len(), 1);
-        assert_eq!(collections.load(Ordering::SeqCst), 1);
-        let values: BTreeMap<_, _> = exports[0]
-            .scope_metrics()
-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-            .map(|metric| {
-                let value = match metric.data() {
-                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
-                        sum.data_points().map(|point| point.value() as i64).sum()
-                    }
-                    AggregatedMetrics::I64(MetricData::Gauge(gauge)) => {
-                        gauge.data_points().map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value).sum()
-                    }
-                    _ => panic!("unexpected metric"),
-                };
-                (metric.name().to_string(), value)
-            })
-            .collect();
-        assert_eq!(
-            values,
-            BTreeMap::from([("codex.active".into(), 7), ("codex.completed".into(), 3)])
-        );
+        assert!(source.to_string().contains("flush failed"));
+        assert_eq!(*calls.lock().unwrap(), vec!["flush", "shutdown"]);
     }
 
     #[test]
